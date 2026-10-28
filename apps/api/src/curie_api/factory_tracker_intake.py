@@ -45,7 +45,7 @@ import httpx
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from . import factory_base, factory_rediscovery, workitem_dispatch
+from . import factory_rediscovery, workitem_dispatch
 from .config import Settings
 from .factory_admission import LABEL_REFUSAL_MARKER, cancel_work_item, label_refusal
 from .forges.authority import may_start_with
@@ -305,8 +305,53 @@ async def _poll_binding(
         polled = not polling or await _poll_label(
             sessionmaker, scope, tracker, label, running.get(label, []), held
         )
+        if polling and polled:
+            await _observe_existing_bases(sessionmaker, scope, tracker, label)
         if polled and label in sweeps:
             await _sweep_label(sessionmaker, scope, tracker, label, held)
+
+
+async def _observe_existing_bases(
+    sessionmaker: async_sessionmaker[AsyncSession], scope: _Scope, tracker: Tracker, label: str
+) -> None:
+    from .factory_base_reconcile import observe_base_labels
+    from .forges.trackers import code_host_for_repository
+
+    async with sessionmaker() as session:
+        items = list(
+            await session.scalars(
+                select(WorkItem).where(
+                    WorkItem.tracker_kind == scope.tracker.kind,
+                    WorkItem.tracker_host == scope.tracker.host,
+                    WorkItem.tracker_scope_id == scope.binding.tracker_scope_id,
+                    WorkItem.trigger_label == label,
+                    WorkItem.cancelled_at.is_(None),
+                )
+            )
+        )
+    for item in items:
+        try:
+            ticket = await tracker.ticket_labels(item.tracker_issue)
+            host = code_host_for_repository(scope.registry, scope.client, item.repository)
+            repository = await host.resolve_repository(item.repository_project_id)
+            if repository != item.repository or repository.path != item.repository_path:
+                continue
+            async with sessionmaker() as session:
+                current = await session.get(WorkItem, item.id)
+                if current is None or current.version != item.version:
+                    continue
+                await observe_base_labels(
+                    session,
+                    item=current,
+                    labels=set(ticket.labels),
+                    default_branch=repository.default_branch,
+                    event_identity=None,
+                    settings=scope.settings,
+                    client=scope.client,
+                )
+                await session.commit()
+        except (ForgeError, FeedbackUnavailable):
+            continue
 
 
 def _deferred(scope: _Scope, label: str, what: str, exc: Exception) -> None:
@@ -642,11 +687,11 @@ async def _chosen_repository(
     configured one, or the repository is refused as moved."""
 
     connection = scope.registry.code_host(repo.code_host)
-    code_host = connection.adapter(scope.client)
-    repository = await resolve_stored(
-        code_host,
-        RepositoryRef(connection.config.kind, connection.config.host, repo.project_id, repo.path),
+    descriptor = RepositoryRef(
+        connection.config.kind, connection.config.host, repo.project_id, repo.path
     )
+    code_host = connection.adapter(scope.client, repository=descriptor)
+    repository = await resolve_stored(code_host, descriptor)
     return connection, code_host, repository
 
 
@@ -703,19 +748,6 @@ async def _admission(
     """The admission facts on the chosen repository, or None after a base refusal."""
 
     installation = await connection.installation_for(repository)
-    base: factory_base.ResolvedBase | None = None
-    if not has_open_pr:
-        resolved = await factory_base.resolve_base(
-            policy=repo,
-            labels=set(ticket.labels),
-            default_branch=repository.default_branch,
-            code_host=code_host,
-            repository=repository,
-        )
-        if isinstance(resolved, factory_base.BaseRefusal):
-            await factory_base.comment_refusal(tracker.marked_comments, notice.issue, resolved)
-            return None
-        base = resolved
     kind, address, conversation = reply_route(scope.registry, notice.issue, repository.path)
     return Admission(
         agent_id=agent_id,
@@ -729,7 +761,6 @@ async def _admission(
         requester=f"{tracker.kind}:{notice.actor.id}:{notice.actor.login}",
         request_id=notice_request_id(notice),
         trigger_label=label,
-        base=base,
     )
 
 

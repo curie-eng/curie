@@ -323,6 +323,7 @@ def test_factory_bases_default_base_is_optional(
         {"acme-corp/acme-bot": {"bases": ["-oops"]}},
         {"acme-corp/acme-bot": {"bases": ["a..b"]}},
         {"acme-corp/acme-bot": {"bases": [""]}},
+        {"acme-corp/acme-bot": {"bases": [], "default_base": "main"}},
         {"acme-corp/acme-bot": {"default_base": "main"}},
     ],
 )
@@ -456,7 +457,7 @@ def test_invalid_current_selection_refuses_acquisition_without_fallback(
     ("policy", "default", "labels", "expected"),
     [
         ({REPO: {"bases": ["main", "next"]}}, "next", (), ("next", "default")),
-        ({REPO: {"bases": [], "default_base": "main"}}, "main", (), ("main", "default")),
+        ({REPO: {"bases": []}}, "next", (), ("next", "default")),
         ({REPO: {"bases": ["next"]}}, "main", (), None),
         ({"acme-corp/other": {"bases": ["main", "next"]}}, "main", ("base:next",), None),
     ],

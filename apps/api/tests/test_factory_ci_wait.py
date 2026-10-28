@@ -187,7 +187,7 @@ def _published(
 
     _label(client, github, number)
     row = _request(number)
-    _start_running(row["id"])
+    _start_running(client, row["id"])
     pr = next(_PRS)
     _attach_publication(row["work_item_id"], status="succeeded", pr=pr, head_sha=head_sha)
     return {**row, "pr": pr, "pr_url": f"https://github.com/{REPO}/pull/{pr}"}
@@ -2044,7 +2044,7 @@ def test_a_request_awaiting_ci_is_not_an_orphan(
     number = {"succeeded": 9790, "pending": 9791}[publication] + (10 if check == "declared" else 0)
     _label(client, github, number)
     row = _request(number)
-    epoch = _start_running(row["id"])
+    epoch = _start_running(client, row["id"])
     _attach_publication(
         row["work_item_id"],
         status=publication,
@@ -2066,7 +2066,7 @@ def test_a_request_with_no_publication_is_still_an_orphan_candidate(
     number = 9792
     _label(client, github, number)
     row = _request(number)
-    epoch = _start_running(row["id"])
+    epoch = _start_running(client, row["id"])
 
     assert str(row["id"]) in _listed_owner_ids(client)
 
@@ -2561,7 +2561,7 @@ def test_recorded_github_timeline_waits_for_python_aggregate_through_the_factory
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "factory_admitted", response.text
     published = _request(number)
-    _start_running(published["id"])
+    _start_running(client, published["id"])
     pull = _published_stub_pull(stub, tmp_path)
     head_sha = pull["head"]["sha"]
     _attach_publication(
@@ -2773,7 +2773,7 @@ def test_managed_workspace_clones_the_tls_github_origin_through_real_api_and_sto
     assert admitted.status_code == 200, admitted.text
     assert admitted.json()["status"] == "factory_admitted", admitted.text
     request = _request(3815)
-    _start_running(request["id"])
+    _start_running(client, request["id"])
     pull = _published_stub_pull(stub, tmp_path)
     _attach_publication(
         request["work_item_id"], status="succeeded", pr=pull["number"], head_sha=pull["head"]["sha"]

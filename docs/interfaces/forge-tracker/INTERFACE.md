@@ -56,8 +56,9 @@ marked and described:
 5. `read_ticket` returns the ticket as markdown for the sandbox. Nothing is
    stored.
 6. `ticket_labels` returns the issue's current labels and component names,
-   which admission reads for `base:` and `repo:` labels and label conflicts.
-   Nothing is stored.
+   which admission reads for repository routing and label conflicts. Sandbox
+   acquisition and base reconciliation read them again for the current `base:`
+   choice. The adapter stores nothing.
 7. `set_state_label` applies the factory state label and drops others.
 8. `closing_reference` produces the text a pull request body carries.
 9. `publication_references` returns every scope-qualified text by which an

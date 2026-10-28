@@ -21,7 +21,7 @@ from ..auth import require_internal_worker_token
 from ..config import Settings, get_settings
 from ..deps import SessionDep
 from ..forges.types import GITHUB, CredentialScope, RepositoryRef
-from ..models import Deployment, WorkItem
+from ..models import Deployment, ExecutionRequest, WorkItem
 from ..repository_access import issue_stored_credential, thread_repository
 from ..workspace_policy import credential_mode, repository_allowed
 
@@ -214,7 +214,7 @@ async def redeem_workspace_credential(
     # Exactly one match carries a base; zero or an ambiguous two carry none.
     factory_items = (
         await session.execute(
-            select(WorkItem.base_branch, WorkItem.base_commit)
+            select(WorkItem)
             .where(
                 WorkItem.agent_id == deployment.agent_id,
                 WorkItem.conversation_id == data.conversation_id,
@@ -223,7 +223,29 @@ async def redeem_workspace_credential(
             .limit(2)
         )
     ).all()
-    base_branch, base_commit = factory_items[0] if len(factory_items) == 1 else (None, None)
+    base_branch, base_commit = None, None
+    if len(factory_items) == 1:
+        item = factory_items[0][0]
+        current_request = await session.scalar(
+            select(ExecutionRequest)
+            .where(
+                ExecutionRequest.work_item_id == item.id,
+                ExecutionRequest.status.in_(("waiting", "running", "cancellation_requested")),
+            )
+            .order_by(ExecutionRequest.sequence.desc())
+            .limit(1)
+        )
+        if (
+            current_request is not None
+            and item.trigger_label is not None
+            and item.base_resolved_request_id != current_request.id
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "factory base is unresolved for this execution request",
+                headers={"Cache-Control": "no-store"},
+            )
+        base_branch, base_commit = item.base_branch, item.base_commit
     try:
         issued = await issue_stored_credential(
             settings,

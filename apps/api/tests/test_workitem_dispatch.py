@@ -32,7 +32,7 @@ from curie_api.workitem_dispatch import (
 )
 from curie_api.workitems import lifecycle as workitems
 from fastapi.testclient import TestClient
-from forge_fakes import factory_wake
+from forge_fakes import factory_wake, no_external_calls
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from test_workitems import _grant_opened_pull_request
@@ -345,14 +345,16 @@ def test_acquire_wrong_generation_duplicate_owner_and_cancelled_item(
         facts = _facts(agent_id)
         admitted = await admit(session, facts)
         assert admitted.request is not None
-        unpublished = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=1,
-            wake=await factory_wake(session, facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            unpublished = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert unpublished.generation == 1
         assert unpublished.work_item_id == admitted.work_item.id
         assert unpublished.conversation_id == scoped_conversation_id(
@@ -361,32 +363,38 @@ def test_acquire_wrong_generation_duplicate_owner_and_cancelled_item(
         assert unpublished.wait_deadline == admitted.request.wait_deadline
         assert unpublished.repository_path == facts.repository.path
 
-        stale = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=0,
-            wake=await factory_wake(session, facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            stale = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=0,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert _code(stale) == "not_published"
-        future = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=2,
-            wake=await factory_wake(session, facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            future = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=2,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert _code(future) in {"not_published", "not_dispatchable"}
-        duplicate = await acquire(
-            session,
-            facts.request_id,
-            owner=OTHER_OWNER,
-            generation=1,
-            wake=await factory_wake(session, facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            duplicate = await acquire(
+                session,
+                facts.request_id,
+                owner=OTHER_OWNER,
+                generation=1,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert _code(duplicate) == "duplicate"
 
         cancelled = await cancel(
@@ -395,14 +403,16 @@ def test_acquire_wrong_generation_duplicate_owner_and_cancelled_item(
             expected_version=admitted.work_item.version,
         )
         assert cancelled.work_item.cancelled_at is not None
-        refused = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=1,
-            wake=await factory_wake(session, facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            refused = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert _code(refused) == "work_item_cancelled"
 
     with_session(body)
@@ -418,14 +428,16 @@ def test_default_acquire_lease_and_same_owner_renewal_use_database_time(
     async def body(session: AsyncSession) -> None:
         facts = _facts(await _agent_with_channel(session))
         await admit(session, facts)
-        first = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=1,
-            wake=await factory_wake(session, facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            first = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert isinstance(first, workitem_dispatch.AcquireGrant)
         acquired = await _request_row(session, facts.request_id)
         now = await _now(session)
@@ -440,28 +452,32 @@ def test_default_acquire_lease_and_same_owner_renewal_use_database_time(
         )
         await session.commit()
         shortened = await _request_row(session, facts.request_id)
-        renewed = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=1,
-            wake=await factory_wake(session, facts.request_id),
-            context=first.context,
-        )
+        async with no_external_calls() as http_client:
+            renewed = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=await factory_wake(session, facts.request_id),
+                context=first.context,
+                client=http_client,
+            )
         assert renewed == first
         after = await _request_row(session, facts.request_id)
         now = await _now(session)
         assert 59 <= (after.acquire_expires_at - now).total_seconds() <= 61
         assert after.acquire_expires_at > shortened.acquire_expires_at
         assert (after.acquire_owner, after.acquired_generation) == (OWNER, 1)
-        refused = await acquire(
-            session,
-            facts.request_id,
-            owner=OTHER_OWNER,
-            generation=1,
-            wake=await factory_wake(session, facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            refused = await acquire(
+                session,
+                facts.request_id,
+                owner=OTHER_OWNER,
+                generation=1,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert _code(refused) == "duplicate"
 
     with_session(body)
@@ -483,14 +499,16 @@ def test_default_acquire_lease_redispatches_only_after_expiry(
     async def body(session: AsyncSession) -> None:
         facts = _facts(await _agent_with_channel(session))
         await admit(session, facts)
-        acquired = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=1,
-            wake=await factory_wake(session, facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            acquired = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert isinstance(acquired, workitem_dispatch.AcquireGrant)
         await session.execute(
             text(
@@ -513,28 +531,32 @@ def test_default_acquire_lease_redispatches_only_after_expiry(
             assert after.acquired_generation is None
             assert after.last_deferral_reason == "acquire_lost"
             assert 9 <= (after.dispatch_not_before - now).total_seconds() <= 11
-            replacement = await acquire(
-                session,
-                facts.request_id,
-                owner=OTHER_OWNER,
-                generation=after.dispatch_generation,
-                wake=await factory_wake(session, facts.request_id),
-                context=None,
-            )
+            async with no_external_calls() as http_client:
+                replacement = await acquire(
+                    session,
+                    facts.request_id,
+                    owner=OTHER_OWNER,
+                    generation=after.dispatch_generation,
+                    wake=await factory_wake(session, facts.request_id),
+                    context=None,
+                    client=http_client,
+                )
             assert isinstance(replacement, workitem_dispatch.AcquireGrant)
             assert replacement.generation == before.dispatch_generation + 1
         else:
             assert after.dispatch_generation == before.dispatch_generation
             assert after.acquire_owner == OWNER
             assert after.acquire_expires_at == before.acquire_expires_at
-            refused = await acquire(
-                session,
-                facts.request_id,
-                owner=OTHER_OWNER,
-                generation=after.dispatch_generation,
-                wake=await factory_wake(session, facts.request_id),
-                context=None,
-            )
+            async with no_external_calls() as http_client:
+                refused = await acquire(
+                    session,
+                    facts.request_id,
+                    owner=OTHER_OWNER,
+                    generation=after.dispatch_generation,
+                    wake=await factory_wake(session, facts.request_id),
+                    context=None,
+                    client=http_client,
+                )
             assert _code(refused) == "duplicate"
 
     with_session(body)
@@ -548,14 +570,16 @@ def test_defer_preserves_deadline_version_start_and_attempts(
         facts = _facts(agent_id)
         admitted = await admit(session, facts)
         assert admitted.request is not None
-        granted = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=1,
-            wake=await factory_wake(session, facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            granted = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert granted.generation == 1
         before = await _request_row(session, facts.request_id)
         now = await _now(session)
@@ -580,14 +604,16 @@ def test_defer_preserves_deadline_version_start_and_attempts(
         assert after_busy.last_deferral_reason == "thread_busy"
         assert busy.dispatch_generation == after_busy.dispatch_generation
 
-        acquired = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=after_busy.dispatch_generation,
-            wake=await factory_wake(session, facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            acquired = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=after_busy.dispatch_generation,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert isinstance(acquired, AcquireGrant), acquired
         capacity = await defer(
             session,
@@ -617,14 +643,16 @@ def test_start_records_attempt_epoch_deadline_and_runtime_names(
         agent_id = await _agent_with_channel(session)
         facts = _facts(agent_id)
         await admit(session, facts)
-        acquired = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=1,
-            wake=await factory_wake(session, facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            acquired = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert isinstance(acquired, AcquireGrant), acquired
         started = await start(
             session,
@@ -657,14 +685,16 @@ def test_heartbeat_and_finish_refuse_a_stale_runtime_epoch(
         agent_id = await _agent_with_channel(session)
         facts = _facts(agent_id)
         await admit(session, facts)
-        acquired = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=1,
-            wake=await factory_wake(session, facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            acquired = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert isinstance(acquired, AcquireGrant), acquired
         await start(
             session,
@@ -842,14 +872,16 @@ def test_termination_claim_waits_for_heartbeat_expiry_and_maps_owner_lost(
         agent_id = await _agent_with_channel(session)
         facts = _facts(agent_id)
         admitted = await admit(session, facts)
-        acquired = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=1,
-            wake=await factory_wake(session, facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            acquired = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert isinstance(acquired, AcquireGrant), acquired
         await start(
             session,
@@ -883,14 +915,16 @@ def test_termination_claim_waits_for_heartbeat_expiry_and_maps_owner_lost(
 
         owner_lost_facts = _facts(agent_id, issue_number=2574)
         owner_lost = await admit(session, owner_lost_facts)
-        acquired = await acquire(
-            session,
-            owner_lost_facts.request_id,
-            owner=OWNER,
-            generation=1,
-            wake=await factory_wake(session, owner_lost_facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            acquired = await acquire(
+                session,
+                owner_lost_facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=await factory_wake(session, owner_lost_facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert isinstance(acquired, AcquireGrant), acquired
         await start(
             session,
@@ -1177,14 +1211,16 @@ def short_runtime_ttl(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 async def _running(session: AsyncSession, agent_id: uuid.UUID, *, issue: int = 2573) -> Admission:
     facts = _facts(agent_id, issue_number=issue)
     await admit(session, facts)
-    acquired = await acquire(
-        session,
-        facts.request_id,
-        owner=OWNER,
-        generation=1,
-        wake=await factory_wake(session, facts.request_id),
-        context=None,
-    )
+    async with no_external_calls() as http_client:
+        acquired = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=1,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
+            client=http_client,
+        )
     assert isinstance(acquired, AcquireGrant), acquired
     await start(
         session,
@@ -1560,14 +1596,16 @@ async def _acquire_and_defer(
     """Acquire the current generation, defer it, and bracket the defer's clock."""
 
     row = await _start_row(session, request_id)
-    granted = await acquire(
-        session,
-        request_id,
-        owner=OWNER,
-        generation=row.dispatch_generation,
-        wake=await factory_wake(session, request_id),
-        context=None,
-    )
+    async with no_external_calls() as http_client:
+        granted = await acquire(
+            session,
+            request_id,
+            owner=OWNER,
+            generation=row.dispatch_generation,
+            wake=await factory_wake(session, request_id),
+            context=None,
+            client=http_client,
+        )
     assert getattr(granted, "code", None) is None, granted
     before = await _now(session)
     result = await defer(
@@ -1654,14 +1692,16 @@ def test_fifth_start_deferral_fails_the_request_as_start_failed(
             start_failure_detail=None,
         )
         assert _code(again) == "not_dispatchable"
-        reacquired = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=row.dispatch_generation,
-            wake=await factory_wake(session, facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            reacquired = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=row.dispatch_generation,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert _code(reacquired) == "not_dispatchable"
         unchanged = await _start_row(session, facts.request_id)
         assert unchanged.status == "failed"
@@ -1941,14 +1981,16 @@ async def _acquired(
     session: AsyncSession, request_id: uuid.UUID, *, owner: str = OWNER
 ) -> AcquireGrant:
     row = await _start_row(session, request_id)
-    granted = await acquire(
-        session,
-        request_id,
-        owner=owner,
-        generation=row.dispatch_generation,
-        wake=await factory_wake(session, request_id),
-        context=None,
-    )
+    async with no_external_calls() as http_client:
+        granted = await acquire(
+            session,
+            request_id,
+            owner=owner,
+            generation=row.dispatch_generation,
+            wake=await factory_wake(session, request_id),
+            context=None,
+            client=http_client,
+        )
     assert isinstance(granted, AcquireGrant), granted
     return granted
 
@@ -2538,14 +2580,16 @@ async def _assert_factory_neighbor_starts(session: AsyncSession) -> None:
     facts = _facts(agent_id, issue_number=4620, address=address)
     admitted = await admit(session, facts)
     assert isinstance(admitted, workitems.WorkItemOutcome)
-    acquired = await acquire(
-        session,
-        facts.request_id,
-        owner=OTHER_OWNER,
-        generation=1,
-        wake=await factory_wake(session, facts.request_id),
-        context=None,
-    )
+    async with no_external_calls() as http_client:
+        acquired = await acquire(
+            session,
+            facts.request_id,
+            owner=OTHER_OWNER,
+            generation=1,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
+            client=http_client,
+        )
     assert isinstance(acquired, workitem_dispatch.AcquireGrant)
     assert acquired.context.agent_id == agent_id
     started = await start(
@@ -2579,24 +2623,28 @@ def test_factory_wake_mismatch_leaves_authority_untouched_and_valid_delivery_sta
         await admit(session, facts)
         wake = await factory_wake(session, facts.request_id)
         before = dict(await _request_row(session, facts.request_id))
-        refused = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=1,
-            wake=wake.model_copy(update=change),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            refused = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=wake.model_copy(update=change),
+                context=None,
+                client=http_client,
+            )
         assert _code(refused) == "factory_wake_mismatch"
         assert dict(await _request_row(session, facts.request_id)) == before
-        acquired = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=1,
-            wake=wake,
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            acquired = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=wake,
+                context=None,
+                client=http_client,
+            )
         assert isinstance(acquired, workitem_dispatch.AcquireGrant)
         started = await start(
             session,
@@ -2694,14 +2742,16 @@ def test_invalid_factory_authority_defers_without_starting_while_neighbor_progre
         wake = await factory_wake(session, facts.request_id)
         context = None
         if phase != "acquire":
-            granted = await acquire(
-                session,
-                facts.request_id,
-                owner=OWNER,
-                generation=1,
-                wake=wake,
-                context=None,
-            )
+            async with no_external_calls() as http_client:
+                granted = await acquire(
+                    session,
+                    facts.request_id,
+                    owner=OWNER,
+                    generation=1,
+                    wake=wake,
+                    context=None,
+                    client=http_client,
+                )
             assert isinstance(granted, workitem_dispatch.AcquireGrant)
             context = granted.context
         before = await _request_row(session, facts.request_id)
@@ -2718,14 +2768,16 @@ def test_invalid_factory_authority_defers_without_starting_while_neighbor_progre
                 context=context,
             )
         else:
-            refused = await acquire(
-                session,
-                facts.request_id,
-                owner=OWNER,
-                generation=1,
-                wake=wake,
-                context=context,
-            )
+            async with no_external_calls() as http_client:
+                refused = await acquire(
+                    session,
+                    facts.request_id,
+                    owner=OWNER,
+                    generation=1,
+                    wake=wake,
+                    context=context,
+                    client=http_client,
+                )
         assert _code(refused) == code
         after = await _request_row(session, facts.request_id)
         assert after.status == "waiting"
@@ -2763,25 +2815,29 @@ def test_factory_revalidation_rejects_foreign_context_and_preserves_neighbor(
         facts = _facts(await _agent_with_channel(session))
         await admit(session, facts)
         wake = await factory_wake(session, facts.request_id)
-        acquired = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=1,
-            wake=wake,
-            context=None,
-        )
-        assert isinstance(acquired, workitem_dispatch.AcquireGrant)
-        context = acquired.context.model_copy(update={field: uuid.uuid4()})
-        if phase == "renew":
-            refused = await acquire(
+        async with no_external_calls() as http_client:
+            acquired = await acquire(
                 session,
                 facts.request_id,
                 owner=OWNER,
                 generation=1,
                 wake=wake,
-                context=context,
+                context=None,
+                client=http_client,
             )
+        assert isinstance(acquired, workitem_dispatch.AcquireGrant)
+        context = acquired.context.model_copy(update={field: uuid.uuid4()})
+        if phase == "renew":
+            async with no_external_calls() as http_client:
+                refused = await acquire(
+                    session,
+                    facts.request_id,
+                    owner=OWNER,
+                    generation=1,
+                    wake=wake,
+                    context=context,
+                    client=http_client,
+                )
         else:
             refused = await start(
                 session,
@@ -2814,25 +2870,29 @@ def test_replacing_current_binding_invalidates_the_acquired_context(
         facts = _facts(await _agent_with_channel(session))
         await admit(session, facts)
         wake = await factory_wake(session, facts.request_id)
-        acquired = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=1,
-            wake=wake,
-            context=None,
-        )
-        assert isinstance(acquired, workitem_dispatch.AcquireGrant)
-        await _invalidate_factory_binding(session, facts.agent_id, "replaced")
-        if phase == "renew":
-            refused = await acquire(
+        async with no_external_calls() as http_client:
+            acquired = await acquire(
                 session,
                 facts.request_id,
                 owner=OWNER,
                 generation=1,
                 wake=wake,
-                context=acquired.context,
+                context=None,
+                client=http_client,
             )
+        assert isinstance(acquired, workitem_dispatch.AcquireGrant)
+        await _invalidate_factory_binding(session, facts.agent_id, "replaced")
+        if phase == "renew":
+            async with no_external_calls() as http_client:
+                refused = await acquire(
+                    session,
+                    facts.request_id,
+                    owner=OWNER,
+                    generation=1,
+                    wake=wake,
+                    context=acquired.context,
+                    client=http_client,
+                )
         else:
             refused = await start(
                 session,

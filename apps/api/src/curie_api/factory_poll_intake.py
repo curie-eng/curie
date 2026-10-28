@@ -608,7 +608,9 @@ async def _apply_notice(
             if notice.disposition == "cancel":
                 await github_factory.cancel_notice(session, notice, settings)
             elif notice.disposition == "base_label":
-                await github_factory.record_base_label_notice(session, notice, verified, settings)
+                await github_factory.record_base_label_notice(
+                    session, notice, verified, settings, client=client
+                )
             else:
                 await github_factory.admit_notice(
                     session, notice, settings, verified, client=client

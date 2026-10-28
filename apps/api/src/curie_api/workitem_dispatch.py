@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+import httpx
 from aci_protocol.turn import route_identity
 from curie_telemetry.redact import redact_text
 from pydantic import BaseModel, ConfigDict
@@ -43,7 +44,14 @@ from .forges.errors import NotFound
 from .forges.registry import forges_registry
 from .forges.trackers import binding_for_scope, reply_route
 from .forges.types import ReplyTarget, RepositoryRef, TrackerIssueRef
-from .models import Agent, AgentChannel, ExecutionRequest, Publication, WorkItem
+from .models import (
+    Agent,
+    AgentChannel,
+    ExecutionRequest,
+    FactoryBaseTransition,
+    Publication,
+    WorkItem,
+)
 from .threadkeys import (
     legacy_route_adapter_of,
     pre_identity_key_of,
@@ -495,6 +503,11 @@ async def readmit(
         requester=facts.requester,
         base=getattr(facts, "base", None),
         trigger_label=facts.trigger_label,
+        base_settle_until=(
+            now + timedelta(seconds=get_settings().factory_base_label_settle_s)
+            if facts.trigger_label
+            else None
+        ),
     )
     if isinstance(readmitted, WorkItemConflict):
         return readmitted
@@ -533,6 +546,11 @@ async def _admit_new(
         request_id=facts.request_id,
         wait_deadline=wait_deadline,
         expected_work_item_version=created.work_item.version,
+        base_settle_until=(
+            now + timedelta(seconds=get_settings().factory_base_label_settle_s)
+            if facts.trigger_label
+            else None
+        ),
     )
     if isinstance(requested, WorkItemConflict):
         if requested.code == "identity_mismatch":
@@ -560,6 +578,24 @@ async def claim_due(
             ExecutionRequest.wait_deadline > func.clock_timestamp(),
             ExecutionRequest.dispatch_not_before <= func.clock_timestamp(),
             ExecutionRequest.objective.is_not(None),
+            ~exists().where(
+                WorkItem.id == ExecutionRequest.work_item_id,
+                WorkItem.readmit_request_id.is_not(None),
+            ),
+            ~exists().where(
+                FactoryBaseTransition.work_item_id == ExecutionRequest.work_item_id,
+                or_(
+                    FactoryBaseTransition.phase.not_in(("applied", "conflict", "refused")),
+                    and_(
+                        FactoryBaseTransition.phase == "applied",
+                        FactoryBaseTransition.outcome_ready_at.is_(None),
+                    ),
+                    and_(
+                        FactoryBaseTransition.phase.in_(("conflict", "refused")),
+                        FactoryBaseTransition.request_id == ExecutionRequest.id,
+                    ),
+                ),
+            ),
             ExecutionRequest.published_generation.is_distinct_from(
                 ExecutionRequest.dispatch_generation
             ),
@@ -794,7 +830,20 @@ async def acquire(
     generation: int,
     wake: FactoryWake,
     context: FactoryContext | None,
+    client: httpx.AsyncClient,
 ) -> AcquireGrant | DispatchConflict:
+    from .factory_base_reconcile import resolve_for_acquire
+
+    ready = await resolve_for_acquire(
+        session,
+        request_id=request_id,
+        owner=owner,
+        generation=generation,
+        settings=get_settings(),
+        client=client,
+    )
+    if not ready:
+        return await _refuse(session, "not_dispatchable", request_id=request_id)
     locked = await _lock_pair(session, request_id)
     if isinstance(locked, DispatchConflict):
         return locked
@@ -892,6 +941,33 @@ async def acquire(
             session, work_item, request, owner=owner, generation=generation, refusal=refusal
         )
     assert isinstance(current, FactoryContext)
+    pending_pin = session.info.pop("factory_base_pin", None)
+    if pending_pin is not None:
+        from .factory_notices import mark_status_comment_stale
+        from .models import ThreadPublicationLineage
+
+        pin_item_id, pin_request_id, selected_base, settle_until, empty_lineage_id, base_commit = (
+            pending_pin
+        )
+        if pin_item_id != work_item.id or pin_request_id != request.id:
+            await session.rollback()
+            return await _refuse(session, "not_dispatchable", request_id=request_id)
+        if empty_lineage_id is not None:
+            lineage = await session.get(ThreadPublicationLineage, empty_lineage_id)
+            if lineage is not None:
+                lineage.base_ref, lineage.base_sha = selected_base.branch, selected_base.commit
+                lineage.version += 1
+        request.base_settle_until = settle_until
+        work_item.base_branch, work_item.base_source, work_item.base_commit = (
+            selected_base.branch,
+            selected_base.source,
+            base_commit,
+        )
+        work_item.base_resolved_request_id = request.id
+        work_item.base_selection_fingerprint = None
+        work_item.base_requested_branch, work_item.base_requested_source = None, None
+        work_item.version += 1
+        await mark_status_comment_stale(session, work_item.id)
     grant = AcquireGrant(
         generation=generation,
         work_item_id=work_item.id,
@@ -1103,6 +1179,10 @@ async def start(
         return await _refuse(
             session, "waiting_deadline_elapsed", work_item_id=work_item.id, request_id=request.id
         )
+    if request.base_settle_until is not None and work_item.base_resolved_request_id != request.id:
+        return await _refuse(
+            session, "not_dispatchable", work_item_id=work_item.id, request_id=request.id
+        )
     current = await _factory_context(session, work_item, request)
     refusal = current if isinstance(current, str) else _factory_context_change(current, context)
     if refusal is not None:
@@ -1297,12 +1377,7 @@ def _not_approval_hold() -> ColumnElement[bool]:
 
 
 def _not_awaiting_publication() -> ColumnElement[bool]:
-    # A publication in flight or succeeded hands the request's terminus to the
-    # publication loop and the CI gate, not to runtime owner loss.
-    return ~exists().where(
-        Publication.execution_request_id == ExecutionRequest.id,
-        Publication.status.in_((*lifecycle.IN_FLIGHT_PUBLICATION, "succeeded")),
-    )
+    return lifecycle.not_awaiting_publication()
 
 
 async def list_runtime_owners(
@@ -1387,6 +1462,7 @@ async def declare_owner_lost(
         or request.runtime_epoch != runtime_epoch
         or held
         or awaiting_publication is not None
+        or await session.scalar(select(lifecycle.ready_base_transition_exists(request.id)))
     ):
         return await _refuse(
             session,

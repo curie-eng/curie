@@ -30,7 +30,7 @@ from curie_api.models import (
 from curie_api.workitem_dispatch import AcquireGrant, acquire, admit, finish, start
 from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
-from forge_fakes import factory_wake
+from forge_fakes import factory_wake, no_external_calls
 from sqlalchemy import delete, event, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
@@ -183,14 +183,16 @@ def _admit(facts: SimpleNamespace) -> uuid.UUID:
 
 def _start(request_id: uuid.UUID) -> int:
     async def body(session: AsyncSession) -> int:
-        acquired = await acquire(
-            session,
-            request_id,
-            owner=OWNER,
-            generation=1,
-            wake=await factory_wake(session, request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            acquired = await acquire(
+                session,
+                request_id,
+                owner=OWNER,
+                generation=1,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=http_client,
+            )
         assert isinstance(acquired, AcquireGrant), acquired
         started = await start(
             session,

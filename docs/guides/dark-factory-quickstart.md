@@ -413,7 +413,9 @@ reads as a single forge configuration document:
    egress policy.
 5. `factory.enabled`, `factory.intake` (`poll` or `webhook`),
    `factory.cardBaseUrl` and `factory.ciWaitSeconds` replace the matching
-   `api.*` settings.
+   `api.*` settings. `factory.baseLabelSettleSeconds` controls the wait after
+   the selection label is applied before the factory reads the current base
+   labels at sandbox acquisition. It defaults to 60 seconds; zero is valid.
 
 The old `api.githubFactory*` keys are removed. To upgrade a v0.12.5
 installation configured with `curie cluster factory`, use a CLI containing

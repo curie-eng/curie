@@ -308,6 +308,7 @@ class Settings(BaseSettings):
     # Polling is the default intake (#3745). Webhook mode is opt-in and keeps
     # the missed-label backstop. The poll interval is the GitHub tracker's.
     factory_intake: Literal["poll", "webhook"] = "poll"
+    factory_base_label_settle_s: int = Field(default=60, ge=0)
     # A failed label delivery is never redelivered by GitHub (#3081). The work
     # item reconciler lists labeled open issues this often and admits any with
     # no WorkItem once its label is older than the grace, so a delivery still

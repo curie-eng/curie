@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from .branches import base_allowed
 from .factory_notices import code_span
 from .forges.config import RepositoryBindingConfig
 from .forges.errors import ForgeError
@@ -90,8 +91,8 @@ def choose_base(
         # The repository read carried no default branch; ask again later.
         raise FeedbackUnavailable("repository_unavailable")
     choice = BaseChoice(branch, "label" if named else "default")
-    allowed = entry.bases if entry is not None else (default_branch,)
-    if choice.branch not in allowed:
+    allowed = entry.bases if entry is not None else ()
+    if not base_allowed(choice.branch, allowed, default_branch=default_branch):
         return BaseRefusal(
             "base_not_allowed",
             f"base {code_span(choice.branch)} is not an allowed base for this deployment",

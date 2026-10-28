@@ -205,6 +205,7 @@ def factory_env(
         "GITHUB_API_URL": api_url,
         "FACTORY_ENABLED": "true",
         "FACTORY_INTAKE": intake,
+        "FACTORY_BASE_LABEL_SETTLE_S": "0",
         "CURIE_FORGES": forges_env_json(forges_document(api_url=api_url, **forges), key_dir),
     }
 

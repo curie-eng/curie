@@ -128,9 +128,9 @@ def valid_base_branch(branch: str) -> bool:
         isinstance(branch, str)
         and 0 < len(branch) <= 1024
         and branch not in {"@", "HEAD"}
-        and not branch.startswith(("-", "/", "refs/heads/"))
+        and not branch.startswith(("-", "/"))
         and not branch.endswith(("/", "."))
-        and re.fullmatch(r"[0-9a-fA-F]{40,64}", branch) is None
+        and not any(char.isspace() for char in branch)
         and re.search(r"[\x00-\x20\x7f~^:?*\[\\]", branch) is None
         and not any(part in branch for part in ("..", "@{", "//"))
         and all(
@@ -336,7 +336,7 @@ fi
 git_with_timeout -c user.name="$GIT_USER_NAME" -c user.email="$GIT_USER_EMAIL" commit \
   -m "$COMMIT_TITLE" -m "Curie-Revision: $REVISION_ID"
 if [[ -z "$EXPECTED_REMOTE_HEAD" ]]; then
-  if [[ -z "$BASE_BRANCH" || "$BASE_BRANCH" == refs/heads/* || "$BASE_BRANCH" == -* ]] || \
+  if [[ -z "$BASE_BRANCH" || "$BASE_BRANCH" == -* ]] || \
       ! git_with_timeout check-ref-format "refs/heads/$BASE_BRANCH"; then
     echo "publication base branch is invalid" >&2
     exit 1

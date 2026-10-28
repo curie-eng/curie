@@ -176,6 +176,7 @@ api:
   FACTORY_CI_WAIT_S: factory.ciWaitSeconds
   FACTORY_ENABLED: factory.enabled
   FACTORY_INTAKE: factory.intake
+  FACTORY_BASE_LABEL_SETTLE_S: factory.baseLabelSettleSeconds
   GITHUB_API_URL: api.githubApiUrl
   GITHUB_APP_ID: api.githubAppId
   GITHUB_APP_PRIVATE_KEY: api.githubAppExistingSecret

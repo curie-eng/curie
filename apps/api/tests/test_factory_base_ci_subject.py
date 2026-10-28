@@ -86,7 +86,6 @@ def _applied_move(
                 item.base_source = "label"
                 item.base_commit = NEXT_SHA
                 item.base_resolved_request_id = request.id
-                request.objective = "Verify the repository after its base changed."
                 lineage.base_ref = "next"
                 lineage.base_sha = NEXT_SHA
                 lineage.head_sha = HEAD_B
@@ -130,7 +129,7 @@ def _applied_move(
             await engine.dispose()
 
     branch = asyncio.run(seed())
-    epoch = _start_running(row["id"])
+    epoch = _start_running(client, row["id"])
     sink.branches["next"] = NEXT_SHA
     sink.pull_script = [
         {
@@ -331,7 +330,7 @@ def test_a_normal_request_with_no_ci_subject_remains_reclaimable(moved: Any) -> 
     github.labels = [LABEL]
     _label(client, github, 32103)
     normal = _request(32103)
-    epoch = _start_running(normal["id"])
+    epoch = _start_running(client, normal["id"])
     assert str(normal["id"]) in _listed_owner_ids(client)
 
     declared = _owner_lost(client, normal["id"], epoch)

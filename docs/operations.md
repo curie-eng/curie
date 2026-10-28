@@ -1530,9 +1530,10 @@ stays requested until the runtime reports that it stopped. An already linked
 pull request stays linked, and later publication is refused.
 
 Polling reads each bound repository every `factory.trackers[].pollIntervalSeconds`
-(default 45 seconds). It admits an open labeled issue with no grace delay,
-admits a mention and review feedback on a factory pull request, and cancels a
-work item whose issue was closed or unlabeled. Those reads do not record a
+(default 45 seconds). It can admit an open labeled issue immediately, but
+sandbox acquisition waits for the base label settling interval described below.
+It admits a mention and review feedback on a factory pull request, and cancels
+a work item whose issue was closed or unlabeled. Those reads do not record a
 webhook delivery. The webhook is optional. In webhook mode the missed-label
 backstop stays: every `FACTORY_RECONCILE_INTERVAL_S` (default 300, 0
 disables) the reconciler lists the open issues carrying the factory label and
@@ -1706,15 +1707,56 @@ The factory reads no `GITHUB_FACTORY_*` environment. The chart refuses an
 
 The branch a factory ticket starts from and targets is `bases` and
 `defaultBase` on the repository entry. `bases` is a non-empty list of unique
-allowed branches. `defaultBase` must be one of them and defaults to the
-repository default branch. A repository entry without `bases` may only use its
-default branch. A ticket picks a base with a `base:<branch>` issue label; with no
-label it uses the default. Two `base:` labels, a base outside `bases`, or a base
-that does not exist are refused with an issue comment, and no other branch is
-substituted. The base is frozen when the work item is created: a later label
-change is ignored. The status comment shows it on a `Base:` line, for example
+case-sensitive glob patterns: `main` permits only that branch, `release/*`
+permits matching release branches, and `*` permits any valid branch name that
+exists on the remote. `defaultBase` remains a literal branch name, must match
+an allowed pattern, and defaults to the repository default branch. A repository
+entry without `bases` may only use its default branch. Patterns never create
+branches; tags and local-only branches do not satisfy the remote existence check.
+
+A ticket picks a literal base with one `base:<branch>` issue label. No base
+label, including removal of the previous one, selects the default. Multiple
+base labels, invalid or disallowed names, and missing remote branches are
+refused with a visible reason; no other branch is substituted.
+
+The factory waits after the factory selection label is applied before acquiring
+the sandbox. Set `factory.baseLabelSettleSeconds` (API env
+`FACTORY_BASE_LABEL_SETTLE_S`) to change the interval: the default is 60 seconds,
+and zero is valid. Reapplying the selection label begins a new interval. At
+sandbox acquisition, the factory reads the current labels and records the base
+branch, its source and its remote commit. An earlier intake scan does not freeze
+that choice. The status comment shows a `Base:` line, for example
 ``Base: `next` (from label `base:next`)``, or `(deployment default)` when no label
 chose it.
+
+If the effective base changes before a PR exists, the platform cancels the old
+execution, waits for it to stop, and automatically starts fresh work from the
+new branch. The replacement gets fresh execution authority. Selecting the same
+branch from a different source updates the provenance without restarting;
+movement of the branch tip alone is not a base label change.
+
+After a PR exists, a durable platform operation replays its commits onto the
+new base and validates the replay. It pushes a clean result only if the remote
+PR head still matches the recorded head, then retargets the PR after confirming
+that push. Once the target change is durably confirmed, it appends and pushes a
+distinct empty commit with the same tree. Required CI must pass on that final
+head under the new target, including when no further code changes are needed.
+The empty commit remains in branch history and is an ancestor of later fixes.
+Old approvals and checks do not authorize the new head and base. Durable
+progress lets reconciliation resume after a restart.
+
+A replay conflict changes neither the remote branch nor the PR target. The
+status comment keeps the conflict visible until the factory selection label is
+reapplied to retry with current labels and remote state. Editing a base label
+alone does not retry a conflicting replay. Other refusals also remain visible.
+
+Explicit checkpoint restoration keeps the checkpoint's original trusted base
+commit and recorded PR target branch. It still checks the current repository
+and allowed patterns, and does not reinterpret the saved patch against current
+labels or a newer branch tip. See
+[ADR 0253](adr/0253-factory-base-labels-resolve-at-claim-and-follow-relabels.md)
+and the restoration exception in
+[ADR 0251](adr/0251-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md).
 
 When a publication request is refused, the issue's `Could not complete:`
 notice (cause `approval_create_failed`) carries the refusal code and message

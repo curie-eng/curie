@@ -2422,9 +2422,7 @@ def test_adopted_job_cannot_supply_or_change_the_api_authoritative_base_branch(
     assert (core.created, batch.created) == creates
 
 
-@pytest.mark.parametrize(
-    "base_branch", ["", "../main", "main\nnext", "-main", "a" * 1025]
-)
+@pytest.mark.parametrize("base_branch", ["", "../main", "main\nnext", "-main", "a" * 1025])
 def test_builder_refuses_an_invalid_base_branch(publication_k8s: Any, base_branch: str) -> None:
     with pytest.raises(publication_k8s.PublicationResourceError):
         _build(publication_k8s, replace(_payload(publication_k8s), base_branch=base_branch))

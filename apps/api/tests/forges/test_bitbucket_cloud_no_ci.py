@@ -241,7 +241,7 @@ def _publish(pair: BitbucketPair, fake: BitbucketCloudFake) -> Published:
     assert request_id is not None
     work_item_id = _work_item(pair.issue)["id"]
     _gate_pass()
-    _start(request_id)
+    _start(pair.client, request_id)
     _gate_pass()
     assert _status(request_id) == ("running", None)
     pull = pair.open_pull_request()

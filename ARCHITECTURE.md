@@ -850,8 +850,9 @@ The governing decisions are
 [ADR 0162](docs/adr/0162-work-items-own-durable-execution-identity.md),
 [ADR 0171](docs/adr/0171-a-factory-run-may-take-three-hours-and-is-bounded-by-time-not-turns.md),
 [ADR 0174](docs/adr/0174-publication-prechecks-use-an-execution-scoped-capability.md),
-[ADR 0186](docs/adr/0186-a-factory-ticket-declares-its-base-and-keeps-it.md) (Draft), and
-[ADR 0187](docs/adr/0187-the-factory-polls-github-and-the-platform-reads-the-issue.md).
+[ADR 0186](docs/adr/0186-a-factory-ticket-declares-its-base-and-keeps-it.md),
+[ADR 0187](docs/adr/0187-the-factory-polls-github-and-the-platform-reads-the-issue.md), and
+[ADR 0253](docs/adr/0253-factory-base-labels-resolve-at-claim-and-follow-relabels.md).
 
 ### Factory component map
 
@@ -903,15 +904,16 @@ flowchart LR
   is the default; the signed webhook
   ([`apps/api/src/curie_api/github_factory.py::handle_factory_delivery`](apps/api/src/curie_api/github_factory.py))
   is opt-in. Both check the installation, allowlist, and sender permission
-  ([`apps/api/src/curie_api/github_factory.py::verify_current`](apps/api/src/curie_api/github_factory.py))
-  and resolve the base branch
-  ([`apps/api/src/curie_api/factory_base.py::resolve_base`](apps/api/src/curie_api/factory_base.py)).
+  ([`apps/api/src/curie_api/github_factory.py::verify_current`](apps/api/src/curie_api/github_factory.py)).
 - **WorkItem service.** Version fenced lifecycle in
   [`apps/api/src/curie_api/workitems.py`](apps/api/src/curie_api/workitems.py)
   and dispatch in
   [`apps/api/src/curie_api/workitem_dispatch.py`](apps/api/src/curie_api/workitem_dispatch.py);
   the worker calls it over `/v1/internal/work-items`
   ([`apps/api/src/curie_api/routers/work_items.py`](apps/api/src/curie_api/routers/work_items.py)).
+  At sandbox acquisition, after the selection label settling interval, it reads
+  current labels and resolves the permitted remote base through
+  [`apps/api/src/curie_api/factory_base_reconcile.py::resolve_for_acquire`](apps/api/src/curie_api/factory_base_reconcile.py).
 - **WorkItemReconciler**
   ([`apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler`](apps/api/src/curie_api/workitem_reconciler.py)).
   An API lifespan loop that publishes wakes, enforces deadlines, runs intake
@@ -944,6 +946,7 @@ flowchart LR
 sequenceDiagram
     participant GH as GitHub
     participant I as Factory intake (api)
+    participant A as WorkItem API
     participant DB as Postgres
     participant R as WorkItemReconciler (api)
     participant V as Valkey curie:runs
@@ -953,21 +956,20 @@ sequenceDiagram
 
     I->>GH: poll labelled issues (or receive a signed webhook)
     I->>GH: re-read issue, installation, allowlist, sender permission
-    I->>GH: resolve base (base: label or deployment default)
-    alt base missing, not allowed, or two base: labels
-        I->>GH: refusal comment, no WorkItem
-    else admitted
-        I->>DB: WorkItem + ExecutionRequest (waiting, wait deadline)
-    end
+    I->>DB: WorkItem + ExecutionRequest (waiting, wait deadline)
     R->>DB: claim due request under a lease
     R->>V: XADD work-item-{id}-execute-{generation}
     R->>DB: fence published generation
     W->>V: XREADGROUP
-    W->>DB: acquire (internal worker route)
-    alt no sandbox capacity
-        W->>DB: defer (same request, generation + 1), then ACK
+    W->>A: acquire (internal worker route)
+    A->>GH: after labels settle, read current labels and resolve remote base
+    alt base missing, not allowed, or multiple base: labels
+        A->>GH: visible refusal, do not acquire sandbox
+    else no sandbox capacity
+        W->>A: defer (same request, generation + 1), then ACK
     else claimed
-        W->>DB: start (runtime epoch, execution deadline)
+        A->>DB: record base name, source and remote commit
+        W->>A: start (runtime epoch, execution deadline)
         W->>S: boot with turn budget, issue read and progress capabilities
         S->>GH: get_issue through the API, never directly
         S-->>W: turn ends awaiting a publication approval
@@ -992,6 +994,22 @@ sequenceDiagram
 
 Not shown above:
 
+**Base selection and relabels.** Repository `bases` are case-sensitive glob
+patterns; `defaultBase` is a literal branch name. Even `*` requires an existing
+remote branch, and a missing or disallowed base is never substituted. The
+selection label settling interval is `factory.baseLabelSettleSeconds`
+(`FACTORY_BASE_LABEL_SETTLE_S`), default 60 seconds; zero is valid. Before a PR,
+a changed effective base cancels the old execution and starts fresh only after
+it stops. After a PR, the durable operation in
+[`apps/api/src/curie_api/factory_base_reconcile.py`](apps/api/src/curie_api/factory_base_reconcile.py)
+validates a clean rebase, pushes with an expected-head fence, and confirms the
+new head before retargeting. It then pushes a distinct empty commit with the
+same tree so required CI runs on the final head under the new target. That
+commit remains in history as an ancestor of later fixes. A conflict leaves the
+remote branch and target unchanged and stays visible until the selection label
+is reapplied. Explicit restoration keeps ADR 0251's exact checkpoint base and
+target pins.
+
 **Settlement.** An approval holds the request until its deadline. An unpublished
 turn fails as `early_stop` for no work, `no_pull_request` for a first run without
 a recorded pull request, or `revision_unchanged` for a revision with a recorded
@@ -1013,8 +1031,9 @@ which reruns failed GitHub Actions jobs once and never treats unreadable CI as s
 Status words follow [Clause status](#clause-status), plus two used only here:
 `AMENDED` means a later ADR replaced the clause and the code follows it;
 `DIVERGED` means the code differs and no ADR records the change. A Draft ADR
-row describes existing code; it does not accept the ADR. This evidence
-snapshot is `next` commit `bac88c6ea`, read on 2026-10-02.
+row describes existing code; it does not accept the ADR. The original evidence
+snapshot is `next` commit `bac88c6ea`, read on 2026-10-02. Base-selection rows
+were refreshed against the ADR 0253 implementation on 2026-10-28.
 
 | ADR | Clause | Status | Evidence and limit |
 | --- | --- | --- | --- |
@@ -1043,9 +1062,11 @@ snapshot is `next` commit `bac88c6ea`, read on 2026-10-02.
 | 0174 | `ppc` authorizes only the metadata comparison | ENFORCED | `require_publication_precheck`; no other route accepts it. |
 | 0174 | Precheck limits: 10 s and 5 per turn; 20 per lineage per 5 minutes | ENFORCED | [`runner/src/curie_runner/publication_precheck.py`](runner/src/curie_runner/publication_precheck.py) and [`apps/api/src/curie_api/routers/publication_precheck.py`](apps/api/src/curie_api/routers/publication_precheck.py). |
 | 0174 | An empty snapshot is refused without pending approval | ENFORCED | Runner refusals `body_required`, `stale_context`, `rate_limited`, `no_change`. |
-| 0186 (Draft) | Base is one `base:` label or the default, from an allowlist | ENFORCED | The `bases` and `default_base` of each `CURIE_FORGES` repository binding, and `factory_base.resolve_base`. |
-| 0186 (Draft) | A bad base is refused with a comment, never substituted | ENFORCED | `factory_base.comment_refusal` before any WorkItem is written. |
-| 0186 (Draft) | The base is frozen on the WorkItem | ENFORCED | `work_items_base_ck`; a later `base:` label is recorded in `base_label_ignored`, not followed. |
+| 0186 | Base is one `base:` label or the default, from an allowlist | AMENDED | ADR 0253 permits case-sensitive glob patterns and resolves current labels at sandbox acquisition. |
+| 0186 | A bad base is refused with a comment, never substituted | ENFORCED | `factory_base.resolve_base` and `factory_base.comment_refusal`. |
+| 0186 | The base is frozen on the WorkItem | AMENDED | ADR 0253 follows ordinary base relabels; ADR 0251 restoration retains exact checkpoint pins. |
+| 0253 | Current labels select an existing allowed remote branch after settling | ENFORCED | `factory_base_reconcile.resolve_for_acquire` and `workitem_dispatch.acquire`. |
+| 0253 | Relabels restart unpublished work or durably rebase and retarget its PR | ENFORCED | `factory_base_reconcile.observe_base_labels` and `factory_base_reconcile.reconcile_base_transitions`; final CI runs on a distinct commit pushed after retargeting. |
 | 0187 | Polling is the default, one replica, conditional reads | ENFORCED | `poll_once` holds `pg_try_advisory_lock` and stores ETags and cursors. |
 | 0187 | Polling mode needs no webhook secret | ENFORCED | The factory settings validator requires a secret only in webhook mode. |
 | 0187 | The sandbox holds no GitHub credential | ENFORCED | The `wir` capability is scoped to one request and its issue. |

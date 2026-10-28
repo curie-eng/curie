@@ -243,6 +243,7 @@
       "properties": {
         "enabled": {"type": "boolean"},
         "intake": {"type": "string", "enum": ["poll", "webhook"]},
+        "baseLabelSettleSeconds": {"type": "integer", "minimum": 0},
         "cardBaseUrl": {"type": "string"},
         "ciWaitSeconds": {"type": "integer", "minimum": 1, "maximum": 10800},
         "codeHosts": {"type": "array", "items": {"$ref": "#/definitions/forge"}},

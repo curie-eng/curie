@@ -382,7 +382,7 @@ def test_a_note_is_stripped_before_it_is_stored(admitted: Any) -> None:  # noqa:
 
 
 def _fail(client: Any, request_id: uuid.UUID) -> None:
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     failed = client.post(
         f"/v1/internal/work-items/requests/{request_id}/finish",
         headers=WORKER,

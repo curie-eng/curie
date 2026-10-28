@@ -71,7 +71,7 @@ from curie_api.workitem_outcomes import derive_outcome
 from curie_api.workitems import lifecycle as workitems
 from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
-from forge_fakes import factory_wake
+from forge_fakes import factory_wake, no_external_calls
 from forge_fakes.github import (
     ci_view,
     forges_document,
@@ -301,14 +301,16 @@ def _admit_revision(facts: SimpleNamespace) -> SimpleNamespace:
 
 def _start(request_id: uuid.UUID, *, generation: int = 1) -> int:
     async def body(session: AsyncSession) -> int:
-        acquired = await acquire(
-            session,
-            request_id,
-            owner=OWNER,
-            generation=generation,
-            wake=await factory_wake(session, request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            acquired = await acquire(
+                session,
+                request_id,
+                owner=OWNER,
+                generation=generation,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=http_client,
+            )
         assert isinstance(acquired, AcquireGrant), acquired
         started = await start(
             session,
@@ -626,14 +628,16 @@ def test_capacity_deferral_is_waiting_and_names_capacity(
     seeded = _admit(facts)
 
     async def body(session: AsyncSession) -> None:
-        acquired = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=1,
-            wake=await factory_wake(session, facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            acquired = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert isinstance(acquired, AcquireGrant), acquired
         await defer(
             session,
@@ -797,14 +801,16 @@ def test_failed_start_failed_names_the_attempts_and_last_reason(
                 text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
                 {"id": facts.request_id},
             )
-            granted = await acquire(
-                session,
-                facts.request_id,
-                owner=OWNER,
-                generation=generation,
-                wake=await factory_wake(session, facts.request_id),
-                context=None,
-            )
+            async with no_external_calls() as http_client:
+                granted = await acquire(
+                    session,
+                    facts.request_id,
+                    owner=OWNER,
+                    generation=generation,
+                    wake=await factory_wake(session, facts.request_id),
+                    context=None,
+                    client=http_client,
+                )
             assert getattr(granted, "code", None) is None, granted
             deferred = await defer(
                 session,
@@ -842,14 +848,16 @@ def _defer_once(request_id: uuid.UUID, *, reason: str, capacity: bool, detail: s
             text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
             {"id": request_id},
         )
-        granted = await acquire(
-            session,
-            request_id,
-            owner=OWNER,
-            generation=generation,
-            wake=await factory_wake(session, request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            granted = await acquire(
+                session,
+                request_id,
+                owner=OWNER,
+                generation=generation,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=http_client,
+            )
         assert getattr(granted, "code", None) is None, granted
         deferred = await defer(
             session,

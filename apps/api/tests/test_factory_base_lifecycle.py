@@ -165,7 +165,7 @@ def test_a_relabel_during_a_running_execution_keeps_its_base_until_the_replaceme
     number = 30961
     assert _labelled(client, github, number, "base:next").json()["status"] == "factory_admitted"
     old_id = _requests(number)[0]["id"]
-    _start_running(old_id)
+    _start_running(client, old_id)
     before = _item(number)
     assert (before["base_branch"], before["base_source"]) == ("next", "label")
 
@@ -186,7 +186,7 @@ def test_a_relabel_during_a_running_execution_keeps_its_base_until_the_replaceme
     assert [row["status"] for row in _requests(number)] == ["cancelled", "waiting"]
     waiting = _item(number)
     assert (waiting["base_branch"], waiting["base_commit"]) == ("next", before["base_commit"])
-    _start_running(_requests(number)[-1]["id"])
+    _start_running(client, _requests(number)[-1]["id"])
     after = _item(number)
     assert (after["base_branch"], after["base_source"]) == ("main", "default")
 
@@ -204,7 +204,7 @@ def test_a_readmission_refused_for_another_agent_leaves_the_base_unchanged(
     _train(monkeypatch, tmp_path, client)
     number = 30962
     assert _labelled(client, github, number).json()["status"] == "factory_admitted"
-    _start_running(_requests(number)[0]["id"])
+    _start_running(client, _requests(number)[0]["id"])
     before = _item(number)
     assert (before["base_branch"], before["base_source"]) == ("main", "default")
 
@@ -263,7 +263,7 @@ def test_a_source_only_change_updates_provenance_without_restarting(
         == "factory_admitted"
     )
     request_id = _requests(number)[0]["id"]
-    _start_running(request_id)
+    _start_running(client, request_id)
     before = _item(number)
     github.labels = [LABEL, "base:main"] if labelled else [LABEL]
 
@@ -293,7 +293,7 @@ def test_removing_a_base_label_stops_the_predecessor_before_a_fresh_default_clai
     number = 30968
     assert _labelled(client, github, number, "base:next").json()["status"] == "factory_admitted"
     old_id = _requests(number)[0]["id"]
-    _start_running(old_id)
+    _start_running(client, old_id)
     old_base = _item(number)
     github.labels = [LABEL]
 
@@ -312,7 +312,7 @@ def test_removing_a_base_label_stops_the_predecessor_before_a_fresh_default_clai
     assert [row["status"] for row in requests] == ["cancelled", "waiting"]
     assert requests[-1]["id"] != old_id
 
-    _start_running(requests[-1]["id"])
+    _start_running(client, requests[-1]["id"])
 
     assert (_item(number)["base_branch"], _item(number)["base_source"]) == ("main", "default")
     _reconcile()
@@ -357,7 +357,7 @@ def _completed_run(client: Any, github: Any, number: int, pr: int) -> uuid.UUID:
     github.labels = [LABEL]
     _label(client, github, number)
     first = _request(number)
-    _start_running(first["id"])
+    _start_running(client, first["id"])
     _attach_publication(first["work_item_id"], status="succeeded", pr=pr)
     client.portal.call(client.app.state.work_item_reconciler.run_once)
     done = _request(number)

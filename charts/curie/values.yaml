@@ -1296,6 +1296,7 @@ codeHostTrust:
 factory:
   enabled: false
   intake: poll  # or webhook
+  baseLabelSettleSeconds: 60
   cardBaseUrl: ""
   ciWaitSeconds: 3600
   codeHosts: []
