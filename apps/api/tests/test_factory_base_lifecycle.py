@@ -1,9 +1,7 @@
-"""The recorded base across relabels, refusals and finalized comments (#3095, ADR 0186).
+"""Request-scoped bases across relabels, refusals and finalized comments (ADR 0253).
 
-Review round 2: a relabel must not move the base under a running execution, a
-refused readmission must not write a base, and an ignored relabel must reach a
-finalized status comment, including one that arrives while a status pass
-holds GitHub open between its claim and its writeback (#4167).
+A relabel cannot move the base under a running execution. Requested targets
+remain visible across status synchronization and finalization (#4167).
 
 GitHub issue label event identities follow:
 https://docs.github.com/en/rest/issues/events
@@ -73,6 +71,7 @@ def _train(monkeypatch: pytest.MonkeyPatch, key_dir: Path, client: Any) -> None:
         ],
     )
     monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, key_dir))
+    monkeypatch.setenv("FACTORY_BASE_LABEL_SETTLE_S", "0")
     get_settings.cache_clear()
     client.app.state.forges = forges_registry(get_settings())
 
@@ -165,10 +164,10 @@ def test_a_relabel_during_a_running_execution_keeps_its_base_until_the_replaceme
     _train(monkeypatch, tmp_path, client)
     number = 30961
     assert _labelled(client, github, number, "base:next").json()["status"] == "factory_admitted"
-    before = _item(number)
-    assert (before["base_branch"], before["base_source"]) == ("next", "label")
     old_id = _requests(number)[0]["id"]
     _start_running(old_id)
+    before = _item(number)
+    assert (before["base_branch"], before["base_source"]) == ("next", "label")
 
     again = _labelled(client, github, number)
 
@@ -185,9 +184,11 @@ def test_a_relabel_during_a_running_execution_keeps_its_base_until_the_replaceme
     _reconcile()
 
     assert [row["status"] for row in _requests(number)] == ["cancelled", "waiting"]
+    waiting = _item(number)
+    assert (waiting["base_branch"], waiting["base_commit"]) == ("next", before["base_commit"])
+    _start_running(_requests(number)[-1]["id"])
     after = _item(number)
     assert (after["base_branch"], after["base_source"]) == ("main", "default")
-    assert after["base_label_ignored"] is None
 
 
 def test_a_readmission_refused_for_another_agent_leaves_the_base_unchanged(
@@ -203,6 +204,7 @@ def test_a_readmission_refused_for_another_agent_leaves_the_base_unchanged(
     _train(monkeypatch, tmp_path, client)
     number = 30962
     assert _labelled(client, github, number).json()["status"] == "factory_admitted"
+    _start_running(_requests(number)[0]["id"])
     before = _item(number)
     assert (before["base_branch"], before["base_source"]) == ("main", "default")
 
@@ -246,7 +248,74 @@ def test_a_readmission_refused_for_another_agent_leaves_the_base_unchanged(
     )
 
 
-def test_an_ignored_relabel_re_renders_a_finalized_status_comment(
+@pytest.mark.parametrize("labelled", [True, False])
+def test_a_source_only_change_updates_provenance_without_restarting(
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    labelled: bool,
+) -> None:
+    client, github, _sink = admitted
+    _train(monkeypatch, tmp_path, client)
+    number = 30967
+    assert _labelled(client, github, number, *(() if labelled else ("base:main",))).json()[
+        "status"
+    ] == "factory_admitted"
+    request_id = _requests(number)[0]["id"]
+    _start_running(request_id)
+    before = _item(number)
+    github.labels = [LABEL, "base:main"] if labelled else [LABEL]
+
+    changed = _post(client, "issues", _issue_event(
+        "labeled" if labelled else "unlabeled", number, label={"name": "base:main"}
+    ))
+
+    assert changed.status_code == 200, changed.text
+    after = _item(number)
+    assert (after["base_branch"], after["base_commit"]) == (
+        before["base_branch"], before["base_commit"]
+    )
+    assert after["base_source"] == ("label" if labelled else "default")
+    assert _requests(number) == [{"id": request_id, "status": "running"}]
+
+
+def test_removing_a_base_label_stops_the_predecessor_before_a_fresh_default_claim(
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client, github, _sink = admitted
+    _train(monkeypatch, tmp_path, client)
+    number = 30968
+    assert _labelled(client, github, number, "base:next").json()["status"] == "factory_admitted"
+    old_id = _requests(number)[0]["id"]
+    _start_running(old_id)
+    old_base = _item(number)
+    github.labels = [LABEL]
+
+    removed = _post(client, "issues", _issue_event(
+        "unlabeled", number, label={"name": "base:next"}
+    ))
+
+    assert removed.status_code == 200, removed.text
+    assert _requests(number) == [{"id": old_id, "status": "cancellation_requested"}]
+    assert _item(number)["base_commit"] == old_base["base_commit"]
+    _reconcile()
+    assert len(_requests(number)) == 1
+    _observe_termination(client, old_id)
+    _reconcile()
+    requests = _requests(number)
+    assert [row["status"] for row in requests] == ["cancelled", "waiting"]
+    assert requests[-1]["id"] != old_id
+
+    _start_running(requests[-1]["id"])
+
+    assert (_item(number)["base_branch"], _item(number)["base_source"]) == ("main", "default")
+    _reconcile()
+    assert len(_requests(number)) == 2
+
+
+def test_a_requested_base_re_renders_a_finalized_status_comment(
     admitted: Any,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -261,19 +330,22 @@ def test_an_ignored_relabel_re_renders_a_finalized_status_comment(
 
     github.labels = [LABEL, "base:next"]
     changed = _post(client, "issues", _issue_event("labeled", number, label={"name": "base:next"}))
-    assert _code(changed) == "base_label_recorded"
+    assert changed.status_code == 200, changed.text
     sink.requests.clear()
 
     _reconcile()
 
     (comment,) = _marked(sink, first["id"])
-    assert (
-        "Base: `main` (deployment default) Label now says `base:next`; the recorded base is kept."
-    ) in comment["body"]
+    _assert_requested_base(comment["body"])
     assert any(method == "PATCH" for method, _path, _body in sink.requests)
 
 
-NOTE = "Base: `main` (deployment default) Label now says `base:next`; the recorded base is kept."
+def _assert_requested_base(body: str) -> None:
+    assert "Base: `main` (deployment default)" in body
+    assert "`next`" in body or "`base:next`" in body
+    assert any(word in body.lower() for word in ("requested", "pending", "waiting", "moving"))
+    assert "the recorded base is kept" not in body
+
 
 
 def _completed_run(client: Any, github: Any, number: int, pr: int) -> uuid.UUID:
@@ -313,7 +385,7 @@ def _finalized_with_label_due(
 def _held_status_sync(
     client: Any, github: Any, sink: Any, number: int, *, path: str | None, relabel: bool
 ) -> None:
-    """One status pass held open on GitHub, with an ignored `base:next` relabel meanwhile."""
+    """One status pass held open on GitHub while a new base is requested."""
 
     async def go() -> None:
         async with _blocked_status_sync(client, sink, number, path=path) as (sync, _released):
@@ -338,7 +410,7 @@ def _held_status_sync(
                         ),
                         5,
                     )
-                assert _code(changed) == "base_label_recorded"
+                assert changed.status_code == 200, changed.text
             assert not sync.done(), "GitHub must still be blocked when the relabel returns"
 
     client.portal.call(go)
@@ -348,14 +420,14 @@ def _assert_note_reaches_the_comment(sink: Any, request_id: uuid.UUID) -> None:
     sink.requests.clear()
     _reconcile()
     (comment,) = _marked(sink, request_id)
-    assert NOTE in comment["body"], comment["body"]
+    _assert_requested_base(comment["body"])
     assert FINAL_MARKER in comment["body"]
-    assert any(NOTE in (body or "") for _path, body in _patches(sink))
+    assert any("next" in (body or "") for _path, body in _patches(sink))
     (notice,) = _notices(request_id)
     assert notice["finalized_at"] is not None
 
 
-def test_an_ignored_relabel_during_a_held_label_sync_still_reaches_the_final_comment(
+def test_a_requested_base_during_held_label_sync_still_reaches_the_final_comment(
     admitted: Any,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -380,7 +452,7 @@ def test_an_ignored_relabel_during_a_held_label_sync_still_reaches_the_final_com
     _assert_note_reaches_the_comment(sink, request_id)
 
 
-def test_an_ignored_relabel_during_the_held_finalizing_sync_still_reaches_the_comment(
+def test_a_requested_base_during_held_finalizing_sync_still_reaches_the_comment(
     admitted: Any,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
