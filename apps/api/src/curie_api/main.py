@@ -117,6 +117,7 @@ from .routers import (
     work_item_issue,
     work_item_outcomes,
     work_items,
+    workspace_recovery,
     workspaces,
 )
 from .schema_compat import assert_servable
@@ -651,6 +652,7 @@ def create_app(
     app.include_router(work_item_outcomes.router)
     app.include_router(cluster_message_replies.router)
     app.include_router(cluster_message_replies.internal_router)
+    app.include_router(workspace_recovery.router)
     app.include_router(workspaces.router)
     app.include_router(channels.router)
     app.include_router(provider_installations.router)

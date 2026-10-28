@@ -63,7 +63,8 @@ CONTRACT = "0041"
 # @spec AGENT-ROLE-PERSISTENCE-V1-9: policy ORM reads require the 0133 column.
 # @spec HTTP-APPROVAL-CONTINUITY-5: approval ORM reads require the 0137 column.
 # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
-APP_SCHEMA_MIN = "0139"
+# Workspace recovery reads require the 0141 outcome ledger.
+APP_SCHEMA_MIN = "0141"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -162,6 +163,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0137",
             "0138",
             "0139",
+            "0141",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -190,8 +192,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0137",
             "0138",
             "0139",
+            "0141",
         }
-    assert current_revision() == "0139"
+    assert current_revision() == "0141"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -274,10 +277,10 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # The directory and connect ORM requires the new identity tables/columns.
     # Migration expand compatibility for older images does not mean this image
     # can serve an older database.
-    # 0138 only widens a CHECK; Grid reports write the 0139 namespace kind.
-    for revision in sorted(known - {"0139"}):
+    # Workspace recovery reads require the 0141 outcome ledger.
+    for revision in sorted(known - {"0141"}):
         assert can_serve(revision, window, known) is False
-    assert can_serve("0139", window, known) is True
+    assert can_serve("0141", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

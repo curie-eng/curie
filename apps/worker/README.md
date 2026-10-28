@@ -1219,6 +1219,22 @@ That tail consumes unused claim reserve and never authorizes requester retry.
   (`tests/sandbox/test_e2e_k8scratch.py`, `CURIE_SANDBOX_E2E=1`) drives the
   real cluster.
 
+### Workspace recovery metadata (ADR 0251)
+
+`curie_worker.workspace_recovery.WorkspaceRecoveryClient` calls the worker-only
+`/v1/internal/workspace-recovery` API using the required internal worker
+credential (`CURIE_INTERNAL_WORKER_TOKEN`, sent as `X-Curie-Worker-Token`).
+Recovery is off by default; enabling `CURIE_WORKSPACE_RECOVERY_ENABLED` on the
+API requires a positive installation cap in `CURIE_WORKSPACE_RECOVERY_MAX_BYTES`.
+The API and worker must share the `CURIE_WORKSPACE_MAX_ARCHIVE_BYTES` base ceiling.
+`reserve`, `complete` and `fail` manage bounded checkpoint metadata; reservations
+have a 60-second completion deadline and 600-second staging lifetime.
+`acquire-reader` and `release-reader` manage at most eight readers per WorkItem,
+each bounded to 300 seconds. Two-phase metadata collection uses `claim-collection`
+to fence eligible objects against readers, then `finalize-collection` after deletion.
+This slice supplies metadata and the client only: terminal capture, object
+transfer and deletion, and restoration are not wired.
+
 ### Retained thread attachments
 
 An attachment on an idle retained thread needs new claim environment, so the

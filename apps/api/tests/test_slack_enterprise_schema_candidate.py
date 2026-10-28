@@ -13,7 +13,7 @@ from alembic.script import ScriptDirectory
 
 ROOT = Path(__file__).resolve().parents[3]
 MIGRATION = ROOT / "apps/api/alembic/versions/0139_slack_enterprise_namespaces.py"
-CANDIDATE = {"schema_min": "0139", "schema_head": "0139"}
+CANDIDATE = {"schema_min": "0141", "schema_head": "0141"}
 
 
 def load(relative: str) -> Any:
@@ -28,10 +28,10 @@ def script() -> ScriptDirectory:
     return ScriptDirectory.from_config(config)
 
 
-def test_migration_0139_is_the_single_head_with_parent_0138() -> None:
+def test_migration_0139_keeps_parent_0138_below_recovery_head() -> None:
     """@spec HTTP-INVOCATION-EXECUTION-21: additive revision after approval provenance."""
     graph = script()
-    assert graph.get_heads() == ["0139"]
+    assert graph.get_heads() == ["0141"]
     revision = graph.get_revision("0139")
     assert revision is not None and revision.down_revision == "0138"
     assert Path(revision.path).resolve() == MIGRATION.resolve()
@@ -54,7 +54,7 @@ def test_migration_0139_is_the_single_head_with_parent_0138() -> None:
         ),
     ],
 )
-def test_every_coupled_candidate_consumer_requires_0139(relative: str, extract: Any) -> None:
+def test_every_coupled_candidate_consumer_requires_0141(relative: str, extract: Any) -> None:
     """@spec HTTP-INVOCATION-EXECUTION-21: Grid reports write slack_enterprise namespaces."""
     assert extract(load(relative)) == CANDIDATE
 
@@ -62,7 +62,7 @@ def test_every_coupled_candidate_consumer_requires_0139(relative: str, extract: 
 def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None:
     """@spec HTTP-INVOCATION-EXECUTION-21: exact graph parent and file digest."""
     revisions = load("cli/src/application_schema_windows.json")["revisions"]
-    assert revisions[-2:] == ["0138", "0139"]
+    assert revisions[-3:] == ["0138", "0139", "0141"]
     assert load("apps/api/src/curie_api/revision_kinds.json")["0139"] == "expand"
     serving = load("packages/protected-hooks/src/curie_protected_hooks/schema_serving.json")
     assert serving["revision_parents"]["0139"] == ["0138"]
