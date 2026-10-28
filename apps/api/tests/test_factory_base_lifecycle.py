@@ -258,22 +258,26 @@ def test_a_source_only_change_updates_provenance_without_restarting(
     client, github, _sink = admitted
     _train(monkeypatch, tmp_path, client)
     number = 30967
-    assert _labelled(client, github, number, *(() if labelled else ("base:main",))).json()[
-        "status"
-    ] == "factory_admitted"
+    assert (
+        _labelled(client, github, number, *(() if labelled else ("base:main",))).json()["status"]
+        == "factory_admitted"
+    )
     request_id = _requests(number)[0]["id"]
     _start_running(request_id)
     before = _item(number)
     github.labels = [LABEL, "base:main"] if labelled else [LABEL]
 
-    changed = _post(client, "issues", _issue_event(
-        "labeled" if labelled else "unlabeled", number, label={"name": "base:main"}
-    ))
+    changed = _post(
+        client,
+        "issues",
+        _issue_event("labeled" if labelled else "unlabeled", number, label={"name": "base:main"}),
+    )
 
     assert changed.status_code == 200, changed.text
     after = _item(number)
     assert (after["base_branch"], after["base_commit"]) == (
-        before["base_branch"], before["base_commit"]
+        before["base_branch"],
+        before["base_commit"],
     )
     assert after["base_source"] == ("label" if labelled else "default")
     assert _requests(number) == [{"id": request_id, "status": "running"}]
@@ -293,9 +297,9 @@ def test_removing_a_base_label_stops_the_predecessor_before_a_fresh_default_clai
     old_base = _item(number)
     github.labels = [LABEL]
 
-    removed = _post(client, "issues", _issue_event(
-        "unlabeled", number, label={"name": "base:next"}
-    ))
+    removed = _post(
+        client, "issues", _issue_event("unlabeled", number, label={"name": "base:next"})
+    )
 
     assert removed.status_code == 200, removed.text
     assert _requests(number) == [{"id": old_id, "status": "cancellation_requested"}]
@@ -345,7 +349,6 @@ def _assert_requested_base(body: str) -> None:
     assert "`next`" in body or "`base:next`" in body
     assert any(word in body.lower() for word in ("requested", "pending", "waiting", "moving"))
     assert "the recorded base is kept" not in body
-
 
 
 def _completed_run(client: Any, github: Any, number: int, pr: int) -> uuid.UUID:

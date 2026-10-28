@@ -77,9 +77,7 @@ class GitGraph:
 
         values = {
             "transition_id": uuid.UUID("11111111-2222-4333-8444-555555555555"),
-            "repository": RepositoryRef(
-                "gitlab", "gitlab.example.com", "41", "acme-corp/acme-bot"
-            ),
+            "repository": RepositoryRef("gitlab", "gitlab.example.com", "41", "acme-corp/acme-bot"),
             "branch": BRANCH,
             "old_base_sha": self.old_base,
             "old_head_sha": self.source,
@@ -363,7 +361,9 @@ def test_rebase_keeps_already_upstream_and_original_empty_commits(graph: GitGrap
     asyncio.run(push_rebase(snapshot, graph.credential(), prepared))
 
     assert git(graph.origin, "rev-list", "--count", f"{target}..{prepared.head_sha}") == "3"
-    replayed = git(graph.origin, "rev-list", "--reverse", f"{target}..{prepared.head_sha}").splitlines()
+    replayed = git(
+        graph.origin, "rev-list", "--reverse", f"{target}..{prepared.head_sha}"
+    ).splitlines()
     assert git(graph.origin, "rev-parse", f"{replayed[0]}^{{tree}}") == git(
         graph.origin, "rev-parse", f"{target}^{{tree}}"
     )
@@ -478,7 +478,9 @@ def test_disk_limit_refuses_before_push_and_a_bounded_valid_replay_progresses(
     assert refused.value.code == "disk_limit"
     assert graph.head() == graph.source
     graph.assert_clean()
-    assert asyncio.run(prepare_rebase(graph.snapshot(), graph.credential())).head_sha != graph.source
+    assert (
+        asyncio.run(prepare_rebase(graph.snapshot(), graph.credential())).head_sha != graph.source
+    )
     graph.assert_clean()
 
 

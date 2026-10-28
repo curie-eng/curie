@@ -25,7 +25,7 @@ from curie_api.forges.memory import InMemoryCodeHost, InMemoryTracker, all_suppo
 from curie_api.forges.types import PullRequest, PullRequestRef, PullRequestState, RepositoryRef
 from curie_api.github_app import GitHubAuth, GitHubCredentials
 from forge_fakes.bitbucket_cloud_record import adapter_for
-from forge_fakes.bitbucket_cloud_replay import Cassette, LIFECYCLE
+from forge_fakes.bitbucket_cloud_replay import LIFECYCLE, Cassette
 from forge_fakes.bitbucket_dc import BitbucketDcFake, capture, dc_adapter
 from forge_fakes.gitlab import GitLabAPI, gitlab_code_host
 
@@ -160,9 +160,7 @@ class ProviderPull:
             )
         if self.kind == types.BITBUCKET_DC:
             if change.get("version") != self.payload["version"]:
-                return httpx.Response(
-                    409, json=capture("error-409-pull-request-out-of-date.json")
-                )
+                return httpx.Response(409, json=capture("error-409-pull-request-out-of-date.json"))
             self.payload["version"] += 1
         if self.kind == types.GITHUB and "base" in change:
             self.target(change["base"])
@@ -494,9 +492,7 @@ async def test_existing_metadata_update_remains_metadata_only(
     assert (changed.title, changed.body) == ("Clarify parser behavior", BODY)
     assert (changed.base_ref, changed.head_ref, changed.head_sha) == ("main", SOURCE, HEAD)
     (change,) = case.writes
-    assert set(change) == (
-        {"title", "version"} if case.kind == types.BITBUCKET_DC else {"title"}
-    )
+    assert set(change) == ({"title", "version"} if case.kind == types.BITBUCKET_DC else {"title"})
 
 
 @pytest.mark.anyio

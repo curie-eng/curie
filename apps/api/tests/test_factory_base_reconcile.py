@@ -114,17 +114,29 @@ class TransitionCase:
 
     def identities(self) -> tuple[dict[str, Any], dict[str, Any], int]:
         async def read(session: AsyncSession) -> tuple[dict[str, Any], dict[str, Any], int]:
-            item = await session.execute(text("SELECT * FROM curie.work_items WHERE id = :id"), {"id": self.work_item_id})
-            lineage = await session.execute(text("SELECT * FROM curie.thread_publication_lineages WHERE id = :id"), {"id": self.lineage_id})
+            item = await session.execute(
+                text("SELECT * FROM curie.work_items WHERE id = :id"), {"id": self.work_item_id}
+            )
+            lineage = await session.execute(
+                text("SELECT * FROM curie.thread_publication_lineages WHERE id = :id"),
+                {"id": self.lineage_id},
+            )
             publications = await session.scalar(text("SELECT count(*) FROM curie.publications"))
-            return dict(item.mappings().one()), dict(lineage.mappings().one()), int(publications or 0)
+            return (
+                dict(item.mappings().one()),
+                dict(lineage.mappings().one()),
+                int(publications or 0),
+            )
 
         return database(read)
 
     def transcript(self) -> str:
         async def read(session: AsyncSession) -> str:
             values = await session.scalars(
-                text("SELECT value FROM curie.thread_transcripts WHERE agent_id = :agent AND thread_key = :thread"),
+                text(
+                    "SELECT value FROM curie.thread_transcripts "
+                    "WHERE agent_id = :agent AND thread_key = :thread"
+                ),
                 {"agent": self.agent_id, "thread": CONVERSATION},
             )
             return json.dumps(list(values), sort_keys=True)
@@ -151,14 +163,23 @@ class TransitionCase:
         if path == "/user":
             return httpx.Response(200, json={"id": 900, "username": "factory-bot"})
         if path == "/projects/41":
-            return httpx.Response(200, json={
-                "id": 41, "path_with_namespace": REPO, "default_branch": "main",
-                "http_url_to_repo": self.clone_url,
-            })
+            return httpx.Response(
+                200,
+                json={
+                    "id": 41,
+                    "path_with_namespace": REPO,
+                    "default_branch": "main",
+                    "http_url_to_repo": self.clone_url,
+                },
+            )
         if path.startswith("/projects/41/repository/branches/"):
             branch = path.removeprefix("/projects/41/repository/branches/")
             head = git(self.graph.origin, "rev-parse", f"refs/heads/{branch}", check=False)
-            return httpx.Response(200, json={"name": branch, "commit": {"id": head}}) if head else httpx.Response(404)
+            return (
+                httpx.Response(200, json={"name": branch, "commit": {"id": head}})
+                if head
+                else httpx.Response(404)
+            )
         if path == "/projects/41/merge_requests/7":
             if self.read_started is not None:
                 self.read_started.set()
@@ -174,21 +195,48 @@ class TransitionCase:
                 change = json.loads(request.content)
                 self.retargets.append(change)
                 self.target = change["target_branch"]
-            return httpx.Response(200, json={
-                "id": 419, "iid": 7, "project_id": 41, "source_project_id": 41,
-                "target_project_id": 41, "source_branch": BRANCH,
-                "target_branch": self.target, "sha": self.graph.head(),
-                "state": self.state, "title": "Factory change", "description": "Existing publication",
-                "draft": False, "has_conflicts": False,
-                "web_url": f"{self.remote.origin}/{REPO}/-/merge_requests/7",
-                "updated_at": datetime.now(UTC).isoformat(),
-            })
+            return httpx.Response(
+                200,
+                json={
+                    "id": 419,
+                    "iid": 7,
+                    "project_id": 41,
+                    "source_project_id": 41,
+                    "target_project_id": 41,
+                    "source_branch": BRANCH,
+                    "target_branch": self.target,
+                    "sha": self.graph.head(),
+                    "state": self.state,
+                    "title": "Factory change",
+                    "description": "Existing publication",
+                    "draft": False,
+                    "has_conflicts": False,
+                    "web_url": f"{self.remote.origin}/{REPO}/-/merge_requests/7",
+                    "updated_at": datetime.now(UTC).isoformat(),
+                },
+            )
         if path == "/projects/41/issues/7":
-            return httpx.Response(200, json={"id": 107, "iid": 7, "project_id": 41, "state": "opened", "labels": ["factory", "base:next"]})
+            return httpx.Response(
+                200,
+                json={
+                    "id": 107,
+                    "iid": 7,
+                    "project_id": 41,
+                    "state": "opened",
+                    "labels": ["factory", "base:next"],
+                },
+            )
         if path == "/projects/41/issues/7/notes":
             if request.method == "POST":
                 body = json.loads(request.content)["body"]
-                self.notes.append({"id": len(self.notes) + 1, "body": body, "author": {"id": 900, "username": "factory-bot"}, "system": False})
+                self.notes.append(
+                    {
+                        "id": len(self.notes) + 1,
+                        "body": body,
+                        "author": {"id": 900, "username": "factory-bot"},
+                        "system": False,
+                    }
+                )
                 return httpx.Response(201, json=self.notes[-1])
             return httpx.Response(200, json=self.notes, headers={"x-next-page": ""})
         raise AssertionError(f"unexpected forge boundary: {request.method} {path}")
@@ -197,7 +245,10 @@ class TransitionCase:
         engine = create_async_engine(get_settings().database_url)
         try:
             async with engine.connect() as connection:
-                result = await connection.execute(text("SELECT * FROM curie.factory_base_transitions WHERE id = :id"), {"id": TRANSITION_ID})
+                result = await connection.execute(
+                    text("SELECT * FROM curie.factory_base_transitions WHERE id = :id"),
+                    {"id": TRANSITION_ID},
+                )
                 return dict(result.mappings().one())
         finally:
             await engine.dispose()
@@ -241,69 +292,135 @@ def transition_case(clean_db: None, graph: GitGraph) -> Iterator[TransitionCase]
     with git_http(graph) as remote:
         host = urlsplit(remote.origin).netloc
         entry = {
-            "name": "gitlab", "kind": "gitlab", "host": host,
+            "name": "gitlab",
+            "kind": "gitlab",
+            "host": host,
             "api_url": f"{remote.origin}/api/v4",
             "credential": {"type": "static_token", "token": SECRET},
         }
         document = {
             "code_hosts": [entry],
             "trackers": [{**entry, "label": "factory", "mention": "factory-bot"}],
-            "bindings": [{
-                "name": "factory", "tracker": "gitlab", "tracker_scope_id": "41",
-                "repos": [{"alias": "app", "code_host": "gitlab", "project_id": "41", "path": REPO, "bases": ["main", "next"], "default_base": "main"}],
-            }],
+            "bindings": [
+                {
+                    "name": "factory",
+                    "tracker": "gitlab",
+                    "tracker_scope_id": "41",
+                    "repos": [
+                        {
+                            "alias": "app",
+                            "code_host": "gitlab",
+                            "project_id": "41",
+                            "path": REPO,
+                            "bases": ["main", "next"],
+                            "default_base": "main",
+                        }
+                    ],
+                }
+            ],
         }
-        settings = get_settings().model_copy(update={"forges": ForgesConfig.model_validate(document)})
-        case = TransitionCase(graph, remote, settings, uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4())
+        settings = get_settings().model_copy(
+            update={"forges": ForgesConfig.model_validate(document)}
+        )
+        case = TransitionCase(
+            graph, remote, settings, uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        )
 
         async def seed(session: AsyncSession) -> None:
-            agent = Agent(id=case.agent_id, name=f"acme-base-{uuid.uuid4().hex}", repo_full_name=REPO)
+            agent = Agent(
+                id=case.agent_id, name=f"acme-base-{uuid.uuid4().hex}", repo_full_name=REPO
+            )
             session.add(agent)
             await session.flush()
             binding = AgentChannel(agent_id=agent.id, kind="gitlab", address=REPO)
             version = AgentVersion(agent_id=agent.id, version_label="v1", created_by="fixture")
             session.add_all([binding, version])
             await session.flush()
-            deployment = Deployment(agent_id=agent.id, version_id=version.id, environment="dev", workspace_enabled=True)
+            deployment = Deployment(
+                agent_id=agent.id, version_id=version.id, environment="dev", workspace_enabled=True
+            )
             session.add(deployment)
             await session.flush()
             lineage = ThreadPublicationLineage(
-                id=case.lineage_id, agent_id=agent.id, deployment_id=deployment.id,
-                conversation_id=CONVERSATION, repo_full_name=REPO, branch=BRANCH,
-                base_ref="main", base_sha=graph.old_base, head_sha=graph.source,
-                pr_number=7, pr_url=f"{remote.origin}/{REPO}/-/merge_requests/7",
-                code_host_kind="gitlab", code_host_host=host, repository_project_id="41",
-                code_host_pr_id="419", latest_revision=2,
-                binding_id=binding.id, binding_generation=binding.generation,
+                id=case.lineage_id,
+                agent_id=agent.id,
+                deployment_id=deployment.id,
+                conversation_id=CONVERSATION,
+                repo_full_name=REPO,
+                branch=BRANCH,
+                base_ref="main",
+                base_sha=graph.old_base,
+                head_sha=graph.source,
+                pr_number=7,
+                pr_url=f"{remote.origin}/{REPO}/-/merge_requests/7",
+                code_host_kind="gitlab",
+                code_host_host=host,
+                repository_project_id="41",
+                code_host_pr_id="419",
+                latest_revision=2,
+                binding_id=binding.id,
+                binding_generation=binding.generation,
             )
             session.add(lineage)
             await session.flush()
             item = WorkItem(
-                id=case.work_item_id, agent_id=agent.id, conversation_id=CONVERSATION,
-                tracker_kind="gitlab", tracker_host=host, tracker_scope_id="41", tracker_issue_id="7",
-                code_host_kind="gitlab", code_host_host=host, repository_project_id="41", repository_path=REPO,
-                publication_lineage_id=lineage.id, trigger_label="factory",
-                base_branch="main", base_source="default", base_commit=graph.old_base,
+                id=case.work_item_id,
+                agent_id=agent.id,
+                conversation_id=CONVERSATION,
+                tracker_kind="gitlab",
+                tracker_host=host,
+                tracker_scope_id="41",
+                tracker_issue_id="7",
+                code_host_kind="gitlab",
+                code_host_host=host,
+                repository_project_id="41",
+                repository_path=REPO,
+                publication_lineage_id=lineage.id,
+                trigger_label="factory",
+                base_branch="main",
+                base_source="default",
+                base_commit=graph.old_base,
                 next_sequence=2,
             )
             session.add(item)
             await session.flush()
             request = ExecutionRequest(
-                id=case.request_id, work_item_id=item.id, sequence=1, status="waiting",
+                id=case.request_id,
+                work_item_id=item.id,
+                sequence=1,
+                status="waiting",
                 wait_deadline=datetime.now(UTC) + timedelta(hours=1),
-                objective="Continue after the selected base changes", requester="gitlab:31:developer",
-                reply_kind="gitlab", reply_address=REPO, reply_conversation_id=CONVERSATION,
+                objective="Continue after the selected base changes",
+                requester="gitlab:31:developer",
+                reply_kind="gitlab",
+                reply_address=REPO,
+                reply_conversation_id=CONVERSATION,
             )
             session.add(request)
             await session.flush()
-            session.add(FactoryBaseTransition(
-                id=TRANSITION_ID, work_item_id=item.id, request_id=request.id, lineage_id=lineage.id,
-                phase="pending", version=1, old_base_ref="main", old_base_sha=graph.old_base,
-                old_head_sha=graph.source, target_base_ref="next", target_base_sha=graph.target,
-                base_source="label", branch=BRANCH, pull_request_number="7",
-                committer_name="Factory", committer_email="factory@example.com", committer_time=COMMIT_TIME,
-                changed_paths=["feature-one.txt", "feature-two.txt"], next_attempt_at=datetime.now(UTC),
-            ))
+            session.add(
+                FactoryBaseTransition(
+                    id=TRANSITION_ID,
+                    work_item_id=item.id,
+                    request_id=request.id,
+                    lineage_id=lineage.id,
+                    phase="pending",
+                    version=1,
+                    old_base_ref="main",
+                    old_base_sha=graph.old_base,
+                    old_head_sha=graph.source,
+                    target_base_ref="next",
+                    target_base_sha=graph.target,
+                    base_source="label",
+                    branch=BRANCH,
+                    pull_request_number="7",
+                    committer_name="Factory",
+                    committer_email="factory@example.com",
+                    committer_time=COMMIT_TIME,
+                    changed_paths=["feature-one.txt", "feature-two.txt"],
+                    next_attempt_at=datetime.now(UTC),
+                )
+            )
             await session.commit()
 
         database(seed)
@@ -346,16 +463,38 @@ def test_durable_move_commits_each_candidate_before_its_remote_effect_and_keeps_
     assert completed["verification_head_sha"] == case.graph.head()
     assert completed["verification_head_sha"] != completed["rebased_head_sha"]
     assert case.remote.pushes == 2
-    assert [(row["phase"], target) for row, target in case.before_push] == [("prepared", "main"), ("ci_prepared", "next")]
+    assert [(row["phase"], target) for row, target in case.before_push] == [
+        ("prepared", "main"),
+        ("ci_prepared", "next"),
+    ]
     assert case.before_push[0][0]["rebased_head_sha"] == completed["rebased_head_sha"]
     assert case.before_push[1][0]["verification_head_sha"] == completed["verification_head_sha"]
     assert all(row["phase"] == "pushed" for row in case.during_retarget)
     assert case.before_push[1][0]["retargeted_at"] is not None
     assert case.retargets == [{"target_branch": "next"}]
     item, lineage, publications = case.identities()
-    assert (item["base_branch"], item["base_source"], item["base_commit"], item["base_resolved_request_id"]) == ("next", "label", case.graph.target, case.request_id)
-    assert (lineage["base_ref"], lineage["base_sha"], lineage["head_sha"]) == ("next", case.graph.target, completed["verification_head_sha"])
-    for column in ("id", "branch", "pr_number", "pr_url", "code_host_kind", "code_host_host", "repository_project_id", "code_host_pr_id", "latest_revision"):
+    assert (
+        item["base_branch"],
+        item["base_source"],
+        item["base_commit"],
+        item["base_resolved_request_id"],
+    ) == ("next", "label", case.graph.target, case.request_id)
+    assert (lineage["base_ref"], lineage["base_sha"], lineage["head_sha"]) == (
+        "next",
+        case.graph.target,
+        completed["verification_head_sha"],
+    )
+    for column in (
+        "id",
+        "branch",
+        "pr_number",
+        "pr_url",
+        "code_host_kind",
+        "code_host_host",
+        "repository_project_id",
+        "code_host_pr_id",
+        "latest_revision",
+    ):
         assert lineage[column] == before_lineage[column]
     assert item["publication_lineage_id"] == before_item["publication_lineage_id"]
     assert publications == before_publications == 0
@@ -368,9 +507,12 @@ def test_durable_move_commits_each_candidate_before_its_remote_effect_and_keeps_
     assert case.retargets == [{"target_branch": "next"}]
 
 
-@pytest.mark.parametrize("crash_after", ["prepared", "rebase_push", "retarget", "ci_prepared", "ci_push"])
+@pytest.mark.parametrize(
+    "crash_after", ["prepared", "rebase_push", "retarget", "ci_prepared", "ci_push"]
+)
 def test_restart_observes_prior_effect_without_repeating_a_remote_write(
-    transition_case: TransitionCase, crash_after: str,
+    transition_case: TransitionCase,
+    crash_after: str,
 ) -> None:
     from curie_api.factory_rebase import prepare_ci_marker, push_ci_marker
 
@@ -381,10 +523,14 @@ def test_restart_observes_prior_effect_without_repeating_a_remote_write(
     if crash_after in {"retarget", "ci_prepared", "ci_push"}:
         _retarget(case, recorded=crash_after != "retarget")
     if crash_after in {"ci_prepared", "ci_push"}:
-        marker = asyncio.run(prepare_ci_marker(case.snapshot(), case.credential(), prepared.head_sha))
+        marker = asyncio.run(
+            prepare_ci_marker(case.snapshot(), case.credential(), prepared.head_sha)
+        )
         case.update(phase="ci_prepared", verification_head_sha=marker.head_sha)
         if crash_after == "ci_push":
-            asyncio.run(push_ci_marker(case.snapshot(), case.credential(), marker, prepared.head_sha))
+            asyncio.run(
+                push_ci_marker(case.snapshot(), case.credential(), marker, prepared.head_sha)
+            )
     saved = case.row()
 
     applied = case.finish()
@@ -415,7 +561,9 @@ def test_restart_before_history_acknowledgement_does_not_duplicate_the_outcome(
     assert case.retargets == [{"target_branch": "next"}]
 
 
-def test_retarget_outage_preserves_pushed_progress_until_a_healthy_retry(transition_case: TransitionCase) -> None:
+def test_retarget_outage_preserves_pushed_progress_until_a_healthy_retry(
+    transition_case: TransitionCase,
+) -> None:
     case = transition_case
     prepared = _prepare(case)
     _push(case, prepared, recorded=True)
@@ -435,7 +583,9 @@ def test_retarget_outage_preserves_pushed_progress_until_a_healthy_retry(transit
     assert case.remote.pushes == 2
 
 
-def test_unrelated_remote_head_is_refused_without_rewriting_it(transition_case: TransitionCase) -> None:
+def test_unrelated_remote_head_is_refused_without_rewriting_it(
+    transition_case: TransitionCase,
+) -> None:
     case = transition_case
     _prepare(case)
     changed = case.graph.commit("human.txt", "new remote owner\n", "Concurrent source edit")
@@ -453,7 +603,9 @@ def test_unrelated_remote_head_is_refused_without_rewriting_it(transition_case: 
 
 
 @pytest.mark.parametrize("state", ["closed", "merged", "missing"])
-def test_non_open_pr_refuses_before_remote_mutation(transition_case: TransitionCase, state: str) -> None:
+def test_non_open_pr_refuses_before_remote_mutation(
+    transition_case: TransitionCase, state: str
+) -> None:
     case = transition_case
     case.state = state
     case.missing_pr = state == "missing"
@@ -491,7 +643,9 @@ def test_competing_reconcilers_share_one_live_lease(transition_case: TransitionC
 
 
 @pytest.mark.parametrize("fence", ["owner", "version", "expiry", "cancelled"])
-def test_stale_inflight_preparation_cannot_commit_or_push(transition_case: TransitionCase, fence: str) -> None:
+def test_stale_inflight_preparation_cannot_commit_or_push(
+    transition_case: TransitionCase, fence: str
+) -> None:
     case = transition_case
 
     async def stale() -> None:
@@ -509,9 +663,21 @@ def test_stale_inflight_preparation_cannot_commit_or_push(transition_case: Trans
                         "expiry": "lease_expires_at = clock_timestamp() - interval '1 second'",
                     }
                     if fence == "cancelled":
-                        await connection.execute(text("UPDATE curie.work_items SET cancelled_at = clock_timestamp(), version = version + 1 WHERE id = :id"), {"id": case.work_item_id})
+                        await connection.execute(
+                            text(
+                                "UPDATE curie.work_items SET cancelled_at = clock_timestamp(), "
+                                "version = version + 1 WHERE id = :id"
+                            ),
+                            {"id": case.work_item_id},
+                        )
                     else:
-                        await connection.execute(text(f"UPDATE curie.factory_base_transitions SET {changes[fence]} WHERE id = :id"), {"id": TRANSITION_ID})
+                        await connection.execute(
+                            text(
+                                "UPDATE curie.factory_base_transitions "
+                                f"SET {changes[fence]} WHERE id = :id"
+                            ),
+                            {"id": TRANSITION_ID},
+                        )
             finally:
                 await engine.dispose()
         finally:
@@ -531,7 +697,9 @@ def test_stale_inflight_preparation_cannot_commit_or_push(transition_case: Trans
     assert case.remote.pushes == 0
 
 
-def test_newer_queued_relabel_cannot_overwrite_a_pushed_operation(transition_case: TransitionCase) -> None:
+def test_newer_queued_relabel_cannot_overwrite_a_pushed_operation(
+    transition_case: TransitionCase,
+) -> None:
     case = transition_case
     prepared = _prepare(case)
     _push(case, prepared, recorded=True)
@@ -552,7 +720,16 @@ def test_newer_queued_relabel_cannot_overwrite_a_pushed_operation(transition_cas
     before = case.row()
     applied = case.finish()
 
-    for column in ("id", "request_id", "old_base_sha", "old_head_sha", "target_base_ref", "target_base_sha", "rebased_head_sha", "committer_time"):
+    for column in (
+        "id",
+        "request_id",
+        "old_base_sha",
+        "old_head_sha",
+        "target_base_ref",
+        "target_base_sha",
+        "rebased_head_sha",
+        "committer_time",
+    ):
         assert applied[column] == before[column]
     assert case.target == "next"
     assert case.remote.pushes == 2
@@ -560,7 +737,9 @@ def test_newer_queued_relabel_cannot_overwrite_a_pushed_operation(transition_cas
     assert item["readmit_request_id"] == successor
 
 
-def test_conflict_is_a_hold_and_repeated_reconcile_passes_make_no_remote_write(transition_case: TransitionCase) -> None:
+def test_conflict_is_a_hold_and_repeated_reconcile_passes_make_no_remote_write(
+    transition_case: TransitionCase,
+) -> None:
     case = transition_case
     source = case.graph.commit("shared.txt", "factory edit\n", "Conflicting factory edit")
     git(case.graph.writer, "push", "origin", BRANCH)

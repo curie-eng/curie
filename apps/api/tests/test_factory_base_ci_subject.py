@@ -95,33 +95,35 @@ def _applied_move(
                 lineage.repository_project_id = item.repository_project_id
                 lineage.code_host_installation_id = item.code_host_installation_id
                 lineage.code_host_pr_id = "P0EXAMPLE77"
-                session.add(FactoryBaseTransition(
-                    id=transition_id,
-                    work_item_id=item.id,
-                    request_id=request.id,
-                    lineage_id=lineage.id,
-                    phase="applied",
-                    version=1,
-                    old_base_ref="main",
-                    old_base_sha=MAIN_SHA,
-                    old_head_sha=HEAD_A,
-                    target_base_ref="next",
-                    target_base_sha=NEXT_SHA,
-                    base_source="label",
-                    branch=lineage.branch,
-                    pull_request_number="77",
-                    committer_name="Curie",
-                    committer_email="factory@example.com",
-                    committer_time=now,
-                    rebased_head_sha=HEAD_C,
-                    verification_head_sha=HEAD_B,
-                    changed_paths=list(paths),
-                    ci_pushed_at=now,
-                    applied_at=now,
-                    outcome_ready_at=now,
-                    ci_ready_at=None,
-                    ci_settled_at=None,
-                ))
+                session.add(
+                    FactoryBaseTransition(
+                        id=transition_id,
+                        work_item_id=item.id,
+                        request_id=request.id,
+                        lineage_id=lineage.id,
+                        phase="applied",
+                        version=1,
+                        old_base_ref="main",
+                        old_base_sha=MAIN_SHA,
+                        old_head_sha=HEAD_A,
+                        target_base_ref="next",
+                        target_base_sha=NEXT_SHA,
+                        base_source="label",
+                        branch=lineage.branch,
+                        pull_request_number="77",
+                        committer_name="Curie",
+                        committer_email="factory@example.com",
+                        committer_time=now,
+                        rebased_head_sha=HEAD_C,
+                        verification_head_sha=HEAD_B,
+                        changed_paths=list(paths),
+                        ci_pushed_at=now,
+                        applied_at=now,
+                        outcome_ready_at=now,
+                        ci_ready_at=None,
+                        ci_settled_at=None,
+                    )
+                )
                 await session.commit()
                 return lineage.branch
         finally:
@@ -130,13 +132,23 @@ def _applied_move(
     branch = asyncio.run(seed())
     epoch = _start_running(row["id"])
     sink.branches["next"] = NEXT_SHA
-    sink.pull_script = [{
-        "mergeable": True, "mergeable_state": "clean", "merged": False,
-        "head": {"ref": branch, "sha": HEAD_B}, "base": {"ref": "next"},
-    }]
+    sink.pull_script = [
+        {
+            "mergeable": True,
+            "mergeable_state": "clean",
+            "merged": False,
+            "head": {"ref": branch, "sha": HEAD_B},
+            "base": {"ref": "next"},
+        }
+    ]
     sink.ci_scripts = {HEAD_C: [ci_green()], HEAD_B: [ci_pending()]}
-    return {**row, "number": number, "transition_id": transition_id, "epoch": epoch,
-            "branch": branch}
+    return {
+        **row,
+        "number": number,
+        "transition_id": transition_id,
+        "epoch": epoch,
+        "branch": branch,
+    }
 
 
 @pytest.fixture
@@ -162,13 +174,18 @@ def _finish(client: Any, row: dict[str, Any], *, round_: int | None = None) -> A
 
 
 def _transition(row: dict[str, Any]) -> dict[str, Any]:
-    return _rows("SELECT * FROM curie.factory_base_transitions WHERE id = :id",
-                 {"id": row["transition_id"]})[0]
+    return _rows(
+        "SELECT * FROM curie.factory_base_transitions WHERE id = :id", {"id": row["transition_id"]}
+    )[0]
 
 
 def _no_publications(row: dict[str, Any]) -> None:
-    assert _rows("SELECT id FROM curie.publications WHERE execution_request_id = :id",
-                 {"id": row["id"]}) == []
+    assert (
+        _rows(
+            "SELECT id FROM curie.publications WHERE execution_request_id = :id", {"id": row["id"]}
+        )
+        == []
+    )
 
 
 def _handoff(client: Any, row: dict[str, Any]) -> None:
@@ -181,11 +198,18 @@ def _handoff(client: Any, row: dict[str, Any]) -> None:
 
 
 def _verified(client: Any, row: dict[str, Any], *, passed: bool = True) -> None:
-    result = verification(client, row["id"], {
-        "check": "unit_tests", "command": "uv run pytest apps/api/tests -q",
-        "outcome": "passed" if passed else "failed", "exit_status": 0 if passed else 1,
-        "missing_binaries": [], "blocked_services": [],
-    })
+    result = verification(
+        client,
+        row["id"],
+        {
+            "check": "unit_tests",
+            "command": "uv run pytest apps/api/tests -q",
+            "outcome": "passed" if passed else "failed",
+            "exit_status": 0 if passed else 1,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+    )
     assert result.status_code == 201, result.text
 
 
@@ -205,8 +229,9 @@ def test_applied_move_does_not_compete_with_the_initial_verification_turn(moved:
 @pytest.mark.parametrize("verdict", ["red", "pending", "green"])
 def test_no_change_successor_settles_only_on_its_final_head(moved: Any, verdict: str) -> None:
     client, _github, sink, row = moved
-    sink.ci_scripts[HEAD_B] = [{"red": ci_failing, "pending": ci_pending,
-                              "green": ci_green}[verdict]()]
+    sink.ci_scripts[HEAD_B] = [
+        {"red": ci_failing, "pending": ci_pending, "green": ci_green}[verdict]()
+    ]
     _handoff(client, row)
 
     _reconcile()
@@ -244,8 +269,10 @@ def test_pending_base_move_ci_retains_ownership_after_runtime_heartbeat_lapses(m
     assert str(row["id"]) not in _listed_owner_ids(client)
     refused = _owner_lost(client, row["id"], row["epoch"])
     assert refused.status_code == 409, refused.text
-    requests = _rows("SELECT id, owner_lost_retry FROM curie.execution_requests "
-                     "WHERE work_item_id = :id", {"id": row["work_item_id"]})
+    requests = _rows(
+        "SELECT id, owner_lost_retry FROM curie.execution_requests WHERE work_item_id = :id",
+        {"id": row["work_item_id"]},
+    )
     assert requests == [{"id": row["id"], "owner_lost_retry": False}]
     sink.ci_scripts[HEAD_B] = [ci_green()]
 
@@ -262,9 +289,14 @@ def test_intermediate_head_green_cannot_settle_even_when_its_check_starts_after_
     client, _github, sink, row = moved
     pushed_at = _transition(row)["ci_pushed_at"]
     started_at = pushed_at + timedelta(seconds=5 if started_after_retarget else -30)
-    sink.ci_scripts[HEAD_C] = [ci_entry(check_run(
-        "build", started_at=started_at.isoformat(),
-    ))]
+    sink.ci_scripts[HEAD_C] = [
+        ci_entry(
+            check_run(
+                "build",
+                started_at=started_at.isoformat(),
+            )
+        )
+    ]
     sink.ci_scripts[HEAD_B] = [ci_pending()]
     _handoff(client, row)
 
@@ -326,8 +358,10 @@ def test_python_paths_in_the_rebase_keep_the_normal_preflight_gate(
         assert _terminal(row["number"]) == ("completed", "completed")
     else:
         assert _terminal(row["number"]) == ("failed", "ci_unverified")
-        (notice,) = _rows("SELECT detail FROM curie.factory_terminal_notices "
-                          "WHERE execution_request_id = :id", {"id": row["id"]})
+        (notice,) = _rows(
+            "SELECT detail FROM curie.factory_terminal_notices WHERE execution_request_id = :id",
+            {"id": row["id"]},
+        )
         assert "python_preflight_" in notice["detail"]
     _no_publications(row)
 
@@ -335,8 +369,15 @@ def test_python_paths_in_the_rebase_keep_the_normal_preflight_gate(
 def test_a_new_real_publication_takes_precedence_over_the_applied_move(moved: Any) -> None:
     client, _github, sink, row = moved
     _handoff(client, row)
-    _attach_fix(row["work_item_id"], row["id"], revision=2, head_sha=HEAD_C,
-                title="Repair after base change", paths=["src/widget.txt"], base_sha=NEXT_SHA)
+    _attach_fix(
+        row["work_item_id"],
+        row["id"],
+        revision=2,
+        head_sha=HEAD_C,
+        title="Repair after base change",
+        paths=["src/widget.txt"],
+        base_sha=NEXT_SHA,
+    )
     sink.pull_script[0]["head"]["sha"] = HEAD_C
     sink.ci_scripts = {HEAD_B: [ci_failing()], HEAD_C: [ci_green()]}
 
@@ -344,8 +385,10 @@ def test_a_new_real_publication_takes_precedence_over_the_applied_move(moved: An
 
     assert _terminal(row["number"]) == ("completed", "completed")
     assert sink.ci_observations == [HEAD_C]
-    publications = _rows("SELECT revision_number FROM curie.publications "
-                         "WHERE execution_request_id = :id", {"id": row["id"]})
+    publications = _rows(
+        "SELECT revision_number FROM curie.publications WHERE execution_request_id = :id",
+        {"id": row["id"]},
+    )
     assert publications == [{"revision_number": 2}]
 
 
@@ -354,11 +397,16 @@ def test_base_move_is_round_one_and_a_real_fix_advances_round_accounting(moved: 
     sink.ci_scripts[HEAD_B] = [ci_failing()]
     _handoff(client, row)
     _reconcile()
-    assert [turn["event_id"] for turn in _ci_turns(row["id"])] == [
-        f"work-item-{row['id']}-ci-2"
-    ]
-    _attach_fix(row["work_item_id"], row["id"], revision=2, head_sha=HEAD_C,
-                title="Repair after base change", paths=["src/widget.txt"], base_sha=NEXT_SHA)
+    assert [turn["event_id"] for turn in _ci_turns(row["id"])] == [f"work-item-{row['id']}-ci-2"]
+    _attach_fix(
+        row["work_item_id"],
+        row["id"],
+        revision=2,
+        head_sha=HEAD_C,
+        title="Repair after base change",
+        paths=["src/widget.txt"],
+        base_sha=NEXT_SHA,
+    )
     handed_off = _finish(client, row, round_=2)
     assert handed_off.status_code == 409, handed_off.text
     assert "publication_pending" in handed_off.text
@@ -368,7 +416,8 @@ def test_base_move_is_round_one_and_a_real_fix_advances_round_accounting(moved: 
     _reconcile()
 
     assert [turn["event_id"] for turn in _ci_turns(row["id"])] == [
-        f"work-item-{row['id']}-ci-2", f"work-item-{row['id']}-ci-3"
+        f"work-item-{row['id']}-ci-2",
+        f"work-item-{row['id']}-ci-3",
     ]
     unpublished = _finish(client, row, round_=3)
     assert unpublished.status_code == 200, unpublished.text
@@ -390,21 +439,34 @@ def test_a_stale_final_head_observation_cannot_settle_over_current_authority(
         try:
             await asyncio.wait_for(entered.wait(), 5)
             if change == "publication":
-                await _attach_fix_async(row["work_item_id"], row["id"], revision=2,
-                                        head_sha=HEAD_C, title="A newer revision",
-                                        paths=["src/widget.txt"], base_sha=NEXT_SHA)
+                await _attach_fix_async(
+                    row["work_item_id"],
+                    row["id"],
+                    revision=2,
+                    head_sha=HEAD_C,
+                    title="A newer revision",
+                    paths=["src/widget.txt"],
+                    base_sha=NEXT_SHA,
+                )
                 sink.ci_scripts[HEAD_C] = [ci_pending()]
                 sink.pull_script[0]["head"]["sha"] = HEAD_C
             else:
                 statement, identifier = {
-                    "request_version": ("UPDATE curie.execution_requests SET version = version + 1 "
-                                        "WHERE id = :id", row["id"]),
-                    "transition_version": ("UPDATE curie.factory_base_transitions "
-                                           "SET version = version + 1 WHERE id = :id",
-                                           row["transition_id"]),
-                    "head": ("UPDATE curie.thread_publication_lineages SET head_sha = :head "
-                             "WHERE id = (SELECT publication_lineage_id FROM curie.work_items "
-                             "WHERE id = :id)", row["work_item_id"]),
+                    "request_version": (
+                        "UPDATE curie.execution_requests SET version = version + 1 WHERE id = :id",
+                        row["id"],
+                    ),
+                    "transition_version": (
+                        "UPDATE curie.factory_base_transitions "
+                        "SET version = version + 1 WHERE id = :id",
+                        row["transition_id"],
+                    ),
+                    "head": (
+                        "UPDATE curie.thread_publication_lineages SET head_sha = :head "
+                        "WHERE id = (SELECT publication_lineage_id FROM curie.work_items "
+                        "WHERE id = :id)",
+                        row["work_item_id"],
+                    ),
                 }[change]
                 engine = create_async_engine(get_settings().database_url)
                 try:
@@ -423,9 +485,11 @@ def test_a_stale_final_head_observation_cannot_settle_over_current_authority(
     assert _transition(row)["ci_settled_at"] is None
     assert _ci_turns(row["id"]) == []
     if change == "head":
-        _execute("UPDATE curie.thread_publication_lineages SET head_sha = :head "
-                 "WHERE id = (SELECT publication_lineage_id FROM curie.work_items WHERE id = :id)",
-                 {"head": HEAD_B, "id": row["work_item_id"]})
+        _execute(
+            "UPDATE curie.thread_publication_lineages SET head_sha = :head "
+            "WHERE id = (SELECT publication_lineage_id FROM curie.work_items WHERE id = :id)",
+            {"head": HEAD_B, "id": row["work_item_id"]},
+        )
     if change == "publication":
         sink.ci_scripts[HEAD_C] = [ci_green()]
 

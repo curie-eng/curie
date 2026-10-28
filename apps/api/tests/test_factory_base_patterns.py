@@ -51,9 +51,7 @@ def test_policy_selects_an_exact_or_glob_matching_literal(
 ) -> None:
     policy = _policy(patterns)
 
-    assert choose_base({f"base:{branch}", "factory"}, policy, "main") == BaseChoice(
-        branch, "label"
-    )
+    assert choose_base({f"base:{branch}", "factory"}, policy, "main") == BaseChoice(branch, "label")
 
 
 @pytest.mark.parametrize(
@@ -193,9 +191,7 @@ def test_wildcard_does_not_resolve_conflicting_labels() -> None:
 
     assert isinstance(refused, BaseRefusal)
     assert refused.code == "base_conflict"
-    assert choose_base({"base:release/1.0"}, policy, "main") == BaseChoice(
-        "release/1.0", "label"
-    )
+    assert choose_base({"base:release/1.0"}, policy, "main") == BaseChoice("release/1.0", "label")
 
 
 @pytest.mark.anyio

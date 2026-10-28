@@ -72,7 +72,9 @@ class BaseGitHubAPI(GitHubAPI):
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
-        if path == f"/repos/{REPO}":
+        if path == f"/repos/{REPO}" or (
+            request.method == "GET" and path == f"/repositories/{self.repository_id}"
+        ):
             return httpx.Response(
                 200,
                 json={
@@ -406,9 +408,7 @@ def test_first_acquisition_pins_the_current_selection(
     assert response.status_code == 200, response.text
     item = _work_item(number)
     assert item is not None
-    assert (item["base_branch"], item["base_source"], item["base_commit"]) == (
-        branch, source, sha
-    )
+    assert (item["base_branch"], item["base_source"], item["base_commit"]) == (branch, source, sha)
     assert api.branch_requests == [branch]
     assert api.posts() == []
 
@@ -597,9 +597,9 @@ def test_a_foreign_refusal_marker_is_not_adopted(
     foreign = {
         "id": 770001,
         "body": f"Quoting the bot: {MARKER} please fix",
-        "user": {"id": 6601, "login": "octocat", "type": "User"} if human else {
-            "id": 4242, "login": "other-app[bot]", "type": "Bot"
-        },
+        "user": {"id": 6601, "login": "octocat", "type": "User"}
+        if human
+        else {"id": 4242, "login": "other-app[bot]", "type": "Bot"},
         "performed_via_github_app": None if human else {"id": 999, "slug": "other-app"},
     }
     api.issue_comments[number] = [dict(foreign)]

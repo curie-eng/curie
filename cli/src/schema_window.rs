@@ -760,8 +760,9 @@ print(json.dumps(graph))
         // @spec HTTP-APPROVAL-CONTINUITY-5: approval ORM reads require 0137.
         // @spec AUTOMATED-REMEDIATION-15: 0138 only widens a CHECK.
         // @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
-        assert_eq!(candidate.schema_min, "0139");
-        assert_eq!(candidate.schema_head, "0139");
+        // Factory ORM reads require the request base columns introduced by 0140.
+        assert_eq!(candidate.schema_min, "0140");
+        assert_eq!(candidate.schema_head, "0140");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -792,7 +793,8 @@ print(json.dumps(graph))
         // @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
         assert!(!live_in_window("0137", &current));
         assert!(!live_in_window("0138", &current));
-        assert!(live_in_window("0139", &current));
+        assert!(!live_in_window("0139", &current));
+        assert!(live_in_window("0140", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

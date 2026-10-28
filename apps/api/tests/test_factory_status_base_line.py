@@ -156,9 +156,11 @@ def test_a_legacy_work_item_renders_no_base_line(admitted: Any) -> None:  # noqa
 
 @pytest.mark.parametrize(
     ("phase", "error", "words"),
-    [("pending", None, ("pending", "waiting", "requested")),
-     ("pushed", None, ("pushed", "retarget", "moving")),
-     ("conflict", "rebase_conflict", ("conflict", "refused"))],
+    [
+        ("pending", None, ("pending", "waiting", "requested")),
+        ("pushed", None, ("pushed", "retarget", "moving")),
+        ("conflict", "rebase_conflict", ("conflict", "refused")),
+    ],
 )
 def test_status_renders_the_real_transition_target_and_progress(
     moved: Any, phase: str, error: str | None, words: tuple[str, ...]

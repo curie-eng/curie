@@ -124,7 +124,9 @@ def test_delayed_base_label_is_read_when_settle_finishes(
     assert claimed.status_code == 200, claimed.text
     item = _work_item(32003)
     assert (item["base_branch"], item["base_source"], item["base_commit"]) == (
-        "next", "label", "4" * 40
+        "next",
+        "label",
+        "4" * 40,
     )
     assert api.branch_requests == ["next"]
     (pin,) = _rows(
@@ -151,9 +153,7 @@ def test_duplicate_delivery_does_not_restart_the_settle_interval(
     assert _post(client, "issues", event, delivery=delivery).status_code == 200
 
     after = _execution(32004)
-    assert (after["id"], after["base_settle_until"]) == (
-        before["id"], before["base_settle_until"]
-    )
+    assert (after["id"], after["base_settle_until"]) == (before["id"], before["base_settle_until"])
     assert api.branch_requests == []
     _due(32004)
     assert _acquire(client, 32004).status_code == 200
@@ -173,9 +173,7 @@ def test_held_acquisition_renewal_never_repins_the_request(base_app: Any) -> Non
 
     assert renewed.status_code == 200, renewed.text
     after = _work_item(32005)
-    assert (after["base_branch"], after["base_commit"]) == (
-        before["base_branch"], NEXT_SHA
-    )
+    assert (after["base_branch"], after["base_commit"]) == (before["base_branch"], NEXT_SHA)
     assert api.branch_requests == []
     assert _start(client, 32005, renewed).status_code == 200
 
@@ -189,8 +187,12 @@ def test_capacity_redelivery_preserves_the_request_pin(base_app: Any) -> None:
     deferred = client.post(
         f"/v1/internal/work-items/requests/{row['id']}/defer",
         headers=WORKER,
-        json={"owner": "factory-base-owner", "generation": first.json()["generation"],
-              "reason": "capacity", "capacity": True},
+        json={
+            "owner": "factory-base-owner",
+            "generation": first.json()["generation"],
+            "reason": "capacity",
+            "capacity": True,
+        },
     )
     assert deferred.status_code == 200, deferred.text
     api.branches["next"] = "6" * 40
@@ -229,24 +231,33 @@ def test_superseding_a_blocked_external_read_cannot_pin_or_start_the_old_request
                 async with httpx.AsyncClient(
                     transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
                 ) as http:
-                    claiming = asyncio.create_task(http.post(
-                        f"/v1/internal/work-items/requests/{old['id']}/acquire",
-                        headers=WORKER, json=payload,
-                    ))
+                    claiming = asyncio.create_task(
+                        http.post(
+                            f"/v1/internal/work-items/requests/{old['id']}/acquire",
+                            headers=WORKER,
+                            json=payload,
+                        )
+                    )
                     try:
                         await asyncio.wait_for(entered.wait(), 5)
                         api.labels = [LABEL, "base:main"]
                         api.advance_label_event(32007)
-                        body = json.dumps(_issue_event(
-                            "labeled", 32007, label={"name": LABEL}
-                        )).encode()
-                        changed = await asyncio.wait_for(http.post(
-                            "/github/webhook", content=body,
-                            headers={"X-GitHub-Delivery": str(uuid.uuid4()),
-                                     "X-GitHub-Event": "issues",
-                                     "X-Hub-Signature-256": _signature(body),
-                                     "Content-Type": "application/json"},
-                        ), 5)
+                        body = json.dumps(
+                            _issue_event("labeled", 32007, label={"name": LABEL})
+                        ).encode()
+                        changed = await asyncio.wait_for(
+                            http.post(
+                                "/github/webhook",
+                                content=body,
+                                headers={
+                                    "X-GitHub-Delivery": str(uuid.uuid4()),
+                                    "X-GitHub-Event": "issues",
+                                    "X-Hub-Signature-256": _signature(body),
+                                    "Content-Type": "application/json",
+                                },
+                            ),
+                            5,
+                        )
                         assert changed.status_code == 200, changed.text
                     finally:
                         release.set()
@@ -262,8 +273,10 @@ def test_superseding_a_blocked_external_read_cannot_pin_or_start_the_old_request
     assert _work_item(32007)["base_commit"] is None
     assert _acquire(client, 32007).status_code == 200
     assert _work_item(32007)["base_commit"] == MAIN_SHA
-    (stale,) = _rows("SELECT status, acquire_owner FROM curie.execution_requests WHERE id = :id",
-                    {"id": old["id"]})
+    (stale,) = _rows(
+        "SELECT status, acquire_owner FROM curie.execution_requests WHERE id = :id",
+        {"id": old["id"]},
+    )
     assert stale == {"status": "cancelled", "acquire_owner": None}
 
 
@@ -291,18 +304,34 @@ def test_a_conflict_hold_requires_a_new_factory_application_before_retrying(base
                 assert lineage is not None
                 now = await session.scalar(text("SELECT clock_timestamp()"))
                 stored.base_branch, stored.base_source, stored.base_commit = (
-                    "main", "default", MAIN_SHA
+                    "main",
+                    "default",
+                    MAIN_SHA,
                 )
                 lineage.base_sha = MAIN_SHA
-                session.add(FactoryBaseTransition(
-                    id=transition_id, work_item_id=stored.id, request_id=request["id"],
-                    lineage_id=lineage.id, phase="conflict", version=1,
-                    old_base_ref="main", old_base_sha=MAIN_SHA, old_head_sha="3" * 40,
-                    target_base_ref="next", target_base_sha=NEXT_SHA, base_source="label",
-                    branch=lineage.branch, pull_request_number="77",
-                    committer_name="Curie", committer_email="factory@example.com",
-                    committer_time=now, error_code="rebase_conflict", changed_paths=[],
-                ))
+                session.add(
+                    FactoryBaseTransition(
+                        id=transition_id,
+                        work_item_id=stored.id,
+                        request_id=request["id"],
+                        lineage_id=lineage.id,
+                        phase="conflict",
+                        version=1,
+                        old_base_ref="main",
+                        old_base_sha=MAIN_SHA,
+                        old_head_sha="3" * 40,
+                        target_base_ref="next",
+                        target_base_sha=NEXT_SHA,
+                        base_source="label",
+                        branch=lineage.branch,
+                        pull_request_number="77",
+                        committer_name="Curie",
+                        committer_email="factory@example.com",
+                        committer_time=now,
+                        error_code="rebase_conflict",
+                        changed_paths=[],
+                    )
+                )
                 await session.commit()
         finally:
             await engine.dispose()
@@ -322,9 +351,7 @@ def test_a_conflict_hold_requires_a_new_factory_application_before_retrying(base
     assert api.branch_requests == []
     assert _work_item(number)["base_commit"] == MAIN_SHA
     api.labels = ["base:next"]
-    removed = _post(client, "issues", _issue_event(
-        "unlabeled", number, label={"name": LABEL}
-    ))
+    removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
     assert removed.status_code == 200, removed.text
 
     reapplied = _label(client, api, number, "base:next")
