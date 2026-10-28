@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
-from typing import NoReturn, cast
+from collections.abc import Awaitable, Callable, Sequence
+from typing import NoReturn, Protocol, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from redis.exceptions import RedisError
@@ -25,7 +25,6 @@ from sqlalchemy import select
 from curie_api.crud import publication_queries as crud_publication_queries
 from curie_api.factory_rediscovery import REFUSING, publishing_code_host, rediscover
 from curie_api.forges.errors import ForgeError, NotFound
-from curie_api.forges.github.code_host import GitHubCodeHost
 from curie_api.forges.hosts import resolve_stored
 from curie_api.forges.ports import CodeHost
 from curie_api.forges.trackers import tracker_for_work_item
@@ -72,6 +71,12 @@ logger = logging.getLogger(__name__)
 
 _ACTIVE = frozenset({"approved", "launching", "running"})
 _PUBLICATION_LABELS_TTL_S = 30 * 24 * 60 * 60
+
+
+class _PullRequestLabels(Protocol):
+    async def add_pull_request_labels(
+        self, pull_request: PullRequestRef, labels: Sequence[str]
+    ) -> None: ...
 
 
 def _refuse(code: str, message: str) -> NoReturn:
@@ -277,7 +282,7 @@ async def _apply_publication_labels(
         valkey = request.app.state.valkey
         if await valkey.exists(marker):
             return
-        await cast(GitHubCodeHost, code_host).add_pull_request_labels(pull.ref, labels)
+        await cast(_PullRequestLabels, code_host).add_pull_request_labels(pull.ref, labels)
         await valkey.set(marker, "1", ex=_PUBLICATION_LABELS_TTL_S)
     except (ForgeError, RedisError) as exc:
         logger.warning(
