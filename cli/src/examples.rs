@@ -946,8 +946,8 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../examples/dark-factory/review/evals/README.md"),
     ),
     (
-        "review/evals/cases.json",
-        include_bytes!("../../examples/dark-factory/review/evals/cases.json"),
+        "review/evals/replay-cases.json",
+        include_bytes!("../../examples/dark-factory/review/evals/replay-cases.json"),
     ),
     (
         "review/skills/review-pr/SKILL.md",

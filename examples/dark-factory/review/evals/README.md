@@ -1,6 +1,6 @@
 # PR review workflow replays
 
-Use `cases.json` with a fresh host agent loaded with the installed skill and both
+Use `replay-cases.json` with a fresh host agent loaded with the installed skill and both
 references. Materialize raw synthetic PR files, diff, linked issue, CI state and
 repository instructions. Expose fake authenticated host tools backed by local
 state, logging every read, test execution, comment, review, merge and issue update.
@@ -13,7 +13,7 @@ instruction text matching alone does not establish behavior. A merge must enforc
 the supplied head precondition. Inject write timeouts after persistence and a head
 change between initial inspection and publication to exercise reconciliation.
 
-These are opt-in host-agent evaluations, not automated CI tests. Record the skill
+These are opt-in host-agent evaluations, not `curie skill eval` suites or automated CI tests. Record the skill
 revision, host, raw fixture, operation log and final observations for each replay.
 Synthetic receipts establish decisions and fake effects only; they do not prove
 real client discovery, tracker permissions, factory admission or branch protection.
