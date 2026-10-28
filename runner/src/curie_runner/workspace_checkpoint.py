@@ -30,7 +30,6 @@ import base64
 import errno
 import hashlib
 import json
-import math
 import os
 import re
 import shutil
@@ -174,9 +173,9 @@ def parse_checkpoint_request(body: object) -> tuple[str, float]:
     if (
         isinstance(budget, bool)
         or not isinstance(budget, int | float)
-        # Compare before any float conversion: a huge integer overflows it.
+        # Compared without float conversion: a huge integer would overflow it.
+        # NaN and infinity fail this range too.
         or not 0 < budget <= MAX_BUDGET_SECONDS
-        or not math.isfinite(budget)
     ):
         raise CheckpointRefusal(
             "invalid_request",
@@ -266,7 +265,6 @@ _Record = tuple[str | int, ...]
 class _Fingerprint:
     digest: str
     records: dict[str, _Record]
-    index: dict[str, tuple[str, str]]
 
 
 def _safe_path(raw: bytes) -> str:
@@ -433,7 +431,7 @@ def _fingerprint(git: _Git, object_format: str) -> _Fingerprint:
         sort_keys=True,
         separators=(",", ":"),
     )
-    return _Fingerprint(hashlib.sha256(canonical.encode()).hexdigest(), records, index)
+    return _Fingerprint(hashlib.sha256(canonical.encode()).hexdigest(), records)
 
 
 def _desired_entries(records: Mapping[str, _Record]) -> dict[str, tuple[str, str]]:
@@ -623,10 +621,6 @@ def capture_workspace_checkpoint(
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
-    if len(patch) > MAX_PATCH_BYTES:
-        raise CheckpointRefusal(
-            "patch_too_large", 422, f"checkpoint patch exceeds {MAX_PATCH_BYTES} bytes"
-        )
     try:
         validate_patch(patch)
     except WorkspaceSnapshotError:

@@ -405,15 +405,15 @@ async def _checkpoint(request: web.Request) -> web.Response:
         base_sha, budget_seconds = parse_checkpoint_request(body)
         if request.app[RUNNER].turn_active:
             raise CheckpointRefusal("turn_active", 409, "cannot checkpoint while a turn is active")
-        captured = await asyncio.to_thread(
-            capture_workspace_checkpoint,
-            workspace,
-            base_sha=base_sha,
-            budget_seconds=budget_seconds,
+        # Encoding and hashing the bounded result also stay off the event loop.
+        answer = await asyncio.to_thread(
+            lambda: capture_workspace_checkpoint(
+                workspace, base_sha=base_sha, budget_seconds=budget_seconds
+            ).to_json()
         )
     except CheckpointRefusal as refusal:
         return web.json_response(refusal.body(), status=refusal.status)
-    return web.json_response(captured.to_json())
+    return web.json_response(answer)
 
 
 def _parse(body: object) -> Event | Interrupt:
