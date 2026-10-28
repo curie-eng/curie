@@ -575,7 +575,7 @@ print(json.dumps(graph))
         ));
         assert!(!declared_window_within_release(
             "sha-4498fa0",
-            &candidate_window("0108", "0109").unwrap()
+            &candidate_window("0108", "0120").unwrap()
         ));
     }
 
@@ -620,7 +620,7 @@ print(json.dumps(graph))
         // Ambiguous and uncatalogued versions are never named.
         let unnamed = [
             declared("0.8.9", 4, "0001", "0044"),
-            declared("sha-4498fa0", 5, "0108", "0109"),
+            declared("sha-4498fa0", 5, "0108", "0120"),
         ];
         assert_eq!(
             fix_for(&[], &unnamed, "0044"),
