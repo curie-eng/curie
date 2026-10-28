@@ -1038,7 +1038,7 @@ async def _advance_transition(
     except _Refused as error:
         await _record_phase(sessionmaker, operation, phase="refused", error_code=str(error))
     except (ForgeError, FeedbackUnavailable, TimeoutError):
-        exhausted = operation.attempts >= 9 and operation.phase != "conflict"
+        exhausted = operation.attempts >= 9 and operation.phase == "pending"
         await _record_phase(
             sessionmaker,
             operation,
@@ -1052,10 +1052,16 @@ async def _advance_transition(
         )
     except factory_rebase.RebaseRefused as error:
         code = error.code
+        recoverable = operation.phase != "pending" and code in (
+            "git_failed",
+            "elapsed_limit",
+            "push_unconfirmed",
+            "disk_limit",
+        )
         await _record_phase(
             sessionmaker,
             operation,
-            phase="conflict" if code == "conflict" else "refused",
+            phase=None if recoverable else "conflict" if code == "conflict" else "refused",
             error_code=code,
         )
 
