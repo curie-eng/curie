@@ -452,10 +452,9 @@ def _github_changed_path(workspace: str, deadline: float) -> str | None:
 def fingerprint(workspace: str, deadline: float) -> str | None:
     """A sha256 over the checkout's HEAD, status, diff and untracked files.
 
-    Each untracked path contributes one mode byte, ``x`` when any execute bit
-    is set and ``-`` otherwise, before its content. ``None`` when any part
-    cannot be read in time: the caller treats that as an unverifiable checkout,
-    never as an unchanged one.
+    Each untracked path is a length-prefixed name, one mode byte (``x`` when
+    any execute bit is set and ``-`` otherwise), then a length-prefixed body.
+    ``None`` means unverifiable rather than unchanged.
     """
     if not workspace:
         return None
@@ -471,23 +470,38 @@ def fingerprint(workspace: str, deadline: float) -> str | None:
         untracked = _git(root, deadline, "ls-files", "--others", "--exclude-standard", "-z")
         for name in filter(None, untracked.split(b"\0")):
             path = Path(root) / os.fsdecode(name)
-            digest.update(name + b"\0")
+            digest.update(len(name).to_bytes(8, "big") + name)
             if time.monotonic() >= deadline:
                 return None
             try:
-                mode = path.lstat().st_mode
+                info = path.lstat()
             except OSError:
                 return None
+            mode = info.st_mode
             # Any execute bit is how git records 100755.
             digest.update(b"x" if mode & 0o111 else b"-")
-            if path.is_symlink():
-                digest.update(os.fsencode(os.readlink(path)))
-            elif path.is_file():
+            if stat.S_ISLNK(mode):
+                body = os.fsencode(os.readlink(path))
+                digest.update(len(body).to_bytes(8, "big"))
+                digest.update(body)
+            elif stat.S_ISREG(mode):
+                size = info.st_size
+                digest.update(size.to_bytes(8, "big"))
+                seen = 0
                 with path.open("rb") as handle:
                     for chunk in iter(lambda: handle.read(1 << 20), b""):
+                        want = min(1 << 20, size - seen)
+                        if len(chunk) != want:
+                            return None
                         digest.update(chunk)
+                        seen += len(chunk)
                         if time.monotonic() >= deadline:
                             return None
+                if seen != size:
+                    return None
+            else:
+                # Framed empty body, unread so a fifo cannot block.
+                digest.update((0).to_bytes(8, "big"))
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     return digest.hexdigest() if time.monotonic() < deadline else None
