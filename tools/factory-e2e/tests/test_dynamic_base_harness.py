@@ -86,6 +86,106 @@ def test_scripted_nochange_requires_successful_actual_tool_output(model: Any) ->
     assert failed["content"][0]["text"].startswith("Could not complete:")
 
 
+@pytest.mark.parametrize("prior_failed", [False, True], ids=["verified-history", "failed-history"])
+def test_new_objective_requires_fresh_verification_after_a_completed_turn(
+    model: Any, prior_failed: bool
+) -> None:
+    # Anthropic's assistant tool_use and matching user tool_result shapes:
+    # https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use
+    model.mode("nochange")
+    earlier = [{"role": "user", "content": "Verify the example repository on its original base."}]
+    prior_response = reply(model, earlier)
+    assert prior_response["stop_reason"] == "tool_use"
+    prior_tool = prior_response["content"][0]
+    assert prior_tool["name"] == "Bash"
+    earlier.extend(
+        [
+            {"role": "assistant", "content": prior_response["content"]},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": prior_tool["id"],
+                        "is_error": prior_failed,
+                        "content": "Earlier repository verification failed."
+                        if prior_failed
+                        else "C4_HEAD="
+                        + "a" * 40
+                        + '\nC4_TARGET=main\nC4_VALUE=VALUE = "factory"\n',
+                    }
+                ],
+            },
+        ]
+    )
+    prior_final = reply(model, earlier)
+    assert prior_final["stop_reason"] == "end_turn"
+    assert prior_final["content"][0]["text"].startswith(
+        "Could not complete:" if prior_failed else "No changes needed:"
+    )
+    prior_observations = (
+        []
+        if prior_failed
+        else [
+            {
+                "tool": prior_tool["id"],
+                "head": "a" * 40,
+                "target": "main",
+                "value": 'VALUE = "factory"',
+            }
+        ]
+    )
+    assert model.observations() == prior_observations
+    messages = [
+        *earlier,
+        {"role": "assistant", "content": prior_final["content"]},
+        {
+            "role": "user",
+            "content": "The base moved. Verify the current repository on its selected base.",
+        },
+    ]
+
+    current_response = reply(model, messages)
+
+    assert current_response["stop_reason"] == "tool_use"
+    current_tool = current_response["content"][0]
+    assert current_tool["name"] == "Bash"
+    assert current_tool["id"] != prior_tool["id"]
+    assert model.observations() == prior_observations
+    messages.extend(
+        [
+            {"role": "assistant", "content": current_response["content"]},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": current_tool["id"],
+                        "is_error": False,
+                        "content": "C4_HEAD="
+                        + "b" * 40
+                        + '\nC4_TARGET=next\nC4_VALUE=VALUE = "factory"\n',
+                    }
+                ],
+            },
+        ]
+    )
+
+    current_final = reply(model, messages)
+
+    assert current_final["stop_reason"] == "end_turn"
+    assert current_final["content"][0]["text"].startswith("No changes needed:")
+    assert model.observations() == [
+        *prior_observations,
+        {
+            "tool": current_tool["id"],
+            "head": "b" * 40,
+            "target": "next",
+            "value": 'VALUE = "factory"',
+        },
+    ]
+
+
 def test_unissued_output_does_not_claim_a_checkout_observation(model: Any) -> None:
     model.mode("nochange")
     response = reply(
