@@ -47,8 +47,20 @@ def command(call):
 
 current = command(args)
 prior = [command(call) for call in calls[:-1]]
+fail_argv = os.environ.get("FAKE_DOCKER_FAIL_ARGV")
+if fail_argv and current == json.loads(fail_argv):
+    sys.stderr.write(os.environ.get("FAKE_DOCKER_FAIL_STDERR", ""))
+    raise SystemExit(int(os.environ.get("FAKE_DOCKER_FAIL_CODE", "1")))
 backing = ["postgres", "valkey", "clickhouse", "rustfs"]
-if current == ["wait", "rustfs-init"]:
+if current == ["config", "--services"]:
+    for name in [
+        "postgres", "valkey", "clickhouse", "rustfs", "rustfs-init", "rustfs-perms",
+        "ollama", "ollama-pull", "langfuse-worker", "langfuse-web",
+        "otel-collector-perms", "otel-collector", "curie-migrate", "curie-api",
+        "curie-ui", "curie-worker", "curie-dispatcher",
+    ]:
+        print(name)
+elif current == ["wait", "rustfs-init"]:
     # Compose 2.24.4 includes wait; it propagates the container exit status:
     # https://github.com/docker/compose/blob/v2.24.4/cmd/compose/wait.go
     raise SystemExit(23 if scenario == "bucket-failure" else 0)
@@ -145,7 +157,8 @@ def web(request: pytest.FixtureRequest) -> Iterator[tuple[str, list[tuple[str, s
 
 def _run(
     tmp_path: Path, web_url: str, *, scenario: str, worker_ready_after: int = 1,
-    start: bool = True, timeout: float = 10,
+    start: bool = True, timeout: float = 10, fail_argv: list[str] | None = None,
+    fail_stderr: str = "", fail_code: int = 1,
 ) -> tuple[subprocess.CompletedProcess[str], list[list[str]], list[str]]:
     fake_docker = tmp_path / "docker"
     fake_docker.write_text(FAKE_DOCKER)
@@ -161,6 +174,10 @@ def _run(
         "FAKE_DOCKER_STATE": str(state), "FAKE_DOCKER_SCENARIO": scenario,
         "FAKE_WORKER_READY_AFTER": str(worker_ready_after),
     }
+    if fail_argv is not None:
+        environment["FAKE_DOCKER_FAIL_ARGV"] = json.dumps(fail_argv)
+        environment["FAKE_DOCKER_FAIL_STDERR"] = fail_stderr
+        environment["FAKE_DOCKER_FAIL_CODE"] = str(fail_code)
     command = [sys.executable, str(READINESS), "--web-url", web_url,
                "--timeout-seconds", str(timeout), "--poll-interval-seconds", "0.01"]
     if start:
@@ -229,6 +246,10 @@ def _virtual_control(
         command = arguments[len(prefix):]
         calls.append(command)
         budgets.append(timeout)
+        if command == ["config", "--services"]:
+            return subprocess.CompletedProcess(
+                arguments, 0, stdout="langfuse-web\nlangfuse-worker\n", stderr="",
+            )
         if command[0] == "ps":
             assert command[:4] == ["ps", "--all", "--format", "json"]
             assert command[-1] in {"langfuse-web", "langfuse-worker"}
@@ -310,8 +331,79 @@ def test_readiness_failed_bucket_initialization_stops_web_and_worker_startup(
     assert not any("--force-recreate" in call or "exec" in call for call in calls)
     assert web[1] == []
     assert result.stderr.strip() == (
-        "Langfuse readiness Compose command failed (phase=bucket initialization, exit code=23)"
+        "Langfuse readiness Compose command failed "
+        "(phase=bucket initialization, exit code=23, cause=unclassified)"
     )
+
+
+_STARTUP_UP = ["up", "-d", "postgres", "valkey", "clickhouse", "rustfs", "rustfs-init"]
+
+
+def test_readiness_startup_image_pull_names_the_single_service(
+    tmp_path: Path, web: tuple[str, list[tuple[str, str | None]]],
+) -> None:
+    result, _, _ = _run(
+        tmp_path, web[0], scenario="healthy", fail_argv=_STARTUP_UP,
+        fail_stderr="toomanyrequests: clickhouse",
+    )
+
+    assert result.returncode == 1
+    assert result.stderr.strip() == (
+        "Langfuse readiness Compose command failed "
+        "(phase=startup, exit code=1, cause=image-pull, service=clickhouse)"
+    )
+
+
+@pytest.mark.parametrize("stderr,cause", [
+    ("address already in use", "port-conflict"),
+    ("is already in use by container", "name-conflict"),
+    ("dependency failed to start", "dependency-failed"),
+    ("failed to create network", "network"),
+    ("no space left on device", "disk"),
+    ("boom", "unclassified"),
+])
+def test_readiness_startup_failure_reports_cause_category(
+    tmp_path: Path, web: tuple[str, list[tuple[str, str | None]]],
+    stderr: str, cause: str,
+) -> None:
+    result, _, _ = _run(
+        tmp_path, web[0], scenario="healthy", fail_argv=_STARTUP_UP, fail_stderr=stderr,
+    )
+
+    assert result.returncode == 1
+    assert f"cause={cause}" in result.stderr
+
+
+def test_readiness_startup_failure_withholds_compose_output_details(
+    tmp_path: Path, web: tuple[str, list[tuple[str, str | None]]],
+) -> None:
+    result, _, _ = _run(
+        tmp_path, web[0], scenario="healthy", fail_argv=_STARTUP_UP,
+        fail_stderr=(
+            "toomanyrequests: clickhouse not-a-real-secret-value logs.example.internal"
+        ),
+    )
+
+    assert result.returncode == 1
+    assert result.stderr.strip() == (
+        "Langfuse readiness Compose command failed "
+        "(phase=startup, exit code=1, cause=image-pull, service=clickhouse)"
+    )
+    assert "not-a-real-secret-value" not in result.stderr
+    assert "logs.example.internal" not in result.stderr
+
+
+def test_readiness_startup_failure_omits_service_when_output_names_two(
+    tmp_path: Path, web: tuple[str, list[tuple[str, str | None]]],
+) -> None:
+    result, _, _ = _run(
+        tmp_path, web[0], scenario="healthy", fail_argv=_STARTUP_UP,
+        fail_stderr="toomanyrequests: clickhouse rustfs",
+    )
+
+    assert result.returncode == 1
+    assert "cause=image-pull" in result.stderr
+    assert "service=" not in result.stderr
 
 
 @pytest.mark.parametrize("web", [401, 403], indirect=True)
