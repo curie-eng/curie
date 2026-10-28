@@ -39,6 +39,11 @@ they are not substitutes for a supported quickstart.
   structure and manual coverage and dependency mapping.
 - [Review factory PRs](guides/factory-pr-review.md): inspect changes, run local
   checks, and publish approved feedback or merge.
+
+## Administer Software Factory
+
+- [Factory repository environments](guides/factory-environments.md): local admin
+  skills for runner image setup and periodic analysis of failed work.
 - [Factory outcomes and costs](guides/measuring-factory-outcomes.md): evaluate
   completed work, estimated spend, and human review effort.
 
@@ -70,8 +75,6 @@ they are not substitutes for a supported quickstart.
 
 - [Administrator guide](administering-co-workers.md): access, approvals, model
   configuration, budgets, memory, inspection, and stopping work.
-- [Factory repository environments](guides/factory-environments.md): local admin
-  skills for runner image setup and periodic analysis of failed work.
 - [Approvals](approvals.md): route binding, approver authority, and resumed turns.
 - [Operations](operations.md): cluster installation, credentials, egress, factory
   operation, upgrades, and operational limits.
