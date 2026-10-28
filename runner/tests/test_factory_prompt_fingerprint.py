@@ -259,6 +259,18 @@ def test_task_notification_preserves_the_baseline_without_recapturing(
     assert c.run.dispatch("UserPromptSubmit", prompt=c.helpers._TASK_NOTIFICATION) == [None]
     assert c.state() == before
     assert c.calls() == calls
+    denied = c.run.pre(
+        "Agent",
+        {
+            "subagent_type": c.helpers.DIFF,
+            "description": "diff-reviewer",
+            "prompt": "Review the diff",
+        },
+    )
+    assert denied is not None
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert c.state() == before
+    c.case("healthy")
     assert "APPROVED" in c.run.review(c.helpers.DIFF, "APPROVE")
 
 
@@ -270,5 +282,21 @@ def test_ci_fix_round_needs_no_initial_fingerprint(capture_run: CaptureRun) -> N
     assert c.helpers.contract() in c.helpers.context_of(context[0])
     assert c.calls() == 0
     assert c.state()["stage"] == "implement"
+    assert c.state()["fingerprint"] is None
     assert c.plan()["permissionDecision"] == "deny"
+    denied = c.run.pre(
+        "Agent",
+        {
+            "subagent_type": c.helpers.DIFF,
+            "description": "diff-reviewer",
+            "prompt": "Review the diff",
+        },
+    )
+    assert denied is not None
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert c.state()["diff"]["round"] == 0
+    assert c.state()["stopped"] is None
+    assert c.state()["fingerprint"] is None
+    c.case("healthy")
     assert "APPROVED" in c.run.review(c.helpers.DIFF, "APPROVE")
+    assert c.state()["fingerprint"] is None

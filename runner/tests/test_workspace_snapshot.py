@@ -89,6 +89,42 @@ def test_snapshot_captures_staged_unstaged_untracked_and_binary_changes(
     _git(clean, "apply", "--check", "--binary", str(patch_file))
 
 
+def test_publication_snapshot_ignores_ignored_and_captures_untracked_mode(
+    snapshot: Any, tmp_path: Path
+) -> None:
+    repo, _ = _repo(tmp_path)
+    (repo / ".gitignore").write_text("ignored/\n")
+    _git(repo, "add", ".gitignore")
+    _git(
+        repo,
+        "-c",
+        "user.name=Curie Test",
+        "-c",
+        "user.email=curie@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "Ignore ignored",
+    )
+    clean = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO, **TRUSTED)
+    (repo / "ignored").mkdir()
+    (repo / "ignored" / "local.txt").write_text("not published\n")
+    ignored = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO, **TRUSTED)
+    assert ignored.patch == clean.patch
+    assert ignored.changed_paths == clean.changed_paths
+
+    untracked = repo / "new.py"
+    untracked.write_bytes(b"print(1)\n")
+    untracked.chmod(0o644)
+    plain = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO, **TRUSTED)
+    untracked.chmod(0o755)
+    executable = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO, **TRUSTED)
+    assert plain.changed_paths == ("new.py",)
+    assert executable.changed_paths == ("new.py",)
+    assert executable.patch != plain.patch
+    assert b"100755" in executable.patch
+
+
 @pytest.mark.parametrize("prefix", ["", "/forge"])
 def test_snapshot_accepts_a_ghes_origin_named_by_the_boot_env(
     snapshot: Any, tmp_path: Path, prefix: str
