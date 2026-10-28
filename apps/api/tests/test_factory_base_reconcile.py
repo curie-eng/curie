@@ -404,6 +404,7 @@ def transition_case(
                 wait_deadline=datetime.now(UTC)
                 + (timedelta(seconds=-1) if wait_expired else timedelta(hours=1)),
                 objective="Continue after the selected base changes",
+                base_settle_until=datetime.now(UTC) - timedelta(seconds=1),
                 requester="gitlab:31:developer",
                 reply_kind="gitlab",
                 reply_address=REPO,
@@ -1405,6 +1406,7 @@ def test_return_to_the_recorded_base_queues_after_preparation_and_eventually_mov
 ) -> None:
     from curie_api import workitems
     from curie_api.workitem_dispatch import AcquireGrant, DispatchConflict
+    from curie_api.workitems.lifecycle import admit_pending_readmit
 
     case = transition_case
     before_lineage = case.identities()[1]
@@ -1433,7 +1435,7 @@ def test_return_to_the_recorded_base_queues_after_preparation_and_eventually_mov
     assert case.retargets == [{"target_branch": "next"}]
 
     async def admit_queued(session: AsyncSession) -> Any:
-        return await workitems.admit_pending_readmit(
+        return await admit_pending_readmit(
             session,
             work_item_id=case.work_item_id,
             wait_deadline=datetime.now(UTC) + timedelta(hours=1),

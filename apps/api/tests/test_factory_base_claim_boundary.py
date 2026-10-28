@@ -48,11 +48,14 @@ def _lineage(number: int) -> dict[str, Any]:
 
 
 def _running_pull(client: Any, github: Any, number: int, pr: int) -> uuid.UUID:
+    from test_factory_base_ci_subject import _acknowledge_publication_history
+
     admitted = _labelled(client, github, number)
     assert admitted.json()["status"] == "factory_admitted", admitted.text
     request_id = _requests(number)[0]["id"]
     _start_running(client, request_id)
     _attach_publication(_item(number)["id"], status="succeeded", pr=pr)
+    _acknowledge_publication_history(client, {"id": request_id})
     return request_id
 
 
@@ -405,3 +408,171 @@ def test_headless_publication_or_uncertain_remote_state_prevents_a_base_restart(
             item["base_commit"],
         )
         assert _lineage(number) == before_lineage
+
+
+
+def _reserve_lineage_review(client: Any, number: int, original_request: uuid.UUID) -> uuid.UUID:
+    item = _item(number)
+    (facts,) = _rows(
+        "SELECT l.deployment_id, w.conversation_id, r.reply_conversation_id, "
+        "b.id AS binding_id, b.generation FROM curie.work_items w "
+        "JOIN curie.thread_publication_lineages l ON l.id = w.publication_lineage_id "
+        "JOIN curie.execution_requests r ON r.id = :request "
+        "JOIN curie.agent_channels b ON b.agent_id = w.agent_id "
+        "AND b.kind = 'github' AND b.address = :repo WHERE w.id = :id",
+        {"id": item["id"], "request": original_request, "repo": REPO},
+    )
+    selected = client.post(
+        f"/v1/internal/workspaces/{facts['deployment_id']}/selection",
+        headers=WORKER,
+        json={
+            "conversation_id": facts["conversation_id"],
+            "author": "U0REQUEST1",
+            "repo_full_name": REPO,
+        },
+    )
+    assert selected.status_code == 200, selected.text
+    _execute(
+        "UPDATE curie.thread_publication_lineages SET binding_id = :binding, "
+        "binding_generation = :generation, reply_conversation_id = :conversation, "
+        "version = version + 1 WHERE id = :id",
+        {
+            "id": _lineage(number)["id"],
+            "binding": facts["binding_id"],
+            "generation": facts["generation"],
+            "conversation": facts["reply_conversation_id"],
+        },
+    )
+    reserved = client.post(
+        "/v1/internal/publications/review-reservations",
+        headers=WORKER,
+        json={
+            "repository_id": REPO_ID,
+            "pr_number": _lineage(number)["pr_number"],
+            "expected_lineage_version": _lineage(number)["version"],
+            "origin_key": f"review:base-authority:{uuid.uuid4()}",
+        },
+    )
+    assert reserved.status_code == 201, reserved.text
+    return uuid.UUID(reserved.json()["revision_id"])
+
+
+@pytest.mark.parametrize("authority", ["approval", "review"])
+def test_a_stale_base_acquisition_cannot_supersede_current_lineage_authority(
+    admitted: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    authority: str,
+) -> None:
+    from test_factory_base_ci_subject import _acknowledge_publication_history
+    from test_factory_ci_wait import _attach_fix
+    from test_factory_terminus import _published_issue
+
+    client, github, sink = admitted
+    _train(monkeypatch, tmp_path, client)
+    sink.by_path = True
+    number, _pr, original = _published_issue(client, github, sink)
+    _acknowledge_publication_history(client, original)
+    selected = _labelled(client, github, number, "base:next")
+    assert selected.status_code == 200, selected.text
+    old = _requests(number)[-1]
+    assert old["status"] == "waiting"
+    before_lineage = _lineage(number)
+    if authority == "approval":
+        publication_id = _attach_fix(
+            original["work_item_id"],
+            original["id"],
+            revision=2,
+            head_sha=before_lineage["head_sha"],
+            base_sha=before_lineage["base_sha"],
+            title="Verify the current base",
+            paths=["README.md"],
+            status="pending",
+        )
+        _execute(
+            "UPDATE curie.approvals SET status = 'pending' WHERE id = "
+            "(SELECT approval_id FROM curie.publications WHERE id = :id)",
+            {"id": publication_id},
+        )
+        authority_sql = (
+            "SELECT a.status, a.resolved_at, a.resolved_by FROM curie.approvals a "
+            "JOIN curie.publications p ON p.approval_id = a.id WHERE p.id = :id"
+        )
+        authority_id = publication_id
+        superseded_status = "rejected"
+    else:
+        authority_id = _reserve_lineage_review(client, number, original["id"])
+        authority_sql = (
+            "SELECT status, version FROM curie.publication_review_reservations WHERE id = :id"
+        )
+        superseded_status = "cancelled"
+    before_authority = _rows(authority_sql, {"id": authority_id})
+    assert before_authority[0]["status"] == ("pending" if authority == "approval" else "reserved")
+    payload = _acquire_body(number, owner="factory-owner")
+
+    async def race() -> httpx.Response:
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def forge(request: httpx.Request) -> httpx.Response:
+            if request.url.path == f"/repos/{REPO}/git/ref/heads/next":
+                entered.set()
+                await release.wait()
+            return github.handle(request)
+
+        previous = client.app.state.http_client
+        async with httpx.AsyncClient(transport=httpx.MockTransport(forge)) as external:
+            client.app.state.http_client = external
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
+                ) as api:
+                    acquiring = asyncio.create_task(
+                        api.post(
+                            f"/v1/internal/work-items/requests/{old['id']}/acquire",
+                            headers=WORKER,
+                            json=payload,
+                        )
+                    )
+                    try:
+                        await asyncio.wait_for(entered.wait(), 5)
+                        github.labels = [LABEL, "base:main"]
+                        github.advance_label_event(number)
+                        body = json.dumps(
+                            _issue_event("labeled", number, label={"name": LABEL})
+                        ).encode()
+                        replaced = await asyncio.wait_for(
+                            api.post(
+                                "/github/webhook",
+                                content=body,
+                                headers={
+                                    "X-GitHub-Delivery": str(uuid.uuid4()),
+                                    "X-GitHub-Event": "issues",
+                                    "X-Hub-Signature-256": _signature(body),
+                                    "Content-Type": "application/json",
+                                },
+                            ),
+                            5,
+                        )
+                        assert replaced.status_code == 200, replaced.text
+                    finally:
+                        release.set()
+                    return await asyncio.wait_for(acquiring, 5)
+            finally:
+                client.app.state.http_client = previous
+
+    stale = client.portal.call(race)
+
+    assert stale.status_code == 409, stale.text
+    assert _requests(number)[-1]["id"] != old["id"]
+    assert _rows(authority_sql, {"id": authority_id}) == before_authority
+    assert _lineage(number)["base_ref"] == "main"
+    current = _acquire(client, number)
+    assert current.status_code == 200, current.text
+    assert _rows(authority_sql, {"id": authority_id}) == before_authority
+
+    healthy = _labelled(client, github, number, "base:next")
+    assert healthy.status_code == 200, healthy.text
+    superseding = _acquire(client, number)
+
+    assert superseding.status_code == 409, superseding.text
+    assert _rows(authority_sql, {"id": authority_id})[0]["status"] == superseded_status
