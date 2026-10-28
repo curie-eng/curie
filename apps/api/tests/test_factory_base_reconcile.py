@@ -478,6 +478,32 @@ def _reach_phase(case: TransitionCase, phase: str) -> dict[str, Any]:
     pytest.fail(f"healthy durable base move did not reach {phase}")
 
 
+def _readmit_factory_marking(case: TransitionCase, successor: uuid.UUID) -> Any:
+    from curie_api.workitem_dispatch import Admission, readmit
+
+    async def admit(session: AsyncSession) -> Any:
+        item = await session.get(WorkItem, case.work_item_id)
+        assert item is not None
+        return await readmit(
+            session,
+            Admission(
+                agent_id=case.agent_id,
+                kind="gitlab",
+                address=REPO,
+                reply_conversation_id="issue-7",
+                issue=item.tracker_issue,
+                repository=item.repository,
+                code_host_installation_id=item.code_host_installation_id,
+                objective="Continue after a fresh factory marking",
+                requester="gitlab:31:developer",
+                request_id=successor,
+                trigger_label="factory",
+            ),
+        )
+
+    return database(admit)
+
+
 def test_durable_move_commits_each_candidate_before_its_remote_effect_and_keeps_history(
     transition_case: TransitionCase,
 ) -> None:
@@ -1060,6 +1086,99 @@ def test_relabel_during_a_leased_prepared_push_queues_the_successor_without_inva
     assert case.identities()[1]["head_sha"] == applied["verification_head_sha"]
     assert case.remote.pushes == 2
     assert case.retargets == [{"target_branch": "next"}]
+
+
+def test_factory_marking_during_a_leased_prepared_push_queues_the_successor(
+    transition_case: TransitionCase,
+) -> None:
+    from curie_api.workitem_dispatch import WorkItemOutcome
+
+    case = transition_case
+    prepared = _reach_phase(case, "prepared")
+    successor = uuid.uuid4()
+    observed: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], Any]] = []
+
+    def readmit_before_receive() -> None:
+        case.record_receive()
+        if len(case.before_push) != 1:
+            return
+        before = case.row()
+        result = _readmit_factory_marking(case, successor)
+        observed.append((before, case.row(), case.identities()[0], result))
+
+    case.remote.before_receive = readmit_before_receive
+    try:
+        case.tick()
+    finally:
+        case.remote.before_receive = case.record_receive
+
+    assert len(observed) == 1
+    before, after, item, result = observed[0]
+    assert case.graph.head() == prepared["rebased_head_sha"]
+    assert before["phase"] == "prepared"
+    assert before["owner"] is not None
+    assert before["lease_expires_at"] > datetime.now(UTC)
+    assert after["phase"] == "prepared"
+    assert after["owner"] == before["owner"]
+    assert after["version"] == before["version"]
+    assert item["readmit_request_id"] == successor
+    assert item["readmit_objective"] == "Continue after a fresh factory marking"
+    assert item["trigger_label"] == "factory"
+    assert isinstance(result, WorkItemOutcome), result
+    assert result.request is not None
+    assert (result.request.id, result.request.status) == (case.request_id, "waiting")
+
+    applied = case.finish()
+
+    assert applied["request_id"] == case.request_id
+    assert applied["target_base_ref"] == "next"
+    assert case.identities()[0]["readmit_request_id"] == successor
+    assert case.identities()[0]["base_branch"] == "next"
+    assert case.identities()[1]["head_sha"] == applied["verification_head_sha"]
+    assert case.remote.pushes == 2
+    assert case.retargets == [{"target_branch": "next"}]
+
+
+def test_factory_marking_supersedes_an_unwritten_pending_transition(
+    transition_case: TransitionCase,
+) -> None:
+    from curie_api.workitem_dispatch import WorkItemOutcome
+
+    case = transition_case
+    before = case.row()
+    before_lineage = case.identities()[1]
+    successor = uuid.uuid4()
+
+    result = _readmit_factory_marking(case, successor)
+
+    assert before["phase"] == "pending"
+    assert isinstance(result, WorkItemOutcome), result
+    assert result.request is not None
+    assert (result.request.id, result.request.status) == (successor, "waiting")
+    operation = case.row()
+    assert operation["phase"] == "refused"
+    assert operation["error_code"] == "selection_superseded"
+    assert operation["owner"] is None
+    assert operation["lease_expires_at"] is None
+    assert operation["version"] == before["version"] + 1
+
+    async def requests(session: AsyncSession) -> list[tuple[uuid.UUID, str]]:
+        rows = await session.execute(
+            text(
+                "SELECT id, status FROM curie.execution_requests "
+                "WHERE work_item_id = :id ORDER BY sequence"
+            ),
+            {"id": case.work_item_id},
+        )
+        return [(row.id, row.status) for row in rows]
+
+    assert database(requests) == [(case.request_id, "cancelled"), (successor, "waiting")]
+    assert case.identities()[0]["readmit_request_id"] is None
+    assert case.identities()[1] == before_lineage
+    assert case.graph.head() == case.graph.source
+    assert case.target == "main"
+    assert case.remote.pushes == 0
+    assert not case.retargets
 
 
 @pytest.mark.parametrize(
