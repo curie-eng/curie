@@ -66,6 +66,47 @@ def _acquire(client: Any, number: int) -> Any:
     )
 
 
+def _attach_empty_lineage(item: dict[str, Any]) -> None:
+    _open_lineage(item["id"])
+    _execute(
+        "UPDATE curie.thread_publication_lineages SET head_sha = NULL, pr_number = NULL, "
+        "pr_url = NULL, base_sha = :base WHERE id = "
+        "(SELECT publication_lineage_id FROM curie.work_items WHERE id = :item)",
+        {"base": item["base_commit"], "item": item["id"]},
+    )
+
+
+def _observe_base_label(client: Any, number: int, forge: Any) -> httpx.Response:
+    async def exercise() -> httpx.Response:
+        original = client.app.state.http_client
+        async with httpx.AsyncClient(transport=httpx.MockTransport(forge)) as external:
+            client.app.state.http_client = external
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
+                ) as api:
+                    body = json.dumps(
+                        _issue_event("labeled", number, label={"name": "base:next"})
+                    ).encode()
+                    return await asyncio.wait_for(
+                        api.post(
+                            "/github/webhook",
+                            content=body,
+                            headers={
+                                "X-GitHub-Delivery": str(uuid.uuid4()),
+                                "X-GitHub-Event": "issues",
+                                "X-Hub-Signature-256": _signature(body),
+                                "Content-Type": "application/json",
+                            },
+                        ),
+                        5,
+                    )
+            finally:
+                client.app.state.http_client = original
+
+    return client.portal.call(exercise)
+
+
 def test_an_open_pull_request_keeps_its_running_request_when_the_base_label_changes(
     admitted: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -224,65 +265,32 @@ def test_an_empty_lineage_is_rechecked_after_the_external_branch_read(
     request_id = _requests(number)[0]["id"]
     _start_running(client, request_id)
     item = _item(number)
-    _open_lineage(item["id"])
-    _execute(
-        "UPDATE curie.thread_publication_lineages SET head_sha = NULL, pr_number = NULL, "
-        "pr_url = NULL, base_sha = :base WHERE id = "
-        "(SELECT publication_lineage_id FROM curie.work_items WHERE id = :item)",
-        {"base": item["base_commit"], "item": item["id"]},
-    )
+    _attach_empty_lineage(item)
     before_lineage = _lineage(number)
     github.labels = [LABEL, "base:next"]
     branch_reads: list[str] = []
 
-    async def exercise() -> httpx.Response:
-        async def forge(request: httpx.Request) -> httpx.Response:
-            if request.url.path == f"/repos/{REPO}/git/ref/heads/{before_lineage['branch']}":
-                branch_reads.append(request.url.path)
-                if publication_wins:
-                    engine = create_async_engine(get_settings().database_url)
-                    try:
-                        async with asyncio.timeout(5), engine.begin() as connection:
-                            await connection.execute(
-                                text(
-                                    "UPDATE curie.thread_publication_lineages "
-                                    "SET head_sha = :head, version = version + 1 WHERE id = :id"
-                                ),
-                                {"head": "6" * 40, "id": before_lineage["id"]},
-                            )
-                    finally:
-                        await engine.dispose()
-                # https://docs.github.com/en/rest/git/refs#get-a-reference
-                return httpx.Response(404, json={"message": "Not Found"})
-            return github.handle(request)
+    async def forge(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/repos/{REPO}/git/ref/heads/{before_lineage['branch']}":
+            branch_reads.append(request.url.path)
+            if publication_wins:
+                engine = create_async_engine(get_settings().database_url)
+                try:
+                    async with asyncio.timeout(5), engine.begin() as connection:
+                        await connection.execute(
+                            text(
+                                "UPDATE curie.thread_publication_lineages "
+                                "SET head_sha = :head, version = version + 1 WHERE id = :id"
+                            ),
+                            {"head": "6" * 40, "id": before_lineage["id"]},
+                        )
+                finally:
+                    await engine.dispose()
+            # https://docs.github.com/en/rest/git/refs#get-a-reference
+            return httpx.Response(404, json={"message": "Not Found"})
+        return github.handle(request)
 
-        original = client.app.state.http_client
-        async with httpx.AsyncClient(transport=httpx.MockTransport(forge)) as external:
-            client.app.state.http_client = external
-            try:
-                async with httpx.AsyncClient(
-                    transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
-                ) as api:
-                    body = json.dumps(
-                        _issue_event("labeled", number, label={"name": "base:next"})
-                    ).encode()
-                    return await asyncio.wait_for(
-                        api.post(
-                            "/github/webhook",
-                            content=body,
-                            headers={
-                                "X-GitHub-Delivery": str(uuid.uuid4()),
-                                "X-GitHub-Event": "issues",
-                                "X-Hub-Signature-256": _signature(body),
-                                "Content-Type": "application/json",
-                            },
-                        ),
-                        5,
-                    )
-            finally:
-                client.app.state.http_client = original
-
-    changed = client.portal.call(exercise)
+    changed = _observe_base_label(client, number, forge)
 
     assert changed.status_code == 200, changed.text
     assert len(branch_reads) == 1
@@ -298,3 +306,93 @@ def test_an_empty_lineage_is_rechecked_after_the_external_branch_read(
     else:
         assert _requests(number) == [{"id": request_id, "status": "cancellation_requested"}]
         assert after_lineage == before_lineage
+
+
+@pytest.mark.parametrize("hold", ["approved_publication", "remote_head", "outage_then_absence"])
+def test_headless_publication_or_uncertain_remote_state_prevents_a_base_restart(
+    admitted: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    hold: str,
+) -> None:
+    client, github, _sink = admitted
+    _train(monkeypatch, tmp_path, client)
+    number = 32105
+    assert _labelled(client, github, number).json()["status"] == "factory_admitted"
+    request_id = _requests(number)[0]["id"]
+    _start_running(client, request_id)
+    item = _item(number)
+    if hold == "approved_publication":
+        _attach_publication(item["id"], status="approved", pr=None)
+        _execute(
+            "UPDATE curie.work_items w SET publication_lineage_id = p.lineage_id, "
+            "version = w.version + 1 FROM curie.publications p "
+            "WHERE w.id = :item AND p.execution_request_id = :request",
+            {"item": item["id"], "request": request_id},
+        )
+        _execute(
+            "UPDATE curie.publications SET terminal_at = NULL WHERE execution_request_id = :id",
+            {"id": request_id},
+        )
+    else:
+        _attach_empty_lineage(item)
+    before_lineage = _lineage(number)
+    authority_sql = (
+        "SELECT p.id, p.status, p.base_sha, p.lineage_id, p.terminal_at, "
+        "p.outcome_history_ready_at, a.status AS approval_status, a.resolved_at "
+        "FROM curie.publications p JOIN curie.approvals a ON a.id = p.approval_id "
+        "WHERE p.execution_request_id = :id"
+    )
+    authority = _rows(authority_sql, {"id": request_id})
+    if hold == "approved_publication":
+        (publication,) = authority
+        assert (publication["status"], publication["approval_status"]) == ("approved", "approved")
+    assert before_lineage["head_sha"] is before_lineage["pr_number"] is None
+    github.labels = [LABEL, "base:next"]
+    branch_status = {
+        "approved_publication": 404,
+        "remote_head": 200,
+        "outage_then_absence": 503,
+    }[hold]
+    branch_reads: list[int] = []
+
+    def forge(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/repos/{REPO}/git/ref/heads/{before_lineage['branch']}":
+            branch_reads.append(branch_status)
+            # https://docs.github.com/en/rest/git/refs#get-a-reference
+            if branch_status == 200:
+                return httpx.Response(
+                    200,
+                    json={
+                        "ref": f"refs/heads/{before_lineage['branch']}",
+                        "object": {"sha": "7" * 40},
+                    },
+                )
+            message = "Not Found" if branch_status == 404 else "Service Unavailable"
+            return httpx.Response(branch_status, json={"message": message})
+        return github.handle(request)
+
+    changed = _observe_base_label(client, number, forge)
+
+    assert changed.status_code == 200, changed.text
+    assert branch_reads == [branch_status]
+    assert _requests(number) == [{"id": request_id, "status": "running"}]
+    after_item = _item(number)
+    assert tuple(after_item[key] for key in ("base_branch", "base_source", "base_commit")) == tuple(
+        item[key] for key in ("base_branch", "base_source", "base_commit")
+    )
+    assert _lineage(number) == before_lineage
+    assert _rows(authority_sql, {"id": request_id}) == authority
+    if hold == "outage_then_absence":
+        branch_status = 404
+
+        healthy = _observe_base_label(client, number, forge)
+
+        assert healthy.status_code == 200, healthy.text
+        assert branch_reads == [503, 404]
+        assert _requests(number) == [{"id": request_id, "status": "cancellation_requested"}]
+        assert (_item(number)["base_branch"], _item(number)["base_commit"]) == (
+            item["base_branch"],
+            item["base_commit"],
+        )
+        assert _lineage(number) == before_lineage
