@@ -296,6 +296,21 @@ async def observe_base_labels(
     registry = forges_registry(settings)
     policy = work_item_policy(registry, item.tracker_issue, item.repository)
     choice = factory_base.choose_base(labels, factory_base.bases_for(policy), default_branch)
+    if (
+        item.base_branch is None
+        and item.cancelled_at is None
+        and (item.trigger_label is None or item.trigger_label in labels)
+    ):
+        intent = (
+            f"refusal\0{choice.code}\0{choice.reason}"
+            if isinstance(choice, factory_base.BaseRefusal)
+            else f"{choice.branch}\0{choice.source}"
+        )
+        fingerprint = hashlib.sha256(intent.encode()).hexdigest()
+        if item.base_selection_fingerprint != fingerprint:
+            item.base_selection_fingerprint = fingerprint
+            item.version += 1
+            await mark_status_comment_stale(session, item.id)
     if isinstance(choice, factory_base.BaseRefusal):
         issue, repository, installation = (
             item.tracker_issue,
