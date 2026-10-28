@@ -83,6 +83,9 @@ _GIT_SAFETY = (
     "core.untrackedCache=false",
     "-c",
     "core.splitIndex=false",
+    # Unescaped UTF-8 paths, so patch headers name files as the manifest does.
+    "-c",
+    "core.quotePath=false",
     "-c",
     "gc.auto=0",
 )
