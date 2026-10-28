@@ -83,7 +83,10 @@ def _sql(statement: str, **params: Any) -> list[dict[str, Any]]:
     return sql_dicts(statement, params)
 
 
-def _seed(*, agent_id: str | None = None, item_id: str | None = None) -> dict[str, Any]:
+def _seed(
+    *, agent_id: str | None = None, item_id: str | None = None, start_failed: bool = False,
+    lineage_closed: bool = False
+) -> dict[str, Any]:
     agent_id = agent_id or str(uuid.uuid4())
     item_id = item_id or str(uuid.uuid4())
     request_id = str(uuid.uuid4())
@@ -121,13 +124,23 @@ def _seed(*, agent_id: str | None = None, item_id: str | None = None) -> dict[st
         "execution_deadline, terminal_at, terminal_cause, version, runtime_owner, "
         "runtime_epoch, runtime_heartbeat_expires_at, dispatch_generation, "
         "execution_attempts) VALUES "
-        "(:id, :item, :sequence, 'failed', clock_timestamp() + interval '1 hour', "
-        "clock_timestamp() - interval '1 minute', clock_timestamp() + interval '1 hour', "
-        "clock_timestamp() - interval '1 second', 'runner_failed', 4, 'fixture-worker', "
-        "3, clock_timestamp() + interval '1 hour', 2, 1)",
+        "(:id, :item, :sequence, CASE WHEN :lineage_closed THEN 'cancelled' ELSE 'failed' END, "
+        "CASE WHEN :lineage_closed THEN NULL ELSE clock_timestamp() + interval '1 hour' END, "
+        "CASE WHEN :start_failed OR :lineage_closed THEN NULL "
+        "ELSE clock_timestamp() - interval '1 minute' END, "
+        "CASE WHEN :start_failed OR :lineage_closed THEN NULL "
+        "ELSE clock_timestamp() + interval '1 hour' END, "
+        "clock_timestamp() - interval '1 second', "
+        "CASE WHEN :lineage_closed THEN 'lineage_closed' "
+        "WHEN :start_failed THEN 'start_failed' ELSE 'runner_failed' END, "
+        "4, 'fixture-worker', "
+        "3, clock_timestamp() + interval '1 hour', 2, "
+        "CASE WHEN :start_failed OR :lineage_closed THEN 0 ELSE 1 END)",
         id=uuid.UUID(request_id),
         item=uuid.UUID(item_id),
         sequence=sequence,
+        start_failed=start_failed,
+        lineage_closed=lineage_closed,
     )
     _sql(
         "UPDATE curie.work_items SET next_sequence = :sequence WHERE id = :id",
@@ -441,21 +454,19 @@ def test_capture_refuses_ineligible_source_without_writes(
     recovery: None, client: Any, state: str
 ) -> None:
     _routes_exist(client)
-    source = _seed()
+    source = _seed(start_failed=state == "start_failed", lineage_closed=state == "lineage_closed")
     params = {"id": uuid.UUID(source["source_request_id"])}
     if state in {"running", "completed"}:
         _sql(
             "UPDATE curie.execution_requests SET status = :status, "
-            "terminal_at = CASE WHEN :status = 'running' THEN NULL ELSE terminal_at END, "
-            "terminal_cause = CASE WHEN :status = 'running' THEN NULL ELSE 'completed' END "
+            "terminal_at = CASE WHEN CAST(:status AS varchar) = 'running' THEN NULL "
+            "ELSE terminal_at END, "
+            "terminal_cause = CASE WHEN CAST(:status AS varchar) = 'running' THEN NULL "
+            "ELSE 'completed' END "
             "WHERE id = :id", status=state, **params,
         )
-    elif state == "start_failed":
-        _sql(
-            "UPDATE curie.execution_requests SET terminal_cause = 'start_failed', "
-            "started_at = NULL, execution_deadline = NULL, execution_attempts = 0 "
-            "WHERE id = :id", **params,
-        )
+    elif state in {"start_failed", "lineage_closed"}:
+        pass
     elif state in {"owner_lost", "execution_deadline", "issue_cancelled", "lineage_closed"}:
         status = {
             "owner_lost": "failed", "execution_deadline": "expired",
@@ -1055,7 +1066,85 @@ def test_agent_deletion_conflicts_until_recovery_collection_is_finalized(
     assert not _sql("SELECT 1 FROM curie.agents WHERE id = :id", id=uuid.UUID(source["agent_id"]))
 
 
-def test_recovery_candidate_cannot_serve_schema_before_0140(
+def test_reserved_capture_completes_after_source_heartbeat_expires(
+    recovery: None, client: Any
+) -> None:
+    _routes_exist(client)
+    source = _seed()
+    reservation = _reserved(client, source)
+    _sql(
+        "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
+        "clock_timestamp() - interval '1 second' WHERE id = :id",
+        id=uuid.UUID(source["source_request_id"]),
+    )
+    assert _sql(
+        "SELECT r.runtime_heartbeat_expires_at < clock_timestamp() AS heartbeat_expired, "
+        "c.capture_deadline > clock_timestamp() AS capture_valid "
+        "FROM curie.execution_requests r JOIN curie.workspace_recovery_checkpoints c "
+        "ON c.source_request_id = r.id WHERE c.id = :id",
+        id=uuid.UUID(reservation["checkpoint_id"]),
+    ) == [{"heartbeat_expired": True, "capture_valid": True}]
+    execution_before = _snapshot()["execution_requests"]
+
+    _completed(client, source, reservation)
+
+    assert str(_sql(
+        "SELECT last_good_checkpoint_id FROM curie.workspace_recovery_groups "
+        "WHERE work_item_id = :id", id=uuid.UUID(source["work_item_id"]),
+    )[0]["last_good_checkpoint_id"]) == reservation["checkpoint_id"]
+    reader = _reader(client, source, reservation)
+    assert {obj["kind"]: obj for obj in reader["objects"]} == {
+        obj["kind"]: obj for obj in reservation["objects"]
+    }
+    assert _snapshot()["execution_requests"] == execution_before
+    _release(client, reader)
+
+
+def test_reserved_reused_base_capture_fails_after_source_heartbeat_expires(
+    recovery: None, client: Any
+) -> None:
+    _routes_exist(client)
+    source = _seed()
+    first = _reserved(client, source)
+    _completed(client, source, first)
+    reservation = _reserved(client, source, reuse=True)
+    _sql(
+        "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
+        "clock_timestamp() - interval '1 second' WHERE id = :id",
+        id=uuid.UUID(source["source_request_id"]),
+    )
+    execution_before = _snapshot()["execution_requests"]
+
+    _fail(client, source, reservation)
+
+    assert _sql(
+        "SELECT status FROM curie.workspace_recovery_checkpoints WHERE id = :id",
+        id=uuid.UUID(reservation["checkpoint_id"]),
+    ) == [{"status": "tombstoned"}]
+    assert _sql(
+        "SELECT kind, status FROM curie.workspace_recovery_objects "
+        "WHERE checkpoint_id = :id ORDER BY kind",
+        id=uuid.UUID(reservation["checkpoint_id"]),
+    ) == [
+        {"kind": "manifest", "status": "tombstoned"},
+        {"kind": "patch", "status": "tombstoned"},
+    ]
+    assert str(_sql(
+        "SELECT last_good_checkpoint_id FROM curie.workspace_recovery_groups "
+        "WHERE work_item_id = :id", id=uuid.UUID(source["work_item_id"]),
+    )[0]["last_good_checkpoint_id"]) == first["checkpoint_id"]
+    claims = _claims(client)
+    assert {claim["key"] for claim in claims} == {
+        obj["key"] for obj in reservation["objects"]
+    }
+    for claim in claims:
+        _ok(_finalize(client, claim))
+    reader = _reader(client, source, first)
+    _release(client, reader)
+    assert _snapshot()["execution_requests"] == execution_before
+
+
+def test_recovery_candidate_cannot_serve_schema_before_0141(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     isolated_migration_db.at("0139")

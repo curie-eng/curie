@@ -98,6 +98,9 @@ def test_worker_client_preserves_complete_checkpoint_during_failed_capture_colle
         })
 
     _drive(client, exercise)
+    state = _snapshot()
+    assert state["workspace_recovery_readers"] == []
+    assert len(state["workspace_recovery_objects"]) == 3
 
 
 @pytest.mark.parametrize("refusal", ("credential", "runtime_epoch"))
