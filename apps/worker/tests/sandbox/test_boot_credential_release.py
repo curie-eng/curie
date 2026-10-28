@@ -6,6 +6,8 @@ import asyncio
 import multiprocessing
 import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -45,8 +47,9 @@ from curie_worker.sandbox.types import SandboxHandle, SubstrateConfig
 from redis.asyncio import Redis as AsyncRedis
 from redis.backoff import NoBackoff
 from redis.retry import Retry
-from sqlalchemy import make_url, text
+from sqlalchemy import event, make_url, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
 from .conftest import FakeSandboxClient
@@ -105,6 +108,9 @@ def credential_api(request: pytest.FixtureRequest) -> _CredentialAPI:
 
     asyncio.run(create_database())
     prefix = f"test:curie:credential-api:{uuid.uuid4().hex}"
+    from curie_api import identity_fence
+
+    patch.setattr(identity_fence, "FENCE_KEY", f"{prefix}:identity-fence")
     for name in tuple(os.environ):
         if name.startswith(("CURIE_SLACK_", "CURIE_OIDC_", "OTEL_")):
             patch.delenv(name)
@@ -391,39 +397,152 @@ def credential_case(
             ) == 0
 
     resources.callback(lambda: asyncio.run(remove_agent()))
-    headers = {"X-API-Key": credential_api.worker_config.api_key}
-    response = http.post(
-        "/agents",
-        headers=headers,
-        json={"name": agent_name, "channel": {"kind": "slack", "address": _CHANNEL}},
-    )
-    assert response.status_code == 201
-    agent = uuid.UUID(response.json()["id"])
-    deployment = ResolvedDeployment(
-        agent_id=agent,
-        agent_name=agent_name,
-        version_id=uuid.uuid4(),
-        version_label="v1",
-        bundle_ref=None,
-        max_usd_per_day=None,
-        max_output_tokens_per_run=None,
-    )
-    case = _CredentialCase(
-        credential_api, http, affinity, config, redis_client, resources, agent, deployment,
-        scoped_conversation_id("slack", _CHANNEL, uuid.uuid4().hex), {},
-    )
-    case.env = case.boot()
-    for url, value in (
-        (f"{case.env[_STATE_URL]}/notes/lifecycle", {"ready": True}),
-        (case.env[HISTORY_REF_ENV], [{"user": "earlier turn"}]),
-    ):
-        assert http.put(url, headers=headers, json={"value": value}).status_code == 200
-    case.check_reads(case.env)
-    return case
+    try:
+        headers = {"X-API-Key": credential_api.worker_config.api_key}
+        response = http.post(
+            "/agents",
+            headers=headers,
+            json={"name": agent_name, "channel": {"kind": "slack", "address": _CHANNEL}},
+        )
+        assert response.status_code == 201
+        agent = uuid.UUID(response.json()["id"])
+        deployment = ResolvedDeployment(
+            agent_id=agent,
+            agent_name=agent_name,
+            version_id=uuid.uuid4(),
+            version_label="v1",
+            bundle_ref=None,
+            max_usd_per_day=None,
+            max_output_tokens_per_run=None,
+        )
+        case = _CredentialCase(
+            credential_api,
+            http,
+            affinity,
+            config,
+            redis_client,
+            resources,
+            agent,
+            deployment,
+            scoped_conversation_id("slack", _CHANNEL, uuid.uuid4().hex),
+            {},
+        )
+        case.env = case.boot()
+        for url, value in (
+            (f"{case.env[_STATE_URL]}/notes/lifecycle", {"ready": True}),
+            (case.env[HISTORY_REF_ENV], [{"user": "earlier turn"}]),
+        ):
+            assert http.put(url, headers=headers, json={"value": value}).status_code == 200
+        case.check_reads(case.env)
+        return case
+    except BaseException:
+        resources.close()
+        raise
 
 
 class _CreatorInterrupted(BaseException):
     pass
+
+
+@pytest.fixture(scope="module")
+def competing_authority(request: pytest.FixtureRequest) -> str:
+    from curie_api import identity_fence
+
+    key = f"test:curie:credential-peer:{uuid.uuid4().hex}"
+    patch = pytest.MonkeyPatch()
+    request.addfinalizer(patch.undo)
+    patch.setattr(identity_fence, "FENCE_KEY", key)
+    client = redis.Redis(
+        host=os.environ.get("TEST_VALKEY_HOST", "127.0.0.1"),
+        port=os.environ.get("TEST_VALKEY_PORT", "26379"),
+        password=os.environ.get("TEST_VALKEY_PW", "valkeypass"),
+    )
+    request.addfinalizer(client.close)
+    request.addfinalizer(lambda: client.delete(key))
+    return key
+
+
+@pytest.mark.parametrize("shared_authority", [False, True])
+def test_credential_setup_isolates_writers_and_cleans_failed_commits(
+    request: pytest.FixtureRequest,
+    competing_authority: str,
+    shared_authority: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from curie_api import identity_fence
+
+    credential_api = request.getfixturevalue("credential_api")
+    committed = False
+
+    def competing_commit(session: Session) -> None:
+        nonlocal committed
+        if committed or session.bind is None:
+            return
+        if session.bind.engine.url.database != credential_api.engine.url.database:
+            return
+        committed = True
+        env = dict(os.environ)
+        env["DATABASE_URL"] = credential_api.engine.url.set(database="postgres").render_as_string(
+            hide_password=False
+        )
+        key = identity_fence.FENCE_KEY if shared_authority else competing_authority
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+import asyncio, sys
+from redis.asyncio import Redis
+from curie_api import identity_fence
+from curie_api.config import get_settings
+from curie_api.db import create_engine, create_sessionmaker
+from sqlalchemy import text
+
+async def main():
+    settings = get_settings()
+    engine = create_engine()
+    client = Redis(host=settings.valkey_host, port=settings.valkey_port,
+                   password=settings.valkey_password)
+    identity_fence.FENCE_KEY = sys.argv[1]
+    try:
+        async with identity_fence.mutation(create_sessionmaker(engine), client) as session:
+            await session.execute(text("SELECT 1"))
+            await session.commit()
+    finally:
+        await client.aclose()
+        await engine.dispose()
+
+asyncio.run(main())
+""",
+                key,
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, result.stderr
+        if shared_authority:
+            raise RuntimeError("forced setup interruption after agent commit")
+
+    event.listen(Session, "after_commit", competing_commit)
+    try:
+        if shared_authority:
+            with pytest.raises(AssertionError, match="500"):
+                request.getfixturevalue("credential_case")
+
+            async def remaining() -> int:
+                async with credential_api.engine.connect() as connection:
+                    return int(await connection.scalar(text("SELECT count(*) FROM curie.agents")))
+
+            assert asyncio.run(remaining()) == 0, "failed setup retained its committed agent"
+        else:
+            case = request.getfixturevalue("credential_case")
+            case.check_reads(case.env)
+            assert "identity_writer_unavailable" not in caplog.text
+        assert committed, "competing writer did not run after the credential agent commit"
+    finally:
+        event.remove(Session, "after_commit", competing_commit)
 
 
 @dataclass(repr=False)
