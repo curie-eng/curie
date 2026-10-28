@@ -9,6 +9,13 @@ decision 7 step 7's local-link identity source in explicitly selected HTTP mode
 and its active-principal requirement for the expressly migrated raw-entry
 exception. Other clauses and unmigrated local behavior remain unchanged.
 
+**Superseded in part by [ADR 0252](0252-http-identity-resolves-enterprise-grid-senders-in-their-organisation.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)),
+on the HTTP identity path only: decision 2's Slack kinds sentence (Slack gains
+`slack_enterprise`), decision 6's Enterprise Grid bullet (a Grid sender resolves
+in the organisation's namespace), and open question 1, settled for that path.
+Local links are unchanged.
+
 **Superseded in part by [ADR 0201](0201-provider-field-mappings-live-with-their-realization.md)**
 (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 in decision 6, the Slack list's field list ("the event's `user_team`, or an

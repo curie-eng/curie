@@ -22,6 +22,7 @@ serialize instead of interleaving:
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -33,7 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..channel_identities import check_attributes
 from ..models import ChannelIdentity, ProviderInstallation
 from .service import SLACK_WORKSPACE, find_or_create_namespace
-from .slack import AUTH_TEST_KEY
+from .slack import AUTH_TEST_KEY, SLACK_ENTERPRISE_KIND
 
 _LOG = logging.getLogger("curie_api.identity.attach")
 
@@ -160,6 +161,20 @@ async def report_slack_identity(
         kind=SLACK_WORKSPACE,
         key=team_id,
     )
+    if (
+        isinstance(enterprise_id, str) and is_enterprise_install is False
+        and re.fullmatch(r"E[A-Z0-9]{2,}", enterprise_id) is not None
+    ):
+        # A Grid workspace's home is also its organisation; only an operator
+        # registration names it. ADR 0252, @spec HTTP-INVOCATION-EXECUTION-21.
+        await find_or_create_namespace(
+            session,
+            tenant_id=tenant_id,
+            provider="slack",
+            authority="",
+            kind=SLACK_ENTERPRISE_KIND,
+            key=enterprise_id,
+        )
     result = SlackReportResult(
         identity_id=identity.id,
         provider_installation_id=identity.provider_installation_id,

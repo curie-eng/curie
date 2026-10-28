@@ -16,8 +16,10 @@ non-Grid workspace:
   an installation with positive non-Grid ``auth.test`` evidence, and only when
   it equals the receiving installation's team. That team is a consistency
   check, never a fallback.
-- **Any Enterprise Grid signal** refuses, on every path, since canonical ids
-  under Grid cannot be confirmed from these payloads.
+- **Any Enterprise Grid signal** refuses, on every path of ``derive``, since
+  canonical ids under Grid cannot be confirmed from these payloads. Only an
+  operator-registered HTTP receiver's Grid workspace path resolves Grid
+  senders, through ``derive_registered_sender`` (ADR 0252).
 
 The envelope ``team_id``, ``source_team``, ``authorizations`` and enterprise
 ids are never a sender team. Nothing is normalised: an id that differs only in
@@ -143,3 +145,76 @@ def derive(
     if team != installation_account:
         return NAMESPACE_CONFLICT
     return (team, user_id)
+
+
+SLACK_WORKSPACE_KIND = "slack_workspace"
+SLACK_ENTERPRISE_KIND = "slack_enterprise"
+# What the dispatcher's copier records for an organisation-wide install.
+ENTERPRISE_INSTALL_SIGNAL = "is_enterprise_install"
+
+
+def _derive_grid(
+    evidence: SlackEvidence, *, organisation: str, installation_account: str
+) -> tuple[str, str] | str:
+    """ADR 0252 decisions 5 and 6. @spec HTTP-INVOCATION-EXECUTION-21.
+
+    The context establishes the organisation; payload enterprise ids only
+    check it, and Grid team fields can name a workspace or the organisation.
+    """
+
+    user_id = evidence.user_id
+    if not user_id or not user_id.strip():
+        return SUBJECT_UNIDENTIFIED
+    signals = evidence.enterprise_ids
+    if not signals or ENTERPRISE_INSTALL_SIGNAL in signals:
+        return SUBJECT_UNIDENTIFIED
+    if any(signal != organisation for signal in signals):
+        return NAMESPACE_CONFLICT
+    if evidence.delivery in OBSERVED_EVENT_TEAM_DELIVERIES:
+        if evidence.is_ext_shared_channel is not False:
+            return SUBJECT_UNIDENTIFIED
+        return (organisation, user_id)
+    if evidence.delivery in INTERACTION_DELIVERIES:
+        team = evidence.interaction_user_team_id
+        if not team:
+            return SUBJECT_UNIDENTIFIED
+        if team != installation_account:
+            return NAMESPACE_CONFLICT
+        return (organisation, user_id)
+    return SUBJECT_UNIDENTIFIED
+
+
+def derive_registered_sender(
+    evidence: SlackEvidence,
+    *,
+    namespace_kind: str,
+    namespace_authority: str,
+    namespace_key: str,
+    installation_account: str,
+) -> tuple[str, str] | str:
+    """Return ``(namespace key, native id)`` for an operator-registered receiver.
+
+    @spec HTTP-INVOCATION-EXECUTION-21. An ordinary registration is exactly
+    :func:`derive` with positive non-Grid evidence for its own account; a Grid
+    workspace registration resolves in its organisation (ADR 0252).
+    """
+
+    if namespace_authority != "":
+        return SUBJECT_UNIDENTIFIED
+    if namespace_kind == SLACK_WORKSPACE_KIND:
+        if namespace_key != installation_account:
+            return SUBJECT_UNIDENTIFIED
+        return derive(
+            evidence,
+            identity_attributes={AUTH_TEST_KEY: {
+                "team_id": installation_account, "enterprise_id": None,
+                "is_enterprise_install": False,
+            }},
+            installation_authority=namespace_authority,
+            installation_account=installation_account,
+        )
+    if namespace_kind == SLACK_ENTERPRISE_KIND and namespace_key != installation_account:
+        return _derive_grid(
+            evidence, organisation=namespace_key, installation_account=installation_account,
+        )
+    return SUBJECT_UNIDENTIFIED

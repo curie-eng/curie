@@ -61,13 +61,21 @@ class HttpReceiverScopeV1(_Frozen):
     installation_account: codec.Identifier
     bot_user_id: codec.Identifier
 
+    @property
+    def grid(self) -> bool:
+        """A workspace installation inside an Enterprise Grid organisation (ADR 0252).
+
+        @spec HTTP-INVOCATION-EXECUTION-21.
+        """
+        return self.namespace.kind == "slack_enterprise"
+
     @model_validator(mode="after")
     def ordinary_workspace(self) -> Self:
-        """@spec HTTP-INVOCATION-EXECUTION-19."""
-        if (
-            self.namespace.authority != "" or self.namespace.kind != "slack_workspace"
-            or self.namespace.key != self.installation_account
-        ):
+        """@spec HTTP-INVOCATION-EXECUTION-19/21."""
+        namespace, account = self.namespace, self.installation_account
+        ordinary = namespace.kind == "slack_workspace" and namespace.key == account
+        grid = namespace.kind == "slack_enterprise" and namespace.key != account
+        if namespace.authority != "" or not (ordinary or grid):
             raise ValueError("invalid_http_receiver_scope")
         return self
 
@@ -106,15 +114,17 @@ _AMBIGUOUS = (
 
 
 def _qualified(scope: HttpReceiverScopeV1, client: WebClient) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-2/19."""
+    """@spec HTTP-INVOCATION-EXECUTION-2/19/21."""
     if not isinstance(client, WebClient):
         raise ValueError("invalid_http_receiver_runtime")
     observed = client.auth_test()
     report = auth_test_report(scope.channel_identity_name, observed)
     ids = bot_ids_from_auth_test(observed)
+    # A Grid workspace install reports its organisation; an ordinary one none.
+    organisation = scope.namespace.key if scope.grid else None
     if (
         report is None or ids is None or report["team_id"] != scope.installation_account
-        or ids.bot_user_id != scope.bot_user_id or report["enterprise_id"] is not None
+        or ids.bot_user_id != scope.bot_user_id or report["enterprise_id"] != organisation
         or report["is_enterprise_install"] is not False
     ):
         raise ValueError("invalid_http_receiver_runtime")

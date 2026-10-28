@@ -8,6 +8,12 @@ Accepted 2026-10-07 with maintainer approval from TheConnMan, recorded as an
 approving review on the publishing pull request
 ([#4048](https://github.com/curie-eng/curie/pull/4048)).
 
+**Superseded in part by [ADR 0252](0252-http-identity-resolves-enterprise-grid-senders-in-their-organisation.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)),
+on the HTTP identity path only: decision 2's Slack context and the standing
+commitment "Enterprise Grid users resolve per workspace" gain a second
+context, the Grid workspace installation.
+
 This ADR amends
 [ADR 0198](0198-identity-links-live-in-provider-identity-namespaces.md).
 

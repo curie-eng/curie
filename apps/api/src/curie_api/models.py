@@ -3716,7 +3716,9 @@ class RemediationReceiptPost(Base):
 class IdentityNamespace(Base):
     """Where a provider's user ids are unique, per tenant (#2910, ADR 0198 decision 1).
 
-    For Slack, one ``slack_workspace`` per team id. ``authority`` is always the
+    For Slack, one ``slack_workspace`` per team id, and one ``slack_enterprise``
+    per Grid organisation id for HTTP receivers (ADR 0252, @spec
+    HTTP-INVOCATION-EXECUTION-21). ``authority`` is always the
     receiving installation's, never the event's (ADR 0198 decision 6, property
     3). Disabling a namespace keeps its links; resolution into it answers
     ``namespace_disabled`` (decision 9).
@@ -3726,7 +3728,8 @@ class IdentityNamespace(Base):
     __table_args__ = (
         CheckConstraint(_PROVIDER_CK[:-1] + ", 'email')", name="identity_namespaces_provider_ck"),
         CheckConstraint(
-            "kind IN ('slack_workspace', 'email_domain')", name="identity_namespaces_kind_ck"
+            "kind IN ('slack_workspace', 'email_domain', 'slack_enterprise')",
+            name="identity_namespaces_kind_ck",
         ),
         CheckConstraint(
             "kind <> 'email_domain' OR (provider = 'email' AND key = lower(key) AND "
@@ -3737,6 +3740,10 @@ class IdentityNamespace(Base):
         CheckConstraint(
             "kind <> 'slack_workspace' OR (provider = 'slack' AND key ~ '^T[A-Z0-9]{2,}$')",
             name="identity_namespaces_slack_workspace_key_ck",
+        ),
+        CheckConstraint(
+            "kind <> 'slack_enterprise' OR (provider = 'slack' AND key ~ '^E[A-Z0-9]{2,}$')",
+            name="identity_namespaces_slack_enterprise_key_ck",
         ),
         CheckConstraint("length(key) > 0", name="identity_namespaces_key_ck"),
         UniqueConstraint(

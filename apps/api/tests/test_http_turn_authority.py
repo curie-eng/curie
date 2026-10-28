@@ -29,10 +29,10 @@ PATH = "/v1/internal/identity/turn-authority/check"
 
 @contextmanager
 def queued_invocation(
-    provider: SimpleNamespace, valkey: redis.Redis, stream: str,
+    provider: SimpleNamespace, valkey: redis.Redis, stream: str, *, grid: bool = False,
 ) -> Iterator[SimpleNamespace]:
-    """@spec HTTP-INVOCATION-EXECUTION-8/16: use ingress, never a test sealing oracle."""
-    scope = membership._scope(provider.url)
+    """@spec HTTP-INVOCATION-EXECUTION-8/16/21: use ingress, never a test sealing oracle."""
+    scope = membership._scope(provider.url, grid=grid)
     module = membership._runtime_api()
     identity_client = HttpIdentityClient(tls_context=provider.tls)
     try:
@@ -41,7 +41,11 @@ def queued_invocation(
             http_identity_client=identity_client,
         )) as client:
             credential = membership._credential(client, scope)
-            accepted = membership._post(client, credential, *membership._submission(scope))
+            submission = (
+                membership._submission(scope, slack=membership._grid_evidence())
+                if grid else membership._submission(scope)
+            )
+            accepted = membership._post(client, credential, *submission)
             assert accepted.status_code == 200, accepted.text
             entries = valkey.xrange(stream)
             assert len(entries) == 1

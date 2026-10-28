@@ -54,6 +54,9 @@ SENDER = "U0EXAMPLE1"
 BEARER = "SyntheticIngressProviderBearer"
 SUBJECT = "SyntheticIngressSubject"
 GROUP = "SyntheticRequiredGroup"
+# @spec HTTP-INVOCATION-EXECUTION-21: synthetic Grid organisation and workspace.
+GRID_ORG = "E0EXAMPLEORG"
+GRID_WORKSPACE = "T0EXAMPLEHOME"
 
 
 def _transport_harness() -> ModuleType:
@@ -164,9 +167,12 @@ def _runtime_api() -> ModuleType:
     return module
 
 
-def _scope(endpoint: str) -> dict[str, Any]:
-    """@spec HTTP-INVOCATION-EXECUTION-4/5/15: real adopted scope, no legacy projections."""
+def _scope(endpoint: str, *, grid: bool = False) -> dict[str, Any]:
+    """@spec HTTP-INVOCATION-EXECUTION-4/5/15/21: real adopted scope, no legacy projections."""
+    account = GRID_WORKSPACE if grid else ACCOUNT
+    kind, key = ("slack_enterprise", GRID_ORG) if grid else ("slack_workspace", ACCOUNT)
     scope: dict[str, Any] = {
+        "account": account,
         "address": "C" + uuid.uuid4().hex[:12].upper(),
         "receiver_id": str(uuid.uuid4()),
         "receiver_key": b"r" * 32,
@@ -188,15 +194,15 @@ def _scope(endpoint: str) -> dict[str, Any]:
                 tenant_id=tenant,
                 provider="slack",
                 authority="",
-                external_account_id=ACCOUNT,
+                external_account_id=account,
                 status="connected",
             )
             namespace = IdentityNamespace(
                 tenant_id=tenant,
                 provider="slack",
                 authority="",
-                kind="slack_workspace",
-                key=ACCOUNT,
+                kind=kind,
+                key=key,
                 status="active",
             )
             session.add_all([installation, namespace])
@@ -228,9 +234,7 @@ def _scope(endpoint: str) -> dict[str, Any]:
                 identity=str(identity.id),
                 installation=str(installation.id),
                 adapter=identity.name,
-                namespace=NamespaceV1(
-                    id=str(namespace.id), authority="", kind="slack_workspace", key=ACCOUNT
-                ),
+                namespace=NamespaceV1(id=str(namespace.id), authority="", kind=kind, key=key),
                 configuration=adopted.configuration,
             )
         async with factory() as session, session.begin():
@@ -267,7 +271,7 @@ def _runtime(module: ModuleType, scope: dict[str, Any]) -> Any:
         channel_identity_name=scope["adapter"],
         provider_installation_id=scope["installation"],
         namespace=scope["namespace"],
-        installation_account=ACCOUNT,
+        installation_account=scope["account"],
         bot_user_id="U0EXAMPLEBOT",
         binding_ids=(scope["binding"],),
         human_native_ids=(SENDER,),
@@ -585,6 +589,70 @@ def test_adopted_http_without_initialized_runtime_is_unavailable_before_lookup_o
         assert response.json() == {"detail": "identity_authority_unavailable"}
         assert synthetic_provider.requests == []
         assert _keys(valkey, scope["binding"]) == set() and valkey.xlen(runs_stream) == 0
+    finally:
+        keys = _keys(valkey, scope["binding"])
+        if keys:
+            valkey.delete(*keys)
+
+
+def _grid_evidence(**changes: Any) -> codec.ReceiverSlackEvidenceV1:
+    """@spec HTTP-INVOCATION-EXECUTION-21: a synthetic Grid mention from a sibling workspace."""
+    return codec.ReceiverSlackEvidenceV1.model_validate({
+        "delivery": "app_mention", "user_id": SENDER, "event_user_team": "T0EXAMPLESIBLING",
+        "event_team": GRID_WORKSPACE, "interaction_user_team_id": None,
+        "is_ext_shared_channel": False, "enterprise_ids": (GRID_ORG,), **changes,
+    })
+
+
+def test_grid_workspace_member_queues_one_organisation_context_and_outsiders_refuse(
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    synthetic_provider: SimpleNamespace,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-2/15/21: synthetic Grid ids; no live Grid qualified."""
+    provider = synthetic_provider
+    scope = _scope(provider.url, grid=True)
+    module = _runtime_api()
+    try:
+        with TestClient(
+            create_app(
+                http_identity_runtime=_runtime(module, scope),
+                http_identity_client=HttpIdentityClient(tls_context=provider.tls),
+            )
+        ) as client:
+            token = _credential(client, scope)
+            for refused in (
+                {"is_ext_shared_channel": True},
+                {"is_ext_shared_channel": None},
+                {"enterprise_ids": ()},
+                {"enterprise_ids": ("E0EXAMPLEPARTNER",)},
+                {"enterprise_ids": (GRID_ORG, "is_enterprise_install")},
+            ):
+                submission = _submission(scope, slack=_grid_evidence(**refused))
+                response = _post(client, token, *submission)
+                assert response.status_code == 401, refused
+                assert response.json() == {"detail": "invalid_http_receiver"}
+            assert provider.requests == []
+            assert _keys(valkey, scope["binding"]) == set() and valkey.xlen(runs_stream) == 0
+            accepted = _post(client, token, *_submission(scope, slack=_grid_evidence()))
+            assert accepted.status_code == 200, accepted.text
+            (entry,) = valkey.xrange(runs_stream)
+            ring = codec.build_identity_keyring(
+                "context", (("synthetic-context", 1, scope["context_key"]),)
+            )
+            context = codec.open_invocation_context(entry[1]["curie_identity_context_v1"], ring)
+            assert isinstance(context, codec.InvocationContextV1)
+            organisation = {
+                "id": scope["namespace"].id, "authority": "", "kind": "slack_enterprise",
+                "key": GRID_ORG,
+            }
+            assert context.scope.namespace.model_dump() == organisation
+            assert context.scope.native_id == SENDER
+            (observed,) = provider.requests
+            assert observed["scope"]["sender"]["namespace"] == organisation
+            assert observed["scope"]["sender"]["native_id"] == SENDER
+            assert QueuedTurn.model_validate_json(entry[1]["payload"]).author == SENDER
     finally:
         keys = _keys(valkey, scope["binding"])
         if keys:

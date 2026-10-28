@@ -584,3 +584,117 @@ def test_namespace_registration_refuses_scope_outside_initial_ordinary_workspace
     with pytest.raises(ValueError):
         rig.runtime(module, scope=module.HttpReceiverScopeV1.model_validate(value))
     assert rig.requests == []
+
+
+GRID_ORG = "E0EXAMPLEORG"
+GRID_WORKSPACE = "T0EXAMPLEHOME"
+GRID_CHANNEL = "C0EXAMPLEGRIDCHANNEL"
+GRID_SENDER = "W0EXAMPLEPERSON"
+
+
+def grid_scope_body(**changes: Any) -> dict[str, Any]:
+    """@spec HTTP-INVOCATION-EXECUTION-21: a synthetic Grid workspace registration."""
+    return scope_body(**{
+        "namespace": {
+            "id": NAMESPACE, "authority": "", "kind": "slack_enterprise", "key": GRID_ORG,
+        },
+        "installation_account": GRID_WORKSPACE,
+        **changes,
+    })
+
+
+def grid_auth(**changes: Any) -> dict[str, Any]:
+    """@spec HTTP-INVOCATION-EXECUTION-21: synthetic workspace-install auth.test answer."""
+    return {
+        "ok": True, "team_id": GRID_WORKSPACE, "user_id": BOT, "bot_id": "B1",
+        "enterprise_id": GRID_ORG, "is_enterprise_install": False, **changes,
+    }
+
+
+def grid_native() -> tuple[dict[str, Any], dict[str, Any]]:
+    """@spec HTTP-INVOCATION-EXECUTION-21: synthetic Grid mention envelope."""
+    event = {
+        "type": "app_mention", "channel": GRID_CHANNEL, "user": GRID_SENDER,
+        "text": "<@U0BOT> Hello synthetic organisation", "ts": "1700.0003",
+        "user_team": "T0EXAMPLESIBLING", "team": GRID_WORKSPACE,
+    }
+    return {
+        "type": "event_callback", "event_id": "EvNativeGridSynthetic",
+        "team_id": GRID_WORKSPACE, "enterprise_id": GRID_ORG,
+        "authorizations": [{
+            "enterprise_id": GRID_ORG, "team_id": GRID_WORKSPACE, "user_id": BOT,
+            "is_bot": True, "is_enterprise_install": False,
+        }],
+        "is_ext_shared_channel": False, "event": event,
+    }, event
+
+
+def test_grid_scope_accepts_only_the_workspace_inside_organisation_shape() -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-19/21."""
+    module = api()
+    scope = module.HttpReceiverScopeV1.model_validate(grid_scope_body())
+    assert scope.namespace.kind == "slack_enterprise" and scope.namespace.key == GRID_ORG
+    for namespace in (
+        {"id": NAMESPACE, "authority": "", "kind": "slack_enterprise", "key": GRID_WORKSPACE},
+        {"id": NAMESPACE, "authority": "https://slack.example.test", "kind": "slack_enterprise",
+         "key": GRID_ORG},
+        {"id": NAMESPACE, "authority": "", "kind": "slack_workspace", "key": GRID_ORG},
+        {"id": NAMESPACE, "authority": "", "kind": "slack_organisation", "key": GRID_ORG},
+    ):
+        with pytest.raises(ValueError):
+            module.HttpReceiverScopeV1.model_validate(grid_scope_body(namespace=namespace))
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        grid_auth(enterprise_id=None),
+        grid_auth(enterprise_id="E0EXAMPLEPARTNER"),
+        grid_auth(is_enterprise_install=True),
+        grid_auth(is_enterprise_install=None),
+        {key: value for key, value in grid_auth().items() if key != "is_enterprise_install"},
+        {key: value for key, value in grid_auth().items() if key != "enterprise_id"},
+        grid_auth(team_id="T0EXAMPLESIBLING"),
+        grid_auth(user_id="U0OTHER"),
+    ],
+)
+def test_grid_startup_requires_positive_workspace_install_evidence(auth: dict[str, Any]) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-19/21: organisation-wide installs stay refused."""
+    module = api()
+    rig = HttpRig(auth=auth)
+    scope = module.HttpReceiverScopeV1.model_validate(grid_scope_body())
+    with pytest.raises(ValueError, match="^invalid_http_receiver_runtime$") as error:
+        rig.runtime(module, scope=scope)
+    assert error.value.__cause__ is None
+    rig.web.auth_test.assert_called_once_with()
+    assert rig.requests == []
+
+
+def test_grid_mention_signs_every_enterprise_signal_for_the_api_to_check() -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-2/19/21: the copier is reused, not reinterpreted."""
+    module = api()
+    rig = HttpRig(auth=grid_auth())
+    runtime = rig.runtime(
+        module,
+        scope=module.HttpReceiverScopeV1.model_validate(grid_scope_body()),
+        bindings=(module.HttpReceiverBindingV1.model_validate(
+            binding_body(native_channel_id=GRID_CHANNEL)
+        ),),
+    )
+    rig.web.auth_test.assert_called_once_with()
+    body, event = grid_native()
+    result = runtime.submit(body=body, event=event, slack_identity=NAME, bot_user_id=BOT)
+    assert result.status == "accepted"
+    ring = codec.build_identity_keyring("receiver", ((RECEIVER, 2, KEY),))
+    proof = codec.verify_receiver_proof(rig.requests[0].headers["X-Curie-Receiver-Proof"], ring)
+    assert isinstance(proof, codec.ReceiverProofV1)
+    assert proof.slack.model_dump(mode="json") == {
+        "delivery": "app_mention", "user_id": GRID_SENDER, "event_user_team": "T0EXAMPLESIBLING",
+        "event_team": GRID_WORKSPACE, "interaction_user_team_id": None,
+        "is_ext_shared_channel": False, "enterprise_ids": [GRID_ORG],
+    }
+    assert json.loads(rig.requests[0].content)["author"] == GRID_SENDER
+    rig.closed()
+    ordinary = HttpRig(auth=grid_auth())
+    with pytest.raises(ValueError, match="^invalid_http_receiver_runtime$"):
+        ordinary.runtime(module)
