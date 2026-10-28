@@ -6,8 +6,10 @@ receiver key custody or the API's verification; they pin the listener's submissi
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import threading
 from typing import Any
 
 import httpx
@@ -92,25 +94,32 @@ def _no_queue_or_legacy(
 def test_selected_click_acks_before_one_proved_submission_of_exact_bytes(
     config: DispatcherConfig, redis_client: redis.Redis,
 ) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-7: ack first, fresh client, one attempt, no ambient auth."""
+    """@spec HTTP-APPROVAL-CONTINUITY-7: the ack is written while the answer is held, then one
+    proved attempt of the exact bytes with no ambient auth."""
     api()
-    acked_first: list[bool] = []
-    sock_holder: list[FakeSocketClient] = []
+    release = threading.Event()
+    arrived = threading.Event()
+    acked_at_answer: list[list[str]] = []
+    sock = FakeSocketClient()
 
-    async def handler(request: httpx.Request) -> httpx.Response:
-        acked_first.append(bool(sock_holder and sock_holder[0].acked_envelope_ids))
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        arrived.set()
+        await asyncio.to_thread(release.wait, 3)
+        # The test releases the answer only after it saw the envelope ack, so this sample
+        # orders the ack before the answer completes.
+        acked_at_answer.append(list(sock.acked_envelope_ids))
         return httpx.Response(200, json=_resolved())
 
     rig = HttpRig(handler)
     app, legacy = _selected(config, redis_client, rig)
-    sock = FakeSocketClient()
-    sock_holder.append(sock)
     try:
         SocketModeHandler(app, app_token="xapp-test").handle(sock, _click("env-answer"))
+        assert sock.acked_envelope_ids == ["env-answer"]
+        assert arrived.wait(2), "selected answer never reached the synthetic API"
     finally:
+        release.set()
         _finish_owned_listeners(app)
-    assert sock.acked_envelope_ids == ["env-answer"]
-    assert acked_first == [True]
+    assert acked_at_answer == [["env-answer"]]
     assert len(rig.requests) == 1
     request = rig.requests[0]
     assert request.method == "POST"

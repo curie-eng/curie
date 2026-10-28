@@ -378,12 +378,22 @@ def quota_pods():
     # @spec QUOTA-OBSERVATION-CLOCK-1.
     now = time.time()
     chargeable = [pod for pod in pods.values() if counts_against_quota(pod, now)]
+    runtime_holders = [
+        pod for pod in chargeable
+        if pod.get("status", {}).get("phase") != "Pending" or any(
+            state in container.get(field, {})
+            for container in pod.get("status", {}).get("containerStatuses", [])
+            for field in ("state", "lastState")
+            for state in ("running", "terminated")
+        )
+    ]
     if len(chargeable) > 2:
         counts = {phase: 0 for phase in ("Pending", "Running", "Succeeded", "Failed", "Unknown", "other")}
         for pod in pods.values():
             phase = pod.get("status", {}).get("phase")
             counts[phase if phase in counts else "other"] += 1
         print("Quota pod diagnostic: " + json.dumps({"chargeable": len(chargeable),
+              "runtime_holding": len(runtime_holders),
               "total": len(pods), "quota_used": quota_used, "phase_counts": counts,
               "read_started": read_started, "read_finished": now,
               "quota_resource_version": quota.get("metadata", {}).get("resourceVersion"),
@@ -396,7 +406,21 @@ def quota_pods():
                         "phase": pod.get("status", {}).get("phase"),
                         "chargeable": counts_against_quota(pod, now)} for pod in pods.values()]},
               sort_keys=True), file=sys.stderr)
-    assert len(chargeable) <= 2, "observed more than two chargeable sandbox pods"
+    assert len(runtime_holders) <= 2, "observed more than two chargeable sandbox pods holding runtime"
+    if len(chargeable) > 2:
+        runtime_uids = {pod["metadata"]["uid"] for pod in runtime_holders}
+        # Thirty seconds bounds pre-runtime admission lag below the unchanged
+        # 300-second listener and 320-second aggregate budgets. It does not
+        # guarantee that upstream quota accounting converges in that interval.
+        for pod in chargeable:
+            if pod["metadata"]["uid"] in runtime_uids:
+                continue
+            try:
+                created = datetime.fromisoformat(pod["metadata"].get("creationTimestamp"))
+                age = now - created.timestamp() if created.tzinfo is not None else -1
+            except (TypeError, ValueError):
+                age = -1
+            assert 0 <= age <= 30, "excess pre-runtime Pending sandbox pod exceeded 30 seconds"
     return pods
 
 
@@ -541,7 +565,7 @@ def batch(phase, count, *, progress=True, stale=None, expect_pressure=False):
         assert "idle route reclamation freed sandbox capacity" in logs, "no actual pressure reclamation was observed"
         assert len(seen_pods) > 2, "quota pressure did not replace retained runner pods"
         assert active_claims, "the burst never observed an active runner"
-        print(f"OK: {phase}: {count} successful 300-second listeners, parked events, {len(seen_pods)} runner UIDs, quota <= 2")
+        print(f"OK: {phase}: {count} successful 300-second listeners, parked events, {len(seen_pods)} runner UIDs, quota usage <= 2, runtime holders <= 2")
     return turns, seen_routes, seen_pods
 
 

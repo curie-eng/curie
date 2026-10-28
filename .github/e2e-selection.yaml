@@ -179,6 +179,17 @@ chart_scenarios:
         - apps/worker/src/curie_worker/connector_k8s.py
         - pyproject.toml
         - uv.lock
+    connector-apply-race:
+      step: Connector apply survives a concurrent reconciler create
+      leg: workload
+      inputs:
+        - charts/curie/ci/runtime/connector-apply-race-runtime.sh
+        - cli
+        - apps/api
+        - apps/worker
+        - packages
+        - pyproject.toml
+        - uv.lock
     connector-secret-rotation:
       step: Hosted connector credential rotation rolls only that connector
       leg: workload
