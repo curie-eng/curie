@@ -18,10 +18,19 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import scripted_kind as sk
+from aci_protocol import RUNS_STREAM_DEFAULT, STREAM_PAYLOAD_FIELD
 from c4_admitted_http import tracker_stub_type
 from c4_admitted_kind import REPOSITORY, AdmittedKind, Ticket
+from channel_protocol.work_item_events import ci_event_id, ci_round_key
+from curie_internal.keyspace import (
+    WORK_ITEM_CI_RERUN_PREFIX,
+    WORKER_KEY_PREFIX_DEFAULT,
+    completion_key,
+    done_key,
+)
 
 CHANGE = "dynamic_change.py"
 SETTLE_SECONDS = 15
@@ -114,7 +123,17 @@ def dynamic_stub_type(module: Any, *, redact: Any) -> type:
                         redact(json.dumps(response)),
                     ),
                 )
-            super()._json(handler, status, body)
+            payload = json.dumps(body).encode()
+            handler.send_response(status)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(payload)))
+            path = urlsplit(handler.path).path.removeprefix("/api/v3")
+            if status == 503 and re.fullmatch(
+                r"/(?:repos/acme-corp/acme-bot|repositories/\d+)/actions/jobs/\d+", path
+            ):
+                handler.send_header("Retry-After", "30")
+            handler.end_headers()
+            handler.wfile.write(payload)
 
         def git(self, *args: str, **kwargs: Any) -> str:
             return (
@@ -266,6 +285,15 @@ def dynamic_stub_type(module: Any, *, redact: Any) -> type:
                         self.control("retarget", "")
                         return 503, {"message": "Example ambiguous provider response"}
                     return 200, self._fresh_pull(pull)
+            if method == "GET" and re.fullmatch(
+                rf"/repos/{REPOSITORY}/actions/jobs/\d+", path
+            ):
+                # Actions job reads require Actions permission; this fixture App
+                # has none. An outage remains a transient provider failure.
+                # https://docs.github.com/en/rest/actions/workflow-jobs#get-a-job-for-a-workflow-run
+                if self.control("actions_lookup") == "unavailable":
+                    return 503, {"message": "Example provider outage"}
+                return 403, {"message": "Resource not accessible by integration"}
             check_match = re.fullmatch(
                 r"/repos/acme-corp/acme-bot/commits/([^/]+)/check-runs", path
             )
@@ -293,7 +321,10 @@ def dynamic_stub_type(module: Any, *, redact: Any) -> type:
                         else None,
                         "started_at": row["started"],
                         "completed_at": row["completed"],
-                        "html_url": self.base_url + "/example-check",
+                        "html_url": (
+                            f"{self.base_url}/{REPOSITORY}/runs/{10000 + i}"
+                            "?check_suite_focus=true"
+                        ),
                         "app": {"id": 51, "slug": "github-actions"},
                         "output": {"title": "Example CI", "summary": "Exercise dynamic base"},
                     }
@@ -656,21 +687,92 @@ class DynamicKind(AdmittedKind):
                 self, "kubectl", "--context", self.context, *args, timeout=5
             )
 
+        def provider_calls() -> list[dict[str, Any]]:
+            calls = self.stub.provider_evidence()
+            actions = [call for call in calls if "/actions/" in call["path"]][-16:]
+            failures = [call for call in calls if call["http_status"] >= 400][-8:]
+            selected = {call["id"]: call for call in [*actions, *failures, *calls[-8:]]}
+            return [selected[key] for key in sorted(selected)]
+
+        request_id = uuid.UUID(evidence["expected_request_id"])
+        fix_event = ci_event_id(request_id, 2)
+        round_key = ci_round_key(request_id, 2)
+
+        def ci_records() -> dict[str, Any]:
+            keys = [
+                round_key,
+                f"{round_key}:enqueued",
+                f"{round_key}:failing",
+                done_key(WORKER_KEY_PREFIX_DEFAULT, fix_event),
+            ]
+            if transition.get("verification_head_sha"):
+                rerun_key = (
+                    f"{WORK_ITEM_CI_RERUN_PREFIX}:{request_id}:"
+                    f"{transition['verification_head_sha']}"
+                )
+                keys.extend((rerun_key, f"{rerun_key}:lock"))
+            return dict(zip(keys, self.valkey("MGET", *keys), strict=True))
+
+        def ci_stream() -> list[dict[str, Any]]:
+            selected = []
+            for stream_id, fields in self.valkey(
+                "XREVRANGE", RUNS_STREAM_DEFAULT, "+", "-", "COUNT", "128"
+            ):
+                payload = json.loads(
+                    dict(zip(fields[::2], fields[1::2], strict=True))[STREAM_PAYLOAD_FIELD]
+                )
+                if payload.get("event_id") == fix_event:
+                    selected.append({
+                        "stream_id": stream_id,
+                        "event_id": fix_event,
+                        "source": payload.get("source"),
+                        "received_at": payload.get("received_at"),
+                        "has_reply_handle": payload.get("reply_handle") is not None,
+                        "text": str(payload.get("text", ""))[:4096],
+                    })
+            return selected
+
+        capture("provider_calls", provider_calls)
+        capture("ci_records", ci_records)
+        capture(
+            "ci_completion",
+            lambda: dict(zip(
+                ("done", "gen", "cause"),
+                self.valkey(
+                    "HMGET", completion_key(WORKER_KEY_PREFIX_DEFAULT, fix_event),
+                    "done", "gen", "cause",
+                ),
+                strict=True,
+            )),
+        )
+        capture("ci_stream", ci_stream)
         capture("requests", lambda: self.requests(ticket))
         capture("work_item", lambda: self.item(ticket))
         capture("transitions", lambda: self.transitions(ticket))
         capture("model_observations", lambda: self.model.observations())
         capture("model_calls", lambda: self.model.call_evidence())
         capture(
+            "current_publications",
+            lambda: self.sql(
+                "SELECT coalesce(json_agg(row_to_json(observation)), '[]'::json) FROM ("
+                "SELECT p.id, p.status, p.revision_number, p.base_sha, p.expected_prior_head, "
+                "l.head_sha AS lineage_head_sha, left(p.error, 2048) AS failure_detail "
+                "FROM curie.publications p "
+                "LEFT JOIN curie.thread_publication_lineages l ON l.id=p.lineage_id "
+                f"WHERE p.execution_request_id='{evidence['expected_request_id']}'::uuid "
+                "ORDER BY p.created_at DESC, p.id DESC LIMIT 16) observation"
+            ),
+        )
+        capture(
             "phase_reports",
             lambda: self.sql(
                 "SELECT coalesce(json_agg(row_to_json(observation)), '[]'::json) FROM ("
-                "SELECT p.execution_request_id, p.phase, p.note "
+                "SELECT p.execution_request_id, p.phase, p.loop_round, p.reported_at, p.note "
                 "FROM curie.execution_request_phase_reports p "
                 "JOIN curie.execution_requests r ON r.id=p.execution_request_id "
                 "JOIN curie.work_items w ON w.id=r.work_item_id "
                 f"WHERE w.tracker_kind='github' AND w.tracker_issue_id='{int(ticket.number)}' "
-                "ORDER BY r.sequence DESC, p.phase LIMIT 32) observation"
+                "ORDER BY r.sequence DESC, p.id DESC LIMIT 32) observation"
             ),
         )
         capture("provider_events", lambda: self.stub.events()[-32:])

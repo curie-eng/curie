@@ -453,6 +453,8 @@ def test_red_nochange_subject_continues_and_new_publication_owns_ci(
         return rows[-1] if rows and rows[-1]["status"] == "succeeded" else None
 
     revision = wait(fixed, seconds=360)
+    if revision is None:
+        run.record_nochange_failure(ticket, row, stage="fix_publication")
     assert revision is not None, "red no-change CI did not enter the normal fix publication path"
     assert revision["head_sha"] != row["verification_head_sha"]
     assert run.stub.git("show", revision["head_sha"] + ":" + CHANGE) == 'VALUE = "factory-fixed"'
