@@ -267,7 +267,7 @@ async def _require_new_publication_runtime(
         return
     # The pending Approval and Publication must not flush on the clock read.
     with session.no_autoflush:
-        now = await session.scalar(select(func.clock_timestamp()))
+        now = (await session.execute(select(func.clock_timestamp()))).scalar_one()
     if (
         not request.runtime_owner
         or request.runtime_heartbeat_expires_at is None
