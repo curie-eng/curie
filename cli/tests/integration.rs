@@ -60,6 +60,7 @@ mod cluster_values_files;
 mod command_surface;
 mod completion_outbox_health;
 mod config_migrate;
+mod connector_apply_mode;
 mod connector_build;
 mod connector_build_decl_vectors;
 mod connector_caller_dev_pair;
