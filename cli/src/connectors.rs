@@ -12,7 +12,8 @@
 //! from `connectors.yaml` removes its Deployment, Service, and NetworkPolicies
 //! on the next deploy. Without that, a deleted connector leaves a pod running
 //! with a credential mounted and nothing referencing it -- the kind of leak
-//! nobody notices because nothing breaks.
+//! nobody notices because nothing breaks. Connector objects are written by
+//! server-side apply (see [`connector_apply_args`]).
 //!
 //! Apply success is not connector health (#2350). After apply+prune, each
 //! hosted Deployment is waited on until Ready or a terminal pod reason, bounded
@@ -174,7 +175,19 @@ pub fn label_objects(manifests: &[Value], agent_name: &str) -> Vec<Value> {
         .collect()
 }
 
-/// `kubectl apply` argv for a JSON document supplied on stdin.
+/// Field manager the CLI uses when it server-side applies connector objects.
+///
+/// A stable name, distinct from the reconciler's `curie-connector-reconciler`,
+/// because a shared manager would let each writer's apply remove fields only the
+/// other declares (for example the CLI's `curie.dev/connector-secret-digest` pod
+/// template annotation). Changing the name orphans ownership on every live
+/// object.
+pub const CONNECTOR_FIELD_MANAGER: &str = "curie-cli-connectors";
+
+/// Client-side `kubectl apply` argv for a JSON document supplied on stdin.
+///
+/// Kept for the owning-agent sandbox pool clone, which is not a connector object
+/// and has no concurrent writer. Connector objects use [`connector_apply_args`].
 ///
 /// kubectl accepts JSON wherever it accepts YAML, so the manifests travel from
 /// the API as JSON and never need a YAML serializer on this side.
@@ -187,6 +200,27 @@ pub fn apply_args(namespace: &str) -> Vec<String> {
         "-f".into(),
         "-".into(),
     ]
+}
+
+/// Server-side `kubectl apply` argv for the connector document on stdin.
+///
+/// Server-side apply makes create-or-update one API server operation, so the
+/// in-cluster reconciler creating the same object concurrently becomes an
+/// update instead of AlreadyExists (#5131). `--force-conflicts` is the same
+/// drift policy ADR 0090 gives the reconciler and applies only to the declared
+/// connector objects and the owned Secret; undeclared fields and unlabelled
+/// objects are untouched. It also never writes a `last-applied-configuration`
+/// copy of the Secret's stringData.
+///
+/// The flags follow `-f -` deliberately.
+pub fn connector_apply_args(namespace: &str) -> Vec<String> {
+    let mut args = apply_args(namespace);
+    args.extend([
+        "--server-side".into(),
+        "--force-conflicts".into(),
+        format!("--field-manager={CONNECTOR_FIELD_MANAGER}"),
+    ]);
+    args
 }
 
 /// Shared with `comms` rollout status: other kubectl rollouts wait 120s.
@@ -1348,6 +1382,9 @@ mod tests {
         let obj = render_secret("r-a-connector-secrets", "ns", &v);
         assert_eq!(obj["stringData"]["TOKEN"], "s3cret");
         assert!(!apply_args("ns").iter().any(|a| a.contains("s3cret")));
+        assert!(!connector_apply_args("ns")
+            .iter()
+            .any(|a| a.contains("s3cret")));
     }
 
     #[test]
@@ -1379,6 +1416,24 @@ mod tests {
     fn apply_reads_from_stdin_so_nothing_touches_disk() {
         let args = apply_args("ns");
         assert_eq!(args.last().unwrap(), "-");
+        let args = connector_apply_args("ns");
+        let file = args.iter().position(|a| a == "-f").unwrap();
+        assert_eq!(args[file + 1], "-");
+    }
+
+    #[test]
+    fn connector_apply_differs_from_client_side_apply_only_by_server_side_flags() {
+        let client = apply_args("ns");
+        let server = connector_apply_args("ns");
+        assert_eq!(&server[..client.len()], client.as_slice());
+        assert_eq!(
+            &server[client.len()..],
+            [
+                "--server-side",
+                "--force-conflicts",
+                "--field-manager=curie-cli-connectors"
+            ]
+        );
     }
 
     #[test]
@@ -2392,7 +2447,11 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
 
     if let Some(doc) = apply_document {
         bound_target.revalidate_ambient_binding().await?;
-        let (ok, _out, err) = run(&bound_target.args(&apply_args(&namespace)), Some(&doc)).await?;
+        let (ok, _out, err) = run(
+            &bound_target.args(&connector_apply_args(&namespace)),
+            Some(&doc),
+        )
+        .await?;
         if !ok {
             anyhow::bail!("applying connectors failed: {}", err.trim());
         }
