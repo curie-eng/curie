@@ -463,6 +463,7 @@ class BitbucketPair:
             ("curie_api.routers.publications", ("code_host_for",)),
             ("curie_api.routers.publication_code_host", ("publishing_code_host",)),
             ("curie_api.factory_rediscovery", ("publishing_code_host",)),
+            ("curie_api.factory_base_reconcile", ("code_host_for_repository",)),
         ):
             for seam in seams:
                 monkeypatch.setattr(f"{module}.{seam}", host)
