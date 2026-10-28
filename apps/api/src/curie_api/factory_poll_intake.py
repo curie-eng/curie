@@ -378,8 +378,7 @@ async def _admit_labeled(
                 label_event_id=event["id"],
             )
             if await _label_already_admitted(sessionmaker, tracker.issue(number), event):
-                # Later base labels only report disagreement with the frozen base.
-                # Reusing the admission here would cancel or replace the live run.
+                # Reconcile an observed base edit on the existing work item.
                 notice = replace(notice, disposition="base_label")
             await _apply_notice(sessionmaker, settings, client, notice, tracker, repository)
         except (Unavailable, FeedbackUnavailable, FeedbackIgnored):

@@ -136,7 +136,7 @@ class Admission:
     objective: str
     requester: str
     request_id: uuid.UUID
-    # The base a fresh admission resolved (ADR 0186), written on a new WorkItem.
+    # An explicit base pin supplied by the caller.
     base: ResolvedBase | None = None
     # Where the request's status reply lands, and the feedback URL it answers.
     # None is the tracker issue; review feedback sets its pull request target.
@@ -531,8 +531,6 @@ async def _admit_new(
         code_host_installation_id=facts.code_host_installation_id,
         agent_id=facts.agent_id,
         conversation_id=_facts_conversation(facts, adapter),
-        # Factory admission resolves a base (ADR 0186) and names the label
-        # that admitted it (#4361); other callers do neither.
         base=getattr(facts, "base", None),
         trigger_label=facts.trigger_label,
     )

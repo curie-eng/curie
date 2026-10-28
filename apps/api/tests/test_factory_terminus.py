@@ -1799,7 +1799,12 @@ def test_a_no_change_reply_outside_an_open_follow_up_still_fails(
                     assignment = {
                         "merged": "status = 'merged'",
                         "closed": "status = 'closed'",
-                        "missing_pr_url": "pr_number = NULL, pr_url = NULL",
+                        "missing_pr_url": (
+                            "pr_number = NULL, pr_url = NULL, code_host_kind = NULL, "
+                            "code_host_host = NULL, repository_project_id = NULL, "
+                            "code_host_installation_id = NULL, code_host_pr_id = NULL, "
+                            "base_ref = NULL"
+                        ),
                         "empty_pr_url": "pr_url = '   '",
                     }[case]
                     changed = await conn.execute(
@@ -1907,7 +1912,9 @@ def test_a_relabel_outside_an_adopted_pull_request_still_fails(admitted: Any, ca
             "(SELECT publication_lineage_id FROM curie.work_items WHERE id = :id)"
         ),
         "missing_pr_url": (
-            "UPDATE curie.thread_publication_lineages SET pr_number = NULL, pr_url = NULL "
+            "UPDATE curie.thread_publication_lineages SET pr_number = NULL, pr_url = NULL, "
+            "code_host_kind = NULL, code_host_host = NULL, repository_project_id = NULL, "
+            "code_host_installation_id = NULL, code_host_pr_id = NULL, base_ref = NULL "
             "WHERE id = (SELECT publication_lineage_id FROM curie.work_items WHERE id = :id)"
         ),
         "earlier_publication_failed": (

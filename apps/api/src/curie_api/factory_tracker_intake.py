@@ -745,7 +745,7 @@ async def _admission(
     has_open_pr: bool,
     ticket: TicketLabels,
 ) -> Admission | None:
-    """The admission facts on the chosen repository, or None after a base refusal."""
+    """The admission facts on the chosen repository."""
 
     installation = await connection.installation_for(repository)
     kind, address, conversation = reply_route(scope.registry, notice.issue, repository.path)

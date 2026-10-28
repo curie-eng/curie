@@ -492,24 +492,19 @@ class DynamicKind(AdmittedKind):
         factory = values["factory"]
         factory["baseLabelSettleSeconds"] = SETTLE_SECONDS
         factory["trackers"][0]["pollIntervalSeconds"] = 1
-        factory["bindings"].append(
-            {
-                "name": "acme-github",
-                "tracker": "github",
-                "trackerScopeId": str(self.stub._repository_row()["id"]),
-                "repos": [
-                    {
-                        "alias": "bot",
-                        "codeHost": "github",
-                        "projectId": str(self.stub._repository_row()["id"]),
-                        "path": REPOSITORY,
-                        "bases": ["*"],
-                        "default_base": "main",
-                        "ci": {"required": {"key": "dynamic-ci", "paths": [CHANGE]}},
-                    }
-                ],
-            }
-        )
+        repositories = [
+            repository
+            for binding in factory["bindings"]
+            for repository in binding["repos"]
+            if repository["codeHost"] == "github" and repository["path"] == REPOSITORY
+        ]
+        assert repositories, "the admitted-agent fixture has no matching GitHub repository policy"
+        for repository in repositories:
+            repository.update(
+                bases=["*"],
+                default_base="main",
+                ci={"required": {"key": "dynamic-ci", "paths": [CHANGE]}},
+            )
         return values
 
     def item(self, ticket: Ticket) -> dict[str, Any]:

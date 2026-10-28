@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pytest  # noqa: E402
 import scripted_kind as sk  # noqa: E402
-from c4_admitted_kind import AdmittedKind, Ticket  # noqa: E402
+from c4_admitted_kind import REPOSITORY, AdmittedKind, Ticket  # noqa: E402
 from c4_dynamic_base import (  # noqa: E402
     CHANGE,
     SETTLE_SECONDS,
@@ -84,6 +84,29 @@ def dynamic_factory(
     )
     if int(api.strip()) != SETTLE_SECONDS:
         raise RuntimeError("the API did not consume factory.baseLabelSettleSeconds from the chart")
+    policy = json.loads(
+        run.kubectl(
+            "-n",
+            run.namespace,
+            "exec",
+            "deployment/curie-api",
+            "--",
+            "python",
+            "-c",
+            "import json; from curie_api.config import get_settings; "
+            "from curie_api.forges.registry import forges_registry; "
+            f"policy = forges_registry(get_settings()).github_repository_policy({REPOSITORY!r}); "
+            "print(json.dumps(policy.model_dump(include={'bases', 'default_base', 'ci'}) "
+            "if policy is not None else None))",
+        )
+    )
+    if (
+        policy is None
+        or policy["bases"] != ["*"]
+        or policy["default_base"] != "main"
+        or policy["ci"]["required"] != {"key": "dynamic-ci", "paths": [CHANGE]}
+    ):
+        raise RuntimeError("the API did not consume the dynamic-base GitHub repository policy")
     run.deadline = None
     run.fixture_ready = True
     return run

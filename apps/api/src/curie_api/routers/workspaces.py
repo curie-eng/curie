@@ -208,9 +208,7 @@ async def redeem_workspace_credential(
             "repository is not allowed for runtime workspaces",
             headers={"Cache-Control": "no-store"},
         )
-    # A factory WorkItem on this conversation froze its base at admission (ADR
-    # 0186); the sandbox starts there. Legacy and non-factory threads get None
-    # and keep the repository default branch.
+    # A factory checkout uses its request's pinned base.
     # Exactly one match carries a base; zero or an ambiguous two carry none.
     factory_items = (
         await session.execute(
