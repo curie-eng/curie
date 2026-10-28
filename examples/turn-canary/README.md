@@ -83,7 +83,7 @@ The exposition carries these series, shown with the default prefix:
 | `turn_canary_target_probe_profile{route}` | 1 when the last attempted turn used an explicit profile, 0 for the nonce default. |
 | `turn_canary_target_last_delivery_success_timestamp_seconds{route}` | Last successful delivery observation, independent of nonce or profile verdict. |
 | `turn_canary_target_last_probe_success_timestamp_seconds{route}` | Last passing profile verdict, or exact nonce verdict for the default. |
-| `turn_canary_target_success{route}` | Last turn result of the route. Published only for a route whose turn was attempted; a capacity-skipped route publishes no sample in that cycle, and the exporter keeps its previous value. |
+| `turn_canary_target_success{route}` | Legacy exact nonce result, independent of a configured profile. Published only for an attempted route; skipped cycles retain the previous sample. |
 | `turn_canary_target_last_run_timestamp_seconds{route}` | Last cycle that selected the route for a turn or a capacity check. |
 | `turn_canary_target_last_success_timestamp_seconds{route}` | Last exact nonce success of the route. |
 | `turn_canary_target_capacity_skipped{route}` | Added. 1 when the route was skipped for capacity in the cycle, 0 when it was turned. |
@@ -92,9 +92,12 @@ The exposition carries these series, shown with the default prefix:
 Delivery observation uses the production reply schema and the enqueued turn's
 kind, address, conversation ID, reply reference and completion event ID. Malformed,
 unrelated or duplicate observed completions fail closed. Status and progress
-alone do not count as a text answer. Exact nonce success still controls the last
-success timestamps, cycle success and one-shot exit code. The new gauge shares
-the selected route label layout and metric prefix. Exact nonce success retains
+alone do not count as a text answer. The legacy target success and target last-success timestamp still describe exact
+nonce observations. Cycle success, its last-success timestamp and the one-shot
+exit code require delivery and the selected probe: the configured profile when
+one applies, otherwise the exact nonce. Turn-phase logs report delivery; probe
+logs report the separate configured verdict. The gauges share the selected route
+label layout and metric prefix. Exact nonce success retains
 its original last-update and event-type rules: a later progress update or a
 `reply.post` cannot turn a previously failing sequence into success. An approval
 pause is unsuccessful even though its relay page remains nonterminal.
@@ -132,11 +135,14 @@ Unicode NFKC normalization, case folding and whitespace collapse apply to both
 reply and markers. Every required group needs one literal substring match and
 no forbidden marker may appear. Metacharacters have no special meaning. A
 refusal is not automatically useful completion; a matching reply proves only
-the declared text contract. The legacy nonce verdict, cycle success, nonce
-success timestamps and one-shot exit status retain their original meaning,
-even when a configured profile passes. Use `target_probe_success` for an alert
-about the explicit contract and `target_delivery_success` with delivery
-freshness for an alert about availability.
+the declared text contract. The legacy target nonce verdict and target
+nonce-success timestamp retain their original meaning. A delivered profile match
+qualifies the cycle even when its diagnostic nonce differs; a profile mismatch
+fails the cycle even if the nonce happens to match. Any attempted route failing
+its delivery, selected probe, enqueue or owned cleanup keeps the cycle failed,
+regardless of later successful routes. Cycle last-success and one-shot exit
+status follow this qualification. Use `target_probe_success` for the explicit
+contract and `target_delivery_success` with delivery freshness for availability.
 
 For a literal exclusion that applies only at the start of the response, add
 optional `forbidden_prefix_any` to a profile. For example, a synthetic status
