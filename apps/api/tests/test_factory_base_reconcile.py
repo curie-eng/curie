@@ -287,7 +287,9 @@ class TransitionCase:
 
 @pytest.fixture
 def transition_case(
-    clean_db: None, graph: GitGraph, monkeypatch: pytest.MonkeyPatch  # noqa: F811
+    clean_db: None,
+    graph: GitGraph,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: F811
 ) -> Iterator[TransitionCase]:
     from curie_api.models import FactoryBaseTransition
 
@@ -687,6 +689,58 @@ def test_restart_before_history_acknowledgement_does_not_duplicate_the_outcome(
     assert case.transcript() == history
     assert case.remote.pushes == 2
     assert case.retargets == [{"target_branch": "next"}]
+
+
+def test_applied_base_outcome_survives_fresh_runner_replay_and_retry(
+    transition_case: TransitionCase,
+) -> None:
+    from curie_api.models import ThreadTranscript
+    from curie_runner.history import TurnRecord, _parse_records, build_conversation_replay
+    from sqlalchemy import select
+
+    case = transition_case
+    completed = case.finish()
+    marker = f"factory-base-transition:{TRANSITION_ID}"
+
+    async def stored(session: AsyncSession) -> list[Any]:
+        row = await session.scalar(
+            select(ThreadTranscript).where(
+                ThreadTranscript.agent_id == case.agent_id,
+                ThreadTranscript.binding_scope.is_(None),
+                ThreadTranscript.thread_key == CONVERSATION,
+            )
+        )
+        assert row is not None
+        assert isinstance(row.value, list)
+        return row.value
+
+    original = database(stored)
+    assert sum(isinstance(entry, dict) and entry.get("id") == marker for entry in original) == 1
+    records = _parse_records(original)
+    assert len(records) == 1
+    outcome = records[0]
+    assert isinstance(outcome, TurnRecord)
+    assert "next" in outcome.assistant
+    assert completed["target_base_sha"] in outcome.assistant
+    assert completed["verification_head_sha"] in outcome.assistant
+    replay, summary = build_conversation_replay(records)
+    assert replay.present
+    assert summary is None
+    assert json.dumps(outcome.assistant) in json.dumps(
+        [message.to_dict() for message in replay.messages]
+    )
+
+    case.update(outcome_ready_at=None)
+    recovered = case.finish()
+
+    assert recovered["outcome_ready_at"] is not None
+    assert recovered["verification_head_sha"] == completed["verification_head_sha"]
+    retried = database(stored)
+    assert retried == original
+    assert sum(isinstance(entry, dict) and entry.get("id") == marker for entry in retried) == 1
+    restored, restored_summary = build_conversation_replay(_parse_records(retried))
+    assert restored_summary is None
+    assert restored.messages == replay.messages
 
 
 def test_retarget_outage_preserves_pushed_progress_until_a_healthy_retry(
