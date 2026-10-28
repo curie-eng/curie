@@ -623,13 +623,21 @@ if len(generic) != 1:
 clone_name = name(generic[0])[: -len("-runner")] + f"-agent-{agent}-runner"
 clone = [i for i in items if name(i) == clone_name]
 if not clone:
-    print(f"FAIL: cloned SandboxTemplate {clone_name} is missing", file=sys.stderr)
+    print(f"FAIL: per-agent SandboxTemplate {clone_name} is missing", file=sys.stderr)
     raise SystemExit(1)
 found = sorted({e.get("manager", "") for e in clone[0]["metadata"].get("managedFields") or []})
-if "kubectl-client-side-apply" not in found or "curie-cli-connectors" in found:
-    print(f"FAIL: cloned SandboxTemplate {clone_name} is not a client-side apply (managers: {found})", file=sys.stderr)
+if "curie-cli-connectors" in found:
+    print(f"FAIL: per-agent SandboxTemplate {clone_name} was written by the connector server-side apply (managers: {found})", file=sys.stderr)
     raise SystemExit(1)
-' "$RELEASE" "$AGENT" || fail "the sandbox pool clone did not stay client-side"
+labels = clone[0]["metadata"].get("labels") or {}
+if labels.get("app.kubernetes.io/managed-by") == "curie-cli":
+    if "kubectl-client-side-apply" not in found:
+        print(f"FAIL: CLI-cloned SandboxTemplate {clone_name} is not a client-side apply (managers: {found})", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"sandbox template {clone_name}: owner is the CLI clone (managers: {found})")
+else:
+    print(f"sandbox template {clone_name}: owner is helm, the CLI left it alone (managers: {found})")
+' "$RELEASE" "$AGENT" || fail "the connector server-side apply wrote the sandbox template"
 
 CLUSTER_IP="$(cluster_ip)"
 [[ -n "$CLUSTER_IP" ]] || fail "service $HELD_SERVICE has no clusterIP"
