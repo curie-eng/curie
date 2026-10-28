@@ -330,7 +330,10 @@ def dynamic_model_type(module: Any) -> type:
                     "CREATE TABLE control (mode TEXT); INSERT INTO control VALUES ('publish');"
                     "CREATE TABLE observations "
                     "(tool TEXT PRIMARY KEY, head TEXT, target TEXT, value TEXT);"
+                    "CREATE TABLE calls (id INTEGER PRIMARY KEY, mode TEXT, failed INTEGER, "
+                    "observed_heads TEXT, tools TEXT, reply TEXT);"
                 )
+            self.database.chmod(0o600)
 
         def mode(self, value: str | None = None) -> str:
             with sqlite3.connect(self.database) as db:
@@ -342,6 +345,12 @@ def dynamic_model_type(module: Any) -> type:
             with sqlite3.connect(self.database) as db:
                 db.row_factory = sqlite3.Row
                 return [dict(row) for row in db.execute("SELECT * FROM observations")]
+
+        def call_evidence(self) -> list[dict[str, Any]]:
+            with sqlite3.connect(self.database) as db:
+                db.row_factory = sqlite3.Row
+                rows = db.execute("SELECT * FROM calls ORDER BY id DESC LIMIT 32")
+                return list(reversed([dict(row) for row in rows]))
 
         def _match(self, method: str, path: str, body: bytes) -> dict[str, Any] | None:
             if method != "POST" or path != "/v1/messages":
@@ -470,6 +479,18 @@ def dynamic_model_type(module: Any) -> type:
                 ]
             else:
                 content = [{"type": "text", "text": "Published the verified example change."}]
+            with sqlite3.connect(self.database) as db:
+                db.execute(
+                    "INSERT INTO calls (mode, failed, observed_heads, tools, reply) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        mode,
+                        int(failed),
+                        json.dumps([observation["head"] for observation in seen][-8:]),
+                        json.dumps([tool["name"] for tool in tools][-16:]),
+                        json.dumps(content),
+                    ),
+                )
             return {
                 "message": {
                     "id": "msg_dynamic_" + uuid.uuid4().hex,
@@ -542,13 +563,10 @@ class DynamicKind(AdmittedKind):
         capture("provider_events", lambda: self.stub.events())
 
         def pod_status() -> Any:
-            pods = json.loads(
-                self.kubectl("-n", self.namespace, "get", "pods", "-o", "json")
-            )["items"]
-            return [
-                {"name": pod["metadata"]["name"], "status": pod["status"]}
-                for pod in pods
+            pods = json.loads(self.kubectl("-n", self.namespace, "get", "pods", "-o", "json"))[
+                "items"
             ]
+            return [{"name": pod["metadata"]["name"], "status": pod["status"]} for pod in pods]
 
         capture("pods", pod_status)
         for component in ("api", "worker"):
@@ -580,6 +598,112 @@ class DynamicKind(AdmittedKind):
                     time.time(),
                 ),
             )
+
+    def record_nochange_failure(
+        self, ticket: Ticket, transition: dict[str, Any], *, stage: str
+    ) -> None:
+        evidence: dict[str, Any] = {
+            "stage": stage,
+            "expected_transition_id": str(uuid.UUID(transition["id"])),
+            "expected_request_id": str(uuid.UUID(transition["request_id"])),
+        }
+        deadline = time.monotonic() + 30
+
+        def bounded(value: Any) -> Any:
+            if isinstance(value, str):
+                return value[-16384:]
+            if isinstance(value, list):
+                return [bounded(item) for item in value[-32:]]
+            if isinstance(value, dict):
+                return {key: bounded(item) for key, item in value.items()}
+            return value
+
+        def capture(name: str, read: Callable[[], Any]) -> None:
+            if time.monotonic() >= deadline:
+                evidence[name] = {"error": "diagnostic_budget_exhausted"}
+                return
+            previous_deadline = self.deadline
+            self.deadline = min(deadline, time.monotonic() + 5)
+            try:
+                evidence[name] = bounded(read())
+            except Exception as exc:  # noqa: BLE001 - preserve the original timeout assertion
+                evidence[name] = {"error": type(exc).__name__, "detail": str(exc)[:1000]}
+            finally:
+                self.deadline = previous_deadline
+
+        capture("requests", lambda: self.requests(ticket))
+        capture("work_item", lambda: self.item(ticket))
+        capture("transitions", lambda: self.transitions(ticket))
+        capture("model_observations", lambda: self.model.observations())
+        capture("model_calls", lambda: self.model.call_evidence())
+        capture(
+            "phase_reports",
+            lambda: self.sql(
+                "SELECT coalesce(json_agg(row_to_json(observation)), '[]'::json) FROM ("
+                "SELECT p.execution_request_id, p.phase, p.note "
+                "FROM curie.execution_request_phase_reports p "
+                "JOIN curie.execution_requests r ON r.id=p.execution_request_id "
+                "JOIN curie.work_items w ON w.id=r.work_item_id "
+                f"WHERE w.tracker_kind='github' AND w.tracker_issue_id='{int(ticket.number)}' "
+                "ORDER BY r.sequence DESC, p.phase LIMIT 32) observation"
+            ),
+        )
+        capture("provider_events", lambda: self.stub.events()[-32:])
+        for component in ("api", "worker"):
+            capture(
+                component + "_logs",
+                lambda component=component: self.kubectl(
+                    "-n",
+                    self.namespace,
+                    "logs",
+                    f"deployment/curie-{component}",
+                    "--all-containers",
+                    "--tail=200",
+                    "--limit-bytes=16384",
+                ),
+            )
+        requests = evidence.get("requests")
+        sandboxes = list(
+            dict.fromkeys(
+                row["runtime_sandbox_name"]
+                for row in reversed(requests if isinstance(requests, list) else [])
+                if row.get("runtime_sandbox_name")
+            )
+        )[:2]
+        for index, sandbox in enumerate(sandboxes):
+            capture(
+                f"sandbox_{index}_logs",
+                lambda sandbox=sandbox: self.kubectl(
+                    "-n",
+                    self.namespace,
+                    "logs",
+                    sandbox,
+                    "--all-containers",
+                    "--tail=200",
+                    "--limit-bytes=16384",
+                ),
+            )
+        try:
+            descriptor = os.open(self.diagnostic_path, os.O_WRONLY | os.O_CREAT, 0o600)
+            os.close(descriptor)
+            self.diagnostic_path.chmod(0o600)
+            with sqlite3.connect(self.diagnostic_path, timeout=1) as db:
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS nochange_failures ("
+                    "id INTEGER PRIMARY KEY, issue_id INTEGER NOT NULL, "
+                    "evidence TEXT NOT NULL, recorded_at REAL NOT NULL)"
+                )
+                db.execute(
+                    "INSERT INTO nochange_failures (issue_id, evidence, recorded_at) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        ticket.number,
+                        self.redact_model_evidence(json.dumps(evidence)),
+                        time.time(),
+                    ),
+                )
+        except (OSError, sqlite3.Error):
+            print("dynamic-base private timeout diagnostics could not be saved", flush=True)
 
     def transitions(self, ticket: Ticket) -> list[dict[str, Any]]:
         return self.sql(

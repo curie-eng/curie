@@ -3,11 +3,11 @@
 `curie_api.factory_tracker_intake.poll_trackers` polls every configured
 non-GitHub tracker binding through `Tracker.poll_marked`, applies each notice
 through start authority, the surface for its label, the label refusal rules,
-repository and base choice, and the shared WorkItem dispatch, and keeps one
+repository choice and the shared WorkItem dispatch, and keeps one
 opaque cursor per (tracker scope, label) in ``factory_poll_cursors.etags``
 under ``marked:<label>``. A sweep re-reads every currently labelled issue every
-``factory_reconcile_interval_s``, so a refusal repaired on the ticket admits
-under the original label event's request id.
+``factory_reconcile_interval_s``, so a repaired intake refusal retries under
+the original label event's request id. Base selection waits until acquisition.
 
 Here the tracker is the real Jira Cloud adapter, built by the production
 registry from the install's `ForgesConfig`, over the Jira fake
@@ -53,6 +53,7 @@ from forge_fakes.github import (
 )
 from forge_fakes.github_comments import _rows
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from test_factory_poll_intake import _acquire
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -83,7 +84,12 @@ DC_REPO = {
 class _GitHub(GitHubRepositoryFake):
     """The GitHub repository fake, also readable by the repository's immutable id."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[httpx.Request] = []
+
     def handle(self, request: httpx.Request) -> httpx.Response:
+        self.calls.append(request)
         if request.url.path == f"/repositories/{REPO_ID}":
             request = httpx.Request(
                 request.method,
@@ -196,6 +202,20 @@ class Intake:
         self.monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, self.key_dir))
         get_settings.cache_clear()
 
+    def acquire(self, request_id: uuid.UUID) -> httpx.Response:
+        external = httpx.AsyncClient(
+            transport=_ByHost(
+                self.jira, self.github, self.dc, dc_down=self.dc_down, dc_status=self.dc_status
+            )
+        )
+        original = self.client.app.state.http_client
+        self.client.app.state.http_client = external
+        try:
+            return _acquire(self.client, request_id)
+        finally:
+            self.client.app.state.http_client = original
+            self.client.portal.call(external.aclose)
+
     def agent(self, *, trigger_label: str | None = None) -> uuid.UUID:
         channel: dict[str, Any] = {"kind": "jira", "address": BINDING}
         if trigger_label is not None:
@@ -266,6 +286,8 @@ def make_intake(
             "FACTORY_ENABLED": "true",
             "FACTORY_INTAKE": "webhook",
             "FACTORY_RECONCILE_INTERVAL_S": str(SWEEP),
+            "FACTORY_BASE_LABEL_SETTLE_S": "0",
+            "INTERNAL_WORKER_TOKEN": "factory-intake-worker",
             "CURIE_FORGES": forges_env_json(document, tmp_path / "forges"),
             "CURIE_WORK_ITEM_RECONCILER_ENABLED": "false",
             "RESUME_RECONCILER_ENABLED": "false",
@@ -313,7 +335,8 @@ def _work_items(issue: jira_fake.JiraIssue) -> list[dict[str, Any]]:
     return _rows(
         "SELECT id, agent_id, tracker_kind, tracker_host, tracker_scope_id, tracker_display_key, "
         "code_host_kind, code_host_host, repository_project_id, repository_path, "
-        "code_host_installation_id, base_branch, base_source, trigger_label, cancelled_at "
+        "code_host_installation_id, base_branch, base_source, base_commit, "
+        "base_resolved_request_id, trigger_label, cancelled_at "
         "FROM curie.work_items WHERE tracker_kind = 'jira_cloud' AND tracker_issue_id = :id",
         {"id": str(issue.id)},
     )
@@ -413,7 +436,10 @@ def test_an_allowlisted_label_admits_one_work_item_on_the_bound_repository(
         REPO,
     )
     assert item["code_host_installation_id"] == INSTALLATION_ID
-    assert (item["base_branch"], item["trigger_label"]) == ("main", LABEL)
+    assert (item["base_branch"], item["base_source"], item["base_commit"]) == (None, None, None)
+    assert item["base_resolved_request_id"] is None
+    assert item["trigger_label"] == LABEL
+    assert not any("/git/ref/heads/" in request.url.path for request in intake.github.calls)
     [request] = _requests(item["id"])
     assert request["id"] == _admit_id(intake, issue, event)
     assert request["status"] == "waiting"
@@ -426,6 +452,19 @@ def test_an_allowlisted_label_admits_one_work_item_on_the_bound_repository(
     )
     assert _cursor() is not None
     # Admission writes nothing on Jira: the status comment is the sync's.
+    assert intake.jira.writes == 0
+
+    acquired = intake.acquire(request["id"])
+
+    assert acquired.status_code == 200, acquired.text
+    [claimed] = _work_items(issue)
+    assert (claimed["base_branch"], claimed["base_source"], claimed["base_commit"]) == (
+        "main",
+        "default",
+        intake.github.branches["main"],
+    )
+    assert claimed["base_resolved_request_id"] == request["id"]
+    assert [row["id"] for row in _requests(item["id"])] == [request["id"]]
     assert intake.jira.writes == 0
 
 
@@ -790,14 +829,14 @@ def test_mention_by_an_actor_without_start_authority_revises_nothing(intake: Int
 
 
 @pytest.mark.parametrize(
-    ("jira_bases", "admitted_on"),
+    ("jira_bases", "claimed_on"),
     [([], None), (["main", "next"], "next")],
     ids=["selected_binding_lists_no_bases", "selected_binding_allows_next"],
 )
 def test_base_policy_comes_from_the_selected_binding(
     make_intake: Callable[[dict[str, Any]], Intake],
     jira_bases: list[str],
-    admitted_on: str | None,
+    claimed_on: str | None,
 ) -> None:
     # Another binding on the same repository, listed first, allows `next`. A
     # first-match repository lookup would borrow its bases.
@@ -813,13 +852,49 @@ def test_base_policy_comes_from_the_selected_binding(
 
     intake.poll()
 
-    if admitted_on is None:
-        assert _work_items(issue) == []
-        [text] = _texts(intake, issue)
-        assert "next" in text
+    [item] = _work_items(issue)
+    [request] = _requests(item["id"])
+    assert (item["base_branch"], item["base_source"], item["base_commit"]) == (None, None, None)
+    assert item["base_resolved_request_id"] is None
+    assert not any("/git/ref/heads/" in call.url.path for call in intake.github.calls)
+    assert _bot_comments(intake, issue) == []
+
+    acquired = intake.acquire(request["id"])
+
+    if claimed_on is None:
+        assert acquired.status_code == 409, acquired.text
+        [waiting] = _work_items(issue)
+        assert (waiting["base_branch"], waiting["base_commit"]) == (None, None)
+        assert waiting["base_resolved_request_id"] is None
+        assert [(row["id"], row["status"]) for row in _requests(item["id"])] == [
+            (request["id"], "waiting")
+        ]
+        [refusal] = _texts(intake, issue)
+        assert "next" in refusal
+        assert "not an allowed base" in refusal
+        refused_again = intake.acquire(request["id"])
+        assert refused_again.status_code == 409, refused_again.text
+        assert _texts(intake, issue) == [refusal]
+        intake.jira.remove_label(issue.id, "base:next", intake.starter)
+        intake.sweep()
+        repaired = intake.acquire(request["id"])
+        assert repaired.status_code == 200, repaired.text
+        [claimed] = _work_items(issue)
+        assert (claimed["base_branch"], claimed["base_source"], claimed["base_commit"]) == (
+            "main",
+            "default",
+            intake.github.branches["main"],
+        )
     else:
-        [item] = _work_items(issue)
-        assert (item["base_branch"], item["base_source"]) == (admitted_on, "label")
+        assert acquired.status_code == 200, acquired.text
+        [claimed] = _work_items(issue)
+        assert (claimed["base_branch"], claimed["base_source"], claimed["base_commit"]) == (
+            claimed_on,
+            "label",
+            intake.github.branches[claimed_on],
+        )
+    assert claimed["base_resolved_request_id"] == request["id"]
+    assert [row["id"] for row in _requests(item["id"])] == [request["id"]]
 
 
 def test_code_host_and_reply_route_follow_the_bound_repository(

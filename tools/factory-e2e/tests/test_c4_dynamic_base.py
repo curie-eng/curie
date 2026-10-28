@@ -156,6 +156,8 @@ def request_by_id(run: DynamicKind, ticket: Ticket, identifier: str) -> dict[str
 
 def nochange_ready(run: DynamicKind, ticket: Ticket, transition: dict[str, Any]) -> dict[str, Any]:
     row = wait(lambda: latest_transition(run, ticket, "applied"))
+    if row is None or row["id"] != transition["id"]:
+        run.record_nochange_failure(ticket, transition, stage="transition_applied")
     assert row is not None and row["id"] == transition["id"], (
         "the platform did not apply the expected base move"
     )
@@ -166,6 +168,8 @@ def nochange_ready(run: DynamicKind, ticket: Ticket, transition: dict[str, Any])
             else None
         )
     )
+    if row is None:
+        run.record_nochange_failure(ticket, transition, stage="ci_ready")
     assert row is not None, "the real no-change finish path did not hand CI its transition subject"
     assert row["ci_settled_at"] is None
     assert run.publication_rows({"id": row["request_id"]}) == [], (
