@@ -897,6 +897,17 @@ class GitHubCodeHost:
         )
         return self._pull_request(repository, payload, require_sides=True)
 
+    async def add_pull_request_labels(
+        self, pull_request: PullRequestRef, labels: Sequence[str]
+    ) -> None:
+        repository = pull_request.repository
+        await self._send(
+            "POST",
+            f"{self._repo(repository.path)}/issues/{int(pull_request.number)}/labels",
+            token=await self._token(repository.path),
+            body={"labels": list(labels)},
+        )
+
     async def update_pull_request(
         self, pull_request: PullRequestRef, *, title: str | None, body: str | None
     ) -> PullRequest:
