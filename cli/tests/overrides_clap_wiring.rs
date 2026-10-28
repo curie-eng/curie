@@ -43,7 +43,7 @@ const MODEL_SENTINEL: &str = "curie-test-model-alpha";
 const REVIEWER_MODEL_SENTINEL: &str = "curie-test-reviewer-model-beta";
 /// A thinking value that could never be mistaken for a model name.
 const THINKING_SENTINEL: &str = "enabled:31337";
-/// An execution-deadline value inside the accepted 60..10800 range (issue #3071).
+/// An execution-deadline value inside the accepted 60..43200 range (issue #3071).
 const DEADLINE_SENTINEL: &str = "120";
 
 /// Run the binary with `argv` and return the single `plan` line of its
@@ -524,7 +524,7 @@ fn execution_deadline_above_the_maximum_is_refused_client_side() {
             "overrides",
             "deal-desk",
             "--execution-deadline",
-            "15000",
+            "43201",
             "--dry-run",
             "--json",
         ])
@@ -534,7 +534,7 @@ fn execution_deadline_above_the_maximum_is_refused_client_side() {
         .expect("run curie");
     assert!(
         !output.status.success(),
-        "a deadline above 10800 seconds must be refused before any request"
+        "a deadline above 43200 seconds must be refused before any request"
     );
 }
 

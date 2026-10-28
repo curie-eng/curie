@@ -166,9 +166,9 @@ PublicationProtectedPaths = Annotated[
 ]
 
 # Upper bound for CURIE_DELIVERY_BUDGET_S and CURIE_RUNNER_TOTAL_TIMEOUT_S:
-# three hours, so a long factory run fits one delivery (#3071, ADR-0171). The
+# twelve hours, so a long factory run fits one delivery (#3071, ADR-0171, #5067). The
 # chart schema carries the same maximum.
-MAX_DELIVERY_BUDGET_S = 10800.0
+MAX_DELIVERY_BUDGET_S = 43200.0
 
 
 class CallerSigningKeyError(RuntimeError):
@@ -947,7 +947,7 @@ class WorkerConfig(BaseSettings):
     # healthy long turn un-reclaimable and a dead owner's turn recoverable
     # after a bounded expiry, replacing the old dead pair of a flat HTTP
     # timeout and a 900s idle-based steal window. Both this budget and the
-    # per-request ceiling reach MAX_DELIVERY_BUDGET_S (three hours, #3071).
+    # per-request ceiling reach MAX_DELIVERY_BUDGET_S (twelve hours, #5067).
     delivery_budget_s: float = Field(
         default=600.0,
         ge=60.0,
@@ -1402,8 +1402,10 @@ class WorkerConfig(BaseSettings):
         default=15.0, gt=0, validation_alias="CURIE_WORK_ITEM_ORPHAN_SWEEP_INTERVAL_S"
     )
     # Settled stream entries are trimmed once they are older than this window
-    # (ADR 0184). The floor sits above the three-hour delivery budget ceiling;
-    # the ceiling is the one year shared by the other seconds knobs.
+    # (ADR 0184). Trimming touches only settled entries, and the
+    # default day keeps the pass clear of any delivery still inside its budget
+    # (at most 43200 s). The ceiling is the one year shared by the other
+    # seconds knobs.
     stream_retention_min_age_s: int = Field(
         default=86400,
         ge=3600,

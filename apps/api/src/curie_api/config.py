@@ -315,8 +315,9 @@ class Settings(BaseSettings):
     # Runs with the work item reconciler and factory ingress; 0 disables it.
     factory_lineage_reconcile_interval_s: float = Field(default=60, ge=0, allow_inf_nan=False)
     # How long a published factory run waits on its pull request's CI, from the
-    # push (#3162). The execution deadline still caps it; at most 10800 s, the
-    # longest execution deadline (ADR 0171).
+    # push (#3162). The execution deadline still caps it; the wait stays at most
+    # 10800 s, a separate bound from the execution deadline, which ADR 0249
+    # raised to 43200 s.
     factory_ci_wait_s: int = Field(
         default=3600,
         gt=0,

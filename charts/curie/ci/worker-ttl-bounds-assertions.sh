@@ -64,7 +64,7 @@
 #       CURIE_RUNNER_TOTAL_TIMEOUT_S=10800 exactly once; 1700 under an 1800-second
 #       delivery budget renders and reaches the worker; equality at 600, a
 #       fractional 0.5-second ceiling, and the inclusive 1800 case render
-#       with coherent delivery budgets. The schema refuses 0 and 10800.1,
+#       with coherent delivery budgets. The schema refuses 0 and 43200.1,
 #       proving the exclusive lower bound and inclusive upper bound. Finally,
 #       the relationship guard refuses the individually schema-valid combination
 #       runnerTotalTimeoutSeconds=1700 / deliveryBudgetSeconds=600 and names
@@ -74,7 +74,7 @@
 #       reply-timeout helper reads the rendered worker Deployment through an
 #       external kubectl stub. Defaults yield 10800 + 60 = 10860 seconds and a
 #       900-second chart override yields 960. Missing, duplicate, nonliteral,
-#       or out-of-range delivery-budget entries (outside 60 through 10800) are
+#       or out-of-range delivery-budget entries (outside 60 through 43200) are
 #       refused with the helper's diagnostic. This is chart and CLI consumer coverage only. A separate
 #       disposable cluster proof drives a real installed release and proves
 #       replies at the cluster tier.
@@ -84,8 +84,9 @@
 #       first-class default (10800) and still emits a non-colliding extraEnv
 #       entry. This is the 2026-09-04 soak: retained extraEnv plus first-class
 #       timeout made Kubernetes reject the worker patch (#2097).
-#   (n) THREE-HOUR CEILING (#3071): budget and runner ceiling at 10800 render
-#       with the default grace, which derives to 10860; 10801 is refused.
+#   (n) TWELVE-HOUR CEILING (#3071, raised by #5067): budget and runner ceiling
+#       at 43200 render with the default grace, which derives to 43260; 43201
+#       is refused. The shipped defaults stay at 10800.
 #   (o) FACTORY TURN BUDGET (#3071): worker.workItemMaxTurns reaches the
 #       worker env as CURIE_WORK_ITEM_MAX_TURNS.
 # SCHEMA WORDING IS NOT ASSERTED, AND MUST NOT BECOME ASSERTED. Every negative
@@ -226,8 +227,9 @@ if type(grace) is not int or grace < required:
     )
 PY
 
-# The shipped ceiling, the schema maxima, and the factory maximum execution
-# deadline are one number. The snippet reads those sources; it does not pin a
+# The shipped defaults are one number, and the schema maxima are the factory
+# maximum execution deadline (#5067): the defaults stay at three hours while
+# the ceiling is twelve. The snippet reads those sources; it does not pin a
 # literal, so a later coordinated change still has to move them together.
 IFS= read -r -d '' WORKER_CEILING_CONSISTENCY_PY <<'PY' || true
 import json, re, sys
@@ -249,23 +251,31 @@ match = re.search(r"^MAX_EXECUTION_DEADLINE_SECONDS\s*=\s*(\d+)\s*$", models, re
 if match is None:
     raise SystemExit("MAX_EXECUTION_DEADLINE_SECONDS assignment was not found")
 deadline = int(match.group(1))
-numbers = {
+defaults = {
     "values.yaml worker.deliveryBudgetSeconds": budget,
     "values.yaml worker.runnerTotalTimeoutSeconds": runner,
+}
+maxima = {
     "values.schema.json deliveryBudgetSeconds maximum": budget_max,
     "values.schema.json runnerTotalTimeoutSeconds maximum": runner_max,
     "MAX_EXECUTION_DEADLINE_SECONDS": deadline,
 }
+numbers = {**defaults, **maxima}
 bad = [name for name, value in numbers.items() if type(value) is not int]
 if bad:
     raise SystemExit(
         "expected integers, got "
         + ", ".join(f"{name}={numbers[name]!r}" for name in bad)
     )
-if len(set(numbers.values())) != 1:
+if len(set(defaults.values())) != 1:
     raise SystemExit(
-        "delivery budget, runner ceiling, schema maxima, and factory maximum differ: "
-        + ", ".join(f"{name}={value}" for name, value in numbers.items())
+        "shipped delivery budget and runner ceiling differ: "
+        + ", ".join(f"{name}={value}" for name, value in defaults.items())
+    )
+if len(set(maxima.values())) != 1:
+    raise SystemExit(
+        "schema maxima and factory maximum execution deadline differ: "
+        + ", ".join(f"{name}={value}" for name, value in maxima.items())
     )
 if runner > budget:
     raise SystemExit(f"runner ceiling {runner} exceeds delivery budget {budget}")
@@ -285,7 +295,7 @@ rendered_budget = int(env["CURIE_DELIVERY_BUDGET_S"])
 rendered_runner = int(env["CURIE_RUNNER_TOTAL_TIMEOUT_S"])
 if rendered_budget != budget or rendered_runner != budget:
     raise SystemExit(
-        "rendered worker ceiling does not match the shared factory maximum "
+        "rendered worker ceiling does not match the shipped default "
         f"{budget}: CURIE_DELIVERY_BUDGET_S={rendered_budget}, "
         f"CURIE_RUNNER_TOTAL_TIMEOUT_S={rendered_runner}"
     )
@@ -675,7 +685,7 @@ assert_env k \
   CURIE_DELIVERY_BUDGET_S=1800
 
 # Disable both resource templates so these failures isolate JSON Schema rather
-# than either cross-field guard. Use --set-json for 10800.1 so the schema sees a
+# than either cross-field guard. Use --set-json for 43200.1 so the schema sees a
 # genuine number and the refusal proves the inclusive maximum.
 assert_refused k runnerTotalTimeoutSeconds \
   --set worker.deploy=false \
@@ -686,7 +696,7 @@ assert_refused k runnerTotalTimeoutSeconds \
   --set worker.deploy=false \
   --set api.deploy=false \
   --set ui.deploy=false \
-  --set-json worker.runnerTotalTimeoutSeconds=10800.1
+  --set-json worker.runnerTotalTimeoutSeconds=43200.1
 
 # Individually valid scalar values, relationally invalid together. Capture the
 # result directly so Helm's required non-zero status is the asserted outcome.
@@ -725,8 +735,8 @@ render_worker_deployment_json "$L_CUSTOM_JSON" \
 assert_ladder_reply_timeout "$L_CUSTOM_JSON" 960
 
 for mutation_and_fragment in \
-  "nonliteral:must be a literal integer from 60 through 10800" \
-  "below-minimum:must be from 60 through 10800" \
+  "nonliteral:must be a literal integer from 60 through 43200" \
+  "below-minimum:must be from 60 through 43200" \
   "duplicate:must appear exactly once in the worker container env" \
   "missing:is absent from the worker container env"; do
   mutation="${mutation_and_fragment%%:*}"
@@ -741,17 +751,17 @@ done
 assert_refused m "CURIE_RUNNER_TOTAL_TIMEOUT_S" \
   --set-json 'worker.extraEnv=[{"name":"CURIE_RUNNER_TOTAL_TIMEOUT_S","value":"1700"},{"name":"CURIE_UPGRADE_FIXTURE","value":"kept"}]'
 
-# (n) #3071 three-hour ceiling and factory turn budget. The delivery budget and
-#     runner ceiling reach 10800 inclusive; 10801 is refused by the schema. A
-#     10800 budget with the DEFAULT terminationGracePeriodSeconds must render,
+# (n) #3071 ceiling, raised to twelve hours by #5067. The delivery budget and
+#     runner ceiling reach 43200 inclusive; 43201 is refused by the schema. A
+#     43200 budget with the DEFAULT terminationGracePeriodSeconds must render,
 #     because the chart derives grace as max(configured, budget + reserve):
-#     10800 + 60 = 10860 on both the pod spec and the worker env.
+#     43200 + 60 = 43260 on both the pod spec and the worker env.
 N_MAX="$TMP/n-max.yaml"
 if ! helm template curie "$CHART" \
-  --set worker.deliveryBudgetSeconds=10800 \
-  --set worker.runnerTotalTimeoutSeconds=10800 \
+  --set worker.deliveryBudgetSeconds=43200 \
+  --set worker.runnerTotalTimeoutSeconds=43200 \
   >"$N_MAX" 2>&1; then
-  fail n "the render FAILED at deliveryBudgetSeconds=10800 with the default grace; grace must follow the budget
+  fail n "the render FAILED at deliveryBudgetSeconds=43200 with the default grace; grace must follow the budget
   $(head -5 "$N_MAX")"
 fi
 if ! msg="$(python3 -c "$WORKER_GRACE_COVERS_BUDGET_PY" "$N_MAX" 2>&1)"; then
@@ -768,21 +778,21 @@ deploys = [
 print(deploys[0]["spec"]["template"]["spec"].get("terminationGracePeriodSeconds"))
 PY
 )"
-[[ "$N_GRACE" == "10860" ]] \
-  || fail n "worker terminationGracePeriodSeconds rendered $N_GRACE at a 10800 budget, expected 10860"
+[[ "$N_GRACE" == "43260" ]] \
+  || fail n "worker terminationGracePeriodSeconds rendered $N_GRACE at a 43200 budget, expected 43260"
 assert_env n \
-  --set worker.deliveryBudgetSeconds=10800 \
-  --set worker.runnerTotalTimeoutSeconds=10800 \
+  --set worker.deliveryBudgetSeconds=43200 \
+  --set worker.runnerTotalTimeoutSeconds=43200 \
   -- \
-  CURIE_DELIVERY_BUDGET_S=10800 \
-  CURIE_RUNNER_TOTAL_TIMEOUT_S=10800 \
-  CURIE_TERMINATION_GRACE_PERIOD_S=10860
+  CURIE_DELIVERY_BUDGET_S=43200 \
+  CURIE_RUNNER_TOTAL_TIMEOUT_S=43200 \
+  CURIE_TERMINATION_GRACE_PERIOD_S=43260
 for knob in deliveryBudgetSeconds runnerTotalTimeoutSeconds; do
   assert_refused n "$knob" \
     --set worker.deploy=false \
     --set api.deploy=false \
     --set ui.deploy=false \
-    --set "worker.$knob=10801"
+    --set "worker.$knob=43201"
 done
 
 # (o) Factory turn budget: worker.workItemMaxTurns defaults to 1000 and an

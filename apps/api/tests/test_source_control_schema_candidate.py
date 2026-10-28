@@ -38,7 +38,8 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # The minimum tracks the newest schema the app reads (#2911's tenant scope);
     # the head is the execution request start failure detail (0123, #4930),
     # which every ExecutionRequest read names, so the minimum rises with it.
-    assert window == {"schema_min": "0123", "schema_head": "0123"}
+    # The API writes the twelve-hour execution deadlines only 0140 admits (#5067).
+    assert window == {"schema_min": "0140", "schema_head": "0140"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -67,9 +68,8 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.0") == {"schema_min": "0122", "schema_head": "0122"}
     assert data["windows"].get("0.14.1") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
-    assert data["windows"].get("0.14.3") == {"schema_min": "0123", "schema_head": "0123"}
+    assert data["windows"].get("0.14.3") == {"schema_min": "0140", "schema_head": "0140"}
     assert data["revisions"][-16:] == [
-        "0095",
         "0096",
         "0097",
         "0098",
@@ -85,6 +85,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0121",
         "0122",
         "0123",
+        "0140",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -96,6 +97,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0120"] == "expand"
     assert kinds["0121"] == "expand"
     assert kinds["0123"] == "expand"
+    assert kinds["0140"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -170,7 +172,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0123"
+    assert current_revision() == "0140"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]

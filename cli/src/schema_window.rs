@@ -564,8 +564,8 @@ print(json.dumps(graph))
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
         // @spec DEPLOY-NOTICE-RELEASE-1.
         let candidate = source_candidate_window();
-        assert_eq!(candidate.schema_min, "0123");
-        assert_eq!(candidate.schema_head, "0123");
+        assert_eq!(candidate.schema_min, "0140");
+        assert_eq!(candidate.schema_head, "0140");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -585,7 +585,8 @@ print(json.dumps(graph))
         assert!(!live_in_window("0120", &current));
         assert!(!live_in_window("0121", &current));
         assert!(!live_in_window("0122", &current));
-        assert!(live_in_window("0123", &current));
+        assert!(!live_in_window("0123", &current));
+        assert!(live_in_window("0140", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");
