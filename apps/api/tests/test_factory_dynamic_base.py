@@ -376,8 +376,9 @@ def test_a_base_only_label_observation_fences_a_blocked_first_acquisition(
     assert (item["base_branch"], item["base_commit"]) == expected
 
 
+@pytest.mark.parametrize("latest_base", ["next", "main"])
 def test_a_base_label_waiting_behind_the_first_pin_still_replaces_its_granted_owner(
-    base_app: Any,
+    base_app: Any, latest_base: str
 ) -> None:
     client, api = base_app
     number = 32009
@@ -457,6 +458,7 @@ def test_a_base_label_waiting_behind_the_first_pin_still_replaces_its_granted_ow
                         )
                         observing_pid = await waiter(acquiring_pid, observing)
                         assert observing_pid != acquiring_pid
+                        api.labels = [LABEL, f"base:{latest_base}"]
                     finally:
                         await holder.rollback()
                     acquired, observed = await asyncio.wait_for(
@@ -476,6 +478,17 @@ def test_a_base_label_waiting_behind_the_first_pin_still_replaces_its_granted_ow
         "WHERE work_item_id = :id ORDER BY sequence",
         {"id": item["id"]},
     )
+    if latest_base == "main":
+        assert requests == [
+            {"id": original["id"], "status": "waiting", "acquire_owner": "factory-base-owner"}
+        ]
+        assert (_work_item(number)["base_branch"], _work_item(number)["base_commit"]) == (
+            "main",
+            MAIN_SHA,
+        )
+        started = _start(client, number, acquired)
+        assert started.status_code == 200, started.text
+        return
     assert [request["status"] for request in requests] == ["cancelled", "waiting"], requests
     predecessor, successor = requests
     assert predecessor == {"id": original["id"], "status": "cancelled", "acquire_owner": None}
