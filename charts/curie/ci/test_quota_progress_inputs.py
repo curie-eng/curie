@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -382,16 +382,17 @@ def test_candidate_stack_provisioning_header_is_declared_once_in_first_twenty_li
 
 
 @pytest.mark.parametrize(
-    ("phase", "deletion_grace", "fetch_finished", "accepted"),
+    ("phase", "deletion_grace", "created", "fetch_finished", "accepted"),
     [
-        ("Running", 30, 1031, True),
-        ("Running", 30, 1029, False),
-        ("Running", 30, 1030, False),
-        ("Running", 0, 1001, True),
-        ("Running", None, 1031, False),
-        ("Pending", None, 1031, False),
-        ("Succeeded", None, 1031, True),
-        ("Failed", None, 1031, True),
+        ("Running", 30, 990, 1031, True),
+        ("Running", 30, 990, 1029, False),
+        ("Running", 30, 990, 1030, False),
+        ("Running", 0, 990, 1001, True),
+        ("Running", None, 990, 1031, False),
+        ("Pending", None, 1001, 1031, True),
+        ("Pending", None, 1000, 1031, False),
+        ("Succeeded", None, 990, 1031, True),
+        ("Failed", None, 990, 1031, True),
     ],
     ids=[
         "grace-expires-during-fetch",
@@ -399,7 +400,8 @@ def test_candidate_stack_provisioning_header_is_declared_once_in_first_twenty_li
         "at-deadline",
         "zero-grace",
         "live-running",
-        "live-pending",
+        "fresh-live-pending",
+        "expired-live-pending",
         "succeeded",
         "failed",
     ],
@@ -408,6 +410,7 @@ def test_burst_quota_snapshot_at_fetch_completion(
     monkeypatch: pytest.MonkeyPatch,
     phase: str,
     deletion_grace: int | None,
+    created: int,
     fetch_finished: int,
     accepted: bool,
 ) -> None:
@@ -437,7 +440,10 @@ def test_burst_quota_snapshot_at_fetch_completion(
     clock = [1000]
     monkeypatch.setattr(time, "time", lambda: clock[0])
     retired = {
-        "metadata": {"uid": "retired"},
+        "metadata": {
+            "uid": "retired",
+            "creationTimestamp": datetime.fromtimestamp(created, UTC).isoformat(),
+        },
         "spec": {"priorityClassName": "sandbox"},
         "status": {"phase": phase},
     }
@@ -483,6 +489,11 @@ def test_burst_quota_snapshot_at_fetch_completion(
     if accepted:
         namespace["quota_pods"]()
     else:
-        with pytest.raises(AssertionError, match="more than two chargeable sandbox pods"):
+        error = (
+            "excess pre-runtime Pending sandbox pod exceeded 30 seconds"
+            if phase == "Pending"
+            else "observed more than two chargeable sandbox pods holding runtime"
+        )
+        with pytest.raises(AssertionError, match=f"^{error}$"):
             namespace["quota_pods"]()
     assert calls == ["resourcequota", "pods"]
