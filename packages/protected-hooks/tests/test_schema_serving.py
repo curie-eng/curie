@@ -71,7 +71,9 @@ def graph_payload() -> dict[str, Any]:
         ("0137", False),
         # @spec AUTOMATED-REMEDIATION-15: 0138 only widens a CHECK below the floor.
         ("0138", False),
-        ("0139", True),
+        ("0139", False),
+        # Workspace recovery reads require the 0141 outcome ledger.
+        ("0141", True),
         ("0000", True),
         ("future-expand", True),
     ],

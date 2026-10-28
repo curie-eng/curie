@@ -112,6 +112,7 @@ KNOWN_BODY_MODULES = frozenset(
         "curie_api.schemas.thread_attachments",
         "curie_api.schemas.versions",
         "curie_api.schemas.workitems",
+        "curie_api.schemas.workspace_recovery",
         "curie_api.schemas.workspaces",
         "curie_api.turn_progress",
         "curie_api.workitem_dispatch",
