@@ -357,6 +357,26 @@ def dynamic_model_type(module: Any) -> type:
                 return None
             request = json.loads(body)
             messages = request.get("messages", [])
+            objective_start = 0
+            for index, message in enumerate(messages):
+                if message.get("role") != "user":
+                    continue
+                content = message.get("content")
+                if isinstance(content, str):
+                    objective_start = index
+                elif (
+                    isinstance(content, list)
+                    and any(
+                        isinstance(block, dict) and block.get("type") == "text"
+                        for block in content
+                    )
+                    and not any(
+                        isinstance(block, dict) and block.get("type") == "tool_result"
+                        for block in content
+                    )
+                ):
+                    objective_start = index
+            messages = messages[objective_start:]
             tools = [
                 block
                 for message in messages
