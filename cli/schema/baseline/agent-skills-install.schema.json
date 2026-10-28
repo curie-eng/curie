@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/agent-skills-install/v1.json",
+  "title": "Curie skill set installation --json",
+  "description": "One receipt per bundled human-facing skill. Installation does not establish client activation or factory access.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "skills": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "enum": [
+              "codex",
+              "claude-code",
+              "copilot",
+              "gemini",
+              "cursor"
+            ]
+          },
+          "skill": {
+            "type": "string",
+            "minLength": 1
+          },
+          "scope": {
+            "enum": [
+              "repository",
+              "user"
+            ]
+          },
+          "directory": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {
+            "enum": [
+              "installed",
+              "unchanged"
+            ]
+          },
+          "guidance": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "agent",
+          "skill",
+          "scope",
+          "directory",
+          "status",
+          "guidance"
+        ]
+      }
+    }
+  },
+  "required": [
+    "skills"
+  ]
+}

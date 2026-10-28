@@ -134,8 +134,28 @@ KUBECONFIG="$CURIE_FACTORY_KUBECONFIG" curie factory quickstart \
   --private-key-file "$CURIE_FACTORY_APP_KEY"
 ```
 
-**3. Delegate the issue.** Add the `curie-factory` label in GitHub. The person
-adding it needs write or admin access to the repository.
+**3. Prepare and delegate the issue.** In the repository checkout, install the
+preparation skill for your coding agent using a CLI build that contains it:
+
+```bash
+curie factory skills install --agent codex
+```
+
+In Codex, invoke `$prepare-factory-ticket <issue-url>`. Answer its questions,
+review the complete specification, then choose **publish and start the factory**.
+The agent verifies the published issue and applies the confirmed factory label.
+The [preparation guide](docs/guides/factory-preparation.md) covers Claude Code,
+Copilot, Gemini and Cursor, global installation, and source builds when your
+released CLI does not yet include this command. Skill installation does not
+replace the factory setup in steps 1 and 2.
+
+The same command installs the local admin skills for repository runner setup
+and maintenance. The [repository environment guide](docs/guides/factory-environments.md)
+shows how to review issues, PRs, toolchains, and failed factory work before
+changing a repository's sandbox image or configuration.
+
+You can also prepare the issue yourself and add `curie-factory` in GitHub. The
+account adding the label needs write or admin access to the repository.
 
 The issue status comment shows progress through planning, implementation, review,
 publication, and CI. Inspect the resulting PR and its verification information.

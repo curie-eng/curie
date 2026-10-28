@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/agent-skill-install/v1.json",
+  "title": "Local coding-agent skill installation --json",
+  "description": "Receipt for an embedded skill installed or retained at a local client discovery path. It does not assert that the client discovered or activated the skill.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "agent": {"enum": ["codex", "claude-code", "copilot", "gemini", "cursor"]},
+    "skill": {"type": "string", "minLength": 1},
+    "scope": {"enum": ["repository", "user"]},
+    "directory": {"type": "string", "minLength": 1},
+    "status": {"enum": ["installed", "unchanged"]},
+    "guidance": {"type": "string", "minLength": 1}
+  },
+  "required": ["agent", "skill", "scope", "directory", "status", "guidance"]
+}

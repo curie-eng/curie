@@ -277,6 +277,11 @@ The cluster factory command performs the same check for its allowlisted reposito
 Without `--app-id`, it prints `toolchain inference skipped: no --app-id`.
 Dry-run describes the inference without reading GitHub.
 
+For a repository-specific image based on issue and PR history, use the local
+[factory environment setup skill](factory-environments.md) before reviewing a
+`--repo-runner` build and binding change. Its companion maintenance skill
+reviews later `needs human` outcomes for image and non-image repairs.
+
 Factory commits are authored by the GitHub App's bot identity. Before any Helm
 call, App setup resolves `<slug>[bot]` through GitHub's user API and configures
 `worker.publication.gitUserName=<slug>[bot]` and
@@ -926,6 +931,14 @@ Cloud ranges from `https://ip-ranges.atlassian.com/` on port 443, or the
 addresses your Data Center host resolves to on its port.
 
 ## Label an issue
+
+For guided issue preparation, install the
+[preparation skill](factory-preparation.md#install-prepare-and-hand-off) in your
+coding agent. It helps clarify the request, presents the full specification for
+review, and can publish and select it after explicit approval using your tracker
+connection. The guide includes the install command, supported clients and source
+build instructions while the feature awaits release. This uses the factory you
+configured above; skill installation alone does not create one.
 
 In the GitHub website, open an issue on the repository and add the label
 `curie-factory`. The person who adds the label must have write or admin access.

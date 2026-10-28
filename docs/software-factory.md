@@ -51,15 +51,86 @@ are not baked into the stock image. The
 [managed sandbox toolchain guide](guides/repository-toolchain-in-the-managed-sandbox.md)
 and bundle reference explain locked installs, absent services, and resource limits.
 
+## Bring your existing local workflow
+
+Use the skills your team already has in its local coding agents to explore an
+idea and prepare a specification. Both open source collections and skills
+developed internally can produce the starting material for factory preparation.
+
+Examples of open source local workflows include:
+
+| Project | Preparation examples |
+| --- | --- |
+| [Matt Pocock's skills](https://github.com/mattpocock/skills) | Requirements clarification with `grill-with-docs`, specifications with `to-spec`, and decomposition with `to-tickets` |
+| [Superpowers](https://github.com/obra/superpowers) | Brainstorming, design and implementation planning |
+| [Addy Osmani's agent skills](https://github.com/addyosmani/agent-skills) | Requirements interviews, specification development and task planning |
+
+Then use `prepare-factory-ticket` to review the existing issue, specification,
+plan or discussion for factory execution. It inspects repository context, asks
+about consequential gaps, assesses verification feasibility, and presents the
+complete final issue for approval before publication and selection. Sufficient
+existing issues keep their format and wording; an unchanged published issue needs
+verification and selection rather than a body update. Settled decisions remain
+inputs to the review, with questions focused on consequential gaps or conflicts. The skill can also help when you are starting with rough intent.
+
+The same handoff works with internally developed local skills: include the
+requirements, decisions and necessary context in the issue or repository material
+the factory can access. A local conversation, installed skill or private file is
+not automatically transferred to the factory. The factory reads the resulting
+issue; it does not require that any particular skill authored it.
+
+These links describe local authoring workflows. Compatibility here means using
+their output as input to factory preparation and issue handoff. It does not assert
+that the projects are installed in the factory or that each has passed a factory
+integration test. The readiness review uses repository and available environment
+evidence; deployment readiness remains unvalidated until connected validation is
+implemented. A review cannot guarantee that a factory run will complete.
+
+You can also use your team's local review skills to inspect a resulting PR and
+prepare feedback, or use the companion [PR review skill](guides/factory-pr-review.md).
+Approved feedback can request another factory revision through the configured
+intake. A local review alone does not start implementation.
+
+## Install Software Factory skills
+
+Use `prepare-factory-ticket` in your local coding agent as the factory readiness
+review and handoff step for existing material. Install the complete set, including
+`review-pr`, once:
+
+```bash
+curie factory skills install --agent codex
+```
+
+In Codex, invoke `$prepare-factory-ticket <issue-url>` or give it new feature
+intent. The skill inspects the checkout, asks about consequential ambiguity and
+presents the entire specification for review. After review, choose **publish and
+start the factory** to publish through your existing tracker tools and select
+eligible issues with the configured factory label. Reports stay local.
+
+The same install provides `factory-environment-setup` and
+`factory-environment-maintenance` for administrators. Use the
+[repository environment guide](guides/factory-environments.md) to plan a
+repository runner image from issue and PR history, review its build and
+deployment, and periodically classify failed work for targeted repairs.
+
+The [preparation guide](guides/factory-preparation.md) has the installation and
+invocation table for Codex, Claude Code, Copilot, Gemini and Cursor, global
+installation, manual upgrades, and a source build option until the installer is
+released. Installation needs no Python or running Curie service. Starting work
+still needs a configured factory, tracker access and the start authority described
+below. The skill does not deploy a factory or guarantee that a task can finish.
+
 ## Delegate, inspect, and refine
 
 The GitHub workflow is below. The GitLab and Jira Cloud quickstarts above
 provide the equivalent provider-specific steps.
 
-1. **Write a bounded GitHub issue.** Describe the behavior, acceptance criteria, and
-   how to verify it. Use Codex, Claude Code, or another coding agent to help
-   investigate and draft the issue if useful; Curie's factory runner takes over
-   after admission. Start with a small change. The sandbox receives the
+1. **Prepare a bounded GitHub issue.** Describe the behavior, acceptance criteria,
+   and how to verify it. Bring output from your [existing local workflow](#bring-your-existing-local-workflow)
+   to the [preparation skill](#install-software-factory-skills) for factory readiness review
+   and approved handoff, or prepare and select the issue yourself.
+   Curie's factory runner takes over after admission. Start with a small change.
+   The sandbox receives the
    repository checkout and reads the issue and comments through a scoped
    platform tool; it holds no GitHub publication credential.
 2. **Add the configured label.** The default is `curie-factory`. A permitted
@@ -72,6 +143,10 @@ provide the equivalent provider-specific steps.
 4. **Inspect the pull request and checks.** Read the diff, verification table,
    and any reviewer notes or unavailable checks. An opened PR can still be
    waiting on CI or need human intervention. The factory does not merge it.
+   For a guided walkthrough and local testing, use the already installed companion:
+   invoke
+   `$review-pr <pr-url>`. The [PR review guide](guides/factory-pr-review.md)
+   covers component details, coverage, manual tests and approved feedback.
 5. **Request a revision.** Use a new issue comment explicitly mentioning the
    configured App login, such as `@<app-slug>`, with your requested change.
    Ordinary comments and edits do not execute work. Authorized PR mentions
