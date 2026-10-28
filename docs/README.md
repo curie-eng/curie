@@ -31,20 +31,23 @@ they are not substitutes for a supported quickstart.
 - [Agent install](agent-install.md): unattended release installation and result
   reporting for a coding agent.
 
+## Work with Software Factory
+
+- [Prepare factory specifications](guides/factory-preparation.md): use your local
+  coding agent to clarify intent and save a reviewed draft without a new runtime.
+- [Factory specification contract](guides/factory-specification.md): canonical ticket
+  structure and manual coverage and dependency mapping.
+- [Review factory PRs](guides/factory-pr-review.md): inspect changes, run local
+  checks, and publish approved feedback or merge.
+- [Factory outcomes and costs](guides/measuring-factory-outcomes.md): evaluate
+  completed work, estimated spend, and human review effort.
+
 ## Use co-workers
 
 - [Co-worker platform](co-workers.md): delegation, workspace interaction, memory,
   approvals, and the shared platform beneath the examples.
 - [First Slack agent](your-first-slack-agent.md): connect a supported bundle to a
   real Slack workspace.
-- [Prepare factory specifications](guides/factory-preparation.md): use your local
-  coding agent to clarify intent and save a reviewed draft without a new runtime.
-- [Factory specification contract](guides/factory-specification.md): canonical ticket
-  structure and manual coverage and dependency mapping.
-- [Factory repository environments](guides/factory-environments.md): local admin
-  skills for runner image setup and periodic analysis of failed work.
-- [Factory outcomes and costs](guides/measuring-factory-outcomes.md): evaluate
-  completed work, estimated spend, and human review effort.
 - [Behavior packs](behavior-packs.md): opt-in greetings, capability tips, and
   progress behavior around a turn.
 - [Local models](local-model.md): opt-in Ollama evaluation, sizing, and limits.
@@ -67,6 +70,8 @@ they are not substitutes for a supported quickstart.
 
 - [Administrator guide](administering-co-workers.md): access, approvals, model
   configuration, budgets, memory, inspection, and stopping work.
+- [Factory repository environments](guides/factory-environments.md): local admin
+  skills for runner image setup and periodic analysis of failed work.
 - [Approvals](approvals.md): route binding, approver authority, and resumed turns.
 - [Operations](operations.md): cluster installation, credentials, egress, factory
   operation, upgrades, and operational limits.
