@@ -70,14 +70,21 @@ _REGULAR_MODES = frozenset({"100644", "100755"})
 _SYMLINK_MODE = "120000"
 _GITLINK_MODE = "160000"
 _SCRATCH_PREFIX = "curie-checkpoint-"
-# Every git call: no workspace-configured program runs and nothing optional is
-# written back to the real repository.
+# Every git call: no workspace-configured program or hook runs and nothing
+# optional is written back to the real repository. A split index would put its
+# shared index in the real git directory even for the scratch index.
 _GIT_SAFETY = (
     "--no-pager",
+    "-c",
+    "core.hooksPath=/dev/null",
     "-c",
     "core.fsmonitor=false",
     "-c",
     "core.untrackedCache=false",
+    "-c",
+    "core.splitIndex=false",
+    "-c",
+    "gc.auto=0",
 )
 _GIT_ENV = {
     "GIT_TERMINAL_PROMPT": "0",
@@ -332,6 +339,7 @@ def _record(
     object_format: str,
     deadline: _Deadline,
 ) -> _Record:
+    deadline.remaining("hash")
     parts = path.split("/")
     try:
         parent = _open_parent(root_fd, parts[:-1])
@@ -345,7 +353,13 @@ def _record(
             info = os.stat(name, dir_fd=parent, follow_symlinks=False)
         except FileNotFoundError:
             return ("absent",)
-        if index_entry is not None and index_entry[0] == _GITLINK_MODE:
+        if (
+            index_entry is not None
+            and index_entry[0] == _GITLINK_MODE
+            and stat.S_ISDIR(info.st_mode)
+        ):
+            # A submodule directory is identified by its index entry, never
+            # descended into; anything else at that path is its real type.
             return ("gitlink", index_entry[1])
         if stat.S_ISLNK(info.st_mode):
             target = os.readlink(os.fsencode(name), dir_fd=parent)
@@ -613,6 +627,8 @@ def capture_workspace_checkpoint(
         raise CheckpointRefusal(
             "manifest_too_large", 422, f"checkpoint manifest exceeds {MAX_MANIFEST_BYTES} bytes"
         )
+    # A result finished after the budget is discarded, not returned late.
+    git.deadline.remaining("hash")
     return WorkspaceCheckpoint(
         base_sha=base_sha, patch=patch, changed_paths=tuple(changed), manifest=manifest
     )
