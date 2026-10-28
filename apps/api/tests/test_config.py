@@ -8,11 +8,32 @@ conftest uses for DATABASE_URL).
 """
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
 from curie_api.config import Settings, get_settings
 from pydantic import ValidationError
+
+_PUBLICATION_LABEL_VECTORS = json.loads(
+    (
+        Path(__file__).resolve().parents[3] / "tests/vectors/factory-publication-labels.json"
+    ).read_text()
+)
+
+
+@pytest.mark.parametrize("vector", _PUBLICATION_LABEL_VECTORS, ids=lambda vector: vector["name"])
+def test_publication_labels_shared_vectors(
+    monkeypatch: pytest.MonkeyPatch, vector: dict[str, Any]
+) -> None:
+    monkeypatch.setenv("CURIE_FACTORY_PUBLICATION_LABELS", json.dumps(vector["value"]))
+
+    if vector["valid"]:
+        assert Settings().factory_publication_labels == vector["expected"]
+    else:
+        with pytest.raises(ValidationError) as raised:
+            Settings()
+        assert vector["key"] in str(raised.value)
 
 
 def test_config_is_open(client: Any) -> None:

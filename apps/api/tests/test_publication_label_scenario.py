@@ -35,6 +35,9 @@ from apps.api.tests.test_workitem_outcomes import (  # noqa: F401 - real stack f
 CHART = Path(__file__).resolve().parents[3] / "charts" / "curie"
 ENV_NAME = "CURIE_FACTORY_PUBLICATION_LABELS"
 LABELS = {REPO: ["SMOKE"]}
+_PUBLICATION_LABEL_VECTORS = json.loads(
+    (CHART.parents[1] / "tests/vectors/factory-publication-labels.json").read_text()
+)
 
 
 def _helm(*arguments: str) -> subprocess.CompletedProcess[str]:
@@ -86,22 +89,24 @@ def test_publication_labels_chart_environment_is_conditional_and_api_only() -> N
     assert _label_environment(_render()) == []
 
 
-@pytest.mark.parametrize(
-    "invalid",
-    [
-        [],
-        {"acme-corp/*": ["SMOKE"]},
-        {REPO: "SMOKE"},
-        {REPO: [""]},
-        {REPO: ["x" * 51]},
-        {REPO: [f"label-{number}" for number in range(11)]},
-    ],
-)
-def test_publication_labels_chart_schema_rejects_invalid_values(invalid: Any) -> None:
-    result = _helm("--set-json", f"api.factoryPublicationLabels={json.dumps(invalid)}")
+@pytest.mark.parametrize("vector", _PUBLICATION_LABEL_VECTORS, ids=lambda vector: vector["name"])
+def test_publication_labels_chart_schema_shared_vectors(vector: dict[str, Any]) -> None:
+    result = _helm("--set-json", f"api.factoryPublicationLabels={json.dumps(vector['value'])}")
 
-    assert result.returncode != 0
-    assert "factoryPublicationLabels" in result.stderr
+    if vector["valid"]:
+        assert result.returncode == 0, result.stderr
+        documents = [document for document in yaml.safe_load_all(result.stdout) if document]
+        entries = _label_environment(documents)
+        if vector["value"]:
+            [(_component, _container, value)] = entries
+            assert json.loads(value) == vector["value"]
+        else:
+            assert entries == []
+    else:
+        assert result.returncode != 0
+        assert "schema" in result.stderr.lower()
+        if isinstance(vector["value"], dict):
+            assert vector["key"] in result.stderr
 
 
 def test_publication_labels_chart_reserves_its_environment_variable() -> None:

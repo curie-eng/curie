@@ -398,12 +398,13 @@ def test_publication_labels_exclude_ineligible_pull_requests_and_repositories(
             "UPDATE curie.thread_publication_lineages SET code_host_kind = 'gitlab', "
             "code_host_host = 'gitlab.example.com', repository_project_id = '101', "
             "code_host_pr_id = 'merge-request-example', base_ref = 'main', "
-            "pr_number = :number, pr_url = :url "
+            "pr_number = :number, pr_url = :url, head_sha = :head "
             "WHERE id = :id",
             {
                 "id": uuid.UUID(publication["lineage_id"]),
                 "number": PR_NUMBER,
                 "url": "https://gitlab.example.com/acme-corp/acme-bot/-/merge_requests/123",
+                "head": HEAD_SHA,
             },
         )
         code_host.existing = replace(
