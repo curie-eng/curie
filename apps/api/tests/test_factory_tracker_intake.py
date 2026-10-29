@@ -1570,3 +1570,464 @@ def test_a_failed_hold_comment_does_not_starve_other_issues(
     _assert_held(intake, dc_issue)
     _assert_admitted_once(intake, healthy, event)
     assert _cursor() is None
+
+
+
+def _start_polled_request(intake: Intake, request_id: uuid.UUID) -> int:
+    acquired = intake.acquire(request_id)
+    assert acquired.status_code == 200, acquired.text
+    grant = acquired.json()
+    started = intake.client.post(
+        f"/v1/internal/work-items/requests/{request_id}/start",
+        headers={"X-Curie-Worker-Token": get_settings().internal_worker_token},
+        json={
+            "owner": "factory-intake-owner",
+            "generation": grant["generation"],
+            "claim_name": "claim-completed-poll",
+            "sandbox_name": "sandbox-completed-poll",
+            "context": grant["context"],
+        },
+    )
+    assert started.status_code == 200, started.text
+    return int(started.json()["runtime_epoch"])
+
+
+def _complete_polled_ci(intake: Intake, request_id: uuid.UUID, authority: str) -> None:
+    import redis.asyncio as aioredis
+    from curie_api import factory_ci
+    from curie_api.workitem_reconciler import WorkItemReconciler
+    from curie_api.workitems import lifecycle
+    from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
+
+    async def complete() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        valkey = aioredis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
+        reconciler = WorkItemReconciler(maker, valkey, get_settings())
+        try:
+            async with maker() as session:
+                settlement = await lifecycle.claim_publication_settlement(
+                    session, exclude=frozenset()
+                )
+                assert settlement is not None and settlement.request_id == request_id
+                assert settlement.subject.kind == authority
+                await session.rollback()
+            async with httpx.AsyncClient(
+                transport=_ByHost(intake.jira, intake.github, intake.dc, dc_down=False)
+            ) as external:
+                result = await factory_ci.gate(
+                    maker,
+                    valkey,
+                    get_settings(),
+                    external,
+                    settlement,
+                    owner="completed-base-poll",
+                    next_poll={},
+                    dispatch=reconciler._dispatch_ci_turn,
+                    may_observe=lambda _request: True,
+                )
+            assert result == "settled", result
+        finally:
+            await valkey.aclose()
+            await engine.dispose()
+
+    intake.client.portal.call(complete)
+    assert _rows(
+        "SELECT status, terminal_cause FROM curie.execution_requests WHERE id = :id",
+        {"id": request_id},
+    ) == [{"status": "completed", "terminal_cause": "completed"}]
+
+
+def _completed_open_polled_authority(
+    intake: Intake, authority: str
+) -> tuple[jira_fake.JiraIssue, dict[str, Any], uuid.UUID, dict[str, Any]]:
+    from curie_api.models import FactoryBaseTransition, ThreadPublicationLineage, WorkItem
+    from sqlalchemy import text
+    from test_factory_terminus import _acknowledge_publication_history, _attach_publication
+    from test_github_factory_base import _open_lineage
+
+    intake.github.push_head("next")
+    intake.agent()
+    issue = _issue(intake)
+    intake.jira.add_label(issue.id, "base:main", intake.starter)
+    intake.jira.add_label(issue.id, LABEL, intake.starter)
+    intake.poll()
+    [item] = _work_items(issue)
+    [request] = _requests(item["id"])
+    epoch = _start_polled_request(intake, request["id"])
+    [item] = _work_items(issue)
+    head = intake.github.push_head("curie/completed-poll-source")
+    if authority == "publication":
+        _attach_publication(item["id"], status="succeeded", pr=77, head_sha=head)
+    else:
+        _open_lineage(item["id"])
+    (lineage,) = _rows(
+        "SELECT l.* FROM curie.thread_publication_lineages l JOIN curie.work_items w "
+        "ON w.publication_lineage_id = l.id WHERE w.id = :id",
+        {"id": item["id"]},
+    )
+    intake.github.branches[lineage["branch"]] = head
+    intake.github.pulls[77] = {
+        "head": lineage["branch"],
+        "base": "main",
+        "state": "open",
+        "merged_at": None,
+        "title": "Verify the completed factory change",
+        "body": "Factory change",
+        "draft": False,
+    }
+    intake.github.report_check(head, "unit-tests", "success")
+    if authority == "publication":
+        _acknowledge_publication_history(intake.client, request)
+    else:
+        async def applied() -> None:
+            from curie_api.factory_base_reconcile import reconcile_base_transitions
+
+            engine = create_async_engine(get_settings().database_url)
+            maker = async_sessionmaker(engine, expire_on_commit=False)
+            try:
+                async with maker() as session:
+                    stored = await session.get(WorkItem, item["id"])
+                    selected = await session.get(ThreadPublicationLineage, lineage["id"])
+                    assert stored is not None and selected is not None
+                    now = await session.scalar(text("SELECT clock_timestamp()"))
+                    selected.base_ref, selected.base_sha, selected.head_sha = (
+                        "main", item["base_commit"], head
+                    )
+                    selected.code_host_kind = stored.code_host_kind
+                    selected.code_host_host = stored.code_host_host
+                    selected.repository_project_id = stored.repository_project_id
+                    selected.code_host_installation_id = stored.code_host_installation_id
+                    selected.code_host_pr_id = "P0EXAMPLE77"
+                    session.add(
+                        FactoryBaseTransition(
+                            work_item_id=item["id"],
+                            request_id=request["id"],
+                            ci_request_id=request["id"],
+                            lineage_id=lineage["id"],
+                            phase="applied",
+                            version=1,
+                            repository_snapshot={
+                                "kind": stored.code_host_kind,
+                                "host": stored.code_host_host,
+                                "project_id": stored.repository_project_id,
+                                "path": stored.repository_path,
+                                "installation_id": stored.code_host_installation_id,
+                                "pull_request_id": selected.code_host_pr_id,
+                            },
+                            old_base_ref="next",
+                            old_base_sha=intake.github.branches["next"],
+                            old_head_sha=intake.github.branches["main"],
+                            target_base_ref="main",
+                            target_base_sha=item["base_commit"],
+                            base_source="label",
+                            branch=lineage["branch"],
+                            pull_request_number="77",
+                            committer_name="Curie",
+                            committer_email="factory@example.com",
+                            committer_time=now,
+                            rebased_head_sha=intake.github.branches["main"],
+                            verification_head_sha=head,
+                            changed_paths=["README.md"],
+                            ci_pushed_at=now,
+                            applied_at=now,
+                        )
+                    )
+                    await session.commit()
+                async with httpx.AsyncClient(
+                    transport=_ByHost(intake.jira, intake.github, intake.dc, dc_down=False)
+                ) as external:
+                    await reconcile_base_transitions(
+                        maker, settings=get_settings(), client=external
+                    )
+            finally:
+                await engine.dispose()
+
+        intake.client.portal.call(applied)
+        handed_off = intake.client.post(
+            f"/v1/internal/work-items/requests/{request['id']}/finish",
+            headers={"X-Curie-Worker-Token": get_settings().internal_worker_token},
+            json={
+                "runtime_epoch": epoch,
+                "outcome": "failed",
+                "cause": "no_pull_request",
+                "detail": "No changes needed: verification passed on the moved head.",
+            },
+        )
+        assert handed_off.status_code == 409, handed_off.text
+        assert "publication_pending" in handed_off.text
+    _complete_polled_ci(
+        intake, request["id"], authority if authority == "publication" else "base_transition"
+    )
+    (lineage,) = _rows(
+        "SELECT l.* FROM curie.thread_publication_lineages l JOIN curie.work_items w "
+        "ON w.publication_lineage_id = l.id WHERE w.id = :id",
+        {"id": item["id"]},
+    )
+    if authority == "transition":
+        assert _rows(
+            "SELECT id FROM curie.publications WHERE lineage_id = :id", {"id": lineage["id"]}
+        ) == []
+        (move,) = _rows(
+            "SELECT outcome_ready_at, ci_settled_at FROM curie.factory_base_transitions "
+            "WHERE lineage_id = :id",
+            {"id": lineage["id"]},
+        )
+        assert move["outcome_ready_at"] is not None and move["ci_settled_at"] is not None
+    return issue, item, request["id"], lineage
+
+
+def _complete_polled_unchanged_follow_up(
+    intake: Intake, issue: jira_fake.JiraIssue, item: dict[str, Any]
+) -> uuid.UUID:
+    intake.jira.add_comment(
+        issue.id,
+        intake.starter,
+        jira_fake.adf_mention(
+            jira_fake.BOT_ACCOUNT_ID, jira_fake.BOT_NAME, after=" verify the existing change"
+        ),
+    )
+    intake.poll()
+    latest = _requests(item["id"])[-1]
+    epoch = _start_polled_request(intake, latest["id"])
+    finished = intake.client.post(
+        f"/v1/internal/work-items/requests/{latest['id']}/finish",
+        headers={"X-Curie-Worker-Token": get_settings().internal_worker_token},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "no_pull_request",
+            "detail": "No changes needed: the existing pull request satisfies this follow-up.",
+        },
+    )
+    assert finished.status_code == 200, finished.text
+    assert _requests(item["id"])[-1]["status"] == "completed"
+    return latest["id"]
+
+
+def _targeted_base_poll_reads(
+    intake: Intake, jira_since: int, github_since: int
+) -> tuple[list[str], list[str]]:
+    labels = [
+        request.path
+        for request in intake.jira.requests[jira_since:]
+        if request.params.get("fields") == "labels,components"
+    ]
+    repositories = [
+        request.url.path
+        for request in intake.github.calls[github_since:]
+        if request.method == "GET"
+        and request.url.path in {f"/repositories/{REPO_ID}", f"/repos/{REPO}"}
+    ]
+    return labels, repositories
+
+
+@pytest.mark.parametrize("authority", ["publication", "transition"])
+@pytest.mark.parametrize(
+    "older_owner", [False, True], ids=["current-owner", "older-no-change-owner"]
+)
+def test_polled_base_change_readmits_completed_current_open_authority(
+    make_intake: Callable[[dict[str, Any]], Intake], authority: str, older_owner: bool
+) -> None:
+    intake = make_intake(_document(jira_binding=_jira_binding(bases=["main", "next"])))
+    issue, item, owner, lineage = _completed_open_polled_authority(intake, authority)
+    latest = _complete_polled_unchanged_follow_up(intake, issue, item) if older_owner else owner
+    before = _requests(item["id"])
+    assert before[-1]["id"] == latest and before[-1]["status"] == "completed"
+    intake.jira.remove_label(issue.id, "base:main", intake.starter)
+    intake.jira.add_label(issue.id, "base:next", intake.starter)
+    jira_since, github_since = len(intake.jira.requests), len(intake.github.calls)
+
+    intake.poll()
+
+    after = _requests(item["id"])
+    assert len(after) == len(before) + 1, after
+    assert after[:-1] == before
+    successor = after[-1]
+    assert successor["id"] not in {row["id"] for row in before}
+    assert successor["status"] == "waiting"
+    assert _targeted_base_poll_reads(intake, jira_since, github_since) == (
+        [f"/rest/api/3/issue/{issue.id}"], [f"/repositories/{REPO_ID}"]
+    )
+    intake.poll()
+    assert _requests(item["id"]) == after
+    acquired = intake.acquire(successor["id"])
+    assert acquired.status_code == 409, acquired.text
+    (move,) = _rows(
+        "SELECT id, request_id, phase, old_head_sha, target_base_ref "
+        "FROM curie.factory_base_transitions WHERE work_item_id = :item AND request_id = :request",
+        {"item": item["id"], "request": successor["id"]},
+    )
+    assert move["request_id"] == successor["id"]
+    assert move["phase"] == "pending"
+    assert move["old_head_sha"] == lineage["head_sha"]
+    assert move["target_base_ref"] == "next"
+    intake.poll()
+    assert _requests(item["id"]) == after
+    assert _rows(
+        "SELECT id FROM curie.factory_base_transitions WHERE request_id = :id",
+        {"id": successor["id"]},
+    ) == [{"id": move["id"]}]
+    assert _rows(
+        "SELECT l.id, l.branch, l.pr_number, l.head_sha, l.base_ref "
+        "FROM curie.thread_publication_lineages l WHERE l.id = :id", {"id": lineage["id"]}
+    ) == [{key: lineage[key] for key in ("id", "branch", "pr_number", "head_sha", "base_ref")}]
+    if authority == "transition":
+        assert _rows(
+            "SELECT id FROM curie.publications WHERE lineage_id = :id", {"id": lineage["id"]}
+        ) == []
+
+
+
+def _foreign_completed_polled_request(intake: Intake) -> uuid.UUID:
+    issue = _issue(intake, "A separate completed ticket")
+    intake.jira.add_label(issue.id, LABEL, intake.starter)
+    intake.poll()
+    [item] = _work_items(issue)
+    [request] = _requests(item["id"])
+    _execute(
+        "UPDATE curie.execution_requests SET status = 'completed', "
+        "started_at = clock_timestamp(), execution_attempts = 1, "
+        "execution_deadline = clock_timestamp() + interval '1 hour', "
+        "terminal_at = clock_timestamp(), terminal_cause = 'completed' WHERE id = :id",
+        {"id": request["id"]},
+    )
+    return request["id"]
+
+
+@pytest.mark.parametrize(
+    ("authority", "damage"),
+    [
+        pytest.param(authority, damage, id=f"{authority}-{damage}")
+        for authority, damages in (
+            (
+                "publication",
+                (
+                    "closed", "latest_failed", "latest_cancelled", "stale_base",
+                    "stale_revision", "wrong_result", "unacknowledged",
+                    "foreign_owner", "failed_owner", "later_applied_move",
+                ),
+            ),
+            (
+                "transition",
+                (
+                    "closed", "latest_failed", "latest_cancelled", "stale_base",
+                    "stale_head", "unacknowledged", "unsettled", "foreign_owner", "failed_owner",
+                ),
+            ),
+        )
+        for damage in damages
+    ],
+)
+def test_base_poll_skips_completed_items_without_current_open_authority(
+    make_intake: Callable[[dict[str, Any]], Intake], authority: str, damage: str
+) -> None:
+    intake = make_intake(_document(jira_binding=_jira_binding(bases=["main", "next"])))
+    issue, item, owner, lineage = _completed_open_polled_authority(intake, authority)
+    latest = (
+        _complete_polled_unchanged_follow_up(intake, issue, item)
+        if damage == "failed_owner" else owner
+    )
+    foreign = _foreign_completed_polled_request(intake) if damage == "foreign_owner" else None
+    if authority == "publication":
+        table = "publications"
+        (subject,) = _rows(
+            "SELECT * FROM curie.publications WHERE execution_request_id = :id", {"id": owner}
+        )
+        base_column, outcome_column, owner_column = (
+            "base_sha", "outcome_history_ready_at", "execution_request_id"
+        )
+    else:
+        table = "factory_base_transitions"
+        (subject,) = _rows(
+            "SELECT * FROM curie.factory_base_transitions WHERE ci_request_id = :id", {"id": owner}
+        )
+        base_column, outcome_column, owner_column = (
+            "target_base_sha", "outcome_ready_at", "ci_request_id"
+        )
+    target_id = subject["id"]
+    if damage == "closed":
+        table, target_id = "thread_publication_lineages", lineage["id"]
+        before, broken = {"status": "open"}, {"status": "closed"}
+    elif damage in {"latest_failed", "latest_cancelled", "failed_owner"}:
+        table, target_id = "execution_requests", owner if damage == "failed_owner" else latest
+        before = {"status": "completed", "terminal_cause": "completed"}
+        broken = {
+            "status": "cancelled" if damage == "latest_cancelled" else "failed",
+            "terminal_cause": "issue_cancelled" if damage == "latest_cancelled" else "ci_failed",
+        }
+        if damage == "latest_cancelled":
+            (timing,) = _rows(
+                "SELECT terminal_at, cancellation_requested_at, termination_observation "
+                "FROM curie.execution_requests WHERE id = :id",
+                {"id": target_id},
+            )
+            (clock,) = _rows("SELECT clock_timestamp() AS now")
+            before.update(timing)
+            broken.update(
+                terminal_at=clock["now"],
+                cancellation_requested_at=clock["now"],
+                termination_observation="runtime stopped",
+            )
+    elif damage == "stale_revision":
+        table, target_id = "thread_publication_lineages", lineage["id"]
+        before = {"latest_revision": lineage["latest_revision"]}
+        broken = {"latest_revision": lineage["latest_revision"] + 1}
+    elif damage == "later_applied_move":
+        table, target_id = "factory_base_transitions", uuid.uuid4()
+        _execute(
+            "INSERT INTO curie.factory_base_transitions "
+            "(id, work_item_id, request_id, ci_request_id, lineage_id, phase, "
+            "old_base_ref, old_base_sha, old_head_sha, target_base_ref, target_base_sha, "
+            "base_source, branch, pull_request_number, committer_name, committer_email, "
+            "committer_time, verification_head_sha, applied_at, outcome_ready_at, "
+            "ci_ready_at, ci_settled_at) VALUES "
+            "(:id, :item, :request, :request, :lineage, 'applied', 'main', :base, :head, "
+            "'main', :base, 'label', :branch, '77', 'Curie', 'factory@example.com', "
+            "clock_timestamp(), :stale, clock_timestamp(), clock_timestamp(), "
+            "clock_timestamp(), clock_timestamp())",
+            {
+                "id": target_id, "item": item["id"], "request": owner,
+                "lineage": lineage["id"], "base": lineage["base_sha"],
+                "head": lineage["head_sha"], "branch": lineage["branch"], "stale": "9" * 40,
+            },
+        )
+        before = {"verification_head_sha": lineage["head_sha"]}
+        broken = {"verification_head_sha": "9" * 40}
+    else:
+        column, value = {
+            "stale_base": (base_column, "9" * 40),
+            "stale_head": ("verification_head_sha", "9" * 40),
+            "wrong_result": ("result_url", f"https://github.com/{REPO}/pull/78"),
+            "unacknowledged": (outcome_column, None),
+            "unsettled": ("ci_settled_at", None),
+            "foreign_owner": (owner_column, foreign),
+        }[damage]
+        before, broken = {column: subject[column]}, {column: value}
+    statement = (
+        f"UPDATE curie.{table} SET "
+        + ", ".join(f"{column} = :{column}" for column in before)
+        + " WHERE id = :id"
+    )
+    _execute(statement, {"id": target_id, **broken})
+    before_requests = _requests(item["id"])
+    intake.jira.remove_label(issue.id, "base:main", intake.starter)
+    intake.jira.add_label(issue.id, "base:next", intake.starter)
+    jira_since, github_since = len(intake.jira.requests), len(intake.github.calls)
+
+    intake.poll()
+    intake.poll()
+
+    assert _targeted_base_poll_reads(intake, jira_since, github_since) == ([], [])
+    assert _requests(item["id"]) == before_requests
+    _execute(statement, {"id": target_id, **before})
+    jira_since, github_since = len(intake.jira.requests), len(intake.github.calls)
+
+    intake.poll()
+
+    after = _requests(item["id"])
+    assert len(after) == len(before_requests) + 1, after
+    assert after[-1]["status"] == "waiting"
+    assert _targeted_base_poll_reads(intake, jira_since, github_since) == (
+        [f"/rest/api/3/issue/{issue.id}"], [f"/repositories/{REPO_ID}"]
+    )

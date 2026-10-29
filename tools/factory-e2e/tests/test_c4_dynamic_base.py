@@ -25,6 +25,7 @@ from c4_dynamic_base import (  # noqa: E402
     TERMINAL,
     DynamicKind,
     assert_ci_still_owns_request,
+    assert_replayed_history,
     configure_dynamic,
     wait,
 )
@@ -154,7 +155,13 @@ def request_by_id(run: DynamicKind, ticket: Ticket, identifier: str) -> dict[str
     return next(row for row in run.requests(ticket) if row["id"] == identifier)
 
 
-def nochange_ready(run: DynamicKind, ticket: Ticket, transition: dict[str, Any]) -> dict[str, Any]:
+def nochange_ready(
+    run: DynamicKind,
+    ticket: Ticket,
+    transition: dict[str, Any],
+    *,
+    expected_content: str,
+) -> dict[str, Any]:
     row = wait(lambda: latest_transition(run, ticket, "applied"))
     if row is None or row["id"] != transition["id"]:
         run.record_nochange_failure(ticket, transition, stage="transition_applied")
@@ -183,7 +190,7 @@ def nochange_ready(run: DynamicKind, ticket: Ticket, transition: dict[str, Any])
     assert checkout is not None, "the successor reused the old checkout"
     assert (checkout["target"], checkout["value"]) == (
         row["target_base_ref"],
-        'VALUE = "factory"',
+        expected_content,
     )
     assert row["outcome_ready_at"] is not None, "execution bypassed the base-change outcome"
     assert_ci_still_owns_request(request_by_id(run, ticket, row["ci_request_id"]), row)
@@ -242,16 +249,48 @@ def assert_completed(run: DynamicKind, ticket: Ticket, request_id: str) -> None:
     assert row["status"] == "completed", f"fresh final-head CI settled {row['status']}"
 
 
-def start_move(run: DynamicKind, ticket: Ticket, target: str = "next") -> dict[str, Any]:
-    run.model.mode("nochange")
-    run.label(ticket, "base:" + target)
-    transition = wait(lambda: rows[-1] if (rows := run.transitions(ticket)) else None)
+def wait_new_transition(
+    run: DynamicKind,
+    ticket: Ticket,
+    *,
+    target: str,
+    previous_transition_id: str | None,
+) -> dict[str, Any]:
+    transition = wait(
+        lambda: (
+            rows[-1]
+            if (rows := run.transitions(ticket))
+            and rows[-1]["id"] != previous_transition_id
+            and rows[-1]["target_base_ref"] == target
+            else None
+        )
+    )
     assert transition is not None, "a relabel did not create a durable platform base move"
     return transition
 
 
+def start_move(
+    run: DynamicKind,
+    ticket: Ticket,
+    *,
+    target: str,
+    previous_transition_id: str | None,
+) -> dict[str, Any]:
+    run.model.mode("nochange")
+    run.label(ticket, "base:" + target)
+    return wait_new_transition(
+        run, ticket, target=target, previous_transition_id=previous_transition_id
+    )
+
+
 def assert_applied_git(
-    run: DynamicKind, before: dict[str, Any], transition: dict[str, Any]
+    run: DynamicKind,
+    before: dict[str, Any],
+    transition: dict[str, Any],
+    *,
+    expected_content: str,
+    expected_push_history: tuple[str, ...],
+    expected_replay_heads: tuple[str, ...],
 ) -> None:
     candidate, final = transition["rebased_head_sha"], transition["verification_head_sha"]
     assert candidate and final and candidate != final
@@ -275,18 +314,121 @@ def assert_applied_git(
     assert changed_paths == transition["changed_paths"] == [CHANGE], (
         "the same-tree verification commit hid the replayed Python change from CI"
     )
-    assert run.stub.git("show", final + ":" + CHANGE) == 'VALUE = "factory"'
+    assert run.stub.git("show", final + ":" + CHANGE) == expected_content
+    source = run.stub.history(transition["old_base_sha"], transition["old_head_sha"])
+    replayed = run.stub.history(transition["target_base_sha"], candidate)
+    assert_replayed_history(source, replayed, expected_source_heads=expected_replay_heads)
+    final_history = run.stub.history(transition["target_base_sha"], final)
+    assert final_history[:-1] == replayed and final_history[-1]["sha"] == final
+    assert final_history[-1]["empty"], "the fresh verification commit changed the replayed tree"
     pull = run.pull(int(before["pr_number"]))
     assert pull["head"]["sha"] == final and pull["base"]["ref"] == transition["target_base_ref"]
     assert pull["head"]["ref"] == before["branch"]
     writes = [event for event in run.stub.events("push") if event["detail"] == before["branch"]]
-    assert [event["head"] for event in writes] == [before["head_sha"], candidate, final], (
+    assert [event["head"] for event in writes] == [*expected_push_history, candidate, final], (
         "recovery wrote an extra or unexpected remote head"
     )
     assert writes[-2]["target"] == transition["old_base_ref"]
     assert writes[-1]["target"] == transition["target_base_ref"], (
         "the final-head CI event ran against the old target"
     )
+
+
+def relabel_completed_request(
+    run: DynamicKind,
+    ticket: Ticket,
+    publication: dict[str, Any],
+    *,
+    completed_request_id: str,
+    previous_transition_id: str,
+    expected_content: str,
+    expected_push_history: tuple[str, ...],
+    expected_replay_heads: tuple[str, ...],
+) -> None:
+    predecessor = request_by_id(run, ticket, completed_request_id)
+    assert predecessor["status"] == "completed"
+    request_ids = [request["id"] for request in run.requests(ticket)]
+    transition_ids = [transition["id"] for transition in run.transitions(ticket)]
+    assert request_ids[-1] == completed_request_id
+    assert transition_ids[-1] == previous_transition_id
+    before = run.pull(int(publication["pr_number"]))
+    assert before["state"] == "open" and before["base"]["ref"] == "next"
+    assert before["head"]["sha"] == expected_replay_heads[-1]
+    lineage_id = run.item(ticket)["publication_lineage_id"]
+    old_lineage = run.sql(
+        "SELECT row_to_json(l) FROM curie.thread_publication_lineages l "
+        f"WHERE id='{uuid.UUID(lineage_id)}'"
+    )
+    assert old_lineage["head_sha"] == before["head"]["sha"]
+    assert ticket.agent.label in {
+        label["name"] for label in run.stub._get("issue", ticket.number)["labels"]
+    }
+    run.model.mode("nochange")
+    run.label(ticket, "base:next", present=False)
+    transition = wait_new_transition(
+        run, ticket, target="main", previous_transition_id=previous_transition_id
+    )
+    row = nochange_ready(run, ticket, transition, expected_content=expected_content)
+    successor = request_by_id(run, ticket, row["ci_request_id"])
+    assert successor["id"] != completed_request_id
+    assert successor["sequence"] == predecessor["sequence"] + 1
+    assert successor["started_at"] is not None
+    assert row["request_id"] == row["ci_request_id"] == successor["id"]
+    assert row["old_head_sha"] == before["head"]["sha"]
+    assert (row["old_base_ref"], row["target_base_ref"], row["base_source"]) == (
+        "next", "main", "default"
+    )
+    assert [request["id"] for request in run.requests(ticket)] == [
+        *request_ids, successor["id"]
+    ]
+    assert [candidate["id"] for candidate in run.transitions(ticket)] == [
+        *transition_ids, row["id"]
+    ]
+    assert request_by_id(run, ticket, completed_request_id) == predecessor, (
+        "a completed predecessor changed during the new base move"
+    )
+    assert_applied_git(
+        run,
+        publication,
+        row,
+        expected_content=expected_content,
+        expected_push_history=expected_push_history,
+        expected_replay_heads=expected_replay_heads,
+    )
+    current = run.pull(before["number"])
+    assert current["state"] == "open"
+    assert (current["id"], current["number"], current["html_url"], current["head"]["ref"]) == (
+        before["id"], before["number"], before["html_url"], before["head"]["ref"]
+    )
+    item = run.item(ticket)
+    assert (item["publication_lineage_id"], item["base_resolved_request_id"]) == (
+        lineage_id, successor["id"]
+    )
+    assert (item["base_branch"], item["base_source"], item["base_commit"]) == (
+        "main", "default", row["target_base_sha"]
+    )
+    lineage = run.sql(
+        "SELECT row_to_json(l) FROM curie.thread_publication_lineages l "
+        f"WHERE id='{uuid.UUID(lineage_id)}'"
+    )
+    assert (lineage["base_ref"], lineage["base_sha"], lineage["head_sha"]) == (
+        "main", row["target_base_sha"], row["verification_head_sha"]
+    )
+    assert lineage["latest_revision"] == old_lineage["latest_revision"]
+    identity = ("id", "branch", "pr_number", "pr_url", "code_host_pr_id")
+    assert tuple(lineage[key] for key in identity) == tuple(old_lineage[key] for key in identity)
+    assert wait(
+        lambda: any(
+            line.startswith("Base:") and "`main`" in line and "deployment default" in line
+            for comment in run.comments(ticket)
+            for line in comment.splitlines()
+        )
+    ), "the completed-request relabel omitted the selected default base"
+    assert_running_after_gate(run, ticket, row, "queued")
+    run.stub.check(row["verification_head_sha"], "success", target="main")
+    assert_completed(run, ticket, successor["id"])
+    assert latest_transition(run, ticket, "applied")["ci_settled_at"] is not None
+    assert request_by_id(run, ticket, completed_request_id) == predecessor
 
 
 def test_delayed_label_and_pre_pr_change_replace_real_checkout(
@@ -358,7 +500,7 @@ def test_clean_move_recovers_push_and_retarget_then_waits_for_final_head_ci(
     old_pull = run.pull(int(publication["pr_number"]))
     run.stub.control("lose_push", "once")
     run.stub.control("retarget", "unavailable")
-    transition = start_move(run, ticket)
+    transition = start_move(run, ticket, target="next", previous_transition_id=None)
     pushed = wait(lambda: latest_transition(run, ticket, "pushed"))
     assert pushed is not None, "the uncertain successful push was not recovered"
     assert len(run.stub.events("lost_push_response")) == 1
@@ -375,7 +517,7 @@ def test_clean_move_recovers_push_and_retarget_then_waits_for_final_head_ci(
     assert wait(lambda: bool(run.stub.events("retarget"))), (
         "the provider did not receive a retarget"
     )
-    row = nochange_ready(run, ticket, transition)
+    row = nochange_ready(run, ticket, transition, expected_content='VALUE = "factory"')
     run.stub.check(pushed["rebased_head_sha"], "success", name="old-target-queued")
     run.stub.check(pushed["rebased_head_sha"], "success", name="old-target-rerun")
     old_checks = {check["name"]: check for check in run.stub.checks(pushed["rebased_head_sha"])}
@@ -385,7 +527,14 @@ def test_clean_move_recovers_push_and_retarget_then_waits_for_final_head_ci(
     assert datetime.fromisoformat(old_checks["old-target-rerun"]["started"]) > retargeted_at
     assert {check["target"] for check in old_checks.values()} == {"main"}
     assert row["id"] == pushed["id"]
-    assert_applied_git(run, publication, row)
+    assert_applied_git(
+        run,
+        publication,
+        row,
+        expected_content='VALUE = "factory"',
+        expected_push_history=(publication["head_sha"],),
+        expected_replay_heads=(publication["head_sha"],),
+    )
     pull = run.pull(old_pull["number"])
     assert (pull["id"], pull["number"], pull["html_url"]) == (
         old_pull["id"],
@@ -423,6 +572,18 @@ def test_clean_move_recovers_push_and_retarget_then_waits_for_final_head_ci(
     run.stub.check(row["verification_head_sha"], "success", target="next")
     assert_completed(run, ticket, row["ci_request_id"])
     assert latest_transition(run, ticket, "applied")["ci_settled_at"] is not None
+    relabel_completed_request(
+        run,
+        ticket,
+        publication,
+        completed_request_id=row["ci_request_id"],
+        previous_transition_id=row["id"],
+        expected_content='VALUE = "factory"',
+        expected_push_history=(
+            publication["head_sha"], row["rebased_head_sha"], row["verification_head_sha"]
+        ),
+        expected_replay_heads=(row["rebased_head_sha"], row["verification_head_sha"]),
+    )
 
 
 def test_conflict_writes_nothing_and_requires_fresh_factory_marking(
@@ -433,7 +594,7 @@ def test_conflict_writes_nothing_and_requires_fresh_factory_marking(
     _, publication = published(run, ticket)
     before = run.pull(int(publication["pr_number"]))
     writes = list(run.stub.events("push"))
-    start_move(run, ticket, "release/blocked")
+    start_move(run, ticket, target="release/blocked", previous_transition_id=None)
     refused = wait(lambda: latest_transition(run, ticket, "conflict"))
     assert refused is not None, "the actual conflicting replay was not refused"
     assert run.stub._ref(publication["branch"]) == publication["head_sha"]
@@ -477,8 +638,15 @@ def test_conflict_writes_nothing_and_requires_fresh_factory_marking(
         )
     )
     assert moved is not None, "fresh factory marking did not retry the corrected current selection"
-    row = nochange_ready(run, ticket, moved)
-    assert_applied_git(run, publication, row)
+    row = nochange_ready(run, ticket, moved, expected_content='VALUE = "factory"')
+    assert_applied_git(
+        run,
+        publication,
+        row,
+        expected_content='VALUE = "factory"',
+        expected_push_history=(publication["head_sha"],),
+        expected_replay_heads=(publication["head_sha"],),
+    )
     assert row["target_base_ref"] == "next"
     run.stub.check(row["verification_head_sha"], "success", target="next")
     assert_completed(run, ticket, row["ci_request_id"])
@@ -490,9 +658,16 @@ def test_red_nochange_subject_continues_and_new_publication_owns_ci(
     run = dynamic_factory
     ticket = run.seed("github", run.agents[0])
     _, publication = published(run, ticket)
-    transition = start_move(run, ticket)
-    row = nochange_ready(run, ticket, transition)
-    assert_applied_git(run, publication, row)
+    transition = start_move(run, ticket, target="next", previous_transition_id=None)
+    row = nochange_ready(run, ticket, transition, expected_content='VALUE = "factory"')
+    assert_applied_git(
+        run,
+        publication,
+        row,
+        expected_content='VALUE = "factory"',
+        expected_push_history=(publication["head_sha"],),
+        expected_replay_heads=(publication["head_sha"],),
+    )
     run.model.mode("fix")
     run.stub.check(row["verification_head_sha"], "failure", target="next")
     assert wait(lambda: ci_observed(run, row["verification_head_sha"], "failure"))
@@ -510,6 +685,7 @@ def test_red_nochange_subject_continues_and_new_publication_owns_ci(
     assert revision is not None, "red no-change CI did not enter the normal fix publication path"
     assert revision["head_sha"] != row["verification_head_sha"]
     assert run.stub.git("show", revision["head_sha"] + ":" + CHANGE) == 'VALUE = "factory-fixed"'
+    assert run.stub.git("rev-parse", revision["head_sha"] + "^") == row["verification_head_sha"]
     assert (
         row["verification_head_sha"] in run.stub.git("rev-list", revision["head_sha"]).splitlines()
     )
@@ -522,3 +698,21 @@ def test_red_nochange_subject_continues_and_new_publication_owns_ci(
     )
     run.stub.check(revision["head_sha"], "success", target="next")
     assert_completed(run, ticket, row["ci_request_id"])
+    assert run.pull(int(publication["pr_number"]))["head"]["sha"] == revision["head_sha"]
+    relabel_completed_request(
+        run,
+        ticket,
+        publication,
+        completed_request_id=row["ci_request_id"],
+        previous_transition_id=row["id"],
+        expected_content='VALUE = "factory-fixed"',
+        expected_push_history=(
+            publication["head_sha"],
+            row["rebased_head_sha"],
+            row["verification_head_sha"],
+            revision["head_sha"],
+        ),
+        expected_replay_heads=(
+            row["rebased_head_sha"], row["verification_head_sha"], revision["head_sha"]
+        ),
+    )

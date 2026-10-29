@@ -272,22 +272,19 @@ def test_a_base_webhook_cannot_restart_finished_work_without_a_fresh_factory_mar
     )
 
 
-def test_finished_published_work_still_records_a_refusal_without_starting_a_request(
+def test_a_base_webhook_readmits_the_completed_current_open_pull_request(
     admitted: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    client, github, _sink = admitted
+    from test_factory_terminus import _published_issue
+
+    client, github, sink = admitted
     _train(monkeypatch, tmp_path, client)
-    number = 32111
-    request_id = _running_pull(client, github, number, 90312)
-    _execute(
-        "UPDATE curie.execution_requests SET status = 'completed', "
-        "terminal_cause = 'completed', terminal_at = clock_timestamp() WHERE id = :id",
-        {"id": request_id},
-    )
-    item = _item(number)
-    lineage = _lineage(number)
+    sink.by_path = True
+    number, _pr, original = _published_issue(client, github, sink)
+    _acknowledge_publication_history(client, original)
+    before_item, before_lineage = _item(number), _lineage(number)
     github.labels = [LABEL, "base:next"]
 
     observed = _post(
@@ -295,17 +292,35 @@ def test_finished_published_work_still_records_a_refusal_without_starting_a_requ
     )
 
     assert observed.status_code == 200, observed.text
-    assert _requests(number) == [{"id": request_id, "status": "completed"}]
-    assert _lineage(number) == lineage
+    requests = _requests(number)
+    assert len(requests) == 2, requests
+    predecessor, successor = requests
+    assert predecessor == {"id": original["id"], "status": "completed"}
+    assert successor["id"] != original["id"]
+    assert successor["status"] == "waiting"
+    assert _lineage(number) == before_lineage
     assert (_item(number)["base_branch"], _item(number)["base_commit"]) == (
-        item["base_branch"], item["base_commit"]
+        before_item["base_branch"], before_item["base_commit"]
     )
-    [requested] = _rows(
-        "SELECT base_requested_branch, base_requested_source "
-        "FROM curie.work_items WHERE id = :id",
-        {"id": item["id"]},
-    )
-    assert requested == {"base_requested_branch": "next", "base_requested_source": "label"}
+
+    acquiring = _acquire(client, number)
+
+    assert acquiring.status_code == 409, acquiring.text
+    assert _rows(
+        "SELECT request_id, phase, target_base_ref FROM curie.factory_base_transitions "
+        "WHERE work_item_id = :id",
+        {"id": before_item["id"]},
+    ) == [{"request_id": successor["id"], "phase": "pending", "target_base_ref": "next"}]
+    for _ in range(2):
+        repeated = _post(
+            client, "issues", _issue_event("labeled", number, label={"name": "base:next"})
+        )
+        assert repeated.status_code == 200, repeated.text
+        assert _requests(number) == [predecessor, successor]
+    assert _rows(
+        "SELECT count(*) AS count FROM curie.factory_base_transitions WHERE work_item_id = :id",
+        {"id": before_item["id"]},
+    ) == [{"count": 1}]
 
 
 @pytest.mark.parametrize(("target", "status_code"), [("next", 409), ("main", 200)])

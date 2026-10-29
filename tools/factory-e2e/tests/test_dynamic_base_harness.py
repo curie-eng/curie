@@ -79,6 +79,48 @@ def test_nochange_observation_process_rejects_false_completion(status: str) -> N
         assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize("retain_empty", [True, False], ids=["kept", "dropped"])
+def test_replay_history_process_rejects_dropped_empty_commit(
+    dynamic_github: Any, retain_empty: bool
+) -> None:
+    stub = dynamic_github
+    base = stub.heads()["main"]
+    change = stub.commit_branch("history/source", {CHANGE: 'VALUE = "factory"\n'}, parent="main")
+    marker = stub.commit_branch("history/source", {})
+    history = stub.history(base, marker)
+    assert [commit["empty"] for commit in history] == [False, True]
+    directory = Path(__file__).resolve().parent
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json, sys; "
+            "sys.path[:0] = json.loads(sys.argv[1]); "
+            "from c4_dynamic_base import assert_replayed_history; "
+            "observation = json.load(sys.stdin); "
+            "assert_replayed_history(observation['source'], observation['replayed'], "
+            "expected_source_heads=tuple(observation['expected_source_heads']))",
+            json.dumps([str(directory), str(directory.parent)]),
+        ],
+        input=json.dumps(
+            {
+                "source": history,
+                "replayed": history if retain_empty else history[:-1],
+                "expected_source_heads": [change, marker],
+            }
+        ),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if retain_empty:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode == 1, result.stderr
+        assert "replay dropped or duplicated" in result.stderr
+
+
 @pytest.fixture
 def model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setenv("TMPDIR", str(tmp_path))

@@ -142,6 +142,19 @@ def dynamic_stub_type(module: Any, *, redact: Any) -> type:
                 .strip()
             )
 
+        def history(self, base: str, head: str) -> list[dict[str, Any]]:
+            commits = self.git("rev-list", "--reverse", "--first-parent", f"{base}..{head}")
+            return [
+                {
+                    "sha": commit,
+                    "author": self.git("show", "-s", "--format=%an <%ae> %aI", commit),
+                    "message": self.git("show", "-s", "--format=%B", commit),
+                    "empty": self.git("rev-parse", commit + "^{tree}")
+                    == self.git("rev-parse", commit + "^1^{tree}"),
+                }
+                for commit in commits.splitlines()
+            ]
+
         def commit_branch(
             self, branch: str, files: dict[str, str], *, parent: str | None = None
         ) -> str:
@@ -923,3 +936,22 @@ def assert_ci_still_owns_request(request: dict[str, Any], transition: dict[str, 
         "old-target or pending CI completed the no-change successor"
     )
     assert transition["ci_settled_at"] is None, "an unsettled final head received a CI settlement"
+
+
+def assert_replayed_history(
+    source: list[dict[str, Any]],
+    replayed: list[dict[str, Any]],
+    *,
+    expected_source_heads: tuple[str, ...],
+) -> None:
+    assert tuple(commit["sha"] for commit in source) == expected_source_heads, (
+        "the source history omitted or added an expected publication or verification commit"
+    )
+    assert len(replayed) == len(expected_source_heads), (
+        "the replay dropped or duplicated a publication or empty verification commit"
+    )
+    assert [
+        (commit["author"], commit["message"], commit["empty"]) for commit in replayed
+    ] == [(commit["author"], commit["message"], commit["empty"]) for commit in source], (
+        "the replay changed publication history or an empty verification commit"
+    )
