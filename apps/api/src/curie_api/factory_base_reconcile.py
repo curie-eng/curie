@@ -53,7 +53,7 @@ def transition_blocks() -> Any:
     )
 
 
-def _lineage_empty(lineage: ThreadPublicationLineage) -> bool:
+def lineage_empty(lineage: ThreadPublicationLineage) -> bool:
     return (
         lineage.status == "open"
         and lineage.head_sha is None
@@ -205,7 +205,7 @@ async def resolve_for_acquire(
     lineage = await session.get(ThreadPublicationLineage, lineage_id) if lineage_id else None
     lineage_version = lineage.version if lineage is not None else None
     lineage_base = lineage.base_ref if lineage is not None else None
-    lineage_branch = lineage.branch if lineage is not None and _lineage_empty(lineage) else None
+    lineage_branch = lineage.branch if lineage is not None and lineage_empty(lineage) else None
     await session.commit()
     try:
         async with asyncio.timeout(_READ_SECONDS):
@@ -314,14 +314,14 @@ async def resolve_for_acquire(
                     session, request, "base_publication_pending", retry_s=retry_s
                 )
             base_commit = lineage.base_sha
-        elif not _lineage_empty(lineage):
+        elif not lineage_empty(lineage):
             await _record_requested_base(session, item, resolved)
             if (
                 lineage.status != "open"
                 or lineage.head_sha is None
                 or lineage.pr_number is None
                 or not lineage.base_sha
-                or await _lineage_busy(session, lineage.id)
+                or await lineage_busy(session, lineage.id)
             ):
                 return await _defer_selection(
                     session, request, "base_publication_pending", retry_s=retry_s
@@ -360,7 +360,7 @@ async def resolve_for_acquire(
         elif (
             lineage_branch != lineage.branch
             or remote_lineage_head is not None
-            or await _lineage_busy(session, lineage.id)
+            or await lineage_busy(session, lineage.id)
         ):
             await _record_requested_base(session, item, resolved)
             return await _defer_selection(
@@ -559,7 +559,7 @@ async def _observe_base_labels_once(
     lineage_id = item.publication_lineage_id
     lineage = await session.get(ThreadPublicationLineage, lineage_id) if lineage_id else None
     lineage_version = lineage.version if lineage is not None else None
-    lineage_branch = lineage.branch if lineage is not None and _lineage_empty(lineage) else None
+    lineage_branch = lineage.branch if lineage is not None and lineage_empty(lineage) else None
     repository, installation = item.repository, item.code_host_installation_id
     await session.commit()
     remote_absent = lineage_id is None
@@ -627,10 +627,10 @@ async def _observe_base_labels_once(
                 and bool(lineage.base_sha)
             )
             or (
-                _lineage_empty(lineage)
+                lineage_empty(lineage)
                 and lineage.branch == lineage_branch
                 and remote_absent
-                and not await _lineage_busy(session, lineage.id)
+                and not await lineage_busy(session, lineage.id)
             )
         )
     )
@@ -747,7 +747,7 @@ async def _supersede_pending_authority(session: AsyncSession, lineage_id: uuid.U
             await session.rollback()
 
 
-async def _lineage_busy(session: AsyncSession, lineage_id: uuid.UUID) -> bool:
+async def lineage_busy(session: AsyncSession, lineage_id: uuid.UUID) -> bool:
     publication = await session.scalar(
         select(Publication.id)
         .where(
@@ -918,7 +918,7 @@ async def _apply_transition(
                 sessionmaker, operation, phase="refused", error_code="lineage_changed"
             )
             return
-        if await _lineage_busy(session, lineage.id):
+        if await lineage_busy(session, lineage.id):
             await session.rollback()
             await _record_phase(sessionmaker, operation, error_code="publication_pending")
             return
@@ -1043,7 +1043,7 @@ async def _advance_transition(
         )
         repository, issue = item.repository, item.tracker_issue
         installation = item.code_host_installation_id
-        busy = await _lineage_busy(session, lineage.id)
+        busy = await lineage_busy(session, lineage.id)
         stopping = await session.scalar(
             select(ExecutionRequest.id)
             .where(

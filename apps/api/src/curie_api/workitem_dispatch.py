@@ -1018,7 +1018,7 @@ async def acquire(
                 transition.ci_ready_at = None
                 transition.version += 1
         if empty_lineage_id is not None:
-            from .factory_base_reconcile import _lineage_busy, _lineage_empty
+            from .factory_base_reconcile import lineage_busy, lineage_empty
 
             lineage = await session.scalar(
                 select(ThreadPublicationLineage)
@@ -1029,8 +1029,8 @@ async def acquire(
             if (
                 work_item.publication_lineage_id != empty_lineage_id
                 or lineage is None
-                or not _lineage_empty(lineage)
-                or await _lineage_busy(session, empty_lineage_id)
+                or not lineage_empty(lineage)
+                or await lineage_busy(session, empty_lineage_id)
             ):
                 await session.rollback()
                 return await _refuse(session, "not_dispatchable", request_id=request_id)
