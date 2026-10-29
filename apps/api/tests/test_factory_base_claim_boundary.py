@@ -17,7 +17,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
-from forge_fakes.github import LABEL, REPO, REPO_ID, _issue_event, _post, _signature
+from forge_fakes.github import BASE_SHA, LABEL, REPO, REPO_ID, _issue_event, _post, _signature
 from forge_fakes.github_comments import _rows, admitted, comments  # noqa: F401
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -242,8 +242,44 @@ def test_a_base_webhook_cannot_restart_finished_work_without_a_fresh_factory_mar
     acquired = _acquire(client, number)
     assert acquired.status_code == 200, acquired.text
     assert (_item(number)["base_branch"], _item(number)["base_commit"]) == (
-        "next", github.branches["next"]
+        "next", BASE_SHA
     )
+
+
+def test_finished_published_work_still_records_a_refusal_without_starting_a_request(
+    admitted: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client, github, _sink = admitted
+    _train(monkeypatch, tmp_path, client)
+    number = 32111
+    request_id = _running_pull(client, github, number, 90312)
+    _execute(
+        "UPDATE curie.execution_requests SET status = 'completed', "
+        "terminal_cause = 'completed', terminal_at = clock_timestamp() WHERE id = :id",
+        {"id": request_id},
+    )
+    item = _item(number)
+    lineage = _lineage(number)
+    github.labels = [LABEL, "base:next"]
+
+    observed = _post(
+        client, "issues", _issue_event("labeled", number, label={"name": "base:next"})
+    )
+
+    assert observed.status_code == 200, observed.text
+    assert _requests(number) == [{"id": request_id, "status": "completed"}]
+    assert _lineage(number) == lineage
+    assert (_item(number)["base_branch"], _item(number)["base_commit"]) == (
+        item["base_branch"], item["base_commit"]
+    )
+    [requested] = _rows(
+        "SELECT base_requested_branch, base_requested_source "
+        "FROM curie.work_items WHERE id = :id",
+        {"id": item["id"]},
+    )
+    assert requested == {"base_requested_branch": "next", "base_requested_source": "label"}
 
 
 @pytest.mark.parametrize(("target", "status_code"), [("next", 409), ("main", 200)])
