@@ -52,7 +52,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # @spec AUTOMATED-REMEDIATION-15: 0138 only widens a CHECK.
     # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
     # Workspace recovery reads require the 0141 outcome ledger.
-    candidate = {"schema_min": "0143", "schema_head": "0143"}
+    candidate = {"schema_min": "0144", "schema_head": "0144"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
@@ -60,10 +60,10 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["windows"]["0.12.3"] == {"schema_min": "0076", "schema_head": "0093"}
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == released_0130
-    assert catalog["revisions"][-26:] == [
+    assert catalog["revisions"][-27:] == [
         "0095", "0096", "0097", "0098", "0099", "0100", "0101", "0102", "0103",
         "0105", "0107", "0108", "0120", "0121", "0122", "0123", "0130", "0131",
-        "0136", "0132", "0133", "0137", "0138", "0139", "0141", "0143",
+        "0136", "0132", "0133", "0137", "0138", "0139", "0141", "0143", "0144",
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(
