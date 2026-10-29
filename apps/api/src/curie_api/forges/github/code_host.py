@@ -200,6 +200,20 @@ def _check_id(item: Mapping[str, Any]) -> str | None:
     return str(value) if type(value) is int and value > 0 else None
 
 
+def _later_run(candidate: NormalizedCheck, earlier: NormalizedCheck) -> bool:
+    if candidate.key != earlier.key or candidate.head_sha != earlier.head_sha:
+        return False
+    if candidate.started_at is None or earlier.started_at is None:
+        return False
+    if candidate.started_at != earlier.started_at:
+        return candidate.started_at > earlier.started_at
+    return (
+        candidate.check_id is not None
+        and earlier.check_id is not None
+        and int(candidate.check_id) > int(earlier.check_id)
+    )
+
+
 def base_rollup(detail: ci.CiDetail) -> CiRollup | None:
     """The checks read on the base branch head (#4105), or None when not read."""
 
@@ -232,11 +246,17 @@ def normalize_checks(detail: ci.CiDetail, head_sha: str) -> tuple[NormalizedChec
                 url=url if isinstance(url, str) else None,
                 source=CheckSource.RUN,
                 reported_state=status if status != "completed" else _text(run.get("conclusion")),
-                started_at=_since(run.get("started_at")),
+                started_at=_timestamp(run.get("started_at")),
                 check_id=_check_id(run),
                 native=isinstance(app, dict) and app.get("slug") == ACTIONS_APP_SLUG,
             )
         )
+    checks = [
+        check
+        for check in checks
+        if check.state is not CheckState.CANCELLED
+        or not any(_later_run(candidate, check) for candidate in checks)
+    ]
     for item in detail.statuses:
         context = _text(item.get("context"))
         url = item.get("target_url")
