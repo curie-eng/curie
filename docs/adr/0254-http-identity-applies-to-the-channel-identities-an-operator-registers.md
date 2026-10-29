@@ -46,8 +46,15 @@ back by removing a receiver.
    equals a registration's `channel_identity_name` in the same tenant. Every
    binding of that identity requires it, including bindings the registration
    does not list as permitted, which therefore refuse rather than fall back.
-3. A binding on an identity without a registration keeps its existing legacy
-   admission path in the same tenant. So does every non-Slack binding, and every
+   A binding whose agent's invocation role has been migrated, or carries an
+   agent-owned filter, also requires it even when its identity has no
+   registration. Those filters are evaluated only from HTTP facts, and a
+   migrated role keeps no team requirement for the legacy path to check, so
+   the legacy path would admit callers the filter excludes. Such a binding
+   refuses until its identity is registered or the role is changed. An
+   unreadable stored policy counts as requiring HTTP identity.
+3. Any other binding on an identity without a registration keeps its existing
+   legacy admission path in the same tenant. So does every non-Slack binding, and every
    binding when the API was started without HTTP registrations.
 4. The registrations loaded by the API are the one source of this
    classification. The API classifies its own ingress from them. The worker
