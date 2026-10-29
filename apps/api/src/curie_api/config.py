@@ -167,6 +167,22 @@ class Settings(BaseSettings):
     attachment_sandbox_key_prefix: str = SANDBOX_KEY_PREFIX_DEFAULT
     attachment_transfer_timeout_seconds: int = Field(default=300, ge=1, le=3600)
 
+    workspace_recovery_enabled: bool = Field(
+        default=False, validation_alias="CURIE_WORKSPACE_RECOVERY_ENABLED"
+    )
+    workspace_recovery_max_bytes: int | None = Field(
+        default=None, gt=0, validation_alias="CURIE_WORKSPACE_RECOVERY_MAX_BYTES"
+    )
+    workspace_max_archive_bytes: int = Field(
+        default=268435456, gt=0, validation_alias="CURIE_WORKSPACE_MAX_ARCHIVE_BYTES"
+    )
+
+    @model_validator(mode="after")
+    def _validate_workspace_recovery(self) -> "Settings":
+        if self.workspace_recovery_enabled and self.workspace_recovery_max_bytes is None:
+            raise ValueError("workspace recovery requires a positive installation byte cap")
+        return self
+
     # Separate trust boundary for credential redemption. The operator/CLI API
     # key can administer deployments but cannot redeem the GitHub identity.
     internal_worker_token: str = Field(

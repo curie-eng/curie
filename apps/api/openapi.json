@@ -10625,6 +10625,619 @@
         "title": "ReadArguments",
         "type": "object"
       },
+      "RecoveryAcknowledged": {
+        "additionalProperties": false,
+        "properties": {
+          "released": {
+            "default": true,
+            "title": "Released",
+            "type": "boolean"
+          }
+        },
+        "title": "RecoveryAcknowledged",
+        "type": "object"
+      },
+      "RecoveryAcquireReader": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_id": {
+            "format": "uuid",
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "holder_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Holder Id",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "checkpoint_id",
+          "holder_id"
+        ],
+        "title": "RecoveryAcquireReader",
+        "type": "object"
+      },
+      "RecoveryCaptureFailure": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_id": {
+            "format": "uuid",
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "status": {
+            "const": "tombstoned",
+            "default": "tombstoned",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "checkpoint_id"
+        ],
+        "title": "RecoveryCaptureFailure",
+        "type": "object"
+      },
+      "RecoveryClaimCollection": {
+        "additionalProperties": false,
+        "properties": {
+          "collector_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Collector Id",
+            "type": "string"
+          },
+          "limit": {
+            "default": 100,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "collector_id"
+        ],
+        "title": "RecoveryClaimCollection",
+        "type": "object"
+      },
+      "RecoveryCollectionClaim": {
+        "additionalProperties": false,
+        "properties": {
+          "claim_id": {
+            "format": "uuid",
+            "title": "Claim Id",
+            "type": "string"
+          },
+          "claimed_until": {
+            "format": "date-time",
+            "title": "Claimed Until",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "object_id": {
+            "format": "uuid",
+            "title": "Object Id",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "object_id",
+          "key",
+          "claim_id",
+          "version",
+          "claimed_until"
+        ],
+        "title": "RecoveryCollectionClaim",
+        "type": "object"
+      },
+      "RecoveryCollectionClaims": {
+        "additionalProperties": false,
+        "properties": {
+          "claims": {
+            "items": {
+              "$ref": "#/components/schemas/RecoveryCollectionClaim"
+            },
+            "title": "Claims",
+            "type": "array"
+          }
+        },
+        "required": [
+          "claims"
+        ],
+        "title": "RecoveryCollectionClaims",
+        "type": "object"
+      },
+      "RecoveryComplete": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_id": {
+            "format": "uuid",
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "dispatch_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Dispatch Generation",
+            "type": "integer"
+          },
+          "receipts": {
+            "items": {
+              "$ref": "#/components/schemas/RecoveryObjectReceipt"
+            },
+            "maxItems": 3,
+            "minItems": 1,
+            "title": "Receipts",
+            "type": "array"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "source_request_id": {
+            "format": "uuid",
+            "title": "Source Request Id",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "source_request_id",
+          "runtime_epoch",
+          "dispatch_generation",
+          "checkpoint_id",
+          "receipts"
+        ],
+        "title": "RecoveryComplete",
+        "type": "object"
+      },
+      "RecoveryCompletion": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_id": {
+            "format": "uuid",
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "completed_at": {
+            "format": "date-time",
+            "title": "Completed At",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "status": {
+            "const": "complete",
+            "default": "complete",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "checkpoint_id",
+          "completed_at",
+          "expires_at"
+        ],
+        "title": "RecoveryCompletion",
+        "type": "object"
+      },
+      "RecoveryFail": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_id": {
+            "format": "uuid",
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "dispatch_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Dispatch Generation",
+            "type": "integer"
+          },
+          "reason": {
+            "enum": [
+              "upload_failed",
+              "capture_failed",
+              "capture_timeout",
+              "torn_capture",
+              "lease_lost"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "source_request_id": {
+            "format": "uuid",
+            "title": "Source Request Id",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "source_request_id",
+          "runtime_epoch",
+          "dispatch_generation",
+          "checkpoint_id",
+          "reason"
+        ],
+        "title": "RecoveryFail",
+        "type": "object"
+      },
+      "RecoveryFinalizeCollection": {
+        "additionalProperties": false,
+        "properties": {
+          "claim_id": {
+            "format": "uuid",
+            "title": "Claim Id",
+            "type": "string"
+          },
+          "collector_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Collector Id",
+            "type": "string"
+          },
+          "object_id": {
+            "format": "uuid",
+            "title": "Object Id",
+            "type": "string"
+          },
+          "version": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "collector_id",
+          "object_id",
+          "claim_id",
+          "version"
+        ],
+        "title": "RecoveryFinalizeCollection",
+        "type": "object"
+      },
+      "RecoveryFinalized": {
+        "additionalProperties": false,
+        "properties": {
+          "finalized": {
+            "default": true,
+            "title": "Finalized",
+            "type": "boolean"
+          }
+        },
+        "title": "RecoveryFinalized",
+        "type": "object"
+      },
+      "RecoveryObjectDeclaration": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "enum": [
+              "base",
+              "patch",
+              "manifest"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "size_bytes",
+          "sha256"
+        ],
+        "title": "RecoveryObjectDeclaration",
+        "type": "object"
+      },
+      "RecoveryObjectReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Key",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "base",
+              "patch",
+              "manifest"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "size_bytes",
+          "sha256",
+          "key"
+        ],
+        "title": "RecoveryObjectReceipt",
+        "type": "object"
+      },
+      "RecoveryReader": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_id": {
+            "format": "uuid",
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "holder_id": {
+            "title": "Holder Id",
+            "type": "string"
+          },
+          "lease_id": {
+            "format": "uuid",
+            "title": "Lease Id",
+            "type": "string"
+          },
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/RecoveryObjectReceipt"
+            },
+            "title": "Objects",
+            "type": "array"
+          }
+        },
+        "required": [
+          "lease_id",
+          "checkpoint_id",
+          "holder_id",
+          "expires_at",
+          "objects"
+        ],
+        "title": "RecoveryReader",
+        "type": "object"
+      },
+      "RecoveryReleaseReader": {
+        "additionalProperties": false,
+        "properties": {
+          "holder_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Holder Id",
+            "type": "string"
+          },
+          "lease_id": {
+            "format": "uuid",
+            "title": "Lease Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_id",
+          "holder_id"
+        ],
+        "title": "RecoveryReleaseReader",
+        "type": "object"
+      },
+      "RecoveryRepository": {
+        "additionalProperties": false,
+        "properties": {
+          "host": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Host",
+            "type": "string"
+          },
+          "path": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Path",
+            "type": "string"
+          },
+          "project_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "provider": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Provider",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "host",
+          "project_id",
+          "path"
+        ],
+        "title": "RecoveryRepository",
+        "type": "object"
+      },
+      "RecoveryReservation": {
+        "additionalProperties": false,
+        "properties": {
+          "capture_deadline": {
+            "format": "date-time",
+            "title": "Capture Deadline",
+            "type": "string"
+          },
+          "checkpoint_id": {
+            "format": "uuid",
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/RecoveryObjectReceipt"
+            },
+            "title": "Objects",
+            "type": "array"
+          },
+          "staging_expires_at": {
+            "format": "date-time",
+            "title": "Staging Expires At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "checkpoint_id",
+          "objects",
+          "capture_deadline",
+          "staging_expires_at"
+        ],
+        "title": "RecoveryReservation",
+        "type": "object"
+      },
+      "RecoveryReserve": {
+        "additionalProperties": false,
+        "properties": {
+          "base_archive_limit_bytes": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Base Archive Limit Bytes",
+            "type": "integer"
+          },
+          "base_commit": {
+            "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+            "title": "Base Commit",
+            "type": "string"
+          },
+          "dispatch_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Dispatch Generation",
+            "type": "integer"
+          },
+          "idempotency_key": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/RecoveryObjectDeclaration"
+            },
+            "maxItems": 3,
+            "minItems": 2,
+            "title": "Objects",
+            "type": "array"
+          },
+          "repository": {
+            "$ref": "#/components/schemas/RecoveryRepository"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "source_request_id": {
+            "format": "uuid",
+            "title": "Source Request Id",
+            "type": "string"
+          },
+          "target_branch": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Target Branch",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "source_request_id",
+          "runtime_epoch",
+          "dispatch_generation",
+          "idempotency_key",
+          "repository",
+          "base_commit",
+          "target_branch",
+          "base_archive_limit_bytes",
+          "objects"
+        ],
+        "title": "RecoveryReserve",
+        "type": "object"
+      },
       "Reference": {
         "additionalProperties": false,
         "properties": {
@@ -30741,6 +31354,419 @@
         "summary": "Cancel Work Item",
         "tags": [
           "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/workspace-recovery/acquire-reader": {
+      "post": {
+        "operationId": "acquire_reader_v1_internal_workspace_recovery_acquire_reader_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryAcquireReader"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryReader"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Acquire Reader",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
+    "/v1/internal/workspace-recovery/claim-collection": {
+      "post": {
+        "operationId": "claim_collection_v1_internal_workspace_recovery_claim_collection_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryClaimCollection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryCollectionClaims"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Claim Collection",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
+    "/v1/internal/workspace-recovery/complete": {
+      "post": {
+        "operationId": "complete_v1_internal_workspace_recovery_complete_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryComplete"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryCompletion"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Complete",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
+    "/v1/internal/workspace-recovery/fail": {
+      "post": {
+        "operationId": "fail_v1_internal_workspace_recovery_fail_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryFail"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryCaptureFailure"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Fail",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
+    "/v1/internal/workspace-recovery/finalize-collection": {
+      "post": {
+        "operationId": "finalize_collection_v1_internal_workspace_recovery_finalize_collection_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryFinalizeCollection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryFinalized"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Finalize Collection",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
+    "/v1/internal/workspace-recovery/release-reader": {
+      "post": {
+        "operationId": "release_reader_v1_internal_workspace_recovery_release_reader_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryReleaseReader"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryAcknowledged"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Release Reader",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
+    "/v1/internal/workspace-recovery/reserve": {
+      "post": {
+        "operationId": "reserve_v1_internal_workspace_recovery_reserve_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryReserve"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryReservation"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reserve",
+        "tags": [
+          "internal-workspace-recovery"
         ]
       }
     },

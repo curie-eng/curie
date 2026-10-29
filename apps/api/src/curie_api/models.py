@@ -934,6 +934,10 @@ class WorkItem(Base):
     base_selection_fingerprint: Mapped[str | None] = mapped_column(Text, default=None)
     base_requested_branch: Mapped[str | None] = mapped_column(Text, default=None)
     base_requested_source: Mapped[str | None] = mapped_column(Text, default=None)
+    workspace_recovery_outcome: Mapped[str | None] = mapped_column(String(128), default=None)
+    workspace_recovery_outcome_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     version: Mapped[int] = mapped_column(default=1, server_default="1")
     next_sequence: Mapped[int] = mapped_column(default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -4016,3 +4020,140 @@ class FactoryBaseTransition(Base):
     next_attempt_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class WorkspaceRecoveryInstallation(Base):
+    __tablename__ = "workspace_recovery_installation"
+    __table_args__ = (CheckConstraint("id = 1", name="recovery_installation_singleton_ck"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, server_default="1")
+
+
+class WorkspaceRecoveryGroup(Base):
+    __tablename__ = "workspace_recovery_groups"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["work_item_id", "last_good_checkpoint_id"],
+            [f"{SCHEMA}.workspace_recovery_checkpoints.work_item_id",
+             f"{SCHEMA}.workspace_recovery_checkpoints.id"],
+            name="recovery_group_last_good_fkey", use_alter=True,
+        ),
+    )
+
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="RESTRICT"), primary_key=True
+    )
+    repository_provider: Mapped[str] = mapped_column(Text)
+    repository_host: Mapped[str] = mapped_column(Text)
+    repository_project_id: Mapped[str] = mapped_column(Text)
+    repository_path: Mapped[str] = mapped_column(Text)
+    base_commit: Mapped[str] = mapped_column(String(64))
+    target_branch: Mapped[str] = mapped_column(Text)
+    last_good_checkpoint_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+
+
+class WorkspaceRecoveryCheckpoint(Base):
+    __tablename__ = "workspace_recovery_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("work_item_id", "id", name="recovery_checkpoint_group_id_key"),
+        UniqueConstraint("source_request_id", "idempotency_key",
+                         name="recovery_checkpoint_idempotency_key"),
+        CheckConstraint("status IN ('staging', 'complete', 'tombstoned')",
+                        name="recovery_checkpoint_status_ck"),
+        CheckConstraint("runtime_epoch >= 1 AND dispatch_generation >= 1 AND version >= 1",
+                        name="recovery_checkpoint_authority_ck"),
+        CheckConstraint("char_length(idempotency_key) BETWEEN 1 AND 256",
+                        name="recovery_checkpoint_idempotency_length_ck"),
+        CheckConstraint("content_sha256 ~ '^[0-9a-f]{64}$'",
+                        name="recovery_checkpoint_digest_ck"),
+        CheckConstraint("(completed_at IS NULL) = (expires_at IS NULL) AND "
+                        "(status <> 'complete' OR completed_at IS NOT NULL)",
+                        name="recovery_checkpoint_completion_ck"),
+        Index("recovery_checkpoint_one_staging", "work_item_id", unique=True,
+              postgresql_where=text("status = 'staging'")),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.workspace_recovery_groups.work_item_id", ondelete="RESTRICT")
+    )
+    source_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="RESTRICT")
+    )
+    runtime_epoch: Mapped[int] = mapped_column(BigInteger)
+    dispatch_generation: Mapped[int] = mapped_column(BigInteger)
+    idempotency_key: Mapped[str] = mapped_column(String(256))
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    version: Mapped[int] = mapped_column(BigInteger, default=1, server_default="1")
+    includes_base: Mapped[bool] = mapped_column(default=False, server_default="false")
+    status: Mapped[str] = mapped_column(String(16), default="staging", server_default="staging")
+    capture_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    staging_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WorkspaceRecoveryObject(Base):
+    __tablename__ = "workspace_recovery_objects"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["work_item_id", "checkpoint_id"],
+            [f"{SCHEMA}.workspace_recovery_checkpoints.work_item_id",
+             f"{SCHEMA}.workspace_recovery_checkpoints.id"],
+            name="recovery_object_checkpoint_fkey", ondelete="RESTRICT",
+        ),
+        CheckConstraint("kind IN ('base', 'patch', 'manifest') AND "
+                        "((kind = 'base') = (checkpoint_id IS NULL))",
+                        name="recovery_object_kind_ck"),
+        CheckConstraint("size_bytes >= 0 AND sha256 ~ '^[0-9a-f]{64}$'",
+                        name="recovery_object_descriptor_ck"),
+        CheckConstraint("status IN ('staging', 'complete', 'tombstoned', 'claimed')",
+                        name="recovery_object_status_ck"),
+        CheckConstraint("version >= 0 AND ((status = 'claimed' AND claim_id IS NOT NULL "
+                        "AND collector_id IS NOT NULL AND claimed_until IS NOT NULL) OR "
+                        "(status <> 'claimed' AND claim_id IS NULL AND collector_id IS NULL "
+                        "AND claimed_until IS NULL))",
+                        name="recovery_object_claim_ck"),
+        UniqueConstraint("checkpoint_id", "kind", name="recovery_object_checkpoint_kind_key"),
+        Index("recovery_object_one_base", "work_item_id", unique=True,
+              postgresql_where=text("kind = 'base'")),
+        Index("recovery_object_group", "work_item_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.workspace_recovery_groups.work_item_id", ondelete="RESTRICT")
+    )
+    checkpoint_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    kind: Mapped[str] = mapped_column(String(16))
+    key: Mapped[str] = mapped_column(String(512), unique=True)
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    sha256: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), default="staging", server_default="staging")
+    staging_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    collector_id: Mapped[str | None] = mapped_column(String(256))
+    claimed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+
+
+class WorkspaceRecoveryReader(Base):
+    __tablename__ = "workspace_recovery_readers"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["work_item_id", "checkpoint_id"],
+            [f"{SCHEMA}.workspace_recovery_checkpoints.work_item_id",
+             f"{SCHEMA}.workspace_recovery_checkpoints.id"],
+            name="recovery_reader_checkpoint_fkey", ondelete="RESTRICT",
+        ),
+        UniqueConstraint("work_item_id", "checkpoint_id", "holder_id",
+                         name="recovery_reader_holder_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.workspace_recovery_groups.work_item_id", ondelete="RESTRICT")
+    )
+    checkpoint_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    holder_id: Mapped[str] = mapped_column(String(256))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

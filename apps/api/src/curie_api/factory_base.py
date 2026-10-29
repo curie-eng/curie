@@ -132,8 +132,9 @@ def refusal_body(refusal: BaseRefusal) -> str:
     """The refusal comment's text; the comment adapter appends the marker."""
 
     return (
-        f"Curie did not start this issue: {refusal.reason}. Fix the `base:` label or the"
-        " deployment's allowed bases; Curie will pick the issue up again on its next pass."
+        f"Curie refused this base selection: {refusal.reason}. Fix the `base:` label or the"
+        " deployment's allowed bases. Queued work retries on a later pass; after a run"
+        " finishes, re-add the factory label to request another attempt."
     )
 
 

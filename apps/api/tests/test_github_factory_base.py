@@ -445,6 +445,7 @@ def test_invalid_current_selection_refuses_acquisition_without_fallback(
     assert request["acquire_owner"] is None
     assert request["start_deferrals"] == 0
     assert reason in request["last_deferral_reason"]
+    assert (request["dispatch_not_before"] - request["updated_at"]).total_seconds() >= 60
     assert "main" not in api.branch_requests
     assert set(api.branch_requests) == ({read_branch} if read_branch else set())
     (body,) = api.posts()
@@ -557,6 +558,8 @@ def test_a_branch_lookup_outage_stays_nonterminal_and_recovers(
     assert response.status_code == 409, response.text
     assert _execution(number)["status"] == "waiting"
     assert _execution(number)["start_deferrals"] == 0
+    request = _execution(number)
+    assert 0 < (request["dispatch_not_before"] - request["updated_at"]).total_seconds() <= 5
     assert api.posts() == []
     api.branch_outage = False
     _execute(

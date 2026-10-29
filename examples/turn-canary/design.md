@@ -40,8 +40,9 @@ adapter is connected.
 
 - **TURN-CANARY-3: completion.** The checker polls the authenticated
   `/cluster-message-replies/{reply_ref}` API with a monotonic cursor and a
-  finite deadline. Success needs a `turn.completed` event with outcome
-  `delivered` and a reply update whose entire text equals the nonce. A reply
+  finite deadline. Without a profile, cycle qualification needs a `turn.completed`
+  event with outcome `delivered`, observed delivery as defined below, and a reply
+  update whose entire text equals the nonce. A reply
   alone, an approval pause, dropped or escalated completion, a mismatched
   nonce, malformed event, or a timeout fails. No reply is posted to a channel.
   Independently, delivery is observed only when the production `ReplyEvent`
@@ -56,9 +57,9 @@ adapter is connected.
   consistent with the observed completion. The checker assesses only events
   observed before return, without sealing the relay against later writes.
   Delivery is lifecycle evidence, not proof of model execution, useful task
-  completion, policy compliance or final-text provenance. Exact nonce success,
-  last-success timestamps, cycle success and exit status keep their existing
-  meaning: exact success uses the last `reply.update` literally, including a
+  completion, policy compliance or final-text provenance. The legacy target nonce
+  result and target last-success timestamp retain their meaning: exact success
+  uses the last `reply.update` literally, including a
   progress edit, and accepts only `reply.update`, `turn.status` and
   `turn.completed` event types. A valid `reply.post` therefore cannot broaden
   exact success. An `awaiting-approval` completion uses the relay's nonterminal
@@ -337,7 +338,7 @@ cleanup.
 
   Only a selected route whose exact inventory agent slug has a profile uses
   its prompt. Missing or unmatched slugs keep the original nonce question.
-  A profile does not select routes or change qualification, isolation, wire
+  A profile does not select routes or change read-only runtime qualification, isolation, wire
   correlation, timeout, capacity, cleanup, or agent safety policy. Its question
   receives the same explicit no-tools, no-actions, no-approvals and
   no-durable-changes suffix as the nonce question. Operators choose a
@@ -371,10 +372,19 @@ cleanup.
   success, independently of nonce or profile matching. Both timestamps are retained across
   exporter rotations until inventory removes the route, but is not restored
   after restart; a missing timestamp is not healthy delivery. Existing
-  exact_nonce, target_success, nonce success timestamps, cycle success and
-  exit status retain their original meaning, including when a profile passes.
-  Alerts opt into the new mode and result and use delivery timestamps plus
-  last-run freshness instead of interpreting nonce success as delivery.
+  exact_nonce, target_success and target nonce-success timestamps retain their
+  original meaning. Cycle qualification instead requires both delivery_success
+  and probe_success on every attempted route, so the configured profile replaces
+  the diagnostic nonce only for that route's cycle verdict. A passing profile
+  with a different nonce can qualify; an exact nonce cannot hide a failed
+  configured profile. Enqueue, delivery, selected-probe or owned-cleanup failure
+  keeps the cycle failed even when another route subsequently passes. Capacity
+  skip and held-route rules remain those of TURN-CANARY-6. Global cycle
+  last-success and one-shot exit status follow this qualified cycle result.
+  Turn-phase logs describe actual delivery; probe-phase logs describe the
+  configured text verdict, and relay reason codes remain independent. Alerts
+  use delivery timestamps plus last-run freshness rather than interpreting
+  the legacy nonce result as delivery or profile qualification.
 
 - **TURN-CANARY-17: standalone profile schema and source assembly.**
   `probe_profiles.py`, beside `turn_canary.py`, is the single owner of the

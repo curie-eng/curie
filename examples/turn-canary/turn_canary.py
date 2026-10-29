@@ -1171,13 +1171,20 @@ async def _turn_targets(
                     result.target_last_probe_success[target_label] = time.time()
                 result.record("relay", assessment.reason)
                 result.record(
-                    "turn", "delivered" if result.target_success[target_label] else "failed"
+                    "turn", "delivered" if assessment.delivery_success else "failed"
                 )
             except Exception as exc:  # noqa: BLE001 - reset is still owed
                 result.target_success[target_label] = False
                 result.target_delivery_success[target_label] = False
                 result.record("relay", "failed", exc)
-            all_ok = all_ok and result.target_success[target_label]
+            # Legacy nonce observations stay independently available. A
+            # configured contract, together with actual delivery, qualifies
+            # this route for the cycle instead of that diagnostic nonce.
+            all_ok = (
+                all_ok
+                and result.target_delivery_success[target_label]
+                and result.target_probe_success[target_label]
+            )
             if result.target_success[target_label]:
                 result.target_last_success[target_label] = time.time()
         if profile is not None:

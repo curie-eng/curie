@@ -80,8 +80,10 @@ async def _defer_selection(
     request: ExecutionRequest,
     reason: str,
     *,
+    retry_s: float,
     settle_until: datetime | None = None,
 ) -> bool:
+    now = await lifecycle.database_now(session)
     await session.execute(
         update(ExecutionRequest)
         .where(
@@ -91,12 +93,12 @@ async def _defer_selection(
         )
         .values(
             dispatch_generation=ExecutionRequest.dispatch_generation + 1,
-            dispatch_not_before=func.clock_timestamp() + timedelta(seconds=5),
+            dispatch_not_before=settle_until or now + timedelta(seconds=retry_s),
             acquired_generation=None,
             acquire_owner=None,
             acquire_expires_at=None,
             last_deferral_reason=reason,
-            updated_at=func.clock_timestamp(),
+            updated_at=now,
             **({"base_settle_until": settle_until} if settle_until is not None else {}),
         )
     )
@@ -138,6 +140,20 @@ async def resolve_for_acquire(
     if held:
         await session.commit()
         return True
+    registry = forges_registry(settings)
+    issue, repository, installation = (
+        item.tracker_issue,
+        item.repository,
+        item.code_host_installation_id,
+    )
+    retry_s = max(
+        [60.0]
+        + [
+            tracker.poll_interval_s
+            for tracker in registry.config.trackers
+            if tracker.kind == issue.kind and tracker.host == issue.host
+        ]
+    )
     blocked = await session.scalar(
         select(FactoryBaseTransition.id)
         .where(
@@ -153,7 +169,9 @@ async def resolve_for_acquire(
         .limit(1)
     )
     if blocked is not None:
-        return await _defer_selection(session, request, "base_transition_pending")
+        return await _defer_selection(
+            session, request, "base_transition_pending", retry_s=retry_s
+        )
     if item.base_resolved_request_id == request.id or item.trigger_label is None:
         return True
     settle_until = request.base_settle_until
@@ -179,14 +197,8 @@ async def resolve_for_acquire(
         )
     if settle_until > now:
         return await _defer_selection(
-            session, request, "base_label_settling", settle_until=settle_until
+            session, request, "base_label_settling", retry_s=0, settle_until=settle_until
         )
-    registry = forges_registry(settings)
-    issue, repository, installation = (
-        item.tracker_issue,
-        item.repository,
-        item.code_host_installation_id,
-    )
     policy = work_item_policy(registry, issue, repository)
     item_id, item_version, request_version = item.id, item.version, request.version
     trigger_label, lineage_id = item.trigger_label, item.publication_lineage_id
@@ -232,7 +244,7 @@ async def resolve_for_acquire(
         await lifecycle.lock_work_item(session, item_id)
         request = await lifecycle.lock_request(session, work_item_id=item_id, request_id=request_id)
         if request is not None and request.dispatch_generation == generation:
-            return await _defer_selection(session, request, "base_unavailable")
+            return await _defer_selection(session, request, "base_unavailable", retry_s=5)
         await session.commit()
         return False
     item = await lifecycle.lock_work_item(session, item_id)
@@ -268,7 +280,11 @@ async def resolve_for_acquire(
             pass
         await lifecycle.lock_work_item(session, item_id)
         request = await lifecycle.lock_request(session, work_item_id=item_id, request_id=request_id)
-        return await _defer_selection(session, request, resolved.code) if request else False
+        return (
+            await _defer_selection(session, request, resolved.code, retry_s=retry_s)
+            if request
+            else False
+        )
     lineage = (
         await session.scalar(
             select(ThreadPublicationLineage)
@@ -281,7 +297,7 @@ async def resolve_for_acquire(
     )
     if lineage_id is not None and (lineage is None or lineage.version != lineage_version):
         await _record_requested_base(session, item, resolved)
-        return await _defer_selection(session, request, "base_publication_pending")
+        return await _defer_selection(session, request, "base_publication_pending", retry_s=retry_s)
     if lineage is not None and lineage.base_ref != resolved.branch:
         async with AsyncSession(
             bind=await session.connection(),
@@ -294,7 +310,9 @@ async def resolve_for_acquire(
     if lineage is not None:
         if lineage.base_ref == resolved.branch:
             if not lineage.base_sha:
-                return await _defer_selection(session, request, "base_publication_pending")
+                return await _defer_selection(
+                    session, request, "base_publication_pending", retry_s=retry_s
+                )
             base_commit = lineage.base_sha
         elif not _lineage_empty(lineage):
             await _record_requested_base(session, item, resolved)
@@ -305,7 +323,9 @@ async def resolve_for_acquire(
                 or not lineage.base_sha
                 or await _lineage_busy(session, lineage.id)
             ):
-                return await _defer_selection(session, request, "base_publication_pending")
+                return await _defer_selection(
+                    session, request, "base_publication_pending", retry_s=retry_s
+                )
             session.add(
                 FactoryBaseTransition(
                     work_item_id=item.id,
@@ -334,14 +354,18 @@ async def resolve_for_acquire(
                     },
                 )
             )
-            return await _defer_selection(session, request, "base_transition_pending")
+            return await _defer_selection(
+                session, request, "base_transition_pending", retry_s=retry_s
+            )
         elif (
             lineage_branch != lineage.branch
             or remote_lineage_head is not None
             or await _lineage_busy(session, lineage.id)
         ):
             await _record_requested_base(session, item, resolved)
-            return await _defer_selection(session, request, "base_publication_pending")
+            return await _defer_selection(
+                session, request, "base_publication_pending", retry_s=retry_s
+            )
         else:
             empty_lineage_id = lineage.id
     session.info["factory_base_pin"] = (
@@ -610,6 +634,8 @@ async def _observe_base_labels_once(
             )
         )
     )
+    if safe and previous.status not in {"waiting", "running", "cancellation_requested"}:
+        return None
     await _record_requested_base(session, item, choice)
     if not safe:
         item.base_selection_fingerprint = None

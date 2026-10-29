@@ -1,7 +1,7 @@
 """Pin factory bases per request after the label settling window.
 
-Revision ID: 0141
-Revises: 0139
+Revision ID: 0143
+Revises: 0141
 """
 
 from collections.abc import Sequence
@@ -10,8 +10,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0141"
-down_revision: str = "0139"
+revision: str = "0143"
+down_revision: str = "0141"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 S = "curie"

@@ -97,11 +97,18 @@ def test_settle_uses_database_time_and_cannot_grant_early(
     assert seconds <= (row["base_settle_until"] - before).total_seconds()
     assert (row["base_settle_until"] - after).total_seconds() <= seconds
     if seconds:
+        _execute(
+            "UPDATE curie.execution_requests SET base_settle_until = wait_deadline WHERE id = :id",
+            {"id": row["id"]},
+        )
+        row = _execution(32002)
         early = _acquire(client, 32002)
         assert early.status_code == 409, early.text
         assert _execution(32002)["acquire_owner"] is None
         assert _work_item(32002)["base_commit"] is None
         assert api.branch_requests == []
+        deferred = _execution(32002)
+        assert deferred["dispatch_not_before"] == row["base_settle_until"]
         _due(32002)
 
     ready = _acquire(client, 32002)
