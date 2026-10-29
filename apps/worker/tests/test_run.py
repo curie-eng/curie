@@ -1469,6 +1469,64 @@ def test_build_wires_the_sweep_coverage_into_the_kernel(
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_build_wires_the_recovery_collector_only_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    sync_redis: redis.Redis,
+    enabled: bool,
+) -> None:
+    """ADR 0251: the recovery collector is opt in and never replaces the claim coordinator."""
+    from curie_worker.workspace import WorkspaceClaimCoordinator
+    from curie_worker.workspace_recovery_storage import RecoveryCollector, RecoveryObjectStore
+
+    assert "workspace-recovery-gc" in run._SUPERVISED_OPERATIONS
+    endpoint = sync_redis.connection_pool.connection_kwargs
+    config = WorkerConfig(
+        fake_model=True,
+        valkey_host=str(endpoint["host"]),
+        valkey_port=int(endpoint["port"]),
+        valkey_password=str(endpoint.get("password") or ""),
+        valkey_db=int(endpoint.get("db", 0)),
+        s3_access_key="PLACEHOLDER",
+        s3_secret_key="PLACEHOLDER",
+        workspace_enabled=True,
+        workspace_recovery_enabled=enabled,
+    )
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
+
+    async def exercise() -> None:
+        runtime = run.build(config, {"CURIE_SANDBOX_SUBSTRATE": "docker"})
+        affinity_redis = runtime.consumer._kernel._substrate._affinity._redis
+        collector = runtime.workspace_recovery_gc
+        try:
+            # Recovery on or off, ordinary managed workspaces are still built.
+            assert isinstance(runtime.consumer._kernel._workspace, WorkspaceClaimCoordinator)
+            if not enabled:
+                assert collector is None
+                return
+            assert isinstance(collector, RecoveryCollector)
+            store = collector._store
+            assert isinstance(store, RecoveryObjectStore)
+            assert store._bucket == config.workspace_bucket
+            assert store._key("workspace-recovery/x") == "private/workspace-recovery/x"
+            with pytest.raises(ValueError):
+                store._key("workspaces/x")
+            assert collector._collector_id == config.consumer_name
+        finally:
+            if collector is not None:
+                collector._store._client.close()
+            affinity_redis.close()
+            await runtime.runner.close()
+            await runtime.sink.aclose()
+            await runtime.eval_http.aclose()
+            await runtime.async_redis.aclose()
+            await runtime.pressure_async_redis.aclose()
+            await runtime.eval_redis.aclose()
+            await runtime.engine.dispose()
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize(("raw", "expected"), [(None, 16), ("4", 4)])
 def test_max_concurrency_environment_sizes_the_production_runs_consumer(
     monkeypatch: pytest.MonkeyPatch,

@@ -41,6 +41,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, NoReturn
 from urllib.parse import parse_qs, urlsplit, urlunsplit
@@ -931,7 +932,7 @@ async def _expire_staging(ctx: _Ctx) -> None:
 
 
 async def _expire_checkpoint(
-    ctx: _Ctx, checkpoint_id: uuid.UUID, *, delay: str = "-1 second"
+    ctx: _Ctx, checkpoint_id: uuid.UUID, *, delay: timedelta = timedelta(seconds=-1)
 ) -> None:
     # Injected time: the 24 h retention of a complete checkpoint ends at the given offset.
     await _sql(
@@ -1736,7 +1737,7 @@ async def _race_acquire_against_collection(
     reader = _reader(ctx)
     # Injected time: retention ends a moment from now, so the reader and the
     # collector race across the expiry instant.
-    await _expire_checkpoint(ctx, checkpoint, delay="300 milliseconds")
+    await _expire_checkpoint(ctx, checkpoint, delay=timedelta(milliseconds=300))
     await asyncio.sleep(offset)
     barrier = asyncio.Barrier(2)
 

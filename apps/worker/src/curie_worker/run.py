@@ -120,6 +120,12 @@ from .workspace import (
     WorkspaceObjectStore,
     WorkspacePreparer,
 )
+from .workspace_recovery import WorkspaceRecoveryClient
+from .workspace_recovery_storage import (
+    RecoveryCollector,
+    RecoveryObjectStore,
+    build_recovery_s3_client,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +175,8 @@ class Runtime:
     # None unless the end to end connector and the connector reconciler are
     # both on (#3245).
     e2e_reaper: E2EReaperLoop | None = None
+    # None unless workspace recovery is on with the internal token (ADR 0251).
+    workspace_recovery_gc: RecoveryCollector | None = None
     deploy_notice_consumer: DeployNoticeConsumer | None = None
     # Trims settled entries off the runs and eval streams (ADR 0184). Optional
     # only so a Runtime constructed elsewhere need not name it.
@@ -596,6 +604,26 @@ def build(
     # eval-lane reporters below; httpx.AsyncClient is task-safe.
     eval_http = httpx.AsyncClient(timeout=30.0)
     owner.register_close("eval-http", eval_http.aclose, order=30)
+    recovery_gc: RecoveryCollector | None = None
+    if config.workspace_recovery_enabled and config.internal_worker_token:
+        recovery_s3 = build_recovery_s3_client(
+            endpoint_url=config.s3_endpoint_url,
+            access_key=config.s3_access_key,
+            secret_key=config.s3_secret_key,
+            region=config.s3_region,
+        )
+        owner.register_close(
+            "workspace-recovery-s3", lambda: _close_sync(recovery_s3.close), order=70
+        )
+        recovery_gc = RecoveryCollector(
+            ledger=WorkspaceRecoveryClient(
+                api_base_url=config.api_base_url,
+                worker_token=config.internal_worker_token,
+                client=eval_http,
+            ),
+            store=RecoveryObjectStore(client=recovery_s3, bucket=config.workspace_bucket),
+            collector_id=config.consumer_name,
+        )
     attachment_access_client = None
     broker_server = None
     if config.attachment_enabled and config.attachment_mode == "lazy":
@@ -866,6 +894,7 @@ def build(
             bundles=cron_bundle_store,
         ),
         e2e_reaper=_build_e2e_reaper(config, work_items),
+        workspace_recovery_gc=recovery_gc,
         cron_loop=CronSchedulerLoop(
             source_guard=CronHookSourceGuard(source_gate, engine),
             engine=engine,
@@ -896,6 +925,7 @@ _SUPERVISED_OPERATIONS = frozenset(
         "cron",
         "publications",
         "e2e-reaper",
+        "workspace-recovery-gc",
     }
 )
 
@@ -1639,6 +1669,15 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
         tasks.append(launch("action-executor", lambda: rt.action_executor.run_forever(shutdown)))  # type: ignore[union-attr]
     if getattr(rt, "e2e_reaper", None) is not None:
         tasks.append(launch("e2e-reaper", lambda: rt.e2e_reaper.run_forever(shutdown)))  # type: ignore[union-attr]
+    recovery_gc = getattr(rt, "workspace_recovery_gc", None)
+    if recovery_gc is not None:
+        interval_s = config.workspace_recovery_collect_interval_s
+        tasks.append(
+            launch(
+                "workspace-recovery-gc",
+                lambda: recovery_gc.run_forever(shutdown, interval_s=interval_s),
+            )
+        )
     if rt.cron_loop is not None:
         tasks.append(launch("cron", lambda: rt.cron_loop.run_forever(shutdown)))  # type: ignore[union-attr]
     if getattr(rt, "publication_loop", None) is not None:

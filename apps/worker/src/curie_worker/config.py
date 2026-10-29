@@ -1150,6 +1150,15 @@ class WorkerConfig(BaseSettings):
     workspace_max_concurrent_clones: int = Field(
         default=2, gt=0, validation_alias="CURIE_WORKSPACE_MAX_CONCURRENT_CLONES"
     )
+    # Recovery checkpoint objects (ADR 0251). Off by default; when on, with the
+    # internal worker token, the worker supervises the recovery object collector.
+    # Recovery never changes ``workspace_enabled`` or the claim coordinator.
+    workspace_recovery_enabled: bool = Field(
+        default=False, validation_alias="CURIE_WORKSPACE_RECOVERY_ENABLED"
+    )
+    workspace_recovery_collect_interval_s: float = Field(
+        default=30.0, gt=0, validation_alias="CURIE_WORKSPACE_RECOVERY_COLLECT_INTERVAL_S"
+    )
     # The inbound-attachment lane's resource envelope (#2567). These are the
     # operator's handles on ``AttachmentLimits``, whose own defaults these
     # literals mirror -- the chart templates the same three numbers into the
