@@ -5,66 +5,67 @@ engineering issue enters through a configured integration. The platform
 authenticates the source, records work and authority in its own services, and
 runs an agent bundle in an isolated sandbox. The result returns to the
 originating workspace or work system. The [capability reference](capabilities.md)
-is the source for release status and provider limits; this page explains how
+is the source for release status and integration limits; this page explains how
 the platform pieces fit together.
 
-## Component map
+## Capability map
 
-```mermaid
-flowchart LR
-    Systems["Workspaces and work systems"] --> Intake["Adapters and authenticated intake"]
-    Intake --> API["API: routing, identity, policy, work state"]
-    API --> Queue["Valkey queue"]
-    Queue --> Worker["Worker and isolated sandbox"]
-    Worker --> Harness["Agent harness and configured model"]
-    Worker --> API
-    API --> Systems
-    API --> Stores["Postgres, object storage, memory and telemetry"]
-```
+| Capability | What the platform supplies | Where to read more |
+| --- | --- | --- |
+| Workspace adaptors | Authenticated intake and return paths for supported external workspaces and work systems. | [Workspace adaptors](#workspace-adaptors) |
+| Authentication, authorization, and synchronization | Account links, IdP projections, and access decisions where the integration supports them. | [Authentication, authorization, and synchronization](#authentication-authorization-and-synchronization) |
+| Memory and context | Scoped facts and durable work state for an agent's task. | [Memory and context](#memory-and-context) |
+| Controls | Approval, tool and publication policy, model selection, execution bounds, and outcome visibility. | [Controls](#controls) |
 
-The arrows show a common path, not one universal connector. A Slack mention
-and a factory issue use different intake and return paths. The
+This map groups capabilities, not a single request path. A Slack mention and
+a factory issue use different intake and return paths. The
 [as built architecture](../ARCHITECTURE.md#component-map) names the services,
 stores and message flows in more detail.
 
-## Workspace and work system connections
+In this overview, an **external workspace** is a connected service where
+people communicate or manage work, including an issue tracker or code host.
+The detailed design often calls that service a `provider` and spells
+"adaptor" as `adapter` in component names. A **model provider** is the
+separate service that supplies model inference.
 
-Adapters translate provider events into platform requests and return replies
-through the provider that received the work. The receiving route determines
-which agent and channel identity handle a message. Factory intake instead
+## Workspace adaptors
+
+Adaptors translate external workspace events into platform requests and
+return replies through the workspace that received the work. The receiving
+route determines which agent and channel identity handle a message. Factory intake instead
 admits an issue from a configured tracker and code host pairing, then follows
 the resulting pull request or merge request.
 
-A connection to one provider does not authorize another. Slack conversation
-support is released. Discord has a separate adapter with limits. The shipped
-AgentMail adapter currently refuses inbound email because it cannot establish
+A connection to one external workspace does not authorize another. Slack
+conversation support is released. Discord has a separate adaptor with limits. The shipped
+AgentMail adaptor currently refuses inbound email because it cannot establish
 sender authentication Curie can verify. There is no supported first party
 Teams channel. Factory support varies by tracker and code host pairing; consult
 [workspaces and integrations](capabilities.md#workspaces-and-integrations)
 before selecting one. See [message flow](diagrams/message-flow.md) and the
 [Software Factory overview](software-factory.md) for the two primary paths.
 
-## Identity and authorization
+## Authentication, authorization, and synchronization
 
 Curie separates the account that sent an event from the person it represents.
 A tenant scoped principal identifies a person by IdP issuer and subject.
 Directory sync projects IdP people, account status, groups and known channel
-accounts into Curie. A provider account can be linked to a principal inside
-the namespace where that provider's native user ID is meaningful. An agent can
+accounts into Curie. An external workspace account can be linked to a principal inside
+the namespace where that workspace's native user ID is meaningful. An agent can
 name separate invocation and approver teams; the API checks current membership
 when a supported path invokes the agent or resolves an approval.
 
-These are scoped mechanisms, not a promise that every provider actor resolves
-to one person. The current account link resolver has a Slack realization;
+These are scoped mechanisms, not a promise that every external workspace
+actor resolves to one person. The current account link resolver has a Slack realization;
 email resolution requires both an authenticated sender and a link in an IdP
 governed domain, while the shipped AgentMail inbound path remains unavailable.
-Factory tracker admission and code host publication use their own provider
-authority checks. A bot identity by itself does not prove a shared human
+Factory tracker admission and code host publication use their own
+service specific authority checks. A bot identity by itself does not prove a shared human
 identity. See the [identity design](adr/0220-one-identity-provider-decides-who-may-invoke-and-approve-on-every-channel.md),
 [namespace design](adr/0198-identity-links-live-in-provider-identity-namespaces.md),
 and [administrator guidance](administering-co-workers.md#bind-workspaces-and-credentials-deliberately).
 
-## Scoped context and memory
+## Memory and context
 
 The platform can load agent facts across that agent's bindings and channel
 facts for the current binding. Memory writes require enabled tools and scoped
@@ -85,14 +86,14 @@ than the factory sandbox.
 
 Operators select implementation and reviewer models explicitly. Supported
 routes include Anthropic, OpenRouter, compatible provider endpoints and opt in
-local Ollama, subject to provider compatibility and allowed egress. The
+local Ollama, subject to endpoint compatibility and allowed egress. The
 harness interface permits future extensions, but arbitrary agent runtimes and
 automatic model choice by task complexity are not supported promises. See
 [execution architecture](../ARCHITECTURE.md#one-worker-two-hidden-seams-substrate-and-transport),
 [model providers](interfaces/model-provider/INTERFACE.md), and
 [existing agent limits](capabilities.md#existing-agents-and-models).
 
-## Controls and evidence
+## Controls
 
 Approval routes determine who may resolve a pending action. Tool policy and
 external service permissions are separate checks; approval does not enlarge a
@@ -106,7 +107,7 @@ The current USD budget field is a session ceiling passed to the SDK, not an
 aggregate daily ledger. Work item views expose status, CI outcomes, usage and
 estimated model cost. A pull request, passing checks or an estimate does not
 establish accepted work or measured return on investment. Those conclusions
-require a defined cohort, provider billing reconciliation and human effort.
+require a defined cohort, model service billing reconciliation and human effort.
 See [approvals](approvals.md), [factory review and publication](software-factory.md#what-review-and-publication-enforce),
 [budget limits](administering-co-workers.md#configure-model-roles-and-bounded-runs),
 and [outcome measurement](guides/measuring-factory-outcomes.md).
