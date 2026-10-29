@@ -797,8 +797,16 @@ class SlackReplyAdapter:
                 if verbatim
                 else split_answer(part.text, max_bytes=_MSG_TOO_LONG_RESEND_BYTES)
             )
+            placeholder_update = index == 0 and target.reply_ref is not None
             for sub_index, sub in enumerate(smaller):
-                sub_key = key if sub_index == 0 else create_key(index, sub_index)
+                # Every smaller post, piece 0 included, gets its own key. Slack
+                # dedupes chat.postMessage on client_msg_id and answers ok with the
+                # first message's ts even when the text differs, so reusing the
+                # refused part's key would let a retry's full-part post dedupe onto
+                # an already accepted piece 0 and skip the remaining pieces.
+                sub_key = (
+                    key if placeholder_update and sub_index == 0 else create_key(index, sub_index)
+                )
                 sub_slot = sub_index == 0
                 try:
                     delivered = await send(
