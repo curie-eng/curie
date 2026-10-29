@@ -1085,8 +1085,10 @@ class _FaultProxy:
     Modes: ``pass`` forwards both directions; ``stall`` accepts a connection and
     never forwards or answers it; ``cut_after(n)`` forwards ``n`` more client
     bytes in total, then closes both ends of the connection carrying the last
-    byte and returns to ``pass``. ``close()`` stops listening and shuts every
-    socket so a boto thread blocked on a stalled read unblocks.
+    byte and returns to ``pass``; ``trickle(rate)`` forwards requests normally but
+    releases response bytes at about ``rate`` bytes per second. ``close()`` stops
+    listening and shuts every socket so a boto thread blocked on a stalled read
+    unblocks.
     """
 
     def __init__(self, upstream_port: int) -> None:
@@ -1097,6 +1099,7 @@ class _FaultProxy:
         self._lock = threading.Lock()
         self._mode = "pass"
         self._cut_remaining = 0
+        self._trickle_rate = 0
         self.cuts = 0
         self.accepted = 0
         self._sockets: set[socket.socket] = set()
@@ -1108,9 +1111,18 @@ class _FaultProxy:
     def endpoint(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
+    def passthrough(self) -> None:
+        with self._lock:
+            self._mode = "pass"
+
     def stall(self) -> None:
         with self._lock:
             self._mode = "stall"
+
+    def trickle(self, bytes_per_second: int) -> None:
+        with self._lock:
+            self._mode = "trickle"
+            self._trickle_rate = max(2, bytes_per_second)
 
     def cut_after(self, client_bytes: int) -> None:
         with self._lock:
@@ -1213,9 +1225,21 @@ class _FaultProxy:
                 break
             if not data:
                 break
+            with self._lock:
+                rate = self._trickle_rate if self._mode == "trickle" else 0
             try:
-                client.sendall(data)
+                if not rate:
+                    client.sendall(data)
+                    continue
+                # Half a second's worth of bytes, then a half second pause.
+                step = max(1, rate // 2)
+                for offset in range(0, len(data), step):
+                    client.sendall(data[offset : offset + step])
+                    if self._closed.wait(0.5):
+                        break
             except OSError:
+                break
+            if self._closed.is_set():
                 break
         self._release(client, upstream)
 
@@ -1658,6 +1682,7 @@ async def _case_base_over_limit(ctx: _Ctx) -> None:
     previous = await _good_checkpoint(ctx, other, base=ctx.harness.base_source())
     limit = len(ctx.harness.base_bytes) - 1
     source = await _seed(ctx)
+    assert await _recovery_outcome(ctx, source) is None
     with _settings_env({"CURIE_WORKSPACE_MAX_ARCHIVE_BYTES": str(limit)}):
         result = await _writer(ctx, base_limit=limit).capture(
             _request(
@@ -1667,9 +1692,18 @@ async def _case_base_over_limit(ctx: _Ctx) -> None:
                 base=ctx.harness.base_source(),
             )
         )
-    _assert_failed(result, "base_too_large", reserved=False)
+    _assert_failed(
+        result, "base_too_large", reserved=False, refusal="workspace_recovery.base_too_large"
+    )
+    # The ledger records the refusal; the item had no recovery outcome before it.
+    assert await _recovery_outcome(ctx, source) == "base_too_large"
     assert await _checkpoint_rows(ctx, source) == []
     assert await _base_key(ctx, source) is None
+    assert await _item_object_keys(ctx, source) == set()
+    retained = ctx.harness.client.list_objects_v2(
+        Bucket=BUCKET, Prefix=f"private/workspace-recovery/retained/{source.work_item_id}/"
+    )
+    assert retained.get("KeyCount", 0) == 0
     await _settle_after_failure(ctx, previous=(other, previous))
 
 
@@ -1929,6 +1963,58 @@ def _record_text(record: logging.LogRecord) -> str:
     return "\n".join(parts)
 
 
+async def _trickled_reads(ctx: _Ctx, source: _Source, checkpoint: uuid.UUID) -> None:
+    """A signed read ends when its lease ends, however slowly the bytes arrive."""
+
+    harness = ctx.harness
+    proxy = _FaultProxy(harness.store.port)
+    try:
+        # The store client targets the proxy, so capabilities are signed for its host.
+        reader = RecoveryCheckpointReader(
+            ledger=ctx.ledger,
+            store=_proxied_store(proxy),
+            transport=ctx.transport,
+            reference_ttl_seconds=60,
+        )
+        lease = await reader.acquire(
+            work_item_id=source.work_item_id, checkpoint_id=checkpoint, holder_id="proxied-reader"
+        )
+        assert urlsplit(reader.capability(lease, "base")).port == proxy.port
+        # Liveness twin: a full lease reads the base through the proxy and verifies it.
+        whole = ctx.tmp / "proxied-base"
+        await reader.read(lease, "base", whole)
+        assert _file_sha(whole) == harness.base_sha
+        whole.unlink()
+
+        # Injected time: the lease has three seconds left.
+        await _sql(
+            ctx,
+            "UPDATE curie.workspace_recovery_readers "
+            "SET expires_at = clock_timestamp() + interval '3 seconds' WHERE id = :id",
+            id=lease.lease_id,
+        )
+        short = await reader.acquire(
+            work_item_id=source.work_item_id, checkpoint_id=checkpoint, holder_id="proxied-reader"
+        )
+        assert short.lease_id == lease.lease_id
+        remaining = short.expires_at.timestamp() - time.time()
+        assert remaining < 4.0
+        # Injected fault: a slow store link that would take about twelve seconds to
+        # deliver the base, far longer than the lease has left.
+        proxy.trickle(max(1024, len(harness.base_bytes) // 12))
+        slow = ctx.tmp / "trickled-base"
+        started = time.monotonic()
+        with pytest.raises(RecoveryReadRefused) as lapsed:
+            await reader.read(short, "base", slow)
+        elapsed = time.monotonic() - started
+        assert lapsed.value.code == "lease_expired"
+        assert elapsed <= max(0.0, remaining) + 3.0, elapsed
+        assert not slow.exists()
+        await reader.release(short)
+    finally:
+        proxy.close()
+
+
 @pytest.mark.anyio
 async def test_recovery_private_read_capabilities(
     harness: _Harness, tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -2019,6 +2105,8 @@ async def test_recovery_private_read_capabilities(
             with pytest.raises(RecoveryReadRefused) as lapsed:
                 reader.capability(bounded, "base")
             assert lapsed.value.code == "lease_expired"
+
+            await _trickled_reads(ctx, source, checkpoint)
 
             released = await reader.acquire(
                 work_item_id=source.work_item_id, checkpoint_id=checkpoint, holder_id="releaser"

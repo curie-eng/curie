@@ -449,12 +449,16 @@ class RecoveryCheckpointWriter:
                 if request.base is None:
                     raise _CaptureFailure("base_unavailable") from None
                 sources["base"] = workdir / "base"
-                size, digest = await self._spool_base(
+                size, digest, oversized = await self._spool_base(
                     request.base, sources["base"], deadline, cancel
                 )
                 sizes["base"] = size
                 declarations["base"] = {"kind": "base", "size_bytes": size, "sha256": digest}
+                # An oversized base is declared at its true size so the ledger
+                # refuses it with ``base_too_large`` and records that outcome.
                 reservation = await self._reserve(request, declarations, deadline)
+                if oversized:
+                    raise _CaptureFailure("base_too_large") from None
             await self._upload(reservation, declarations, sources, deadline, cancel)
             await self._complete(request, reservation, deadline)
             result = RecoveryCaptureResult("complete", _checkpoint_id(reservation))
@@ -520,11 +524,17 @@ class RecoveryCheckpointWriter:
         destination: Path,
         deadline: float,
         cancel: threading.Event,
-    ) -> tuple[int, str]:
+    ) -> tuple[int, str, bool]:
+        """Spool the base privately while hashing; returns size, digest and oversize.
+
+        Past the archive limit the spool stops writing but keeps hashing, so the
+        true size and digest can be declared and the ledger records the refusal.
+        """
+
         limit = self._base_limit
         clock = self._clock
 
-        def spool() -> tuple[int, str] | FailureCode:
+        def spool() -> tuple[int, str, bool] | FailureCode:
             digest = hashlib.sha256()
             total = 0
             fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -535,15 +545,14 @@ class RecoveryCheckpointWriter:
                         if cancel.is_set() or clock() >= deadline:
                             return "capture_timeout"
                         total += len(chunk)
-                        if total > limit:
-                            return "base_too_large"
                         digest.update(chunk)
-                        handle.write(chunk)
+                        if total <= limit:
+                            handle.write(chunk)
             finally:
                 close = getattr(chunks, "close", None)
                 if close is not None:
                     close()
-            return total, digest.hexdigest()
+            return total, digest.hexdigest(), total > limit
 
         remaining = deadline - clock()
         if remaining <= 0:
@@ -557,10 +566,10 @@ class RecoveryCheckpointWriter:
             raise _CaptureFailure("base_unavailable") from None
         if isinstance(outcome, str):
             raise _CaptureFailure(outcome)
-        size, digest = outcome
-        if digest != base.sha256:
+        size, digest, oversized = outcome
+        if not oversized and digest != base.sha256:
             raise _CaptureFailure("base_digest_mismatch")
-        return size, digest
+        return size, digest, oversized
 
     async def _upload(
         self,
@@ -832,8 +841,11 @@ class RecoveryCheckpointReader:
 
         url = self.capability(lease, kind)
         ref = lease.objects[kind]
-        # The read may not outlive the lease that authorized it.
-        budget = max(1.0, lease.expires_at.timestamp() - self._wall_clock())
+        # The whole read (request, headers, body, writes, verification) must finish
+        # inside the lease that authorized it (ADR 0251 section 4).
+        budget = lease.expires_at.timestamp() - self._wall_clock()
+        if budget <= 0:
+            raise RecoveryReadRefused("lease_expired")
         request = httpx.Request(
             "GET",
             url,
@@ -843,33 +855,33 @@ class RecoveryCheckpointReader:
         )
         fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         os.fchmod(fd, 0o600)
-        failure: str | None = None
-        try:
+
+        async def stream() -> str | None:
             with os.fdopen(fd, "wb") as handle:
                 digest = hashlib.sha256()
                 total = 0
-                response = await asyncio.wait_for(
-                    self._transport.handle_async_request(request), budget
-                )
+                response = await self._transport.handle_async_request(request)
                 try:
                     if response.status_code != 200:
-                        failure = "read_refused"
-                    else:
-                        async for chunk in response.aiter_raw(_READ_CHUNK_BYTES):
-                            total += len(chunk)
-                            if total > ref.size_bytes:
-                                failure = "digest_mismatch"
-                                break
-                            digest.update(chunk)
-                            handle.write(chunk)
+                        return "read_refused"
+                    async for chunk in response.aiter_raw(_READ_CHUNK_BYTES):
+                        total += len(chunk)
+                        if total > ref.size_bytes:
+                            return "digest_mismatch"
+                        digest.update(chunk)
+                        handle.write(chunk)
                 finally:
                     await response.aclose()
-                if failure is None and (
-                    total != ref.size_bytes or digest.hexdigest() != ref.sha256
-                ):
-                    failure = "digest_mismatch"
+            if total != ref.size_bytes or digest.hexdigest() != ref.sha256:
+                return "digest_mismatch"
+            return None
+
+        try:
+            failure = await asyncio.wait_for(stream(), budget)
+        except TimeoutError:
+            failure = "lease_expired"
         except Exception:  # noqa: BLE001 - typed fault boundary
-            failure = failure or "read_failed"
+            failure = "read_failed"
         if failure is not None:
             _remove(destination)
             logger.info(
