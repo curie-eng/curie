@@ -50,12 +50,9 @@ def _enabled(settings: Settings) -> None:
         raise RecoveryRefusal("disabled", 503)
 
 
-def _live_authority(
-    item: WorkItem, source: ExecutionRequest, now: datetime, *, starting: bool
-) -> None:
+def _failed_source(source: ExecutionRequest) -> None:
     if (
-        item.cancelled_at is not None
-        or source.status != "failed"
+        source.status != "failed"
         or source.started_at is None
         or source.terminal_at is None
         or source.termination_observation is not None
@@ -70,6 +67,14 @@ def _live_authority(
         }
     ):
         raise RecoveryRefusal("ineligible_source")
+
+
+def _live_authority(
+    item: WorkItem, source: ExecutionRequest, now: datetime, *, starting: bool
+) -> None:
+    if item.cancelled_at is not None:
+        raise RecoveryRefusal("ineligible_source")
+    _failed_source(source)
     if starting and (
         source.runtime_heartbeat_expires_at is None
         or source.runtime_heartbeat_expires_at <= now
@@ -508,8 +513,10 @@ async def _cleanup_context(
     """Authority for cleaning up a capture's own checkpoint.
 
     Unlike ``_capture_context`` the source need not be the WorkItem's latest
-    request, nor unexpired: a predecessor whose lease was lost after a successor
-    was admitted still tombstones its own staging. Nor is the retained group
+    request, nor unexpired, nor its WorkItem uncancelled: a predecessor whose
+    lease was lost after a successor was admitted, or whose WorkItem was
+    cancelled after its capture, still tombstones its own checkpoint. Nor is the
+    retained group
     compared with the WorkItem's current base: ordinary readmission replaces that
     base, and the predecessor still withdraws its own checkpoint. The retained
     group must exist, and the checkpoint's exact source (request, epoch, dispatch
@@ -532,7 +539,7 @@ async def _cleanup_context(
         raise RecoveryRefusal("retained_identity")
     cp = await _checkpoint(session, item.id, body.checkpoint_id)
     now = await database_now(session)
-    _live_authority(item, source, now, starting=False)
+    _failed_source(source)
     _capture_identity(cp, body)
     return item, group, cp, now
 
@@ -543,23 +550,25 @@ async def _retract(
     """Withdraw a just-completed checkpoint whose capture lost its lease after commit.
 
     Its objects are left for the collector, whose reader-pinning rule keeps a
-    reader that already leased it working until its lease expires.
+    reader that already leased it working until its lease expires. The group's
+    pointer moves only when it named this checkpoint; a successor's newer
+    checkpoint stays the answer.
     """
 
-    if group.last_good_checkpoint_id != cp.id:
-        raise RecoveryRefusal("checkpoint_state")
     assert cp.completed_at is not None
+    was_last_good = group.last_good_checkpoint_id == cp.id
     await _tombstone(session, group, cp)
-    group.last_good_checkpoint_id = await session.scalar(
-        select(Checkpoint.id)
-        .where(
-            Checkpoint.work_item_id == item.id,
-            Checkpoint.status == "complete",
-            Checkpoint.id != cp.id,
+    if was_last_good:
+        group.last_good_checkpoint_id = await session.scalar(
+            select(Checkpoint.id)
+            .where(
+                Checkpoint.work_item_id == item.id,
+                Checkpoint.status == "complete",
+                Checkpoint.id != cp.id,
+            )
+            .order_by(Checkpoint.completed_at.desc(), Checkpoint.id.desc())
+            .limit(1)
         )
-        .order_by(Checkpoint.completed_at.desc(), Checkpoint.id.desc())
-        .limit(1)
-    )
     _outcome_if_not_later(item, "lease_lost", now, cp.completed_at)
     await session.flush()
     return wire.RecoveryCaptureFailure(checkpoint_id=cp.id, status="retracted")
