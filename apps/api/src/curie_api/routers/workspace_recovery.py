@@ -34,6 +34,18 @@ async def _transaction[Result: BaseModel](
     return response
 
 
+@router.post("/context", response_model=wire.RecoveryCaptureContext)
+async def context(
+    body: wire.RecoveryCaptureAuthority, session: SessionDep
+) -> wire.RecoveryCaptureContext:
+    return await _transaction(session, ledger.context(session, get_settings(), body))
+
+
+@router.post("/outcome", response_model=wire.RecoveryOutcomeRecorded)
+async def outcome(body: wire.RecoveryOutcome, session: SessionDep) -> wire.RecoveryOutcomeRecorded:
+    return await _transaction(session, ledger.outcome(session, get_settings(), body))
+
+
 @router.post("/reserve", response_model=wire.RecoveryReservation)
 async def reserve(body: wire.RecoveryReserve, session: SessionDep) -> wire.RecoveryReservation:
     return await _transaction(session, ledger.reserve(session, get_settings(), body))

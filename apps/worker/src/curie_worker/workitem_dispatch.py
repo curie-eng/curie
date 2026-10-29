@@ -682,6 +682,10 @@ class WorkItemRun:
         # nothing and creates no approval, since the API termination chain owns
         # the lost request's teardown (ADR 0206, #4331).
         self.abandoned = False
+        # Set only once an ordinary failed finish is known to have committed
+        # (#5143): the release may then capture a recovery checkpoint first.
+        # Cancellation, termination, deadline and owner loss never set it.
+        self.recovery_eligible = False
         self.held = False
         self.runtime_epoch: int | None = None
         self.claim_name: str | None = None

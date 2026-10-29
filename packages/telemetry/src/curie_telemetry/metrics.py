@@ -476,6 +476,8 @@ _HTTP_OPERATIONS = [
     "/v1/internal/publications/{publication_id}/pull-request/metadata",
     "/v1/internal/publications/{publication_id}/branch-head",
     "/v1/internal/publications/{publication_id}/revision-commit",
+    "/v1/internal/workspace-recovery/context",
+    "/v1/internal/workspace-recovery/outcome",
     "/v1/internal/workspace-recovery/reserve",
     "/v1/internal/workspace-recovery/complete",
     "/v1/internal/workspace-recovery/fail",

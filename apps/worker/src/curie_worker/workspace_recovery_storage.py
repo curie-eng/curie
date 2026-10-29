@@ -27,7 +27,7 @@ from typing import Any, Literal
 
 import httpx
 
-from .workspace import WorkspaceClaimCoordinator, WorkspaceObjectStore
+from .workspace import PreparedWorkspace, WorkspaceClaimCoordinator, WorkspaceObjectStore
 from .workspace_recovery import WorkspaceRecoveryClient
 
 logger = logging.getLogger(__name__)
@@ -261,15 +261,29 @@ class RecoveryBaseSource:
     open: Callable[[], Iterable[bytes]]
 
     @classmethod
-    def from_claim(
-        cls, coordinator: WorkspaceClaimCoordinator, thread_key: str
-    ) -> RecoveryBaseSource | None:
-        prepared = coordinator.current(thread_key)
-        if prepared is None:
-            return None
+    def from_prepared(
+        cls, coordinator: WorkspaceClaimCoordinator, prepared: PreparedWorkspace
+    ) -> RecoveryBaseSource:
+        """The base of an already-read claim. Touches no store until ``open``.
+
+        The writer calls ``open`` inside its spool thread, so building this on the
+        event loop never blocks it.
+        """
+
         objects = coordinator.preparer.objects
         object_key = prepared.object_key
         return cls(sha256=prepared.sha256, open=lambda: objects.get_stream(object_key))
+
+    @classmethod
+    def from_claim(
+        cls, coordinator: WorkspaceClaimCoordinator, thread_key: str
+    ) -> RecoveryBaseSource | None:
+        """Read the thread's claim, then its base. Synchronous: call off the loop."""
+
+        prepared = coordinator.current(thread_key)
+        if prepared is None:
+            return None
+        return cls.from_prepared(coordinator, prepared)
 
 
 @dataclass(frozen=True)
@@ -296,6 +310,7 @@ FailureCode = Literal[
     "digest_mismatch",
     "capture_timeout",
     "complete_failed",
+    "lease_lost",
 ]
 
 
@@ -309,9 +324,14 @@ class RecoveryCaptureResult:
 
 
 class _CaptureFailure(Exception):
-    def __init__(self, code: FailureCode, refusal: str | None = None) -> None:
+    def __init__(
+        self, code: FailureCode, refusal: str | None = None, *, retract: bool = False
+    ) -> None:
         self.code: FailureCode = code
         self.refusal = refusal
+        # Set only when this invocation created its reservation (not a replay) and
+        # has sent a ``complete``: the one case allowed to withdraw a checkpoint.
+        self.retract = retract
         super().__init__(code)
 
 
@@ -378,7 +398,21 @@ _SIZE_REFUSALS: dict[str, FailureCode] = {
 _FAIL_REASON: dict[str, str] = {
     "capture_timeout": "capture_timeout",
     "digest_mismatch": "capture_failed",
+    "lease_lost": "lease_lost",
 }
+
+# Awaited before a completion is attempted and once more after it commits; any
+# exception means the caller's exclusive ownership of the workspace is gone.
+Fence = Callable[[], Awaitable[None]]
+
+
+async def _fenced(fence: Fence | None) -> None:
+    if fence is None:
+        return
+    try:
+        await fence()
+    except Exception:  # noqa: BLE001 - any fence fault is a lost lease
+        raise _CaptureFailure("lease_lost") from None
 
 
 class RecoveryCheckpointWriter:
@@ -403,10 +437,26 @@ class RecoveryCheckpointWriter:
         self._cleanup_budget = cleanup_budget_seconds
         self._clock = clock
 
-    async def capture(self, request: RecoveryCaptureRequest) -> RecoveryCaptureResult:
-        """Capture one checkpoint. Storage, ledger and network faults never raise."""
+    async def capture(
+        self,
+        request: RecoveryCaptureRequest,
+        *,
+        deadline: float | None = None,
+        fence: Fence | None = None,
+    ) -> RecoveryCaptureResult:
+        """Capture one checkpoint. Storage, ledger and network faults never raise.
 
-        deadline = self._clock() + self._capture_budget
+        ``deadline`` is absolute on this writer's clock and replaces the per-call
+        budget, so one aggregate deadline can cover work done before this call.
+        ``fence`` is awaited before every completion attempt and once after the
+        completion commits. A fence failing before completion tombstones the
+        staging; failing after this call sent its own completion retracts the
+        checkpoint if it committed, whose objects are then left to the collector. A
+        replay of an already-complete checkpoint never asks for a retraction.
+        """
+
+        if deadline is None:
+            deadline = self._clock() + self._capture_budget
         # Size caps are the ledger's: it records the refusal as the WorkItem's latest
         # recovery outcome (ADR 0251 section 3), so there is no local precheck.
         sizes: dict[str, int] = {"patch": len(request.patch), "manifest": len(request.manifest)}
@@ -425,6 +475,16 @@ class RecoveryCheckpointWriter:
                 "sha256": _sha256(request.manifest),
             },
         }
+        # Set once any ``complete`` request has been sent: the writer cannot tell
+        # whether a sent request committed, so every later failure may withdraw it.
+        sent: list[bool] = []
+
+        def may_retract() -> bool:
+            # Only a reservation this invocation created may be withdrawn: a replay's
+            # ``complete`` answers success for a checkpoint an earlier invocation
+            # completed, and proves nothing about who did.
+            return bool(sent) and reservation is not None and reservation["replayed"] is False
+
         try:
             self._scratch_root.mkdir(parents=True, exist_ok=True)
             workdir = Path(tempfile.mkdtemp(prefix="recovery-", dir=self._scratch_root))
@@ -458,16 +518,22 @@ class RecoveryCheckpointWriter:
                 if oversized:
                     raise _CaptureFailure("base_too_large") from None
             await self._upload(reservation, declarations, sources, deadline, cancel)
-            await self._complete(request, reservation, deadline)
+            await self._complete(request, reservation, deadline, fence, sent)
+            await _fenced(fence)
             result = RecoveryCaptureResult("complete", _checkpoint_id(reservation))
         except _CaptureFailure as failure:
             cancel.set()
-            result = await self._failed(request, reservation, set(declarations), failure)
+            failure.retract = may_retract()
+            result = await self._failed(request, reservation, set(declarations), failure, fence)
         except Exception:  # noqa: BLE001 - typed fault boundary
             cancel.set()
             code: FailureCode = "ledger_unavailable" if reservation is None else "upload_failed"
             result = await self._failed(
-                request, reservation, set(declarations), _CaptureFailure(code)
+                request,
+                reservation,
+                set(declarations),
+                _CaptureFailure(code, retract=may_retract()),
+                fence,
             )
         finally:
             cancel.set()
@@ -492,6 +558,9 @@ class RecoveryCheckpointWriter:
             "target_branch": request.target_branch,
             "base_archive_limit_bytes": self._base_limit,
             "objects": list(declarations.values()),
+            # The ledger's capture deadline is its ``now`` plus what is left of
+            # this capture's aggregate budget, never a fresh full budget.
+            "capture_budget_seconds": min(CAPTURE_BUDGET_SECONDS, remaining),
         }
         try:
             reservation = await _ledger_call(self._ledger.reserve, payload, remaining)
@@ -505,7 +574,7 @@ class RecoveryCheckpointWriter:
         try:
             _checkpoint_id(reservation)
             objects = reservation["objects"]
-            if not isinstance(objects, list):
+            if not isinstance(objects, list) or not isinstance(reservation["replayed"], bool):
                 raise TypeError
         except (KeyError, TypeError, ValueError):
             raise _CaptureFailure("ledger_unavailable") from None
@@ -607,7 +676,12 @@ class RecoveryCheckpointWriter:
                 raise _CaptureFailure("upload_failed") from None
 
     async def _complete(
-        self, request: RecoveryCaptureRequest, reservation: dict[str, Any], deadline: float
+        self,
+        request: RecoveryCaptureRequest,
+        reservation: dict[str, Any],
+        deadline: float,
+        fence: Fence | None,
+        sent: list[bool],
     ) -> None:
         payload = {
             **request.authority.payload(),
@@ -618,7 +692,12 @@ class RecoveryCheckpointWriter:
             remaining = deadline - self._clock()
             if remaining <= 0:
                 break
+            await _fenced(fence)
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                break
             try:
+                sent.append(True)
                 await _ledger_call(self._ledger.complete, payload, remaining)
                 return
             except _LedgerRefused as refused:
@@ -635,15 +714,36 @@ class RecoveryCheckpointWriter:
         reservation: dict[str, Any] | None,
         declared: set[str],
         failure: _CaptureFailure,
+        fence: Fence | None,
     ) -> RecoveryCaptureResult:
         if reservation is None:
             return RecoveryCaptureResult("failed", None, failure.code, failure.refusal)
         checkpoint_id = _checkpoint_id(reservation)
+
+        async def settle() -> bool:
+            # One rule for every retract-eligible failure (a reservation this call
+            # created, with a ``complete`` sent) whose lease was not already lost:
+            # re-run the fence. A passing fence proves ownership was continuous from
+            # acquisition through now, covering any commit, so the original reason
+            # goes without ``retract`` and a complete checkpoint stands. A failing or
+            # unanswerable fence means a commit may have landed without ownership.
+            if failure.retract and failure.code != "lease_lost":
+                # The fence gets its own bound (at most half the cleanup allowance)
+                # so a stalled fence cannot starve the retraction; a timeout or any
+                # other error counts as lost.
+                try:
+                    await asyncio.wait_for(_fenced(fence), self._cleanup_budget / 2)
+                except Exception:  # noqa: BLE001 - typed fault boundary
+                    failure.code = "lease_lost"
+                else:
+                    failure.retract = False
+            return await self._cleanup(request, reservation, declared, failure)
+
+        # Accepted residual: an asyncio.CancelledError (shutdown) during an in-flight
+        # ``complete`` bypasses this cleanup. It only happens while this process still
+        # holds the lease; the ledger's staging rows are what the collector acts on.
         try:
-            cleanup_complete = await asyncio.wait_for(
-                self._cleanup(request, reservation, declared, failure.code),
-                self._cleanup_budget,
-            )
+            cleanup_complete = await asyncio.wait_for(settle(), self._cleanup_budget)
         except Exception:  # noqa: BLE001 - typed fault boundary
             cleanup_complete = False
         return RecoveryCaptureResult(
@@ -655,9 +755,14 @@ class RecoveryCheckpointWriter:
         request: RecoveryCaptureRequest,
         reservation: dict[str, Any],
         declared: set[str],
-        code: FailureCode,
+        failure: _CaptureFailure,
     ) -> bool:
         """Tombstone the reservation, then discard exactly the keys this capture declared.
+
+        Only a failure carrying ``retract`` (this call sent its own completion and
+        its fence then failed) asks the ledger to withdraw a complete checkpoint.
+        A ``retracted`` answer, including a repeated fail on a checkpoint that was
+        once complete, discards nothing.
 
         Objects are discarded only after ``fail`` confirms the tombstone. A replayed
         reservation can name a checkpoint that is already complete (or whose
@@ -671,13 +776,19 @@ class RecoveryCheckpointWriter:
         payload = {
             **request.authority.payload(),
             "checkpoint_id": str(_checkpoint_id(reservation)),
-            "reason": _FAIL_REASON.get(code, "upload_failed"),
+            "reason": _FAIL_REASON.get(failure.code, "upload_failed"),
+            "retract": failure.retract,
         }
         try:
             response = await _ledger_call(self._ledger.fail, payload)
         except Exception:  # noqa: BLE001 - typed fault boundary
             return False
-        if response.get("status") != "tombstoned":
+        status = response.get("status")
+        if status == "retracted":
+            # A completed checkpoint withdrawn after a lost lease: a reader may
+            # already hold it, so its objects are the collector's to remove.
+            return True
+        if status != "tombstoned":
             return False
         results = await asyncio.gather(
             *(asyncio.to_thread(self._store.discard, key) for key in keys),

@@ -43,6 +43,7 @@ from ..workitem_dispatch import (
 from ..workspace import (
     WorkspaceClaimCoordinator,
 )
+from ..workspace_recovery_capture import WorkspaceRecoveryCapture
 from . import (
     approval,
     approval_key,
@@ -103,6 +104,7 @@ class Kernel:
         sibling_limit: SiblingTurnLimit | None = None,
         progress: ProgressStore | None = None,
         bundles: BundleReader | None = None,
+        recovery: WorkspaceRecoveryCapture | None = None,
     ) -> None:
         self._substrate = substrate
         self._runner = runner
@@ -138,6 +140,9 @@ class Kernel:
         # and legacy deployments. A turn that requires a repository refuses when
         # this lane is unavailable instead of booting an empty directory.
         self._workspace = workspace
+        # The terminal recovery capture (ADR 0251, #5143). None, the default and
+        # the disabled configuration, keeps every release on the plain path.
+        self._recovery = recovery
         # The inbound-attachment lane (#2567), optional on exactly the same
         # terms as the workspace lane above: a deployment that has not wired it
         # runs every turn unchanged rather than discovering a missing attribute.
@@ -360,6 +365,7 @@ class Kernel:
     _preflight_reclaimed_delivery = work_items._preflight_reclaimed_delivery
     _quiesce_capacity_epoch = work_items._quiesce_capacity_epoch
     _release_work_item_sandbox = work_items._release_work_item_sandbox
+    _release_with_recovery = work_items._release_with_recovery
     _terminate_work_item = work_items._terminate_work_item
     _stop_owned_work_item = work_items._stop_owned_work_item
     _abandon_stale_work_item = work_items._abandon_stale_work_item

@@ -1840,3 +1840,65 @@ def test_the_publication_job_trust_bundle_comes_from_the_worker_mount(
     monkeypatch.setenv("CURIE_CODE_HOST_CA_BUNDLE", "/etc/curie/code-host-trust/ca.crt")
 
     assert WorkerConfig().publication_ca_bundle_path == "/etc/curie/code-host-trust/ca.crt"
+
+
+# --- workspace recovery capture prerequisites (#5143) ----------------------------
+
+
+def test_recovery_capture_refuses_to_start_without_the_internal_worker_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The capture's ledger calls authenticate with the worker token, so none is a refusal."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_WORKSPACE_RECOVERY_ENABLED", "true")
+    monkeypatch.setenv("CURIE_INTERNAL_WORKER_TOKEN", "")
+    with pytest.raises(ValidationError) as exc_info:
+        WorkerConfig()
+    assert "CURIE_INTERNAL_WORKER_TOKEN" in str(exc_info.value)
+
+
+def test_recovery_capture_refuses_to_start_without_managed_workspaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A capture reads the claim's trusted base, which only managed workspaces have."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_WORKSPACE_RECOVERY_ENABLED", "true")
+    monkeypatch.setenv("CURIE_INTERNAL_WORKER_TOKEN", "recovery-worker-token")
+    monkeypatch.setenv("CURIE_WORKSPACE_ENABLED", "false")
+    with pytest.raises(ValidationError) as exc_info:
+        WorkerConfig()
+    assert "CURIE_WORKSPACE_ENABLED" in str(exc_info.value)
+
+
+def test_recovery_capture_starts_with_its_token_and_workspaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Liveness for the two refusals above: the complete configuration is accepted."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_WORKSPACE_RECOVERY_ENABLED", "true")
+    monkeypatch.setenv("CURIE_INTERNAL_WORKER_TOKEN", "recovery-worker-token")
+    monkeypatch.setenv("CURIE_WORKSPACE_ENABLED", "true")
+    config = WorkerConfig()
+    assert config.workspace_recovery_enabled is True
+    assert config.workspace_enabled is True
+    assert config.internal_worker_token == "recovery-worker-token"
+
+
+@pytest.mark.parametrize(
+    ("token", "workspace"),
+    [("", "false"), ("", "true"), ("recovery-worker-token", "false")],
+    ids=["neither", "no-token", "no-workspace"],
+)
+def test_disabled_recovery_keeps_every_existing_configuration_valid(
+    monkeypatch: pytest.MonkeyPatch, token: str, workspace: str
+) -> None:
+    """The refusals bind only when recovery is on; off, nothing new is required."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_WORKSPACE_RECOVERY_ENABLED", "false")
+    monkeypatch.setenv("CURIE_INTERNAL_WORKER_TOKEN", token)
+    monkeypatch.setenv("CURIE_WORKSPACE_ENABLED", workspace)
+    assert WorkerConfig().workspace_recovery_enabled is False

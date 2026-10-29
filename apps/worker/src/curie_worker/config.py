@@ -1150,9 +1150,11 @@ class WorkerConfig(BaseSettings):
     workspace_max_concurrent_clones: int = Field(
         default=2, gt=0, validation_alias="CURIE_WORKSPACE_MAX_CONCURRENT_CLONES"
     )
-    # Recovery checkpoint objects (ADR 0251). Off by default; when on, with the
-    # internal worker token, the worker supervises the recovery object collector.
-    # Recovery never changes ``workspace_enabled`` or the claim coordinator.
+    # Recovery checkpoint objects (ADR 0251). Off by default; when on (which
+    # requires the internal worker token and managed workspaces), the worker
+    # captures a failed run's workspace before releasing its claim (#5143) and
+    # supervises the recovery object collector. Recovery never changes
+    # ``workspace_enabled`` or the claim coordinator.
     workspace_recovery_enabled: bool = Field(
         default=False, validation_alias="CURIE_WORKSPACE_RECOVERY_ENABLED"
     )
@@ -1227,6 +1229,22 @@ class WorkerConfig(BaseSettings):
     attachment_thread_prepare_timeout_seconds: float = Field(
         default=15.0, gt=0, validation_alias="CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS"
     )
+
+    @model_validator(mode="after")
+    def validate_workspace_recovery_capture(self) -> WorkerConfig:
+        # The terminal capture (#5143) authenticates its ledger calls with the
+        # worker token and reads the claim's trusted base, which only managed
+        # workspaces have. Refused before operation, not discovered per run.
+        if self.workspace_recovery_enabled:
+            if not self.internal_worker_token:
+                raise ValueError(
+                    "CURIE_WORKSPACE_RECOVERY_ENABLED requires CURIE_INTERNAL_WORKER_TOKEN"
+                )
+            if not self.workspace_enabled:
+                raise ValueError(
+                    "CURIE_WORKSPACE_RECOVERY_ENABLED requires CURIE_WORKSPACE_ENABLED"
+                )
+        return self
 
     @model_validator(mode="after")
     def validate_lazy_attachment_activation(self) -> WorkerConfig:

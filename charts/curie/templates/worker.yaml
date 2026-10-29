@@ -317,6 +317,10 @@ spec:
               value: {{ .Values.worker.workspace.maxCheckoutBytes | int64 | quote }}
             - name: CURIE_WORKSPACE_MAX_ARCHIVE_BYTES
               value: {{ .Values.worker.workspace.maxArchiveBytes | int64 | quote }}
+            # Workspace recovery capture (ADR 0251). The API renders the same
+            # value from the same helper.
+            - name: CURIE_WORKSPACE_RECOVERY_ENABLED
+              value: {{ include "curie.workspaceRecoveryEnabled" . | quote }}
             - name: CURIE_WORKSPACE_MAX_MEMBERS
               value: {{ .Values.worker.workspace.maxMembers | quote }}
             - name: CURIE_WORKSPACE_MAX_COMPRESSION_RATIO

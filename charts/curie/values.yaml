@@ -2153,6 +2153,14 @@ worker:
     bucket: curie-workspaces
     cloneVolumeSize: 4Gi
     mountPath: /var/lib/curie/workspaces
+    # Workspace recovery capture (ADR 0251). Off by default. Enabling it keeps
+    # a checkpoint of a terminated turn's workspace for 24 hours and requires
+    # maxBytes, a positive installation-wide cap that counts every recovery
+    # byte; the render fails without it. The API also receives
+    # maxArchiveBytes above so its ledger matches the worker's limit.
+    recovery:
+      enabled: false
+      maxBytes: null
   # Inbound channel attachments (#2567). The worker downloads a referenced file
   # with the channel bot token (Slack) or from the adapter that sent it, with
   # that adapter's adapterCredentials secret (any other kind, ADR-0153), parks

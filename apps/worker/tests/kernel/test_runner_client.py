@@ -1775,3 +1775,381 @@ def test_production_http_timeout_handler_holds_next_query_until_ack(
             await app_runner.cleanup()
 
     asyncio.run(go())
+
+
+# --- POST /v1/checkpoint: the recovery capture's runner read (#5143) ----------------
+#
+# The liveness case drives the real runner app (``curie_runner.server.create_app``
+# with its checkpoint route) over a real git checkout. Every other body is a
+# recorded real shape: success bodies come from the runner's own
+# ``WorkspaceCheckpoint.to_json`` and refusals from its own
+# ``CheckpointRefusal.body`` / ``CheckpointTimeout.body``
+# (runner/src/curie_runner/workspace_checkpoint.py), served at the status the
+# route answers them with (runner/src/curie_runner/server.py ``_checkpoint``).
+# Only the bytes inside a shape are altered, to provoke each validation branch.
+
+_CHECKPOINT_TOKEN = "checkpoint-runner-token"
+_PATCH_CAP = 900_000
+_MANIFEST_CAP = 1_048_576
+_GIT = (
+    "-c",
+    "user.name=Recovery Fixture",
+    "-c",
+    "user.email=recovery@example.com",
+    "-c",
+    "commit.gpgsign=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+)
+
+
+def _checkpoint_git(repo: Any, *args: str) -> str:
+    import subprocess
+
+    done = subprocess.run(
+        ["git", *_GIT, *args], cwd=repo, capture_output=True, text=True, check=True
+    )
+    return done.stdout.strip()
+
+
+def _checkpoint_repo(root: Any) -> tuple[Any, str]:
+    root.mkdir(parents=True)
+    _checkpoint_git(root, "init", "-q", "-b", "main")
+    (root / "README.md").write_text("base\n")
+    (root / "run.sh").write_text("#!/bin/sh\necho run\n")
+    _checkpoint_git(root, "add", "-A")
+    _checkpoint_git(root, "commit", "-q", "-m", "base")
+    return root, _checkpoint_git(root, "rev-parse", "HEAD")
+
+
+def _real_checkpoint_runner(workspace: Any) -> SessionRunner:
+    from curie_runner.server import bind_status_attestation
+
+    runner = SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
+        session_factory=FakeModelSession,
+        ceiling=10_000,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="checkpoint-client",
+    )
+    return bind_status_attestation(
+        runner,
+        session_id="session-acme-checkpoint",
+        sandbox_id="sandbox-acme-checkpoint",
+        cwd=str(workspace),
+    )
+
+
+def _recorded_success(
+    *, base_sha: str, patch: bytes, manifest: bytes, paths: tuple[str, ...]
+) -> dict[str, Any]:
+    from curie_runner.workspace_checkpoint import WorkspaceCheckpoint
+
+    return WorkspaceCheckpoint(
+        base_sha=base_sha, patch=patch, changed_paths=paths, manifest=manifest
+    ).to_json()
+
+
+@contextlib.asynccontextmanager
+async def _recorded_checkpoint_runner(answer: Any):  # noqa: ANN201 - async cm
+    """Serve ``answer(request)`` on /v1/checkpoint and record each request body."""
+
+    seen: list[dict[str, Any]] = []
+    headers: list[dict[str, str]] = []
+    app = web.Application()
+
+    async def checkpoint(request: web.Request) -> web.StreamResponse:
+        headers.append(dict(request.headers))
+        seen.append(json.loads(await request.read()))
+        return await answer(request)
+
+    app.add_routes([web.post("/v1/checkpoint", checkpoint)])
+    server = TestServer(app)
+    await server.start_server()
+    client = RunnerClient(total_timeout_s=30.0)
+    try:
+        yield client, f"http://127.0.0.1:{server.port}", seen, headers
+    finally:
+        await client.close()
+        await server.close()
+
+
+def _json_answer(body: Any, status: int = 200) -> Any:
+    async def answer(_request: web.Request) -> web.Response:
+        return web.json_response(body, status=status)
+
+    return answer
+
+
+def test_checkpoint_reads_the_real_runner_route_and_validates_its_answer(tmp_path: Any) -> None:
+    from curie_worker.runner_client import RunnerWorkspaceCheckpoint
+
+    repo, base = _checkpoint_repo(tmp_path / "workspace")
+    (repo / "README.md").write_text("edited\n")
+    (repo / "notes.txt").write_text("untracked\n")
+    (repo / "run.sh").chmod(0o755)
+    (repo / "blob.bin").write_bytes(b"\x00\x01binary\xff")
+
+    async def go() -> None:
+        runner = _real_checkpoint_runner(repo)
+        server = TestServer(create_app(runner, token=_CHECKPOINT_TOKEN))
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=30.0)
+        base_url = f"http://127.0.0.1:{server.port}"
+        try:
+            checkpoint = await client.checkpoint(
+                base_url, _CHECKPOINT_TOKEN, base_sha=base, budget_seconds=30.0
+            )
+            assert isinstance(checkpoint, RunnerWorkspaceCheckpoint)
+            assert checkpoint.base_sha == base
+            assert checkpoint.changed_paths == ("README.md", "blob.bin", "notes.txt", "run.sh")
+            assert b"diff --git a/README.md b/README.md" in checkpoint.patch
+            document = json.loads(checkpoint.manifest)
+            assert document["base_sha"] == base
+            assert [entry["path"] for entry in document["entries"]] == list(
+                checkpoint.changed_paths
+            )
+            # The token is not optional: the route is bearer-gated.
+            from curie_worker.runner_client import RunnerCheckpointRefused
+
+            with pytest.raises(RunnerError) as missing:
+                await client.checkpoint(base_url, None, base_sha=base, budget_seconds=30.0)
+            assert not isinstance(missing.value, RunnerCheckpointRefused)
+            with pytest.raises(RunnerError):
+                await client.checkpoint(base_url, "", base_sha=base, budget_seconds=30.0)
+            # A real coded refusal from the real route: a base the checkout lacks.
+            with pytest.raises(RunnerCheckpointRefused) as refused:
+                await client.checkpoint(
+                    base_url, _CHECKPOINT_TOKEN, base_sha="f" * 40, budget_seconds=30.0
+                )
+            assert (refused.value.code, refused.value.status) == ("base_unavailable", 422)
+            # The positive control still holds after the refusals.
+            again = await client.checkpoint(
+                base_url, _CHECKPOINT_TOKEN, base_sha=base, budget_seconds=30.0
+            )
+            assert again.patch == checkpoint.patch
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_checkpoint_sends_the_bearer_and_exactly_base_and_budget() -> None:
+    base = "ab" * 20
+    body = _recorded_success(
+        base_sha=base, patch=b"diff --git a/x b/x\n", manifest=b"{}", paths=("x",)
+    )
+
+    async def go() -> None:
+        async with _recorded_checkpoint_runner(_json_answer(body)) as (client, url, seen, headers):
+            await client.checkpoint(url, "runner-token", base_sha=base, budget_seconds=12.5)
+            assert seen == [{"base_sha": base, "budget_seconds": 12.5}]
+            assert headers[0].get("Authorization") == "Bearer runner-token"
+
+            # A missing token never reaches the runner at all.
+            with pytest.raises(RunnerError):
+                await client.checkpoint(url, None, base_sha=base, budget_seconds=12.5)
+            assert len(seen) == 1
+
+    asyncio.run(go())
+
+
+def test_checkpoint_accepts_a_patch_and_manifest_exactly_at_their_caps() -> None:
+    # Liveness for the cap refusals below: the boundary itself is accepted.
+    base = "cd" * 20
+    patch = b"p" * _PATCH_CAP
+    manifest = b"m" * _MANIFEST_CAP
+    body = _recorded_success(base_sha=base, patch=patch, manifest=manifest, paths=("big.bin",))
+
+    async def go() -> None:
+        async with _recorded_checkpoint_runner(_json_answer(body)) as (client, url, _seen, _h):
+            checkpoint = await client.checkpoint(
+                url, "runner-token", base_sha=base, budget_seconds=30.0
+            )
+            assert checkpoint.patch == patch
+            assert checkpoint.manifest == manifest
+            assert checkpoint.changed_paths == ("big.bin",)
+
+    asyncio.run(go())
+
+
+def _malformed_bodies(base: str) -> dict[str, Any]:
+    good = _recorded_success(
+        base_sha=base, patch=b"diff --git a/x b/x\n", manifest=b'{"v":1}', paths=("x",)
+    )
+
+    def changed(**fields: Any) -> dict[str, Any]:
+        return {**good, **fields}
+
+    over_patch = _recorded_success(
+        base_sha=base, patch=b"p" * (_PATCH_CAP + 1), manifest=b"{}", paths=("x",)
+    )
+    over_manifest = _recorded_success(
+        base_sha=base, patch=b"p", manifest=b"m" * (_MANIFEST_CAP + 1), paths=("x",)
+    )
+    missing = dict(good)
+    missing.pop("manifest_sha256")
+    return {
+        "patch-not-base64": changed(patch_base64="!!not base64!!"),
+        "patch-loose-base64": changed(patch_base64=good["patch_base64"] + "\n"),
+        "manifest-not-base64": changed(manifest_base64="***"),
+        "patch-size-mismatch": changed(patch_size_bytes=good["patch_size_bytes"] + 1),
+        "manifest-size-mismatch": changed(manifest_size_bytes=0),
+        "patch-digest-mismatch": changed(patch_sha256="0" * 64),
+        "manifest-digest-mismatch": changed(manifest_sha256="0" * 64),
+        "other-base": changed(base_sha="ef" * 20),
+        "paths-not-a-list": changed(changed_paths="x"),
+        "missing-field": missing,
+        "patch-over-cap": over_patch,
+        "manifest-over-cap": over_manifest,
+        "not-an-object": ["not", "an", "object"],
+    }
+
+
+@pytest.mark.parametrize("shape", sorted(_malformed_bodies("12" * 20)))
+def test_checkpoint_refuses_a_malformed_answer_as_a_runner_error(shape: str) -> None:
+    from curie_worker.runner_client import RunnerCheckpointRefused
+
+    base = "12" * 20
+    body = _malformed_bodies(base)[shape]
+
+    async def go() -> None:
+        async with _recorded_checkpoint_runner(_json_answer(body)) as (client, url, _seen, _h):
+            with pytest.raises(RunnerError) as raised:
+                await client.checkpoint(url, "runner-token", base_sha=base, budget_seconds=30.0)
+            # Malformed is not a coded refusal: the capture records runner_unavailable.
+            assert not isinstance(raised.value, RunnerCheckpointRefused)
+            # The error never carries the payload bytes.
+            assert "not base64" not in str(raised.value)
+
+    asyncio.run(go())
+
+
+def _coded_refusals() -> dict[str, tuple[int, dict[str, Any]]]:
+    from curie_runner.workspace_checkpoint import CheckpointRefusal, CheckpointTimeout
+
+    def shape(refusal: CheckpointRefusal) -> tuple[int, dict[str, Any]]:
+        return refusal.status, refusal.body()
+
+    return {
+        "workspace_changed": shape(
+            CheckpointRefusal("workspace_changed", 409, "the workspace changed mid-checkpoint")
+        ),
+        "patch_too_large": shape(
+            CheckpointRefusal("patch_too_large", 422, "checkpoint patch exceeds 900000 bytes")
+        ),
+        "manifest_too_large": shape(
+            CheckpointRefusal("manifest_too_large", 422, "manifest exceeds 1048576 bytes")
+        ),
+        "unsafe_entry": shape(CheckpointRefusal("unsafe_entry", 422, "unsafe entry")),
+        "unreadable": shape(CheckpointRefusal("unreadable", 422, "unreadable entry")),
+        "deadline_exceeded": shape(CheckpointTimeout("git")),
+        "turn_active": shape(
+            CheckpointRefusal("turn_active", 409, "cannot checkpoint while a turn is active")
+        ),
+    }
+
+
+@pytest.mark.parametrize("code", sorted(_coded_refusals()))
+def test_checkpoint_maps_each_coded_refusal_with_its_code_and_status(code: str) -> None:
+    from curie_worker.runner_client import RunnerCheckpointRefused
+
+    status, body = _coded_refusals()[code]
+    base = "34" * 20
+
+    async def go() -> None:
+        async with _recorded_checkpoint_runner(_json_answer(body, status)) as (
+            client,
+            url,
+            _seen,
+            _h,
+        ):
+            with pytest.raises(RunnerCheckpointRefused) as raised:
+                await client.checkpoint(url, "runner-token", base_sha=base, budget_seconds=30.0)
+            assert isinstance(raised.value, RunnerError)
+            assert raised.value.code == code
+            assert raised.value.status == status
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (404, {"error": "not found"}),
+        (500, {"error": "boom", "code": "workspace_changed"}),
+        (502, "bad gateway"),
+        (409, {"error": "uncoded conflict"}),
+    ],
+    ids=["no-route", "server-error-even-if-coded", "bad-gateway", "uncoded-4xx"],
+)
+def test_checkpoint_treats_routeless_uncoded_and_server_errors_as_unavailable(
+    status: int, body: Any
+) -> None:
+    from curie_worker.runner_client import RunnerCheckpointRefused
+
+    base = "56" * 20
+
+    async def answer(_request: web.Request) -> web.Response:
+        if isinstance(body, str):
+            return web.Response(text=body, status=status)
+        return web.json_response(body, status=status)
+
+    async def go() -> None:
+        async with _recorded_checkpoint_runner(answer) as (client, url, _seen, _h):
+            with pytest.raises(RunnerError) as raised:
+                await client.checkpoint(url, "runner-token", base_sha=base, budget_seconds=30.0)
+            assert not isinstance(raised.value, RunnerCheckpointRefused)
+
+    asyncio.run(go())
+
+
+def test_checkpoint_transport_failure_is_a_runner_error() -> None:
+    import socket
+
+    from curie_worker.runner_client import RunnerCheckpointRefused
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    async def go() -> None:
+        client = RunnerClient(total_timeout_s=30.0)
+        try:
+            with pytest.raises(RunnerError) as raised:
+                await client.checkpoint(
+                    f"http://127.0.0.1:{port}",
+                    "runner-token",
+                    base_sha="78" * 20,
+                    budget_seconds=5.0,
+                )
+            assert not isinstance(raised.value, RunnerCheckpointRefused)
+        finally:
+            await client.close()
+
+    asyncio.run(go())
+
+
+def test_checkpoint_is_bounded_by_the_remaining_budget() -> None:
+    """A wedged runner cannot hold the capture past the budget the caller has left."""
+
+    base = "9a" * 20
+
+    async def wedged(_request: web.Request) -> web.Response:
+        await asyncio.sleep(20)
+        return web.json_response({})
+
+    async def go() -> None:
+        async with _recorded_checkpoint_runner(wedged) as (client, url, _seen, _h):
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            with pytest.raises((RunnerError, TimeoutError)):
+                await client.checkpoint(
+                    url, "runner-token", base_sha=base, budget_seconds=1.0, remaining_s=1.0
+                )
+            assert loop.time() - started < 8.0
+
+    asyncio.run(go())
