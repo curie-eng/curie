@@ -557,7 +557,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
             "curie",
             "--locked",
             "-j",
-            "2",
+            self.env.get("CARGO_BUILD_JOBS", "2"),
             timeout=1800,
         )
         for name in ("api", "worker", "ui"):
