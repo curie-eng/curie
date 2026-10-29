@@ -4,6 +4,10 @@ Date: 2026-10-23
 
 Status: Accepted
 
+Partially superseded by [ADR 0254](0254-http-identity-applies-to-the-channel-identities-an-operator-registers.md):
+decision 2's tenant-wide scope. The selected HTTP mode applies to the channel
+identities an operator registers; other clauses remain unchanged.
+
 Accepted 2026-10-23 with explicit maintainer approval from Junwon Jung,
 including agent-owned role filters and retained channel/approval-route narrowing.
 Tracked in [#4890](https://github.com/curie-eng/curie/issues/4890).
