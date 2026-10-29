@@ -371,6 +371,12 @@ def _write_private(path: Path, data: bytes) -> None:
         handle.write(data)
 
 
+_SIZE_REFUSALS: dict[str, FailureCode] = {
+    "workspace_recovery.patch_too_large": "patch_too_large",
+    "workspace_recovery.manifest_too_large": "manifest_too_large",
+    "workspace_recovery.base_too_large": "base_too_large",
+}
+
 _FAIL_REASON: dict[str, str] = {
     "capture_timeout": "capture_timeout",
     "digest_mismatch": "capture_failed",
@@ -403,13 +409,9 @@ class RecoveryCheckpointWriter:
         """Capture one checkpoint. Storage, ledger and network faults never raise."""
 
         deadline = self._clock() + self._capture_budget
+        # Size caps are the ledger's: it records the refusal as the WorkItem's latest
+        # recovery outcome (ADR 0251 section 3), so there is no local precheck.
         sizes: dict[str, int] = {"patch": len(request.patch), "manifest": len(request.manifest)}
-        if sizes["patch"] > PATCH_LIMIT_BYTES:
-            return self._outcome(request, RecoveryCaptureResult("failed", None, "patch_too_large"))
-        if sizes["manifest"] > MANIFEST_LIMIT_BYTES:
-            return self._outcome(
-                request, RecoveryCaptureResult("failed", None, "manifest_too_large")
-            )
         cancel = threading.Event()
         workdir: Path | None = None
         reservation: dict[str, Any] | None = None
@@ -429,8 +431,16 @@ class RecoveryCheckpointWriter:
             self._scratch_root.mkdir(parents=True, exist_ok=True)
             workdir = Path(tempfile.mkdtemp(prefix="recovery-", dir=self._scratch_root))
             sources = {"patch": workdir / "patch", "manifest": workdir / "manifest"}
-            await asyncio.to_thread(_write_private, sources["patch"], request.patch)
-            await asyncio.to_thread(_write_private, sources["manifest"], request.manifest)
+            for kind, data in (("patch", request.patch), ("manifest", request.manifest)):
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    raise _CaptureFailure("capture_timeout")
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(_write_private, sources[kind], data), remaining
+                    )
+                except TimeoutError:
+                    raise _CaptureFailure("capture_timeout") from None
             try:
                 reservation = await self._reserve(request, declarations, deadline)
             except _CaptureFailure as failure:
@@ -491,7 +501,8 @@ class RecoveryCheckpointWriter:
         except TimeoutError:
             raise _CaptureFailure("capture_timeout") from None
         except _LedgerRefused as refused:
-            raise _CaptureFailure("reserve_refused", refused.code) from None
+            code = _SIZE_REFUSALS.get(refused.code or "", "reserve_refused")
+            raise _CaptureFailure(code, refused.code) from None
         except _LedgerUnavailable:
             raise _CaptureFailure("ledger_unavailable") from None
         try:
@@ -646,11 +657,14 @@ class RecoveryCheckpointWriter:
         declared: set[str],
         code: FailureCode,
     ) -> bool:
-        """Tombstone the reservation and discard exactly the keys this capture uploaded.
+        """Tombstone the reservation, then discard exactly the keys this capture declared.
 
-        After a failed ``complete`` the pointer may have committed with its response
-        lost, so objects are discarded only once ``fail`` confirms the tombstone.
-        Otherwise ``complete`` was never sent and both run together.
+        Objects are discarded only after ``fail`` confirms the tombstone. A replayed
+        reservation can name a checkpoint that is already complete (or whose
+        ``complete`` committed with its response lost); ``fail`` refuses it, and
+        deleting its keys then would destroy a good checkpoint. When ``fail`` is
+        refused or unavailable nothing is discarded: the ledger's staging rows are
+        the durable record the collector acts on, and cleanup reports incomplete.
         """
 
         keys = [str(obj["key"]) for obj in reservation["objects"] if str(obj["kind"]) in declared]
@@ -659,27 +673,17 @@ class RecoveryCheckpointWriter:
             "checkpoint_id": str(_checkpoint_id(reservation)),
             "reason": _FAIL_REASON.get(code, "upload_failed"),
         }
-
-        async def tombstone() -> bool:
-            try:
-                await _ledger_call(self._ledger.fail, payload)
-            except Exception:  # noqa: BLE001 - typed fault boundary
-                return False
-            return True
-
-        async def discard_all() -> bool:
-            results = await asyncio.gather(
-                *(asyncio.to_thread(self._store.discard, key) for key in keys),
-                return_exceptions=True,
-            )
-            return not any(isinstance(item, BaseException) for item in results)
-
-        if code == "complete_failed":
-            if not await tombstone():
-                return False
-            return await discard_all()
-        tombstoned, discarded = await asyncio.gather(tombstone(), discard_all())
-        return tombstoned and discarded
+        try:
+            response = await _ledger_call(self._ledger.fail, payload)
+        except Exception:  # noqa: BLE001 - typed fault boundary
+            return False
+        if response.get("status") != "tombstoned":
+            return False
+        results = await asyncio.gather(
+            *(asyncio.to_thread(self._store.discard, key) for key in keys),
+            return_exceptions=True,
+        )
+        return not any(isinstance(item, BaseException) for item in results)
 
     def _outcome(
         self,
@@ -756,13 +760,15 @@ class RecoveryCheckpointReader:
         *,
         ledger: WorkspaceRecoveryClient,
         store: RecoveryObjectStore,
-        http: httpx.AsyncClient,
+        transport: httpx.AsyncBaseTransport,
         reference_ttl_seconds: int,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
+        # Signed GETs go straight to a transport, never an ``httpx`` client, whose
+        # logger records full request URLs (and so the signature) at INFO.
         self._ledger = ledger
         self._store = store
-        self._http = http
+        self._transport = transport
         self._ttl = reference_ttl_seconds
         self._wall_clock = wall_clock
 
@@ -826,6 +832,15 @@ class RecoveryCheckpointReader:
 
         url = self.capability(lease, kind)
         ref = lease.objects[kind]
+        # The read may not outlive the lease that authorized it.
+        budget = max(1.0, lease.expires_at.timestamp() - self._wall_clock())
+        request = httpx.Request(
+            "GET",
+            url,
+            extensions={
+                "timeout": {"connect": budget, "read": budget, "write": budget, "pool": budget}
+            },
+        )
         fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         os.fchmod(fd, 0o600)
         failure: str | None = None
@@ -833,17 +848,22 @@ class RecoveryCheckpointReader:
             with os.fdopen(fd, "wb") as handle:
                 digest = hashlib.sha256()
                 total = 0
-                async with self._http.stream("GET", url) as response:
+                response = await asyncio.wait_for(
+                    self._transport.handle_async_request(request), budget
+                )
+                try:
                     if response.status_code != 200:
                         failure = "read_refused"
                     else:
-                        async for chunk in response.aiter_bytes(_READ_CHUNK_BYTES):
+                        async for chunk in response.aiter_raw(_READ_CHUNK_BYTES):
                             total += len(chunk)
                             if total > ref.size_bytes:
                                 failure = "digest_mismatch"
                                 break
                             digest.update(chunk)
                             handle.write(chunk)
+                finally:
+                    await response.aclose()
                 if failure is None and (
                     total != ref.size_bytes or digest.hexdigest() != ref.sha256
                 ):

@@ -719,6 +719,7 @@ class _Ctx:
     tmp: Path
     engine: AsyncEngine
     http: httpx.AsyncClient
+    transport: httpx.AsyncBaseTransport
     ledger: WorkspaceRecoveryClient
     store: RecoveryObjectStore
 
@@ -726,6 +727,8 @@ class _Ctx:
 @asynccontextmanager
 async def _context(harness: _Harness, tmp: Path) -> AsyncIterator[_Ctx]:
     engine = create_async_engine(harness.db_url, poolclass=NullPool)
+    # Signed reads go through a bare transport, as the production reader takes one.
+    transport = httpx.AsyncHTTPTransport()
     try:
         async with httpx.AsyncClient(timeout=30.0) as http:
             yield _Ctx(
@@ -733,10 +736,12 @@ async def _context(harness: _Harness, tmp: Path) -> AsyncIterator[_Ctx]:
                 tmp=tmp,
                 engine=engine,
                 http=http,
+                transport=transport,
                 ledger=_ledger(harness, http),
                 store=RecoveryObjectStore(client=harness.client, bucket=BUCKET),
             )
     finally:
+        await transport.aclose()
         await engine.dispose()
 
 
@@ -821,11 +826,16 @@ def _authority(source: _Source) -> RecoveryAuthority:
 
 
 def _request(
-    source: _Source, *, patch: bytes, manifest: bytes, base: RecoveryBaseSource | None
+    source: _Source,
+    *,
+    patch: bytes,
+    manifest: bytes,
+    base: RecoveryBaseSource | None,
+    key: str | None = None,
 ) -> RecoveryCaptureRequest:
     return RecoveryCaptureRequest(
         authority=_authority(source),
-        idempotency_key=uuid.uuid4().hex,
+        idempotency_key=key or uuid.uuid4().hex,
         repository=RecoveryRepository(
             provider="github", host="github.com", project_id="101", path=REPOSITORY_PATH
         ),
@@ -859,7 +869,7 @@ def _writer(
 
 def _reader(ctx: _Ctx, *, ttl: int = 60) -> RecoveryCheckpointReader:
     return RecoveryCheckpointReader(
-        ledger=ctx.ledger, store=ctx.store, http=ctx.http, reference_ttl_seconds=ttl
+        ledger=ctx.ledger, store=ctx.store, transport=ctx.transport, reference_ttl_seconds=ttl
     )
 
 
@@ -1502,6 +1512,45 @@ async def _case_storage_outage(ctx: _Ctx) -> None:
     )
 
 
+async def _case_replay_through_fault(ctx: _Ctx) -> None:
+    """A replayed idempotency key names a complete checkpoint; a fault must not delete it."""
+
+    source = await _seed(ctx)
+    await _good_checkpoint(ctx, source, base=ctx.harness.base_source())
+    key = uuid.uuid4().hex
+    first = await _writer(ctx).capture(
+        _request(source, patch=ctx.harness.patch, manifest=ctx.harness.manifest, base=None, key=key)
+    )
+    assert first.status == "complete", first
+    completed = first.checkpoint_id
+    assert completed is not None
+    keys = await _checkpoint_keys(ctx, completed)
+    assert set(keys) == {"patch", "manifest"}
+
+    proxy = _FaultProxy(ctx.harness.store.port)
+    store = _proxied_store(proxy)
+    # Injected fault: the store is down when the same capture is retried, as after
+    # a worker restart that replays its last capture request.
+    proxy.close()
+    replay = await _writer(ctx, store=store).capture(
+        _request(source, patch=ctx.harness.patch, manifest=ctx.harness.manifest, base=None, key=key)
+    )
+    assert replay.status == "failed", replay
+    assert replay.failure == "upload_failed", replay
+    assert replay.checkpoint_id in {None, completed}, replay
+    # The ledger refuses to tombstone a complete checkpoint, so nothing is discarded.
+    assert replay.cleanup_complete is False, replay
+    assert await _checkpoint_status(ctx, completed) == "complete"
+    assert await _last_good(ctx, source) == completed
+    for object_key in keys.values():
+        assert _exists(ctx.harness, _physical(object_key)), object_key
+        assert ctx.store.pending_uploads(object_key) == [], object_key
+    await _assert_readable(ctx, source, completed, ctx.harness.good_digests())
+    await _settle_after_failure(ctx, previous=(source, completed))
+    for object_key in keys.values():
+        assert _exists(ctx.harness, _physical(object_key)), object_key
+
+
 async def _accepted_second_capture(ctx: _Ctx, *, patch: bytes, manifest: bytes) -> None:
     source = await _seed(ctx)
     previous = await _good_checkpoint(ctx, source, base=ctx.harness.base_source())
@@ -1517,14 +1566,39 @@ async def _accepted_second_capture(ctx: _Ctx, *, patch: bytes, manifest: bytes) 
     _assert_sentinels(ctx.harness)
 
 
+async def _recovery_outcome(ctx: _Ctx, source: _Source) -> str | None:
+    rows = await _sql(
+        ctx,
+        "SELECT workspace_recovery_outcome FROM curie.work_items WHERE id = :id",
+        id=source.work_item_id,
+    )
+    return rows[0]["workspace_recovery_outcome"]
+
+
+async def _item_object_keys(ctx: _Ctx, source: _Source) -> set[str]:
+    rows = await _sql(
+        ctx,
+        "SELECT key FROM curie.workspace_recovery_objects WHERE work_item_id = :id",
+        id=source.work_item_id,
+    )
+    return {str(row["key"]) for row in rows}
+
+
 async def _refused_second_capture(
     ctx: _Ctx, *, patch: bytes, manifest: bytes, failure: str
 ) -> None:
+    """The ledger owns the size caps and records the refusal as the item's outcome."""
+
     source = await _seed(ctx)
     previous = await _good_checkpoint(ctx, source, base=ctx.harness.base_source())
+    assert await _recovery_outcome(ctx, source) == "complete"
+    keys_before = await _item_object_keys(ctx, source)
     result = await _writer(ctx).capture(_request(source, patch=patch, manifest=manifest, base=None))
-    _assert_failed(result, failure, reserved=False)
+    _assert_failed(result, failure, reserved=False, refusal=f"workspace_recovery.{failure}")
+    assert await _recovery_outcome(ctx, source) == failure
     assert [row["id"] for row in await _checkpoint_rows(ctx, source)] == [previous]
+    # Nothing was reserved, so nothing could have been uploaded.
+    assert await _item_object_keys(ctx, source) == keys_before
     await _settle_after_failure(ctx, previous=(source, previous))
 
 
@@ -1639,12 +1713,7 @@ async def _case_installation_over_cap(ctx: _Ctx) -> None:
         reserved=False,
         refusal="workspace_recovery.installation_capacity",
     )
-    outcome = await _sql(
-        ctx,
-        "SELECT workspace_recovery_outcome FROM curie.work_items WHERE id = :id",
-        id=source.work_item_id,
-    )
-    assert outcome[0]["workspace_recovery_outcome"] == "installation_capacity"
+    assert await _recovery_outcome(ctx, source) == "installation_capacity"
     assert [row["id"] for row in await _checkpoint_rows(ctx, source)] == [previous]
     await _settle_after_failure(ctx, previous=(source, previous))
 
@@ -1656,6 +1725,7 @@ _FAULT_CASES: dict[str, Callable[[_Ctx], Awaitable[None]]] = {
     "pointer_write": _case_pointer_write,
     "corrupt_base": _case_corrupt_base,
     "storage_outage": _case_storage_outage,
+    "replay_through_fault": _case_replay_through_fault,
     "patch_at_limit": _case_patch_at_limit,
     "patch_over_limit": _case_patch_over_limit,
     "manifest_at_limit": _case_manifest_at_limit,
@@ -1837,6 +1907,19 @@ def _expires(url: str) -> int:
     return int(parse_qs(urlsplit(url).query)["X-Amz-Expires"][0])
 
 
+async def _probe(
+    transport: httpx.AsyncBaseTransport, url: str, params: Mapping[str, str] | None = None
+) -> tuple[int, bytes]:
+    """One unauthenticated GET straight through a transport, so no client logs the URL."""
+
+    response = await transport.handle_async_request(httpx.Request("GET", url, params=params))
+    try:
+        body = await response.aread()
+    finally:
+        await response.aclose()
+    return response.status_code, body
+
+
 def _record_text(record: logging.LogRecord) -> str:
     parts = [record.getMessage()]
     if record.exc_info:
@@ -1850,7 +1933,14 @@ def _record_text(record: logging.LogRecord) -> str:
 async def test_recovery_private_read_capabilities(
     harness: _Harness, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    caplog.set_level(logging.DEBUG, logger="curie_worker")
+    # Every logger is captured at DEBUG, the HTTP stack explicitly. The AWS SDK's own
+    # wire tracing is held at INFO: at DEBUG botocore prints every canonical request
+    # and Authorization header by design, which says nothing about this code.
+    caplog.set_level(logging.DEBUG)
+    for name in ("curie_worker", "httpx", "httpcore", "urllib3"):
+        caplog.set_level(logging.DEBUG, logger=name)
+    for name in ("botocore", "boto3", "s3transfer"):
+        caplog.set_level(logging.INFO, logger=name)
     assert CANARY.encode() in harness.patch
     async with _context(harness, tmp_path) as ctx:
         source = await _seed(ctx)
@@ -1860,16 +1950,18 @@ async def test_recovery_private_read_capabilities(
         assert base_key is not None
         keys["base"] = base_key
 
-        async with httpx.AsyncClient(timeout=15.0) as anonymous:
+        anonymous = httpx.AsyncHTTPTransport()
+        try:
             for key in keys.values():
                 anonymous_url = f"{harness.store.endpoint}/{BUCKET}/{_physical(key)}"
-                response = await anonymous.get(anonymous_url)
-                assert response.status_code == 403, key
-            listing = await anonymous.get(
+                status, _ = await _probe(anonymous, anonymous_url)
+                assert status == 403, key
+            status, _ = await _probe(
+                anonymous,
                 f"{harness.store.endpoint}/{BUCKET}",
                 params={"list-type": "2", "prefix": "private/"},
             )
-            assert listing.status_code == 403
+            assert status == 403
 
             reader = _reader(ctx, ttl=60)
             lease = await reader.acquire(
@@ -1888,14 +1980,14 @@ async def test_recovery_private_read_capabilities(
                 <= _expires(capability)
                 <= min(60, math.floor(lease.expires_at.timestamp() - before))
             )
-            granted = await anonymous.get(capability)
-            assert granted.status_code == 200
-            assert _sha(granted.content) == _sha(harness.patch)
+            status, body = await _probe(anonymous, capability)
+            assert status == 200
+            assert _sha(body) == _sha(harness.patch)
 
             # The patch capability's signature replayed against the manifest key.
             parts = urlsplit(capability)
             forged = urlunsplit(parts._replace(path=f"/{BUCKET}/{_physical(keys['manifest'])}"))
-            assert (await anonymous.get(forged)).status_code == 403
+            assert (await _probe(anonymous, forged))[0] == 403
             with pytest.raises(RecoveryReadRefused) as unknown:
                 reader.capability(lease, "credentials")
             assert unknown.value.code == "unknown_object"
@@ -1904,7 +1996,7 @@ async def test_recovery_private_read_capabilities(
             brief = short.capability(lease, "manifest")
             assert _expires(brief) == 1
             await asyncio.sleep(4.0)
-            assert (await anonymous.get(brief)).status_code == 403
+            assert (await _probe(anonymous, brief))[0] == 403
 
             # Injected time: the lease's remaining life shrinks to a few seconds.
             await _sql(
@@ -1922,7 +2014,7 @@ async def test_recovery_private_read_capabilities(
             remaining = math.floor(bounded.expires_at.timestamp() - before)
             capped = reader.capability(bounded, "base")
             assert 1 <= _expires(capped) <= remaining < 60
-            assert (await anonymous.get(capped)).status_code == 200
+            assert (await _probe(anonymous, capped))[0] == 200
             await asyncio.sleep(max(0.0, bounded.expires_at.timestamp() - time.time()) + 1.0)
             with pytest.raises(RecoveryReadRefused) as lapsed:
                 reader.capability(bounded, "base")
@@ -1947,17 +2039,16 @@ async def test_recovery_private_read_capabilities(
             with pytest.raises(RecoveryReadRefused) as gone:
                 reader.capability(released, "manifest")
             assert gone.value.code == "lease_released"
+        finally:
+            await anonymous.aclose()
         _assert_sentinels(harness)
 
-    worker_records = [record for record in caplog.records if record.name.startswith("curie_worker")]
-    assert any(
-        record.name == "curie_worker.workspace_recovery_storage" for record in worker_records
-    )
-    for record in worker_records:
+    records = list(caplog.records)
+    assert any(record.name == "curie_worker.workspace_recovery_storage" for record in records)
+    for record in records:
         logged = _record_text(record)
-        assert CANARY not in logged, record.name
-        assert "X-Amz-Signature" not in logged, record.name
-        assert "Signature=" not in logged, record.name
+        for forbidden in (CANARY, "X-Amz-Signature", "Signature=", "X-Amz-Credential"):
+            assert forbidden not in logged, (record.name, forbidden)
 
 
 # --- AC4: owned services are removed ----------------------------------------------------------

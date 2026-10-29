@@ -1239,9 +1239,9 @@ from claim objects, so releasing a claim never deletes them. The checkpoint writ
 reserves capacity before any upload, uploads each object by explicit multipart
 upload within a 60-second aggregate budget, verifies the stored size and SHA-256
 by HEAD and a full read-back, and only then completes the checkpoint. A failed or
-late capture gets five seconds of foreground cleanup (multipart abort, deletion of
-the keys it uploaded, and a ledger `fail`); anything left stays staging until the
-collector removes it. The reader holds a non-renewable reader lease and signs a
+late capture gets five seconds of foreground cleanup: a ledger `fail`, then, only
+once the tombstone is confirmed, multipart abort and deletion of the keys it
+declared. Anything left stays staging until the collector removes it. The reader holds a non-renewable reader lease and signs a
 GET for exactly one object, expiring at the lesser of
 `CURIE_WORKSPACE_REFERENCE_TTL_SECONDS` and the lease's remaining time, then
 streams and verifies the download. When `CURIE_WORKSPACE_RECOVERY_ENABLED` is set
