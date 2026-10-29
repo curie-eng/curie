@@ -47,7 +47,9 @@ def _url_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def split_verbatim_answer(text: str) -> list[AnswerPart]:
+def split_verbatim_answer(
+    text: str, *, max_bytes: int = SLACK_VERBATIM_MAX_BYTES
+) -> list[AnswerPart]:
     """Partition literal text without adding, removing or normalizing characters.
 
     The budget stays inside the 3,000-character limit Slack documents for a
@@ -62,14 +64,12 @@ def split_verbatim_answer(text: str) -> list[AnswerPart]:
     spans = [
         span
         for span in _url_spans(text)
-        if len(text[span[0] : span[1]].encode("utf-8")) <= SLACK_VERBATIM_MAX_BYTES
+        if len(text[span[0] : span[1]].encode("utf-8")) <= max_bytes
     ]
     parts: list[AnswerPart] = []
     start = 0
-    while len(text[start:].encode("utf-8")) > SLACK_VERBATIM_MAX_BYTES:
-        end = start + len(
-            text[start:].encode("utf-8")[:SLACK_VERBATIM_MAX_BYTES].decode("utf-8", "ignore")
-        )
+    while len(text[start:].encode("utf-8")) > max_bytes:
+        end = start + len(text[start:].encode("utf-8")[:max_bytes].decode("utf-8", "ignore"))
         floor = start + (end - start) // 2
         line = text.rfind("\n", floor, end)
         space = text.rfind(" ", floor, end)
@@ -105,7 +105,7 @@ def verbatim_rich_text(text: str) -> dict[str, object]:
     }
 
 
-def split_answer(text: str) -> list[AnswerPart]:
+def split_answer(text: str, *, max_bytes: int = SLACK_ANSWER_MAX_BYTES) -> list[AnswerPart]:
     """Keep every source character, reopening long code fences between messages.
 
     Prefer a line boundary, then whitespace; preserve complete short mrkdwn
@@ -113,7 +113,7 @@ def split_answer(text: str) -> list[AnswerPart]:
     cross messages, but none of its content is discarded. Unicode code points,
     combining marks and joiner sequences are kept together when they fit.
     """
-    if len(text.encode()) <= SLACK_ANSWER_MAX_BYTES:
+    if len(text.encode()) <= max_bytes:
         return [AnswerPart(text)]
     atoms = list(_ATOM.finditer(text))
     parts: list[AnswerPart] = []
@@ -122,7 +122,7 @@ def split_answer(text: str) -> list[AnswerPart]:
     while start < len(text):
         prefix = "```\n" if fenced else ""
         # Reserve closing scaffolding even before a chunk opens a fence.
-        budget = SLACK_ANSWER_MAX_BYTES - len(prefix.encode()) - 4
+        budget = max_bytes - len(prefix.encode()) - 4
         end = start + len(text[start:].encode()[:budget].decode("utf-8", "ignore"))
         code_point_end = end
         if end < len(text):
