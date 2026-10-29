@@ -1702,7 +1702,7 @@ def test_lease_lost_retraction_of_the_only_checkpoint_clears_the_pointer(
     assert _checkpoint_status(only) == "tombstoned"
 
 
-@pytest.mark.parametrize("case", ("other_reason", "not_last_good", "other_source"))
+@pytest.mark.parametrize("case", ("other_reason", "other_source"))
 def test_a_complete_checkpoint_is_retracted_only_by_its_own_lease_loss(
     recovery: None, client: Any, case: str
 ) -> None:
@@ -1715,8 +1715,6 @@ def test_a_complete_checkpoint_is_retracted_only_by_its_own_lease_loss(
     target, authority, reason = second, _authority(source), "lease_lost"
     if case == "other_reason":
         reason = "upload_failed"
-    elif case == "not_last_good":
-        target = first
     else:
         authority = {**authority, "runtime_epoch": 4}
     before = _snapshot()
@@ -1726,6 +1724,63 @@ def test_a_complete_checkpoint_is_retracted_only_by_its_own_lease_loss(
     }))
     assert _snapshot() == before
     assert _last_good(source) == second["checkpoint_id"]
+
+
+def test_retraction_withdraws_its_own_checkpoint_and_keeps_a_successors_pointer(
+    recovery: None, client: Any
+) -> None:
+    """A successor's newer checkpoint stays the answer; the predecessor's still goes."""
+
+    _routes_exist(client)
+    source = _seed()
+    own = _reserved(client, source)
+    _completed(client, source, own)
+    successor = _seed(agent_id=source["agent_id"], item_id=source["work_item_id"])
+    _terminal_now(successor)
+    newer = _reserved(client, successor, reuse=True)
+    _completed(client, successor, newer)
+    assert _last_good(source) == newer["checkpoint_id"]
+
+    response = _lease_lost(client, source, own, retract=True)
+    assert _ok(response) == {"checkpoint_id": own["checkpoint_id"], "status": "retracted"}
+    _no_capability(response.text)
+    assert _checkpoint_status(own) == "tombstoned"
+    assert _checkpoint_status(newer) == "complete"
+    assert _last_good(source) == newer["checkpoint_id"]
+    _refused(_post(client, "acquire-reader", _reader_body(source, own)))
+    _release(client, _reader(client, source, newer))
+
+
+@pytest.mark.parametrize("stage", ("complete", "staging"))
+def test_cleanup_after_the_work_item_was_cancelled(
+    recovery: None, client: Any, stage: str
+) -> None:
+    """A cancellation committing after the capture does not strand its checkpoint."""
+
+    _routes_exist(client)
+    source = _seed()
+    reservation = _reserved(client, source)
+    if stage == "complete":
+        _completed(client, source, reservation)
+    # As the lifecycle's cancel does: the WorkItem is marked cancelled.
+    _sql(
+        "UPDATE curie.work_items SET cancelled_at = clock_timestamp() WHERE id = :id",
+        id=uuid.UUID(source["work_item_id"]),
+    )
+    if stage == "complete":
+        response = _lease_lost(client, source, reservation, retract=True)
+        expected = "retracted"
+    else:
+        response = _post(client, "fail", {
+            **_authority(source),
+            "checkpoint_id": reservation["checkpoint_id"],
+            "reason": "upload_failed",
+        })
+        expected = "tombstoned"
+    assert _ok(response) == {"checkpoint_id": reservation["checkpoint_id"], "status": expected}
+    assert _checkpoint_status(reservation) == "tombstoned"
+    assert _last_good(source) is None
+    _refused(_post(client, "acquire-reader", _reader_body(source, reservation)))
 
 
 def test_lease_lost_without_retract_never_withdraws_a_complete_checkpoint(
