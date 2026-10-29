@@ -205,6 +205,7 @@ def factory_env(
         "GITHUB_API_URL": api_url,
         "FACTORY_ENABLED": "true",
         "FACTORY_INTAKE": intake,
+        "FACTORY_BASE_LABEL_SETTLE_S": "0",
         "CURIE_FORGES": forges_env_json(forges_document(api_url=api_url, **forges), key_dir),
     }
 
@@ -271,7 +272,9 @@ class GitHubAPI:
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
-        if path == f"/repos/{REPO}":
+        if path == f"/repos/{REPO}" or (
+            request.method == "GET" and path == f"/repositories/{self.repository_id}"
+        ):
             return httpx.Response(
                 200,
                 json={"id": self.repository_id, "full_name": REPO, "default_branch": "main"},
@@ -766,7 +769,7 @@ class GitHubRepositoryFake:
 
     def _read_code(self, request: httpx.Request, path: str) -> httpx.Response:
         repo = f"/repos/{REPO}"
-        if path == repo:
+        if path in {repo, f"/repositories/{REPO_ID}"}:
             return httpx.Response(
                 200,
                 json={"id": REPO_ID, "full_name": REPO, "default_branch": self.default_branch},

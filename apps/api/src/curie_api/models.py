@@ -911,33 +911,36 @@ class WorkItem(Base):
     )
     # A relabel that arrived while a request was still running. The
     # reconciler admits it once that request reaches a terminus.
-    readmit_request_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), default=None
-    )
+    readmit_request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
     readmit_requester: Mapped[str | None] = mapped_column(Text, default=None)
     readmit_objective: Mapped[str | None] = mapped_column(Text, default=None)
-    # The base resolved for that deferred relabel (ADR 0186). It replaces the
-    # recorded base only when the replacement request is admitted.
+    # Intent for a deferred label event. The successor resolves its remote
+    # base at acquisition while its predecessor keeps its own pin.
     readmit_base_branch: Mapped[str | None] = mapped_column(Text, default=None)
     readmit_base_source: Mapped[str | None] = mapped_column(Text, default=None)
     readmit_base_commit: Mapped[str | None] = mapped_column(Text, default=None)
-    # The base resolved at admission and frozen for every later run (ADR
-    # 0186). All three are NULL on a legacy row, which uses the repository
-    # default branch. ``base_label_ignored`` is the branch a later ``base:``
-    # label names when it disagrees with the recorded one.
+    # The exact base selected by the request recorded in base_resolved_request_id.
+    # The ignored-label column remains solely as historical expand data.
     base_branch: Mapped[str | None] = mapped_column(Text, default=None)
     base_source: Mapped[str | None] = mapped_column(Text, default=None)
     base_commit: Mapped[str | None] = mapped_column(Text, default=None)
     base_label_ignored: Mapped[str | None] = mapped_column(Text, default=None)
+    base_resolved_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    readmit_base_settle_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    base_selection_fingerprint: Mapped[str | None] = mapped_column(Text, default=None)
+    base_requested_branch: Mapped[str | None] = mapped_column(Text, default=None)
+    base_requested_source: Mapped[str | None] = mapped_column(Text, default=None)
     workspace_recovery_outcome: Mapped[str | None] = mapped_column(String(128), default=None)
     workspace_recovery_outcome_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
     version: Mapped[int] = mapped_column(default=1, server_default="1")
     next_sequence: Mapped[int] = mapped_column(default=1, server_default="1")
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -1169,7 +1172,8 @@ class ExecutionRequest(Base):
     sequence: Mapped[int]
     status: Mapped[str] = mapped_column(default="waiting", server_default="waiting")
     wait_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    started_at: Mapped[datetime | None] = mapped_column(
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    base_settle_until: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
     execution_deadline: Mapped[datetime | None] = mapped_column(
@@ -3936,6 +3940,86 @@ class IdentityConnectToken(Base):
     )
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class FactoryBaseTransition(Base):
+    """One durable, leased rewrite and retarget of a factory lineage."""
+
+    __tablename__ = "factory_base_transitions"
+    __table_args__ = (
+        CheckConstraint(
+            "phase IN ('pending','prepared','pushed','retargeted','ci_prepared',"
+            "'ci_pushed','applied','conflict','refused')",
+            name="factory_base_transitions_phase_ck",
+        ),
+        CheckConstraint(
+            "version >= 1 AND attempts >= 0", name="factory_base_transitions_version_ck"
+        ),
+        CheckConstraint(
+            "base_source IN ('label','default')", name="factory_base_transitions_source_ck"
+        ),
+        Index(
+            "uq_factory_base_transitions_active_item",
+            "work_item_id",
+            unique=True,
+            postgresql_where=text("phase NOT IN ('applied','conflict','refused')"),
+        ),
+        Index(
+            "uq_factory_base_transitions_active_lineage",
+            "lineage_id",
+            unique=True,
+            postgresql_where=text("phase NOT IN ('applied','conflict','refused')"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
+    )
+    request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
+    )
+    ci_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
+    )
+    lineage_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="CASCADE")
+    )
+    phase: Mapped[str] = mapped_column(Text, default="pending", server_default="pending")
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    owner: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    repository_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    old_base_ref: Mapped[str] = mapped_column(Text)
+    old_base_sha: Mapped[str] = mapped_column(Text)
+    old_head_sha: Mapped[str] = mapped_column(Text)
+    target_base_ref: Mapped[str] = mapped_column(Text)
+    target_base_sha: Mapped[str] = mapped_column(Text)
+    base_source: Mapped[str] = mapped_column(Text)
+    branch: Mapped[str] = mapped_column(Text)
+    pull_request_number: Mapped[str] = mapped_column(Text)
+    committer_name: Mapped[str] = mapped_column(Text)
+    committer_email: Mapped[str] = mapped_column(Text)
+    committer_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    rebased_head_sha: Mapped[str | None] = mapped_column(Text, default=None)
+    verification_head_sha: Mapped[str | None] = mapped_column(Text, default=None)
+    changed_paths: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default="[]")
+    prepared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    retargeted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    ci_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    outcome_ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    ci_ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    ci_settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    refusal_noticed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    error_code: Mapped[str | None] = mapped_column(Text, default=None)
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class WorkspaceRecoveryInstallation(Base):

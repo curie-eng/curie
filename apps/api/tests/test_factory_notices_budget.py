@@ -55,7 +55,7 @@ def _finish_body(
 def test_usd_stop_below_cap_names_recorded_spend(priced: Any) -> None:  # noqa: F811
     client, github, sink, _book = priced
     request_id = _admit(client, github, sink, 46991)
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     response = _usage(client, request_id, [_entry(IMPLEMENTER, 500_000, 0)])
     assert response.status_code == 201, response.text
     response = _usage(
@@ -88,7 +88,7 @@ def test_usd_stop_at_or_above_cap_keeps_current_sentence(
 ) -> None:
     client, github, sink, _book = priced
     request_id = _admit(client, github, sink, 46992)
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     response = _usage(client, request_id, [_entry(IMPLEMENTER, input_tokens, 0)])
     assert response.status_code == 201, response.text
 
@@ -105,7 +105,7 @@ def test_usd_stop_without_recorded_cost_keeps_current_sentence(
 ) -> None:
     client, github, sink, _book = priced
     request_id = _admit(client, github, sink, 46993)
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     if unpriced_usage:
         response = _usage(client, request_id, [_entry(UNPRICED, 1, 0)])
         assert response.status_code == 201, response.text
@@ -121,7 +121,7 @@ def test_usd_stop_without_recorded_cost_keeps_current_sentence(
 def test_a_recorded_zero_is_below_the_usd_cap(priced: Any) -> None:  # noqa: F811
     client, github, sink, _book = priced
     request_id = _admit(client, github, sink, 46994)
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     response = _usage(client, request_id, [_entry(UNPRICED, 0, 0)])
     assert response.status_code == 201, response.text
 
@@ -138,7 +138,7 @@ def test_a_retry_compares_only_its_own_usage_and_progress(
 ) -> None:
     client, github, sink, _book = priced
     first = _admit(client, github, sink, 46995)
-    epoch = _start_running(first)
+    epoch = _start_running(client, first)
     response = _usage(client, first, [_entry(IMPLEMENTER, 100_000_000, 0)])
     assert response.status_code == 201, response.text
     response = report(client, first, "plan", note="Earlier run's note")
@@ -148,7 +148,7 @@ def test_a_retry_compares_only_its_own_usage_and_progress(
     first_row, second_row = _requests(46995)
     assert first_row["work_item_id"] == second_row["work_item_id"]
     second = second_row["id"]
-    epoch = _start_running(second)
+    epoch = _start_running(client, second)
     if current_tokens is not None:
         response = _usage(client, second, [_entry(IMPLEMENTER, current_tokens, 0)])
         assert response.status_code == 201, response.text
@@ -177,7 +177,7 @@ def test_budget_stop_uses_the_latest_nonempty_progress_note(
 ) -> None:
     client, github, sink = admitted
     request_id = _admit(client, github, sink, 46996)
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     for phase, note in (
         ("plan", "Superseded diagnosis"),
         ("plan_review", "Found the root cause"),
@@ -210,7 +210,7 @@ def test_budget_stop_never_prints_the_verification_preflight_record(
 ) -> None:
     client, github, sink = admitted
     request_id = _admit(client, github, sink, 47561)
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     response = verification(client, request_id, NOT_DECLARED)
     assert response.status_code == 201, response.text
 
@@ -226,7 +226,7 @@ def test_budget_stop_falls_back_to_the_latest_human_note_before_the_preflight_re
 ) -> None:
     client, github, sink = admitted
     request_id = _admit(client, github, sink, 47562)
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     response = report(client, request_id, "plan_review", note="Found the root cause")
     assert response.status_code == 201, response.text
     response = verification(client, request_id, NOT_DECLARED)
@@ -247,7 +247,7 @@ def test_budget_stop_omits_progress_when_no_note_exists(
 ) -> None:
     client, github, sink = admitted
     request_id = _admit(client, github, sink, 46997)
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     if with_report:
         response = report(client, request_id, "plan")
         assert response.status_code == 201, response.text
@@ -258,7 +258,7 @@ def test_budget_stop_omits_progress_when_no_note_exists(
 def test_budget_progress_label_and_note_are_one_inert_line(admitted: Any) -> None:  # noqa: F811
     client, github, sink = admitted
     request_id = _admit(client, github, sink, 46998)
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     declaration = {
         **DECLARATION,
         "phases": [
@@ -290,7 +290,7 @@ def test_budget_progress_label_and_note_are_one_inert_line(admitted: Any) -> Non
 def test_budget_progress_line_is_cut_to_300_characters(admitted: Any) -> None:  # noqa: F811
     client, github, sink = admitted
     request_id = _admit(client, github, sink, 46999)
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     label = "Review " + "x" * 33
     declaration = {"phases": [{"id": "review", "label": label}]}
     note = "<!-- diagnosis --> " + "y" * 261
@@ -312,7 +312,7 @@ def test_progress_notes_stay_off_running_and_other_terminal_comments(
 ) -> None:
     client, github, sink = admitted
     request_id = _admit(client, github, sink, 47000)
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     note = "Progress that belongs only on the status card"
     response = report(client, request_id, "plan", note=note)
     assert response.status_code == 201, response.text

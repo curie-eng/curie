@@ -47,6 +47,7 @@ class Operation(enum.StrEnum):
     FIND_PULL_REQUEST = "code_host.find_pull_request"
     OPEN_PULL_REQUEST = "code_host.open_pull_request"
     UPDATE_PULL_REQUEST = "code_host.update_pull_request"
+    RETARGET_PULL_REQUEST = "code_host.retarget_pull_request"
     READ_PULL_REQUEST = "code_host.read_pull_request"
     OBSERVE_CI = "code_host.observe_ci"
     LIST_REVIEW_FEEDBACK = "code_host.list_review_feedback"

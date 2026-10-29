@@ -406,14 +406,24 @@ reads as a single forge configuration document:
 3. `factory.bindings` join a tracker to repositories. Each entry under
    `repos` has an `alias`, a `codeHost`, a `projectId`, a `path`, optional
    `bases` and `defaultBase`, and an optional `ci` policy (`required` with
-   `key`, `paths` and `pendingKeyPrefix`, and `metadataRerunKeys`).
+   `key`, `paths` and `pendingKeyPrefix`, and `metadataRerunKeys`). `bases`
+   accepts case-sensitive glob patterns such as `release/*`; `defaultBase`
+   remains a literal allowed branch. Every selected branch must exist remotely.
 4. `factory.codeHosts[].egress` and `factory.trackers[].egress` list the CIDRs
    and ports the entry needs. A GitHub entry with none gets the chart's built-in
    GitHub set. `factory.sandboxEgress.<agent>: true` enrolls an agent in that
    egress policy.
 5. `factory.enabled`, `factory.intake` (`poll` or `webhook`),
    `factory.cardBaseUrl` and `factory.ciWaitSeconds` replace the matching
-   `api.*` settings.
+   `api.*` settings. `factory.baseLabelSettleSeconds` controls the wait after
+   the selection label is applied before the factory reads the current base
+   labels at sandbox acquisition. It defaults to 60 seconds; zero is valid.
+
+Base changes restart unpublished work or durably rebase and retarget its PR.
+A clean replay uses an expected-head fence, and required CI runs on a distinct
+same-tree commit pushed after retargeting. Conflicts leave the branch and PR
+target unchanged until the factory label is reapplied; see the
+[base selection rules](../operations.md#admitting-a-labelled-github-issue).
 
 The old `api.githubFactory*` keys are removed. To upgrade a v0.12.5
 installation configured with `curie cluster factory`, use a CLI containing

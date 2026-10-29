@@ -634,6 +634,7 @@ _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES = {
         "poll_trackers",
         "sync_status_comments",
         "redispatch_lapsed_acquisitions",
+        "reconcile_base_transitions",
         "publish_execute_wakes",
     ],
 }

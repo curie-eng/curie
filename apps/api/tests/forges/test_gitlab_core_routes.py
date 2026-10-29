@@ -64,7 +64,7 @@ def _opened(install: GitLabInstall) -> tuple[dict[str, Any], dict[str, Any], int
     MR iid and the publication."""
 
     _iid, item, first = _admitted(install)
-    epoch = gl.start_request(first["id"])
+    epoch = gl.start_request(install.client, first["id"])
     deployment_id = gl.deployment(install, item["agent_id"])
     selected = gl.select_workspace(install, deployment_id, item, first["requester"])
     assert selected.status_code == 200, selected.text

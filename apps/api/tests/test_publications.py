@@ -7420,7 +7420,7 @@ def _factory_publication_case(
     _factory_label(client, github, issue_number)
     request = _factory_request(issue_number)
     request_id = request["id"]
-    runtime_epoch = _start_factory_request(request_id)
+    runtime_epoch = _start_factory_request(client, request_id)
     work_item = _factory_rows(
         "SELECT w.agent_id, w.conversation_id FROM curie.work_items w WHERE w.id = :id",
         {"id": request["work_item_id"]},

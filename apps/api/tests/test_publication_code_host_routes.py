@@ -12,16 +12,18 @@ import asyncio
 import hashlib
 import time
 import uuid
+from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from curie_api.config import get_settings
 from curie_api.factory_rediscovery import issue_marker
-from curie_api.forges.config import ForgesConfig
 from curie_api.forges.errors import Ambiguous, NotFound, Unavailable
-from curie_api.forges.registry import build_registry
+from curie_api.forges.registry import forges_registry
 from curie_api.forges.types import (
     Commit,
     FactoryPublication,
@@ -33,7 +35,14 @@ from curie_api.forges.types import (
 from curie_api.models import ExecutionRequest, Publication, WorkItem
 from curie_api.routers import publication_code_host
 from fastapi.testclient import TestClient
-from forge_fakes.github import forges_document
+from forge_fakes.github import (
+    GitHubAPI,
+    _Credentials,
+    fake_installation_tokens,
+    forges_document,
+    forges_env_json,
+    github_repository_binding,
+)
 from sqlalchemy import select, text
 
 from apps.api.tests.test_workitem_outcomes import (  # noqa: F401 - the stack fixture
@@ -235,10 +244,48 @@ def factory_approved(
     stack: TestClient,  # noqa: F811
     auth_headers: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
-) -> Seeded:
-    config = ForgesConfig.model_validate(forges_document(api_url=get_settings().github_api_url))
-    stack.app.state.forges = build_registry(config)
-    return _seed(stack, auth_headers, monkeypatch, open_pr=False, trigger_label="curie:implement")
+    tmp_path: Path,
+) -> Iterator[Seeded]:
+    label = "curie:implement"
+    document = forges_document(
+        api_url=get_settings().github_api_url,
+        label=label,
+        bindings=[
+            github_repository_binding(repo=REPO, repo_id=101, bases=["main"], default_base="main")
+        ],
+    )
+    monkeypatch.setenv("FACTORY_BASE_LABEL_SETTLE_S", "0")
+    monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, tmp_path))
+    get_settings.cache_clear()
+    stack.app.state.forges = forges_registry(get_settings())
+
+    class PublicationCredentials(_Credentials):
+        def token_for_verified_installation(self, repo: str, installation_id: int) -> str:
+            assert installation_id == 202
+            return self.token_for(repo)
+
+    fake_installation_tokens(monkeypatch, PublicationCredentials())
+    github = GitHubAPI()
+    github.repository_id = 101
+    github.labels = [label]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        response = github.handle(request)
+        if request.url.path == f"/repos/{REPO}/git/ref/heads/main":
+            # https://docs.github.com/en/rest/git/refs#get-a-reference
+            payload = response.json()
+            payload["object"]["sha"] = BASE_SHA
+            return httpx.Response(response.status_code, json=payload)
+        return response
+
+    original = stack.app.state.http_client
+    external = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    stack.app.state.http_client = external
+    try:
+        yield _seed(stack, auth_headers, monkeypatch, open_pr=False, trigger_label=label)
+    finally:
+        stack.app.state.http_client = original
+        stack.portal.call(external.aclose)
 
 
 def _matching_pull(publication: dict[str, Any], code_host: _CodeHost) -> PullRequest:
@@ -962,7 +1009,7 @@ def test_branch_context_preserves_verified_lineage_base(seeded: Seeded) -> None:
     ("branch", "source", "commit"),
     [
         ("", "default", BASE_SHA),
-        ("refs/heads/main", "default", BASE_SHA),
+        ("refs/heads//main", "default", BASE_SHA),
         ("bad..branch", "default", BASE_SHA),
         ("x" * 1025, "default", BASE_SHA),
         ("main", "default", "not-a-sha"),

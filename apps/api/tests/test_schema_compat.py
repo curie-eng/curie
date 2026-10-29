@@ -63,8 +63,8 @@ CONTRACT = "0041"
 # @spec AGENT-ROLE-PERSISTENCE-V1-9: policy ORM reads require the 0133 column.
 # @spec HTTP-APPROVAL-CONTINUITY-5: approval ORM reads require the 0137 column.
 # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
-# Workspace recovery reads require the 0141 outcome ledger.
-APP_SCHEMA_MIN = "0141"
+# Factory base transition ORM reads require the 0144 transition table.
+APP_SCHEMA_MIN = "0144"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -164,6 +164,8 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0138",
             "0139",
             "0141",
+            "0143",
+            "0144",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -193,8 +195,10 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0138",
             "0139",
             "0141",
+            "0143",
+            "0144",
         }
-    assert current_revision() == "0141"
+    assert current_revision() == "0144"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -209,6 +213,13 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
         ("execution_requests", "owner_lost_retry"),
         ("execution_requests", "start_deferrals"),
         ("factory_terminal_notices", "sync_owner"),
+        ("work_items", "base_resolved_request_id"),
+        ("work_items", "readmit_base_settle_until"),
+        ("work_items", "base_selection_fingerprint"),
+        ("work_items", "base_requested_branch"),
+        ("work_items", "base_requested_source"),
+        ("execution_requests", "base_settle_until"),
+        ("factory_base_transitions", "ci_request_id"),
         ("remediation_nominations", "execution_code"),
         ("remediation_nominations", "approval_reason"),
     } <= columns
@@ -277,10 +288,12 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # The directory and connect ORM requires the new identity tables/columns.
     # Migration expand compatibility for older images does not mean this image
     # can serve an older database.
-    # Workspace recovery reads require the 0141 outcome ledger.
-    for revision in sorted(known - {"0141"}):
+    # Factory base transition reads require the 0144 table.
+    for revision in sorted(known - {"0144"}):
         assert can_serve(revision, window, known) is False
-    assert can_serve("0141", window, known) is True
+    assert can_serve("0141", window, known) is False
+    assert can_serve("0143", window, known) is False
+    assert can_serve("0144", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

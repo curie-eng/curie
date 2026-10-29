@@ -36,7 +36,7 @@ from pydantic import (
 )
 from pydantic_core import InitErrorDetails, PydanticCustomError
 
-from curie_api.branches import valid_base_branch
+from curie_api.branches import base_allowed, valid_base_pattern
 from curie_api.forges import types
 from curie_api.forges.capabilities import NATIVE_FORGES, mandatory_capabilities
 from curie_api.forges.errors import CredentialUnreadable, InvalidPairing
@@ -538,9 +538,9 @@ class RepositoryBindingConfig(_Model):
 
     Identity is (code host kind, code host host, ``project_id``); ``path`` is
     for display and for the adapter's resolve-and-compare before cloning.
-    ``bases`` are the branches a ticket may start from (a ``base:`` label picks
-    one); empty means the repository's default branch only. ``default_base``,
-    when set, is one of ``bases`` and is used when no label picks one.
+    ``bases`` are case-sensitive branch globs (a ``base:`` label picks a literal
+    branch); empty means the repository's default branch only. ``default_base``
+    is a matching literal branch used when no label picks one.
     """
 
     alias: str
@@ -567,10 +567,17 @@ class RepositoryBindingConfig(_Model):
 
     @model_validator(mode="after")
     def check_bases(self) -> Self:
-        if not all(valid_base_branch(base) for base in self.bases) or _duplicates(self.bases):
-            raise ValueError(f"repository {self.alias!r} bases must be unique branch names")
-        if self.default_base is not None and self.default_base not in self.bases:
-            raise ValueError(f"repository {self.alias!r} default_base must be one of its bases")
+        if not all(valid_base_pattern(base) for base in self.bases) or _duplicates(self.bases):
+            raise ValueError(
+                f"repository {self.alias!r} bases must be unique branch names or glob patterns"
+            )
+        if self.default_base is not None and not base_allowed(
+            self.default_base, self.bases, default_branch=None
+        ):
+            raise ValueError(
+                f"repository {self.alias!r} default_base must be one of its bases"
+                " or match a base pattern"
+            )
         if self.docker is not None and self.docker.enabled:
             if self.runner is None or "docker-cli" not in self.runner.tools:
                 raise ValueError(

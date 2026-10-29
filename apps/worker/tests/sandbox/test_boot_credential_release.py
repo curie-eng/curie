@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import multiprocessing
 import os
 import socket
@@ -885,7 +886,7 @@ def crashed_creator(
             assert not process.is_alive(), "credential test resource server did not stop"
 
     case.resources.callback(stop_manager)
-    manager.start()
+    manager.start(initializer=importlib.import_module, initargs=(FakeSandboxClient.__module__,))
     client = _LifecycleClient(
         claims=manager.dict(),
         sandboxes=manager.dict(),

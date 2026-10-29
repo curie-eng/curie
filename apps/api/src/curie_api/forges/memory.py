@@ -29,6 +29,7 @@ from curie_api.forges.capabilities import (
 )
 from curie_api.forges.errors import Ambiguous, NotFound, Unavailable, Unsupported
 from curie_api.forges.ports import CodeHost, MarkedComments, Tracker
+from curie_api.forges.retarget import require_retargetable
 from curie_api.forges.types import (
     Actor,
     CheckState,
@@ -813,6 +814,37 @@ class InMemoryCodeHost(_Declared):
         pull.updated_at = datetime.now(UTC)
         self.ledger.record()
         return self._view(pull)
+
+    async def retarget_pull_request(
+        self,
+        pull_request: PullRequestRef,
+        *,
+        base_ref: str,
+        expected_head_sha: str,
+    ) -> PullRequest:
+        self._gate(Operation.RETARGET_PULL_REQUEST)
+        self._repository(pull_request.repository)
+        pull = self._pull(pull_request)
+        before = self._view(pull)
+        require_retargetable(
+            before, pull_request, expected_head_sha=expected_head_sha, base_ref=base_ref
+        )
+        if (pull_request.repository, base_ref) not in self._branches:
+            raise NotFound("branch")
+        if before.base_ref == base_ref:
+            return before
+        pull.base_ref = base_ref
+        pull.updated_at = datetime.now(UTC)
+        self.ledger.record()
+        after = self._view(pull)
+        require_retargetable(
+            after,
+            pull_request,
+            expected_head_sha=expected_head_sha,
+            base_ref=base_ref,
+            previous=before,
+        )
+        return after
 
     async def read_pull_request(self, pull_request: PullRequestRef) -> PullRequest:
         self._gate(Operation.READ_PULL_REQUEST)

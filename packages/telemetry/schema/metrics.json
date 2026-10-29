@@ -2280,10 +2280,11 @@
           "poll_trackers",
           "sync_status_comments",
           "redispatch_lapsed_acquisitions",
+          "reconcile_base_transitions",
           "publish_execute_wakes"
         ]
       },
-      "cardinality_bound": 12,
+      "cardinality_bound": 13,
       "description": "Consecutive failed passes for each WorkItem reconciler step.",
       "monotonic": false,
       "type": "gauge",
@@ -2306,10 +2307,11 @@
           "poll_trackers",
           "sync_status_comments",
           "redispatch_lapsed_acquisitions",
+          "reconcile_base_transitions",
           "publish_execute_wakes"
         ]
       },
-      "cardinality_bound": 12,
+      "cardinality_bound": 13,
       "description": "Failed WorkItem reconciler steps.",
       "monotonic": true,
       "type": "counter",

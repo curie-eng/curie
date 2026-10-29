@@ -53,7 +53,7 @@ from curie_api.workitem_dispatch import DispatchConflict, acquire, start
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from fastapi.testclient import TestClient
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import create_async_engine
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response
@@ -464,6 +464,7 @@ def gitlab_install(
         ):
             monkeypatch.delenv(name, raising=False)
         env = {
+            "FACTORY_BASE_LABEL_SETTLE_S": "0",
             "FACTORY_ENABLED": "true",
             "FACTORY_INTAKE": "poll",
             "CURIE_FORGES": forges_env_json(document, tmp_path / "forges"),
@@ -587,7 +588,7 @@ def execute(statement: str, params: dict[str, Any]) -> None:
     asyncio.run(go())
 
 
-def start_request(request_id: uuid.UUID) -> int:
+def start_request(client: TestClient, request_id: uuid.UUID) -> int:
     """A worker acquires the published generation and starts the runtime."""
 
     generation = _rows(
@@ -596,33 +597,30 @@ def start_request(request_id: uuid.UUID) -> int:
     )[0]["dispatch_generation"]
 
     async def go() -> int:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with AsyncSession(engine) as session:
-                acquired = await acquire(
-                    session,
-                    request_id,
-                    owner="gitlab-owner",
-                    generation=generation,
-                    wake=await factory_wake(session, request_id),
-                    context=None,
-                )
-                assert not isinstance(acquired, DispatchConflict), acquired
-                started = await start(
-                    session,
-                    request_id,
-                    owner="gitlab-owner",
-                    generation=generation,
-                    claim_name="claim-gitlab",
-                    sandbox_name="sbx-gitlab",
-                    context=acquired.context,
-                )
-                assert not isinstance(started, DispatchConflict), started
-                return int(started.runtime_epoch)
-        finally:
-            await engine.dispose()
+        async with client.app.state.sessionmaker() as session:
+            acquired = await acquire(
+                session,
+                request_id,
+                owner="gitlab-owner",
+                generation=generation,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=client.app.state.http_client,
+            )
+            assert not isinstance(acquired, DispatchConflict), acquired
+            started = await start(
+                session,
+                request_id,
+                owner="gitlab-owner",
+                generation=generation,
+                claim_name="claim-gitlab",
+                sandbox_name="sbx-gitlab",
+                context=acquired.context,
+            )
+            assert not isinstance(started, DispatchConflict), started
+            return int(started.runtime_epoch)
 
-    return asyncio.run(go())
+    return int(client.portal.call(go))
 
 
 # --- the worker's workspace and publication ---------------------------------------------
@@ -902,8 +900,7 @@ def run_label_to_merge_request_ci_review_and_cancel(
         item["repository_path"],
     ) == (types.GITLAB, install.host, str(backend.project_id), backend.project_path)
     assert item["code_host_installation_id"] is None
-    assert item["base_branch"] == "main"
-    assert item["base_commit"] == backend.default_head()
+    assert (item["base_branch"], item["base_commit"]) == (None, None)
     assert item["agent_id"] == install.agent_id
     [first] = requests_of(item["id"])
     assert first["objective"].splitlines()[0] == install.issue_url(iid)
@@ -920,7 +917,10 @@ def run_label_to_merge_request_ci_review_and_cancel(
     posted = note.body
 
     # 2. The run starts: the same note is edited in place, the state label moves.
-    epoch = start_request(first["id"])
+    epoch = start_request(install.client, first["id"])
+    [item] = work_items(iid)
+    assert item["base_branch"] == "main"
+    assert item["base_commit"] == backend.default_head()
     reconcile()
     assert requests_of(item["id"])[0]["status"] == "running"
     [same] = install.bot_notes(iid)
@@ -1074,7 +1074,7 @@ def run_label_to_merge_request_ci_review_and_cancel(
     reconcile()  # the same note again admits nothing new
     assert len(requests_of(item["id"])) == 2
     assert len(work_items(iid)) == 1
-    start_request(revision["id"])
+    start_request(install.client, revision["id"])
     reconcile()
     reconcile()
     replies = backend.thread_replies(mr.iid, discussion)
@@ -1168,7 +1168,7 @@ def run_failures_log_and_answer_no_token(
     iid = admit(install)
     [item] = work_items(iid)
     [first] = requests_of(item["id"])
-    start_request(first["id"])
+    start_request(install.client, first["id"])
     deployment_id = deployment(install, item["agent_id"])
     assert select_workspace(install, deployment_id, item, first["requester"]).status_code == 200
 

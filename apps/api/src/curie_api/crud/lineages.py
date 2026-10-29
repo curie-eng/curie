@@ -4,7 +4,7 @@ import re
 import uuid
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -19,6 +19,7 @@ from ..models import (
     AgentChannel,
     Deployment,
     ExecutionRequest,
+    FactoryBaseTransition,
     Publication,
     PublicationReviewReservation,
     ThreadPublicationLineage,
@@ -184,7 +185,29 @@ async def publication_lineage_has_pending_revision(
         )
         .limit(1)
     )
-    return pending_id is not None
+    moving = await session.scalar(
+        select(FactoryBaseTransition.id)
+        .where(
+            FactoryBaseTransition.lineage_id == lineage.id,
+            or_(
+                FactoryBaseTransition.phase.in_(
+                    ("pending", "prepared", "pushed", "retargeted", "ci_prepared", "ci_pushed")
+                ),
+                and_(
+                    FactoryBaseTransition.phase.in_(("conflict", "refused")),
+                    FactoryBaseTransition.request_id.in_(
+                        select(ExecutionRequest.id).where(
+                            ExecutionRequest.status.in_(
+                                ("waiting", "running", "cancellation_requested")
+                            )
+                        )
+                    ),
+                ),
+            ),
+        )
+        .limit(1)
+    )
+    return pending_id is not None or moving is not None
 
 
 async def _publication_lineage_has_reserved_review(
@@ -223,7 +246,16 @@ async def publication_lineage_has_pending_outcome(
         )
         .limit(1)
     )
-    return pending_id is not None
+    moving = await session.scalar(
+        select(FactoryBaseTransition.id)
+        .where(
+            FactoryBaseTransition.lineage_id == lineage.id,
+            FactoryBaseTransition.outcome_ready_at.is_(None),
+            FactoryBaseTransition.phase == "applied",
+        )
+        .limit(1)
+    )
+    return pending_id is not None or moving is not None
 
 
 async def publication_lineage_visible_outcome_revision(

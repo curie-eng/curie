@@ -60,21 +60,7 @@ def forge_failure(exc: ForgeError) -> HTTPException:
 
 
 def _valid_base_ref(branch: str | None) -> bool:
-    return (
-        valid_base_branch(branch)
-        and isinstance(branch, str)
-        and len(branch) <= 1024
-        and not branch.startswith(("refs/", "/"))
-        and not branch.endswith((".", "/"))
-        and branch != "@"
-        and "@{" not in branch
-        and "//" not in branch
-        and re.fullmatch(r"[0-9a-fA-F]{40,64}", branch) is None
-        and not any(ord(char) < 32 or ord(char) == 127 or char in "~^:?*[\\" for char in branch)
-        and all(
-            not part.startswith(".") and not part.endswith(".lock") for part in branch.split("/")
-        )
-    )
+    return isinstance(branch, str) and len(branch) <= 1024 and valid_base_branch(branch)
 
 
 def stored_publication_base_ref(

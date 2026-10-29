@@ -271,4 +271,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0249 | [A factory run may take twelve hours](0249-a-factory-run-may-take-twelve-hours.md) | Accepted |
 | 0251 | [A failed factory run keeps a private recovery checkpoint that only explicit restoration reads](0251-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md) | Accepted |
 | 0252 | [HTTP identity resolves Enterprise Grid senders in their organisation](0252-http-identity-resolves-enterprise-grid-senders-in-their-organisation.md) | Accepted |
+| 0253 | [Factory base labels resolve at claim and follow relabels](0253-factory-base-labels-resolve-at-claim-and-follow-relabels.md) | Accepted |
 <!-- END GENERATED: adr-index -->
