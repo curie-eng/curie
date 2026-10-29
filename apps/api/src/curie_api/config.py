@@ -44,6 +44,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from .e2e_connector import E2EInstall
 from .forges import types as forge_types
 from .forges.config import ForgesConfig
+from .repo_full_name import normalize_repo_full_name
 from .workspace_policy import valid_allowlist_entry
 
 # Dev-only default secrets. The production boot gate refuses to start when any of
@@ -394,6 +395,12 @@ class Settings(BaseSettings):
     # Empty is fail-closed: enabling workspace capability alone grants no
     # repository access.
     github_repo_allowlist: tuple[str, ...] = ()
+    factory_publication_labels: Annotated[dict[str, list[str]], NoDecode] = Field(
+        default_factory=dict,
+        validation_alias=AliasChoices(
+            "CURIE_FACTORY_PUBLICATION_LABELS", "factory_publication_labels"
+        ),
+    )
     # Commit polling (issue #1239). A self-hosted cluster that accepts no
     # inbound traffic cannot receive a GitHub webhook, so without this it has
     # no push-to-deploy at all. Outbound always works, so the API asks GitHub
@@ -1069,6 +1076,37 @@ class Settings(BaseSettings):
                 "no worker consumes; set one, or set both to the same value"
             )
         return self
+
+    @field_validator("factory_publication_labels", mode="before")
+    @classmethod
+    def _validate_factory_publication_labels(cls, value: object) -> dict[str, list[str]]:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                raise ValueError("CURIE_FACTORY_PUBLICATION_LABELS must be a JSON object") from None
+        if not isinstance(value, dict):
+            raise ValueError("CURIE_FACTORY_PUBLICATION_LABELS must be a JSON object")
+        normalized: dict[str, list[str]] = {}
+        for repository, labels in value.items():
+            try:
+                key = normalize_repo_full_name(repository).casefold()
+            except ValueError:
+                raise ValueError(
+                    f"CURIE_FACTORY_PUBLICATION_LABELS key {repository!r} "
+                    "must be exactly owner/repository"
+                ) from None
+            if (
+                not isinstance(labels, list)
+                or len(labels) > 10
+                or any(not isinstance(label, str) or not 1 <= len(label) <= 50 for label in labels)
+            ):
+                raise ValueError(
+                    f"CURIE_FACTORY_PUBLICATION_LABELS key {repository!r} "
+                    "must have at most 10 label strings of 1 to 50 characters"
+                )
+            normalized[key] = labels
+        return normalized
 
     @model_validator(mode="after")
     def _validate_github_repo_allowlist(self) -> "Settings":

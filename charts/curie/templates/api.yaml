@@ -380,6 +380,10 @@ spec:
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.api.githubTokenExistingSecret "existingSecretKey" .Values.api.githubTokenExistingSecretKey "defaultKey" "githubToken") | nindent 18 }}
             - name: GITHUB_REPO_ALLOWLIST
               value: {{ .Values.api.githubRepoAllowlist | toJson | quote }}
+            {{- with (get (.Values.api | default dict) "factoryPublicationLabels") }}
+            - name: CURIE_FACTORY_PUBLICATION_LABELS
+              value: {{ . | toJson | quote }}
+            {{- end }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" .Values.api.extraEnv) | nindent 12 }}
             # GitHub App identity (ADR-0092). When both are set the platform
             # mints a one-hour token scoped to the single repository it is

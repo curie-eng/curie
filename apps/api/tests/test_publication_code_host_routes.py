@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import logging
+import socket
 import time
 import uuid
 from collections.abc import Iterator
@@ -20,6 +23,8 @@ from typing import Any
 
 import httpx
 import pytest
+import redis
+import redis.asyncio as async_redis
 from curie_api.config import get_settings
 from curie_api.factory_rediscovery import issue_marker
 from curie_api.forges.errors import Ambiguous, NotFound, Unavailable
@@ -34,6 +39,7 @@ from curie_api.forges.types import (
 )
 from curie_api.models import ExecutionRequest, Publication, WorkItem
 from curie_api.routers import publication_code_host
+from curie_test_support.valkey import NO_RETRY
 from fastapi.testclient import TestClient
 from forge_fakes.github import (
     GitHubAPI,
@@ -83,12 +89,16 @@ class _CodeHost:
         self.head: str | None = HEAD_SHA
         self.existing: PullRequest | None = None
         self.opened: list[dict[str, Any]] = []
+        self.label_calls: list[tuple[PullRequestRef, list[str]]] = []
+        self.label_fail: Exception | None = None
         self.calls: list[str] = []
         self.publications: tuple[FactoryPublication, ...] = ()
         self.commit = Commit(sha=HEAD_SHA, parents=("0" * 40,), message="unmarked")
         self.commits: dict[str, Commit] = {}
         self.base_head: str | None = BASE_SHA
         self.default_branch = "main"
+        self.kind = "github"
+        self.host = "github.com"
         self.reads: list[str] = []
         self.branch_reads: list[str] = []
         self.read_delay = 0.0
@@ -130,6 +140,13 @@ class _CodeHost:
             pull_request.repository, title=self.title, body=self.body, updated_at=UPDATED_AT
         )
 
+    async def add_pull_request_labels(
+        self, pull_request: PullRequestRef, labels: list[str]
+    ) -> None:
+        self.label_calls.append((pull_request, list(labels)))
+        if self.label_fail is not None:
+            raise self.label_fail
+
     async def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:
         self.calls.append("branch_head")
         self._maybe_fail()
@@ -149,9 +166,9 @@ class _CodeHost:
         return self.commits[sha]
 
     async def resolve_repository(self, project_id: str) -> RepositoryRef:
-        assert project_id == f"path:{REPO}"
+        assert project_id == (f"path:{REPO}" if self.kind == "github" else "101")
         return RepositoryRef(
-            "github", "github.com", "101", REPO, default_branch=self.default_branch
+            self.kind, self.host, "101", REPO, default_branch=self.default_branch
         )
 
     async def find_pull_request(
@@ -300,6 +317,225 @@ def _matching_pull(publication: dict[str, Any], code_host: _CodeHost) -> PullReq
 
 def _url(publication_id: object, suffix: str) -> str:
     return f"/v1/internal/publications/{publication_id}/{suffix}"
+
+
+Labelled = tuple[TestClient, dict[str, Any], _CodeHost, redis.Redis]
+
+
+@pytest.fixture
+def publication_labels(
+    approved: Seeded, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Labelled]:
+    client, publication, code_host = approved
+    monkeypatch.setenv(
+        "CURIE_FACTORY_PUBLICATION_LABELS", json.dumps({REPO.upper(): ["SMOKE", "ready"]})
+    )
+    get_settings.cache_clear()
+    valkey = redis.Redis.from_url(get_settings().valkey_dsn(), decode_responses=True)
+    valkey.ping()
+    try:
+        yield client, publication, code_host, valkey
+    finally:
+        ids = with_session(
+            lambda session: session.scalars(
+                select(Publication.id).where(
+                    Publication.lineage_id == uuid.UUID(publication["lineage_id"])
+                )
+            )
+        )
+        for publication_id in ids:
+            valkey.delete(f"curie:publication-labels:{publication_id}")
+        valkey.close()
+        get_settings.cache_clear()
+
+
+def _recover_labels(client: TestClient, publication: dict[str, Any], **fields: Any) -> Any:
+    return client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": False, **fields},
+        headers=WORKER_HEADERS,
+    )
+
+
+def test_publication_labels_apply_once_per_revision_and_keep_a_bounded_marker(
+    publication_labels: Labelled, auth_headers: dict[str, str]
+) -> None:
+    client, publication, code_host, valkey = publication_labels
+    first = _recover_labels(client, publication)
+
+    assert first.status_code == 200, first.text
+    assert code_host.label_calls == [
+        (
+            PullRequestRef(RepositoryRef("github", "github.com", "101", REPO), str(PR_NUMBER)),
+            ["SMOKE", "ready"],
+        )
+    ]
+    key = f"curie:publication-labels:{publication['id']}"
+    assert valkey.exists(key) == 1
+    assert 0 < valkey.ttl(key) <= 30 * 24 * 60 * 60
+    code_host.existing = _matching_pull(publication, code_host)
+
+    repeat = _recover_labels(client, publication)
+
+    assert repeat.status_code == 200, repeat.text
+    assert len(code_host.label_calls) == 1
+    _open_pr(client, publication["id"])
+    _execute(
+        "UPDATE curie.publications SET outcome_history_ready_at = now() WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    )
+    deployment_id = with_session(
+        lambda session: session.scalar(
+            select(Publication.deployment_id).where(Publication.id == uuid.UUID(publication["id"]))
+        )
+    )
+    second = _publish(client, str(deployment_id), base_sha=HEAD_SHA)
+    _resolve(client, auth_headers, second["approval_id"])
+    assert second["lineage_id"] == publication["lineage_id"]
+    assert second["id"] != publication["id"]
+    code_host.existing = _matching_pull(second, code_host)
+
+    revised = _recover_labels(client, second)
+
+    assert revised.status_code == 200, revised.text
+    assert len(code_host.label_calls) == 2
+    assert valkey.exists(f"curie:publication-labels:{second['id']}") == 1
+
+
+def test_publication_labels_apply_when_adopting_an_existing_open_pull_request(
+    publication_labels: Labelled,
+) -> None:
+    client, publication, code_host, _valkey = publication_labels
+    code_host.existing = _matching_pull(publication, code_host)
+
+    response = _recover_labels(client, publication, adopt_only=True)
+
+    assert response.status_code == 200, response.text
+    assert len(code_host.label_calls) == 1
+    assert code_host.opened == []
+
+
+@pytest.mark.parametrize(
+    "excluded",
+    ["draft", "closed", "merged", "adopt-miss", "unconfigured", "empty", "non-github"],
+)
+def test_publication_labels_exclude_ineligible_pull_requests_and_repositories(
+    publication_labels: Labelled, monkeypatch: pytest.MonkeyPatch, excluded: str
+) -> None:
+    client, publication, code_host, valkey = publication_labels
+    if excluded in {"draft", "closed", "merged"}:
+        code_host.existing = replace(
+            _matching_pull(publication, code_host),
+            draft=excluded == "draft",
+            state={"closed": PullRequestState.CLOSED, "merged": PullRequestState.MERGED}.get(
+                excluded, PullRequestState.OPEN
+            ),
+        )
+    elif excluded in {"unconfigured", "empty"}:
+        monkeypatch.setenv(
+            "CURIE_FACTORY_PUBLICATION_LABELS",
+            json.dumps({REPO: []} if excluded == "empty" else {}),
+        )
+        get_settings.cache_clear()
+    elif excluded == "non-github":
+        code_host.kind = "gitlab"
+        code_host.host = "gitlab.example.com"
+        _execute(
+            "UPDATE curie.thread_publication_lineages SET code_host_kind = 'gitlab', "
+            "code_host_host = 'gitlab.example.com', repository_project_id = '101', "
+            "code_host_pr_id = 'merge-request-example', base_ref = 'main', "
+            "pr_number = :number, pr_url = :url, head_sha = :head "
+            "WHERE id = :id",
+            {
+                "id": uuid.UUID(publication["lineage_id"]),
+                "number": PR_NUMBER,
+                "url": "https://gitlab.example.com/acme-corp/acme-bot/-/merge_requests/123",
+                "head": HEAD_SHA,
+            },
+        )
+        code_host.existing = replace(
+            _matching_pull(publication, code_host),
+            ref=PullRequestRef(
+                RepositoryRef("gitlab", "gitlab.example.com", "101", REPO), str(PR_NUMBER)
+            ),
+        )
+
+    response = _recover_labels(client, publication, adopt_only=excluded == "adopt-miss")
+
+    assert response.status_code == (204 if excluded == "adopt-miss" else 200), response.text
+    assert code_host.label_calls == []
+    assert valkey.exists(f"curie:publication-labels:{publication['id']}") == 0
+
+
+def test_publication_labels_failure_is_warned_without_a_marker_and_retries(
+    publication_labels: Labelled, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, publication, code_host, valkey = publication_labels
+    code_host.label_fail = Unavailable("private-provider-payload")
+
+    with caplog.at_level(logging.WARNING, logger=publication_code_host.__name__):
+        failed = _recover_labels(client, publication)
+
+    assert failed.status_code == 200, failed.text
+    assert failed.json()["number"] == PR_NUMBER
+    warnings = [
+        record for record in caplog.records if record.name == publication_code_host.__name__
+    ]
+    assert len(warnings) == 1
+    assert publication["id"] in warnings[0].getMessage()
+    assert REPO in warnings[0].getMessage()
+    assert "Unavailable" in warnings[0].getMessage()
+    assert "private-provider-payload" not in caplog.text
+    assert valkey.exists(f"curie:publication-labels:{publication['id']}") == 0
+    code_host.label_fail = None
+    code_host.existing = _matching_pull(publication, code_host)
+
+    retried = _recover_labels(client, publication)
+
+    assert retried.status_code == 200, retried.text
+    assert len(code_host.label_calls) == 2
+    assert valkey.exists(f"curie:publication-labels:{publication['id']}") == 1
+
+
+def test_publication_labels_failure_when_valkey_is_unreachable_keeps_the_pull_request(
+    publication_labels: Labelled, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, publication, code_host, valkey = publication_labels
+    original = client.app.state.valkey
+    with socket.socket() as unavailable:
+        unavailable.bind(("127.0.0.1", 0))
+        broken = async_redis.Redis(
+            host="127.0.0.1",
+            port=unavailable.getsockname()[1],
+            socket_connect_timeout=0.1,
+            socket_timeout=0.1,
+            retry=NO_RETRY,
+        )
+        client.app.state.valkey = broken
+        try:
+            with caplog.at_level(logging.WARNING, logger=publication_code_host.__name__):
+                response = _recover_labels(client, publication)
+        finally:
+            client.app.state.valkey = original
+            client.portal.call(broken.aclose)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["number"] == PR_NUMBER
+    assert code_host.label_calls == []
+    assert valkey.exists(f"curie:publication-labels:{publication['id']}") == 0
+    warnings = [
+        record for record in caplog.records if record.name == publication_code_host.__name__
+    ]
+    assert len(warnings) == 1
+    assert publication["id"] in warnings[0].getMessage()
+    assert "ConnectionError" in warnings[0].getMessage()
+    code_host.existing = _matching_pull(publication, code_host)
+
+    recovered = _recover_labels(client, publication)
+
+    assert recovered.status_code == 200, recovered.text
+    assert len(code_host.label_calls) == 1
+    assert valkey.exists(f"curie:publication-labels:{publication['id']}") == 1
 
 
 @pytest.mark.parametrize(("method", "suffix", "body"), ROUTES)

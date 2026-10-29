@@ -155,6 +155,7 @@ api:
   CURIE_E2E_SOURCE_HOSTS: e2eConnector.sourceHosts
   CURIE_E2E_TTL_SECONDS: e2eConnector.ttlSeconds
   CURIE_E2E_WORKER_CLUSTER_ROLE: e2eConnector.workerClusterRole
+  CURIE_FACTORY_PUBLICATION_LABELS: api.factoryPublicationLabels
   CURIE_FORGES: factory.codeHosts / factory.trackers / factory.bindings
   CURIE_HTTP_IDENTITY_DIR: api.httpIdentity.existingSecret
   CURIE_INSTALLATION_ID: the release-managed installation identity (remove this override)
