@@ -466,10 +466,11 @@ def test_recovery_admin_access(access: Access, caplog: pytest.LogCaptureFixture)
          key=patch["key"])
     access.s3.delete_object(Bucket=access.bucket, Key=f"private/{patch['key']}")
     _refused(access.get(source, reservation, "patch"), 502)
-    access.s3.put_object(Bucket=access.bucket, Key=f"private/{patch['key']}", Body=CANARY)
-    corrupt = access.get(source, reservation, "patch")
-    _refused(corrupt, 502)
-    assert payloads["patch"] not in corrupt.content and not _readers(source)
+    for damaged in (CANARY, b"x" * len(payloads["patch"]), payloads["patch"] + b"excess"):
+        access.s3.put_object(Bucket=access.bucket, Key=f"private/{patch['key']}", Body=damaged)
+        corrupt = access.get(source, reservation, "patch")
+        _refused(corrupt, 502)
+        assert payloads["patch"] not in corrupt.content and not _readers(source)
     access.s3.put_object(
         Bucket=access.bucket, Key=f"private/{patch['key']}", Body=payloads["patch"]
     )
