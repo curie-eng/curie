@@ -1807,6 +1807,130 @@ async def _fault_store_outage(stage: _Stage, _monkeypatch: pytest.MonkeyPatch) -
     _assert_released(stage)
 
 
+OWNERSHIP_STALL_SECONDS = 3.0
+
+
+async def _fault_ownership_read_stalls(stage: _Stage, _monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stalled workspace-ownership read never blocks the worker's event loop.
+
+    The capture builds its base source from the PreparedWorkspace it was handed;
+    any lookup that still touches the object store runs off the loop, so other
+    turns keep being served while it waits.
+    """
+
+    await stage.start_run()
+    await stage.fail_turn()
+    await stage.finish_failed()
+    assert stage.capture is not None
+    objects = stage.coordinator.preparer.objects
+    ownership_key = stage.coordinator._ownership_key(stage.thread_key)
+    real_get = objects.get_stream
+    armed: list[bool] = []
+    stalls: list[tuple[float, float]] = []
+
+    def get_stream(key: str, *args: Any, **kwargs: Any) -> Any:
+        if armed and key == ownership_key:
+            # Injected fault: the store answers this one object slowly.
+            started = time.monotonic()
+            time.sleep(OWNERSHIP_STALL_SECONDS)
+            stalls.append((started, time.monotonic()))
+        return real_get(key, *args, **kwargs)
+
+    real_capture = stage.capture.capture
+    seen: list[Any] = []
+
+    async def capture_armed(*args: Any, **kwargs: Any) -> Any:
+        armed.append(True)
+        try:
+            result = await real_capture(*args, **kwargs)
+        finally:
+            armed.clear()
+        seen.append(result)
+        return result
+
+    ticks: list[float] = []
+
+    async def ticker() -> None:
+        while True:
+            ticks.append(time.monotonic())
+            await asyncio.sleep(0.05)
+
+    stage.capture.capture = capture_armed  # type: ignore[method-assign]
+    objects.get_stream = get_stream  # type: ignore[method-assign]
+    beat = asyncio.create_task(ticker())
+    try:
+        await stage.release()
+    finally:
+        beat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await beat
+        del objects.get_stream
+    _assert_release_bounded(stage)
+
+    for started, ended in stalls:
+        inside = [tick for tick in ticks if started + 0.5 < tick < ended - 0.5]
+        assert inside, "the event loop was blocked by a synchronous ownership read"
+    assert [result.status for result in seen] == ["complete"], seen
+    own = await stage.own_checkpoints()
+    assert list(own.values()) == ["complete"], own
+    await stage.assert_request_unchanged()
+    _assert_released(stage)
+
+
+async def _fault_base_stream_fails_before_reservation(
+    stage: _Stage, _monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A writer failure before any reservation still records the WorkItem's outcome."""
+
+    await stage.start_run()
+    await stage.fail_turn()
+    await stage.finish_failed()
+    assert stage.capture is not None
+    objects = stage.coordinator.preparer.objects
+    base_key = stage.prepared.object_key
+    real_get = objects.get_stream
+    armed: list[bool] = []
+
+    def get_stream(key: str, *args: Any, **kwargs: Any) -> Any:
+        if armed and key == base_key:
+            # Injected fault: the private base object cannot be streamed.
+            raise RuntimeError("injected base stream failure")
+        return real_get(key, *args, **kwargs)
+
+    real_capture = stage.capture.capture
+    seen: list[Any] = []
+
+    async def capture_armed(*args: Any, **kwargs: Any) -> Any:
+        armed.append(True)
+        try:
+            result = await real_capture(*args, **kwargs)
+        finally:
+            armed.clear()
+        seen.append(result)
+        return result
+
+    stage.capture.capture = capture_armed  # type: ignore[method-assign]
+    objects.get_stream = get_stream  # type: ignore[method-assign]
+    try:
+        await stage.release()
+    finally:
+        del objects.get_stream
+    _assert_release_bounded(stage)
+
+    assert len(seen) == 1, seen
+    assert (seen[0].status, seen[0].code, seen[0].checkpoint_id) == (
+        "failed",
+        "base_unavailable",
+        None,
+    ), seen
+    assert len(stage.checkpoint_calls) == 1
+    # No reservation was made, yet the reason is recorded on the WorkItem.
+    assert await stage.own_checkpoints() == {}
+    assert (await stage.recovery_state())["outcome"] == "capture_failed"
+    await stage.assert_request_unchanged()
+    _assert_released(stage)
+
+
 RUNNER_PHASE_BUDGET = 4.0
 
 
@@ -1969,6 +2093,8 @@ _FAULTS: dict[str, _Fault] = {
     "owner_loss": _Fault(_fault_owner_loss),
     "work_item_cancelled_finish": _Fault(_fault_cancelled_finish),
     "torn_capture": _Fault(_fault_torn_capture),
+    "ownership_read_stalls": _Fault(_fault_ownership_read_stalls),
+    "base_stream_fails_before_reservation": _Fault(_fault_base_stream_fails_before_reservation),
     "patch_too_large": _Fault(_fault_patch_too_large),
     "runner_unavailable": _Fault(_fault_runner_outage),
     "store_outage": _Fault(_fault_store_outage, store="dead"),

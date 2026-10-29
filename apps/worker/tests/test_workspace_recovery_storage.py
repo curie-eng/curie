@@ -1620,6 +1620,50 @@ async def _case_replay_with_lost_lease(ctx: _Ctx) -> None:
     await _assert_readable(ctx, source, previous, ctx.harness.good_digests())
 
 
+async def _case_replay_lost_after_its_completion(ctx: _Ctx) -> None:
+    """A replay's own ``complete`` returns, then its fence fails: still no retraction.
+
+    The reservation was replayed, so this invocation never created the checkpoint;
+    its completion answer proves nothing about who did. Only a writer whose
+    reservation was not replayed may send ``retract``.
+    """
+
+    source = await _seed(ctx)
+    previous = await _good_checkpoint(ctx, source, base=ctx.harness.base_source())
+    key = uuid.uuid4().hex
+    first = await _writer(ctx).capture(
+        _request(source, patch=ctx.harness.patch, manifest=ctx.harness.manifest, base=None, key=key)
+    )
+    assert first.status == "complete", first
+    completed = first.checkpoint_id
+    assert completed is not None and completed != previous
+    keys = await _checkpoint_keys(ctx, completed)
+    assert set(keys) == {"patch", "manifest"}
+
+    fenced: list[int] = []
+
+    async def lost_after_commit() -> None:
+        fenced.append(1)
+        if len(fenced) >= 2:
+            # Injected fault: the lease is lost after the replayed completion.
+            raise _InjectedFailure("lease lost after the replayed completion")
+
+    replay = await _writer(ctx).capture(
+        _request(
+            source, patch=ctx.harness.patch, manifest=ctx.harness.manifest, base=None, key=key
+        ),
+        fence=lost_after_commit,
+    )
+    assert fenced == [1, 1], "the replay never reached its post-completion fence"
+    assert replay.status == "failed", replay
+    assert replay.failure == "lease_lost", replay
+    assert await _checkpoint_status(ctx, completed) == "complete"
+    assert await _last_good(ctx, source) == completed
+    for object_key in keys.values():
+        assert _exists(ctx.harness, _physical(object_key)), object_key
+    await _assert_readable(ctx, source, completed, ctx.harness.good_digests())
+
+
 async def _case_retracted_checkpoint_is_never_discarded(ctx: _Ctx) -> None:
     """After a retraction every repeated ``fail`` answers ``retracted``, never ``tombstoned``.
 
@@ -1875,6 +1919,7 @@ _FAULT_CASES: dict[str, Callable[[_Ctx], Awaitable[None]]] = {
     "storage_outage": _case_storage_outage,
     "replay_through_fault": _case_replay_through_fault,
     "replay_with_lost_lease": _case_replay_with_lost_lease,
+    "replay_lost_after_its_completion": _case_replay_lost_after_its_completion,
     "retracted_checkpoint_is_never_discarded": _case_retracted_checkpoint_is_never_discarded,
     "patch_at_limit": _case_patch_at_limit,
     "patch_over_limit": _case_patch_over_limit,

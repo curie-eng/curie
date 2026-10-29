@@ -200,8 +200,9 @@ def _reserved(client: Any, source: dict[str, Any], **kwargs: Any) -> dict[str, A
     body = _reserve_body(source, **kwargs)
     result = _ok(_post(client, "reserve", body))
     assert set(result) == {
-        "checkpoint_id", "objects", "capture_deadline", "staging_expires_at"
+        "checkpoint_id", "objects", "capture_deadline", "staging_expires_at", "replayed"
     }
+    assert isinstance(result["replayed"], bool)
     uuid.UUID(result["checkpoint_id"])
     assert len(result["objects"]) == len(body["objects"])
     expected = {obj["kind"]: obj for obj in body["objects"]}
@@ -1482,13 +1483,36 @@ def test_reserve_replays_with_a_smaller_remaining_budget_and_keeps_its_deadline(
     first = _ok(_post(client, "reserve", body))
     state = _snapshot()
     replay = _ok(_post(client, "reserve", {**body, "capture_budget_seconds": 12.5}))
-    assert replay == first
+    assert {**replay, "replayed": False} == first
     assert _snapshot() == state
     # The budget is excluded from the content digest; the content is not.
     changed = copy.deepcopy(body)
     changed["objects"][-1]["sha256"] = "f" * 64
     _refused(_post(client, "reserve", changed))
     assert _snapshot() == state
+
+
+def test_reserve_answers_replayed_only_when_the_idempotency_key_matched(
+    recovery: None, client: Any
+) -> None:
+    """``replayed`` is the writer's proof that this invocation did not create the checkpoint."""
+
+    _routes_exist(client)
+    source = _seed()
+    body = _reserve_body(source, key="replay-proof")
+    first = _ok(_post(client, "reserve", body))
+    assert first["replayed"] is False
+    replay = _ok(_post(client, "reserve", body))
+    assert replay["replayed"] is True
+    assert replay["checkpoint_id"] == first["checkpoint_id"]
+    _completed(client, source, first)
+    # A replay of a complete checkpoint still says so.
+    after = _ok(_post(client, "reserve", body))
+    assert after["replayed"] is True
+    assert after["checkpoint_id"] == first["checkpoint_id"]
+    fresh = _ok(_post(client, "reserve", _reserve_body(source, reuse=True)))
+    assert fresh["replayed"] is False
+    assert fresh["checkpoint_id"] != first["checkpoint_id"]
 
 
 def test_a_completion_after_the_budgeted_deadline_is_refused_and_publishes_nothing(
@@ -1548,6 +1572,36 @@ def test_lease_lost_cleanup_tombstones_a_superseded_source_staging(
     # The successor's own capture is unaffected.
     _terminal_now(successor)
     assert _ok(_post(client, "context", _authority(successor)))["base_commit"] == BASE
+
+
+@pytest.mark.parametrize("stage", ("staging", "complete"))
+def test_predecessor_cleanup_survives_a_successor_readmitted_on_a_new_base(
+    recovery: None, client: Any, stage: str
+) -> None:
+    """Cleanup is fenced by the retained checkpoint's identity, not the WorkItem's base.
+
+    Ordinary readmission moves the WorkItem to a new base commit; the predecessor
+    whose lease was lost still withdraws its own staging or completion.
+    """
+
+    _routes_exist(client)
+    source = _seed()
+    reservation = _reserved(client, source)
+    if stage == "complete":
+        _completed(client, source, reservation)
+    _seed(agent_id=source["agent_id"], item_id=source["work_item_id"])
+    _sql(
+        "UPDATE curie.work_items SET base_commit = :base WHERE id = :id",
+        id=uuid.UUID(source["work_item_id"]),
+        base="b" * 40,
+    )
+    response = _lease_lost(client, source, reservation, retract=stage == "complete")
+    expected = "retracted" if stage == "complete" else "tombstoned"
+    assert _ok(response) == {"checkpoint_id": reservation["checkpoint_id"], "status": expected}
+    _no_capability(response.text)
+    assert _checkpoint_status(reservation) == "tombstoned"
+    assert _last_good(source) is None
+    assert _outcome(source)["workspace_recovery_outcome"] == "lease_lost"
 
 
 @pytest.mark.parametrize("change", ("other_epoch", "other_generation", "running_source"))
