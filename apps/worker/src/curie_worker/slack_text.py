@@ -25,7 +25,9 @@ class AnswerPart:
         return self.prefix + self.content + self.suffix
 
 
-def split_verbatim_answer(text: str) -> list[AnswerPart]:
+def split_verbatim_answer(
+    text: str, *, max_bytes: int = SLACK_VERBATIM_MAX_BYTES
+) -> list[AnswerPart]:
     """Partition literal text without adding, removing or normalizing characters.
 
     The budget stays inside the 3,000-character limit Slack documents for a
@@ -40,7 +42,7 @@ def split_verbatim_answer(text: str) -> list[AnswerPart]:
     size = 0
     for index, char in enumerate(text):
         encoded_size = len(char.encode("utf-8"))
-        if size + encoded_size > SLACK_VERBATIM_MAX_BYTES:
+        if size + encoded_size > max_bytes:
             parts.append(AnswerPart(text[start:index]))
             start = index
             size = 0
@@ -49,7 +51,7 @@ def split_verbatim_answer(text: str) -> list[AnswerPart]:
     return parts
 
 
-def split_answer(text: str) -> list[AnswerPart]:
+def split_answer(text: str, *, max_bytes: int = SLACK_ANSWER_MAX_BYTES) -> list[AnswerPart]:
     """Keep every source character, reopening long code fences between messages.
 
     Prefer a line boundary, then whitespace; preserve complete short mrkdwn
@@ -57,7 +59,7 @@ def split_answer(text: str) -> list[AnswerPart]:
     cross messages, but none of its content is discarded. Unicode code points,
     combining marks and joiner sequences are kept together when they fit.
     """
-    if len(text.encode()) <= SLACK_ANSWER_MAX_BYTES:
+    if len(text.encode()) <= max_bytes:
         return [AnswerPart(text)]
     atoms = list(_ATOM.finditer(text))
     parts: list[AnswerPart] = []
@@ -66,7 +68,7 @@ def split_answer(text: str) -> list[AnswerPart]:
     while start < len(text):
         prefix = "```\n" if fenced else ""
         # Reserve closing scaffolding even before a chunk opens a fence.
-        budget = SLACK_ANSWER_MAX_BYTES - len(prefix.encode()) - 4
+        budget = max_bytes - len(prefix.encode()) - 4
         end = start + len(text[start:].encode()[:budget].decode("utf-8", "ignore"))
         code_point_end = end
         if end < len(text):
