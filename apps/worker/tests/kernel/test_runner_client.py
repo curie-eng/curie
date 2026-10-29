@@ -2121,7 +2121,9 @@ def test_checkpoint_transport_failure_is_a_runner_error() -> None:
         try:
             with pytest.raises(RunnerError) as raised:
                 await client.checkpoint(
-                    f"http://127.0.0.1:{port}", "runner-token", base_sha="78" * 20,
+                    f"http://127.0.0.1:{port}",
+                    "runner-token",
+                    base_sha="78" * 20,
                     budget_seconds=5.0,
                 )
             assert not isinstance(raised.value, RunnerCheckpointRefused)

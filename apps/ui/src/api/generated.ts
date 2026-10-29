@@ -3843,6 +3843,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/workspace-recovery/context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Context */
+        post: operations["context_v1_internal_workspace_recovery_context_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/workspace-recovery/fail": {
         parameters: {
             query?: never;
@@ -3871,6 +3888,23 @@ export interface paths {
         put?: never;
         /** Finalize Collection */
         post: operations["finalize_collection_v1_internal_workspace_recovery_finalize_collection_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/workspace-recovery/outcome": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Outcome */
+        post: operations["outcome_v1_internal_workspace_recovery_outcome_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -8558,6 +8592,31 @@ export interface components {
              */
             work_item_id: string;
         };
+        /** RecoveryCaptureAuthority */
+        RecoveryCaptureAuthority: {
+            /** Dispatch Generation */
+            dispatch_generation: number;
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /**
+             * Source Request Id
+             * Format: uuid
+             */
+            source_request_id: string;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** RecoveryCaptureContext */
+        RecoveryCaptureContext: {
+            /** Base Commit */
+            base_commit: string;
+            repository: components["schemas"]["RecoveryRepository"];
+            /** Target Branch */
+            target_branch: string;
+        };
         /** RecoveryCaptureFailure */
         RecoveryCaptureFailure: {
             /**
@@ -8568,9 +8627,9 @@ export interface components {
             /**
              * Status
              * @default tombstoned
-             * @constant
+             * @enum {string}
              */
-            status?: "tombstoned";
+            status?: "tombstoned" | "retracted";
         };
         /** RecoveryClaimCollection */
         RecoveryClaimCollection: {
@@ -8735,6 +8794,33 @@ export interface components {
             /** Size Bytes */
             size_bytes: number;
         };
+        /** RecoveryOutcome */
+        RecoveryOutcome: {
+            /** Dispatch Generation */
+            dispatch_generation: number;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "torn_capture" | "capture_timeout" | "capture_failed" | "runner_unavailable" | "patch_too_large" | "manifest_too_large" | "base_mismatch";
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /**
+             * Source Request Id
+             * Format: uuid
+             */
+            source_request_id: string;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** RecoveryOutcomeRecorded */
+        RecoveryOutcomeRecorded: {
+            /** Recorded */
+            recorded: boolean;
+        };
         /** RecoveryReader */
         RecoveryReader: {
             /**
@@ -8804,6 +8890,11 @@ export interface components {
             base_archive_limit_bytes: number;
             /** Base Commit */
             base_commit: string;
+            /**
+             * Capture Budget Seconds
+             * @default 60
+             */
+            capture_budget_seconds?: number;
             /** Dispatch Generation */
             dispatch_generation: number;
             /** Idempotency Key */
@@ -18897,6 +18988,41 @@ export interface operations {
             };
         };
     };
+    context_v1_internal_workspace_recovery_context_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RecoveryCaptureAuthority"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryCaptureContext"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     fail_v1_internal_workspace_recovery_fail_post: {
         parameters: {
             query?: never;
@@ -18954,6 +19080,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RecoveryFinalized"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    outcome_v1_internal_workspace_recovery_outcome_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RecoveryOutcome"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryOutcomeRecorded"];
                 };
             };
             /** @description Validation Error */

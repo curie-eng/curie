@@ -86,7 +86,7 @@ def _sql(statement: str, **params: Any) -> list[dict[str, Any]]:
 
 def _seed(
     *, agent_id: str | None = None, item_id: str | None = None, start_failed: bool = False,
-    lineage_closed: bool = False
+    lineage_closed: bool = False, deadline_passed: bool = False
 ) -> dict[str, Any]:
     agent_id = agent_id or str(uuid.uuid4())
     item_id = item_id or str(uuid.uuid4())
@@ -130,6 +130,7 @@ def _seed(
         "CASE WHEN :start_failed OR :lineage_closed THEN NULL "
         "ELSE clock_timestamp() - interval '1 minute' END, "
         "CASE WHEN :start_failed OR :lineage_closed THEN NULL "
+        "WHEN :deadline_passed THEN clock_timestamp() - interval '1 second' "
         "ELSE clock_timestamp() + interval '1 hour' END, "
         "clock_timestamp() - interval '1 second', "
         "CASE WHEN :lineage_closed THEN 'lineage_closed' "
@@ -142,6 +143,7 @@ def _seed(
         sequence=sequence,
         start_failed=start_failed,
         lineage_closed=lineage_closed,
+        deadline_passed=deadline_passed,
     )
     _sql(
         "UPDATE curie.work_items SET next_sequence = :sequence WHERE id = :id",
@@ -1264,7 +1266,10 @@ def test_capture_context_refuses_a_source_that_cannot_start_a_capture(
     recovery: None, client: Any, monkeypatch: pytest.MonkeyPatch, state: str
 ) -> None:
     _routes_exist(client)
-    source = _seed(start_failed=state == "start_failed")
+    # Execution deadlines are write once, so an expired one is seeded expired.
+    source = _seed(
+        start_failed=state == "start_failed", deadline_passed=state == "expired_deadline"
+    )
     body = _authority(source)
     request = {"id": uuid.UUID(source["source_request_id"])}
     status, code = 409, None
@@ -1306,10 +1311,6 @@ def test_capture_context_refuses_a_source_that_cannot_start_a_capture(
         )
         code = "workspace_recovery.expired_source"
     elif state == "expired_deadline":
-        _sql(
-            "UPDATE curie.execution_requests SET execution_deadline = "
-            "clock_timestamp() - interval '1 second' WHERE id = :id", **request,
-        )
         code = "workspace_recovery.expired_source"
     else:
         _sql(
@@ -1363,10 +1364,9 @@ def test_capture_outcome_survives_an_expired_heartbeat_and_deadline(
     """A capture that spent its whole budget still records why, after the lease lapsed."""
 
     _routes_exist(client)
-    source = _seed()
+    source = _seed(deadline_passed=True)
     _sql(
         "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
-        "clock_timestamp() - interval '1 second', execution_deadline = "
         "clock_timestamp() - interval '1 second' WHERE id = :id",
         id=uuid.UUID(source["source_request_id"]),
     )

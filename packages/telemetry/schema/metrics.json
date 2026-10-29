@@ -575,6 +575,8 @@
           "/v1/internal/publications/{publication_id}/pull-request/metadata",
           "/v1/internal/publications/{publication_id}/branch-head",
           "/v1/internal/publications/{publication_id}/revision-commit",
+          "/v1/internal/workspace-recovery/context",
+          "/v1/internal/workspace-recovery/outcome",
           "/v1/internal/workspace-recovery/reserve",
           "/v1/internal/workspace-recovery/complete",
           "/v1/internal/workspace-recovery/fail",
@@ -637,7 +639,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1584,
+      "cardinality_bound": 1600,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -800,6 +802,8 @@
           "/v1/internal/publications/{publication_id}/pull-request/metadata",
           "/v1/internal/publications/{publication_id}/branch-head",
           "/v1/internal/publications/{publication_id}/revision-commit",
+          "/v1/internal/workspace-recovery/context",
+          "/v1/internal/workspace-recovery/outcome",
           "/v1/internal/workspace-recovery/reserve",
           "/v1/internal/workspace-recovery/complete",
           "/v1/internal/workspace-recovery/fail",
@@ -869,7 +873,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 7920,
+      "cardinality_bound": 8000,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -1032,6 +1036,8 @@
           "/v1/internal/publications/{publication_id}/pull-request/metadata",
           "/v1/internal/publications/{publication_id}/branch-head",
           "/v1/internal/publications/{publication_id}/revision-commit",
+          "/v1/internal/workspace-recovery/context",
+          "/v1/internal/workspace-recovery/outcome",
           "/v1/internal/workspace-recovery/reserve",
           "/v1/internal/workspace-recovery/complete",
           "/v1/internal/workspace-recovery/fail",
@@ -1101,7 +1107,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 7920,
+      "cardinality_bound": 8000,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

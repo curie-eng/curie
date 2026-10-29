@@ -1228,7 +1228,8 @@ Recovery is off by default; enabling `CURIE_WORKSPACE_RECOVERY_ENABLED` on the
 API requires a positive installation cap in `CURIE_WORKSPACE_RECOVERY_MAX_BYTES`.
 The API and worker must share the `CURIE_WORKSPACE_MAX_ARCHIVE_BYTES` base ceiling.
 `reserve`, `complete` and `fail` manage bounded checkpoint metadata; reservations
-have a 60-second completion deadline and 600-second staging lifetime.
+have a completion deadline of at most 60 seconds (the capture's remaining budget)
+and a 600-second staging lifetime.
 `acquire-reader` and `release-reader` manage at most eight readers per WorkItem,
 each bounded to 300 seconds. Two-phase metadata collection uses `claim-collection`
 to fence eligible objects against readers, then `finalize-collection` after deletion.
@@ -1250,8 +1251,29 @@ on the worker and the internal worker token is present, the worker supervises th
 `CURIE_WORKSPACE_RECOVERY_COLLECT_INTERVAL_S` seconds (default 30): it claims
 eligible objects, deletes them outside any lock, and finalizes each claim, so a
 collector interrupted between deletion and finalization repeats both after
-restart. Logs carry ids, kinds, sizes and typed codes only. Capture call sites in
-the run path and restoration are not wired yet.
+restart. Logs carry ids, kinds, sizes and typed codes only.
+
+Capture is wired on ordinary failure (#5143). A run whose failed finish is known
+to have committed is marked recovery eligible; cancellation, execution deadline,
+termination, owner loss and a `work_item_cancelled` finish refusal never are, and
+keep the plain release. Before releasing an eligible run's claim, the kernel holds
+a renewable lease on the thread lock and, only while the thread's route still
+names the run's claim, `curie_worker.workspace_recovery_capture.WorkspaceRecoveryCapture`
+reads the WorkItem's repository and base through the ledger's `context`
+operation, asks the runner's `POST /v1/checkpoint` for a patch and manifest against
+the claim's trusted base, and writes the checkpoint. One 60-second aggregate
+deadline covers all of it, and `reserve` carries the budget still left, so the
+ledger's completion deadline never outlives it. A capture that ends before any
+reservation (torn capture, oversized patch or manifest, runner unavailable,
+timeout, base mismatch) records its reason through the `outcome` operation within
+the five-second cleanup allowance. The lease is checked before every completion
+attempt and once after it commits; a lease lost first tombstones the staging, and
+a lease lost after commit retracts the just-completed checkpoint back to the
+previous one, leaving its objects to the collector. When the lease is lost before
+the release, the lock is reacquired and the plain release runs with the recorded
+claim. A capture failure never changes the WorkItem's terminal outcome. Enabling
+recovery on the worker requires `CURIE_INTERNAL_WORKER_TOKEN` and
+`CURIE_WORKSPACE_ENABLED`. Restoration is not wired yet.
 
 ### Retained thread attachments
 

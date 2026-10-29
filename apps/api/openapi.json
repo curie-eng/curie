@@ -10666,6 +10666,64 @@
         "title": "RecoveryAcquireReader",
         "type": "object"
       },
+      "RecoveryCaptureAuthority": {
+        "additionalProperties": false,
+        "properties": {
+          "dispatch_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Dispatch Generation",
+            "type": "integer"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "source_request_id": {
+            "format": "uuid",
+            "title": "Source Request Id",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "source_request_id",
+          "runtime_epoch",
+          "dispatch_generation"
+        ],
+        "title": "RecoveryCaptureAuthority",
+        "type": "object"
+      },
+      "RecoveryCaptureContext": {
+        "additionalProperties": false,
+        "properties": {
+          "base_commit": {
+            "title": "Base Commit",
+            "type": "string"
+          },
+          "repository": {
+            "$ref": "#/components/schemas/RecoveryRepository"
+          },
+          "target_branch": {
+            "title": "Target Branch",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "base_commit",
+          "target_branch"
+        ],
+        "title": "RecoveryCaptureContext",
+        "type": "object"
+      },
       "RecoveryCaptureFailure": {
         "additionalProperties": false,
         "properties": {
@@ -10675,8 +10733,11 @@
             "type": "string"
           },
           "status": {
-            "const": "tombstoned",
             "default": "tombstoned",
+            "enum": [
+              "tombstoned",
+              "retracted"
+            ],
             "title": "Status",
             "type": "string"
           }
@@ -11021,6 +11082,69 @@
         "title": "RecoveryObjectReceipt",
         "type": "object"
       },
+      "RecoveryOutcome": {
+        "additionalProperties": false,
+        "properties": {
+          "dispatch_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Dispatch Generation",
+            "type": "integer"
+          },
+          "reason": {
+            "enum": [
+              "torn_capture",
+              "capture_timeout",
+              "capture_failed",
+              "runner_unavailable",
+              "patch_too_large",
+              "manifest_too_large",
+              "base_mismatch"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "source_request_id": {
+            "format": "uuid",
+            "title": "Source Request Id",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "source_request_id",
+          "runtime_epoch",
+          "dispatch_generation",
+          "reason"
+        ],
+        "title": "RecoveryOutcome",
+        "type": "object"
+      },
+      "RecoveryOutcomeRecorded": {
+        "additionalProperties": false,
+        "properties": {
+          "recorded": {
+            "title": "Recorded",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "recorded"
+        ],
+        "title": "RecoveryOutcomeRecorded",
+        "type": "object"
+      },
       "RecoveryReader": {
         "additionalProperties": false,
         "properties": {
@@ -11173,6 +11297,13 @@
             "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
             "title": "Base Commit",
             "type": "string"
+          },
+          "capture_budget_seconds": {
+            "default": 60.0,
+            "exclusiveMinimum": 0.0,
+            "maximum": 60.0,
+            "title": "Capture Budget Seconds",
+            "type": "number"
           },
           "dispatch_generation": {
             "maximum": 9.223372036854776e+18,
@@ -31534,6 +31665,65 @@
         ]
       }
     },
+    "/v1/internal/workspace-recovery/context": {
+      "post": {
+        "operationId": "context_v1_internal_workspace_recovery_context_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryCaptureAuthority"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryCaptureContext"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Context",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
     "/v1/internal/workspace-recovery/fail": {
       "post": {
         "operationId": "fail_v1_internal_workspace_recovery_fail_post",
@@ -31647,6 +31837,65 @@
           }
         },
         "summary": "Finalize Collection",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
+    "/v1/internal/workspace-recovery/outcome": {
+      "post": {
+        "operationId": "outcome_v1_internal_workspace_recovery_outcome_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryOutcome"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryOutcomeRecorded"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Outcome",
         "tags": [
           "internal-workspace-recovery"
         ]

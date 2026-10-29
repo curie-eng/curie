@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import time
@@ -183,6 +184,20 @@ class RunnerSnapshotReadError(RunnerError):
     """The publication snapshot could not be read or validated at its boundary."""
 
 
+class RunnerCheckpointRefused(RunnerError):
+    """The runner answered ``/v1/checkpoint`` with a coded refusal.
+
+    Only a 4xx or a 504 carrying a string ``code`` is a refusal; an uncoded
+    answer, any other 5xx, a transport fault or a malformed body is a plain
+    ``RunnerError``. The message carries the code and status only.
+    """
+
+    def __init__(self, code: str, status: int) -> None:
+        super().__init__(f"/v1/checkpoint refused: {code} ({status})")
+        self.code = code
+        self.status = status
+
+
 class RunnerStreamTimeout(TimeoutError):
     """The turn exceeded its deadline during transport or frame handling.
 
@@ -211,6 +226,74 @@ class RunnerWorkspaceSnapshot:
     contains_workflow_files: bool
     publication_title: str
     publication_body: str
+
+
+@dataclass(frozen=True)
+class RunnerWorkspaceCheckpoint:
+    """A recovery checkpoint read from the runner after strict boundary validation."""
+
+    base_sha: str
+    patch: bytes
+    changed_paths: tuple[str, ...]
+    manifest: bytes
+
+
+CHECKPOINT_PATCH_MAX_BYTES = 900_000
+CHECKPOINT_MANIFEST_MAX_BYTES = 1_048_576
+# Both payloads base64 encoded, plus the changed path list (bounded by the
+# manifest, which names every changed path) and the fixed fields.
+_CHECKPOINT_BODY_MAX_BYTES = (
+    4 * ((CHECKPOINT_PATCH_MAX_BYTES + 2) // 3)
+    + 4 * ((CHECKPOINT_MANIFEST_MAX_BYTES + 2) // 3)
+    + CHECKPOINT_MANIFEST_MAX_BYTES
+    + 65_536
+)
+# How long past its own budget a checkpoint call may wait for the runner's coded
+# deadline answer when the caller hands no remaining budget.
+_CHECKPOINT_GRACE_S = 5.0
+
+
+def _checkpoint_bytes(body: dict[str, Any], name: str, cap: int) -> bytes:
+    encoded = body[f"{name}_base64"]
+    if not isinstance(encoded, str):
+        raise TypeError(f"{name}_base64 is not a string")
+    data = base64.b64decode(encoded, validate=True)
+    if len(data) > cap:
+        raise ValueError(f"{name} exceeds {cap} raw bytes")
+    size = body[f"{name}_size_bytes"]
+    if isinstance(size, bool) or size != len(data):
+        raise ValueError(f"{name} size does not match its decoded payload")
+    if body[f"{name}_sha256"] != hashlib.sha256(data).hexdigest():
+        raise ValueError(f"{name} digest does not match its decoded payload")
+    return data
+
+
+def _parse_checkpoint(raw: bytes, base_sha: str) -> RunnerWorkspaceCheckpoint:
+    body = json.loads(raw)
+    if not isinstance(body, dict):
+        raise TypeError("checkpoint answer is not an object")
+    if body["base_sha"] != base_sha:
+        raise ValueError("checkpoint answer names another base")
+    paths = body["changed_paths"]
+    if not isinstance(paths, list) or not all(isinstance(path, str) and path for path in paths):
+        raise TypeError("changed_paths is not a string list")
+    return RunnerWorkspaceCheckpoint(
+        base_sha=base_sha,
+        patch=_checkpoint_bytes(body, "patch", CHECKPOINT_PATCH_MAX_BYTES),
+        changed_paths=tuple(paths),
+        manifest=_checkpoint_bytes(body, "manifest", CHECKPOINT_MANIFEST_MAX_BYTES),
+    )
+
+
+def _checkpoint_refusal_code(status: int, raw: bytes) -> str | None:
+    if not (400 <= status < 500 or status == 504):
+        return None
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return None
+    code = body.get("code") if isinstance(body, dict) else None
+    return code if isinstance(code, str) and code else None
 
 
 class TurnStream:
@@ -788,6 +871,57 @@ class RunnerClient:
                     "/v1/snapshot returned an invalid bounded payload "
                     f"after {len(raw)} bytes: {type(exc).__name__}: {str(exc)[:160]}"
                 ) from exc
+
+    async def checkpoint(
+        self,
+        base_url: str,
+        token: str | None,
+        *,
+        base_sha: str,
+        budget_seconds: float,
+        remaining_s: float | None = None,
+    ) -> RunnerWorkspaceCheckpoint:
+        """Read a recovery checkpoint of the managed checkout against ``base_sha``.
+
+        Always runner-token authenticated, like ``snapshot``. The runner spends
+        at most ``budget_seconds``; this call waits at most ``remaining_s`` (or
+        the budget plus a short grace) and then raises ``TimeoutError``. A coded
+        refusal raises ``RunnerCheckpointRefused``; anything else unusable raises
+        ``RunnerError``. Errors name codes, statuses and sizes, never bytes.
+        """
+
+        if not token:
+            raise RunnerError("recovery checkpoint requires a runner token")
+        wait_s = remaining_s if remaining_s is not None else budget_seconds + _CHECKPOINT_GRACE_S
+        raw = bytearray()
+        try:
+            async with self._session.post(
+                f"{base_url}/v1/checkpoint",
+                headers=_auth_headers(token),
+                json={"base_sha": base_sha, "budget_seconds": budget_seconds},
+                timeout=self._request_timeout(wait_s),
+            ) as resp:
+                async for chunk in resp.content.iter_chunked(65_536):
+                    raw.extend(chunk)
+                    if len(raw) > _CHECKPOINT_BODY_MAX_BYTES:
+                        raise RunnerError("/v1/checkpoint answer exceeds its encoded byte limit")
+                status = resp.status
+        except aiohttp.ClientError as exc:
+            if isinstance(exc, TimeoutError):
+                raise
+            raise RunnerError(f"/v1/checkpoint transport failed: {type(exc).__name__}") from None
+        if status != 200:
+            code = _checkpoint_refusal_code(status, bytes(raw))
+            if code is not None:
+                raise RunnerCheckpointRefused(code, status)
+            raise RunnerError(f"/v1/checkpoint -> {status} without a refusal code")
+        try:
+            return _parse_checkpoint(bytes(raw), base_sha)
+        except (KeyError, TypeError, ValueError, binascii.Error) as exc:
+            raise RunnerError(
+                "/v1/checkpoint returned an invalid bounded payload "
+                f"after {len(raw)} bytes: {type(exc).__name__}"
+            ) from None
 
     async def status(
         self,

@@ -1084,6 +1084,9 @@ async def _stage(
                 loop=asyncio.get_running_loop(),
                 script=script,
             )
+            # The production kernel holds its dispatch client; the owner stop path
+            # (halt, observe absence, record termination) needs it to run at all.
+            h.kernel._work_items = stage.dispatch
             await stage.sql(
                 "INSERT INTO curie.agents (id, name, repo_full_name) VALUES (:id, :name, :repo)",
                 id=agent_id,
@@ -1569,13 +1572,24 @@ async def _fault_cancellation(stage: _Stage, _monkeypatch: pytest.MonkeyPatch) -
 async def _fault_execution_deadline(stage: _Stage, _monkeypatch: pytest.MonkeyPatch) -> None:
     from curie_api.workitems import lifecycle
 
-    run = await stage.start_run()
-    # Injected time: the execution deadline passes now instead of in hours.
+    # Deadlines are write once at start, so the agent gets the shortest deadline
+    # the schema allows before the run starts and the test waits it out.
     await stage.sql(
-        "UPDATE curie.execution_requests SET execution_deadline = "
-        "clock_timestamp() - interval '1 second' WHERE id = :id",
-        id=run.request_id,
+        "UPDATE curie.agents SET execution_deadline_seconds = 60 WHERE id = :id",
+        id=stage.agent_id,
     )
+    run = await stage.start_run()
+    for _ in range(180):
+        passed = await stage.sql(
+            "SELECT execution_deadline <= clock_timestamp() AS passed "
+            "FROM curie.execution_requests WHERE id = :id",
+            id=run.request_id,
+        )
+        if passed[0]["passed"]:
+            break
+        await asyncio.sleep(0.5)
+    else:
+        raise AssertionError("the 60 second execution deadline never passed")
     versions = (
         await stage.sql(
             "SELECT w.version AS item, r.version AS request FROM curie.execution_requests r "
@@ -1675,12 +1689,13 @@ async def _fault_torn_capture(stage: _Stage, monkeypatch: pytest.MonkeyPatch) ->
             stage.root / "torn-bin", subcommand="write-tree", action=_once(marker, writer)
         ),
     )
+    seeded_calls = len(stage.checkpoint_calls)
     try:
         await stage.release()
     finally:
         monkeypatch.undo()
     assert marker.exists(), "the concurrent writer never ran during the checkpoint"
-    assert len(stage.checkpoint_calls) == 1
+    assert len(stage.checkpoint_calls) == seeded_calls + 1
     await _assert_fault_kept_the_failure(stage, "torn_capture")
     assert await stage.own_checkpoints() == {}
     _assert_released(stage)

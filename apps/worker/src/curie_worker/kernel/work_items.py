@@ -13,6 +13,7 @@ from aci_protocol import (
 from ..binding import FactoryWake
 from ..delivery_lease import DeliveryLease
 from ..killswitch import KillSwitch
+from ..threadlock import LockLeaseLost
 from ..workitem_dispatch import (
     TerminationObservation,
     WorkItemConflict,
@@ -103,10 +104,22 @@ async def _finish_or_settle(
         # The preceding attempt may have committed before its response was
         # lost. Nothing remains to own; do not redeliver the ended turn.
         run.finished = True
+        # A lost response of a committed failed finish (#5143); the recovery
+        # ledger's own ``failed`` source check is the backstop.
+        _mark_recovery_eligible(run, outcome)
     except WorkItemTransportError:
         self._begin_settling(
             run, outcome=outcome, cause=cause, detail=detail, ci_fix_round=ci_fix_round
         )
+    else:
+        _mark_recovery_eligible(run, outcome)
+
+
+def _mark_recovery_eligible(run: WorkItemRun, outcome: str) -> None:
+    """An ordinary failed finish committed: the release may capture first (#5143)."""
+
+    if outcome == "failed":
+        run.recovery_eligible = True
 
 
 async def _settle_work_item(self: Kernel, pending: _SettlingWorkItem) -> None:
@@ -128,6 +141,8 @@ async def _settle_work_item(self: Kernel, pending: _SettlingWorkItem) -> None:
             except WorkItemConflict as exc:
                 if exc.code in {"not_running", "publication_pending"}:
                     run.finished = True
+                if exc.code == "not_running":
+                    _mark_recovery_eligible(run, pending.outcome)
                 return
             except WorkItemTransportError as exc:
                 logger.warning(
@@ -137,6 +152,7 @@ async def _settle_work_item(self: Kernel, pending: _SettlingWorkItem) -> None:
                     exc,
                 )
             else:
+                _mark_recovery_eligible(run, pending.outcome)
                 return
     finally:
         await self._clean_settling_work_item(pending)
@@ -181,6 +197,8 @@ async def _cancel_settling_work_items(
         if agent_id is not None and pending.run.agent_id != agent_id:
             continue
         self._settling_work_items.pop(key)
+        # A termination or reset owns this runtime now: its release is plain.
+        pending.run.recovery_eligible = False
         if pending.task is not None and pending.task is not current:
             pending.task.cancel()
             tasks.append(pending.task)
@@ -595,6 +613,15 @@ async def _release_work_item_sandbox(self: Kernel, run: WorkItemRun) -> None:
             thread_key,
         )
         return
+    if run.recovery_eligible and self._recovery is not None and self._workspace is not None:
+        await self._release_with_recovery(run, claim_name)
+        return
+    await _release_claim_locked(self, thread_key, claim_name)
+
+
+async def _release_claim_locked(self: Kernel, thread_key: str, claim_name: str) -> None:
+    """The plain release: lock the thread, release the recorded claim, unlock."""
+
     try:
         token = await asyncio.wait_for(
             self._lock.acquire(self._config.lock_key(thread_key)),
@@ -608,6 +635,15 @@ async def _release_work_item_sandbox(self: Kernel, run: WorkItemRun) -> None:
         )
         return
     try:
+        await _release_claim(self, thread_key, claim_name)
+    finally:
+        await self._lock.release(self._config.lock_key(thread_key), token)
+
+
+async def _release_claim(self: Kernel, thread_key: str, claim_name: str) -> None:
+    """Release ``claim_name`` if the route still names it. Caller holds the lock."""
+
+    try:
         released = await asyncio.wait_for(
             asyncio.to_thread(self._substrate.release_if_claim, thread_key, claim_name),
             constants._RESET_RELEASE_TIMEOUT_S,
@@ -620,8 +656,76 @@ async def _release_work_item_sandbox(self: Kernel, run: WorkItemRun) -> None:
             thread_key,
             exc_info=True,
         )
-    finally:
-        await self._lock.release(self._config.lock_key(thread_key), token)
+
+
+async def _release_with_recovery(self: Kernel, run: WorkItemRun, claim_name: str) -> None:
+    """Capture a failed run's workspace, then release its claim (#5143, ADR 0251).
+
+    Runs under a renewable lease on the thread lock, which every route decision
+    takes, so no new turn can start on the workspace while it is read. The
+    capture runs only while the thread's route still names this run's claim
+    and the workspace coordinator still holds its prepared base; a late
+    predecessor whose route names a successor's claim captures nothing, and its
+    fenced release then deletes nothing (#4331). The capture never raises and
+    never changes the run's outcome. Ownership is confirmed after the capture;
+    when the lease was lost before the release ran, the lock is reacquired and
+    the plain release runs with the recorded claim. A release that already ran
+    under a confirmed lease is never repeated.
+    """
+
+    assert self._recovery is not None and self._workspace is not None
+    recovery, workspace = self._recovery, self._workspace
+    thread_key = run.thread_key
+    entered = False
+    release_ran = False
+    try:
+        async with self._lock.hold(self._config.lock_key(thread_key)) as lease:
+            entered = True
+            handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
+            prepared = await asyncio.to_thread(workspace.current, thread_key)
+            if handle is not None and handle.claim_name == claim_name and prepared is not None:
+
+                async def fence() -> None:
+                    await lease.ensure_owned()
+                    # The renewer may have marked the lease lost during the await.
+                    if lease.lost:
+                        raise LockLeaseLost(lease.key)
+
+                await recovery.capture(run, handle, prepared, fence=fence)
+            else:
+                logger.info(
+                    "work-item %s no longer owns thread %s's runtime; no recovery capture",
+                    run.request_id,
+                    thread_key,
+                )
+            await lease.ensure_owned()
+            release_ran = True
+            await _release_claim(self, thread_key, claim_name)
+    except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
+        if not entered:
+            logger.warning(
+                "work-item sandbox release could not lock thread %s; leaving the claim",
+                thread_key,
+                exc_info=True,
+            )
+            return
+        if release_ran:
+            # hold()'s exit found the lease gone after the release ran under a
+            # confirmed lease; it is not repeated.
+            logger.info(
+                "work-item %s lease on thread %s ended after its release (%s)",
+                run.request_id,
+                thread_key,
+                type(exc).__name__,
+            )
+            return
+        logger.warning(
+            "work-item %s lost thread %s's lease before release (%s); reacquiring",
+            run.request_id,
+            thread_key,
+            type(exc).__name__,
+        )
+        await _release_claim_locked(self, thread_key, claim_name)
 
 
 async def _terminate_work_item(self: Kernel, qevent: QueuedTurn, request_id: uuid.UUID) -> None:

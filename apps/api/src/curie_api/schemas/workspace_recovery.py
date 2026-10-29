@@ -47,6 +47,9 @@ class RecoveryReserve(RecoveryCaptureAuthority):
     target_branch: Annotated[str, Field(min_length=1, max_length=1024, pattern=r"\S")]
     base_archive_limit_bytes: PositiveInt
     objects: Annotated[list[RecoveryObjectDeclaration], Field(min_length=2, max_length=3)]
+    # The aggregate capture budget still left at this call; the ledger's capture
+    # deadline is ``now`` plus it. Excluded from the idempotency digest.
+    capture_budget_seconds: Annotated[float, Field(gt=0, le=60)] = 60.0
 
     @model_validator(mode="after")
     def _object_set(self) -> Self:
@@ -84,7 +87,29 @@ class RecoveryFail(RecoveryCaptureAuthority):
 
 class RecoveryCaptureFailure(RecoveryMessage):
     checkpoint_id: uuid.UUID
-    status: Literal["tombstoned"] = "tombstoned"
+    status: Literal["tombstoned", "retracted"] = "tombstoned"
+
+
+class RecoveryCaptureContext(RecoveryMessage):
+    repository: RecoveryRepository
+    base_commit: str
+    target_branch: str
+
+
+class RecoveryOutcome(RecoveryCaptureAuthority):
+    reason: Literal[
+        "torn_capture",
+        "capture_timeout",
+        "capture_failed",
+        "runner_unavailable",
+        "patch_too_large",
+        "manifest_too_large",
+        "base_mismatch",
+    ]
+
+
+class RecoveryOutcomeRecorded(RecoveryMessage):
+    recorded: bool
 
 
 class RecoveryAcquireReader(RecoveryMessage):

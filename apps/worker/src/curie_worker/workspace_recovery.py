@@ -1,4 +1,4 @@
-"""Authenticated recovery metadata client, without capture or restoration wiring."""
+"""Authenticated recovery metadata client (ADR 0251); restoration is not wired."""
 
 from typing import Any
 
@@ -25,6 +25,12 @@ class WorkspaceRecoveryClient:
         if not isinstance(result, dict):
             raise ValueError("workspace recovery returned malformed metadata")
         return result
+
+    async def context(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._post("context", payload)
+
+    async def outcome(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._post("outcome", payload)
 
     async def reserve(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._post("reserve", payload)
