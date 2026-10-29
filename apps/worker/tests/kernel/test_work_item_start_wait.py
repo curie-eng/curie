@@ -51,7 +51,9 @@ def test_workspace_timeout_is_uncounted_wait(
         monkeypatch.setattr(case.issuer, "redeem", exhausted_redeem)
     case.run(case.deliver())
     assert_timeout_payload(case, case.fault)
-    assert_uncounted_wait(case, case.run(case.state()))
+    row = case.run(case.state())
+    assert_uncounted_wait(case, row)
+    assert row["last_start_failure_detail"] == case.payloads[0]["start_failure_detail"]
     assert not case.keys()
     assert not case.h.fake_k8s.claims
     if case.fault == "total":
