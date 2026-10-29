@@ -3204,6 +3204,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/identity/binding-classification/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check Binding Classification
+         * @description The worker's per-identity question. Writes and grants nothing.
+         *
+         *     @spec HTTP-INVOCATION-EXECUTION-22.
+         */
+        post: operations["check_binding_classification_v1_internal_identity_binding_classification_check_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/identity/turn-authority/check": {
         parameters: {
             query?: never;
@@ -5485,6 +5507,36 @@ export interface components {
              *     }
              */
             tips?: components["schemas"]["TipsPackConfig"];
+        };
+        /**
+         * BindingClassificationRequestV1
+         * @description @spec HTTP-INVOCATION-EXECUTION-22.
+         */
+        BindingClassificationRequestV1: {
+            /** Request Id */
+            request_id: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            scope: components["schemas"]["TurnAuthorityScopeV1"];
+        };
+        /**
+         * BindingClassificationResponseV1
+         * @description Classification, not permission. @spec HTTP-INVOCATION-EXECUTION-22.
+         */
+        BindingClassificationResponseV1: {
+            /** Http Identity Required */
+            http_identity_required: boolean;
+            /** Request Id */
+            request_id: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            scope: components["schemas"]["TurnAuthorityScopeV1"];
         };
         /** Body_confirm_connection_identity_connect__token__confirm_post */
         Body_confirm_connection_identity_connect__token__confirm_post: {
@@ -17641,6 +17693,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ApprovalCreationResponseV1"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    check_binding_classification_v1_internal_identity_binding_classification_check_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BindingClassificationRequestV1"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BindingClassificationResponseV1"];
                 };
             };
             /** @description Validation Error */
