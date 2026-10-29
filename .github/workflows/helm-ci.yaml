@@ -920,6 +920,14 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/ephemeral-storage-assertions.sh
 
+      # Prove factory scratch volumes can be generic ephemeral claims, the
+      # default stays emptyDir at the profile sizes, and the pod annotation
+      # names the values key that won (issue #5158).
+      - name: helm render assertions (sandbox scratch volume)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/sandbox-scratch-volume-assertions.sh
+
       # Prove values.schema.json bounds the three worker TTL/timeout knobs at
       # both ends (issue #1388): 0, a negative, 31536001 and a non-integer are
       # refused by helm itself, while the shipped defaults, legitimate tuning
