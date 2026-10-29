@@ -1095,6 +1095,7 @@ async def kernel_harness(
     identity_authority: object | None = None,
     pod_termination_wait_s: float = 0.0,
     attachment_access: object | None = None,
+    recovery_factory: Callable[[object | None], object] | None = None,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
     """Assemble a live kernel. @spec HTTP-INVOCATION-EXECUTION-18."""
@@ -1176,6 +1177,7 @@ async def kernel_harness(
     # delivery_budget_s`` validator, which now couples the two.
     runner_client = RunnerClient(total_timeout_s=config.runner_total_timeout_s)
     card_store = ApprovalCardStore(async_redis, config)
+    workspace = workspace_factory(substrate) if workspace_factory else None
     kernel = Kernel(
         substrate=substrate,
         runner=runner_client,
@@ -1201,7 +1203,7 @@ async def kernel_harness(
         approval_reader=approval_reader,  # type: ignore[arg-type]
         actions=actions,  # type: ignore[arg-type]
         publication_creator=publication_creator,  # type: ignore[arg-type]
-        workspace=(workspace_factory(substrate) if workspace_factory else None),  # type: ignore[arg-type]
+        workspace=workspace,  # type: ignore[arg-type]
         card_store=card_store,
         route_ttl_seconds=substrate._config.route_ttl_seconds,
         suspended_route_ttl_seconds=substrate._config.suspended_route_ttl_seconds,
@@ -1218,6 +1220,9 @@ async def kernel_harness(
         ),
         **({"sweep": sweep_factory(async_redis, config)} if sweep_factory is not None else {}),
         **({"identity_authority": identity_authority} if identity_authority is not None else {}),
+        # The terminal recovery capture (#5143) is built over the same workspace
+        # coordinator the kernel releases through; omitted, the kernel has none.
+        **({"recovery": recovery_factory(workspace)} if recovery_factory is not None else {}),
     )
     killswitch = None
     if with_killswitch:
