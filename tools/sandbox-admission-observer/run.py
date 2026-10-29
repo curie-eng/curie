@@ -145,6 +145,22 @@ _KINDS = {
 }
 
 
+def _condition_rows(document: Any) -> list[Any]:
+    """Return status.conditions only when it is a list.
+
+    kube-apiserver accepts an explicit null. dict.get's default does not apply
+    when the key is present, so a null status or null conditions used to raise
+    TypeError inside startup polling and the generic handler hid that class.
+    """
+    if not isinstance(document, dict):
+        return []
+    status = document.get("status")
+    if not isinstance(status, dict):
+        return []
+    rows = status.get("conditions")
+    return rows if isinstance(rows, list) else []
+
+
 class _Collector:
     def __init__(self, context: str, run_id: str, command: list[str]) -> None:
         self.namespace = f"test-4368-idle-capacity-{run_id}"
@@ -306,30 +322,47 @@ class _Collector:
             if self._namespace_present:
                 self._namespace_ended = True
             return
+        metadata = namespace.get("metadata")
+        if not isinstance(metadata, dict):
+            return
         self._namespace_present = True
-        if namespace.get("metadata", {}).get("deletionTimestamp"):
+        if metadata.get("deletionTimestamp"):
             self._namespace_ended = True
             self.observer.verify()
             return
         if not self._versions:
             crds = self._get("crd", *_KINDS.values())
+            items = crds.get("items")
+            if not isinstance(items, list):
+                items = []
             established = [
                 any(
-                    row.get("type") == "Established" and row.get("status") == "True"
-                    for row in obj.get("status", {}).get("conditions", [])
+                    isinstance(row, dict)
+                    and row.get("type") == "Established"
+                    and row.get("status") == "True"
+                    for row in _condition_rows(obj)
                 )
-                for obj in crds.get("items", [])
+                for obj in items
+                if isinstance(obj, dict)
             ]
             if len(established) == 2 and all(established):
                 preflight = self._get("job", f"{self.fullname}-preflight-controller")
                 if any(
-                    row.get("type") == "Complete" and row.get("status") == "True"
-                    for row in preflight.get("status", {}).get("conditions", [])
+                    isinstance(row, dict)
+                    and row.get("type") == "Complete"
+                    and row.get("status") == "True"
+                    for row in _condition_rows(preflight)
                 ):
                     self._start_objects()
         if self._versions and not self._worker_started:
             worker = self._get("deployment", f"{self.fullname}-worker")
-            if worker.get("status", {}).get("availableReplicas", 0) > 0:
+            worker_status = worker.get("status") if isinstance(worker, dict) else None
+            replicas = (
+                worker_status.get("availableReplicas", 0)
+                if isinstance(worker_status, dict)
+                else 0
+            )
+            if isinstance(replicas, int) and replicas > 0:
                 self._stream(
                     "logs",
                     ["logs", f"deployment/{self.fullname}-worker",
@@ -484,8 +517,11 @@ def main(arguments: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("FAIL: admission observation interrupted", file=sys.stderr)
         result = 130
-    except Exception:  # noqa: BLE001 - control plane exceptions may contain credentials
-        print("FAIL: admission observer could not complete", file=sys.stderr)
+    except Exception as error:  # noqa: BLE001 - control plane exceptions may contain credentials
+        print(
+            f"FAIL: admission observer could not complete ({type(error).__name__})",
+            file=sys.stderr,
+        )
     finally:
         signal.signal(signal.SIGTERM, previous)
         try:
