@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -1668,6 +1669,9 @@ def test_concurrent_daemon_sections_are_collected_over_each_probe_window(
         t0, t1 = pods.windows[run]
         assert bound["context"] == CONTEXT
         assert bound["namespace"] == DAEMON_NAMESPACE
+        # The daemon is read with the client credential of the same run's runner pod.
+        assert bound["runner_namespace"] == obj.ns == NAMESPACE
+        assert bound["runner_pod"] == RUNNERS[run]
         assert bound["nonce"] == NONCE
         assert str(bound["since"]) == str(math.floor(t0) - 5)
         assert str(bound["until"]) == str(math.ceil(t1) + 5)
@@ -2161,6 +2165,9 @@ def test_ci_stub_check_runs_carry_the_requested_head(
         with urlopen(request, context=context, timeout=30) as response:
             token = str(json.load(response)["token"])
         monkeypatch.setenv("SSL_CERT_FILE", str(stub.ca_file))
+        # urlopen's shared opener fixes its TLS context when first built, so an
+        # earlier test's plain urlopen would otherwise hide SSL_CERT_FILE here.
+        monkeypatch.setattr(urllib.request, "_opener", None)
         monkeypatch.setenv("GITHUB_TOKEN", token)
         section = docker_scenario.collect_ci(
             stub.base_url + "/api/v3", dl.REPO, "main", sha, ["E2E required"]
