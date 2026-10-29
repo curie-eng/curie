@@ -198,6 +198,54 @@ def test_a_base_relabel_before_publication_still_restarts_and_claims_the_request
     assert (_item(number)["base_branch"], _item(number)["base_source"]) == ("next", "label")
 
 
+@pytest.mark.parametrize("finished_status", ["completed", "failed"])
+def test_a_base_webhook_cannot_restart_finished_work_without_a_fresh_factory_marking(
+    admitted: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    finished_status: str,
+) -> None:
+    client, github, _sink = admitted
+    _train(monkeypatch, tmp_path, client)
+    number = 32110
+    assert _labelled(client, github, number).json()["status"] == "factory_admitted"
+    request_id = _requests(number)[0]["id"]
+    _start_running(client, request_id)
+    original = _item(number)
+    cause = "completed" if finished_status == "completed" else "no_pull_request"
+    _execute(
+        "UPDATE curie.execution_requests SET status = :status, terminal_cause = :cause, "
+        "terminal_at = clock_timestamp() WHERE id = :id",
+        {"status": finished_status, "cause": cause, "id": request_id},
+    )
+    github.labels = [LABEL, "base:next"]
+
+    for _ in range(2):
+        observed = _post(
+            client, "issues", _issue_event("labeled", number, label={"name": "base:next"})
+        )
+        assert observed.status_code == 200, observed.text
+        assert _requests(number) == [{"id": request_id, "status": finished_status}]
+        current = _item(number)
+        assert (current["base_branch"], current["base_commit"]) == (
+            original["base_branch"], original["base_commit"]
+        )
+
+    marked = _labelled(client, github, number, "base:next")
+
+    assert marked.status_code == 200, marked.text
+    assert marked.json()["status"] == "factory_admitted", marked.text
+    predecessor, replacement = _requests(number)
+    assert predecessor == {"id": request_id, "status": finished_status}
+    assert replacement["id"] != request_id
+    assert replacement["status"] == "waiting"
+    acquired = _acquire(client, number)
+    assert acquired.status_code == 200, acquired.text
+    assert (_item(number)["base_branch"], _item(number)["base_commit"]) == (
+        "next", github.branches["next"]
+    )
+
+
 @pytest.mark.parametrize(("target", "status_code"), [("next", 409), ("main", 200)])
 def test_factory_label_readmission_cannot_repin_an_existing_pull_request(
     admitted: Any,
