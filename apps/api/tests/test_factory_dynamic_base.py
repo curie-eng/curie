@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import Settings, get_settings
+from curie_api.factory_notices import sync_status_comments
+from curie_api.forges.registry import forges_registry
 from forge_fakes.github import LABEL, REPO, _issue_event, _post, _signature
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -33,7 +37,7 @@ from test_github_factory_base import (  # noqa: F401
     _work_item,
     base_app,
 )
-from test_github_factory_ingress import _rows
+from test_github_factory_ingress import _code, _rows
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -60,6 +64,278 @@ def _start(client: Any, number: int, grant: Any) -> Any:
             "context": grant.json()["context"],
         },
     )
+
+
+def _set_forges(
+    client: Any, monkeypatch: pytest.MonkeyPatch, environment: dict[str, str | None]
+) -> None:
+    for key, value in environment.items():
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    get_settings.cache_clear()
+    client.app.state.forges = forges_registry(get_settings())
+
+
+def _revoke_tracker(
+    client: Any, monkeypatch: pytest.MonkeyPatch, *, change: str = "removed"
+) -> dict[str, str | None]:
+    original = {
+        key: os.environ.get(key) for key in ("CURIE_FORGES", "FACTORY_ENABLED", "GITHUB_API_URL")
+    }
+    document = json.loads(os.environ["CURIE_FORGES"])
+    revoked = {**original, "FACTORY_ENABLED": "false"}
+    if change == "removed":
+        removed = {entry["name"] for entry in document["trackers"]}
+        document["bindings"] = [
+            entry for entry in document["bindings"] if entry["tracker"] not in removed
+        ]
+        document["trackers"] = []
+    else:
+        assert change == "host_changed"
+        revoked["GITHUB_API_URL"] = "https://github.example.com/api/v3"
+        for section in ("trackers", "code_hosts"):
+            for entry in document[section]:
+                entry["host"] = "github.example.com"
+                entry["api_url"] = "https://github.example.com/api/v3"
+    revoked["CURIE_FORGES"] = json.dumps(document)
+    _set_forges(client, monkeypatch, revoked)
+    return original
+
+
+def _acquire_through_forge(
+    client: Any,
+    request_id: uuid.UUID,
+    payload: dict[str, Any],
+    forge: Callable[[httpx.Request], httpx.Response],
+) -> httpx.Response:
+    async def post() -> httpx.Response:
+        previous = client.app.state.http_client
+        async with httpx.AsyncClient(transport=httpx.MockTransport(forge)) as external:
+            client.app.state.http_client = external
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
+                ) as http:
+                    return await http.post(
+                        f"/v1/internal/work-items/requests/{request_id}/acquire",
+                        headers=WORKER,
+                        json=payload,
+                    )
+            finally:
+                client.app.state.http_client = previous
+
+    return client.portal.call(post)
+
+
+def _assert_unstarted_and_unpinned(number: int, admitted: dict[str, Any]) -> None:
+    row = _execution(number)
+    assert row["id"] == admitted["id"]
+    assert row["objective"] == admitted["objective"]
+    assert row["wait_deadline"] == admitted["wait_deadline"]
+    assert row["execution_attempts"] == 0
+    assert row["runtime_epoch"] == admitted["runtime_epoch"]
+    for field in (
+        "acquire_owner",
+        "acquired_generation",
+        "acquire_expires_at",
+        "started_at",
+        "execution_deadline",
+        "runtime_owner",
+        "runtime_claim_name",
+        "runtime_sandbox_name",
+    ):
+        assert row[field] is None, (field, row[field])
+    (item,) = _rows(
+        "SELECT base_branch, base_source, base_commit, base_resolved_request_id, "
+        "base_selection_fingerprint, publication_lineage_id FROM curie.work_items WHERE id = :id",
+        {"id": admitted["work_item_id"]},
+    )
+    assert all(value is None for value in item.values()), item
+    assert _rows(
+        "SELECT id FROM curie.publications WHERE execution_request_id = :id",
+        {"id": admitted["id"]},
+    ) == []
+
+
+@pytest.mark.parametrize("change", ["removed", "host_changed"])
+def test_unresolved_acquisition_refuses_invalid_tracker_authority_and_recovers(
+    base_app: Any, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    client, api = base_app
+    number = 32010
+    assert _label(client, api, number, "base:next").json()["status"] == "factory_admitted"
+    _due(number)
+    before, payload = _execution(number), _acquire_body(number)
+    original = _revoke_tracker(client, monkeypatch, change=change)
+    reads: list[str] = []
+
+    def forge(request: httpx.Request) -> httpx.Response:
+        reads.append(request.url.path)
+        return api.handle(request)
+
+    refused = _acquire_through_forge(client, before["id"], payload, forge)
+
+    assert refused.status_code == 409, refused.text
+    assert _code(refused) == "factory_surface_mismatch"
+    row = _execution(number)
+    assert row["status"] == "waiting"
+    assert row["last_deferral_reason"] == "not_started:factory_surface_mismatch"
+    assert row["start_deferrals"] == before["start_deferrals"] + 1
+    assert row["capacity_deferrals"] == before["capacity_deferrals"]
+    assert row["dispatch_generation"] == before["dispatch_generation"] + 1
+    assert row["terminal_cause"] is None
+    assert reads == []
+    _assert_unstarted_and_unpinned(number, before)
+    _set_forges(client, monkeypatch, original)
+    _due(number)
+
+    restored = _acquire(client, number)
+
+    assert restored.status_code == 200, restored.text
+    assert _execution(number)["id"] == before["id"]
+    assert _execution(number)["start_deferrals"] == before["start_deferrals"] + 1
+    assert _work_item(number)["base_commit"] == NEXT_SHA
+    assert _start(client, number, restored).status_code == 200
+    assert _execution(number)["execution_attempts"] == 1
+
+
+def test_removed_tracker_settles_after_five_refusals_and_keeps_its_status_outbox_owed(
+    base_app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, api = base_app
+    monkeypatch.setenv("CURIE_WORK_ITEM_START_DEFERRAL_LIMIT", "5")
+    get_settings.cache_clear()
+    number = 32011
+    assert _label(client, api, number).json()["status"] == "factory_admitted"
+    _due(number)
+    before = _execution(number)
+    notice_sql = "SELECT * FROM curie.factory_terminal_notices WHERE execution_request_id = :id"
+    (notice_before,) = _rows(notice_sql, {"id": before["id"]})
+    _revoke_tracker(client, monkeypatch)
+    for attempt in range(1, 6):
+        _due(number)
+        refused = _acquire(client, number)
+        assert refused.status_code == 409, refused.text
+        assert _code(refused) == (
+            "factory_start_failed" if attempt == 5 else "factory_surface_mismatch"
+        )
+        row = _execution(number)
+        assert row["status"] == ("failed" if attempt == 5 else "waiting")
+        assert row["start_deferrals"] == attempt
+        assert row["capacity_deferrals"] == before["capacity_deferrals"]
+        assert row["dispatch_generation"] == before["dispatch_generation"] + attempt
+        assert row["last_deferral_reason"] == "not_started:factory_surface_mismatch"
+        _assert_unstarted_and_unpinned(number, before)
+    assert row["terminal_cause"] == "start_failed"
+    assert row["terminal_at"] is not None
+    (terminal_notice,) = _rows(notice_sql, {"id": before["id"]})
+    assert terminal_notice["terminal_cause"] == "start_failed"
+    assert terminal_notice["card_token"] == notice_before["card_token"]
+
+    async def sync() -> int:
+        return await sync_status_comments(
+            client.app.state.sessionmaker, get_settings(), owner="authority-outbox", limit=1
+        )
+
+    for attempt in range(1, 3):
+        assert client.portal.call(sync) == 0
+        (notice,) = _rows(notice_sql, {"id": before["id"]})
+        assert notice["execution_request_id"] == before["id"]
+        assert notice["work_item_id"] == before["work_item_id"]
+        assert notice["terminal_cause"] == "start_failed"
+        assert notice["attempts"] == terminal_notice["attempts"] + attempt
+        assert notice["sync_owner"] is None
+        assert notice["sync_lease_expires_at"] is None
+        for field in ("finalized_at", "refusal", "refused_at"):
+            assert notice[field] is None
+        assert notice["rendered_digest"] == notice_before["rendered_digest"]
+        assert _execution(number) == row
+    assert api.comment_writes == []
+    assert api.branch_requests == []
+
+
+@pytest.mark.parametrize(
+    ("delivery", "code"),
+    [("generation", "not_published"), ("owner", "duplicate"), ("wake", "factory_wake_mismatch")],
+)
+def test_invalid_unresolved_delivery_cannot_classify_revoked_authority(
+    base_app: Any, monkeypatch: pytest.MonkeyPatch, delivery: str, code: str
+) -> None:
+    client, api = base_app
+    number = 32012
+    assert _label(client, api, number).json()["status"] == "factory_admitted"
+    _due(number)
+    payload = _acquire_body(number)
+    if delivery == "generation":
+        _execute(
+            "UPDATE curie.execution_requests SET dispatch_generation = dispatch_generation + 1 "
+            "WHERE id = :id",
+            {"id": _execution(number)["id"]},
+        )
+        _due(number)
+    elif delivery == "owner":
+        _execute(
+            "UPDATE curie.execution_requests SET acquire_owner = 'other-owner', "
+            "acquired_generation = dispatch_generation, acquire_expires_at = wait_deadline "
+            "WHERE id = :id",
+            {"id": _execution(number)["id"]},
+        )
+    else:
+        payload["wake"]["conversation_id"] = "foreign-issue-thread"
+    before = _execution(number)
+    item_before = _work_item(number)
+    _revoke_tracker(client, monkeypatch)
+    reads: list[str] = []
+
+    def forge(request: httpx.Request) -> httpx.Response:
+        reads.append(request.url.path)
+        return api.handle(request)
+
+    refused = _acquire_through_forge(client, before["id"], payload, forge)
+
+    assert refused.status_code == 409, refused.text
+    assert _code(refused) == code
+    assert _execution(number) == before
+    assert _work_item(number) == item_before
+    assert reads == []
+
+
+def test_an_authorized_tracker_outage_does_not_count_as_a_start_refusal(base_app: Any) -> None:
+    client, api = base_app
+    number = 32013
+    assert _label(client, api, number, "base:next").json()["status"] == "factory_admitted"
+    _due(number)
+    before = _execution(number)
+    reads: list[str] = []
+
+    def forge(request: httpx.Request) -> httpx.Response:
+        reads.append(request.url.path)
+        if request.url.path == f"/repos/{REPO}/issues/{number}":
+            return httpx.Response(503, json={"message": "Service Unavailable"})
+        return api.handle(request)
+
+    refused = _acquire_through_forge(client, before["id"], _acquire_body(number), forge)
+
+    assert refused.status_code == 409, refused.text
+    assert _code(refused) == "not_dispatchable"
+    row = _execution(number)
+    assert row["status"] == "waiting"
+    assert row["last_deferral_reason"] == "base_unavailable"
+    assert row["start_deferrals"] == 0
+    assert row["capacity_deferrals"] == before["capacity_deferrals"]
+    assert f"/repos/{REPO}/issues/{number}" in reads
+    assert api.branch_requests == []
+    _assert_unstarted_and_unpinned(number, before)
+    _due(number)
+
+    restored = _acquire(client, number)
+
+    assert restored.status_code == 200, restored.text
+    assert _execution(number)["id"] == before["id"]
+    assert _work_item(number)["base_commit"] == NEXT_SHA
+    assert _start(client, number, restored).status_code == 200
 
 
 def test_admission_does_not_read_or_resolve_a_branch_head(base_app: Any) -> None:
