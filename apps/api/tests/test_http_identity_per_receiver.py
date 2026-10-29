@@ -291,10 +291,16 @@ def test_internal_route_without_runtime_classifies_every_binding_legacy(
     hooks_client: TestClient,
     synthetic_provider: SimpleNamespace,  # noqa: F811 - the reused fixture.
 ) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-22: an uninitialized API registers nothing."""
+    """@spec HTTP-INVOCATION-EXECUTION-22: an uninitialized API registers nothing.
+
+    The scope's own agent has a migrated filter, so only the unfiltered sibling
+    is legacy.
+    """
     scope = _scope(synthetic_provider.url)
+    sibling = _sibling(scope)
     scope["generation"] = run_generation(scope)
-    answer = _check(hooks_client, scope)
+    assert _check(hooks_client, scope).json()["http_identity_required"] is True
+    answer = _check(hooks_client, sibling)
     assert answer.status_code == 200, answer.text
     assert answer.json()["http_identity_required"] is False
 
