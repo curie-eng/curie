@@ -55,6 +55,7 @@ import shlex
 import shutil
 import socket
 import stat
+import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
@@ -1436,6 +1437,83 @@ async def _race_lease_lost_after_fence(stage: _Stage) -> None:
     await stage.assert_request_unchanged()
 
 
+async def _race_lease_lost_during_final_fence(stage: _Stage) -> None:
+    """The renewer loses the lease while the final pre-release ``ensure_owned`` awaits.
+
+    The compare-token renewal itself succeeded, but by the time it returns the
+    background renewer has seen a replaced token and marked the lease lost. The
+    release must not run under that lease: it goes through the reacquired plain
+    path and releases only the recorded claim.
+    """
+
+    await stage.start_run()
+    await stage.fail_turn()
+    await stage.finish_failed()
+    assert stage.capture is not None
+    lock = stage.h.kernel._lock
+    real_renew = lock._renew
+    armed: list[bool] = []
+    lost_tokens: list[str] = []
+
+    async def renew_then_lose(lease: Any, key: str, token: str) -> bool:
+        owned = await real_renew(key, token)
+        assert owned, "the final fence found the lease already gone"
+        # A successor replaces the token; the concurrent renewer's next pass
+        # (the body of ThreadLock._renew_until_lost) observes it and marks the
+        # lease lost before this fence's await resumes.
+        stage.lose_lease()
+        if not await real_renew(key, token):
+            lease.mark_lost()
+        stage.successor_unlocks()
+        lost_tokens.append(token)
+        return owned
+
+    def renew(key: str, token: str) -> Awaitable[bool]:
+        caller = sys._getframe(1)
+        if armed and caller.f_code.co_name == "ensure_owned":
+            armed.clear()
+            return renew_then_lose(caller.f_locals["self"], key, token)
+        return real_renew(key, token)
+
+    real_capture = stage.capture.capture
+    seen: list[Any] = []
+
+    async def capture_then_arm(*args: Any, **kwargs: Any) -> Any:
+        result = await real_capture(*args, **kwargs)
+        seen.append(result)
+        # The next ownership fence is the one guarding release_if_claim.
+        armed.append(True)
+        return result
+
+    stage.capture.capture = capture_then_arm  # type: ignore[method-assign]
+    stage.observer = _ReleaseObserver(stage)
+    observer = stage.observer
+    held_at_release: list[str | None] = []
+
+    def recording(thread_key: str, claim_name: str) -> bool:
+        held_at_release.append(stage.sync_redis.get(stage.lock_key))
+        return observer(thread_key, claim_name)
+
+    stage.h.substrate.release_if_claim = recording  # type: ignore[method-assign]
+    lock._renew = renew  # type: ignore[method-assign]
+    try:
+        await stage.release()
+    finally:
+        del lock._renew
+    _assert_release_bounded(stage)
+
+    assert [result.status for result in seen] == ["complete"]
+    assert not armed and len(lost_tokens) == 1, "the final fence never ran"
+    # Exactly one release, under a freshly reacquired token, never the lost one.
+    assert len(held_at_release) == 1, held_at_release
+    assert held_at_release[0] is not None, "release_if_claim ran with no thread lock held"
+    assert held_at_release[0] not in {lost_tokens[0], SUCCESSOR_TOKEN}, held_at_release
+    _assert_released(stage)
+    own = await stage.own_checkpoints()
+    assert list(own.values()) == ["complete"], own
+    await stage.assert_request_unchanged()
+
+
 async def _race_lease_lost_after_release(stage: _Stage) -> None:
     await stage.start_run()
     await stage.fail_turn()
@@ -1495,6 +1573,7 @@ _RACES: dict[str, Callable[[_Stage], Awaitable[None]]] = {
     "successor_with_newer_outcome": _race_successor_newer_outcome,
     "lease_lost_during_complete_retracts": _race_lease_lost_during_complete,
     "lease_lost_after_fence_before_release": _race_lease_lost_after_fence,
+    "lease_lost_during_final_fence_reacquires": _race_lease_lost_during_final_fence,
     "lease_lost_after_release_not_repeated": _race_lease_lost_after_release,
     "lock_unobtainable_release_deferred": _race_lock_unobtainable,
 }

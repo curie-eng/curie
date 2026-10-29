@@ -1200,12 +1200,19 @@ def _checkpoint_status(reservation: dict[str, Any]) -> str:
     )
 
 
-def _lease_lost(client: Any, source: dict[str, Any], reservation: dict[str, Any]) -> Any:
-    return _post(client, "fail", {
+def _lease_lost(
+    client: Any, source: dict[str, Any], reservation: dict[str, Any], *, retract: bool = False
+) -> Any:
+    """``retract`` is sent only by a writer whose own completion returned this invocation."""
+
+    body: dict[str, Any] = {
         **_authority(source),
         "checkpoint_id": reservation["checkpoint_id"],
         "reason": "lease_lost",
-    })
+    }
+    if retract:
+        body["retract"] = True
+    return _post(client, "fail", body)
 
 
 def _terminal_now(source: dict[str, Any]) -> None:
@@ -1605,7 +1612,7 @@ def test_lease_lost_retracts_the_just_completed_checkpoint_to_the_previous_one(
     _completed(client, source, second)
     assert _last_good(source) == second["checkpoint_id"]
 
-    response = _lease_lost(client, source, second)
+    response = _lease_lost(client, source, second, retract=True)
     body = _ok(response)
     assert body == {"checkpoint_id": second["checkpoint_id"], "status": "retracted"}
     _no_capability(response.text)
@@ -1620,6 +1627,7 @@ def test_lease_lost_retracts_the_just_completed_checkpoint_to_the_previous_one(
     state = _snapshot()
     repeated = _post(client, "fail", {
         **_authority(source), "checkpoint_id": second["checkpoint_id"], "reason": "lease_lost",
+        "retract": True,
     })
     assert repeated.status_code in {200, 409}, repeated.text
     assert _snapshot() == state
@@ -1634,7 +1642,7 @@ def test_lease_lost_retraction_of_the_only_checkpoint_clears_the_pointer(
     _completed(client, source, only)
     # Superseded while the completion committed: the retraction still applies.
     _seed(agent_id=source["agent_id"], item_id=source["work_item_id"])
-    assert _ok(_lease_lost(client, source, only))["status"] == "retracted"
+    assert _ok(_lease_lost(client, source, only, retract=True))["status"] == "retracted"
     assert _last_good(source) is None
     assert _checkpoint_status(only) == "tombstoned"
 
@@ -1659,6 +1667,62 @@ def test_a_complete_checkpoint_is_retracted_only_by_its_own_lease_loss(
     before = _snapshot()
     _refused(_post(client, "fail", {
         **authority, "checkpoint_id": target["checkpoint_id"], "reason": reason,
+        "retract": True,
     }))
     assert _snapshot() == before
     assert _last_good(source) == second["checkpoint_id"]
+
+
+def test_lease_lost_without_retract_never_withdraws_a_complete_checkpoint(
+    recovery: None, client: Any
+) -> None:
+    """A replay that lost its lease before its own completion cannot retract.
+
+    Its reserve answered an already complete checkpoint, so only ``retract: true``
+    (sent after the writer's own ``complete`` returned) may withdraw it.
+    """
+
+    _routes_exist(client)
+    source = _seed()
+    first = _reserved(client, source)
+    _completed(client, source, first)
+    second = _reserved(client, source, reuse=True)
+    _completed(client, source, second)
+    before = _snapshot()
+    response = _lease_lost(client, source, second)
+    _refused(response)
+    assert response.json()["detail"]["code"] == "workspace_recovery.checkpoint_state"
+    assert _snapshot() == before
+    assert _checkpoint_status(second) == "complete"
+    assert _last_good(source) == second["checkpoint_id"]
+    _release(client, _reader(client, source, second))
+
+
+@pytest.mark.parametrize("repeat", ("retract", "lease_lost", "upload_failed"))
+def test_a_repeated_fail_after_retraction_answers_retracted_never_tombstoned(
+    recovery: None, client: Any, repeat: str
+) -> None:
+    """``tombstoned`` tells the writer to discard; a once-complete checkpoint never is."""
+
+    _routes_exist(client)
+    source = _seed()
+    first = _reserved(client, source)
+    _completed(client, source, first)
+    second = _reserved(client, source, reuse=True)
+    _completed(client, source, second)
+    reader = _reader(client, source, second)
+    assert _ok(_lease_lost(client, source, second, retract=True))["status"] == "retracted"
+    state = _snapshot()
+    body: dict[str, Any] = {
+        **_authority(source),
+        "checkpoint_id": second["checkpoint_id"],
+        "reason": "upload_failed" if repeat == "upload_failed" else "lease_lost",
+    }
+    if repeat == "retract":
+        body["retract"] = True
+    response = _post(client, "fail", body)
+    assert _ok(response) == {"checkpoint_id": second["checkpoint_id"], "status": "retracted"}
+    _no_capability(response.text)
+    assert _snapshot() == state
+    assert _last_good(source) == first["checkpoint_id"]
+    _release(client, reader)

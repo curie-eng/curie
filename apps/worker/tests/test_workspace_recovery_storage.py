@@ -1575,6 +1575,120 @@ async def _case_replay_through_fault(ctx: _Ctx) -> None:
         assert _exists(ctx.harness, _physical(object_key)), object_key
 
 
+async def _case_replay_with_lost_lease(ctx: _Ctx) -> None:
+    """A replay names a complete checkpoint and its fence fails: nothing is retracted.
+
+    Only a writer whose own ``complete`` returned in this invocation may withdraw a
+    checkpoint. A replay that lost its lease before completing never did, so the
+    ledger refuses its ``lease_lost`` cleanup and the checkpoint stays the answer.
+    """
+
+    source = await _seed(ctx)
+    previous = await _good_checkpoint(ctx, source, base=ctx.harness.base_source())
+    key = uuid.uuid4().hex
+    first = await _writer(ctx).capture(
+        _request(source, patch=ctx.harness.patch, manifest=ctx.harness.manifest, base=None, key=key)
+    )
+    assert first.status == "complete", first
+    completed = first.checkpoint_id
+    assert completed is not None and completed != previous
+    keys = await _checkpoint_keys(ctx, completed)
+    assert set(keys) == {"patch", "manifest"}
+
+    fenced: list[int] = []
+
+    async def lost() -> None:
+        # Injected fault: the replaying worker's thread lease is already gone.
+        fenced.append(1)
+        raise _InjectedFailure("lease lost before the replayed completion")
+
+    replay = await _writer(ctx).capture(
+        _request(
+            source, patch=ctx.harness.patch, manifest=ctx.harness.manifest, base=None, key=key
+        ),
+        fence=lost,
+    )
+    assert fenced == [1], "the replay never reached its completion fence"
+    assert replay.status == "failed", replay
+    assert replay.failure == "lease_lost", replay
+    assert replay.checkpoint_id in {None, completed}, replay
+    assert await _checkpoint_status(ctx, completed) == "complete"
+    assert await _last_good(ctx, source) == completed
+    for object_key in keys.values():
+        assert _exists(ctx.harness, _physical(object_key)), object_key
+    await _assert_readable(ctx, source, completed, ctx.harness.good_digests())
+    await _assert_readable(ctx, source, previous, ctx.harness.good_digests())
+
+
+async def _case_retracted_checkpoint_is_never_discarded(ctx: _Ctx) -> None:
+    """After a retraction every repeated ``fail`` answers ``retracted``, never ``tombstoned``.
+
+    A reader that selected the checkpoint before it was withdrawn keeps reading it,
+    so a replayed capture or a repeated cleanup must never discard its objects.
+    """
+
+    source = await _seed(ctx)
+    previous = await _good_checkpoint(ctx, source, base=ctx.harness.base_source())
+    reader = _reader(ctx)
+    held: list[RecoveryReadLease] = []
+    fenced: list[int] = []
+
+    async def lost_after_commit() -> None:
+        fenced.append(1)
+        if len(fenced) < 2:
+            return
+        # A reader selects the just-completed checkpoint, then the lease is lost.
+        just_completed = await _last_good(ctx, source)
+        assert just_completed is not None and just_completed != previous
+        held.append(
+            await reader.acquire(
+                work_item_id=source.work_item_id,
+                checkpoint_id=just_completed,
+                holder_id=f"early-reader-{uuid.uuid4().hex[:8]}",
+            )
+        )
+        raise _InjectedFailure("lease lost after the completion committed")
+
+    key = uuid.uuid4().hex
+    request = _request(
+        source, patch=ctx.harness.patch, manifest=ctx.harness.manifest, base=None, key=key
+    )
+    withdrawn = await _writer(ctx).capture(request, fence=lost_after_commit)
+    assert fenced == [1, 1], fenced
+    assert withdrawn.status == "failed" and withdrawn.failure == "lease_lost", withdrawn
+    retracted = withdrawn.checkpoint_id
+    assert retracted is not None and len(held) == 1
+    lease = held[0]
+    assert lease.checkpoint_id == retracted
+    assert await _checkpoint_status(ctx, retracted) == "tombstoned"
+    assert await _last_good(ctx, source) == previous
+    keys = await _checkpoint_keys(ctx, retracted)
+    assert set(keys) == {"patch", "manifest"}
+
+    try:
+        # The same capture replayed, as after a worker restart, then its cleanup
+        # repeated directly: each answer keeps the objects for the collector.
+        replay = await _writer(ctx).capture(request)
+        assert replay.status == "failed", replay
+        repeated = await ctx.ledger.fail(
+            {
+                **_authority(source).payload(),
+                "checkpoint_id": str(retracted),
+                "reason": "lease_lost",
+            }
+        )
+        assert repeated == {"checkpoint_id": str(retracted), "status": "retracted"}, repeated
+        for object_key in keys.values():
+            assert _exists(ctx.harness, _physical(object_key)), object_key
+        # The early reader still reads every object to the end.
+        for path in (await _read_all(ctx, reader, lease, ctx.harness.good_digests())).values():
+            path.unlink()
+    finally:
+        await reader.release(lease)
+    assert await _last_good(ctx, source) == previous
+    await _assert_readable(ctx, source, previous, ctx.harness.good_digests())
+
+
 async def _accepted_second_capture(ctx: _Ctx, *, patch: bytes, manifest: bytes) -> None:
     source = await _seed(ctx)
     previous = await _good_checkpoint(ctx, source, base=ctx.harness.base_source())
@@ -1760,6 +1874,8 @@ _FAULT_CASES: dict[str, Callable[[_Ctx], Awaitable[None]]] = {
     "corrupt_base": _case_corrupt_base,
     "storage_outage": _case_storage_outage,
     "replay_through_fault": _case_replay_through_fault,
+    "replay_with_lost_lease": _case_replay_with_lost_lease,
+    "retracted_checkpoint_is_never_discarded": _case_retracted_checkpoint_is_never_discarded,
     "patch_at_limit": _case_patch_at_limit,
     "patch_over_limit": _case_patch_over_limit,
     "manifest_at_limit": _case_manifest_at_limit,
