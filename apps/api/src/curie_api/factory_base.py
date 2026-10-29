@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from .branches import base_allowed
 from .factory_notices import code_span
 from .forges.config import RepositoryBindingConfig
 from .forges.errors import ForgeError
@@ -90,32 +91,13 @@ def choose_base(
         # The repository read carried no default branch; ask again later.
         raise FeedbackUnavailable("repository_unavailable")
     choice = BaseChoice(branch, "label" if named else "default")
-    allowed = entry.bases if entry is not None else (default_branch,)
-    if choice.branch not in allowed:
+    allowed = entry.bases if entry is not None else ()
+    if not base_allowed(choice.branch, allowed, default_branch=default_branch):
         return BaseRefusal(
             "base_not_allowed",
             f"base {code_span(choice.branch)} is not an allowed base for this deployment",
         )
     return choice
-
-
-def label_disagreement(
-    labels: set[str],
-    entry: RepositoryBindingConfig | None,
-    default_branch: str | None,
-    recorded: str,
-) -> str | None:
-    """The branch the labels now name when it is not the recorded base.
-
-    The recorded base is kept regardless; this is only what the status comment
-    reports. Two labels name no single branch, so they report nothing.
-    """
-
-    named = _named(labels)
-    if len(named) > 1:
-        return None
-    branch = _single_base(named, entry, default_branch)
-    return branch if branch is not None and branch != recorded else None
 
 
 async def resolve_base(
@@ -150,8 +132,9 @@ def refusal_body(refusal: BaseRefusal) -> str:
     """The refusal comment's text; the comment adapter appends the marker."""
 
     return (
-        f"Curie did not start this issue: {refusal.reason}. Fix the `base:` label or the"
-        " deployment's allowed bases; Curie will pick the issue up again on its next pass."
+        f"Curie refused this base selection: {refusal.reason}. Fix the `base:` label or the"
+        " deployment's allowed bases. Queued work retries on a later pass; after a run"
+        " finishes, re-add the factory label to request another attempt."
     )
 
 

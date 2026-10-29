@@ -2567,6 +2567,7 @@ const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     "CURIE_E2E_SERVICE_ACCOUNT_NAMESPACE",
     "CURIE_E2E_TTL_SECONDS",
     "CURIE_E2E_WORKER_CLUSTER_ROLE",
+    "CURIE_FACTORY_PUBLICATION_LABELS",
     "CURIE_FAKE_MODEL",
     "CURIE_INTERNAL_WORKER_TOKEN",
     "CURIE_MODEL",
@@ -2627,6 +2628,8 @@ const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     "CURIE_WORKSPACE_UPLOAD_TIMEOUT_SECONDS",
     "CURIE_WORK_ITEM_MAX_TURNS",
     "ENVIRONMENT",
+    // The new settle setting has no prior extraEnv values to migrate.
+    "FACTORY_BASE_LABEL_SETTLE_S",
     // The factory settings arrived with #4397 as chart values, never extraEnv.
     "FACTORY_CI_WAIT_S",
     "FACTORY_ENABLED",

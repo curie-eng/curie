@@ -15,9 +15,10 @@ offline (empty means passed):
    daemon: docker info, a named and labelled holder container, eight escape attempts,
    egress probes to IP:port targets and an image pull, then a verified cleanup)
    and the ``daemon`` section (written by ``collect`` from the daemon pod through
-   kubectl: pod uid, docker info, nonce-labelled events). The
-   two runs must use distinct claims and daemons with overlapping windows (float
-   seconds, never rounded).
+   kubectl: pod uid, docker info, nonce-labelled events). ``collect`` reads the daemon
+   over its own mutual TLS with the runner's claim client credential, staged privately
+   in the daemon container and removed afterwards. The two runs must use distinct
+   claims and daemons with overlapping windows (float seconds, never rounded).
 2. cleanup: success, cancel, worker_kill and orphan_sweep each removed the daemon's
    Pod, Service, NetworkPolicy and Secret within 300 s.
 3. control: a run without the opt-in had no Docker environment, daemon or files.
@@ -53,6 +54,8 @@ Live use of this module is the docker scenario driver, the w2 waypoint and accep
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import ipaddress
 import json
@@ -64,11 +67,13 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from collections.abc import Callable
 from functools import partial
 from http.client import HTTPException
+from io import BytesIO
 from pathlib import Path
 from typing import Any, TypeGuard
 from urllib.error import HTTPError, URLError
@@ -157,6 +162,41 @@ HTTP_ATTEMPTS = 30  # one per second
 HEX64 = re.compile(r"[0-9a-f]{64}")
 REVISION = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
+CLAIM_LABEL = "curietech.ai/sandbox-claim"
+DNS_LABEL = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")
+DAEMON_HOST_ARG = re.compile(r"--host=tcp://0\.0\.0\.0:([0-9]{1,5})")
+# The runner's DOCKER_HOST, as tool_daemon.service_host(claim, namespace) plus the port.
+DAEMON_ENDPOINT = "tcp://{claim}.{namespace}.svc:{port}"
+CLIENT_CERT_PATH = "/var/run/curie/docker"
+CLIENT_FILES = ("ca.pem", "cert.pem", "key.pem")
+CERT_PEM = re.compile(r"-----BEGIN CERTIFICATE-----\n[A-Za-z0-9+/=\n]+-----END CERTIFICATE-----")
+KEY_PEM = re.compile(
+    r"-----BEGIN ([A-Z]+ )?PRIVATE KEY-----\n[A-Za-z0-9+/=\n]+-----END ([A-Z]+ )?PRIVATE KEY-----"
+)
+CLIENT_PEM = {"ca.pem": CERT_PEM, "cert.pem": CERT_PEM, "key.pem": KEY_PEM}
+# Run in the dockerd container with the client files as a tar on stdin, $1 the
+# directory the collector chose (STAGE_DIR) and $2 the daemon's Service name: creates
+# exactly that private directory, failing if it already exists, holding the files and
+# a hosts file naming the Service as 127.0.0.1. Removes it on any failure after the
+# mkdir. The collector knows the path before staging, so it can remove it whatever
+# the staging outcome, including a lost acknowledgement.
+COLLECT_STAGE = (
+    'umask 077 && mkdir -- "$1" || exit 1; '
+    'if tar -x -f - -C "$1" && printf \'127.0.0.1 %s\\n\' "$2" > "$1/hosts"; '
+    'then exit 0; else rm -rf -- "$1"; exit 1; fi'
+)
+# $1 the staged directory, $2 HOST:PORT, then the docker argv. In a private mount
+# namespace the staged hosts file covers /etc/hosts, so the Service name reaches the
+# local daemon for this command only, while the client still verifies the server
+# certificate against that name and presents the claim's client certificate.
+COLLECT_RUN = (
+    'd="$1"; shift; exec unshare -m sh -c \'mount --bind "$0/hosts" /etc/hosts && d="$0"'
+    ' && host="$1" && shift && exec docker -H "tcp://$host" --tlsverify'
+    ' --tlscacert "$d/ca.pem" --tlscert "$d/cert.pem" --tlskey "$d/key.pem" "$@"\' "$d" "$@"'
+)
+COLLECT_REMOVE = 'rm -rf -- "$1" && test ! -e "$1"'
+# The staging directory in the dockerd container, with a random 128-bit component.
+STAGE_DIR = "/tmp/curie-collect-{token}"
 
 EPILOG = """\
 envelope (docker-scenario/v1) sections:
@@ -173,7 +213,9 @@ envelope (docker-scenario/v1) sections:
            the source checkout, then removed (from `skill-rung`)
 `probe`, `compose` and `skill-rung` run where DOCKER_HOST names the run's daemon and
 exit 1 after writing their section unless its cleanup is verified. `probe` takes IP:port
-egress targets (no DNS names); `collect` needs an explicit --context. `compose` sends its
+egress targets (no DNS names); `collect` needs an explicit --context and reads the
+daemon over its own mutual TLS with the runner's claim client credential, staged
+privately in the daemon container and removed afterwards. `compose` sends its
 files only as build context and binds no host path (ADR 0217 decisions 4.1 and 8.1).
 `skill-rung` takes the candidate CLI (--curie-bin) and the source checkout (--source)
 because the runner tool catalog has no curie CLI, and refuses to run while a
@@ -1014,17 +1056,22 @@ def judge(envelope: Obj) -> list[str]:
 
 
 def _command(
-    argv: list[str], timeout: int = COMMAND_TIMEOUT, env: dict[str, str] | None = None
+    argv: list[str],
+    timeout: int = COMMAND_TIMEOUT,
+    env: dict[str, str] | None = None,
+    input: str | None = None,
 ) -> tuple[int, str, str]:
     """(exit code, stdout, stderr); a timeout or missing binary is a nonzero code.
 
-    ``env`` replaces the inherited environment when given. The child runs in its own
-    session, and a timeout kills the child's whole process group.
+    ``env`` replaces the inherited environment when given, and ``input`` is written to
+    the child's stdin. The child runs in its own session, and a timeout kills the
+    child's whole process group.
     """
 
     try:
         proc = subprocess.Popen(
             argv,
+            stdin=subprocess.PIPE if input is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1034,7 +1081,7 @@ def _command(
     except FileNotFoundError:
         return 127, "", f"{argv[0]}: not found on PATH"
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        stdout, stderr = proc.communicate(input=input, timeout=timeout)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -1106,26 +1153,187 @@ def probe(nonce: str, image: str, targets: list[tuple[str, str]]) -> Obj:
     }
 
 
-def collect(context: str, namespace: str, pod: str, nonce: str, since: str, until: str) -> Obj:
-    """The daemon section, read from the daemon pod's dockerd container."""
+def _named(items: object, name: str) -> Obj | None:
+    """The one mapping in a Kubernetes list whose ``name`` is ``name``, else None."""
 
-    kubectl = ["kubectl", "--context", context, "-n", namespace]
+    if not isinstance(items, list):
+        return None
+    found = [i for i in items if isinstance(i, dict) and i.get("name") == name]
+    return found[0] if len(found) == 1 else None
 
-    def checked(argv: list[str]) -> str:
-        code, out, err = _command([*kubectl, *argv])
+
+def _list(obj: Obj, key: str) -> list[Any]:
+    value = obj.get(key)
+    return value if isinstance(value, list) else []
+
+
+def _claim(obj: Obj, where: str) -> str:
+    labels = (obj.get("metadata") or {}).get("labels")
+    claim = labels.get(CLAIM_LABEL) if isinstance(labels, dict) else None
+    if not isinstance(claim, str) or not DNS_LABEL.fullmatch(claim):
+        raise CommandError(f"{where} has no usable {CLAIM_LABEL} label")
+    return claim
+
+
+def _daemon_endpoint(daemon: Obj, pod: str) -> tuple[str, int]:
+    """(claim, port) of a daemon pod: its claim label and the one port dockerd declares.
+
+    dockerd must carry exactly one ``--host=tcp://0.0.0.0:<port>`` argument and list that
+    port as a containerPort.
+    """
+
+    where = f"daemon pod {pod}"
+    claim = _claim(daemon, where)
+    dockerd = _named((daemon.get("spec") or {}).get("containers"), "dockerd")
+    if dockerd is None:
+        raise CommandError(f"{where} has no dockerd container")
+    hosts = [a for a in _list(dockerd, "args") if isinstance(a, str) and a.startswith("--host")]
+    match = DAEMON_HOST_ARG.fullmatch(hosts[0]) if len(hosts) == 1 else None
+    if match is None:
+        raise CommandError(f"{where}: dockerd must declare exactly one --host=tcp://0.0.0.0:PORT")
+    port = int(match.group(1))
+    ports = _list(dockerd, "ports")
+    if not any(isinstance(p, dict) and p.get("containerPort") == port for p in ports):
+        raise CommandError(f"{where}: dockerd listens on {port} but lists no such containerPort")
+    return claim, port
+
+
+def _service_port(service: Obj, claim: str, port: int) -> None:
+    """The claim's Service must route its ``docker`` port to the daemon's port."""
+
+    docker = _named((service.get("spec") or {}).get("ports"), "docker")
+    if docker is None or docker.get("port") != port or docker.get("targetPort") != port:
+        raise CommandError(f"service {claim}: its docker port does not route to {port}")
+
+
+def _client_secret(runner: Obj, runner_pod: str, claim: str, endpoint: str) -> str:
+    """The name of the Secret holding the runner's client credential for ``endpoint``.
+
+    The runner must belong to the daemon's claim, its DOCKER_HOST must name exactly
+    that daemon's Service and port, and the Secret is the one mounted at the client
+    certificate path, projecting all three client files when it lists items.
+    """
+
+    where = f"runner pod {runner_pod}"
+    if _claim(runner, where) != claim:
+        raise CommandError(f"{where} belongs to another claim than the daemon's {claim}")
+    spec = runner.get("spec") or {}
+    container = _named(spec.get("containers"), "runner")
+    if container is None:
+        raise CommandError(f"{where} has no runner container")
+    env = _named(container.get("env"), "DOCKER_HOST")
+    if env is None or env.get("value") != endpoint:
+        raise CommandError(f"{where}: DOCKER_HOST does not name {endpoint}")
+    mounts = _list(container, "volumeMounts")
+    found = [m for m in mounts if isinstance(m, dict) and m.get("mountPath") == CLIENT_CERT_PATH]
+    volume = _named(spec.get("volumes"), str(found[0].get("name"))) if len(found) == 1 else None
+    secret = (volume or {}).get("secret")
+    name = secret.get("secretName") if isinstance(secret, dict) else None
+    if not isinstance(name, str) or not name:
+        raise CommandError(f"{where} mounts no client Secret at {CLIENT_CERT_PATH}")
+    if secret.get("items") is not None:
+        keys = {i.get("key") for i in _list(secret, "items") if isinstance(i, dict)}
+        if not set(CLIENT_FILES) <= keys:
+            raise CommandError(f"{where}: Secret {name} does not project {', '.join(CLIENT_FILES)}")
+    return name
+
+
+def _client_file(secret: str, key: str, data: str) -> str:
+    """One client file from a Secret's base64 ``data`` value; errors carry no content."""
+
+    if not data.strip():
+        raise CommandError(f"secret {secret}: {key} is missing or empty")
+    try:
+        text = base64.b64decode(data.strip(), validate=True).decode("ascii")
+    except (binascii.Error, ValueError):
+        raise CommandError(f"secret {secret}: {key} is not valid base64 text") from None
+    if not CLIENT_PEM[key].search(text):
+        raise CommandError(f"secret {secret}: {key} does not hold the expected PEM block")
+    return text
+
+
+def _client_tar(files: dict[str, str]) -> str:
+    """The client files as an in-memory ustar archive, each mode 0600, as ASCII text."""
+
+    buffer = BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+        for name, text in files.items():
+            body = text.encode("ascii")
+            info = tarfile.TarInfo(name)
+            info.size, info.mode, info.mtime = len(body), 0o600, int(time.time())
+            tar.addfile(info, BytesIO(body))
+    return buffer.getvalue().decode("ascii")
+
+
+def collect(
+    context: str,
+    namespace: str,
+    pod: str,
+    runner_namespace: str,
+    runner_pod: str,
+    nonce: str,
+    since: str,
+    until: str,
+) -> Obj:
+    """The daemon section, read from the daemon pod's dockerd container.
+
+    The daemon listens only on mutual TLS, so the reads use the runner's own client
+    credential for the daemon's claim. The runner pod and the daemon must agree on the
+    claim, the Service name and the port before any credential is read; only the three
+    client keys are read, staged in a private directory in the dockerd container and
+    removed afterwards, whether or not the reads succeeded.
+    """
+
+    def kubectl(ns: str, argv: list[str], input: str | None = None) -> str:
+        code, out, err = _command(["kubectl", "--context", context, "-n", ns, *argv], input=input)
         if code != 0:
             raise CommandError(f"kubectl {' '.join(argv)} exited {code}: {err.strip()[-400:]}")
         return out
 
-    uid = json.loads(checked(["get", "pod", pod, "-o", "json"]))["metadata"]["uid"]
-    docker = ["exec", pod, "-c", "dockerd", "--", "docker"]
-    info = checked([*docker, "info", "--format", INFO_FORMAT])
-    events = checked(
-        [
-            *docker, "events", "--since", since, "--until", until,
-            "--filter", f"label={NONCE_LABEL}={nonce}", "--format", "{{json .}}",
-        ]
-    )  # fmt: skip
+    daemon = json.loads(kubectl(namespace, ["get", "pod", pod, "-o", "json"]))
+    uid = daemon["metadata"]["uid"]
+    claim, port = _daemon_endpoint(daemon, pod)
+    if not DNS_LABEL.fullmatch(namespace):
+        raise CommandError(f"namespace {namespace!r} is not a DNS label")
+    host = f"{claim}.{namespace}.svc"
+    service = json.loads(kubectl(namespace, ["get", "service", claim, "-o", "json"]))
+    _service_port(service, claim, port)
+    runner = json.loads(kubectl(runner_namespace, ["get", "pod", runner_pod, "-o", "json"]))
+    endpoint = DAEMON_ENDPOINT.format(claim=claim, namespace=namespace, port=port)
+    secret = _client_secret(runner, runner_pod, claim, endpoint)
+    files: dict[str, str] = {}
+    for key in CLIENT_FILES:
+        path = "{.data." + key.replace(".", "\\.") + "}"
+        data = kubectl(runner_namespace, ["get", "secret", secret, "-o", f"jsonpath={path}"])
+        files[key] = _client_file(secret, key, data)
+
+    dockerd = ["exec", pod, "-c", "dockerd", "--", "sh", "-c"]
+    directory = STAGE_DIR.format(token=secrets.token_hex(16))
+    stage = ["exec", "-i", pod, "-c", "dockerd", "--", "sh", "-c", COLLECT_STAGE, "sh"]
+    docker = [*dockerd, COLLECT_RUN, "sh", directory, f"{host}:{port}"]
+    failure: BaseException | None = None
+    try:
+        kubectl(namespace, [*stage, directory, host], input=_client_tar(files))
+        info = kubectl(namespace, [*docker, "info", "--format", INFO_FORMAT])
+        events = kubectl(
+            namespace,
+            [
+                *docker, "events", "--since", since, "--until", until,
+                "--filter", f"label={NONCE_LABEL}={nonce}", "--format", "{{json .}}",
+            ],
+        )  # fmt: skip
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        try:
+            kubectl(namespace, [*dockerd, COLLECT_REMOVE, "sh", directory])
+        except CommandError as removal:
+            if failure is None:
+                raise CommandError(f"staged credentials not removed: {removal}") from None
+            raise CommandError(
+                f"{failure}; and staged credentials not removed: {removal}"
+            ) from failure
     return {"pod": pod, "pod_uid": uid, "info": parse_info(info), "events": parse_events(events)}
 
 
@@ -1561,7 +1769,8 @@ def build_parser() -> argparse.ArgumentParser:
     probe_cmd.add_argument("--metadata", default=METADATA, type=ip_target, metavar="IP:PORT")
 
     collect_cmd = commands.add_parser("collect", help="read the daemon pod through kubectl")
-    for flag in ("context", "namespace", "pod", "nonce", "since", "until"):
+    flags = ("context", "namespace", "pod", "runner-namespace", "runner-pod", "nonce", "since")
+    for flag in (*flags, "until"):
         collect_cmd.add_argument(f"--{flag}", required=True)
 
     upgrade_cmd = commands.add_parser("upgrade", help="upgrade plan lines and runner images")
@@ -1666,8 +1875,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         elif args.command == "collect":
             section = collect(
-                args.context, args.namespace, args.pod, args.nonce, args.since, args.until
-            )
+                args.context, args.namespace, args.pod, args.runner_namespace, args.runner_pod,
+                args.nonce, args.since, args.until,
+            )  # fmt: skip
         elif args.command == "upgrade":
             before, after = _read_json(args.before), _read_json(args.after)
             plan = args.plan.read_text()

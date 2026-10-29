@@ -35,6 +35,7 @@ from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Operation, Suppo
 from curie_api.forges.errors import Ambiguous, ForgeError, NotFound, Unauthorized, Unavailable
 from curie_api.forges.github import ci
 from curie_api.forges.ports import MarkedComments
+from curie_api.forges.retarget import retarget_checked
 from curie_api.forges.types import (
     Actor,
     CheckSource,
@@ -878,6 +879,17 @@ class GitHubCodeHost:
         )
         return self._pull_request(repository, payload, require_sides=True)
 
+    async def add_pull_request_labels(
+        self, pull_request: PullRequestRef, labels: Sequence[str]
+    ) -> None:
+        repository = pull_request.repository
+        await self._send(
+            "POST",
+            f"{self._repo(repository.path)}/issues/{int(pull_request.number)}/labels",
+            token=await self._token(repository.path),
+            body={"labels": list(labels)},
+        )
+
     async def update_pull_request(
         self, pull_request: PullRequestRef, *, title: str | None, body: str | None
     ) -> PullRequest:
@@ -892,6 +904,44 @@ class GitHubCodeHost:
             body=changes,
         )
         return self._checked(pull_request, payload)
+
+    async def retarget_pull_request(
+        self,
+        pull_request: PullRequestRef,
+        *,
+        base_ref: str,
+        expected_head_sha: str,
+    ) -> PullRequest:
+        repository = pull_request.repository
+        if repository.kind != self.kind or repository.host != self.host:
+            raise NotFound("repository")
+        if not pull_request.number.isdigit():
+            raise NotFound("pull_request_number_invalid")
+        path = f"{self._repo(repository.path)}/pulls/{int(pull_request.number)}"
+        token = await self._token(repository.path)
+
+        def parse(payload: Any) -> PullRequest:
+            pull = self._pull_request(repository, payload, require_sides=True)
+            if any(
+                str(payload[side]["repo"].get("id")) != repository.project_id
+                for side in ("head", "base")
+            ):
+                raise Unavailable("pull_request_mismatch")
+            return pull
+
+        async def read() -> PullRequest:
+            return parse(await self._json("GET", path, token=token))
+
+        async def update() -> PullRequest:
+            return parse(await self._json("PATCH", path, token=token, body={"base": base_ref}))
+
+        return await retarget_checked(
+            pull_request,
+            base_ref=base_ref,
+            expected_head_sha=expected_head_sha,
+            read=read,
+            update=update,
+        )
 
     def _checked(self, pull_request: PullRequestRef, payload: Any) -> PullRequest:
         pull = self._pull_request(pull_request.repository, payload, require_sides=False)

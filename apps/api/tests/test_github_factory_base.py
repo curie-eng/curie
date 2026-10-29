@@ -1,4 +1,4 @@
-"""A factory ticket declares its base branch and keeps it (#3095, ADR 0186).
+"""Factory labels select a request base at acquisition (ADR 0253).
 
 GitHub REST shapes follow:
 https://docs.github.com/en/rest/git/refs#get-a-reference
@@ -17,7 +17,6 @@ import itertools
 import json
 import sys
 import uuid
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,11 +29,9 @@ from curie_api.config import Settings, get_settings
 from curie_api.factory_base import bases_for
 from curie_api.forges.config import ForgesConfig
 from curie_api.forges.registry import ForgeRegistry, forges_registry
-from curie_api.github_app import GitHubCredentials
 from curie_api.main import create_app
 from fastapi.testclient import TestClient
 from forge_fakes.github import (
-    INSTALLATION_ID,
     LABEL,
     REPO,
     REPO_ID,
@@ -50,7 +47,7 @@ from forge_fakes.github import (
 )
 from pydantic import ValidationError
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from test_github_factory_ingress import _code, _rows
 
 MARKER = "<!-- curie-factory-base-refusal -->"
@@ -75,7 +72,9 @@ class BaseGitHubAPI(GitHubAPI):
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
-        if path == f"/repos/{REPO}":
+        if path == f"/repos/{REPO}" or (
+            request.method == "GET" and path == f"/repositories/{self.repository_id}"
+        ):
             return httpx.Response(
                 200,
                 json={
@@ -166,6 +165,10 @@ def _configure(
 @pytest.fixture
 def base_app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clean_db: None) -> Any:
     _configure(monkeypatch, tmp_path, TRAIN)
+    monkeypatch.setenv("FACTORY_BASE_LABEL_SETTLE_S", "0")
+    monkeypatch.setenv("INTERNAL_WORKER_TOKEN", "factory-base-worker")
+    monkeypatch.setenv("CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS", "600")
+    get_settings.cache_clear()
     fake_installation_tokens(monkeypatch, _Credentials())
     api = BaseGitHubAPI()
     with TestClient(create_app()) as client:
@@ -313,7 +316,6 @@ def test_factory_bases_default_base_is_optional(
     "value",
     [
         {"acme-corp/acme-bot": {"bases": ["main", "next"], "default_base": "release-1"}},
-        {"acme-corp/acme-bot": {"bases": [], "default_base": "main"}},
         {"not-a-repository": {"bases": ["main"]}},
         {"acme-corp/*": {"bases": ["main"]}},
         {"acme-corp/acme-bot": {"bases": ["main", "main"]}},
@@ -321,6 +323,7 @@ def test_factory_bases_default_base_is_optional(
         {"acme-corp/acme-bot": {"bases": ["-oops"]}},
         {"acme-corp/acme-bot": {"bases": ["a..b"]}},
         {"acme-corp/acme-bot": {"bases": [""]}},
+        {"acme-corp/acme-bot": {"bases": [], "default_base": "main"}},
         {"acme-corp/acme-bot": {"default_base": "main"}},
     ],
 )
@@ -338,191 +341,204 @@ def test_invalid_factory_bases_refuse_boot(
     assert "CURIE_FORGES" in str(exc.value)
 
 
-# --- Precedence ----------------------------------------------------------------------
+WORKER = {"X-Curie-Worker-Token": "factory-base-worker"}
 
 
-def test_no_base_label_admits_on_the_deployment_default(
+def _execution(number: int) -> dict[str, Any]:
+    return _rows(
+        "SELECT r.* FROM curie.execution_requests r JOIN curie.work_items w "
+        "ON w.id = r.work_item_id WHERE w.tracker_issue_id = :number "
+        "ORDER BY r.sequence DESC LIMIT 1",
+        {"number": str(number)},
+    )[0]
+
+
+def _acquire_body(number: int, *, owner: str = "factory-base-owner") -> dict[str, Any]:
+    from forge_fakes import factory_wake
+
+    row = _execution(number)
+
+    async def wake() -> dict[str, Any]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                return (await factory_wake(session, row["id"])).model_dump(mode="json")
+        finally:
+            await engine.dispose()
+
+    return {
+        "owner": owner,
+        "generation": row["dispatch_generation"],
+        "wake": asyncio.run(wake()),
+        "context": None,
+    }
+
+
+def _acquire(client: Any, number: int, *, owner: str = "factory-base-owner") -> Any:
+    row = _execution(number)
+    return client.post(
+        f"/v1/internal/work-items/requests/{row['id']}/acquire",
+        headers=WORKER,
+        json=_acquire_body(number, owner=owner),
+    )
+
+
+def _admit_and_claim(client: Any, api: BaseGitHubAPI, number: int, *labels: str) -> Any:
+    response = _label(client, api, number, *labels)
+    assert response.json()["status"] == "factory_admitted", response.text
+    assert api.branch_requests == []
+    return _acquire(client, number)
+
+
+@pytest.mark.parametrize(
+    ("labels", "branch", "source", "sha"),
+    [((), "main", "default", MAIN_SHA), (("base:next", "bug"), "next", "label", NEXT_SHA)],
+)
+def test_first_acquisition_pins_the_current_selection(
     base_app: tuple[TestClient, BaseGitHubAPI],
+    labels: tuple[str, ...],
+    branch: str,
+    source: str,
+    sha: str,
 ) -> None:
     client, api = base_app
     number = next(_ISSUES)
 
-    response = _label(client, api, number)
+    response = _admit_and_claim(client, api, number, *labels)
 
-    assert response.json()["status"] == "factory_admitted", response.text
+    assert response.status_code == 200, response.text
     item = _work_item(number)
     assert item is not None
-    assert (item["base_branch"], item["base_source"], item["base_commit"]) == (
-        "main",
-        "default",
-        MAIN_SHA,
-    )
-    assert item["base_label_ignored"] is None
-    assert api.branch_requests == ["main"]
+    assert (item["base_branch"], item["base_source"], item["base_commit"]) == (branch, source, sha)
+    assert api.branch_requests == [branch]
     assert api.posts() == []
 
 
-def test_one_base_label_admits_on_that_branch_with_its_commit(
+@pytest.mark.parametrize(
+    ("labels", "reason", "read_branch"),
+    [
+        (("base:next", "base:main"), "base_conflict", None),
+        (("base:release-1",), "base_not_allowed", None),
+        (("base:",), "base_not_allowed", None),
+        (("base:next",), "base_missing", "next"),
+    ],
+)
+def test_invalid_current_selection_refuses_acquisition_without_fallback(
     base_app: tuple[TestClient, BaseGitHubAPI],
+    labels: tuple[str, ...],
+    reason: str,
+    read_branch: str | None,
 ) -> None:
     client, api = base_app
     number = next(_ISSUES)
-
-    response = _label(client, api, number, "base:next", "bug")
-
-    assert response.json()["status"] == "factory_admitted", response.text
-    item = _work_item(number)
-    assert item is not None
-    assert (item["base_branch"], item["base_source"], item["base_commit"]) == (
-        "next",
-        "label",
-        NEXT_SHA,
-    )
-    assert api.branch_requests == ["next"]
-
-
-def test_two_distinct_base_labels_are_refused_without_a_work_item(
-    base_app: tuple[TestClient, BaseGitHubAPI],
-) -> None:
-    client, api = base_app
-    number = next(_ISSUES)
-
-    response = _label(client, api, number, "base:next", "base:main")
-
-    assert response.status_code == 200, response.text
-    assert _code(response) == "base_conflict"
-    assert _work_item(number) is None
-    assert api.branch_requests == []
-    (body,) = api.posts()
-    assert MARKER in body
-
-
-def test_a_base_label_outside_the_allowed_bases_is_refused(
-    base_app: tuple[TestClient, BaseGitHubAPI],
-) -> None:
-    client, api = base_app
-    number = next(_ISSUES)
-    api.branches["release-1"] = "4" * 40
-
-    response = _label(client, api, number, "base:release-1")
-
-    assert _code(response) == "base_not_allowed"
-    assert _work_item(number) is None
-    assert api.branch_requests == []
-    (body,) = api.posts()
-    assert MARKER in body
-    assert "base `release-1` is not an allowed base for this deployment" in body
-
-
-def test_an_empty_base_label_is_not_an_allowed_base(
-    base_app: tuple[TestClient, BaseGitHubAPI],
-) -> None:
-    client, api = base_app
-    number = next(_ISSUES)
-
-    response = _label(client, api, number, "base:")
-
-    assert _code(response) == "base_not_allowed"
-    assert _work_item(number) is None
-
-
-def test_a_repository_absent_from_the_map_only_allows_its_default_branch(
-    base_app: tuple[TestClient, BaseGitHubAPI], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    client, api = base_app
-    _configure(monkeypatch, tmp_path, {"acme-corp/other": {"bases": ["main", "next"]}}, client)
-    default_number = next(_ISSUES)
-    labelled_number = next(_ISSUES)
-
-    admitted = _label(client, api, default_number)
-    refused = _label(client, api, labelled_number, "base:next")
-
-    assert admitted.json()["status"] == "factory_admitted", admitted.text
-    item = _work_item(default_number)
-    assert item is not None
-    assert (item["base_branch"], item["base_source"]) == ("main", "default")
-    assert _code(refused) == "base_not_allowed"
-    assert _work_item(labelled_number) is None
-
-
-def test_an_unset_default_base_uses_the_repository_default_branch(
-    base_app: tuple[TestClient, BaseGitHubAPI], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    client, api = base_app
-    _configure(monkeypatch, tmp_path, {REPO: {"bases": ["main", "next"]}}, client)
-    api.default_branch = "next"
-    number = next(_ISSUES)
-
-    response = _label(client, api, number)
-
-    assert response.json()["status"] == "factory_admitted", response.text
-    item = _work_item(number)
-    assert item is not None
-    assert (item["base_branch"], item["base_source"], item["base_commit"]) == (
-        "next",
-        "default",
-        NEXT_SHA,
-    )
-
-
-def test_a_deployment_default_outside_the_allowed_bases_is_refused(
-    base_app: tuple[TestClient, BaseGitHubAPI], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """With no default_base, the repository default branch must itself be allowed."""
-
-    client, api = base_app
-    _configure(monkeypatch, tmp_path, {REPO: {"bases": ["next"]}}, client)
-    number = next(_ISSUES)
-
-    response = _label(client, api, number)
-
-    assert _code(response) == "base_not_allowed"
-    assert _work_item(number) is None
-    assert api.branch_requests == []
-    (body,) = api.posts()
-    assert MARKER in body
-    assert "`main`" in body
-
-
-# --- Missing base ----------------------------------------------------------------------
-
-
-def test_a_missing_base_branch_is_refused_once_and_not_substituted(
-    base_app: tuple[TestClient, BaseGitHubAPI],
-) -> None:
-    client, api = base_app
     del api.branches["next"]
-    number = next(_ISSUES)
 
-    first = _label(client, api, number, "base:next")
-    second = _label(client, api, number, "base:next")
+    first = _admit_and_claim(client, api, number, *labels)
+    second = _acquire(client, number)
 
-    assert _code(first) == "base_missing"
-    assert _code(second) == "base_missing"
-    assert _work_item(number) is None
-    assert _rows(
-        "SELECT r.id FROM curie.execution_requests r JOIN curie.work_items w "
-        "ON w.id = r.work_item_id WHERE w.tracker_issue_id = :number",
-        {"number": str(number)},
-    ) == []
-    # No fallback to the default: main is never read.
+    assert first.status_code == second.status_code == 409
+    item = _work_item(number)
+    assert item is not None
+    assert (item["base_branch"], item["base_commit"]) == (None, None)
+    request = _execution(number)
+    assert request["status"] == "waiting"
+    assert request["acquire_owner"] is None
+    assert request["start_deferrals"] == 0
+    assert reason in request["last_deferral_reason"]
+    assert (request["dispatch_not_before"] - request["updated_at"]).total_seconds() >= 60
     assert "main" not in api.branch_requests
+    assert set(api.branch_requests) == ({read_branch} if read_branch else set())
     (body,) = api.posts()
     assert MARKER in body
-    assert "base `next` does not exist in the repository" in body
     assert api.patches() == []
     assert len(api.issue_comments[number]) == 1
+
+
+@pytest.mark.parametrize(
+    ("policy", "default", "labels", "expected"),
+    [
+        ({REPO: {"bases": ["main", "next"]}}, "next", (), ("next", "default")),
+        ({REPO: {"bases": []}}, "next", (), ("next", "default")),
+        ({REPO: {"bases": ["next"]}}, "main", (), None),
+        ({"acme-corp/other": {"bases": ["main", "next"]}}, "main", ("base:next",), None),
+    ],
+)
+def test_claim_uses_only_the_bound_repository_default_policy(
+    base_app: tuple[TestClient, BaseGitHubAPI],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    policy: dict[str, Any],
+    default: str,
+    labels: tuple[str, ...],
+    expected: tuple[str, str] | None,
+) -> None:
+    client, api = base_app
+    _configure(monkeypatch, tmp_path, policy, client)
+    api.default_branch = default
+    number = next(_ISSUES)
+
+    result = _admit_and_claim(client, api, number, *labels)
+
+    item = _work_item(number)
+    assert item is not None
+    if expected is None:
+        assert result.status_code == 409, result.text
+        assert item["base_commit"] is None
+        assert api.branch_requests == []
+        (body,) = api.posts()
+        assert MARKER in body
+    else:
+        assert result.status_code == 200, result.text
+        assert (item["base_branch"], item["base_source"]) == expected
+
+
+@pytest.mark.parametrize("repair", ["branch_created", "label_corrected"])
+def test_a_refused_request_can_claim_after_the_selection_is_repaired(
+    base_app: tuple[TestClient, BaseGitHubAPI], repair: str
+) -> None:
+    client, api = base_app
+    number = next(_ISSUES)
+    del api.branches["next"]
+    first = _admit_and_claim(client, api, number, "base:next")
+    assert first.status_code == 409, first.text
+    request_id = _execution(number)["id"]
+    if repair == "branch_created":
+        api.branches["next"] = NEXT_SHA
+        branch, sha = "next", NEXT_SHA
+    else:
+        api.labels = [LABEL, "base:main"]
+        branch, sha = "main", MAIN_SHA
+    _execute(
+        "UPDATE curie.execution_requests SET dispatch_not_before = clock_timestamp(), "
+        "published_generation = dispatch_generation WHERE id = :id",
+        {"id": request_id},
+    )
+
+    fixed = _acquire(client, number)
+
+    assert fixed.status_code == 200, fixed.text
+    assert _execution(number)["id"] == request_id
+    item = _work_item(number)
+    assert item is not None
+    assert (item["base_branch"], item["base_commit"]) == (branch, sha)
+    assert len(api.posts()) == 1
 
 
 def test_a_changed_refusal_reason_edits_the_one_refusal_comment(
     base_app: tuple[TestClient, BaseGitHubAPI],
 ) -> None:
     client, api = base_app
-    del api.branches["next"]
     number = next(_ISSUES)
+    del api.branches["next"]
+    assert _admit_and_claim(client, api, number, "base:next").status_code == 409
+    api.labels = [LABEL, "base:release-1"]
+    _execute(
+        "UPDATE curie.execution_requests SET dispatch_not_before = clock_timestamp(), "
+        "published_generation = dispatch_generation WHERE id = :id",
+        {"id": _execution(number)["id"]},
+    )
 
-    assert _code(_label(client, api, number, "base:next")) == "base_missing"
-    assert _code(_label(client, api, number, "base:release-1")) == "base_not_allowed"
+    assert _acquire(client, number).status_code == 409
 
     assert len(api.posts()) == 1
     (patched,) = api.patches()
@@ -531,98 +547,31 @@ def test_a_changed_refusal_reason_edits_the_one_refusal_comment(
     assert len(api.issue_comments[number]) == 1
 
 
-def test_a_fixed_label_admits_after_a_refusal(
-    base_app: tuple[TestClient, BaseGitHubAPI],
-) -> None:
-    client, api = base_app
-    del api.branches["next"]
-    number = next(_ISSUES)
-    assert _code(_label(client, api, number, "base:next")) == "base_missing"
-
-    api.branches["next"] = NEXT_SHA
-    response = _label(client, api, number, "base:next")
-
-    assert response.json()["status"] == "factory_admitted", response.text
-    item = _work_item(number)
-    assert item is not None
-    assert (item["base_branch"], item["base_commit"]) == ("next", NEXT_SHA)
-
-
-def test_a_branch_lookup_outage_is_retryable_not_a_refusal(
+def test_a_branch_lookup_outage_stays_nonterminal_and_recovers(
     base_app: tuple[TestClient, BaseGitHubAPI],
 ) -> None:
     client, api = base_app
     number = next(_ISSUES)
     api.branch_outage = True
+    response = _admit_and_claim(client, api, number, "base:next")
 
-    response = _label(client, api, number, "base:next")
-
-    assert response.status_code == 503, response.text
-    assert _work_item(number) is None
+    assert response.status_code == 409, response.text
+    assert _execution(number)["status"] == "waiting"
+    assert _execution(number)["start_deferrals"] == 0
+    request = _execution(number)
+    assert 0 < (request["dispatch_not_before"] - request["updated_at"]).total_seconds() <= 5
     assert api.posts() == []
-
-
-# --- Frozen base -----------------------------------------------------------------------
-
-
-def test_relabel_with_an_open_pr_keeps_the_recorded_base_without_a_branch_read(
-    base_app: tuple[TestClient, BaseGitHubAPI],
-) -> None:
-    client, api = base_app
-    number = next(_ISSUES)
-    assert _label(client, api, number, "base:next").json()["status"] == "factory_admitted"
-    item = _work_item(number)
-    assert item is not None
-    _open_lineage(item["id"])
-    api.branch_requests.clear()
-    # Even an unreadable branch must not matter: the recorded base is kept.
-    del api.branches["main"]
-
-    _label(client, api, number, "base:main")
-
-    after = _work_item(number)
-    assert after is not None
-    assert (after["base_branch"], after["base_source"], after["base_commit"]) == (
-        "next",
-        "label",
-        NEXT_SHA,
-    )
-    assert after["base_label_ignored"] == "main"
-    assert api.branch_requests == []
-    assert api.posts() == []
-
-
-def test_a_base_label_change_event_records_the_ignored_label(
-    base_app: tuple[TestClient, BaseGitHubAPI],
-) -> None:
-    client, api = base_app
-    number = next(_ISSUES)
-    assert _label(client, api, number, "base:next").json()["status"] == "factory_admitted"
-    item = _work_item(number)
-    assert item is not None
-    _open_lineage(item["id"])
-    api.branch_requests.clear()
-
-    api.labels = [LABEL, "base:main"]
-    changed = _post(client, "issues", _issue_event("labeled", number, label={"name": "base:main"}))
-
-    assert changed.status_code == 200, changed.text
-    assert _code(changed) == "base_label_recorded"
-    after = _work_item(number)
-    assert after is not None
-    assert after["base_branch"] == "next"
-    assert after["base_label_ignored"] == "main"
-    assert api.branch_requests == []
-
-    api.labels = [LABEL, "base:next"]
-    restored = _post(
-        client, "issues", _issue_event("unlabeled", number, label={"name": "base:main"})
+    api.branch_outage = False
+    _execute(
+        "UPDATE curie.execution_requests SET dispatch_not_before = clock_timestamp(), "
+        "published_generation = dispatch_generation WHERE id = :id",
+        {"id": _execution(number)["id"]},
     )
 
-    assert _code(restored) == "base_label_recorded"
-    after = _work_item(number)
-    assert after is not None
-    assert after["base_label_ignored"] is None
+    healthy = _acquire(client, number)
+
+    assert healthy.status_code == 200, healthy.text
+    assert _work_item(number)["base_commit"] == NEXT_SHA
 
 
 def test_a_base_label_event_without_a_work_item_is_ignored(
@@ -641,170 +590,32 @@ def test_a_base_label_event_without_a_work_item_is_ignored(
     assert api.branch_requests == []
 
 
-def test_fresh_admission_without_an_open_pr_resolves_the_base_again(
-    base_app: tuple[TestClient, BaseGitHubAPI],
+@pytest.mark.parametrize("author", ["human", "foreign_app"])
+def test_a_foreign_refusal_marker_is_not_adopted(
+    base_app: tuple[TestClient, BaseGitHubAPI], author: str
 ) -> None:
     client, api = base_app
     number = next(_ISSUES)
-    assert _label(client, api, number, "base:next").json()["status"] == "factory_admitted"
-    item = _work_item(number)
-    assert item is not None
-    _open_lineage(item["id"], status="closed")
-    api.branch_requests.clear()
-
-    _label(client, api, number)
-
-    after = _work_item(number)
-    assert after is not None
-    assert (after["base_branch"], after["base_source"], after["base_commit"]) == (
-        "main",
-        "default",
-        MAIN_SHA,
-    )
-    assert after["base_label_ignored"] is None
-    assert api.branch_requests == ["main"]
-
-
-# --- Label reconcile poll ---------------------------------------------------------------
-
-
-class _ReconcileCredentials(_Credentials):
-    def fresh_installation_token(
-        self, repo: str, expected_installation_id: int | None = None
-    ) -> tuple[int, str]:
-        return INSTALLATION_ID, self.token_for_verified_installation(repo, INSTALLATION_ID)
-
-
-class _ReconcileGitHubAPI(BaseGitHubAPI):
-    def __init__(self) -> None:
-        super().__init__()
-        self.labelled: dict[int, datetime] = {}
-
-    def handle(self, request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path == f"/repos/{REPO}/issues":
-            issues = [
-                {"number": n, "state": "open", "labels": [{"name": name} for name in self.labels]}
-                for n in self.labelled
-            ]
-            return httpx.Response(200, json=issues)
-        if path.startswith(f"/repos/{REPO}/issues/") and path.endswith("/events"):
-            number = int(path.split("/")[-2])
-            return httpx.Response(
-                200,
-                json=[
-                    {
-                        "id": 900000 + number,
-                        "event": "labeled",
-                        "label": {"name": LABEL},
-                        "actor": {"id": 6601, "login": "octocat", "type": "User"},
-                        "performed_via_github_app": None,
-                        "created_at": self.labelled[number]
-                        .isoformat()
-                        .replace("+00:00", "Z"),
-                    }
-                ],
-            )
-        return super().handle(request)
-
-
-def test_reconcile_refuses_a_missing_base_with_one_comment_across_passes(
-    base_app: tuple[TestClient, BaseGitHubAPI], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from curie_api.factory_label_reconcile import reconcile_missed_labels
-    from sqlalchemy.ext.asyncio import async_sessionmaker
-
-    credentials = _ReconcileCredentials()
-    fake_installation_tokens(monkeypatch, credentials)
-    monkeypatch.setattr(
-        GitHubCredentials,
-        "fresh_installation_token",
-        lambda _self, repo, expected_installation_id=None: credentials.fresh_installation_token(
-            repo, expected_installation_id
-        ),
-    )
-    api = _ReconcileGitHubAPI()
     del api.branches["next"]
-    number = next(_ISSUES)
-    api.issue_number = number
-    api.labels = [LABEL, "base:next"]
-    api.labelled[number] = datetime.now(UTC) - timedelta(minutes=30)
-
-    def reconcile() -> int:
-        async def go() -> int:
-            engine = create_async_engine(get_settings().database_url)
-            http = httpx.AsyncClient(transport=httpx.MockTransport(api.handle))
-            try:
-                return await reconcile_missed_labels(
-                    async_sessionmaker(engine, expire_on_commit=False),
-                    get_settings(),
-                    http,
-                    now=datetime.now(UTC),
-                )
-            finally:
-                await http.aclose()
-                await engine.dispose()
-
-        return asyncio.run(go())
-
-    assert reconcile() == 0
-    assert reconcile() == 0
-
-    assert _work_item(number) is None
-    (body,) = api.posts()
-    assert MARKER in body
-    assert api.patches() == []
-
-
-def test_a_human_comment_carrying_the_refusal_marker_is_not_adopted(
-    base_app: tuple[TestClient, BaseGitHubAPI],
-) -> None:
-    client, api = base_app
-    del api.branches["next"]
-    number = next(_ISSUES)
-    human = {
+    human = author == "human"
+    foreign = {
         "id": 770001,
         "body": f"Quoting the bot: {MARKER} please fix",
-        "user": {"id": 6601, "login": "octocat", "type": "User"},
-        "performed_via_github_app": None,
+        "user": {"id": 6601, "login": "octocat", "type": "User"}
+        if human
+        else {"id": 4242, "login": "other-app[bot]", "type": "Bot"},
+        "performed_via_github_app": None if human else {"id": 999, "slug": "other-app"},
     }
-    api.issue_comments[number] = [dict(human)]
+    api.issue_comments[number] = [dict(foreign)]
 
-    response = _label(client, api, number, "base:next")
+    assert _admit_and_claim(client, api, number, "base:next").status_code == 409
+    assert _acquire(client, number).status_code == 409
 
-    assert _code(response) == "base_missing"
     assert api.patches() == []
     (body,) = api.posts()
     assert MARKER in body
     assert "base `next` does not exist in the repository" in body
-    assert api.issue_comments[number][0] == human
-
-
-def test_another_apps_comment_carrying_the_refusal_marker_is_not_adopted(
-    base_app: tuple[TestClient, BaseGitHubAPI],
-) -> None:
-    client, api = base_app
-    assert get_settings().github_app_id == "51"
-    del api.branches["next"]
-    number = next(_ISSUES)
-    foreign = {
-        "id": 770002,
-        "body": f"{MARKER} posted by some other integration",
-        "user": {"id": 4242, "login": "other-app[bot]", "type": "Bot"},
-        "performed_via_github_app": {"id": 999, "slug": "other-app"},
-    }
-    api.issue_comments[number] = [dict(foreign)]
-
-    response = _label(client, api, number, "base:next")
-
-    assert _code(response) == "base_missing"
-    assert api.patches() == []
-    (body,) = api.posts()
-    assert MARKER in body
     assert api.issue_comments[number][0] == foreign
-    # Curie's own comment (configured app id 51) is adopted on the next pass.
-    assert _code(_label(client, api, number, "base:next")) == "base_missing"
-    assert len(api.posts()) == 1
 
 
 # --- The policy comes from the chosen binding (#4358 plan D15, r1 finding 4) -------

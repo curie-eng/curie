@@ -20,6 +20,27 @@ exit code. The recording nonce is `e8ce1a8c`.
    image pull.
 5. `events` is the daemon-side `docker events` stream for the window in
    `window` (`T0 T1`), filtered on the nonce label.
+6. `daemon-pod.json`, `daemon-service.json` and `runner-pod.json` are the
+   daemon Pod, its Service and the runner Pod of one live claim on a throwaway
+   cluster, as `kubectl get -o json` returned them, trimmed to the fields
+   `collect` reads plus their labels, volumes and mounts. They are anonymized:
+   the claim and daemon pod name is the recorded `docker info` name
+   (`7bd5b54461f4`), the namespaces are `fd-proof-d-e8ce1a8c` (daemon) and
+   `fd-proof-e8ce1a8c` (runner), the runner pod is `curie-runner-e8ce1a8c-a`,
+   the instance label is `fd-proof`, the daemon pod uid is the uid of run `a`'s
+   daemon section in `passing-envelope.json`, the runner pod uid is made up, and
+   the daemon image is a placeholder registry with the recorded digest. The
+   runner's `GITHUB_TOKEN` env entry keeps only its `secretKeyRef` shape. The
+   client Secret itself is not recorded; the tests mint one with
+   `tool_daemon.issue`.
+7. `tls-foreign-client`, `tls-foreign-ca` and `tls-server-name` are the stderr
+   and exit code of `docker -H tcp://<claim Service>:2376 --tlsverify ... info`
+   run against that daemon with, in turn, a client certificate from another
+   claim's CA, a CA file from another claim, and the daemon of another claim
+   (whose certificate names its own Service). kubectl's trailing "command
+   terminated with exit code 1" line is not part of the recording; the kubectl
+   fake appends it. Names are anonymized as in item 6; in `tls-server-name` the
+   dialed Service is `7bd5b54461f4` and the certificate's claim `3f9a0d2c7e15`.
 
 `github/` holds real GitHub REST response shapes, anonymized: the branch rules
 for the base branch, the check runs of one fully green head, and that head's

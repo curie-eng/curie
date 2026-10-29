@@ -91,7 +91,6 @@ from forge_fakes.github import (
     forges_env_json,
 )
 from forge_fakes.github_comments import _rows
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response
@@ -335,6 +334,7 @@ def install(
         "GITHUB_REPO_ALLOWLIST": '["acme-corp/*"]',
         "GITHUB_TOKEN": "",
         "GITHUB_REVIEW_INGRESS_ENABLED": "false",
+        "FACTORY_BASE_LABEL_SETTLE_S": "0",
         "FACTORY_ENABLED": "true",
         # Review feedback arrives as a signed webhook (the GitHub half).
         "FACTORY_INTAKE": "webhook",
@@ -445,7 +445,7 @@ def _drop_stream() -> None:
         valkey.close()
 
 
-def _start(request_id: uuid.UUID) -> int:
+def _start(client: TestClient, request_id: uuid.UUID) -> int:
     """A worker acquires the published generation and starts the runtime."""
 
     generation = _rows(
@@ -454,33 +454,30 @@ def _start(request_id: uuid.UUID) -> int:
     )[0]["dispatch_generation"]
 
     async def go() -> int:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with AsyncSession(engine) as session:
-                acquired = await acquire(
-                    session,
-                    request_id,
-                    owner="jira-owner",
-                    generation=generation,
-                    wake=await factory_wake(session, request_id),
-                    context=None,
-                )
-                assert not isinstance(acquired, DispatchConflict), acquired
-                started = await start(
-                    session,
-                    request_id,
-                    owner="jira-owner",
-                    generation=generation,
-                    claim_name="claim-jira",
-                    sandbox_name="sbx-jira",
-                    context=acquired.context,
-                )
-                assert not isinstance(started, DispatchConflict), started
-                return int(started.runtime_epoch)
-        finally:
-            await engine.dispose()
+        async with client.app.state.sessionmaker() as session:
+            acquired = await acquire(
+                session,
+                request_id,
+                owner="jira-owner",
+                generation=generation,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=client.app.state.http_client,
+            )
+            assert not isinstance(acquired, DispatchConflict), acquired
+            started = await start(
+                session,
+                request_id,
+                owner="jira-owner",
+                generation=generation,
+                claim_name="claim-jira",
+                sandbox_name="sbx-jira",
+                context=acquired.context,
+            )
+            assert not isinstance(started, DispatchConflict), started
+            return int(started.runtime_epoch)
 
-    return asyncio.run(go())
+    return int(client.portal.call(go))
 
 
 # --- Jira observations ----------------------------------------------------------------
@@ -703,7 +700,7 @@ def test_jira_github_lifecycle(install: Install, initial_label: bool) -> None:
         REPO,
     )
     assert item["code_host_installation_id"] == INSTALLATION_ID
-    assert item["base_branch"] == "main"
+    assert item["base_branch"] is None
     assert item["agent_id"] == install.agent_id
     [first] = _requests(item["id"])
     assert first["objective"].splitlines()[0] == install.browse(key)
@@ -756,7 +753,9 @@ def test_jira_github_lifecycle(install: Install, initial_label: bool) -> None:
     assert _state_labels(install, denied) == set()
 
     # 2. The run starts: the same comment is edited in place.
-    epoch = _start(first["id"])
+    epoch = _start(install.client, first["id"])
+    [item] = _work_items(issue.id)
+    assert item["base_branch"] == "main"
     _reconcile()
     assert _requests(item["id"])[0]["status"] == "running"
     [same] = _status_comments(install, issue)

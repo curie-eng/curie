@@ -138,6 +138,10 @@
       "value": "curie:identity:admission-fence",
       "reason": "Admission generation fence brackets identity authority mutations with pending and stable states"
     },
+    "apps/api/src/curie_api/routers/publication_code_host.py:_apply_publication_labels:1": {
+      "value": "f'curie:publication-labels:{publication.id}'",
+      "reason": "Successful per-publication pull request labeling marker with a 30-day TTL"
+    },
     "apps/dispatcher/src/curie_dispatcher/admission.py:module:1": {
       "value": "curie:identity:admission-fence",
       "reason": "Admission cache reads the shared identity generation fence before reusing or storing decisions"

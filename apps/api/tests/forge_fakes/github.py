@@ -205,6 +205,7 @@ def factory_env(
         "GITHUB_API_URL": api_url,
         "FACTORY_ENABLED": "true",
         "FACTORY_INTAKE": intake,
+        "FACTORY_BASE_LABEL_SETTLE_S": "0",
         "CURIE_FORGES": forges_env_json(forges_document(api_url=api_url, **forges), key_dir),
     }
 
@@ -271,7 +272,9 @@ class GitHubAPI:
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
-        if path == f"/repos/{REPO}":
+        if path == f"/repos/{REPO}" or (
+            request.method == "GET" and path == f"/repositories/{self.repository_id}"
+        ):
             return httpx.Response(
                 200,
                 json={"id": self.repository_id, "full_name": REPO, "default_branch": "main"},
@@ -520,6 +523,7 @@ class GitHubRepositoryFake:
         self.statuses: dict[str, dict[str, dict[str, Any]]] = {}
         self.default_branch = "main"
         self.writes = 0
+        self.label_requests: list[httpx.Request] = []
         self._event_ids = itertools.count(70001)
         self._comment_ids = itertools.count(80001)
         self._check_ids = itertools.count(90001)
@@ -766,7 +770,7 @@ class GitHubRepositoryFake:
 
     def _read_code(self, request: httpx.Request, path: str) -> httpx.Response:
         repo = f"/repos/{REPO}"
-        if path == repo:
+        if path in {repo, f"/repositories/{REPO_ID}"}:
             return httpx.Response(
                 200,
                 json={"id": REPO_ID, "full_name": REPO, "default_branch": self.default_branch},
@@ -853,6 +857,9 @@ class GitHubRepositoryFake:
             issue = self.issues[int(matched[1])]
             names = [entry["name"] for entry in issue["labels"]]
             if request.method == "POST":
+                # GitHub labels also address PR numbers through the issues API:
+                # https://docs.github.com/en/rest/issues/labels?apiVersion=2022-11-28#add-labels-to-an-issue
+                self.label_requests.append(request)
                 names.extend(name for name in body["labels"] if name not in names)
             elif matched[2] is not None and unquote(matched[2]) in names:
                 names.remove(unquote(matched[2]))
@@ -870,7 +877,12 @@ class GitHubRepositoryFake:
             if body["head"] not in self.branches or body["base"] not in self.branches:
                 return httpx.Response(422, json={"message": "Validation Failed"})
             number = self._number()
-            self.issues[number] = {"number": number, "state": "open", "pull_request": {}}
+            self.issues[number] = {
+                "number": number,
+                "state": "open",
+                "pull_request": {},
+                "labels": [],
+            }
             self.pulls[number] = {
                 "head": body["head"],
                 "base": body["base"],

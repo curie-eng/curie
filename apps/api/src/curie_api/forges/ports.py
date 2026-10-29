@@ -228,6 +228,21 @@ class CodeHost(Protocol):
         self, pull_request: PullRequestRef, *, title: str | None, body: str | None
     ) -> PullRequest: ...
 
+    async def retarget_pull_request(
+        self,
+        pull_request: PullRequestRef,
+        *,
+        base_ref: str,
+        expected_head_sha: str,
+    ) -> PullRequest:
+        """Change only an open pull request's target at the expected head.
+
+        Verify identity, source branch and head before and after the update.
+        An already matching target makes no write. Provider reads are optimistic
+        checks; the caller fences branch updates with Git's exact head lease.
+        """
+        ...
+
     async def list_factory_publications(
         self, repository: RepositoryRef
     ) -> tuple[FactoryPublication, ...]:
@@ -257,7 +272,7 @@ class CodeHost(Protocol):
         """Optional: check names the code host requires on ``branch`` before merge.
 
         GitHub unions ruleset contexts and branch protection contexts. Other
-        code hosts declare this unsupported. The factory does not apply labels
+        code hosts declare this unsupported. This read does not apply labels
         or start workflows to make a required check run.
         """
         ...

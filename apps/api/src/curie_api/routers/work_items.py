@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any, Literal, Self
 
 from channel_protocol.work_item_events import CI_FIRST_FIX_ROUND, CI_MAX_ROUNDS
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field, StrictBool, model_validator
 
 from curie_api.workitems.lifecycle import WorkItemConflict, WorkItemOutcome
@@ -286,7 +286,7 @@ async def cancel_work_item(
 
 @router.post("/requests/{request_id}/acquire")
 async def acquire_work_item_request(
-    request_id: uuid.UUID, body: AcquireBody, session: SessionDep
+    request_id: uuid.UUID, body: AcquireBody, session: SessionDep, request: Request
 ) -> dict[str, Any]:
     result = await workitem_dispatch.acquire(
         session,
@@ -295,6 +295,7 @@ async def acquire_work_item_request(
         generation=body.generation,
         wake=body.wake,
         context=body.context,
+        client=request.app.state.http_client,
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)

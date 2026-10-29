@@ -1296,6 +1296,7 @@ codeHostTrust:
 factory:
   enabled: false
   intake: poll  # or webhook
+  baseLabelSettleSeconds: 60
   cardBaseUrl: ""
   ciWaitSeconds: 3600
   codeHosts: []
@@ -1500,6 +1501,12 @@ api:
   # reach. Each entry is owner/repository or owner/*; an empty list allows no
   # opening-message repository selections.
   githubRepoAllowlist: []
+  # Operator-controlled GitHub labels by exact owner/repository; agents cannot
+  # choose labels. No wildcards; at most 10 label names of 1 to 50 characters.
+  # Repository keys match case-insensitively.
+  # Applied once per publication revision using a 30-day Valkey success marker.
+  # Best effort: forge or Valkey errors preserve the publication.
+  factoryPublicationLabels: {}
   # BYO secret (issue #1759, the same idiom githubAppExistingSecret below
   # uses). Wins over githubToken when set. A plain `curie cluster up`
   # preserves the reference and key; an explicit inline replacement or

@@ -37,7 +37,7 @@ import pytest
 import redis
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from channel_protocol.work_item_events import execute_event_id
-from curie_api import factory_base, factory_notices, factory_tracker_intake, workitem_dispatch
+from curie_api import factory_notices, factory_tracker_intake, workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER
@@ -345,7 +345,7 @@ def _ci_turns(request_id: uuid.UUID) -> list[dict[str, Any]]:
     return [t for t in _turns() if t["event_id"].startswith(prefix)]
 
 
-def _start(request_id: uuid.UUID) -> int:
+def _start(client: TestClient, request_id: uuid.UUID) -> int:
     """A worker acquires the published generation and starts the runtime;
     returns the runtime epoch."""
 
@@ -355,33 +355,30 @@ def _start(request_id: uuid.UUID) -> int:
     )[0]["dispatch_generation"]
 
     async def go() -> int:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with AsyncSession(engine) as session:
-                acquired = await acquire(
-                    session,
-                    request_id,
-                    owner="factory-owner",
-                    generation=generation,
-                    wake=await factory_wake(session, request_id),
-                    context=None,
-                )
-                assert not isinstance(acquired, DispatchConflict), acquired
-                started = await start(
-                    session,
-                    request_id,
-                    owner="factory-owner",
-                    generation=generation,
-                    claim_name="claim-factory",
-                    sandbox_name="sbx-factory",
-                    context=acquired.context,
-                )
-                assert not isinstance(started, DispatchConflict), started
-                return int(started.runtime_epoch)
-        finally:
-            await engine.dispose()
+        async with client.app.state.sessionmaker() as session:
+            acquired = await acquire(
+                session,
+                request_id,
+                owner="factory-owner",
+                generation=generation,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=client.app.state.http_client,
+            )
+            assert not isinstance(acquired, DispatchConflict), acquired
+            started = await start(
+                session,
+                request_id,
+                owner="factory-owner",
+                generation=generation,
+                claim_name="claim-factory",
+                sandbox_name="sbx-factory",
+                context=acquired.context,
+            )
+            assert not isinstance(started, DispatchConflict), started
+            return int(started.runtime_epoch)
 
-    return asyncio.run(go())
+    return int(client.portal.call(go))
 
 
 def _agent_id() -> uuid.UUID:
@@ -466,6 +463,7 @@ class BitbucketPair:
             ("curie_api.routers.publications", ("code_host_for",)),
             ("curie_api.routers.publication_code_host", ("publishing_code_host",)),
             ("curie_api.factory_rediscovery", ("publishing_code_host",)),
+            ("curie_api.factory_base_reconcile", ("code_host_for_repository",)),
         ):
             for seam in seams:
                 monkeypatch.setattr(f"{module}.{seam}", host)
@@ -563,14 +561,6 @@ class BitbucketPair:
                 self.binding.start_authority, self.issue, marked_by, tracker=self.tracker
             ):
                 return None
-            base = await factory_base.resolve_base(
-                policy=self.repo,
-                labels=set(),
-                default_branch=self.repository.default_branch,
-                code_host=self.code_host,
-                repository=self.repository,
-            )
-            assert isinstance(base, factory_base.ResolvedBase), base
             return await self._dispatch(
                 Admission(
                     agent_id=agent_id,
@@ -583,7 +573,7 @@ class BitbucketPair:
                     objective=self.tracker.issue_url(self.issue),
                     requester=f"{types.JIRA_CLOUD}:{marked_by.id}:{marked_by.login}",
                     request_id=notice_request_id(notice),
-                    base=base,
+                    trigger_label=self.tracker.label,
                 ),
                 revision=False,
             )
@@ -751,7 +741,7 @@ class BitbucketPair:
             {"id": item["id"]},
         )
         _reconcile()
-        epoch = _start(request["id"])
+        epoch = _start(self.client, request["id"])
         headers = {"X-API-Key": get_settings().api_key}
         version = self.client.post(
             f"/agents/{item['agent_id']}/versions",
@@ -862,6 +852,7 @@ def bitbucket_pair(
         "APPROVAL_SWEEP_INTERVAL_S": "0",
         "DEAD_LETTER_WATCH_INTERVAL_S": "0",
         # No GitHub intake: the reconciler must not poll a GitHub tracker.
+        "FACTORY_BASE_LABEL_SETTLE_S": "0",
         "FACTORY_ENABLED": "false",
         "CURIE_FORGES": forges_env_json(_document(half), key_dir),
         "GITHUB_REVIEW_INGRESS_ENABLED": "false",
@@ -952,12 +943,14 @@ def run_lifecycle(pair: BitbucketPair) -> None:
         item["repository_path"],
     ) == (backend.kind, repository.host, repository.project_id, repository.path)
     assert item["tracker_display_key"] == JIRA_KEY
-    assert item["base_branch"] == "main" and item["base_commit"] is not None
+    assert (item["base_branch"], item["base_commit"]) == (None, None)
     assert [r["id"] for r in _requests(work_item_id)] == [first]
     _reconcile()
     assert _execute_wake(first)["text"] == _requests(work_item_id)[0]["objective"]
     assert pair.state_labels() == {"curie-factory:queued"}
-    _start(first)
+    _start(pair.client, first)
+    item = _work_item(pair.issue)
+    assert item["base_branch"] == "main" and item["base_commit"] is not None
     _reconcile()
     assert _status(first) == ("running", None)
     assert pair.state_labels() == {"curie-factory:running"}
@@ -1023,7 +1016,7 @@ def run_lifecycle(pair: BitbucketPair) -> None:
     )
     _reconcile()
     assert _execute_wake(revision)["text"] == rows[1]["objective"]
-    _start(revision)
+    _start(pair.client, revision)
     _reconcile()
     assert _status(revision) == ("running", None)
     (reply,) = backend.thread_replies(str(pr), root)

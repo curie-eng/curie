@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+import httpx
 from aci_protocol.turn import route_identity
 from curie_telemetry.redact import redact_text
 from pydantic import BaseModel, ConfigDict
@@ -43,7 +44,13 @@ from .forges.errors import NotFound
 from .forges.registry import forges_registry
 from .forges.trackers import binding_for_scope, reply_route
 from .forges.types import ReplyTarget, RepositoryRef, TrackerIssueRef
-from .models import Agent, AgentChannel, ExecutionRequest, Publication, WorkItem
+from .models import (
+    Agent,
+    AgentChannel,
+    ExecutionRequest,
+    FactoryBaseTransition,
+    WorkItem,
+)
 from .threadkeys import (
     legacy_route_adapter_of,
     pre_identity_key_of,
@@ -128,7 +135,7 @@ class Admission:
     objective: str
     requester: str
     request_id: uuid.UUID
-    # The base a fresh admission resolved (ADR 0186), written on a new WorkItem.
+    # An explicit base pin supplied by the caller.
     base: ResolvedBase | None = None
     # Where the request's status reply lands, and the feedback URL it answers.
     # None is the tracker issue; review feedback sets its pull request target.
@@ -495,6 +502,11 @@ async def readmit(
         requester=facts.requester,
         base=getattr(facts, "base", None),
         trigger_label=facts.trigger_label,
+        base_settle_until=(
+            now + timedelta(seconds=get_settings().factory_base_label_settle_s)
+            if facts.trigger_label
+            else None
+        ),
     )
     if isinstance(readmitted, WorkItemConflict):
         return readmitted
@@ -518,8 +530,6 @@ async def _admit_new(
         code_host_installation_id=facts.code_host_installation_id,
         agent_id=facts.agent_id,
         conversation_id=_facts_conversation(facts, adapter),
-        # Factory admission resolves a base (ADR 0186) and names the label
-        # that admitted it (#4361); other callers do neither.
         base=getattr(facts, "base", None),
         trigger_label=facts.trigger_label,
     )
@@ -533,6 +543,11 @@ async def _admit_new(
         request_id=facts.request_id,
         wait_deadline=wait_deadline,
         expected_work_item_version=created.work_item.version,
+        base_settle_until=(
+            now + timedelta(seconds=get_settings().factory_base_label_settle_s)
+            if facts.trigger_label
+            else None
+        ),
     )
     if isinstance(requested, WorkItemConflict):
         if requested.code == "identity_mismatch":
@@ -560,6 +575,24 @@ async def claim_due(
             ExecutionRequest.wait_deadline > func.clock_timestamp(),
             ExecutionRequest.dispatch_not_before <= func.clock_timestamp(),
             ExecutionRequest.objective.is_not(None),
+            ~exists().where(
+                WorkItem.id == ExecutionRequest.work_item_id,
+                WorkItem.readmit_request_id.is_not(None),
+            ),
+            ~exists().where(
+                FactoryBaseTransition.work_item_id == ExecutionRequest.work_item_id,
+                or_(
+                    FactoryBaseTransition.phase.not_in(("applied", "conflict", "refused")),
+                    and_(
+                        FactoryBaseTransition.phase == "applied",
+                        FactoryBaseTransition.outcome_ready_at.is_(None),
+                    ),
+                    and_(
+                        FactoryBaseTransition.phase.in_(("conflict", "refused")),
+                        FactoryBaseTransition.request_id == ExecutionRequest.id,
+                    ),
+                ),
+            ),
             ExecutionRequest.published_generation.is_distinct_from(
                 ExecutionRequest.dispatch_generation
             ),
@@ -786,19 +819,51 @@ async def _defer_factory_refusal(
     )
 
 
-async def acquire(
+async def _unsettled_base_transition(
     session: AsyncSession,
-    request_id: uuid.UUID,
+    work_item: WorkItem,
+    *,
+    base_branch: str | None,
+    base_commit: str | None,
+) -> FactoryBaseTransition | None:
+    from .models import ThreadPublicationLineage
+
+    if work_item.publication_lineage_id is None:
+        return None
+    transition: FactoryBaseTransition | None = await session.scalar(
+        select(FactoryBaseTransition)
+        .join(
+            ThreadPublicationLineage,
+            ThreadPublicationLineage.id == FactoryBaseTransition.lineage_id,
+        )
+        .where(
+            FactoryBaseTransition.work_item_id == work_item.id,
+            FactoryBaseTransition.lineage_id == work_item.publication_lineage_id,
+            FactoryBaseTransition.phase == "applied",
+            FactoryBaseTransition.outcome_ready_at.is_not(None),
+            FactoryBaseTransition.ci_settled_at.is_(None),
+            FactoryBaseTransition.target_base_ref == base_branch,
+            FactoryBaseTransition.target_base_sha == base_commit,
+            ThreadPublicationLineage.head_sha == FactoryBaseTransition.verification_head_sha,
+            ThreadPublicationLineage.base_ref == FactoryBaseTransition.target_base_ref,
+            ThreadPublicationLineage.base_sha == FactoryBaseTransition.target_base_sha,
+        )
+        .order_by(FactoryBaseTransition.applied_at.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    return transition
+
+
+async def _check_acquirable(
+    session: AsyncSession,
+    work_item: WorkItem,
+    request: ExecutionRequest,
     *,
     owner: str,
     generation: int,
     wake: FactoryWake,
-    context: FactoryContext | None,
-) -> AcquireGrant | DispatchConflict:
-    locked = await _lock_pair(session, request_id)
-    if isinstance(locked, DispatchConflict):
-        return locked
-    work_item, request = locked
+) -> tuple[WorkItem, ExecutionRequest, datetime, datetime] | DispatchConflict:
     if work_item.cancelled_at is not None:
         return await _refuse(
             session,
@@ -838,7 +903,6 @@ async def acquire(
             work_item_id=work_item.id,
             request_id=request.id,
         )
-    lease = timedelta(seconds=get_settings().work_item_acquire_lease_seconds)
     held = (
         request.acquire_owner is not None
         and request.acquired_generation == generation
@@ -859,6 +923,36 @@ async def acquire(
             work_item_id=work_item.id,
             request_id=request.id,
         )
+    return work_item, request, deadline, now
+
+
+async def _lock_acquirable(
+    session: AsyncSession,
+    request_id: uuid.UUID,
+    *,
+    owner: str,
+    generation: int,
+    wake: FactoryWake,
+) -> tuple[WorkItem, ExecutionRequest, datetime, datetime] | DispatchConflict:
+    locked = await _lock_pair(session, request_id)
+    if isinstance(locked, DispatchConflict):
+        return locked
+    work_item, request = locked
+    return await _check_acquirable(
+        session, work_item, request, owner=owner, generation=generation, wake=wake
+    )
+
+
+async def _claim_acquire(
+    session: AsyncSession,
+    work_item: WorkItem,
+    request: ExecutionRequest,
+    *,
+    owner: str,
+    generation: int,
+    now: datetime,
+) -> DispatchConflict | None:
+    lease = timedelta(seconds=get_settings().work_item_acquire_lease_seconds)
     changed_id = await session.scalar(
         update(ExecutionRequest)
         .where(
@@ -881,6 +975,85 @@ async def acquire(
             work_item_id=work_item.id,
             request_id=request.id,
         )
+    return None
+
+
+async def acquire(
+    session: AsyncSession,
+    request_id: uuid.UUID,
+    *,
+    owner: str,
+    generation: int,
+    wake: FactoryWake,
+    context: FactoryContext | None,
+    client: httpx.AsyncClient,
+) -> AcquireGrant | DispatchConflict:
+    from .factory_base_reconcile import resolve_for_acquire
+
+    request = await session.get(ExecutionRequest, request_id, populate_existing=True)
+    if request is None:
+        return await _refuse(session, "not_found", request_id=request_id)
+    work_item = await session.get(WorkItem, request.work_item_id, populate_existing=True)
+    if work_item is None:
+        return await _refuse(session, "not_found", request_id=request_id)
+    checked = await _check_acquirable(
+        session, work_item, request, owner=owner, generation=generation, wake=wake
+    )
+    if isinstance(checked, DispatchConflict):
+        return checked
+    current = await _factory_context(session, work_item, request)
+    refusal = (
+        current
+        if isinstance(current, str)
+        else _factory_context_change(current, context) if context is not None else None
+    )
+    if refusal is not None:
+        await session.commit()
+        session.expire_all()
+        locked = await _lock_acquirable(
+            session, request_id, owner=owner, generation=generation, wake=wake
+        )
+        if isinstance(locked, DispatchConflict):
+            return locked
+        work_item, request, _, now = locked
+        current = await _factory_context(session, work_item, request)
+        refusal = (
+            current
+            if isinstance(current, str)
+            else _factory_context_change(current, context) if context is not None else None
+        )
+        if refusal is not None:
+            claimed = await _claim_acquire(
+                session, work_item, request, owner=owner, generation=generation, now=now
+            )
+            if claimed is not None:
+                return claimed
+            return await _defer_factory_refusal(
+                session, work_item, request, owner=owner, generation=generation, refusal=refusal
+            )
+    await session.commit()
+    session.expire_all()
+    ready = await resolve_for_acquire(
+        session,
+        request_id=request_id,
+        owner=owner,
+        generation=generation,
+        settings=get_settings(),
+        client=client,
+    )
+    if not ready:
+        return await _refuse(session, "not_dispatchable", request_id=request_id)
+    locked = await _lock_acquirable(
+        session, request_id, owner=owner, generation=generation, wake=wake
+    )
+    if isinstance(locked, DispatchConflict):
+        return locked
+    work_item, request, deadline, now = locked
+    claimed = await _claim_acquire(
+        session, work_item, request, owner=owner, generation=generation, now=now
+    )
+    if claimed is not None:
+        return claimed
     current = await _factory_context(session, work_item, request)
     refusal = (
         current
@@ -892,6 +1065,99 @@ async def acquire(
             session, work_item, request, owner=owner, generation=generation, refusal=refusal
         )
     assert isinstance(current, FactoryContext)
+    pending_pin = session.info.pop("factory_base_pin", None)
+    if pending_pin is not None:
+        from .factory_notices import mark_status_comment_stale
+        from .models import ThreadPublicationLineage
+
+        pin_item_id, pin_request_id, selected_base, settle_until, empty_lineage_id, base_commit = (
+            pending_pin
+        )
+        if pin_item_id != work_item.id or pin_request_id != request.id:
+            await session.rollback()
+            return await _refuse(session, "not_dispatchable", request_id=request_id)
+        transition = await _unsettled_base_transition(
+            session,
+            work_item,
+            base_branch=selected_base.branch,
+            base_commit=base_commit,
+        )
+        if transition is not None:
+            prior = await session.get(ExecutionRequest, transition.ci_request_id)
+            if (
+                transition.ci_request_id != work_item.base_resolved_request_id
+                or prior is None
+                or prior.work_item_id != work_item.id
+                or (
+                    prior.id != request.id
+                    and (
+                        prior.sequence >= request.sequence
+                        or prior.status not in ("completed", "failed", "expired", "cancelled")
+                    )
+                )
+            ):
+                return await _defer_factory_refusal(
+                    session,
+                    work_item,
+                    request,
+                    owner=owner,
+                    generation=generation,
+                    refusal="not_dispatchable",
+                )
+            if prior.id != request.id:
+                transition.ci_request_id = request.id
+                transition.ci_ready_at = None
+                transition.version += 1
+        if empty_lineage_id is not None:
+            from .factory_base_reconcile import lineage_busy, lineage_empty
+
+            lineage = await session.scalar(
+                select(ThreadPublicationLineage)
+                .where(ThreadPublicationLineage.id == empty_lineage_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if (
+                work_item.publication_lineage_id != empty_lineage_id
+                or lineage is None
+                or not lineage_empty(lineage)
+                or await lineage_busy(session, empty_lineage_id)
+            ):
+                await session.rollback()
+                return await _refuse(session, "not_dispatchable", request_id=request_id)
+            lineage.base_ref, lineage.base_sha = selected_base.branch, selected_base.commit
+            lineage.version += 1
+        request.base_settle_until = settle_until
+        work_item.base_branch, work_item.base_source, work_item.base_commit = (
+            selected_base.branch,
+            selected_base.source,
+            base_commit,
+        )
+        work_item.base_resolved_request_id = request.id
+        work_item.base_label_ignored = None
+        work_item.base_selection_fingerprint = None
+        work_item.base_requested_branch, work_item.base_requested_source = None, None
+        work_item.version += 1
+        await mark_status_comment_stale(session, work_item.id)
+    else:
+        transition = await _unsettled_base_transition(
+            session,
+            work_item,
+            base_branch=work_item.base_branch,
+            base_commit=work_item.base_commit,
+        )
+        if transition is not None and (
+            transition.ci_request_id != request.id
+            or work_item.base_resolved_request_id != request.id
+        ):
+            return await _defer_factory_refusal(
+                session,
+                work_item,
+                request,
+                owner=owner,
+                generation=generation,
+                refusal="not_dispatchable",
+            )
     grant = AcquireGrant(
         generation=generation,
         work_item_id=work_item.id,
@@ -1103,6 +1369,10 @@ async def start(
         return await _refuse(
             session, "waiting_deadline_elapsed", work_item_id=work_item.id, request_id=request.id
         )
+    if request.base_settle_until is not None and work_item.base_resolved_request_id != request.id:
+        return await _refuse(
+            session, "not_dispatchable", work_item_id=work_item.id, request_id=request.id
+        )
     current = await _factory_context(session, work_item, request)
     refusal = current if isinstance(current, str) else _factory_context_change(current, context)
     if refusal is not None:
@@ -1297,12 +1567,7 @@ def _not_approval_hold() -> ColumnElement[bool]:
 
 
 def _not_awaiting_publication() -> ColumnElement[bool]:
-    # A publication in flight or succeeded hands the request's terminus to the
-    # publication loop and the CI gate, not to runtime owner loss.
-    return ~exists().where(
-        Publication.execution_request_id == ExecutionRequest.id,
-        Publication.status.in_((*lifecycle.IN_FLIGHT_PUBLICATION, "succeeded")),
-    )
+    return lifecycle.not_awaiting_publication()
 
 
 async def list_runtime_owners(
@@ -1374,19 +1639,14 @@ async def declare_owner_lost(
         and now < request.execution_deadline
     )
     awaiting_publication = await session.scalar(
-        select(Publication.id)
-        .where(
-            Publication.execution_request_id == request.id,
-            Publication.status.in_((*lifecycle.IN_FLIGHT_PUBLICATION, "succeeded")),
-        )
-        .limit(1)
+        select(~lifecycle.not_awaiting_publication()).where(ExecutionRequest.id == request.id)
     )
     if (
         request.status != "running"
         or request.runtime_owner != owner
         or request.runtime_epoch != runtime_epoch
         or held
-        or awaiting_publication is not None
+        or awaiting_publication
     ):
         return await _refuse(
             session,

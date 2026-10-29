@@ -42,6 +42,7 @@ from curie_api.publication_pulls import (
     adopt_or_open,
     revision_refusal,
 )
+from forge_fakes.github import GitHubRepositoryFake
 
 REPO = "acme-corp/acme-bot"
 REPO_ID = 4401
@@ -221,6 +222,44 @@ def test_stored_pull_number_is_the_only_identity_used_for_lineage_truth() -> Non
     assert observed.state is PullRequestState.OPEN
     assert observed.head_sha == REVISION_HEAD
     assert observed.head_ref == BRANCH
+
+
+def test_add_pull_request_labels_uses_the_documented_issue_endpoint_and_credential() -> None:
+    github = GitHubRepositoryFake()
+    github.branches[BRANCH] = REVISION_HEAD
+
+    async def body(host: GitHubCodeHost) -> None:
+        pull = await host.open_pull_request(
+            _repository(), head_ref=BRANCH, base_ref="main", title=TITLE, body=BODY, draft=False
+        )
+        await host.add_pull_request_labels(pull.ref, ["SMOKE", "ready"])
+
+    _with_host(github.handle, body)
+
+    [request] = github.label_requests
+    assert request.method == "POST"
+    assert request.url.path == f"/repos/{REPO}/issues/1/labels"
+    assert request.headers["Authorization"] == GIT_HEADER
+    assert json.loads(request.content) == {"labels": ["SMOKE", "ready"]}
+    assert github.issues[1]["labels"] == [{"name": "SMOKE"}, {"name": "ready"}]
+
+
+def test_add_pull_request_labels_reports_an_external_forge_failure() -> None:
+    requests: list[httpx.Request] = []
+
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(503, json={"message": "provider payload stays private"})
+
+    with pytest.raises(Unavailable):
+        _with_host(
+            unavailable,
+            lambda host: host.add_pull_request_labels(
+                PullRequestRef(_repository(), "123"), ["SMOKE"]
+            ),
+        )
+
+    assert len(requests) == 1
 
 
 @pytest.mark.parametrize(
