@@ -6,7 +6,9 @@ Status: Accepted
 
 Accepted 2026-10-29 with explicit maintainer approval from jw3329, including
 merging alongside its realizing code path, recorded in the publishing pull
-request ([#5176](https://github.com/curie-eng/curie/pull/5176)). The realizing
+request ([#5176](https://github.com/curie-eng/curie/pull/5176)). The same day the
+maintainer separately approved decision 2's clause for agents whose invocation
+role is migrated or filtered, added after the first CI run. The realizing
 code path is `curie_api.identity.http_invocation.binding_requires_http_identity`
 and the worker's `BindingResolver` identity classifier.
 
