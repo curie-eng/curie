@@ -115,8 +115,9 @@ deployment, and periodically classify failed work for targeted repairs.
 
 The [preparation guide](guides/factory-preparation.md) has the installation and
 invocation table for Codex, Claude Code, Copilot, Gemini and Cursor, global
-installation, manual upgrades, and a source build option until the installer is
-released. Installation needs no Python or running Curie service. Starting work
+installation, safe upgrades, manual handling for customized skills, and a
+source build option until the installer is released. Installation needs no
+Python or running Curie service. Starting work
 still needs a configured factory, tracker access and the start authority described
 below. The skill does not deploy a factory or guarantee that a task can finish.
 

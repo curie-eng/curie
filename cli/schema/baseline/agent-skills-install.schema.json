@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/agent-skills-install/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/agent-skills-install/v1.1.json",
   "title": "Curie skill set installation --json",
   "description": "One receipt per bundled human-facing skill. Installation does not establish client activation or factory access.",
   "type": "object",
@@ -39,6 +39,7 @@
           "status": {
             "enum": [
               "installed",
+              "upgraded",
               "unchanged"
             ]
           },

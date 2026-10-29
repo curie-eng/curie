@@ -308,18 +308,20 @@ runtime admission validator is included.
 sets the ownership boundary for future factory policy; #4589 tracks isolated
 evaluation support.
 
-## Manual upgrades
+## Upgrades
 
 The installer copies the skill bundled with the selected Curie CLI build. It
-accepts an identical existing copy and refuses a different, edited or incomplete
-copy before writing. This release has no automatic update check, managed updater,
-rollback command, release cache or repository version resolver.
+accepts an identical existing copy and upgrades an exact previously shipped
+copy when the bundled skill changes. It refuses edited, extended or incomplete
+copies before writing. There is no automatic update check, rollback command,
+release cache or repository version resolver.
 
-To replace an installed skill, review the new instructions, preserve the old skill
-folder outside every directory your client discovers, then rerun the install
-command using the chosen newer CLI build. Keep the original until the replacement
-works. Reapply any local customizations manually after checking that they still
-fit the new workflow; installation does not merge or discard them.
+To upgrade an unmodified skill, rerun the install command using the chosen
+newer CLI build. For a customized skill, review the new instructions, preserve
+the old skill folder outside every directory your client discovers, then rerun
+the install command. Keep the original until the replacement works. Reapply
+local customizations manually after checking that they still fit the new
+workflow; installation does not merge or discard them.
 
 For example, after backing up and moving the existing skill folder:
 

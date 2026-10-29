@@ -832,14 +832,32 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
 pub fn install_curie_skills(
     options: crate::agent_skills::InstallOptions,
 ) -> Result<Box<dyn CliOutput>> {
+    // Digests of the first shipped skill trees (PR #4554). Append a digest
+    // before changing an embedded skill so an untouched installation upgrades.
     let skills: Vec<crate::agent_skills::SkillFiles<'_>> = [
-        ("preparation", "prepare-factory-ticket"),
-        ("review", "review-pr"),
-        ("environment", "factory-environment-setup"),
-        ("environment", "factory-environment-maintenance"),
+        (
+            "preparation",
+            "prepare-factory-ticket",
+            &["b4c5b268d73dad0a010ccc51c04e9049fdb1b0516af1634f60d0834c962b3d85"][..],
+        ),
+        (
+            "review",
+            "review-pr",
+            &["4c13897920b1ab2deeeda90a6cb00b2b465b0c3a8576eeb552185322fb6efbc8"][..],
+        ),
+        (
+            "environment",
+            "factory-environment-setup",
+            &["a828913e1486f3dd8d7409f4a6f551c5e7d386230c3f8198b8f447ca3f753d6e"][..],
+        ),
+        (
+            "environment",
+            "factory-environment-maintenance",
+            &["ef6d8023e0b3f28ea5ac66748803bf193741635b86e7022c72eab44246a17219"][..],
+        ),
     ]
     .into_iter()
-    .map(|(resource, name)| {
+    .map(|(resource, name, previous_versions)| {
         let prefix = format!("{resource}/skills/{name}/");
         let files = DARK_FACTORY_BUNDLE_FILES
             .iter()
@@ -848,7 +866,11 @@ pub fn install_curie_skills(
                     .map(|relative| (relative, *bytes))
             })
             .collect();
-        (name, files)
+        crate::agent_skills::SkillFiles {
+            name,
+            files,
+            previous_versions,
+        }
     })
     .collect();
     crate::agent_skills::install_set(&skills, options)
