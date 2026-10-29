@@ -136,7 +136,7 @@ provide the equivalent provider-specific steps.
 2. **Add the configured label.** The default is `curie-factory`. A permitted
    user adding it admits work. Polling is the quickstart default, with a
    45-second interval; production can also use authenticated webhooks. By
-   default, the factory waits 60 seconds after selection before acquiring a
+   default, the factory waits 60 seconds after factory marking before acquiring a
    sandbox and reads the current `base:<branch>` label then. With no base label
    it uses the deployment default. Later base changes restart work only while
    it has no publication authority. Once review or publication is reserved, a
