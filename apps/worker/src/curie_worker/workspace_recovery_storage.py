@@ -728,9 +728,12 @@ class RecoveryCheckpointWriter:
             # goes without ``retract`` and a complete checkpoint stands. A failing or
             # unanswerable fence means a commit may have landed without ownership.
             if failure.retract and failure.code != "lease_lost":
+                # The fence gets its own bound (at most half the cleanup allowance)
+                # so a stalled fence cannot starve the retraction; a timeout or any
+                # other error counts as lost.
                 try:
-                    await _fenced(fence)
-                except _CaptureFailure:
+                    await asyncio.wait_for(_fenced(fence), self._cleanup_budget / 2)
+                except Exception:  # noqa: BLE001 - typed fault boundary
                     failure.code = "lease_lost"
                 else:
                     failure.retract = False
