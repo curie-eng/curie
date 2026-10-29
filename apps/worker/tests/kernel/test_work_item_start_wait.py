@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
+import uuid
+from types import SimpleNamespace
 
 import pytest
 from aci_protocol import Final, SessionStatus, TextDelta
+from curie_worker import workspace as workspace_module
 
 from apps.worker.tests.queue_fixtures import wait_until
 from apps.worker.tests.start_wait_fixtures import (
@@ -24,13 +28,35 @@ __all__ = ["start_wait", "start_wait_database"]
 @pytest.mark.parametrize(
     "start_wait", ["clone-slot", "clone", "archive", "upload", "total"], indirect=True
 )
-def test_workspace_timeout_is_uncounted_wait(start_wait: StartWaitCase) -> None:
+def test_workspace_timeout_is_uncounted_wait(
+    start_wait: StartWaitCase, monkeypatch: pytest.MonkeyPatch
+) -> None:
     case = start_wait
+    if case.fault == "total":
+        monotonic = [0.0]
+        monkeypatch.setattr(
+            workspace_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: monotonic[0], time=time.time),
+        )
+        redeem = case.issuer.redeem
+
+        def exhausted_redeem(
+            deployment_id: uuid.UUID, thread_key: str
+        ) -> workspace_module.WorkspaceCredential:
+            credential = redeem(deployment_id, thread_key)
+            monotonic[0] = case.preparer.limits.total_timeout_seconds + 1
+            return credential
+
+        monkeypatch.setattr(case.issuer, "redeem", exhausted_redeem)
     case.run(case.deliver())
     assert_timeout_payload(case, case.fault)
     assert_uncounted_wait(case, case.run(case.state()))
     assert not case.keys()
     assert not case.h.fake_k8s.claims
+    if case.fault == "total":
+        assert case.issuer.redemptions == 1
+        assert case.host.git_requests == []
 
 
 @pytest.mark.parametrize("start_wait", ["lookalike"], indirect=True)

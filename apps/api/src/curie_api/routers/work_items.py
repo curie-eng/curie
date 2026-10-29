@@ -97,8 +97,9 @@ class DeferBody(BaseModel):
     generation: int = Field(ge=1)
     reason: str = Field(min_length=1)
     capacity: bool
-    # #4930: a pre-start workspace preparation diagnostic. Stored only on a
-    # non-capacity `not_started:` defer, redacted and clipped by the API.
+    # #4930: a pre-start workspace preparation diagnostic. Stored on
+    # non-capacity `not_started:` and `workspace_timeout` defers, redacted
+    # and clipped by the API.
     start_failure_detail: str | None = None
 
 

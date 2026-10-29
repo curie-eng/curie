@@ -37,6 +37,16 @@ def test_six_worker_timeouts_keep_waiting_until_the_original_deadline(
             )
             assert case.payloads[-1]["capacity"] is False
             assert not case.payloads[-1]["reason"].startswith("not_started:")
+            diagnostic = case.payloads[-1]["start_failure_detail"]
+            assert isinstance(diagnostic, str) and diagnostic
+            assert row["last_start_failure_detail"] == diagnostic
+            summary = await case.http.get(
+                f"/work-items/{row['work_item_id']}",
+                headers={"X-API-Key": "example-api-key"},
+            )
+            assert summary.status_code == 200, summary.text
+            assert summary.json()["state"] == "waiting"
+            assert diagnostic in summary.json()["actionable_cause"]
         generation = await case.publish()
         case.now = case.initial["wait_deadline"]
         with pytest.raises(WorkItemConflict, match="waiting_deadline_elapsed"):
@@ -64,6 +74,14 @@ def test_six_worker_timeouts_keep_waiting_until_the_original_deadline(
         assert final["wait_deadline"] == case.initial["wait_deadline"]
         assert final["start_deferrals"] == final["capacity_deferrals"] == 0
         assert final["execution_attempts"] == 0
+        assert final["last_start_failure_detail"] == diagnostic
+        summary = await case.http.get(
+            f"/work-items/{final['work_item_id']}",
+            headers={"X-API-Key": "example-api-key"},
+        )
+        assert summary.status_code == 200, summary.text
+        assert summary.json()["state"] == "expired"
+        assert diagnostic in summary.json()["actionable_cause"]
         assert case.h.runner.opened == []
 
     case.run(exercise())
