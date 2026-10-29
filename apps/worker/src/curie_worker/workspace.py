@@ -40,6 +40,7 @@ from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 
 from aci_protocol import BootEnv
+from curie_internal.workspace_objects import WorkspaceObjectPort, WorkspaceObjectSigner
 
 logger = logging.getLogger(__name__)
 
@@ -821,31 +822,8 @@ class SubprocessCommands:
         return CommandResult(stdout=completed.stdout)
 
 
-class WorkspaceObjectPort(Protocol):
-    def put_stream(self, key: str, chunks: Iterable[bytes]) -> None: ...
-
-    def get_stream(self, key: str) -> Iterator[bytes]: ...
-
-    def presign_get(self, key: str, *, expires_seconds: int) -> str: ...
-
-    def delete(self, key: str) -> None: ...
-
-    def list_keys(self, prefix: str) -> Iterator[str]: ...
-
-
-class WorkspaceObjectStore:
+class WorkspaceObjectStore(WorkspaceObjectSigner):
     """Private S3/RustFS storage with streaming exact-object operations."""
-
-    def __init__(self, *, client: Any, bucket: str, prefix: str = "private/workspaces") -> None:
-        self._client = client
-        self._bucket = bucket
-        self._prefix = prefix.strip("/")
-
-    def _key(self, key: str) -> str:
-        clean = key.lstrip("/")
-        if clean.startswith("../") or "/../" in clean:
-            raise ValueError("workspace object key escapes its private prefix")
-        return f"{self._prefix}/{clean}"
 
     def put_stream(self, key: str, chunks: Iterable[bytes]) -> None:
         # boto3 upload_fileobj streams and multipart-uploads as needed. Adapt the
@@ -865,15 +843,6 @@ class WorkspaceObjectStore:
             close = getattr(body, "close", None)
             if close is not None:
                 close()
-
-    def presign_get(self, key: str, *, expires_seconds: int) -> str:
-        return str(
-            self._client.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": self._bucket, "Key": self._key(key)},
-                ExpiresIn=expires_seconds,
-            )
-        )
 
     def delete(self, key: str) -> None:
         self._client.delete_object(Bucket=self._bucket, Key=self._key(key))

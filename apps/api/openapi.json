@@ -11021,6 +11021,216 @@
         "title": "RecoveryObjectReceipt",
         "type": "object"
       },
+      "RecoveryPublicCheckpoint": {
+        "additionalProperties": false,
+        "properties": {
+          "age_seconds": {
+            "minimum": 0.0,
+            "title": "Age Seconds",
+            "type": "number"
+          },
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "base_commit": {
+            "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+            "title": "Base Commit",
+            "type": "string"
+          },
+          "checkpoint_id": {
+            "format": "uuid",
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/RecoveryPublicObject"
+            },
+            "maxItems": 3,
+            "title": "Objects",
+            "type": "array"
+          },
+          "repository": {
+            "$ref": "#/components/schemas/RecoveryRepository"
+          },
+          "source_request_id": {
+            "format": "uuid",
+            "title": "Source Request Id",
+            "type": "string"
+          },
+          "source_sequence": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Source Sequence",
+            "type": "integer"
+          },
+          "source_status": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Source Status",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "staging",
+              "complete",
+              "tombstoned"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "target_branch": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Target Branch",
+            "type": "string"
+          },
+          "total_bytes": {
+            "minimum": 0.0,
+            "title": "Total Bytes",
+            "type": "integer"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "checkpoint_id",
+          "work_item_id",
+          "source_request_id",
+          "repository",
+          "base_commit",
+          "target_branch",
+          "source_sequence",
+          "source_status",
+          "completed_at",
+          "expires_at",
+          "age_seconds",
+          "status",
+          "available",
+          "total_bytes",
+          "objects"
+        ],
+        "title": "RecoveryPublicCheckpoint",
+        "type": "object"
+      },
+      "RecoveryPublicList": {
+        "additionalProperties": false,
+        "properties": {
+          "capture_outcome": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "pattern": "\\S",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capture Outcome"
+          },
+          "capture_outcome_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capture Outcome At"
+          },
+          "checkpoints": {
+            "items": {
+              "$ref": "#/components/schemas/RecoveryPublicCheckpoint"
+            },
+            "maxItems": 3,
+            "title": "Checkpoints",
+            "type": "array"
+          },
+          "repository": {
+            "$ref": "#/components/schemas/RecoveryRepository"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "repository",
+          "capture_outcome",
+          "capture_outcome_at",
+          "checkpoints"
+        ],
+        "title": "RecoveryPublicList",
+        "type": "object"
+      },
+      "RecoveryPublicObject": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "enum": [
+              "base",
+              "patch",
+              "manifest"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "size_bytes",
+          "sha256"
+        ],
+        "title": "RecoveryPublicObject",
+        "type": "object"
+      },
       "RecoveryReader": {
         "additionalProperties": false,
         "properties": {
@@ -32387,6 +32597,218 @@
         "summary": "Get Work Item",
         "tags": [
           "work-items"
+        ]
+      }
+    },
+    "/work-items/{work_item_id}/recovery": {
+      "get": {
+        "operationId": "list_checkpoints_work_items__work_item_id__recovery_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryPublicList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Checkpoints",
+        "tags": [
+          "workspace-recovery"
+        ]
+      }
+    },
+    "/work-items/{work_item_id}/recovery/{checkpoint_id}": {
+      "get": {
+        "operationId": "checkpoint_status_work_items__work_item_id__recovery__checkpoint_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "checkpoint_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Checkpoint Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryPublicCheckpoint"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Checkpoint Status",
+        "tags": [
+          "workspace-recovery"
+        ]
+      }
+    },
+    "/work-items/{work_item_id}/recovery/{checkpoint_id}/objects/{kind}": {
+      "get": {
+        "operationId": "object_download_work_items__work_item_id__recovery__checkpoint_id__objects__kind__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "checkpoint_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Checkpoint Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "enum": [
+                "base",
+                "patch",
+                "manifest"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Object Download",
+        "tags": [
+          "workspace-recovery"
         ]
       }
     },

@@ -4080,6 +4080,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/work-items/{work_item_id}/recovery": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Checkpoints */
+        get: operations["list_checkpoints_work_items__work_item_id__recovery_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/work-items/{work_item_id}/recovery/{checkpoint_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Checkpoint Status */
+        get: operations["checkpoint_status_work_items__work_item_id__recovery__checkpoint_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/work-items/{work_item_id}/recovery/{checkpoint_id}/objects/{kind}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Object Download */
+        get: operations["object_download_work_items__work_item_id__recovery__checkpoint_id__objects__kind__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/work-items/{work_item_id}/usage": {
         parameters: {
             query?: never;
@@ -8725,6 +8776,77 @@ export interface components {
         RecoveryObjectReceipt: {
             /** Key */
             key: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "base" | "patch" | "manifest";
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes: number;
+        };
+        /** RecoveryPublicCheckpoint */
+        RecoveryPublicCheckpoint: {
+            /** Age Seconds */
+            age_seconds: number;
+            /** Available */
+            available: boolean;
+            /** Base Commit */
+            base_commit: string;
+            /**
+             * Checkpoint Id
+             * Format: uuid
+             */
+            checkpoint_id: string;
+            /** Completed At */
+            completed_at: string | null;
+            /** Expires At */
+            expires_at: string | null;
+            /** Objects */
+            objects: components["schemas"]["RecoveryPublicObject"][];
+            repository: components["schemas"]["RecoveryRepository"];
+            /**
+             * Source Request Id
+             * Format: uuid
+             */
+            source_request_id: string;
+            /** Source Sequence */
+            source_sequence: number;
+            /** Source Status */
+            source_status: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "staging" | "complete" | "tombstoned";
+            /** Target Branch */
+            target_branch: string;
+            /** Total Bytes */
+            total_bytes: number;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** RecoveryPublicList */
+        RecoveryPublicList: {
+            /** Capture Outcome */
+            capture_outcome: string | null;
+            /** Capture Outcome At */
+            capture_outcome_at: string | null;
+            /** Checkpoints */
+            checkpoints: components["schemas"]["RecoveryPublicCheckpoint"][];
+            repository: components["schemas"]["RecoveryRepository"];
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** RecoveryPublicObject */
+        RecoveryPublicObject: {
             /**
              * Kind
              * @enum {string}
@@ -19346,6 +19468,108 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["WorkItemOutcomeOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_checkpoints_work_items__work_item_id__recovery_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                work_item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryPublicList"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    checkpoint_status_work_items__work_item_id__recovery__checkpoint_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                work_item_id: string;
+                checkpoint_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryPublicCheckpoint"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    object_download_work_items__work_item_id__recovery__checkpoint_id__objects__kind__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                work_item_id: string;
+                checkpoint_id: string;
+                kind: "base" | "patch" | "manifest";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
                 };
             };
             /** @description Validation Error */

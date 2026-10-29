@@ -618,6 +618,9 @@
           "/work-items/issue-read",
           "/work-items/{work_item_id}",
           "/work-items/{work_item_id}/usage",
+          "/work-items/{work_item_id}/recovery",
+          "/work-items/{work_item_id}/recovery/{checkpoint_id}",
+          "/work-items/{work_item_id}/recovery/{checkpoint_id}/objects/{kind}",
           "unmatched"
         ],
         "role": [
@@ -637,7 +640,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1584,
+      "cardinality_bound": 1608,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -843,6 +846,9 @@
           "/work-items/issue-read",
           "/work-items/{work_item_id}",
           "/work-items/{work_item_id}/usage",
+          "/work-items/{work_item_id}/recovery",
+          "/work-items/{work_item_id}/recovery/{checkpoint_id}",
+          "/work-items/{work_item_id}/recovery/{checkpoint_id}/objects/{kind}",
           "unmatched"
         ],
         "outcome": [
@@ -869,7 +875,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 7920,
+      "cardinality_bound": 8040,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -1075,6 +1081,9 @@
           "/work-items/issue-read",
           "/work-items/{work_item_id}",
           "/work-items/{work_item_id}/usage",
+          "/work-items/{work_item_id}/recovery",
+          "/work-items/{work_item_id}/recovery/{checkpoint_id}",
+          "/work-items/{work_item_id}/recovery/{checkpoint_id}/objects/{kind}",
           "unmatched"
         ],
         "outcome": [
@@ -1101,7 +1110,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 7920,
+      "cardinality_bound": 8040,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

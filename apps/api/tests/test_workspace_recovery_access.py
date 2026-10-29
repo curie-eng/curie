@@ -75,7 +75,7 @@ class StoreProxy:
     mode: str = ""
     seen: threading.Event = field(default_factory=threading.Event)
     release: threading.Event = field(default_factory=threading.Event)
-    requests: list[tuple[str, float]] = field(default_factory=list)
+    requests: list[tuple[str, float]] = field(default_factory=list, repr=False)
 
     def arm(self, mode: str) -> None:
         self.mode = mode
@@ -245,12 +245,17 @@ def access(
             pass
 
         def do_GET(self) -> None:
-            # GitLab REST v4: https://docs.gitlab.com/api/projects/#get-a-single-project
-            assert self.path == "/api/v4/projects/101", self.path
-            data = json.dumps({
-                "id": forge_state["id"], "path_with_namespace": REPOSITORY["path"],
-                "default_branch": forge_state["default_branch"],
-            }).encode()
+            if self.path == "/api/v4/version":
+                # GitLab REST v4: https://docs.gitlab.com/api/version/
+                payload = {"version": "17.0.0", "revision": "example"}
+            else:
+                # GitLab REST v4: https://docs.gitlab.com/api/projects/#get-a-single-project
+                assert self.path == "/api/v4/projects/101", self.path
+                payload = {
+                    "id": forge_state["id"], "path_with_namespace": REPOSITORY["path"],
+                    "default_branch": forge_state["default_branch"],
+                }
+            data = json.dumps(payload).encode()
             self.send_response(503 if forge_state["unavailable"] else 200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -382,7 +387,11 @@ def test_recovery_admin_access(access: Access, caplog: pytest.LogCaptureFixture)
     _metadata(listed["checkpoints"][0], source, reservation, payloads)
     _metadata(_ok(access.get(source, reservation)), source, reservation, payloads)
     for kind, data in payloads.items():
-        response = access.get(source, reservation, kind, follow_redirects=False)
+        with (
+            caplog.at_level(logging.DEBUG, logger="botocore.auth"),
+            caplog.at_level(logging.DEBUG, logger="botocore.regions"),
+        ):
+            response = access.get(source, reservation, kind, follow_redirects=False)
         assert response.status_code == 200, response.text
         assert response.content == data
         assert hashlib.sha256(response.content).hexdigest() == hashlib.sha256(data).hexdigest()
@@ -502,14 +511,43 @@ def test_recovery_admin_access(access: Access, caplog: pytest.LogCaptureFixture)
     _private(caplog.text)
 
 
+class BoundaryEvent:
+    def __init__(self) -> None:
+        self._set = False
+        self._lock = threading.Lock()
+        self._waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
+
+    def set(self) -> None:
+        with self._lock:
+            self._set = True
+            waiters = list(self._waiters)
+        for loop, event in waiters:
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                pass
+
+    async def wait(self) -> None:
+        waiter = (asyncio.get_running_loop(), asyncio.Event())
+        with self._lock:
+            if self._set:
+                return
+            self._waiters.append(waiter)
+        try:
+            await waiter[1].wait()
+        finally:
+            with self._lock:
+                self._waiters.remove(waiter)
+
+
 @dataclass
 class HeldResponse:
     client: TestClient
     path: str
     fail_send: bool = False
     entered: threading.Event = field(default_factory=threading.Event)
-    release: threading.Event = field(default_factory=threading.Event)
-    disconnect: threading.Event = field(default_factory=threading.Event)
+    release: BoundaryEvent = field(default_factory=BoundaryEvent)
+    disconnect: BoundaryEvent = field(default_factory=BoundaryEvent)
     messages: list[dict[str, Any]] = field(default_factory=list)
 
     def run(self) -> None:
@@ -521,7 +559,7 @@ class HeldResponse:
                 if not received:
                     received = True
                     return {"type": "http.request", "body": b"", "more_body": False}
-                await asyncio.to_thread(self.disconnect.wait)
+                await self.disconnect.wait()
                 return {"type": "http.disconnect"}
 
             async def send(message: dict[str, Any]) -> None:
@@ -529,7 +567,7 @@ class HeldResponse:
                     self.entered.set()
                     if self.fail_send:
                         raise OSError("synthetic client send failure")
-                    await asyncio.to_thread(self.release.wait)
+                    await self.release.wait()
                 self.messages.append(message)
 
             scope = {
@@ -706,6 +744,7 @@ def test_recovery_reader_lifetime(access: Access, caplog: pytest.LogCaptureFixtu
                 assert status == 200 and body == payloads["patch"]
                 with pytest.raises((TimeoutError, ExceptionGroup)):
                     future.result(timeout=8)
+                assert future.done(), "download did not end at its lease deadline"
                 assert not _readers(source)
                 assert response.body == b""
             finally:
