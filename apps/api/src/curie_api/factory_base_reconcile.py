@@ -493,6 +493,8 @@ async def _observe_base_labels_once(
         and remote_absent
         and not await _lineage_busy(session, lineage.id)
     )
+    if safe and previous.status not in {"waiting", "running", "cancellation_requested"}:
+        return None
     await _record_requested_base(session, item, choice)
     if not safe:
         item.base_selection_fingerprint = None
