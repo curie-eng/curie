@@ -855,32 +855,15 @@ async def _unsettled_base_transition(
     return transition
 
 
-async def acquire(
+async def _check_acquirable(
     session: AsyncSession,
-    request_id: uuid.UUID,
+    work_item: WorkItem,
+    request: ExecutionRequest,
     *,
     owner: str,
     generation: int,
     wake: FactoryWake,
-    context: FactoryContext | None,
-    client: httpx.AsyncClient,
-) -> AcquireGrant | DispatchConflict:
-    from .factory_base_reconcile import resolve_for_acquire
-
-    ready = await resolve_for_acquire(
-        session,
-        request_id=request_id,
-        owner=owner,
-        generation=generation,
-        settings=get_settings(),
-        client=client,
-    )
-    if not ready:
-        return await _refuse(session, "not_dispatchable", request_id=request_id)
-    locked = await _lock_pair(session, request_id)
-    if isinstance(locked, DispatchConflict):
-        return locked
-    work_item, request = locked
+) -> tuple[WorkItem, ExecutionRequest, datetime, datetime] | DispatchConflict:
     if work_item.cancelled_at is not None:
         return await _refuse(
             session,
@@ -920,7 +903,6 @@ async def acquire(
             work_item_id=work_item.id,
             request_id=request.id,
         )
-    lease = timedelta(seconds=get_settings().work_item_acquire_lease_seconds)
     held = (
         request.acquire_owner is not None
         and request.acquired_generation == generation
@@ -941,6 +923,36 @@ async def acquire(
             work_item_id=work_item.id,
             request_id=request.id,
         )
+    return work_item, request, deadline, now
+
+
+async def _lock_acquirable(
+    session: AsyncSession,
+    request_id: uuid.UUID,
+    *,
+    owner: str,
+    generation: int,
+    wake: FactoryWake,
+) -> tuple[WorkItem, ExecutionRequest, datetime, datetime] | DispatchConflict:
+    locked = await _lock_pair(session, request_id)
+    if isinstance(locked, DispatchConflict):
+        return locked
+    work_item, request = locked
+    return await _check_acquirable(
+        session, work_item, request, owner=owner, generation=generation, wake=wake
+    )
+
+
+async def _claim_acquire(
+    session: AsyncSession,
+    work_item: WorkItem,
+    request: ExecutionRequest,
+    *,
+    owner: str,
+    generation: int,
+    now: datetime,
+) -> DispatchConflict | None:
+    lease = timedelta(seconds=get_settings().work_item_acquire_lease_seconds)
     changed_id = await session.scalar(
         update(ExecutionRequest)
         .where(
@@ -963,6 +975,85 @@ async def acquire(
             work_item_id=work_item.id,
             request_id=request.id,
         )
+    return None
+
+
+async def acquire(
+    session: AsyncSession,
+    request_id: uuid.UUID,
+    *,
+    owner: str,
+    generation: int,
+    wake: FactoryWake,
+    context: FactoryContext | None,
+    client: httpx.AsyncClient,
+) -> AcquireGrant | DispatchConflict:
+    from .factory_base_reconcile import resolve_for_acquire
+
+    request = await session.get(ExecutionRequest, request_id, populate_existing=True)
+    if request is None:
+        return await _refuse(session, "not_found", request_id=request_id)
+    work_item = await session.get(WorkItem, request.work_item_id, populate_existing=True)
+    if work_item is None:
+        return await _refuse(session, "not_found", request_id=request_id)
+    checked = await _check_acquirable(
+        session, work_item, request, owner=owner, generation=generation, wake=wake
+    )
+    if isinstance(checked, DispatchConflict):
+        return checked
+    current = await _factory_context(session, work_item, request)
+    refusal = (
+        current
+        if isinstance(current, str)
+        else _factory_context_change(current, context) if context is not None else None
+    )
+    if refusal is not None:
+        await session.commit()
+        session.expire_all()
+        locked = await _lock_acquirable(
+            session, request_id, owner=owner, generation=generation, wake=wake
+        )
+        if isinstance(locked, DispatchConflict):
+            return locked
+        work_item, request, _, now = locked
+        current = await _factory_context(session, work_item, request)
+        refusal = (
+            current
+            if isinstance(current, str)
+            else _factory_context_change(current, context) if context is not None else None
+        )
+        if refusal is not None:
+            claimed = await _claim_acquire(
+                session, work_item, request, owner=owner, generation=generation, now=now
+            )
+            if claimed is not None:
+                return claimed
+            return await _defer_factory_refusal(
+                session, work_item, request, owner=owner, generation=generation, refusal=refusal
+            )
+    await session.commit()
+    session.expire_all()
+    ready = await resolve_for_acquire(
+        session,
+        request_id=request_id,
+        owner=owner,
+        generation=generation,
+        settings=get_settings(),
+        client=client,
+    )
+    if not ready:
+        return await _refuse(session, "not_dispatchable", request_id=request_id)
+    locked = await _lock_acquirable(
+        session, request_id, owner=owner, generation=generation, wake=wake
+    )
+    if isinstance(locked, DispatchConflict):
+        return locked
+    work_item, request, deadline, now = locked
+    claimed = await _claim_acquire(
+        session, work_item, request, owner=owner, generation=generation, now=now
+    )
+    if claimed is not None:
+        return claimed
     current = await _factory_context(session, work_item, request)
     refusal = (
         current
