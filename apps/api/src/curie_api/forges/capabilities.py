@@ -44,6 +44,7 @@ class Operation(enum.StrEnum):
     CREDENTIAL = "code_host.credential"
     BRANCH_HEAD = "code_host.branch_head"
     READ_COMMIT = "code_host.read_commit"
+    IS_ANCESTOR = "code_host.is_ancestor"
     FIND_PULL_REQUEST = "code_host.find_pull_request"
     OPEN_PULL_REQUEST = "code_host.open_pull_request"
     UPDATE_PULL_REQUEST = "code_host.update_pull_request"

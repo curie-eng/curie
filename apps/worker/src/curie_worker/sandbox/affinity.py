@@ -12,13 +12,19 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Mapping
+from dataclasses import asdict
+from decimal import Decimal
+from typing import Literal
 
 import redis
 from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT
 from redis.asyncio import Redis as AsyncRedis
 
+from .quota import resource_vector
 from .types import (
     EXECUTOR_THREAD_KEY_PREFIX,
+    AdmissionReservation,
+    CapacityInventory,
     PressureCandidate,
     PressureScanResult,
     RouteRecord,
@@ -84,6 +90,77 @@ redis.call('DEL', KEYS[1])
 return 1
 """
 
+_ADMISSION_RESERVE = """
+local function digits(value, scale)
+    local whole, fraction = string.match(value, '^(%d+)%.?(%d*)$')
+    if not whole then error('invalid admission quantity') end
+    return whole .. fraction .. string.rep('0', scale - #fraction)
+end
+local function sum(a, b)
+    local af = string.match(a, '%.(%d+)$') or ''
+    local bf = string.match(b, '%.(%d+)$') or ''
+    local scale = math.max(#af, #bf)
+    a, b = digits(a, scale), digits(b, scale)
+    local width = math.max(#a, #b)
+    a, b = string.rep('0', width - #a) .. a, string.rep('0', width - #b) .. b
+    local carry, result = 0, ''
+    for i = width, 1, -1 do
+        local n = tonumber(string.sub(a, i, i)) + tonumber(string.sub(b, i, i)) + carry
+        result, carry = tostring(n % 10) .. result, math.floor(n / 10)
+    end
+    result = tostring(carry) .. result
+    if scale > 0 then
+        result = string.sub(result, 1, #result - scale) .. '.' .. string.sub(result, -scale)
+    end
+    result = string.gsub(result, '^0+(%d)', '%1')
+    return result
+end
+local function greater(a, b)
+    local af = string.match(a, '%.(%d+)$') or ''
+    local bf = string.match(b, '%.(%d+)$') or ''
+    local scale = math.max(#af, #bf)
+    a, b = digits(a, scale), digits(b, scale)
+    a, b = string.gsub(a, '^0+', ''), string.gsub(b, '^0+', '')
+    return #a > #b or (#a == #b and a > b)
+end
+local occupied, hard = cjson.decode(ARGV[1]), cjson.decode(ARGV[2])
+local suspended, observed_at = cjson.decode(ARGV[5]), tonumber(ARGV[6])
+local rows = redis.call('HGETALL', KEYS[1])
+for i = 1, #rows, 2 do
+    local name, row = rows[i], cjson.decode(rows[i + 1])
+    local current = occupied[name] or {}
+    if not (suspended[name] and observed_at > row.updated_at and row.state == 'bound') then
+        for key, value in pairs(row.resources) do
+            if greater(value, current[key] or '0') then current[key] = value end
+        end
+    end
+    occupied[name] = current
+end
+local used = {}
+for key, _ in pairs(hard) do used[key] = '0' end
+for _, resources in pairs(occupied) do
+    for key, _ in pairs(hard) do used[key] = sum(used[key], resources[key] or '0') end
+end
+local row = cjson.decode(ARGV[4])
+local accepted = redis.call('HEXISTS', KEYS[1], ARGV[3]) == 0
+for key, limit in pairs(hard) do
+    if greater(sum(used[key], row.resources[key] or '0'), limit) then accepted = false end
+end
+if accepted and ARGV[7] == 'reserve' then redis.call('HSET', KEYS[1], ARGV[3], ARGV[4]) end
+return cjson.encode({accepted=accepted, used=used})
+"""
+
+_ADMISSION_UPDATE = """
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then return 0 end
+local row, expected = cjson.decode(raw), cjson.decode(ARGV[2])
+if row.owner_token ~= expected.owner_token or row.state ~= expected.state
+    or row.updated_at ~= expected.updated_at then return 0 end
+if ARGV[3] == '' then redis.call('HDEL', KEYS[1], ARGV[1])
+else redis.call('HSET', KEYS[1], ARGV[1], ARGV[3]) end
+return 1
+"""
+
 
 class AffinityStore:
     """Thread-to-sandbox route records with atomic acquire and guarded delete."""
@@ -101,6 +178,91 @@ class AffinityStore:
         self._delete_if_claim = client.register_script(_DELETE_IF_CLAIM)
         self._replace_if_generation = client.register_script(_REPLACE_IF_GENERATION)
         self._touch_if_live_claim = client.register_script(_TOUCH_IF_LIVE_CLAIM)
+        self._admission_reserve = client.register_script(_ADMISSION_RESERVE)
+        self._admission_update = client.register_script(_ADMISSION_UPDATE)
+
+    def _admission_key(self, namespace: str, quota_name: str) -> str:
+        return f"{self._prefix}:admission:{namespace}:{quota_name}"
+
+    def admission_entries(self, namespace: str, quota_name: str) -> dict[str, AdmissionReservation]:
+        rows = self._redis.hgetall(self._admission_key(namespace, quota_name))
+        result = {}
+        for name, raw in rows.items():
+            row = AdmissionReservation(**json.loads(raw))
+            if row.state not in {"preparing", "submitted", "bound", "retiring"}:
+                raise ValueError("invalid sandbox admission state")
+            resource_vector(row.resources)
+            result[name.decode() if isinstance(name, bytes) else str(name)] = row
+        return result
+
+    def admission_update(
+        self,
+        namespace: str,
+        quota_name: str,
+        name: str,
+        expected: AdmissionReservation,
+        replacement: AdmissionReservation | None,
+    ) -> bool:
+        return bool(self._admission_update(
+            keys=[self._admission_key(namespace, quota_name)],
+            args=[
+                name, json.dumps(asdict(expected)),
+                "" if replacement is None else json.dumps(asdict(replacement)),
+            ],
+        ))
+
+    def reserve_admission(
+        self,
+        namespace: str,
+        quota_name: str,
+        name: str,
+        reservation: AdmissionReservation,
+        hard: Mapping[str, str],
+        inventory: CapacityInventory,
+        *,
+        operation: Literal["reserve", "inspect"],
+    ) -> tuple[bool, dict[str, str]]:
+        """Charge observed occupants and every outstanding reservation atomically."""
+
+        occupied: dict[str, dict[str, str]] = {}
+        owners_with_pods = {pod.claim_name for pod in inventory.pods.values()}
+        suspended = {
+            claim: True for claim in inventory.suspended_claims if claim not in owners_with_pods
+        }
+        identities = inventory.claims | frozenset(
+            owner if owner is not None else f"sandbox:{name}"
+            for name, owner in inventory.sandboxes.items()
+        )
+        for identity in identities:
+            if identity in suspended:
+                continue
+            footprint = inventory.claim_resources.get(identity)
+            if footprint is not None:
+                occupied[identity] = resource_vector(footprint)
+        pod_totals: dict[str, dict[str, Decimal]] = {}
+        for uid, pod in inventory.pods.items():
+            identity = pod.claim_name or f"pod:{uid}"
+            totals = pod_totals.setdefault(identity, {})
+            for key, value in resource_vector(pod.resources).items():
+                totals[key] = totals.get(key, Decimal(0)) + Decimal(value)
+        for identity, totals in pod_totals.items():
+            current = occupied.setdefault(identity, {})
+            for key, amount in totals.items():
+                current[key] = format(max(amount, Decimal(current.get(key, "0"))), "f")
+        known = self.admission_entries(namespace, quota_name)
+        if any(
+            identity not in occupied and identity not in suspended and identity not in known
+            for identity in identities
+        ):
+            raise ValueError("sandbox admission inventory lacks an occupied footprint")
+        raw = self._admission_reserve(
+            keys=[self._admission_key(namespace, quota_name)],
+            args=[json.dumps(occupied), json.dumps(resource_vector(hard)), name,
+                  json.dumps(asdict(reservation)), json.dumps(suspended), inventory.observed_at,
+                  operation],
+        )
+        result = json.loads(raw)
+        return bool(result["accepted"]), result["used"]
 
     def _key(self, thread_key: str) -> str:
         return f"{self._prefix}:route:{thread_key}"

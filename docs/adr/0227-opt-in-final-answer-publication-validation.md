@@ -4,6 +4,8 @@ Date: 2026-10-14
 
 Status: Accepted
 
+Superseded in part by [ADR 0250](0250-verbatim-slack-answers-render-as-rich-text-sections-with-literal-links.md): clause 8's Slack rendering sentence ("emits literal plain-text blocks"); verbatim answers now render as rich text sections with literal links. The rest of this ADR stands.
+
 Accepted alongside implementation with explicit maintainer approval from Junwon Jung on 2026-10-14 under ADR 0102. Approval covers the reviewed generic final-answer publication boundary and the realizing paths below. On the same date Junwon Jung also approved scoping the requirement to declared trigger tools, with a per-turn `Final.text_mode` mark so a mixed bundle's ordinary answers keep their rendering.
 
 Tracked in [#4560](https://github.com/curie-eng/curie/issues/4560).

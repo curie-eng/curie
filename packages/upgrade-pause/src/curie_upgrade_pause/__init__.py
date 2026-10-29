@@ -1,8 +1,11 @@
 """Shared upgrade pause identity and atomic, extend-only renewal."""
 
-from typing import Literal
+from __future__ import annotations
 
-from redis.asyncio import Redis
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from redis.asyncio import Redis
 
 PAUSE_LEASE_S = 300
 

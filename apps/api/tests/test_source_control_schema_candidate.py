@@ -42,7 +42,8 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # @spec AUTOMATED-REMEDIATION-15: 0138 only widens a CHECK.
     # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
     # Workspace recovery reads require the 0141 outcome ledger.
-    assert window == {"schema_min": "0144", "schema_head": "0144"}
+    # The 0145 join requires both the stable deadline backport (0140) and 0144.
+    assert window == {"schema_min": "0145", "schema_head": "0145"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -54,7 +55,7 @@ def test_current_release_fields_match_cli_version(field: str) -> None:
     else:
         chart = yaml.safe_load((ROOT / "charts/curie/Chart.yaml").read_text())
         value = chart["version" if field == "chart" else "appVersion"]
-    assert value == "0.14.2"
+    assert value == "0.14.3"
     assert value in catalog()["windows"]
 
 
@@ -71,7 +72,8 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.0") == {"schema_min": "0122", "schema_head": "0122"}
     assert data["windows"].get("0.14.1") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
-    assert data["revisions"][-27:] == [
+    assert data["windows"].get("0.14.3") == {"schema_min": "0140", "schema_head": "0140"}
+    assert data["revisions"][-29:] == [
         "0095",
         "0096",
         "0097",
@@ -96,9 +98,11 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0137",
         "0138",
         "0139",
+        "0140",
         "0141",
         "0143",
         "0144",
+        "0145",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -119,9 +123,11 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0137"] == "expand"
     assert kinds["0138"] == "expand"
     assert kinds["0139"] == "expand"
+    assert kinds["0140"] == "expand"
     assert kinds["0141"] == "expand"
     assert kinds["0143"] == "expand"
     assert kinds["0144"] == "expand"
+    assert kinds["0145"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -136,7 +142,7 @@ def test_every_prior_registered_window_is_exactly_preserved() -> None:
     assert actual["0.12.1"] == {"schema_min": "0076", "schema_head": "0076"}
     assert set(actual) - set(expected) <= {
         "0.12.1", "0.12.2", "0.12.3", "0.12.4", "0.12.5", "0.13.0", "0.13.1", "0.13.2",
-        "0.14.0", "0.14.1", "0.14.2"
+        "0.14.0", "0.14.1", "0.14.2", "0.14.3"
     }
 
 
@@ -178,7 +184,7 @@ def test_released_0076_startup_refuses_without_migrating_then_0101_starts(
         get_settings.cache_clear()
 
 
-@pytest.mark.parametrize("source", ["0105", "0107", "0106", "0123", "0130", "0131"])
+@pytest.mark.parametrize("source", ["0105", "0107", "0106", "0123", "0130", "0131", "0140", "0144"])
 def test_both_train_heads_upgrade_without_losing_existing_rows(
     source: str, isolated_migration_db: IsolatedMigrationDb
 ) -> None:
@@ -196,7 +202,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0144"
+    assert current_revision() == "0145"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]
@@ -215,3 +221,18 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
         ("tenant_identity_providers", "http_selection"),
         ("tenant_identity_providers", "lifecycle_generation"),
     } <= columns
+    # 0140 (v0.14.3) and 0136 replace the same two checks, so either train's
+    # head reaches the twelve-hour bound through the 0145 join.
+    checks = {
+        row["conname"]: row["definition"]
+        for row in sql_dicts(
+            "SELECT conname, pg_get_constraintdef(oid) AS definition FROM pg_constraint "
+            "WHERE conname IN ('agents_execution_deadline_seconds_ck', "
+            "'execution_requests_deadline_ck')"
+        )
+    }
+    assert set(checks) == {"agents_execution_deadline_seconds_ck", "execution_requests_deadline_ck"}
+    assert "43200" in checks["agents_execution_deadline_seconds_ck"]
+    assert "10800" not in checks["agents_execution_deadline_seconds_ck"]
+    assert "'12:00:00'::interval" in checks["execution_requests_deadline_ck"]
+    assert "'03:00:00'::interval" not in checks["execution_requests_deadline_ck"]

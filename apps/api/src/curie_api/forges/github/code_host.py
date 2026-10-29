@@ -201,6 +201,20 @@ def _check_id(item: Mapping[str, Any]) -> str | None:
     return str(value) if type(value) is int and value > 0 else None
 
 
+def _later_run(candidate: NormalizedCheck, earlier: NormalizedCheck) -> bool:
+    if candidate.key != earlier.key or candidate.head_sha != earlier.head_sha:
+        return False
+    if candidate.started_at is None or earlier.started_at is None:
+        return False
+    if candidate.started_at != earlier.started_at:
+        return candidate.started_at > earlier.started_at
+    return (
+        candidate.check_id is not None
+        and earlier.check_id is not None
+        and int(candidate.check_id) > int(earlier.check_id)
+    )
+
+
 def base_rollup(detail: ci.CiDetail) -> CiRollup | None:
     """The checks read on the base branch head (#4105), or None when not read."""
 
@@ -233,11 +247,17 @@ def normalize_checks(detail: ci.CiDetail, head_sha: str) -> tuple[NormalizedChec
                 url=url if isinstance(url, str) else None,
                 source=CheckSource.RUN,
                 reported_state=status if status != "completed" else _text(run.get("conclusion")),
-                started_at=_since(run.get("started_at")),
+                started_at=_timestamp(run.get("started_at")),
                 check_id=_check_id(run),
                 native=isinstance(app, dict) and app.get("slug") == ACTIONS_APP_SLUG,
             )
         )
+    checks = [
+        check
+        for check in checks
+        if check.state is not CheckState.CANCELLED
+        or not any(_later_run(candidate, check) for candidate in checks)
+    ]
     for item in detail.statuses:
         context = _text(item.get("context"))
         url = item.get("target_url")
@@ -626,6 +646,25 @@ class GitHubCodeHost:
             return Commit(sha=str(payload["sha"]), parents=parents, message=str(payload["message"]))
         except (KeyError, TypeError):
             raise Unavailable("malformed_response") from None
+
+    async def is_ancestor(self, repository: RepositoryRef, ancestor: str, descendant: str) -> bool:
+        if ancestor == descendant:
+            return True
+        # One three-dot compare; only its status answers, never the commit list.
+        path = (
+            f"{self._repo(repository.path)}/compare/"
+            f"{quote(ancestor, safe='')}...{quote(descendant, safe='')}"
+        )
+        try:
+            payload = await self._json("GET", path, token=await self._token(repository.path))
+        except NotFound:
+            raise Unavailable("ancestry_unknown") from None
+        status = payload.get("status") if isinstance(payload, dict) else None
+        if status in ("identical", "ahead"):
+            return True
+        if status in ("behind", "diverged"):
+            return False
+        raise Unavailable("malformed_response")
 
     # Pull requests ---------------------------------------------------------
 

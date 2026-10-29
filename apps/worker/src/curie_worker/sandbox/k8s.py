@@ -11,6 +11,8 @@ the k8scratch e2e test.
 
 from __future__ import annotations
 
+import copy
+import json
 import logging
 import re
 import socket
@@ -20,6 +22,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 from aci_protocol import BootEnv
@@ -43,11 +46,13 @@ from .claim_tokens import (
     executor_withheld_names,
     split_claim_tokens,
 )
-from .quota import quota_has_live_headroom, quota_rejection_is_valid
-from .resources import prepare_resources_claim
+from .quota import ADMISSION_DIMENSIONS, quota_has_live_headroom, quota_rejection_is_valid
+from .resources import claim_resources_spec, pod_resources, prepare_resources_claim
 from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
+    CapacityInventory,
+    CapacityPod,
     ClaimNameConflict,
     ClaimTimeoutError,
     ClaimView,
@@ -57,12 +62,15 @@ from .types import (
     ListableDaemonKind,
     OperatingMode,
     QuotaRejection,
+    QuotaStatus,
     SandboxError,
     SandboxTermination,
     SandboxView,
     ToolDaemonMount,
     filter_agent_child_env,
 )
+
+ADMISSION_CLAIM_LABEL = "sandbox.users.io/curie-admission-claim"
 
 logger = logging.getLogger(__name__)
 
@@ -289,7 +297,99 @@ def _safe_termination_reason(raw: object, *, fallback: str = "Terminated") -> st
     return fallback
 
 
-def _safe_pod_message(raw: object) -> str | None:
+_SCRATCH_SIZE_KEYS = "curie.ai/sandbox-scratch-size-keys"
+_SCRATCH_KEY_MAX_LEN = 120
+# Agent names follow the chart's DNS slug, at most 40 characters. Profile
+# names are catalog keys: the chart accepts any nonempty key, including
+# factory_large. The segment stays one values-path field, at most 63
+# characters, so a dot cannot add another path component.
+_AGENT_SLUG = r"[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?"
+_PROFILE_SLUG = r"[A-Za-z0-9_-]{1,63}"
+_SCRATCH_VALUE_KEY = re.compile(
+    rf"(?:agentSandbox\.workspaceSizeLimits\.{_AGENT_SLUG}"
+    rf"|agentSandbox\.runner\.workspace\.sizeLimit"
+    rf"|agentSandbox\.runner\.hardening\.writablePathSizeLimit"
+    rf"|agentSandbox\.resourceProfiles\.{_PROFILE_SLUG}"
+    rf"\.(?:workspaceSizeLimit|homeSizeLimit|tmpSizeLimit|writablePathSizeLimit))"
+)
+
+
+def _scratch_mount_path(pod: Any, volume: str) -> str | None:
+    """Mount path of ``volume`` when the pod spec also declares that volume.
+
+    Missing attributes stay unmatched. The live client and the tests both use
+    attribute access, and pods from older tests omit ``spec``.
+    """
+
+    spec = getattr(pod, "spec", None)
+    volumes = getattr(spec, "volumes", None)
+    if not isinstance(volumes, list) or not any(
+        getattr(item, "name", None) == volume for item in volumes
+    ):
+        return None
+    containers = getattr(spec, "containers", None)
+    if not isinstance(containers, list):
+        return None
+    for container in containers:
+        mounts = getattr(container, "volume_mounts", None)
+        if not isinstance(mounts, list):
+            continue
+        for mount in mounts:
+            if getattr(mount, "name", None) != volume:
+                continue
+            path = getattr(mount, "mount_path", None)
+            if isinstance(path, str) and path:
+                return path
+    return None
+
+
+def _scratch_stamp_entry(pod: Any, volume: str) -> dict[str, Any] | None:
+    metadata = getattr(pod, "metadata", None)
+    annotations = getattr(metadata, "annotations", None)
+    if not isinstance(annotations, dict):
+        return None
+    raw = annotations.get(_SCRATCH_SIZE_KEYS)
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    entry = parsed.get(volume)
+    return entry if isinstance(entry, dict) else None
+
+
+def _scratch_eviction_detail(pod: Any, volume: str, limit: str) -> str | None:
+    """Name the mount and the stamped values key, or None to keep the allowlist.
+
+    The volume name and the limit come from the kubelet allowlist match. The
+    key comes from the pod annotation and must be one of the envelope paths.
+    A rejected key is not copied into the detail. ``ephemeral`` appends the
+    type remedy only when it is JSON true; JSON false still names the key.
+    """
+
+    mount_path = _scratch_mount_path(pod, volume)
+    entry = _scratch_stamp_entry(pod, volume)
+    if mount_path is None or entry is None:
+        return None
+    key = entry.get("key")
+    ephemeral = entry.get("ephemeral")
+    if (
+        not isinstance(key, str)
+        or len(key) > _SCRATCH_KEY_MAX_LEN
+        or _SCRATCH_VALUE_KEY.fullmatch(key) is None
+        or not isinstance(ephemeral, bool)
+    ):
+        return None
+    detail = f"sandbox scratch {mount_path} ({volume}) exceeded {limit}; raise {key}"
+    if ephemeral:
+        detail += " or set scratchVolume.type=ephemeral"
+    return detail
+
+
+def _safe_pod_message(raw: object, pod: Any = None) -> str | None:
     if not isinstance(raw, str):
         return None
     # Kubernetes messages are untrusted free text. Extract only the shape
@@ -303,6 +403,9 @@ def _safe_pod_message(raw: object) -> str | None:
     if match is None:
         return None
     volume, limit = match.groups()
+    mapped = _scratch_eviction_detail(pod, volume, limit)
+    if mapped is not None:
+        return mapped
     return f'Usage of EmptyDir volume "{volume}" exceeds the limit "{limit}"'
 
 
@@ -335,7 +438,7 @@ def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
     if phase == "Failed" and reason == "Evicted":
         return SandboxTermination(
             "Evicted",
-            _safe_pod_message(getattr(status, "message", None)),
+            _safe_pod_message(getattr(status, "message", None), pod),
             _runner_exit_code(status),
         )
 
@@ -389,7 +492,12 @@ def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
 
 
 def _event_termination(
-    events: Any, *, pod_name: str, pod_uid: str | None, since: datetime
+    events: Any,
+    *,
+    pod_name: str,
+    pod_uid: str | None,
+    since: datetime,
+    pod: Any = None,
 ) -> SandboxTermination | None:
     # Event lists are name filtered at the API, then checked here as well.
     # A readable pod's UID prevents an old event for a reused name from being
@@ -416,7 +524,7 @@ def _event_termination(
             matches.append(
                 SandboxTermination(
                     _safe_termination_reason(reason),
-                    _safe_pod_message(getattr(event, "message", None)),
+                    _safe_pod_message(getattr(event, "message", None), pod),
                 )
             )
     for preferred in ("Evicted", "OOMKilled", "OOMKilling"):
@@ -515,6 +623,7 @@ class KubernetesSandboxClient:
         self._api = k8s_client.CustomObjectsApi(api_client)
         self._core_api = k8s_client.CoreV1Api(api_client)
         self._networking_api = k8s_client.NetworkingV1Api(api_client)
+        self._node_api = k8s_client.NodeV1Api(api_client)
         self._namespace = namespace
 
     def _resources_pool(
@@ -533,20 +642,11 @@ class KubernetesSandboxClient:
         if not agent_name:
             raise ValueError("runner resources require an agent name")
         source_name = pool[: -len("-pool")] if pool.endswith("-pool") else pool
-        try:
-            source = self._api.get_namespaced_custom_object(
-                EXT_GROUP,
-                EXT_VERSION,
-                self._namespace,
-                "sandboxtemplates",
-                source_name,
-                _request_timeout=_claim_timeout(deadline),
-            )
-        except k8s_client.ApiException as exc:
-            if exc.status == 404:
-                raise ValueError(f"source template {source_name} is missing") from exc
-            raise
-        templates = {source_name: source.get("spec") or {}}
+        source = self._source_template_spec(
+            self._pool_template_name(pool, request_timeout_seconds=_claim_timeout(deadline)),
+            request_timeout_seconds=_claim_timeout(deadline),
+        )
+        templates = {source_name: source}
         warm_pools: dict[str, Any] = {}
         owned_pool = prepare_resources_claim(
             pool, agent_name, runner_resources, templates, warm_pools
@@ -625,7 +725,9 @@ class KubernetesSandboxClient:
         """
 
         names = claim_object_names(claim)
-        source_name = self._pool_template_name(pool, deadline)
+        source_name = self._pool_template_name(
+            pool, request_timeout_seconds=_claim_timeout(deadline)
+        )
         source_spec = self._source_template_spec(
             source_name, request_timeout_seconds=_claim_timeout(deadline)
         )
@@ -696,7 +798,7 @@ class KubernetesSandboxClient:
             raise
         return names
 
-    def _pool_template_name(self, pool: str, deadline: float) -> str:
+    def _pool_template_name(self, pool: str, *, request_timeout_seconds: float) -> str:
         """The template ``pool``'s ``sandboxTemplateRef`` names; a missing pool refuses."""
 
         obj = self._get(
@@ -704,7 +806,7 @@ class KubernetesSandboxClient:
             EXT_VERSION,
             "sandboxwarmpools",
             pool,
-            request_timeout_seconds=_claim_timeout(deadline),
+            request_timeout_seconds=request_timeout_seconds,
         )
         if obj is None:
             raise ValueError(f"source pool {pool} is missing")
@@ -728,6 +830,196 @@ class KubernetesSandboxClient:
             raise ValueError(f"source template {name} is missing")
         spec: dict[str, Any] = obj.get("spec") or {}
         return spec
+
+    def _capacity_pod_spec(
+        self,
+        spec: dict[str, Any],
+        *,
+        runtime_class_overheads: dict[str, dict[str, str]],
+        request_timeout_seconds: float,
+    ) -> dict[str, Any]:
+        pod = copy.deepcopy(spec)
+        runtime_class = pod.get("runtimeClassName")
+        if runtime_class and not pod.get("overhead"):
+            if runtime_class not in runtime_class_overheads:
+                runtime = self._node_api.read_runtime_class(
+                    runtime_class, _request_timeout=request_timeout_seconds
+                )
+                overhead = getattr(runtime, "overhead", None)
+                runtime_class_overheads[runtime_class] = (
+                    getattr(overhead, "pod_fixed", None) or {}
+                )
+            pod["overhead"] = runtime_class_overheads[runtime_class]
+        return pod
+
+    def claim_resources(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+        executor_secret_names: frozenset[str] | None,
+    ) -> dict[str, str]:
+        del executor_secret_names
+        timeout = 1.0
+        source = self._source_template_spec(
+            self._pool_template_name(pool, request_timeout_seconds=timeout),
+            request_timeout_seconds=timeout,
+        )
+        if runner_resources is not None:
+            if not agent_name:
+                raise ValueError("runner resources require an agent name")
+            source = claim_resources_spec(source, runner_resources)
+        return pod_resources(self._capacity_pod_spec(
+            source["podTemplate"]["spec"], runtime_class_overheads={},
+            request_timeout_seconds=timeout,
+        ))
+
+    def capacity_inventory(
+        self,
+        *,
+        priority_class: str,
+        known_claim_resources: Mapping[str, Mapping[str, str]],
+        request_timeout_seconds: float,
+    ) -> CapacityInventory:
+        observed_at = time.time()
+        deadline = time.monotonic() + request_timeout_seconds
+
+        def budget() -> float:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("sandbox capacity inventory deadline expired")
+            return remaining
+
+        claims = self._api.list_namespaced_custom_object(
+            EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims",
+            _request_timeout=budget(),
+        )["items"]
+        sandboxes = self._api.list_namespaced_custom_object(
+            CORE_GROUP, CORE_VERSION, self._namespace, "sandboxes",
+            _request_timeout=budget(),
+        )["items"]
+        pods = self._core_api.list_namespaced_pod(
+            self._namespace, _request_timeout=budget()
+        ).items
+        footprints: dict[str, dict[str, str]] = {}
+        claim_names: set[str] = set()
+        runtime_class_overheads: dict[str, dict[str, str]] = {}
+
+        def record_footprint(identity: str, footprint: dict[str, str]) -> None:
+            previous = footprints.get(identity, {})
+            footprints[identity] = {
+                key: format(max(Decimal(value), Decimal(previous.get(key, "0"))), "f")
+                for key, value in footprint.items()
+            }
+
+        owners: dict[str, str | None] = {}
+        owners_by_uid: dict[str, str | None] = {}
+        owner_modes: dict[str, list[str | None]] = {}
+        for sandbox in sandboxes:
+            metadata = sandbox["metadata"]
+            spec = sandbox.get("spec") or {}
+            pod_spec = (spec.get("podTemplate") or {}).get("spec")
+            if pod_spec and pod_spec.get("priorityClassName", priority_class) != priority_class:
+                continue
+            owner = next((
+                ref["name"] for ref in metadata.get("ownerReferences", [])
+                if ref.get("kind") == "SandboxClaim" and ref.get("uid")
+            ), None)
+            if owner is None:
+                owner = (metadata.get("labels") or {}).get(ADMISSION_CLAIM_LABEL)
+            owners[metadata["name"]] = owner
+            owners_by_uid[metadata["uid"]] = owner
+            if pod_spec:
+                footprint = pod_resources(self._capacity_pod_spec(
+                    pod_spec, runtime_class_overheads=runtime_class_overheads,
+                    request_timeout_seconds=budget(),
+                ))
+                identity = owner or f"sandbox:{metadata['name']}"
+                record_footprint(identity, footprint)
+            if owner:
+                owner_modes.setdefault(owner, []).append(spec.get("operatingMode"))
+        chargeable: dict[str, CapacityPod] = {}
+        now = datetime.now(UTC)
+        for pod in pods:
+            if pod.spec.priority_class_name != priority_class or pod.status.phase in {
+                "Succeeded", "Failed"
+            }:
+                continue
+            metadata = pod.metadata
+            if metadata.deletion_timestamp is not None:
+                grace = metadata.deletion_grace_period_seconds
+                elapsed = (now - metadata.deletion_timestamp).total_seconds()
+                if grace is not None and elapsed > grace:
+                    continue
+            owner = None
+            for ref in metadata.owner_references or []:
+                if ref.kind == "Sandbox" and ref.uid in owners_by_uid:
+                    owner = owners_by_uid[ref.uid]
+                    if owner is None:
+                        footprints[f"sandbox:{ref.name}"] = dict.fromkeys(
+                            ADMISSION_DIMENSIONS, "0"
+                        )
+                    break
+            if owner is None:
+                owner = (metadata.labels or {}).get(ADMISSION_CLAIM_LABEL)
+            if not metadata.uid:
+                raise ValueError("sandbox capacity Pod has no UID")
+            footprint = pod_resources(pod.spec.to_dict())
+            chargeable[metadata.uid] = CapacityPod(
+                claim_name=owner,
+                resources=footprint,
+            )
+            if owner is not None:
+                record_footprint(owner, footprint)
+        pool_templates: dict[str, str] = {}
+        template_specs: dict[str, dict[str, Any]] = {}
+        for claim in claims:
+            name = claim["metadata"]["name"]
+            if name not in footprints:
+                if name in known_claim_resources:
+                    footprints[name] = dict(known_claim_resources[name])
+                else:
+                    pool = claim["spec"]["warmPoolRef"]["name"]
+                    if pool not in pool_templates:
+                        pool_templates[pool] = self._pool_template_name(
+                            pool, request_timeout_seconds=budget()
+                        )
+                    template = pool_templates[pool]
+                    if template not in template_specs:
+                        template_specs[template] = self._source_template_spec(
+                            template, request_timeout_seconds=budget()
+                        )["podTemplate"]["spec"]
+                    spec = template_specs[template]
+                    if spec.get("priorityClassName", priority_class) != priority_class:
+                        continue
+                    footprints[name] = pod_resources(self._capacity_pod_spec(
+                        spec, runtime_class_overheads=runtime_class_overheads,
+                        request_timeout_seconds=budget(),
+                    ))
+            claim_names.add(name)
+        budget()
+        return CapacityInventory(
+            claims=frozenset(claim_names), sandboxes=owners, pods=chargeable,
+            claim_resources=footprints,
+            suspended_claims=frozenset(
+                owner for owner, modes in owner_modes.items()
+                if all(mode == "Suspended" for mode in modes)
+            ),
+            observed_at=observed_at,
+        )
+
+    def read_quota(
+        self, quota_name: str, *, request_timeout_seconds: float
+    ) -> QuotaStatus:
+        quota = self._core_api.read_namespaced_resource_quota(
+            quota_name, self._namespace, _request_timeout=request_timeout_seconds
+        )
+        return QuotaStatus(
+            name=quota.metadata.name, namespace=quota.metadata.namespace,
+            spec_hard=quota.spec.hard, status_hard=quota.status.hard,
+            status_used=quota.status.used,
+        )
 
     def _rollback_delete(self, plural: str, name: str) -> None:
         """Delete one object a failed claim created; never mask the original error.
@@ -810,7 +1102,10 @@ class KubernetesSandboxClient:
                 "name": name,
                 "labels": {MANAGED_BY_LABEL: MANAGED_BY_VALUE, **(labels or {})},
             },
-            "spec": {"warmPoolRef": {"name": pool}},
+            "spec": {
+                "warmPoolRef": {"name": pool},
+                "additionalPodMetadata": {"labels": {ADMISSION_CLAIM_LABEL: name}},
+            },
         }
         if env:
             # Unnamed entries land on the first main container (the runner). The
@@ -1183,7 +1478,7 @@ class KubernetesSandboxClient:
                     _request_timeout=max(0.001, deadline - time.monotonic()),
                 )
                 event_termination = _event_termination(
-                    events, pod_name=name, pod_uid=pod_uid, since=since
+                    events, pod_name=name, pod_uid=pod_uid, since=since, pod=pod
                 )
             except Exception:  # noqa: BLE001 - pod state still provides evidence
                 pass

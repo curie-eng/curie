@@ -72,9 +72,13 @@ def graph_payload() -> dict[str, Any]:
         # @spec AUTOMATED-REMEDIATION-15: 0138 only widens a CHECK below the floor.
         ("0138", False),
         ("0139", False),
+        # #5067: the stable deadline backport alone has none of the feature tables.
+        ("0140", False),
         ("0141", False),
         ("0143", False),
-        ("0144", True),
+        # The candidate minimum is the 0145 join of 0140 and 0144.
+        ("0144", False),
+        ("0145", True),
         ("0000", True),
         ("future-expand", True),
     ],
