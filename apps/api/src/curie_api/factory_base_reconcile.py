@@ -635,6 +635,8 @@ async def _observe_base_labels_once(
         )
     )
     if safe and previous.status not in {"waiting", "running", "cancellation_requested"}:
+        if lineage is not None and lineage.head_sha is not None and lineage.pr_number is not None:
+            await _record_requested_base(session, item, choice)
         return None
     await _record_requested_base(session, item, choice)
     if not safe:

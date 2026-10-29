@@ -1035,6 +1035,13 @@ row describes existing code; it does not accept the ADR. The original evidence
 snapshot is `next` commit `bac88c6ea`, read on 2026-10-02. Base-selection rows
 were refreshed against the ADR 0253 implementation on 2026-10-28.
 
+Implementation is staged: [PR #5139](https://github.com/curie-eng/curie/pull/5139)
+provides claim-time selection and pre-PR restart;
+[PR #5152](https://github.com/curie-eng/curie/pull/5152) implements durable PR
+rebase, retargeting and final-head CI ownership. Required live-provider and real
+external-integration acceptance remain unverified; current-head validation is
+recorded in PR #5152.
+
 | ADR | Clause | Status | Evidence and limit |
 | --- | --- | --- | --- |
 | 0145 | Curie stores no issue content | ENFORCED | `WorkItem` has no content column; the request objective is the issue URL (`_facts` in [`apps/api/src/curie_api/github_factory.py`](apps/api/src/curie_api/github_factory.py)). |

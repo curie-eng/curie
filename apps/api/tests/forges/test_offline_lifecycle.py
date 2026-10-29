@@ -274,7 +274,30 @@ def _start(client: TestClient, request_id: uuid.UUID) -> None:
                 context=None,
                 client=client.app.state.http_client,
             )
-            assert not isinstance(acquired, DispatchConflict), acquired
+            diagnostic: object = acquired
+            if isinstance(acquired, DispatchConflict):
+                persisted = (
+                    await session.execute(
+                        text(
+                            "SELECT r.status, r.wait_deadline, r.base_settle_until, "
+                            "r.dispatch_not_before, r.last_deferral_reason, "
+                            "r.version AS request_version, r.dispatch_generation, "
+                            "r.published_generation, r.acquired_generation, "
+                            "r.published_generation IS DISTINCT FROM "
+                            "r.dispatch_generation AS dispatch_pending, "
+                            "w.version AS work_item_version, clock_timestamp() AS database_now "
+                            "FROM curie.execution_requests r JOIN curie.work_items w "
+                            "ON w.id = r.work_item_id WHERE r.id = :id"
+                        ),
+                        {"id": request_id},
+                    )
+                ).mappings().one_or_none()
+                diagnostic = {
+                    "code": acquired.code,
+                    "expected_generation": generation,
+                    "persisted": dict(persisted) if persisted is not None else None,
+                }
+            assert not isinstance(acquired, DispatchConflict), diagnostic
             started = await start(
                 session,
                 request_id,
