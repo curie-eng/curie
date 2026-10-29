@@ -412,6 +412,59 @@ def test_established_crds_do_not_start_inventory_before_preflight_completion(
     assert not worker_calls
 
 
+def test_null_startup_status_does_not_crash_or_start_inventory(preflight_bootstrap) -> None:
+    # kube v1.31.4 accepts a CRD status patch that stores conditions as null.
+    # kubectl 1.37.1 then returns that null, and dict.get's default does not
+    # replace a present null, so the old poll raised TypeError.
+    subject, objects, calls, worker_calls = preflight_bootstrap
+    objects["namespace"] = {"metadata": None}
+    subject._poll_startup()
+    assert not subject._namespace_present
+    objects["namespace"] = {"metadata": {"name": subject.namespace}}
+    objects["crd"] = {
+        "items": [
+            {"status": {"conditions": None}},
+            {"status": None},
+            "not-an-object",
+        ]
+    }
+    subject._poll_startup()
+    objects["crd"] = {"items": None}
+    subject._poll_startup()
+    objects["crd"] = {
+        "items": [
+            {"status": {"conditions": [{"type": "Established", "status": "True"}]}},
+            {"status": {"conditions": [{"type": "Established", "status": "True"}]}},
+        ]
+    }
+    objects["job"] = {"status": None}
+    subject._poll_startup()
+    objects["job"] = {"status": {"conditions": None}}
+    subject._poll_startup()
+    subject._versions = {"claims": "1", "sandboxes": "1"}
+    objects["deployment"] = {"status": None}
+    subject._poll_startup()
+    objects["deployment"] = {"status": {"availableReplicas": None}}
+    subject._poll_startup()
+    assert not calls
+    assert not worker_calls
+
+
+def test_unexpected_error_names_its_class_only(helper, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("CURIE_SCENARIO_CONTEXT", "acme-context")
+    monkeypatch.setenv("CURIE_SCENARIO_RUN_ID", "acme-run")
+
+    def explode(_self) -> int:
+        raise RuntimeError("secret-payload")
+
+    monkeypatch.setattr(helper._Collector, "run", explode)
+    assert helper.main(["--", sys.executable, "-c", "raise SystemExit(0)"]) == 1
+    captured = capsys.readouterr()
+    assert "admission observer could not complete (RuntimeError)" in captured.err
+    assert "secret-payload" not in captured.err
+    assert "secret-payload" not in captured.out
+
+
 def test_completed_preflight_starts_inventory_and_worker_observation(preflight_bootstrap) -> None:
     subject, objects, calls, worker_calls = preflight_bootstrap
     # The chart hook completes only after the controller's informer cache sync:
