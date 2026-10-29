@@ -25,6 +25,31 @@ agent's instructions and tools to the same platform.
 | [SRE co-worker](#sre-co-worker-on-your-laptop) | Ask about your local cluster in Slack; approve configured mutations. |
 | [Bring your existing agent](#make-your-existing-agent-a-co-worker) | Reuse its instructions and tools, then connect it to a workspace. |
 
+## How the platform works
+
+Curie connects supported workspaces and work systems to a shared execution and
+control plane. Adapters authenticate incoming work; the API routes it, keeps
+work and approval state, and enforces the authority that applies. A worker runs
+a versioned agent bundle in an isolated sandbox. Scoped memory, model
+configuration, and usage estimates support that workflow.
+
+```mermaid
+flowchart LR
+    Systems["Workspaces and work systems"] --> Intake["Authenticated intake"]
+    Intake --> API["API: routing, identity, policy and work state"]
+    API --> Queue["Queue"]
+    Queue --> Runner["Worker and isolated sandbox"]
+    Runner --> Model["Agent harness and configured model"]
+    Runner --> API
+    API --> Systems
+```
+
+The paths and limits depend on the integration. Read
+[platform capabilities and boundaries](docs/platform-capabilities.md) for
+the component interactions and a factory walkthrough, and
+[capabilities and release status](docs/capabilities.md) for what is
+available in a supported deployment.
+
 ### See the Software Factory
 
 <a href="https://vimeo.com/1231115133/eadc6eb936">

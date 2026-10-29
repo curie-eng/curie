@@ -33,6 +33,8 @@ they are not substitutes for a supported quickstart.
 
 ## Use co-workers
 
+- [Platform capabilities and boundaries](platform-capabilities.md): how
+  integrations, identity, memory, execution, controls, and evidence interact.
 - [Co-worker platform](co-workers.md): delegation, workspace interaction, memory,
   approvals, and the shared platform beneath the examples.
 - [First Slack agent](your-first-slack-agent.md): connect a supported bundle to a
