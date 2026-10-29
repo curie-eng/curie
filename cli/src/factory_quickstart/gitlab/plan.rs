@@ -358,10 +358,11 @@ pub(in crate::factory_quickstart) async fn quickstart(
         }
     }
     let planned = native::plan_install(&opts, current.as_deref(), real_interactive).await?;
-    let creates_kind = planned.install.actions.iter().any(|action| {
-        matches!(action, Action::External { program, args }
-            if program == "kind" && args.first().is_some_and(|arg| arg == "create"))
-    });
+    let creates_kind = planned
+        .install
+        .actions
+        .iter()
+        .any(Action::creates_kind_cluster);
     let common = CommonOpts {
         namespace: opts.namespace.clone(),
         release: opts.release.clone(),
