@@ -96,6 +96,11 @@ def test_settle_uses_database_time_and_cannot_grant_early(
     assert seconds <= (row["base_settle_until"] - before).total_seconds()
     assert (row["base_settle_until"] - after).total_seconds() <= seconds
     if seconds:
+        _execute(
+            "UPDATE curie.execution_requests SET base_settle_until = wait_deadline WHERE id = :id",
+            {"id": row["id"]},
+        )
+        row = _execution(32002)
         early = _acquire(client, 32002)
         assert early.status_code == 409, early.text
         assert _execution(32002)["acquire_owner"] is None
