@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import json
@@ -1224,6 +1225,15 @@ def test_cli_collect_requires_context() -> None:
     assert "--context" in result.stderr
 
 
+def test_cli_collect_requires_the_runner_namespace_and_pod() -> None:
+    result = _run(
+        str(SCRIPT), "collect", "--context", "ctx", "--namespace", "ns", "--pod", "p",
+        "--nonce", NONCE, "--since", "1", "--until", "2",
+    )  # fmt: skip
+    assert result.returncode == 2
+    assert "--runner-namespace" in result.stderr and "--runner-pod" in result.stderr
+
+
 def test_factory_e2e_judge_docker(tmp_path: Path, envelope: dict[str, Any]) -> None:
     passing = _run(
         str(FACTORY), "judge-docker", "--envelope", str(FIXTURES / "passing-envelope.json")
@@ -1296,42 +1306,248 @@ code = int((raw / (name + ".rc")).read_text().strip())
 sys.exit(code)
 """
 
+
+# The kubectl fake replays the recorded objects in raw/ (daemon-pod.json,
+# daemon-service.json, runner-pod.json) by namespace and name, serves the client
+# Secret one jsonpath key at a time from the test's FAKE_SECRET file, and runs every
+# `exec ... -- sh -c SCRIPT` for real with the dockerd shims below first on PATH and
+# TMPDIR under the test's tmp_path, so the staging, the private mount and the
+# removal scripts execute and their effects can be observed. It appends kubectl's
+# "command terminated" line on a nonzero exec, as the real CLI does.
 FAKE_KUBECTL = r"""
-import json, os, sys
+import io, json, os, subprocess, sys, tarfile
 from pathlib import Path
-raw = Path(os.environ["FAKE_RAW"])
 args = sys.argv[1:]
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write(json.dumps(args) + "\n")
-if "get" in args and "pod" in args:
-    pod = args[args.index("pod") + 1]
-    print(json.dumps({"kind": "Pod", "metadata": {"name": pod, "uid": os.environ["FAKE_UID"]}}))
+ns = args[args.index("-n") + 1]
+rest = args[args.index("-n") + 2:]
+objects = {}
+for env in ("FAKE_DAEMON_POD", "FAKE_SERVICE", "FAKE_RUNNER_POD"):
+    obj = json.loads(Path(os.environ[env]).read_text())
+    meta = obj["metadata"]
+    objects[(obj["kind"].lower(), meta["namespace"], meta["name"])] = obj
+secret = json.loads(Path(os.environ["FAKE_SECRET"]).read_text())
+def fail(text, code=1):
+    sys.stderr.write(text + "\n")
+    sys.exit(code)
+if rest[:1] == ["get"] and rest[1] in ("pod", "service"):
+    found = objects.get((rest[1], ns, rest[2]))
+    if found is None or rest[3:] != ["-o", "json"]:
+        fail(f'Error from server (NotFound): {rest[1]}s "{rest[2]}" not found')
+    print(json.dumps(found))
     sys.exit(0)
-if "exec" in args and "--" in args:
-    docker = args[args.index("--") + 1:]
-    name = {"info": "info-daemon", "events": "events"}.get(docker[1] if len(docker) > 1 else "")
-    if docker[:1] == ["docker"] and name:
-        sys.stdout.write((raw / (name + ".out")).read_text())
-        sys.exit(int((raw / (name + ".rc")).read_text().strip()))
-sys.stderr.write("fake kubectl: unexpected argv " + " ".join(args) + "\n")
-sys.exit(99)
+if rest[:2] == ["get", "secret"]:
+    if (ns, rest[2]) != (secret["namespace"], secret["name"]):
+        fail(f'Error from server (NotFound): secrets "{rest[2]}" not found')
+    path = rest[4] if rest[3:4] == ["-o"] and len(rest) == 5 else ""
+    if not (path.startswith("jsonpath={.data.") and path.endswith("}")):
+        fail("fake kubectl: only one jsonpath data key may be read", 98)
+    key = path[len("jsonpath={.data."):-1].replace("\\.", ".")
+    sys.stdout.write(secret["data"].get(key, ""))
+    sys.exit(0)
+if rest[:1] == ["exec"] and "--" in rest:
+    head, command = rest[1:rest.index("--")], rest[rest.index("--") + 1:]
+    stdin = "-i" in head
+    pod = [t for t in head if t not in ("-i", "-c", "dockerd")]
+    if ("pod", ns, pod[0]) not in objects or head[head.index("-c") + 1] != "dockerd":
+        fail(f'Error from server (NotFound): pods "{pod[0]}" not found')
+    data = sys.stdin.buffer.read() if stdin else b""
+    if stdin:
+        with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+            members = [[m.name, m.mode, m.isfile()] for m in tar.getmembers()]
+        with open(os.environ["FAKE_DOCKERD_LOG"], "a") as log:
+            log.write(json.dumps({"staged": members}) + "\n")
+    if os.environ.get("FAKE_CLEANUP_FAIL") and command[2].startswith("rm -rf"):
+        busy = f"rm: can't remove '{command[-1]}': Resource busy"
+        fail(busy + "\ncommand terminated with exit code 1")
+    env = dict(os.environ, TMPDIR=os.environ["FAKE_DOCKERD_TMP"])
+    env["PATH"] = os.environ["FAKE_DOCKERD_BIN"] + os.pathsep + env["PATH"]
+    proc = subprocess.run(command, input=data, capture_output=True, env=env)
+    sys.stdout.buffer.write(proc.stdout)
+    sys.stderr.buffer.write(proc.stderr)
+    if proc.returncode:
+        sys.stderr.write(f"command terminated with exit code {proc.returncode}\n")
+    sys.exit(proc.returncode)
+fail("fake kubectl: unexpected argv " + " ".join(args), 99)
 """
+
+# Shims for the dockerd container's own tools. unshare drops -m; mount logs the
+# bind of the staged hosts file over /etc/hosts; docker checks that the Service name
+# it dials is mapped to 127.0.0.1 by that file, then plays the daemon: it trusts only
+# the claim's CA and client certificate and serves only the claim's Service name
+# (FAKE_TRUST), replaying the recorded TLS refusal for anything else, and otherwise
+# replays info-daemon or events.
+DOCKERD_SHIMS = {
+    "unshare": r"""
+import os, sys
+args = sys.argv[1:]
+if args[:1] != ["-m"]:
+    sys.exit("unshare: fake expects -m")
+os.execvp(args[1], args[1:])
+""",
+    "mount": r"""
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+if len(args) != 3 or args[0] != "--bind" or args[2] != "/etc/hosts":
+    sys.exit("mount: fake expects --bind SRC /etc/hosts")
+with open(os.environ["FAKE_DOCKERD_LOG"], "a") as log:
+    log.write(json.dumps({"mount": args, "hosts": Path(args[1]).read_text()}) + "\n")
+""",
+    "docker": r"""
+import hashlib, json, os, sys
+from pathlib import Path
+raw = Path(os.environ["FAKE_RAW"])
+args = sys.argv[1:]
+flags = ["-H", "--tlsverify", "--tlscacert", "--tlscert", "--tlskey"]
+if [args[0], args[2], args[3], args[5], args[7]] != flags:
+    sys.exit("docker: fake expects -H HOST --tlsverify and the three TLS files")
+target = args[1].removeprefix("tcp://")
+files = {"ca": args[4], "cert": args[6], "key": args[8]}
+seen = {k: hashlib.sha256(Path(p).read_bytes()).hexdigest() for k, p in files.items()}
+modes = {k: oct(os.stat(p).st_mode & 0o777) for k, p in files.items()}
+with open(os.environ["FAKE_DOCKERD_LOG"], "a") as log:
+    log.write(json.dumps({"docker": args, "sha256": seen, "modes": modes}) + "\n")
+hosts = (Path(files["ca"]).parent / "hosts").read_text().split("\n")
+if f"127.0.0.1 {target.rsplit(':', 1)[0]}" not in hosts:
+    sys.exit(f"error during connect: dial tcp: lookup {target}: no such host")
+trust = json.loads(Path(os.environ["FAKE_TRUST"]).read_text())
+if target != trust["server"]:
+    name = "tls-server-name"
+elif seen["ca"] != trust["ca"]:
+    name = "tls-foreign-ca"
+elif seen["cert"] != trust["client"]:
+    name = "tls-foreign-client"
+else:
+    name = {"info": "info-daemon", "events": "events"}[args[9]]
+code = int((raw / (name + ".rc")).read_text().strip())
+(sys.stdout if code == 0 else sys.stderr).write((raw / (name + ".out")).read_text())
+sys.exit(code)
+""",
+}
+
+DAEMON_NAMESPACE = "fd-proof-d-e8ce1a8c"
+RUNNER_NAMESPACE = "fd-proof-e8ce1a8c"
+RUNNER_POD = "curie-runner-e8ce1a8c-a"
+CLIENT_SECRET = f"{DAEMON_NAME}-tokens"
+DAEMON_SERVER = f"{DAEMON_NAME}.{DAEMON_NAMESPACE}.svc:2376"
+OTHER_CLAIM = "3f9a0d2c7e15"
+CLIENT_KEYS = ("ca.pem", "cert.pem", "key.pem")
+
+
+def _issue(claim: str) -> dict[str, str]:
+    from curie_worker.sandbox import tool_daemon
+
+    return dict(tool_daemon.issue(claim, DAEMON_NAMESPACE, 3600).client_files)
+
+
+@pytest.fixture(scope="module")
+def client_pems() -> dict[str, str]:
+    """The claim's client files, minted the way the worker mints them."""
+
+    return _issue(DAEMON_NAME)
+
+
+@pytest.fixture(scope="module")
+def foreign_pems() -> dict[str, str]:
+    """Another claim's client files: a CA and client certificate the daemon never saw."""
+
+    return _issue(OTHER_CLAIM)
+
+
+def _b64(text: str) -> str:
+    return base64.b64encode(text.encode()).decode()
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+class FakeCluster:
+    """Points the kubectl fake at its objects, Secret and daemon trust, one file each."""
+
+    def __init__(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pems: dict[str, str]
+    ) -> None:
+        self.dir = tmp_path / "cluster"
+        self.dir.mkdir()
+        self.tmp = tmp_path / "dockerd-tmp"
+        self.tmp.mkdir()
+        self.log = tmp_path / "dockerd.log"
+        self.log.touch()
+        self.pems = pems
+        self.monkeypatch = monkeypatch
+        monkeypatch.setenv("FAKE_DOCKERD_TMP", str(self.tmp))
+        monkeypatch.setenv("FAKE_DOCKERD_LOG", str(self.log))
+        trust = {"server": DAEMON_SERVER, "ca": _sha(pems["ca.pem"])}
+        trust["client"] = _sha(pems["cert.pem"])
+        monkeypatch.setenv("FAKE_TRUST", str(self._write("trust.json", trust)))
+        self.reset()
+
+    def _write(self, name: str, obj: Any) -> Path:
+        path = self.dir / name
+        path.write_text(json.dumps(obj))
+        return path
+
+    def reset(self) -> None:
+        """The recorded objects, the claim's own Secret, and no fault."""
+
+        for env, name in (
+            ("FAKE_DAEMON_POD", "daemon-pod.json"),
+            ("FAKE_SERVICE", "daemon-service.json"),
+            ("FAKE_RUNNER_POD", "runner-pod.json"),
+        ):
+            self.monkeypatch.setenv(env, str(RAW / name))
+        self.secret({key: _b64(text) for key, text in self.pems.items()})
+        self.monkeypatch.delenv("FAKE_CLEANUP_FAIL", raising=False)
+
+    def secret(self, data: dict[str, str]) -> None:
+        body = {"namespace": RUNNER_NAMESPACE, "name": CLIENT_SECRET, "data": data}
+        self.monkeypatch.setenv("FAKE_SECRET", str(self._write("secret.json", body)))
+
+    def edit(self, name: str, change: Callable[[dict[str, Any]], object]) -> None:
+        """Serve an edited copy of a recorded object: daemon-pod, daemon-service, runner-pod."""
+
+        obj = json.loads((RAW / f"{name}.json").read_text())
+        change(obj)
+        env = {"daemon-pod": "FAKE_DAEMON_POD", "daemon-service": "FAKE_SERVICE"}
+        path = self._write(f"{name}.json", obj)
+        self.monkeypatch.setenv(env.get(name, "FAKE_RUNNER_POD"), str(path))
+
+    def records(self) -> list[dict[str, Any]]:
+        return [json.loads(line) for line in self.log.read_text().splitlines()]
+
+    def leftovers(self) -> list[str]:
+        return sorted(p.name for p in self.tmp.iterdir())
 
 
 @pytest.fixture
 def fake_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     bin_dir = tmp_path / "fakebin"
-    bin_dir.mkdir()
-    for name, body in (("docker", FAKE_DOCKER), ("kubectl", FAKE_KUBECTL)):
-        exe = bin_dir / name
-        exe.write_text(f"#!{sys.executable}\n{body}")
-        exe.chmod(0o755)
+    dockerd_bin = tmp_path / "dockerd-bin"
+    for directory, fakes in (
+        (bin_dir, {"docker": FAKE_DOCKER, "kubectl": FAKE_KUBECTL}),
+        (dockerd_bin, DOCKERD_SHIMS),
+    ):
+        directory.mkdir()
+        for name, body in fakes.items():
+            exe = directory / name
+            exe.write_text(f"#!{sys.executable}\n{body}")
+            exe.chmod(0o755)
     log = tmp_path / "argv.log"
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_RAW", str(RAW))
     monkeypatch.setenv("FAKE_LOG", str(log))
-    monkeypatch.setenv("FAKE_UID", "8a3f2c1e-4b7d-4e90-9a61-2f5c8d0b7e14")
+    monkeypatch.setenv("FAKE_DOCKERD_BIN", str(dockerd_bin))
     yield log
+
+
+@pytest.fixture
+def cluster(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_bin: Path, client_pems: dict[str, str]
+) -> FakeCluster:
+    return FakeCluster(tmp_path, monkeypatch, client_pems)
 
 
 def _logged(log: Path) -> list[list[str]]:
@@ -1448,35 +1664,384 @@ def test_probe_accepts_ipv4_and_bracketed_ipv6_targets(tmp_path: Path, fake_bin:
     assert targets["cluster-api"] == "[fd00::1]:443"
 
 
+def _collect_argv(out: Path) -> list[str]:
+    flags = {
+        "context": "scratch-ctx", "namespace": DAEMON_NAMESPACE, "pod": DAEMON_NAME,
+        "runner-namespace": RUNNER_NAMESPACE, "runner-pod": RUNNER_POD, "nonce": NONCE,
+        "since": "1792669432", "until": "1792669451",
+    }  # fmt: skip
+    argv = ["collect", "--out", str(out)]
+    for flag, value in flags.items():
+        argv += [f"--{flag}", value]
+    return argv
+
+
+def _material(*pem_sets: dict[str, str]) -> list[str]:
+    """Every PEM, its base64 form and each of its body lines: none may surface."""
+
+    found: list[str] = ["-----BEGIN", "PRIVATE KEY"]
+    for pems in pem_sets:
+        for text in pems.values():
+            found += [text, _b64(text), _b64(text)[:40]]
+            found += [line for line in text.splitlines() if len(line) >= 16 and "-----" not in line]
+    return found
+
+
+def _no_material(texts: list[str], *pem_sets: dict[str, str]) -> None:
+    for text in texts:
+        for secret in _material(*pem_sets):
+            assert secret not in text, "client credential material leaked"
+
+
+def _refused(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    *pem_sets: dict[str, str],
+) -> str:
+    """Run collect, expect a refusal, and return its stderr after the leak checks."""
+
+    out = tmp_path / "daemon.json"
+    assert docker_scenario.main(_collect_argv(out)) == 1
+    assert not out.exists()
+    captured = capsys.readouterr()
+    _no_material([captured.out, captured.err], *pem_sets)
+    return captured.err
+
+
+def _secret_reads(calls: list[list[str]]) -> list[list[str]]:
+    return [c for c in calls if "secret" in c]
+
+
+def _execs(calls: list[list[str]]) -> list[list[str]]:
+    return [c for c in calls if "exec" in c]
+
+
 def test_collect_replays_recordings(
-    tmp_path: Path, fake_bin: Path, envelope: dict[str, Any]
+    tmp_path: Path,
+    fake_bin: Path,
+    cluster: FakeCluster,
+    envelope: dict[str, Any],
+    client_pems: dict[str, str],
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     out = tmp_path / "daemon.json"
-    code = docker_scenario.main(
-        [
-            "collect", "--context", "scratch-ctx", "--namespace", "fd-proof-d-e8ce1a8c",
-            "--pod", DAEMON_NAME, "--nonce", NONCE,
-            "--since", "1792669432", "--until", "1792669451", "--out", str(out),
-        ]
-    )  # fmt: skip
-    assert code == 0
-    assert json.loads(out.read_text()) == envelope["runs"]["a"]["daemon"]
+    assert docker_scenario.main(_collect_argv(out)) == 0
+    section = json.loads(out.read_text())
+    assert section == envelope["runs"]["a"]["daemon"]
+    captured = capsys.readouterr()
+    _no_material([out.read_text(), captured.out, captured.err], client_pems)
 
     calls = _logged(fake_bin)
-    assert calls
+    runner_side = [["get", "pod", RUNNER_POD, "-o", "json"]] + [
+        ["get", "secret", CLIENT_SECRET, "-o", "jsonpath={.data." + key.replace(".", "\\.") + "}"]
+        for key in CLIENT_KEYS
+    ]
     for call in calls:
         assert call[call.index("--context") + 1] == "scratch-ctx", call
-        assert call[call.index("-n") + 1] == "fd-proof-d-e8ce1a8c", call
-    execs = [c for c in calls if "exec" in c]
-    assert len(execs) >= 2
+        namespace = call[call.index("-n") + 1]
+        rest = call[call.index("-n") + 2 :]
+        assert namespace == (RUNNER_NAMESPACE if rest in runner_side else DAEMON_NAMESPACE), call
+    assert _secret_reads(calls) == [
+        ["--context", "scratch-ctx", "-n", RUNNER_NAMESPACE, *read] for read in runner_side[1:]
+    ]
+    assert ["get", "service", DAEMON_NAME, "-o", "json"] in [c[4:] for c in calls]
+    assert ["get", "pod", DAEMON_NAME, "-o", "json"] in [c[4:] for c in calls]
+    execs = _execs(calls)
+    assert len(execs) == 4  # stage, info, events, removal
     for call in execs:
         assert call[call.index("-c") + 1] == "dockerd", call
         assert DAEMON_NAME in call[: call.index("--")]
+    assert "-i" in execs[0][: execs[0].index("--")]
     events = next(c for c in execs if "events" in c)
     assert events[events.index("--since") + 1] == "1792669432"
     assert events[events.index("--until") + 1] == "1792669451"
     assert f"label=curie.fixture.nonce={NONCE}" in events
-    assert any("get" in c and "pod" in c and DAEMON_NAME in c for c in calls)
+
+    records = cluster.records()
+    staged = [r["staged"] for r in records if "staged" in r]
+    assert staged == [[[key, 0o600, True] for key in CLIENT_KEYS]]
+    host = DAEMON_SERVER.rsplit(":", 1)[0]
+    mounts = [r for r in records if "mount" in r]
+    assert len(mounts) == 2
+    assert all(m["hosts"] == f"127.0.0.1 {host}\n" for m in mounts)
+    dockers = [r for r in records if "docker" in r]
+    assert [d["docker"][9] for d in dockers] == ["info", "events"]
+    for record in dockers:
+        argv = record["docker"]
+        directory = mounts[0]["mount"][1].removesuffix("/hosts")
+        assert argv[:9] == [
+            "-H", f"tcp://{DAEMON_SERVER}", "--tlsverify",
+            "--tlscacert", f"{directory}/ca.pem", "--tlscert", f"{directory}/cert.pem",
+            "--tlskey", f"{directory}/key.pem",
+        ]  # fmt: skip
+        assert record["sha256"] == {
+            "ca": _sha(client_pems["ca.pem"]),
+            "cert": _sha(client_pems["cert.pem"]),
+            "key": _sha(client_pems["key.pem"]),
+        }
+        assert set(record["modes"].values()) == {"0o600"}
+    assert cluster.leftovers() == []
+
+
+def test_collect_accepts_a_client_secret_mounted_without_items(
+    tmp_path: Path, cluster: FakeCluster, envelope: dict[str, Any]
+) -> None:
+    def whole_secret(pod: dict[str, Any]) -> None:
+        del _volume(pod)["secret"]["items"]
+
+    cluster.edit("runner-pod", whole_secret)
+    out = tmp_path / "daemon.json"
+    assert docker_scenario.main(_collect_argv(out)) == 0
+    assert json.loads(out.read_text()) == envelope["runs"]["a"]["daemon"]
+    assert cluster.leftovers() == []
+
+
+def _endpoint(claim: str, namespace: str, port: int) -> Callable[[dict[str, Any]], object]:
+    """An edit setting the runner's DOCKER_HOST to another daemon address."""
+
+    value = f"tcp://{claim}.{namespace}.svc:{port}"
+    return lambda pod: _docker_host(pod).update({"value": value})
+
+
+def _dockerd(pod: dict[str, Any]) -> dict[str, Any]:
+    return next(c for c in pod["spec"]["containers"] if c["name"] == "dockerd")
+
+
+def _runner(pod: dict[str, Any]) -> dict[str, Any]:
+    return next(c for c in pod["spec"]["containers"] if c["name"] == "runner")
+
+
+def _docker_host(pod: dict[str, Any]) -> dict[str, Any]:
+    return next(e for e in _runner(pod)["env"] if e["name"] == "DOCKER_HOST")
+
+
+def _volume(pod: dict[str, Any]) -> dict[str, Any]:
+    return next(v for v in pod["spec"]["volumes"] if v["name"] == "curie-docker-tls")
+
+
+def _host_arg(pod: dict[str, Any], value: str | None) -> None:
+    args = _dockerd(pod)["args"]
+    index = args.index("--host=tcp://0.0.0.0:2376")
+    if value is None:
+        del args[index]
+    else:
+        args[index] = value
+
+
+CLAIM = docker_scenario.CLAIM_LABEL
+# (served object, edit, expected refusal text): each must refuse before any Secret read.
+MISMATCHES: dict[str, tuple[str, Callable[[dict[str, Any]], object], str]] = {
+    "runner-claim-differs": (
+        "runner-pod", lambda o: o["metadata"]["labels"].update({CLAIM: OTHER_CLAIM}),
+        "belongs to another claim",
+    ),
+    "runner-claim-missing": (
+        "runner-pod", lambda o: o["metadata"]["labels"].pop(CLAIM), "no usable",
+    ),
+    "daemon-claim-missing": (
+        "daemon-pod", lambda o: o["metadata"]["labels"].pop(CLAIM), "no usable",
+    ),
+    "dockerd-port-not-declared": (
+        "daemon-pod", lambda o: _host_arg(o, "--host=tcp://0.0.0.0:2377"), "no such containerPort",
+    ),
+    "container-port-differs": (
+        "daemon-pod", lambda o: _dockerd(o)["ports"][0].update({"containerPort": 2377}),
+        "no such containerPort",
+    ),
+    "dockerd-second-host": (
+        "daemon-pod", lambda o: _dockerd(o)["args"].append("--host=unix:///var/run/docker.sock"),
+        "exactly one --host",
+    ),
+    "dockerd-no-tcp-host": ("daemon-pod", lambda o: _host_arg(o, None), "exactly one --host"),
+    "service-port-differs": (
+        "daemon-service", lambda o: o["spec"]["ports"][0].update({"port": 2377}), "does not route",
+    ),
+    "service-target-port-differs": (
+        "daemon-service", lambda o: o["spec"]["ports"][0].update({"targetPort": 2377}),
+        "does not route",
+    ),
+    "service-port-unnamed": (
+        "daemon-service", lambda o: o["spec"]["ports"][0].update({"name": "tls"}), "does not route",
+    ),
+    "runner-endpoint-port-differs": (
+        "runner-pod", _endpoint(DAEMON_NAME, DAEMON_NAMESPACE, 2377), "does not name",
+    ),
+    "runner-names-another-claim": (
+        "runner-pod", _endpoint(OTHER_CLAIM, DAEMON_NAMESPACE, 2376), "does not name",
+    ),
+    "runner-names-another-namespace": (
+        "runner-pod", _endpoint(DAEMON_NAME, RUNNER_NAMESPACE, 2376), "does not name",
+    ),
+    "runner-dials-a-bare-ip": (
+        "runner-pod", lambda o: _docker_host(o).update({"value": "tcp://10.42.0.17:2376"}),
+        "does not name",
+    ),
+    "runner-without-docker-host": (
+        "runner-pod", lambda o: _runner(o)["env"].remove(_docker_host(o)), "does not name",
+    ),
+    "secret-projects-no-key": (
+        "runner-pod", lambda o: _volume(o)["secret"]["items"].pop(), "does not project",
+    ),
+    "no-client-mount": (
+        "runner-pod", lambda o: _runner(o)["volumeMounts"].clear(), "mounts no client Secret",
+    ),
+    "no-runner-container": (
+        "runner-pod", lambda o: _runner(o).update({"name": "sidecar"}), "no runner container",
+    ),
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("case", sorted(MISMATCHES))
+def test_collect_refuses_a_mismatched_claim_endpoint_before_reading_credentials(
+    tmp_path: Path,
+    fake_bin: Path,
+    cluster: FakeCluster,
+    client_pems: dict[str, str],
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+) -> None:
+    name, edit, reason = MISMATCHES[case]
+    cluster.edit(name, edit)
+    err = _refused(tmp_path, capsys, client_pems)
+    assert reason in err
+    calls = _logged(fake_bin)
+    assert _secret_reads(calls) == []
+    assert _execs(calls) == []
+    assert cluster.leftovers() == []
+
+
+def _without(data: dict[str, str], key: str) -> None:
+    del data[key]
+
+
+# (key, change to the served base64 data): each refused before anything is staged.
+BAD_CREDENTIALS: dict[str, tuple[str, Callable[[dict[str, str]], object], str]] = {
+    "missing-key": ("key.pem", lambda d: _without(d, "key.pem"), "missing or empty"),
+    "empty-key": ("cert.pem", lambda d: d.update({"cert.pem": ""}), "missing or empty"),
+    "malformed-base64": (
+        "ca.pem", lambda d: d.update({"ca.pem": d["ca.pem"][:-3] + "!*#"}), "base64",
+    ),
+    "not-pem": ("cert.pem", lambda d: d.update({"cert.pem": _b64("not a certificate\n")}), "PEM"),
+    "key-in-cert-slot": ("cert.pem", lambda d: d.update({"cert.pem": d["key.pem"]}), "PEM"),
+    "cert-in-key-slot": ("key.pem", lambda d: d.update({"key.pem": d["cert.pem"]}), "PEM"),
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("case", sorted(BAD_CREDENTIALS))
+def test_collect_refuses_a_missing_or_malformed_client_credential(
+    tmp_path: Path,
+    fake_bin: Path,
+    cluster: FakeCluster,
+    client_pems: dict[str, str],
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+) -> None:
+    key, change, reason = BAD_CREDENTIALS[case]
+    data = {k: _b64(text) for k, text in client_pems.items()}
+    change(data)
+    cluster.secret(data)
+    err = _refused(tmp_path, capsys, client_pems)
+    assert f"secret {CLIENT_SECRET}: {key}" in err and reason in err
+    assert _execs(_logged(fake_bin)) == []
+    assert cluster.leftovers() == []
+
+
+@pytest.mark.parametrize(
+    ("foreign", "recording"),
+    [
+        (("cert.pem", "key.pem"), "tls-foreign-client"),
+        (("ca.pem",), "tls-foreign-ca"),
+        (CLIENT_KEYS, "tls-foreign-ca"),
+    ],
+)
+def test_collect_fails_closed_on_a_foreign_client_credential(
+    tmp_path: Path,
+    cluster: FakeCluster,
+    client_pems: dict[str, str],
+    foreign_pems: dict[str, str],
+    capsys: pytest.CaptureFixture[str],
+    foreign: tuple[str, ...],
+    recording: str,
+) -> None:
+    served = {k: foreign_pems[k] if k in foreign else client_pems[k] for k in CLIENT_KEYS}
+    cluster.secret({k: _b64(text) for k, text in served.items()})
+    err = _refused(tmp_path, capsys, client_pems, foreign_pems)
+    assert _raw(recording).strip() in err
+    assert [r["docker"][9] for r in cluster.records() if "docker" in r] == ["info"]
+    assert cluster.leftovers() == []
+
+
+def test_collect_fails_closed_when_the_daemon_certificate_names_another_service(
+    tmp_path: Path,
+    cluster: FakeCluster,
+    client_pems: dict[str, str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    trust = json.loads(Path(os.environ["FAKE_TRUST"]).read_text())
+    trust["server"] = f"{OTHER_CLAIM}.{DAEMON_NAMESPACE}.svc:2376"
+    Path(os.environ["FAKE_TRUST"]).write_text(json.dumps(trust))
+    err = _refused(tmp_path, capsys, client_pems)
+    assert _raw("tls-server-name").strip() in err
+    assert cluster.leftovers() == []
+
+
+def test_collect_reports_a_failed_removal_without_material(
+    tmp_path: Path,
+    cluster: FakeCluster,
+    client_pems: dict[str, str],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FAKE_CLEANUP_FAIL", "1")
+    err = _refused(tmp_path, capsys, client_pems)
+    assert "staged credentials not removed" in err and "Resource busy" in err
+    assert len(cluster.leftovers()) == 1
+
+
+def test_collect_reports_both_a_refusal_and_a_failed_removal(
+    tmp_path: Path,
+    cluster: FakeCluster,
+    client_pems: dict[str, str],
+    foreign_pems: dict[str, str],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    served = {**client_pems, **{k: foreign_pems[k] for k in ("cert.pem", "key.pem")}}
+    cluster.secret({k: _b64(text) for k, text in served.items()})
+    monkeypatch.setenv("FAKE_CLEANUP_FAIL", "1")
+    err = _refused(tmp_path, capsys, client_pems, foreign_pems)
+    assert _raw("tls-foreign-client").strip() in err
+    assert "staged credentials not removed" in err
+
+
+@pytest.mark.parametrize("fault", ["malformed", "foreign", "mismatch", "removal"])
+def test_collect_recovers_after_a_refused_run(
+    tmp_path: Path,
+    cluster: FakeCluster,
+    client_pems: dict[str, str],
+    foreign_pems: dict[str, str],
+    envelope: dict[str, Any],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    data = {k: _b64(text) for k, text in client_pems.items()}
+    if fault == "malformed":
+        cluster.secret({**data, "key.pem": "%%%"})
+    elif fault == "foreign":
+        cluster.secret({**data, "cert.pem": _b64(foreign_pems["cert.pem"])})
+    elif fault == "mismatch":
+        cluster.edit("runner-pod", MISMATCHES["runner-names-another-claim"][1])
+    else:
+        monkeypatch.setenv("FAKE_CLEANUP_FAIL", "1")
+    _refused(tmp_path, capsys, client_pems, foreign_pems)
+    left = cluster.leftovers()
+
+    cluster.reset()
+    out = tmp_path / "daemon.json"
+    assert docker_scenario.main(_collect_argv(out)) == 0
+    assert json.loads(out.read_text()) == envelope["runs"]["a"]["daemon"]
+    assert cluster.leftovers() == left
 
 
 # ci against a local GitHub stand-in serving the recorded REST shapes

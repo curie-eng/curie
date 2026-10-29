@@ -1,0 +1,64 @@
+{
+ "apiVersion": "v1",
+ "kind": "Pod",
+ "metadata": {
+  "name": "7bd5b54461f4",
+  "namespace": "fd-proof-d-e8ce1a8c",
+  "uid": "8a3f2c1e-4b7d-4e90-9a61-2f5c8d0b7e14",
+  "labels": {
+   "app.kubernetes.io/component": "docker-daemon",
+   "app.kubernetes.io/instance": "fd-proof",
+   "curietech.ai/sandbox-claim": "7bd5b54461f4"
+  }
+ },
+ "spec": {
+  "containers": [
+   {
+    "name": "dockerd",
+    "image": "registry.example/curie-docker-daemon@sha256:ceefc877b7d3e11866fa63676d6b4fb778ec65641b83ceaa3e3185f6a47b11de",
+    "args": [
+     "dockerd",
+     "--userns-remap=default",
+     "--authorization-plugin=curie-authz",
+     "--host=tcp://0.0.0.0:2376",
+     "--tlsverify",
+     "--tlscacert=/certs/ca.pem",
+     "--tlscert=/certs/server-cert.pem",
+     "--tlskey=/certs/server-key.pem"
+    ],
+    "ports": [
+     {
+      "containerPort": 2376,
+      "protocol": "TCP"
+     }
+    ],
+    "volumeMounts": [
+     {
+      "mountPath": "/var/lib/docker",
+      "name": "data"
+     },
+     {
+      "mountPath": "/certs",
+      "name": "certs",
+      "readOnly": true
+     }
+    ]
+   }
+  ],
+  "volumes": [
+   {
+    "emptyDir": {
+     "sizeLimit": "3Gi"
+    },
+    "name": "data"
+   },
+   {
+    "name": "certs",
+    "secret": {
+     "defaultMode": 420,
+     "secretName": "7bd5b54461f4"
+    }
+   }
+  ]
+ }
+}
