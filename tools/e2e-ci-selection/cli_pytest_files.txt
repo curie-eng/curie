@@ -28,6 +28,7 @@ apps/worker/tests/test_hook_approval_proof_thread_key.py
 apps/worker/tests/test_progress.py
 apps/worker/tests/test_publication_validation.py
 apps/worker/tests/test_stream_retention.py
+apps/worker/tests/test_workspace_recovery_storage.py
 charts/curie/ci/repro/test_classify_recovery.py
 charts/curie/ci/runtime/test_docker_daemon_fixture.py
 charts/curie/ci/runtime/test_quota_observation_clock.py
