@@ -312,6 +312,11 @@ def test_factory_label_readmission_cannot_repin_an_existing_pull_request(
     assert (_item(number)["base_branch"], _item(number)["base_commit"]) == ("main", before_base)
     assert _lineage(number) == before_lineage
     if target == "next":
+        (deferred,) = _rows(
+            "SELECT dispatch_not_before, updated_at FROM curie.execution_requests WHERE id = :id",
+            {"id": successor["id"]},
+        )
+        assert (deferred["dispatch_not_before"] - deferred["updated_at"]).total_seconds() >= 60
         github.labels = [LABEL]
         corrected = _post(
             client, "issues", _issue_event("unlabeled", number, label={"name": "base:next"})

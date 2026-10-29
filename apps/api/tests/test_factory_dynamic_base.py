@@ -101,6 +101,8 @@ def test_settle_uses_database_time_and_cannot_grant_early(
         assert _execution(32002)["acquire_owner"] is None
         assert _work_item(32002)["base_commit"] is None
         assert api.branch_requests == []
+        deferred = _execution(32002)
+        assert deferred["dispatch_not_before"] == row["base_settle_until"]
         _due(32002)
 
     ready = _acquire(client, 32002)
