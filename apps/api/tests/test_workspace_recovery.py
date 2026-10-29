@@ -408,7 +408,8 @@ def test_recovery_http_authority(recovery: None, client: Any, auth_headers: Any)
 
     reservation = _ok(_post(client, "reserve", body))
     reserved_state = _snapshot()
-    assert _ok(_post(client, "reserve", body)) == reservation
+    replay = _ok(_post(client, "reserve", body))
+    assert replay == {**reservation, "replayed": True}
     assert _snapshot() == reserved_state
     conflict = copy.deepcopy(body)
     conflict["objects"][1]["sha256"] = "f" * 64

@@ -11274,6 +11274,10 @@
             "title": "Objects",
             "type": "array"
           },
+          "replayed": {
+            "title": "Replayed",
+            "type": "boolean"
+          },
           "staging_expires_at": {
             "format": "date-time",
             "title": "Staging Expires At",
@@ -11284,7 +11288,8 @@
           "checkpoint_id",
           "objects",
           "capture_deadline",
-          "staging_expires_at"
+          "staging_expires_at",
+          "replayed"
         ],
         "title": "RecoveryReservation",
         "type": "object"

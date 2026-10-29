@@ -212,7 +212,9 @@ def _receipt(obj: RecoveryObject) -> wire.RecoveryObjectReceipt:
     )
 
 
-async def _reservation(session: AsyncSession, cp: Checkpoint) -> wire.RecoveryReservation:
+async def _reservation(
+    session: AsyncSession, cp: Checkpoint, *, replayed: bool
+) -> wire.RecoveryReservation:
     objects = [
         obj
         for obj in await _objects(session, cp.work_item_id)
@@ -225,6 +227,7 @@ async def _reservation(session: AsyncSession, cp: Checkpoint) -> wire.RecoveryRe
         objects=[_receipt(obj) for obj in objects],
         capture_deadline=cp.capture_deadline,
         staging_expires_at=cp.staging_expires_at,
+        replayed=replayed,
     )
 
 
@@ -303,7 +306,7 @@ async def reserve(
     if replay is not None:
         if replay.content_sha256 != digest:
             raise RecoveryRefusal("idempotency_conflict")
-        return await _reservation(session, replay)
+        return await _reservation(session, replay, replayed=True)
     caps = {"base": settings.workspace_max_archive_bytes, "patch": 900000, "manifest": 1048576}
     for obj in body.objects:
         if obj.size_bytes > caps[obj.kind]:
@@ -385,7 +388,7 @@ async def reserve(
         )
     _outcome(item, "reserved", now)
     await session.flush()
-    return await _reservation(session, cp)
+    return await _reservation(session, cp, replayed=False)
 
 
 async def _transition(
@@ -458,7 +461,7 @@ async def _capture_context(
 
 async def complete(session: AsyncSession, body: wire.RecoveryComplete) -> wire.RecoveryCompletion:
     item, group, cp, now = await _capture_context(session, body)
-    reservation = await _reservation(session, cp)
+    reservation = await _reservation(session, cp, replayed=True)
     expected = sorted(obj.model_dump_json() for obj in reservation.objects)
     actual = sorted(obj.model_dump_json() for obj in body.receipts)
     if expected != actual:
@@ -506,8 +509,11 @@ async def _cleanup_context(
 
     Unlike ``_capture_context`` the source need not be the WorkItem's latest
     request, nor unexpired: a predecessor whose lease was lost after a successor
-    was admitted still tombstones its own staging. The exact source (request,
-    epoch, dispatch generation) and its eligible failure are still required.
+    was admitted still tombstones its own staging. Nor is the retained group
+    compared with the WorkItem's current base: ordinary readmission replaces that
+    base, and the predecessor still withdraws its own checkpoint. The retained
+    group must exist, and the checkpoint's exact source (request, epoch, dispatch
+    generation) and its eligible failure are still required.
     """
 
     item = await lock_work_item(session, body.work_item_id)
@@ -518,13 +524,11 @@ async def _cleanup_context(
         source is None
         or source.runtime_epoch != body.runtime_epoch
         or source.dispatch_generation != body.dispatch_generation
-        or item.base_commit is None
-        or item.base_branch is None
     ):
         raise RecoveryRefusal("source_identity")
     await _installation(session)
     group = await _group(session, item.id)
-    if group is None or _group_identity(group) != _item_identity(item):
+    if group is None:
         raise RecoveryRefusal("retained_identity")
     cp = await _checkpoint(session, item.id, body.checkpoint_id)
     now = await database_now(session)

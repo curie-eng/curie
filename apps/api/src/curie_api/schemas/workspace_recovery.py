@@ -64,6 +64,9 @@ class RecoveryReservation(RecoveryMessage):
     objects: list[RecoveryObjectReceipt]
     capture_deadline: datetime
     staging_expires_at: datetime
+    # True when the idempotency key matched an existing checkpoint, so this call
+    # did not create it; a replayed reservation never asks for a retraction.
+    replayed: bool
 
 
 class RecoveryComplete(RecoveryCaptureAuthority):

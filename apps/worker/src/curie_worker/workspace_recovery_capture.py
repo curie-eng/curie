@@ -57,6 +57,17 @@ _REFUSAL_OUTCOMES: dict[str, str] = {
     "deadline_exceeded": "capture_timeout",
 }
 
+# A writer failure that ended before any reservation and the WorkItem outcome it
+# records. Ledger refusals (``reserve_refused`` and the ``*_too_large`` codes)
+# recorded their own outcome and are absent here.
+_UNRESERVED_OUTCOMES: dict[str, str] = {
+    "capture_timeout": "capture_timeout",
+    "base_unavailable": "capture_failed",
+    "base_digest_mismatch": "capture_failed",
+    "upload_failed": "capture_failed",
+    "ledger_unavailable": "capture_failed",
+}
+
 
 @dataclass(frozen=True)
 class RecoveryTerminalResult:
@@ -189,13 +200,19 @@ class WorkspaceRecoveryCapture:
                 target_branch=str(context["target_branch"]),
                 patch=checkpoint.patch,
                 manifest=checkpoint.manifest,
-                base=RecoveryBaseSource.from_claim(self._coordinator, run.thread_key),
+                # Built from the claim the kernel already read: nothing here touches
+                # the store on the event loop; the writer opens it in its spool thread.
+                base=RecoveryBaseSource.from_prepared(self._coordinator, prepared),
             ),
             deadline=deadline,
             fence=fence,
         )
         if written.status == "complete":
             return RecoveryTerminalResult("complete", None, written.checkpoint_id)
+        if written.checkpoint_id is None and written.failure in _UNRESERVED_OUTCOMES:
+            # The writer failed before any reservation, so no ledger operation has
+            # recorded why; the cleanup allowance records it now.
+            await self._record(authority, _UNRESERVED_OUTCOMES[written.failure])
         return RecoveryTerminalResult("failed", written.failure, written.checkpoint_id)
 
     async def _context(self, authority: RecoveryAuthority, deadline: float) -> dict[str, Any]:

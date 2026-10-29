@@ -27,7 +27,7 @@ from typing import Any, Literal
 
 import httpx
 
-from .workspace import WorkspaceClaimCoordinator, WorkspaceObjectStore
+from .workspace import PreparedWorkspace, WorkspaceClaimCoordinator, WorkspaceObjectStore
 from .workspace_recovery import WorkspaceRecoveryClient
 
 logger = logging.getLogger(__name__)
@@ -261,15 +261,29 @@ class RecoveryBaseSource:
     open: Callable[[], Iterable[bytes]]
 
     @classmethod
-    def from_claim(
-        cls, coordinator: WorkspaceClaimCoordinator, thread_key: str
-    ) -> RecoveryBaseSource | None:
-        prepared = coordinator.current(thread_key)
-        if prepared is None:
-            return None
+    def from_prepared(
+        cls, coordinator: WorkspaceClaimCoordinator, prepared: PreparedWorkspace
+    ) -> RecoveryBaseSource:
+        """The base of an already-read claim. Touches no store until ``open``.
+
+        The writer calls ``open`` inside its spool thread, so building this on the
+        event loop never blocks it.
+        """
+
         objects = coordinator.preparer.objects
         object_key = prepared.object_key
         return cls(sha256=prepared.sha256, open=lambda: objects.get_stream(object_key))
+
+    @classmethod
+    def from_claim(
+        cls, coordinator: WorkspaceClaimCoordinator, thread_key: str
+    ) -> RecoveryBaseSource | None:
+        """Read the thread's claim, then its base. Synchronous: call off the loop."""
+
+        prepared = coordinator.current(thread_key)
+        if prepared is None:
+            return None
+        return cls.from_prepared(coordinator, prepared)
 
 
 @dataclass(frozen=True)
@@ -315,8 +329,9 @@ class _CaptureFailure(Exception):
     ) -> None:
         self.code: FailureCode = code
         self.refusal = refusal
-        # Set only when this invocation's own ``complete`` returned and the fence
-        # after it failed: the one case allowed to withdraw a complete checkpoint.
+        # Set only when this invocation created its reservation (not a replay), its
+        # own ``complete`` returned and the fence after it failed: the one case
+        # allowed to withdraw a complete checkpoint.
         self.retract = retract
         super().__init__(code)
 
@@ -498,7 +513,10 @@ class RecoveryCheckpointWriter:
             try:
                 await _fenced(fence)
             except _CaptureFailure as lost:
-                raise _CaptureFailure(lost.code, retract=True) from None
+                # Only a reservation this invocation created may be withdrawn: a
+                # replay's ``complete`` answers success for a checkpoint an earlier
+                # invocation completed, and proves nothing about who did.
+                raise _CaptureFailure(lost.code, retract=reservation["replayed"] is False) from None
             result = RecoveryCaptureResult("complete", _checkpoint_id(reservation))
         except _CaptureFailure as failure:
             cancel.set()
@@ -548,7 +566,7 @@ class RecoveryCheckpointWriter:
         try:
             _checkpoint_id(reservation)
             objects = reservation["objects"]
-            if not isinstance(objects, list):
+            if not isinstance(objects, list) or not isinstance(reservation["replayed"], bool):
                 raise TypeError
         except (KeyError, TypeError, ValueError):
             raise _CaptureFailure("ledger_unavailable") from None

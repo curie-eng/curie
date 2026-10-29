@@ -8883,6 +8883,8 @@ export interface components {
             checkpoint_id: string;
             /** Objects */
             objects: components["schemas"]["RecoveryObjectReceipt"][];
+            /** Replayed */
+            replayed: boolean;
             /**
              * Staging Expires At
              * Format: date-time
