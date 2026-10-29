@@ -263,4 +263,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0247 | [A tree-identical parent or a schema window registration reuses checks](0247-a-tree-identical-parent-or-a-schema-window-registration-reuses-checks.md) | Accepted |
 | 0249 | [A factory run may take twelve hours](0249-a-factory-run-may-take-twelve-hours.md) | Accepted |
 | 0250 | [Verbatim Slack answers render as rich text sections with literal links](0250-verbatim-slack-answers-render-as-rich-text-sections-with-literal-links.md) | Accepted |
+| 0251 | [Claim-backed sandbox scratch is bounded by its storage request](0251-claim-backed-sandbox-scratch-is-bounded-by-its-storage-request.md) | Draft |
 <!-- END GENERATED: adr-index -->

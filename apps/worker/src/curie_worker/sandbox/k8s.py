@@ -12,6 +12,7 @@ the k8scratch e2e test.
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import re
 import time
@@ -285,7 +286,99 @@ def _safe_termination_reason(raw: object, *, fallback: str = "Terminated") -> st
     return fallback
 
 
-def _safe_pod_message(raw: object) -> str | None:
+_SCRATCH_SIZE_KEYS = "curie.ai/sandbox-scratch-size-keys"
+_SCRATCH_KEY_MAX_LEN = 120
+# Agent names follow the chart's DNS slug, at most 40 characters. Profile
+# names are catalog keys: the chart accepts any nonempty key, including
+# factory_large. The segment stays one values-path field, at most 63
+# characters, so a dot cannot add another path component.
+_AGENT_SLUG = r"[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?"
+_PROFILE_SLUG = r"[A-Za-z0-9_-]{1,63}"
+_SCRATCH_VALUE_KEY = re.compile(
+    rf"(?:agentSandbox\.workspaceSizeLimits\.{_AGENT_SLUG}"
+    rf"|agentSandbox\.runner\.workspace\.sizeLimit"
+    rf"|agentSandbox\.runner\.hardening\.writablePathSizeLimit"
+    rf"|agentSandbox\.resourceProfiles\.{_PROFILE_SLUG}"
+    rf"\.(?:workspaceSizeLimit|homeSizeLimit|tmpSizeLimit|writablePathSizeLimit))"
+)
+
+
+def _scratch_mount_path(pod: Any, volume: str) -> str | None:
+    """Mount path of ``volume`` when the pod spec also declares that volume.
+
+    Missing attributes stay unmatched. The live client and the tests both use
+    attribute access, and pods from older tests omit ``spec``.
+    """
+
+    spec = getattr(pod, "spec", None)
+    volumes = getattr(spec, "volumes", None)
+    if not isinstance(volumes, list) or not any(
+        getattr(item, "name", None) == volume for item in volumes
+    ):
+        return None
+    containers = getattr(spec, "containers", None)
+    if not isinstance(containers, list):
+        return None
+    for container in containers:
+        mounts = getattr(container, "volume_mounts", None)
+        if not isinstance(mounts, list):
+            continue
+        for mount in mounts:
+            if getattr(mount, "name", None) != volume:
+                continue
+            path = getattr(mount, "mount_path", None)
+            if isinstance(path, str) and path:
+                return path
+    return None
+
+
+def _scratch_stamp_entry(pod: Any, volume: str) -> dict[str, Any] | None:
+    metadata = getattr(pod, "metadata", None)
+    annotations = getattr(metadata, "annotations", None)
+    if not isinstance(annotations, dict):
+        return None
+    raw = annotations.get(_SCRATCH_SIZE_KEYS)
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    entry = parsed.get(volume)
+    return entry if isinstance(entry, dict) else None
+
+
+def _scratch_eviction_detail(pod: Any, volume: str, limit: str) -> str | None:
+    """Name the mount and the stamped values key, or None to keep the allowlist.
+
+    The volume name and the limit come from the kubelet allowlist match. The
+    key comes from the pod annotation and must be one of the envelope paths.
+    A rejected key is not copied into the detail. ``ephemeral`` appends the
+    type remedy only when it is JSON true; JSON false still names the key.
+    """
+
+    mount_path = _scratch_mount_path(pod, volume)
+    entry = _scratch_stamp_entry(pod, volume)
+    if mount_path is None or entry is None:
+        return None
+    key = entry.get("key")
+    ephemeral = entry.get("ephemeral")
+    if (
+        not isinstance(key, str)
+        or len(key) > _SCRATCH_KEY_MAX_LEN
+        or _SCRATCH_VALUE_KEY.fullmatch(key) is None
+        or not isinstance(ephemeral, bool)
+    ):
+        return None
+    detail = f"sandbox scratch {mount_path} ({volume}) exceeded {limit}; raise {key}"
+    if ephemeral:
+        detail += " or set scratchVolume.type=ephemeral"
+    return detail
+
+
+def _safe_pod_message(raw: object, pod: Any = None) -> str | None:
     if not isinstance(raw, str):
         return None
     # Kubernetes messages are untrusted free text. Extract only the shape
@@ -299,6 +392,9 @@ def _safe_pod_message(raw: object) -> str | None:
     if match is None:
         return None
     volume, limit = match.groups()
+    mapped = _scratch_eviction_detail(pod, volume, limit)
+    if mapped is not None:
+        return mapped
     return f'Usage of EmptyDir volume "{volume}" exceeds the limit "{limit}"'
 
 
@@ -331,7 +427,7 @@ def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
     if phase == "Failed" and reason == "Evicted":
         return SandboxTermination(
             "Evicted",
-            _safe_pod_message(getattr(status, "message", None)),
+            _safe_pod_message(getattr(status, "message", None), pod),
             _runner_exit_code(status),
         )
 
@@ -385,7 +481,12 @@ def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
 
 
 def _event_termination(
-    events: Any, *, pod_name: str, pod_uid: str | None, since: datetime
+    events: Any,
+    *,
+    pod_name: str,
+    pod_uid: str | None,
+    since: datetime,
+    pod: Any = None,
 ) -> SandboxTermination | None:
     # Event lists are name filtered at the API, then checked here as well.
     # A readable pod's UID prevents an old event for a reused name from being
@@ -412,7 +513,7 @@ def _event_termination(
             matches.append(
                 SandboxTermination(
                     _safe_termination_reason(reason),
-                    _safe_pod_message(getattr(event, "message", None)),
+                    _safe_pod_message(getattr(event, "message", None), pod),
                 )
             )
     for preferred in ("Evicted", "OOMKilled", "OOMKilling"):
@@ -1260,7 +1361,7 @@ class KubernetesSandboxClient:
                     _request_timeout=max(0.001, deadline - time.monotonic()),
                 )
                 event_termination = _event_termination(
-                    events, pod_name=name, pod_uid=pod_uid, since=since
+                    events, pod_name=name, pod_uid=pod_uid, since=since, pod=pod
                 )
             except Exception:  # noqa: BLE001 - pod state still provides evidence
                 pass
