@@ -52,7 +52,18 @@ is zero or it starts with "-", else "".
 {{/*
 curie.sandboxEnvelope: (dict "root" $ "agent" <name or "">) -> JSON
   {"profile", "resources": {"requests", "limits"}, "workspaceSizeLimit",
-   "writable": [one sizeLimit per runner.hardening.writablePaths entry]}
+   "workspaceSizeKey", "writable": [one sizeLimit per runner.hardening.writablePaths entry],
+   "writableKeys", "writableEphemeral",
+   "scratchVolume": {"type", "storageClassName"}}
+
+writable stays a list of size strings. writableKeys is the winning values key
+for each path, and writableEphemeral is true only for the path equal to
+runner.hardening.home. Workspace is ephemeral-eligible; workspaceSizeKey is the
+winning workspace key (empty when the workspace volume is off). scratchVolume
+comes from the selected profile. A missing scratchVolume, including under
+--reuse-values, or a scratchVolume map with no type key, means type emptyDir
+and an empty storage class. A present type key is used as its string, including
+an empty string. Allowed types are emptyDir and ephemeral.
 
 The profile catalog (agentSandbox.resourceProfiles) is consulted only for a
 field no explicit value supplies, so a values set without the catalog (a
@@ -87,6 +98,25 @@ template, the profile and the keys to set.
 {{- end -}}
 {{- $profile := get $catalog $name | default dict -}}
 {{- $pkey := printf "agentSandbox.resourceProfiles.%s" $name -}}
+{{- /* Missing scratchVolume (a release reused from a chart that has no such
+       key) stays emptyDir. A present type is used as written, including an
+       empty string, which the refusal below rejects. An empty class is omitted
+       at render. */ -}}
+{{- $scratchType := "emptyDir" -}}
+{{- $scratchClass := "" -}}
+{{- $scratchRaw := get $profile "scratchVolume" -}}
+{{- if and (not (kindIs "invalid" $scratchRaw)) (kindIs "map" $scratchRaw) -}}
+{{- if hasKey $scratchRaw "type" -}}
+{{- $scratchType = toString (get $scratchRaw "type") -}}
+{{- end -}}
+{{- $scratchClassRaw := get $scratchRaw "storageClassName" -}}
+{{- if not (kindIs "invalid" $scratchClassRaw) -}}
+{{- $scratchClass = toString $scratchClassRaw -}}
+{{- end -}}
+{{- end -}}
+{{- if and (ne $scratchType "emptyDir") (ne $scratchType "ephemeral") -}}
+{{- fail (printf "%s.scratchVolume.type %q is not emptyDir or ephemeral" $pkey $scratchType) -}}
+{{- end -}}
 {{- $std := get $catalog "standard" | default dict -}}
 {{- $gen := $runner.resources | default dict -}}
 {{- $genSides := dict "requests" (get $gen "requests" | default dict) "limits" (get $gen "limits" | default dict) -}}
@@ -136,6 +166,7 @@ template, the profile and the keys to set.
 {{- end -}}
 {{- end -}}
 {{- $ws := "" -}}
+{{- $workspaceSizeKey := "" -}}
 {{- $wf := $runner.workspace | default dict -}}
 {{- if $wf.enabled -}}
 {{- $k := "" -}}
@@ -161,8 +192,11 @@ template, the profile and the keys to set.
 {{- if include "curie.sandboxEnvelope.nonpositive" $ws -}}
 {{- fail (printf "sandbox workspace sizeLimit %v for the %s (profile %s) from %s is not a positive quantity; the kubelet does not enforce a zero or negative emptyDir sizeLimit (ADR-0059 requires a finite sizeLimit)" $ws $who $name $k) -}}
 {{- end -}}
+{{- $workspaceSizeKey = $k -}}
 {{- end -}}
 {{- $writable := list -}}
+{{- $writableKeys := list -}}
+{{- $writableEphemeral := list -}}
 {{- $h := $runner.hardening | default dict -}}
 {{- if $h.enabled -}}
 {{- $gw := get $h "writablePathSizeLimit" -}}
@@ -184,9 +218,15 @@ template, the profile and the keys to set.
 {{- fail (printf "sandbox writable path %s sizeLimit %v for the %s (profile %s) from %s is not a positive quantity; the kubelet does not enforce a zero or negative emptyDir sizeLimit (ADR-0059 requires a finite sizeLimit)" $p $v $who $name $vk) -}}
 {{- end -}}
 {{- $writable = append $writable $v -}}
+{{- $writableKeys = append $writableKeys $vk -}}
+{{- if eq (toString $p) (toString (get $h "home" | default "")) -}}
+{{- $writableEphemeral = append $writableEphemeral true -}}
+{{- else -}}
+{{- $writableEphemeral = append $writableEphemeral false -}}
 {{- end -}}
 {{- end -}}
-{{- toJson (dict "profile" $name "resources" $out "workspaceSizeLimit" $ws "writable" $writable) -}}
+{{- end -}}
+{{- toJson (dict "profile" $name "resources" $out "workspaceSizeLimit" $ws "workspaceSizeKey" $workspaceSizeKey "writable" $writable "writableKeys" $writableKeys "writableEphemeral" $writableEphemeral "scratchVolume" (dict "type" $scratchType "storageClassName" $scratchClass)) -}}
 {{- end -}}
 
 {{/*
@@ -238,16 +278,18 @@ workspace <size>, home <size>, tmp <size>" ("none" where no volume renders).
 {{/*
 curie.sandboxEnvelope.differing: root -> JSON list of {"agent", "env"} for
 every per-agent pool whose effective envelope differs from the generic
-template's in any field (#4889 A6). Used by NOTES.
+template's (#4889 A6). The comparison includes resources, workspace size,
+writable sizes, the scratch volume (type and class), and the winning size-key
+fields. Used by NOTES.
 */}}
 {{- define "curie.sandboxEnvelope.differing" -}}
 {{- $root := . -}}
 {{- $generic := include "curie.sandboxEnvelope" (dict "root" $root "agent" "") | fromJson -}}
-{{- $gkey := toJson (list $generic.resources $generic.workspaceSizeLimit $generic.writable) -}}
+{{- $gkey := toJson (list $generic.resources $generic.workspaceSizeLimit $generic.writable $generic.scratchVolume $generic.workspaceSizeKey $generic.writableKeys $generic.writableEphemeral) -}}
 {{- $out := list -}}
 {{- range $agent := include "curie.agentSandboxPoolAgents" $root | fromJsonArray -}}
 {{- $env := include "curie.sandboxEnvelope" (dict "root" $root "agent" $agent) | fromJson -}}
-{{- if ne $gkey (toJson (list $env.resources $env.workspaceSizeLimit $env.writable)) -}}
+{{- if ne $gkey (toJson (list $env.resources $env.workspaceSizeLimit $env.writable $env.scratchVolume $env.workspaceSizeKey $env.writableKeys $env.writableEphemeral)) -}}
 {{- $out = append $out (dict "agent" $agent "env" $env) -}}
 {{- end -}}
 {{- end -}}
