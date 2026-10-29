@@ -329,9 +329,8 @@ class _CaptureFailure(Exception):
     ) -> None:
         self.code: FailureCode = code
         self.refusal = refusal
-        # Set only when this invocation created its reservation (not a replay), its
-        # own ``complete`` returned and the fence after it failed: the one case
-        # allowed to withdraw a complete checkpoint.
+        # Set only when this invocation created its reservation (not a replay) and
+        # has sent a ``complete``: the one case allowed to withdraw a checkpoint.
         self.retract = retract
         super().__init__(code)
 
@@ -451,8 +450,8 @@ class RecoveryCheckpointWriter:
         budget, so one aggregate deadline can cover work done before this call.
         ``fence`` is awaited before every completion attempt and once after the
         completion commits. A fence failing before completion tombstones the
-        staging; failing after this call's own completion returned retracts the
-        just-completed checkpoint, whose objects are then left to the collector. A
+        staging; failing after this call sent its own completion retracts the
+        checkpoint if it committed, whose objects are then left to the collector. A
         replay of an already-complete checkpoint never asks for a retraction.
         """
 
@@ -476,6 +475,16 @@ class RecoveryCheckpointWriter:
                 "sha256": _sha256(request.manifest),
             },
         }
+        # Set once any ``complete`` request has been sent: the writer cannot tell
+        # whether a sent request committed, so every later failure may withdraw it.
+        sent: list[bool] = []
+
+        def may_retract() -> bool:
+            # Only a reservation this invocation created may be withdrawn: a replay's
+            # ``complete`` answers success for a checkpoint an earlier invocation
+            # completed, and proves nothing about who did.
+            return bool(sent) and reservation is not None and reservation["replayed"] is False
+
         try:
             self._scratch_root.mkdir(parents=True, exist_ok=True)
             workdir = Path(tempfile.mkdtemp(prefix="recovery-", dir=self._scratch_root))
@@ -509,23 +518,21 @@ class RecoveryCheckpointWriter:
                 if oversized:
                     raise _CaptureFailure("base_too_large") from None
             await self._upload(reservation, declarations, sources, deadline, cancel)
-            await self._complete(request, reservation, deadline, fence)
-            try:
-                await _fenced(fence)
-            except _CaptureFailure as lost:
-                # Only a reservation this invocation created may be withdrawn: a
-                # replay's ``complete`` answers success for a checkpoint an earlier
-                # invocation completed, and proves nothing about who did.
-                raise _CaptureFailure(lost.code, retract=reservation["replayed"] is False) from None
+            await self._complete(request, reservation, deadline, fence, sent)
+            await _fenced(fence)
             result = RecoveryCaptureResult("complete", _checkpoint_id(reservation))
         except _CaptureFailure as failure:
             cancel.set()
+            failure.retract = may_retract()
             result = await self._failed(request, reservation, set(declarations), failure)
         except Exception:  # noqa: BLE001 - typed fault boundary
             cancel.set()
             code: FailureCode = "ledger_unavailable" if reservation is None else "upload_failed"
             result = await self._failed(
-                request, reservation, set(declarations), _CaptureFailure(code)
+                request,
+                reservation,
+                set(declarations),
+                _CaptureFailure(code, retract=may_retract()),
             )
         finally:
             cancel.set()
@@ -673,6 +680,7 @@ class RecoveryCheckpointWriter:
         reservation: dict[str, Any],
         deadline: float,
         fence: Fence | None,
+        sent: list[bool],
     ) -> None:
         payload = {
             **request.authority.payload(),
@@ -688,6 +696,7 @@ class RecoveryCheckpointWriter:
             if remaining <= 0:
                 break
             try:
+                sent.append(True)
                 await _ledger_call(self._ledger.complete, payload, remaining)
                 return
             except _LedgerRefused as refused:
