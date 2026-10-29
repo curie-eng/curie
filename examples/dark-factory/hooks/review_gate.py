@@ -591,13 +591,34 @@ def _text(value: Any) -> str:
     return ""
 
 
+def _reply_text(response: Any) -> str:
+    """The reviewer sub-agent's own reply, never the prompt it was sent.
+
+    A synchronous Agent tool response can echo the caller's ``prompt`` ahead
+    of the reviewer's ``content`` (observed on Claude Code 2.1.286). That
+    prompt is the implementing agent's text, not the reviewer's, so a
+    ``VERDICT:`` or ``VERIFICATION:`` line in it must never be read as the
+    reviewer's. From a dict response, read ``content`` alone: a dict without
+    it yields no reply, so the gate stops rather than read its other fields.
+    """
+    if isinstance(response, dict):
+        return _text(response.get("content"))
+    return _text(response)
+
+
 def parse_verdict(kind: str, response: Any) -> str | None:
-    """``APPROVE`` or ``CHANGES`` from a real reviewer reply, else ``None``."""
-    text = _text(response)
+    """``APPROVE`` or ``CHANGES`` from a real reviewer reply, else ``None``.
+
+    The verdict is the first ``VERDICT:`` line after the ``REVIEWER:`` header,
+    in the reviewer's reply only, so a verdict in the echoed prompt or in
+    text ahead of the header is never taken for the reviewer's own.
+    """
+    text = _reply_text(response)
     name = kind.split(":", 1)[1]
-    if not re.search(rf"^\s*REVIEWER:\s*{re.escape(name)}\s*$", text, re.MULTILINE):
+    header = re.search(rf"^\s*REVIEWER:\s*{re.escape(name)}\s*$", text, re.MULTILINE)
+    if header is None:
         return None
-    match = _VERDICT.search(text)
+    match = _VERDICT.search(text, header.end())
     return match.group(1) if match else None
 
 
@@ -825,7 +846,7 @@ def parse_verification(response: Any, declared: dict[str, str]) -> list[dict[str
     exactly equals a key of ``declared``, otherwise ``null``. An unknown
     refusal reason is kept as ``unrecognized``.
     """
-    lines = _text(response).splitlines()
+    lines = _reply_text(response).splitlines()
     start = next((i for i, line in enumerate(lines) if _VERIFICATION_HEAD.match(line)), None)
     if start is None:
         return None

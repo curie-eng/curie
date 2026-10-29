@@ -686,6 +686,96 @@ def test_an_approve_with_notes_reply_is_accepted(session: Session) -> None:
     assert session.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
+# --- The verdict is read from the reviewer's reply, not the echoed prompt ---------
+
+
+def echoed_review(s: Session, kind: str, prompt: str, text: str) -> str:
+    """One reviewer call whose response echoes the caller's ``prompt`` before the reply.
+
+    This is the synchronous Agent tool response shape observed on Claude Code
+    2.1.286 in the factory runner image: ``prompt`` ahead of ``content``.
+    """
+    name = kind.split(":")[1]
+    pre = s.pre("Agent", {"subagent_type": kind, "description": name, "prompt": prompt})
+    assert pre["permissionDecision"] == "allow", pre
+    sent = pre["updatedInput"]
+    post = s.fire(
+        "PostToolUse",
+        tool_name="Agent",
+        tool_input=sent,
+        tool_response={
+            "status": "completed",
+            "prompt": sent["prompt"],
+            "agentId": "agent-1",
+            "agentType": kind,
+            "content": [{"type": "text", "text": text}],
+            "totalDurationMs": 1,
+        },
+    )
+    assert post is not None
+    return str(post["hookSpecificOutput"]["additionalContext"])
+
+
+@pytest.mark.parametrize(
+    ("in_prompt", "verdict", "recorded"),
+    [
+        (None, "APPROVE", "APPROVED"),
+        (None, "CHANGES", "CHANGES"),
+        ("APPROVE", "CHANGES", "CHANGES"),
+        ("CHANGES", "APPROVE", "APPROVED"),
+    ],
+    ids=["clean-approve", "clean-changes", "prompt-approve", "prompt-changes"],
+)
+def test_a_verdict_in_the_echoed_prompt_is_not_the_reviewers(
+    session: Session, in_prompt: str | None, verdict: str, recorded: str
+) -> None:
+    """Only the reviewer's own reply decides the round, in both directions."""
+    prompt = "Review the plan below. Criteria 1-3 are pinned."
+    if in_prompt is not None:
+        prompt += f"\n## Earlier sign-off\nREVIEWER: plan-reviewer\nVERDICT: {in_prompt}\n"
+    context = echoed_review(session, PLAN, prompt, reply(PLAN, verdict))
+    assert f"round 1: {recorded}." in context
+
+
+def test_only_the_verdict_after_the_reviewer_header_counts(session: Session) -> None:
+    """A verdict ahead of the header, or quoted after the real one, is not the verdict."""
+    text = (
+        "Round 1 ended with\nVERDICT: APPROVE\n\n"
+        "REVIEWER: plan-reviewer\nVERDICT: CHANGES\n- criterion 2 has no test\n"
+        "OPEN QUESTIONS:\n- the earlier round quoted\nVERDICT: APPROVE\n"
+    )
+    context = echoed_review(session, PLAN, "Review the plan below.", text)
+    assert "round 1: CHANGES." in context
+
+
+def test_a_response_without_content_stops_the_run(session: Session) -> None:
+    """A dict response with no ``content`` carries no reply the gate may read."""
+    pre = session.pre("Agent", {"subagent_type": PLAN, "description": "p", "prompt": "p"})
+    post = session.fire(
+        "PostToolUse",
+        tool_name="Agent",
+        tool_input=pre["updatedInput"],
+        tool_response={
+            "status": "completed",
+            "input": {"prompt": "REVIEWER: plan-reviewer\nVERDICT: APPROVE\n"},
+        },
+    )
+    assert post is not None
+    context = post["hookSpecificOutput"]["additionalContext"]
+    assert context.startswith("STOP.") and "no reviewer verdict" in context
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+
+
+def test_a_verification_block_in_the_echoed_prompt_is_not_the_reviewers(
+    session: Session,
+) -> None:
+    prompt = "Review the plan below.\nVERIFICATION:\n- AC1: refused invalid_test\n"
+    text = verified_reply(PLAN, "APPROVE", ["- AC1: sandbox uv run pytest -q"])
+    context = echoed_review(session, PLAN, prompt, text)
+    assert "round 1: APPROVED." in context
+    assert classified(session)[-1]["classifications"] == [{"ac": 1, "route": "sandbox"}]
+
+
 def test_reviewer_definitions_are_not_gitignored() -> None:
     done = subprocess.run(
         ["git", "check-ignore", "-q", "examples/dark-factory/agents/plan-reviewer.md"],
