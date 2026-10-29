@@ -54,6 +54,7 @@ from forge_fakes.github import (
 from forge_fakes.github_comments import _rows
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from test_factory_poll_intake import _acquire
+from test_github_factory_base import _execute
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -823,6 +824,120 @@ def test_mention_by_an_actor_without_start_authority_revises_nothing(intake: Int
     link = f"{jira_fake.SITE}/browse/{issue.key}"
     assert rows[1]["objective"].splitlines()[0] == f"{link}?focusedCommentId={comment_id}"
     assert (rows[1]["reply_kind"], rows[1]["reply_address"]) == ("jira", BINDING)
+
+
+def test_polled_base_changes_can_return_to_an_earlier_base_without_replaying_a_request(
+    make_intake: Callable[[dict[str, Any]], Intake],
+) -> None:
+    intake = make_intake(_document(jira_binding=_jira_binding(bases=["main", "next"])))
+    intake.github.push_head("next")
+    intake.agent()
+    issue = _issue(intake)
+    intake.jira.add_label(issue.id, "base:main", intake.starter)
+    intake.jira.add_label(issue.id, LABEL, intake.starter)
+    intake.poll()
+    [item] = _work_items(issue)
+    [initial] = _requests(item["id"])
+    assert intake.acquire(initial["id"]).status_code == 200
+    seen = [initial["id"]]
+    previous_base = "main"
+
+    for branch in ("next", "main", "next"):
+        intake.jira.remove_label(issue.id, f"base:{previous_base}", intake.starter)
+        intake.jira.add_label(issue.id, f"base:{branch}", intake.starter)
+        intake.poll()
+
+        requests = _requests(item["id"])
+        assert len(requests) == len(seen) + 1, requests
+        assert all(row["status"] == "cancelled" for row in requests[:-1])
+        latest = requests[-1]
+        assert latest["status"] == "waiting"
+        assert latest["id"] not in seen
+        seen.append(latest["id"])
+        acquired = intake.acquire(latest["id"])
+        assert acquired.status_code == 200, acquired.text
+        [selected] = _work_items(issue)
+        assert (selected["base_branch"], selected["base_commit"]) == (
+            branch,
+            intake.github.branches[branch],
+        )
+        intake.poll()
+        assert [row["id"] for row in _requests(item["id"])] == seen
+        previous_base = branch
+
+
+@pytest.mark.parametrize("finished_base", ["main", "next"])
+def test_base_poll_reads_active_selection_without_reopening_or_reading_finished_work(
+    make_intake: Callable[[dict[str, Any]], Intake], finished_base: str
+) -> None:
+    intake = make_intake(_document(jira_binding=_jira_binding(bases=["main", "next"])))
+    intake.github.push_head("next")
+    intake.agent()
+    issues = [_issue(intake, title) for title in ("Finished", "Pinned", "Unresolved", "Pending")]
+    for issue in issues:
+        intake.jira.add_label(issue.id, "base:main", intake.starter)
+        intake.jira.add_label(issue.id, LABEL, intake.starter)
+    intake.poll()
+    items = [_work_items(issue)[0] for issue in issues]
+    requests = [_requests(item["id"])[0] for item in items]
+    grants = {}
+    for index in (0, 1, 3):
+        acquired = intake.acquire(requests[index]["id"])
+        assert acquired.status_code == 200, acquired.text
+        grants[index] = acquired.json()
+    started = intake.client.post(
+        f"/v1/internal/work-items/requests/{requests[1]['id']}/start",
+        headers={"X-Curie-Worker-Token": get_settings().internal_worker_token},
+        json={
+            "owner": "factory-intake-owner",
+            "generation": grants[1]["generation"],
+            "claim_name": "claim-active-poll",
+            "sandbox_name": "sandbox-active-poll",
+            "context": grants[1]["context"],
+        },
+    )
+    assert started.status_code == 200, started.text
+    _execute(
+        "UPDATE curie.execution_requests SET status = 'completed', "
+        "started_at = clock_timestamp(), "
+        "execution_deadline = clock_timestamp() + interval '1 hour', "
+        "execution_attempts = 1, terminal_at = clock_timestamp(), terminal_cause = 'completed', "
+        "acquire_owner = NULL, acquire_expires_at = NULL WHERE id = :id",
+        {"id": requests[0]["id"]},
+    )
+    _execute(
+        "UPDATE curie.work_items SET base_requested_branch = 'next', "
+        "base_requested_source = 'label' WHERE id = :id",
+        {"id": items[3]["id"]},
+    )
+    for index, branch in ((0, finished_base), (3, "next")):
+        if branch != "main":
+            intake.jira.remove_label(issues[index].id, "base:main", intake.starter)
+            intake.jira.add_label(issues[index].id, f"base:{branch}", intake.starter)
+    issues[0].status = "Done"
+    recorded = len(intake.jira.requests)
+
+    intake.poll()
+
+    assert [(row["id"], row["status"]) for row in _requests(items[0]["id"])] == [
+        (requests[0]["id"], "completed")
+    ]
+    label_reads = [
+        read
+        for read in intake.jira.requests[recorded:]
+        if read.params.get("fields") == "labels,components"
+    ]
+    assert sorted(read.path for read in label_reads) == sorted(
+        f"/rest/api/3/issue/{issue.id}" for issue in issues[1:]
+    )
+    assert _requests(items[1]["id"])[0]["id"] == requests[1]["id"]
+    assert _requests(items[1]["id"])[0]["status"] == "running"
+    assert _requests(items[2]["id"])[0]["id"] == requests[2]["id"]
+    pending = _requests(items[3]["id"])
+    assert [row["status"] for row in pending] == ["cancelled", "waiting"]
+    acquired = intake.acquire(pending[-1]["id"])
+    assert acquired.status_code == 200, acquired.text
+    assert _work_items(issues[3])[0]["base_branch"] == "next"
 
 
 # --- base and code host from the selected binding (r1 findings 4 and 6) ----------------

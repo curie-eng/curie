@@ -77,7 +77,7 @@ from .forges.types import (
 )
 from .github_factory import lock_issue, work_item_for
 from .github_review_events import FeedbackUnavailable
-from .models import FactoryPollCursor, WorkItem
+from .models import ExecutionRequest, FactoryPollCursor, WorkItem
 from .workitem_dispatch import Admission
 
 logger = logging.getLogger(__name__)
@@ -316,6 +316,13 @@ async def _observe_existing_bases(
     from .factory_base_reconcile import observe_base_labels
     from .forges.trackers import code_host_for_repository
 
+    latest_status = (
+        select(ExecutionRequest.status)
+        .where(ExecutionRequest.work_item_id == WorkItem.id)
+        .order_by(ExecutionRequest.sequence.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
     async with sessionmaker() as session:
         items = list(
             await session.scalars(
@@ -325,6 +332,7 @@ async def _observe_existing_bases(
                     WorkItem.tracker_scope_id == scope.binding.tracker_scope_id,
                     WorkItem.trigger_label == label,
                     WorkItem.cancelled_at.is_(None),
+                    latest_status.in_(("waiting", "running")),
                 )
             )
         )

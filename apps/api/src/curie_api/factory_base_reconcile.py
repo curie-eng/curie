@@ -621,7 +621,7 @@ async def _observe_base_labels_once(
         .execution_options(populate_existing=True)
         .limit(1)
     )
-    request_id = uuid.uuid5(item.id, f"base:{event_identity or fingerprint}")
+    request_id = uuid.uuid5(item.id, f"base:{previous.id}:{event_identity or fingerprint}")
     item.base_selection_fingerprint = fingerprint
     if moving is not None and moving.phase != "pending":
         item.readmit_request_id = request_id
