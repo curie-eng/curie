@@ -1444,9 +1444,6 @@ class _RecordingSubstrate:
         self.calls: list[tuple[str, str, dict[str, str]]] = []
         self.handoff_calls: list[dict[str, Any]] = []
 
-    def preflight_capacity(self, **_: object) -> None:
-        return None
-
     def claim(self, thread_key: str, *, env: dict[str, str] | None = None, **_: object) -> object:
         self.calls.append(("claim", thread_key, dict(env or {})))
         return object()
@@ -1501,7 +1498,7 @@ def test_workspace_ownership_is_durable_before_the_sandbox_claim_is_exposed(
     class SimulatedWorkerCrash(BaseException):
         pass
 
-    class CrashingSubstrate(_RecordingSubstrate):
+    class CrashingSubstrate:
         observed: Any | None = None
 
         def claim(

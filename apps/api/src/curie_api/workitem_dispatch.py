@@ -984,10 +984,9 @@ async def _apply_deferral(
 ) -> DeferResult | DispatchConflict:
     counts_as_start = not capacity and reason.startswith(START_DEFERRAL_REASON_PREFIX)
     settings = get_settings()
-    records_start_failure = counts_as_start or (
-        not capacity and reason == "workspace_stage_timeout"
-    )
-    detail = _start_failure_detail(start_failure_detail) if records_start_failure else None
+    # Only a failed sandbox start records its cause; capacity and other waits
+    # leave the previous one in place (#4930).
+    detail = _start_failure_detail(start_failure_detail) if counts_as_start else None
     values: dict[str, Any] = {}
     if capacity:
         delay = _backoff_seconds(settings, request.capacity_deferrals)

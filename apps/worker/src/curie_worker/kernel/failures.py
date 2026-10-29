@@ -198,6 +198,7 @@ class TurnOutcome:
     saw_side_effect: bool = False
     classification: str | None = None
     error_message: str | None = None
+    workspace_stage_timeout: bool = False
     text: str = ""
     status: SessionStatus | None = None
     steered: bool = False
@@ -231,7 +232,6 @@ class TurnOutcome:
     tools_called: frozenset[str] = frozenset()
     assistant_text: str = ""
     continued: bool = False
-    workspace_stage_timeout: bool = False
 
 
 class _FactoryExecutionEnded(Exception):

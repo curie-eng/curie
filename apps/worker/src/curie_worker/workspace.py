@@ -1315,8 +1315,6 @@ class WorkspacePreparer:
                                 self._real_remaining(real_started),
                             ),
                         )
-                except WorkspaceStageTimeout:
-                    raise
                 except TimeoutError as exc:
                     raise WorkspaceStageTimeout("clone", self.limits.clone_timeout_seconds) from exc
                 except WorkspacePreparationError as exc:
@@ -1736,12 +1734,6 @@ class WorkspaceClaimCoordinator:
             raise WorkspacePreparationError(
                 "lineage-checkout", "lineage head and base are mutually exclusive"
             )
-        self.substrate.preflight_capacity(
-            env=env,
-            agent_name=agent_name,
-            runner_resources=runner_resources,
-            workspace_repo=repo_full_name,
-        )
         if lineage_branch is not None and lineage_head is not None:
             prepared = self.preparer.prepare_lineage(
                 deployment_id=deployment_id,

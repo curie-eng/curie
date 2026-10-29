@@ -1129,6 +1129,7 @@ async def kernel_harness(
     actions: object | None = None,
     publication_creator: object | None = None,
     workspace_factory: Callable[[SandboxSubstrate], object] | None = None,
+    work_items: object | None = None,
     sink: object | None = None,
     runner_app: web.Application | None = None,
     claim_timeout_seconds: float = 3.0,
@@ -1245,6 +1246,7 @@ async def kernel_harness(
         actions=actions,  # type: ignore[arg-type]
         publication_creator=publication_creator,  # type: ignore[arg-type]
         workspace=(workspace_factory(substrate) if workspace_factory else None),  # type: ignore[arg-type]
+        work_items=work_items,  # type: ignore[arg-type]
         card_store=card_store,
         route_ttl_seconds=substrate._config.route_ttl_seconds,
         suspended_route_ttl_seconds=substrate._config.suspended_route_ttl_seconds,

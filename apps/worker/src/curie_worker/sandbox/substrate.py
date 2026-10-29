@@ -328,34 +328,15 @@ class SandboxSubstrate:
         )
         raise CapacityExhaustedError(rejection)
 
-    def preflight_capacity(
-        self,
-        *,
-        env: dict[str, str] | None = None,
-        agent_name: str | None = None,
-        runner_resources: dict[str, Any] | None = None,
-        workspace_repo: str | None = None,
-    ) -> None:
-        """Refuse known capacity exhaustion before preparing a fresh workspace."""
-
-        if self._config.admission is None:
-            return
-        runner = self._preflight_repo_runner(workspace_repo, env, agent_name)
-        self._reserve_admission(
-            "", pool=self._claim_pool(runner, env, agent_name),
-            runner_resources=runner_resources, agent_name=agent_name,
-            executor_secret_names=None, operation="inspect",
-        )
-
-    def _reserve_admission(
+    def _evaluate_admission(
         self,
         name: str,
         *,
+        operation: Literal["reserve", "inspect"],
         pool: str,
         runner_resources: dict[str, Any] | None,
         agent_name: str | None,
         executor_secret_names: frozenset[str] | None,
-        operation: Literal["reserve", "inspect"] = "reserve",
     ) -> AdmissionReservation | None:
         config = self._config.admission
         if config is None:
@@ -380,12 +361,19 @@ class SandboxSubstrate:
             ))
         now = time.time()
         reservation = AdmissionReservation(
-            state="preparing", resources=requested,
+            state="preparing",
+            resources=requested,
             owner_token=secrets.token_hex(16) if operation == "reserve" else "",
-            created_at=now, updated_at=now,
+            created_at=now,
+            updated_at=now,
         )
         accepted, used = self._affinity.reserve_admission(
-            self._config.namespace, config.quota_name, name, reservation, hard, inventory,
+            self._config.namespace,
+            config.quota_name,
+            name,
+            reservation,
+            hard,
+            inventory,
             operation=operation,
         )
         if not accepted:
@@ -1755,33 +1743,6 @@ class SandboxSubstrate:
         _refuse_unsecreted_repo_claim(runner, env, agent_name, self._config.connector_secret_pools)
         return runner
 
-    def _claim_pool(
-        self,
-        runner: RepoRunnerPool | None,
-        env: Mapping[str, str] | None,
-        agent_name: str | None,
-    ) -> str:
-        config = self._config
-        if isinstance(self._k8s, DockerSandboxClient):
-            return config.warm_pool
-        if runner is not None:
-            return runner.pool
-        pool = claim_warm_pool(
-            config.warm_pool,
-            env,
-            agent_name,
-            config.agent_pools,
-            config.connector_secret_pools,
-        )
-        # A per-agent pool cloned after a hosted connector deploy is usable
-        # even when the chart did not list the agent. Absence keeps the
-        # choice above, including the generic pool and the secret refusal.
-        if pool == config.warm_pool:
-            derived = self._existing_agent_pool(config.warm_pool, agent_name)
-            if derived is not None:
-                pool = derived
-        return pool
-
     def _route_matches_runner(
         self,
         handle: SandboxHandle,
@@ -1828,6 +1789,55 @@ class SandboxSubstrate:
 
         return True
 
+    def _claim_pool(
+        self,
+        *,
+        env: Mapping[str, str] | None,
+        agent_name: str | None,
+        runner: RepoRunnerPool | None,
+    ) -> str:
+        config = self._config
+        if isinstance(self._k8s, DockerSandboxClient):
+            return config.warm_pool
+        if runner is not None:
+            return runner.pool
+        pool = claim_warm_pool(
+            config.warm_pool,
+            env,
+            agent_name,
+            config.agent_pools,
+            config.connector_secret_pools,
+        )
+        # A per-agent pool cloned after a hosted connector deploy is usable
+        # even when the chart did not list the agent. Absence keeps the
+        # choice above, including the generic pool and the secret refusal.
+        if pool == config.warm_pool:
+            derived = self._existing_agent_pool(config.warm_pool, agent_name)
+            if derived is not None:
+                pool = derived
+        return pool
+
+    def preflight_capacity(
+        self,
+        *,
+        env: dict[str, str] | None = None,
+        workspace_repo: str | None = None,
+        agent_name: str | None = None,
+        runner_resources: dict[str, Any] | None = None,
+    ) -> None:
+        if self._config.admission is None:
+            return
+        runner = self._preflight_repo_runner(workspace_repo, env, agent_name)
+        pool = self._claim_pool(env=env, agent_name=agent_name, runner=runner)
+        self._evaluate_admission(
+            "",
+            operation="inspect",
+            pool=pool,
+            runner_resources=runner_resources,
+            agent_name=agent_name,
+            executor_secret_names=None,
+        )
+
     def _claim_fresh(
         self,
         thread_key: str,
@@ -1869,10 +1879,14 @@ class SandboxSubstrate:
             if repo_runner is not None
             else self._preflight_repo_runner(workspace_repo, env, agent_name)
         )
-        pool = self._claim_pool(runner, env, agent_name)
-        reservation = self._reserve_admission(
-            name, pool=pool, runner_resources=runner_resources, agent_name=agent_name,
+        pool = self._claim_pool(env=env, agent_name=agent_name, runner=runner)
+        reservation = self._evaluate_admission(
+            name,
+            pool=pool,
+            runner_resources=runner_resources,
+            agent_name=agent_name,
             executor_secret_names=executor_secret_names,
+            operation="reserve",
         )
         # Passed only for an executor claim, so a client that predates the
         # keyword keeps serving ordinary claims unchanged.

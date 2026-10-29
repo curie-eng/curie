@@ -255,9 +255,7 @@ def _workspace_lane(
     )
     coordinator = module.WorkspaceClaimCoordinator(
         preparer=preparer,
-        substrate=SimpleNamespace(
-            claim=lambda *_a, **_k: object(), preflight_capacity=lambda **_kwargs: None
-        ),
+        substrate=SimpleNamespace(claim=lambda *_a, **_k: object()),
         ownership_ttl_seconds=ownership_ttl_seconds,
         wall_clock=clock,
     )
