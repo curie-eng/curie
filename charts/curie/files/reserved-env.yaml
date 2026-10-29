@@ -99,6 +99,7 @@ worker:
   CURIE_WORKSPACE_MAX_COMPRESSION_RATIO: worker.workspace.maxCompressionRatio
   CURIE_WORKSPACE_MAX_CONCURRENT_CLONES: worker.workspace.maxConcurrentClones
   CURIE_WORKSPACE_MAX_MEMBERS: worker.workspace.maxMembers
+  CURIE_WORKSPACE_RECOVERY_ENABLED: worker.workspace.recovery.enabled
   CURIE_WORKSPACE_REFERENCE_TTL_SECONDS: worker.workspace.referenceTtlSeconds
   CURIE_WORKSPACE_SCRATCH_ROOT: worker.workspace.mountPath
   CURIE_WORKSPACE_TOTAL_TIMEOUT_SECONDS: worker.workspace.totalTimeoutSeconds
@@ -163,6 +164,9 @@ api:
   CURIE_PUBLICATION_RETENTION_SECONDS: worker.publication.retentionSeconds
   CURIE_REMEDIATION_AUTHORITY_KEY: api.remediationAuthorityKey
   CURIE_REMEDIATION_ENABLED: remediation.enabled
+  CURIE_WORKSPACE_MAX_ARCHIVE_BYTES: worker.workspace.maxArchiveBytes
+  CURIE_WORKSPACE_RECOVERY_ENABLED: worker.workspace.recovery.enabled
+  CURIE_WORKSPACE_RECOVERY_MAX_BYTES: worker.workspace.recovery.maxBytes
   CURIE_SANDBOX_QUOTA_LIMITS_CPU: resourceQuota.hard.limitsCpu
   CURIE_SANDBOX_QUOTA_LIMITS_MEMORY: resourceQuota.hard.limitsMemory
   CURIE_SANDBOX_QUOTA_REQUESTS_CPU: resourceQuota.hard.requestsCpu

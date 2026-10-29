@@ -461,7 +461,14 @@
             "maxMembers": {"type": "integer", "minimum": 1, "maximum": 100000},
             "maxCompressionRatio": {"type": "number", "minimum": 1, "maximum": 1000},
             "referenceTtlSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
-            "bucket": {"type": "string", "minLength": 3}
+            "bucket": {"type": "string", "minLength": 3},
+            "recovery": {
+              "type": "object",
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "maxBytes": {"type": ["integer", "null"], "minimum": 1}
+              }
+            }
           }
         },
         "attachments": {
