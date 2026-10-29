@@ -15,12 +15,14 @@ from typing import Any
 import pytest
 import redis
 from aci_protocol import QueuedTurn
+from curie_api import agent_role_policy
 from curie_api.config import get_settings
 from curie_api.identity.http_transport import HttpIdentityClient
 from curie_api.main import create_app
 from curie_api.models import Agent, AgentChannel, ChannelIdentity
 from fastapi.testclient import TestClient
-from role_policy_support import run
+from principal_adoption_support import ISSUER
+from role_policy_support import change, run
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from test_http_invocation_membership import (
@@ -334,3 +336,62 @@ def run_generation(scope: dict[str, Any]) -> int:
 
     run(read)
     return result["generation"]
+
+
+GROUP_FILTER = {
+    "entries": [{"kind": "issuer_group", "group": {"issuer": ISSUER, "id": "SyntheticOtherGroup"}}],
+}
+
+
+def _restrict(sibling: dict[str, Any], operation: str) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-22: give the sibling agent an HTTP-only filter."""
+
+    async def apply(factory: async_sessionmaker[AsyncSession]) -> None:
+        """@spec HTTP-INVOCATION-EXECUTION-22: through the existing role-policy owner."""
+        async with factory() as session, session.begin():
+            await agent_role_policy.apply_role_change(
+                session,
+                change=change(
+                    uuid.UUID(sibling["tenant"]), uuid.UUID(sibling["agent"]),
+                    operation=operation, filter=GROUP_FILTER,
+                ),
+            )
+
+    run(apply)
+
+
+@pytest.mark.parametrize("operation", ["migrate_role", "set_filter"])
+@pytest.mark.parametrize("initialized", [True, False])
+def test_unregistered_binding_of_a_filtered_agent_refuses_instead_of_legacy(
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    synthetic_provider: SimpleNamespace,  # noqa: F811 - the reused fixture.
+    operation: str,
+    initialized: bool,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-22: the legacy path never evaluates role filters."""
+    scope = _scope(synthetic_provider.url)
+    sibling = _sibling(scope)
+    _restrict(sibling, operation)
+    module = _runtime_api()
+    app = (
+        create_app(
+            http_identity_runtime=_runtime(module, scope),
+            http_identity_client=HttpIdentityClient(tls_context=synthetic_provider.tls),
+        )
+        if initialized else create_app()
+    )
+    try:
+        with TestClient(app) as client:
+            token = _credential(client, sibling)
+            refused = _legacy_post(client, token, sibling)
+            assert refused.status_code == 401, refused.text
+            assert refused.json() == {"detail": "invalid_http_receiver"}
+            assert valkey.xlen(runs_stream) == 0 and synthetic_provider.requests == []
+            assert _keys(valkey, sibling["binding"]) == set()
+            answer = _check(client, sibling)
+            assert answer.status_code == 200, answer.text
+            assert answer.json()["http_identity_required"] is True
+    finally:
+        _cleanup(valkey, scope["binding"], sibling["binding"])
