@@ -1,7 +1,7 @@
 """Reconcile durable factory branch moves.
 
-Revision ID: 0142
-Revises: 0141
+Revision ID: 0144
+Revises: 0143
 """
 
 from collections.abc import Sequence
@@ -10,8 +10,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0142"
-down_revision: str = "0141"
+revision: str = "0144"
+down_revision: str = "0143"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 S = "curie"

@@ -192,4 +192,3 @@ def test_0143_to_0144_preserves_retained_base_pins_and_selection_intent(
         ("curie.factory_base_transitions",)
     ]
     assert sql_rows("SELECT count(*) FROM curie.factory_base_transitions") == [(0,)]
-
