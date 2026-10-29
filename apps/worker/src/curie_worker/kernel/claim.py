@@ -1221,6 +1221,14 @@ async def _claim_or_resume(
                 ttl_seconds=self._route_ttl_seconds,
             )
             return await validate_wait_claim(existing)
+        if caller_run is not None and replace_handle is None:
+            await asyncio.to_thread(
+                self._substrate.preflight_capacity,
+                env=boot_env,
+                workspace_repo=workspace_repo,
+                agent_name=agent_name,
+                runner_resources=runner_resources,
+            )
         handoff_revalidation: Callable[[], None] | None = None
         candidate_validation: Callable[[SandboxHandle], None] | None = None
         if replace_handle is not None:

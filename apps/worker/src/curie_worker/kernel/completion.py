@@ -225,7 +225,11 @@ async def _complete(
         )
         try:
             await run.defer(
-                f"not_started:{telemetry_outcome}",
+                (
+                    "workspace_timeout"
+                    if turn is not None and turn.workspace_stage_timeout
+                    else f"not_started:{telemetry_outcome}"
+                ),
                 capacity=False,
                 start_failure_detail=start_failure_detail,
             )
