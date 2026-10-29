@@ -1514,6 +1514,40 @@ async def _race_lease_lost_during_final_fence(stage: _Stage) -> None:
     await stage.assert_request_unchanged()
 
 
+async def _race_release_raises_under_valid_lease(stage: _Stage) -> None:
+    """A release that raised under a valid lease did not run: it is retried once.
+
+    The reacquired plain path releases the recorded claim, and only that claim.
+    """
+
+    await stage.start_run()
+    await stage.fail_turn()
+    await stage.finish_failed()
+    others_before = {name for name in stage.h.fake_k8s.claims if name != stage.handle.claim_name}
+    stage.observer = _ReleaseObserver(stage)
+    observer = stage.observer
+    attempts: list[str] = []
+
+    def flaky(thread_key: str, claim_name: str) -> bool:
+        attempts.append(claim_name)
+        if len(attempts) == 1:
+            # Injected fault: the first release call fails before it removes anything.
+            raise RuntimeError("injected release_if_claim failure")
+        return observer(thread_key, claim_name)
+
+    stage.h.substrate.release_if_claim = flaky  # type: ignore[method-assign]
+    await stage.release()
+    _assert_release_bounded(stage)
+
+    assert attempts == [stage.handle.claim_name] * 2, attempts
+    own = await stage.own_checkpoints()
+    assert list(own.values()) == ["complete"], own
+    _assert_released(stage)
+    others_after = {name for name in stage.h.fake_k8s.claims if name != stage.handle.claim_name}
+    assert others_before <= others_after, (others_before, others_after)
+    await stage.assert_request_unchanged()
+
+
 async def _race_lease_lost_after_release(stage: _Stage) -> None:
     await stage.start_run()
     await stage.fail_turn()
@@ -1575,6 +1609,7 @@ _RACES: dict[str, Callable[[_Stage], Awaitable[None]]] = {
     "lease_lost_after_fence_before_release": _race_lease_lost_after_fence,
     "lease_lost_during_final_fence_reacquires": _race_lease_lost_during_final_fence,
     "lease_lost_after_release_not_repeated": _race_lease_lost_after_release,
+    "release_raises_under_valid_lease_retries": _race_release_raises_under_valid_lease,
     "lock_unobtainable_release_deferred": _race_lock_unobtainable,
 }
 

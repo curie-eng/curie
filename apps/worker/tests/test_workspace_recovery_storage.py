@@ -1289,6 +1289,40 @@ class _LostCompletionResponse(httpx.AsyncBaseTransport):
         await self._inner.aclose()
 
 
+class _UnconfirmedCompletion(httpx.AsyncBaseTransport):
+    """Real HTTP to the API; every ``/complete`` is forwarded, its answer withheld.
+
+    ``mode="unavailable"`` answers each forwarded completion with a 503;
+    ``mode="stall"`` holds the answer until the caller's own deadline gives up.
+    ``on_commit`` runs after the first completion reached the API.
+    """
+
+    def __init__(self, mode: str, on_commit: Callable[[], None] | None = None) -> None:
+        self._inner = httpx.AsyncHTTPTransport()
+        self._mode = mode
+        self._on_commit = on_commit
+        self.complete_calls = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        response = await self._inner.handle_async_request(request)
+        if not request.url.path.endswith("/workspace-recovery/complete"):
+            return response
+        self.complete_calls += 1
+        await response.aread()
+        await response.aclose()
+        assert response.status_code == 200, response.status_code
+        if self.complete_calls == 1 and self._on_commit is not None:
+            self._on_commit()
+        if self._mode == "stall":
+            # Injected fault: the committed completion's answer never arrives.
+            await asyncio.sleep(300)
+        # Injected fault: the API committed, but the worker sees it unavailable.
+        return httpx.Response(503, json={"detail": "injected"}, request=request)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
 # --- AC1: recovery outlives the claim ---------------------------------------------------------
 
 
@@ -1749,6 +1783,104 @@ async def _case_completion_committed_response_lost(ctx: _Ctx) -> None:
     await _assert_readable(ctx, source, previous, ctx.harness.good_digests())
 
 
+async def _assert_retracted_to(
+    ctx: _Ctx, source: _Source, retracted: uuid.UUID, previous: uuid.UUID
+) -> None:
+    rows = await _sql(
+        ctx,
+        "SELECT status, completed_at FROM curie.workspace_recovery_checkpoints WHERE id = :id",
+        id=retracted,
+    )
+    assert rows[0]["status"] == "tombstoned" and rows[0]["completed_at"] is not None, rows
+    assert await _last_good(ctx, source) == previous
+    assert await _recovery_outcome(ctx, source) == "lease_lost"
+    await _assert_readable(ctx, source, previous, ctx.harness.good_digests())
+
+
+async def _case_completion_stalls_past_budget_while_lease_lost(ctx: _Ctx) -> None:
+    """A committed completion whose answer outlives the budget, lease lost meanwhile.
+
+    The cleanup fence is re-run inside the cleanup allowance; it finds the lease
+    gone, so the commit made without proven ownership is retracted.
+    """
+
+    source = await _seed(ctx)
+    previous = await _good_checkpoint(ctx, source, base=ctx.harness.base_source())
+    lost: list[bool] = []
+    fenced: list[int] = []
+
+    async def fence() -> None:
+        fenced.append(1)
+        if lost:
+            raise _InjectedFailure("lease lost while the completion answer stalled")
+
+    fault = _UnconfirmedCompletion("stall", on_commit=lambda: lost.append(True))
+    started = time.monotonic()
+    async with httpx.AsyncClient(transport=fault, timeout=600.0) as faulty:
+        result = await _writer(
+            ctx, ledger=_ledger(ctx.harness, faulty), capture_budget=8.0
+        ).capture(
+            _request(source, patch=ctx.harness.patch, manifest=ctx.harness.manifest, base=None),
+            fence=fence,
+        )
+    elapsed = time.monotonic() - started
+    assert elapsed <= 8.0 + CLEANUP_BUDGET_SECONDS + 3.0, elapsed
+    assert fault.complete_calls == 1
+    assert len(fenced) == 2, "the cleanup did not re-check the lease"
+    assert result.status == "failed", result
+    assert result.checkpoint_id is not None
+    await _assert_retracted_to(ctx, source, result.checkpoint_id, previous)
+
+
+async def _unavailable_completion_twice(
+    ctx: _Ctx, *, lose_on_cleanup: bool
+) -> tuple[_Source, uuid.UUID, RecoveryCaptureResult, list[int]]:
+    source = await _seed(ctx)
+    previous = await _good_checkpoint(ctx, source, base=ctx.harness.base_source())
+    fenced: list[int] = []
+
+    async def fence() -> None:
+        fenced.append(1)
+        # The two pre-completion fences pass; only the post-failure check may fail.
+        if lose_on_cleanup and len(fenced) > 2:
+            raise _InjectedFailure("lease lost before the cleanup")
+
+    fault = _UnconfirmedCompletion("unavailable")
+    async with httpx.AsyncClient(transport=fault, timeout=30.0) as faulty:
+        result = await _writer(ctx, ledger=_ledger(ctx.harness, faulty)).capture(
+            _request(source, patch=ctx.harness.patch, manifest=ctx.harness.manifest, base=None),
+            fence=fence,
+        )
+    assert fault.complete_calls == 2  # the idempotent completion is retried once
+    assert fenced == [1, 1, 1], "the cleanup did not re-check the lease"
+    assert result.status == "failed", result
+    assert result.checkpoint_id is not None
+    return source, previous, result, fenced
+
+
+async def _case_unavailable_completion_then_lease_lost(ctx: _Ctx) -> None:
+    """Completion unconfirmed twice, lease gone at cleanup: the commit is retracted."""
+
+    source, previous, result, _ = await _unavailable_completion_twice(ctx, lose_on_cleanup=True)
+    assert result.checkpoint_id is not None
+    await _assert_retracted_to(ctx, source, result.checkpoint_id, previous)
+
+
+async def _case_unavailable_completion_under_proven_lease(ctx: _Ctx) -> None:
+    """Completion unconfirmed twice, lease proven at cleanup: the commit stands."""
+
+    source, previous, result, _ = await _unavailable_completion_twice(ctx, lose_on_cleanup=False)
+    committed = result.checkpoint_id
+    assert committed is not None and committed != previous
+    assert await _checkpoint_status(ctx, committed) == "complete"
+    assert await _last_good(ctx, source) == committed
+    assert await _recovery_outcome(ctx, source) != "lease_lost"
+    keys = await _checkpoint_keys(ctx, committed)
+    for object_key in keys.values():
+        assert _exists(ctx.harness, _physical(object_key)), object_key
+    await _assert_readable(ctx, source, committed, ctx.harness.good_digests())
+
+
 async def _case_retracted_checkpoint_is_never_discarded(ctx: _Ctx) -> None:
     """After a retraction every repeated ``fail`` answers ``retracted``, never ``tombstoned``.
 
@@ -2006,6 +2138,11 @@ _FAULT_CASES: dict[str, Callable[[_Ctx], Awaitable[None]]] = {
     "replay_with_lost_lease": _case_replay_with_lost_lease,
     "replay_lost_after_its_completion": _case_replay_lost_after_its_completion,
     "completion_committed_response_lost": _case_completion_committed_response_lost,
+    "completion_stalls_past_budget_while_lease_lost": (
+        _case_completion_stalls_past_budget_while_lease_lost
+    ),
+    "unavailable_completion_then_lease_lost": _case_unavailable_completion_then_lease_lost,
+    "unavailable_completion_under_proven_lease": _case_unavailable_completion_under_proven_lease,
     "retracted_checkpoint_is_never_discarded": _case_retracted_checkpoint_is_never_discarded,
     "patch_at_limit": _case_patch_at_limit,
     "patch_over_limit": _case_patch_over_limit,
