@@ -6,7 +6,7 @@ import hashlib
 import json
 import uuid
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -564,8 +564,13 @@ async def _retract(
 async def fail(session: AsyncSession, body: wire.RecoveryFail) -> wire.RecoveryCaptureFailure:
     item, group, cp, now = await _cleanup_context(session, body)
     if cp.status == "tombstoned":
-        return wire.RecoveryCaptureFailure(checkpoint_id=cp.id)
-    if cp.status == "complete" and body.reason == "lease_lost":
+        # A checkpoint that was ever complete may still be held by a reader, so a
+        # repeated fail answers ``retracted`` and the writer leaves its objects.
+        status: Literal["tombstoned", "retracted"] = (
+            "retracted" if cp.completed_at is not None else "tombstoned"
+        )
+        return wire.RecoveryCaptureFailure(checkpoint_id=cp.id, status=status)
+    if cp.status == "complete" and body.retract and body.reason == "lease_lost":
         return await _retract(session, item, group, cp, now)
     if cp.status != "staging":
         raise RecoveryRefusal("checkpoint_state")

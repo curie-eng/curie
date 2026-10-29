@@ -8730,6 +8730,11 @@ export interface components {
              * @enum {string}
              */
             reason: "upload_failed" | "capture_failed" | "capture_timeout" | "torn_capture" | "lease_lost";
+            /**
+             * Retract
+             * @default false
+             */
+            retract?: boolean;
             /** Runtime Epoch */
             runtime_epoch: number;
             /**

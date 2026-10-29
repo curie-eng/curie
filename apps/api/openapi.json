@@ -10935,6 +10935,11 @@
             "title": "Reason",
             "type": "string"
           },
+          "retract": {
+            "default": false,
+            "title": "Retract",
+            "type": "boolean"
+          },
           "runtime_epoch": {
             "maximum": 9.223372036854776e+18,
             "minimum": 1.0,

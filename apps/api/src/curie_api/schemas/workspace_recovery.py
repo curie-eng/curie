@@ -83,6 +83,9 @@ class RecoveryFail(RecoveryCaptureAuthority):
     reason: Literal[
         "upload_failed", "capture_failed", "capture_timeout", "torn_capture", "lease_lost"
     ]
+    # Only the writer whose own complete call returned may withdraw a complete
+    # checkpoint; without it a fail on a complete checkpoint is refused.
+    retract: bool = False
 
 
 class RecoveryCaptureFailure(RecoveryMessage):

@@ -310,9 +310,14 @@ class RecoveryCaptureResult:
 
 
 class _CaptureFailure(Exception):
-    def __init__(self, code: FailureCode, refusal: str | None = None) -> None:
+    def __init__(
+        self, code: FailureCode, refusal: str | None = None, *, retract: bool = False
+    ) -> None:
         self.code: FailureCode = code
         self.refusal = refusal
+        # Set only when this invocation's own ``complete`` returned and the fence
+        # after it failed: the one case allowed to withdraw a complete checkpoint.
+        self.retract = retract
         super().__init__(code)
 
 
@@ -431,8 +436,9 @@ class RecoveryCheckpointWriter:
         budget, so one aggregate deadline can cover work done before this call.
         ``fence`` is awaited before every completion attempt and once after the
         completion commits. A fence failing before completion tombstones the
-        staging; failing after it retracts the just-completed checkpoint, whose
-        objects are then left to the collector.
+        staging; failing after this call's own completion returned retracts the
+        just-completed checkpoint, whose objects are then left to the collector. A
+        replay of an already-complete checkpoint never asks for a retraction.
         """
 
         if deadline is None:
@@ -489,7 +495,10 @@ class RecoveryCheckpointWriter:
                     raise _CaptureFailure("base_too_large") from None
             await self._upload(reservation, declarations, sources, deadline, cancel)
             await self._complete(request, reservation, deadline, fence)
-            await _fenced(fence)
+            try:
+                await _fenced(fence)
+            except _CaptureFailure as lost:
+                raise _CaptureFailure(lost.code, retract=True) from None
             result = RecoveryCaptureResult("complete", _checkpoint_id(reservation))
         except _CaptureFailure as failure:
             cancel.set()
@@ -683,7 +692,7 @@ class RecoveryCheckpointWriter:
         checkpoint_id = _checkpoint_id(reservation)
         try:
             cleanup_complete = await asyncio.wait_for(
-                self._cleanup(request, reservation, declared, failure.code),
+                self._cleanup(request, reservation, declared, failure),
                 self._cleanup_budget,
             )
         except Exception:  # noqa: BLE001 - typed fault boundary
@@ -697,12 +706,14 @@ class RecoveryCheckpointWriter:
         request: RecoveryCaptureRequest,
         reservation: dict[str, Any],
         declared: set[str],
-        code: FailureCode,
+        failure: _CaptureFailure,
     ) -> bool:
         """Tombstone the reservation, then discard exactly the keys this capture declared.
 
-        A ``lease_lost`` failure after completion is answered ``retracted`` and
-        discards nothing.
+        Only a failure carrying ``retract`` (this call's own completion returned,
+        then its fence failed) asks the ledger to withdraw a complete checkpoint.
+        A ``retracted`` answer, including a repeated fail on a checkpoint that was
+        once complete, discards nothing.
 
         Objects are discarded only after ``fail`` confirms the tombstone. A replayed
         reservation can name a checkpoint that is already complete (or whose
@@ -716,7 +727,8 @@ class RecoveryCheckpointWriter:
         payload = {
             **request.authority.payload(),
             "checkpoint_id": str(_checkpoint_id(reservation)),
-            "reason": _FAIL_REASON.get(code, "upload_failed"),
+            "reason": _FAIL_REASON.get(failure.code, "upload_failed"),
+            "retract": failure.retract,
         }
         try:
             response = await _ledger_call(self._ledger.fail, payload)

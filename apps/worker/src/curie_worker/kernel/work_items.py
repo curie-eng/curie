@@ -681,16 +681,16 @@ async def _release_with_recovery(self: Kernel, run: WorkItemRun, claim_name: str
     try:
         async with self._lock.hold(self._config.lock_key(thread_key)) as lease:
             entered = True
+
+            async def fence() -> None:
+                await lease.ensure_owned()
+                # The renewer may have marked the lease lost during the await.
+                if lease.lost:
+                    raise LockLeaseLost(lease.key)
+
             handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
             prepared = await asyncio.to_thread(workspace.current, thread_key)
             if handle is not None and handle.claim_name == claim_name and prepared is not None:
-
-                async def fence() -> None:
-                    await lease.ensure_owned()
-                    # The renewer may have marked the lease lost during the await.
-                    if lease.lost:
-                        raise LockLeaseLost(lease.key)
-
                 await recovery.capture(run, handle, prepared, fence=fence)
             else:
                 logger.info(
@@ -698,7 +698,7 @@ async def _release_with_recovery(self: Kernel, run: WorkItemRun, claim_name: str
                     run.request_id,
                     thread_key,
                 )
-            await lease.ensure_owned()
+            await fence()
             release_ran = True
             await _release_claim(self, thread_key, claim_name)
     except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
