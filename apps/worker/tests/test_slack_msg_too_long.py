@@ -316,3 +316,49 @@ def test_answer_under_the_limit_is_one_update():
         assert slack.delivered() == [rendered(text, "mrkdwn")]
 
     asyncio.run(run())
+
+
+class LostNoticeAckSlack(Slack):
+    """Stores the first created notice, then loses its acknowledgement once."""
+
+    lost = False
+
+    async def post(self, **body):
+        result = await super().post(**body)
+        if body["text"] == MSG_TOO_LONG_NOTICE and not self.lost:
+            self.lost = True
+            raise TimeoutError("synthetic lost acknowledgement")
+        return result
+
+
+@pytest.mark.parametrize("reply_ref", ["1.2", None])
+@pytest.mark.parametrize("mode", ["mrkdwn", "verbatim"])
+def test_retry_after_lost_notice_ack_posts_one_notice_per_refused_part(mode, reply_ref, outcomes):
+    async def run():
+        text = prose(9000)
+        if mode == "verbatim":
+            originals = [p.content for p in split_verbatim_answer(text)]
+        else:
+            originals = [p.text for p in split_answer(render(text, None)[0])]
+        refused = [o for o in originals if len(o.encode()) > 300]
+        assert len(refused) >= 2
+        sink = SlackReplyAdapter("xoxb-test")
+        slack = LostNoticeAckSlack(sink, limit=300)
+        with pytest.raises(TimeoutError):
+            await emit(sink, event(text, mode, ref=reply_ref))
+        assert slack.lost
+        retry_sink = SlackReplyAdapter("xoxb-test")
+        retry = LostNoticeAckSlack(retry_sink, limit=300, created=slack.created)
+        retry.lost = True
+        await emit(retry_sink, event(text, mode, ref=reply_ref))
+        created = [body["text"] for body in retry.created.values()]
+        edits = [body["text"] for m, body in retry.calls if m == "update-ok"]
+        # The placeholder edit, when there is one, is the last edit of the retry.
+        shown = created + edits[-1:] if reply_ref is not None else created
+        assert shown.count(MSG_TOO_LONG_NOTICE) == len(refused)
+        for text_shown in shown:
+            assert text_shown == MSG_TOO_LONG_NOTICE or text_shown in originals
+            assert text_shown not in refused
+        assert ("curie.reply.delivery", "success") in outcomes
+
+    asyncio.run(run())

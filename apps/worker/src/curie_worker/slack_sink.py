@@ -701,12 +701,16 @@ class SlackReplyAdapter:
         seed = event.delivery_id or ref
         posted_any = False
 
-        def create_key(index: int, sub_index: int | None = None) -> str | None:
+        def create_key(
+            index: int, sub_index: int | None = None, *, notice: bool = False
+        ) -> str | None:
             if seed is None:
                 return None
             name = f"curie-answer:{identity}:{target.address}:{seed}:{digest}:{index}"
             if sub_index is not None:
                 name += f":{sub_index}"
+            if notice:
+                name += ":notice"
             return str(uuid.uuid5(uuid.NAMESPACE_URL, name))
 
         async def send(
@@ -856,7 +860,9 @@ class SlackReplyAdapter:
                     if not await send(
                         text_payload(MSG_TOO_LONG_NOTICE),
                         index=index,
-                        key=sub_key,
+                        # Own key: on retry the piece is refused again and its post
+                        # must not dedupe onto a stored notice and look delivered.
+                        key=create_key(index, sub_index, notice=True),
                         slot=sub_slot,
                     ):
                         return ref
