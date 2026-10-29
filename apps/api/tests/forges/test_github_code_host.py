@@ -42,6 +42,7 @@ from curie_api.publication_pulls import (
     adopt_or_open,
     revision_refusal,
 )
+from forge_fakes.github import GitHubRepositoryFake
 
 REPO = "acme-corp/acme-bot"
 REPO_ID = 4401
@@ -221,6 +222,44 @@ def test_stored_pull_number_is_the_only_identity_used_for_lineage_truth() -> Non
     assert observed.state is PullRequestState.OPEN
     assert observed.head_sha == REVISION_HEAD
     assert observed.head_ref == BRANCH
+
+
+def test_add_pull_request_labels_uses_the_documented_issue_endpoint_and_credential() -> None:
+    github = GitHubRepositoryFake()
+    github.branches[BRANCH] = REVISION_HEAD
+
+    async def body(host: GitHubCodeHost) -> None:
+        pull = await host.open_pull_request(
+            _repository(), head_ref=BRANCH, base_ref="main", title=TITLE, body=BODY, draft=False
+        )
+        await host.add_pull_request_labels(pull.ref, ["SMOKE", "ready"])
+
+    _with_host(github.handle, body)
+
+    [request] = github.label_requests
+    assert request.method == "POST"
+    assert request.url.path == f"/repos/{REPO}/issues/1/labels"
+    assert request.headers["Authorization"] == GIT_HEADER
+    assert json.loads(request.content) == {"labels": ["SMOKE", "ready"]}
+    assert github.issues[1]["labels"] == [{"name": "SMOKE"}, {"name": "ready"}]
+
+
+def test_add_pull_request_labels_reports_an_external_forge_failure() -> None:
+    requests: list[httpx.Request] = []
+
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(503, json={"message": "provider payload stays private"})
+
+    with pytest.raises(Unavailable):
+        _with_host(
+            unavailable,
+            lambda host: host.add_pull_request_labels(
+                PullRequestRef(_repository(), "123"), ["SMOKE"]
+            ),
+        )
+
+    assert len(requests) == 1
 
 
 @pytest.mark.parametrize(
@@ -603,6 +642,136 @@ def test_the_one_pull_request_listed_is_held_to_the_contract_branch() -> None:
 
     with pytest.raises(PullRequestRefused, match="approved publication contract"):
         _with_host(handler, _recover)
+
+
+# --- ancestry (#5094) ---------------------------------------------------------------
+
+# A root, a side branch merged back, and an unrelated branch off the root.
+ROOT = "1" * 40
+SIDE = "2" * 40
+MAINLINE = "3" * 40
+MERGE = "4" * 40
+FORK = "5" * 40
+GRAPH: dict[str, tuple[str, ...]] = {
+    ROOT: (),
+    SIDE: (ROOT,),
+    MAINLINE: (ROOT,),
+    MERGE: (MAINLINE, SIDE),
+    FORK: (ROOT,),
+}
+
+
+def _reaches(descendant: str, ancestor: str) -> bool:
+    pending, seen = [descendant], set()
+    while pending:
+        sha = pending.pop()
+        if sha == ancestor:
+            return True
+        if sha not in seen:
+            seen.add(sha)
+            pending.extend(GRAPH[sha])
+    return False
+
+
+def _compare_handler(requests: list[httpx.Request]) -> Handler:
+    """GitHub REST "Compare two commits": GET /repos/{owner}/{repo}/compare/{base}...{head}.
+
+    ``status`` is identical, ahead (head is base plus commits), behind, or diverged.
+    The fake answers from its own graph and replays the documented top-level fields.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        prefix = f"/repos/{REPO}/compare/"
+        assert request.url.path.startswith(prefix), request.url.path
+        base, head = request.url.path.removeprefix(prefix).split("...")
+        if base not in GRAPH or head not in GRAPH:
+            return httpx.Response(404, json={"message": "Not Found"})
+        if base == head:
+            status = "identical"
+        elif _reaches(head, base):
+            status = "ahead"
+        elif _reaches(base, head):
+            status = "behind"
+        else:
+            status = "diverged"
+        return httpx.Response(
+            200,
+            json={
+                "url": f"https://api.github.com/repos/{REPO}/compare/{base}...{head}",
+                "status": status,
+                "ahead_by": 0 if status in ("identical", "behind") else 1,
+                "behind_by": 0 if status in ("identical", "ahead") else 1,
+                "total_commits": 0,
+                "base_commit": {"sha": base},
+                "merge_base_commit": {"sha": ROOT},
+                "commits": [],
+                "files": [],
+            },
+        )
+
+    return handler
+
+
+def test_is_ancestor_of_identical_shas_is_true_without_a_request() -> None:
+    requests: list[httpx.Request] = []
+
+    assert _with_host(
+        _compare_handler(requests), lambda host: host.is_ancestor(_repository(), MERGE, MERGE)
+    )
+    assert requests == []
+
+
+@pytest.mark.parametrize(
+    ("ancestor", "descendant", "expected"),
+    [
+        (ROOT, MAINLINE, True),
+        (SIDE, MERGE, True),
+        (ROOT, MERGE, True),
+        (MERGE, ROOT, False),
+        (FORK, MERGE, False),
+    ],
+    ids=("ahead", "merge-parent", "through-merge", "behind", "diverged"),
+)
+def test_is_ancestor_reads_one_three_dot_compare_status(
+    ancestor: str, descendant: str, expected: bool
+) -> None:
+    requests: list[httpx.Request] = []
+
+    answer = _with_host(
+        _compare_handler(requests),
+        lambda host: host.is_ancestor(_repository(), ancestor, descendant),
+    )
+
+    assert answer is expected
+    [request] = requests
+    assert request.method == "GET"
+    assert request.url.path == f"/repos/{REPO}/compare/{ancestor}...{descendant}"
+    assert request.headers["Authorization"] == GIT_HEADER
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"status": "unknown"}, {"status": None}, ["ahead"]],
+    ids=("missing", "unknown", "null", "not-an-object"),
+)
+def test_is_ancestor_on_a_malformed_compare_is_unavailable_not_false(payload: Any) -> None:
+    with pytest.raises(Unavailable):
+        _with_host(
+            lambda _request: httpx.Response(200, json=payload),
+            lambda host: host.is_ancestor(_repository(), ROOT, MERGE),
+        )
+
+
+def test_is_ancestor_on_a_missing_commit_is_unavailable_not_false() -> None:
+    requests: list[httpx.Request] = []
+
+    with pytest.raises(Unavailable):
+        _with_host(
+            _compare_handler(requests),
+            lambda host: host.is_ancestor(_repository(), "6" * 40, MERGE),
+        )
+    assert len(requests) == 1
 
 
 # --- repository and credential -----------------------------------------------------

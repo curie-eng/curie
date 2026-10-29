@@ -4,8 +4,8 @@
   "repository": {
     "name": "curie-eng/curie",
     "branch": "main",
-    "commit": "81df3e4c7f3d1f50227796e4d0ac0802e3538049",
-    "shortCommit": "81df3e4c",
+    "commit": "c587b8b2b0f9640139b40f0bbcdff04e2266f628",
+    "shortCommit": "c587b8b2",
     "release": "v0.14.1"
   },
   "title": "Curie architecture atlas",
@@ -5315,6 +5315,34 @@
       "title": "ADR 0195 original contrary-check wording",
       "path": "docs/adr/0195-a-version-only-delta-reuses-its-parents-checks.md",
       "href": "https://github.com/curie-eng/curie/blob/eb56c6c21b5a0ab7c7a9fc460cc4cfda67fcc3d0/docs/adr/0195-a-version-only-delta-reuses-its-parents-checks.md"
+    },
+    {
+      "id": "eval-stream-v0141",
+      "type": "code",
+      "title": "Eval boot connector authority and operator approval gates",
+      "path": "apps/worker/src/curie_worker/eval/stream.py",
+      "href": "https://github.com/curie-eng/curie/blob/c587b8b2b0f9640139b40f0bbcdff04e2266f628/apps/worker/src/curie_worker/eval/stream.py"
+    },
+    {
+      "id": "eval-binding-v0141",
+      "type": "code",
+      "title": "Tenant-scoped eval connector identity and stored tool policy",
+      "path": "apps/worker/src/curie_worker/binding.py",
+      "href": "https://github.com/curie-eng/curie/blob/c587b8b2b0f9640139b40f0bbcdff04e2266f628/apps/worker/src/curie_worker/binding.py"
+    },
+    {
+      "id": "eval-matrix-v0141",
+      "type": "code",
+      "title": "Stream-scoped complete eval matrix reads",
+      "path": "apps/api/src/curie_api/routers/evals.py",
+      "href": "https://github.com/curie-eng/curie/blob/c587b8b2b0f9640139b40f0bbcdff04e2266f628/apps/api/src/curie_api/routers/evals.py"
+    },
+    {
+      "id": "langfuse-read-v0141",
+      "type": "code",
+      "title": "Bounded complete trace pagination and selected read fields",
+      "path": "apps/api/src/curie_api/langfuse.py",
+      "href": "https://github.com/curie-eng/curie/blob/c587b8b2b0f9640139b40f0bbcdff04e2266f628/apps/api/src/curie_api/langfuse.py"
     }
   ],
   "documentationDrift": [
@@ -6572,7 +6600,7 @@
       "zone": "core",
       "x": 0.57,
       "y": 0.72,
-      "description": "The same bundle-carried eval suite runs across skill, local, local-release, and cluster. Worker scores and records cases, then reports a rollup to the API.",
+      "description": "The same bundle-carried eval suite runs across skill, local, local-release, and cluster. Worker scores and records cases, then reports a rollup to the API. Provisioned eval runners retain configured hosted connector scope, agent-only signed caller identity when signing is configured, and tenant-scoped operator approval gates. Ambient memory and history references remain absent.",
       "technology": [
         "frozen case schema",
         "text graders",
@@ -6580,7 +6608,9 @@
       ],
       "evidence": [
         "architecture",
-        "interfaces"
+        "interfaces",
+        "eval-stream-v0141",
+        "eval-binding-v0141"
       ],
       "adrIds": [
         "ADR-0019",
@@ -8071,12 +8101,14 @@
       "implementations": "1 backend (Langfuse traces + scores)",
       "contract": "Eval recorder write + EvalMatrix read DTO + version:/suite: tag convention",
       "reason": "The platform owns the result shape, but only one backend and one unfrozen tag convention have exercised it.",
-      "leakage": "The recorder and matrix reader encode Langfuse tags and API behavior directly.",
+      "leakage": "The recorder and matrix reader encode Langfuse tags and API behavior directly. Matrix reads request only core trace fields and metadata, order by unique trace ID, and refuse incomplete history beyond the page bound. A concrete stream ID applies an enqueue-time lower bound when supported and an exact metadata filter.",
       "nextStep": "Record or freeze the tag convention; wait for a real second store before inventing a generic adapter.",
       "evidence": [
         "architecture-vision",
         "interfaces",
-        "eval-recorder-audit"
+        "eval-recorder-audit",
+        "eval-matrix-v0141",
+        "langfuse-read-v0141"
       ],
       "adrIds": [
         "ADR-0004",
@@ -9883,7 +9915,7 @@
       "id": "eval-loop",
       "label": "Eval + parity ladder",
       "state": "current",
-      "summary": "One bundle and one case file cross skill, local, local-release, and cluster to expose environment drift. Push and pull-request CI runs the smoke upgrade shard; scheduled or manual full kind dispatches exercise the complete upgrade matrix. Python pytest runs six isolated shards behind its required aggregator, with static and workflow-policy gates separate. Image proofs consolidate smoke, connector import, Docker daemon and toolchain checks. Kind upgrade image imports save an inspected platform-specific archive.",
+      "summary": "One bundle and one case file cross skill, local, local-release, and cluster to expose environment drift. Push and pull-request CI runs the smoke upgrade shard; scheduled or manual full kind dispatches exercise the complete upgrade matrix. Python pytest runs six isolated shards behind its required aggregator, with static and workflow-policy gates separate. Image proofs consolidate smoke, connector import, Docker daemon and toolchain checks. Kind upgrade image imports save an inspected platform-specific archive. Provisioned evals preserve hosted connector authority and operator tool gates. Matrix reads remain complete within a bounded, uniquely ordered trace history and filter a requested stream exactly.",
       "steps": [
         {
           "routeId": "api-store",
@@ -9898,7 +9930,7 @@
         {
           "routeId": "worker-sandbox",
           "title": "Choose the required tier",
-          "caption": "Skill, Docker, released Compose, or Kubernetes changes only the substrate rung."
+          "caption": "Skill, Docker, released Compose, or Kubernetes changes only the substrate rung. Provisioned evals use the shared boot environment for scoped connectors and operator approval-required tools."
         },
         {
           "routeId": "worker-runner",
@@ -9919,7 +9951,11 @@
       "evidence": [
         "ci-policy-v0132",
         "kind-schedule-v0132",
-        "upgrade-matrix-v0132"
+        "upgrade-matrix-v0132",
+        "eval-stream-v0141",
+        "eval-binding-v0141",
+        "eval-matrix-v0141",
+        "langfuse-read-v0141"
       ]
     },
     {

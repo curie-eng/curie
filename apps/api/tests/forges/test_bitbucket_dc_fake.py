@@ -109,6 +109,8 @@ def _port_calls(
         Operation.CREDENTIAL: lambda: adapter.credential(repo, CredentialScope.PUSH),
         Operation.BRANCH_HEAD: lambda: adapter.branch_head(repo, "main"),
         Operation.READ_COMMIT: lambda: adapter.read_commit(repo, sha),
+        # Two different commits: identical shas answer before the version read.
+        Operation.IS_ANCESTOR: lambda: adapter.is_ancestor(repo, sha, "f" * 40),
         Operation.FIND_PULL_REQUEST: lambda: adapter.find_pull_request(repo, head_ref="x"),
         Operation.OPEN_PULL_REQUEST: lambda: adapter.open_pull_request(
             repo, head_ref="x", base_ref="main", title="t", body="b"
@@ -448,6 +450,93 @@ async def test_bitbucket_dc_read_commit(fake: BitbucketDcFake, adapter: Any) -> 
     assert (commit.sha, commit.parents, commit.message) == (sha, (base,), "Add the thing")
     with pytest.raises(NotFound):
         await adapter.read_commit(fake.repository(), "f" * 40)
+
+
+def _ancestry_graph(fake: BitbucketDcFake) -> dict[str, str]:
+    """A side branch merged back into the mainline, and a fork off the root."""
+
+    root = fake.branches["main"]
+    side = fake.add_commit((root,), "side")
+    mainline = fake.add_commit((root,), "mainline")
+    merge = fake.add_commit((mainline, side), "merge")
+    fork = fake.add_commit((root,), "fork")
+    return {"root": root, "side": side, "mainline": mainline, "merge": merge, "fork": fork}
+
+
+@pytest.mark.anyio
+async def test_bitbucket_dc_is_ancestor_of_identical_shas_is_true_without_a_request(
+    fake: BitbucketDcFake, adapter: Any
+) -> None:
+    graph = _ancestry_graph(fake)
+
+    assert await adapter.is_ancestor(fake.repository(), graph["merge"], graph["merge"])
+    assert _api_requests(fake, "/merge-base") == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("ancestor", "descendant", "expected"),
+    [
+        ("root", "mainline", True),
+        ("side", "merge", True),
+        ("root", "merge", True),
+        ("merge", "root", False),
+        ("fork", "merge", False),
+    ],
+    ids=("ahead", "merge-parent", "through-merge", "behind", "diverged"),
+)
+async def test_bitbucket_dc_is_ancestor_compares_the_merge_base_with_the_ancestor(
+    fake: BitbucketDcFake, adapter: Any, ancestor: str, descendant: str, expected: bool
+) -> None:
+    graph = _ancestry_graph(fake)
+
+    answer = await adapter.is_ancestor(fake.repository(), graph[ancestor], graph[descendant])
+
+    assert answer is expected
+    (request,) = _api_requests(fake, f"/commits/{graph[ancestor]}/merge-base")
+    assert request.param("otherCommitId") == graph[descendant]
+
+
+@pytest.mark.anyio
+async def test_bitbucket_dc_is_ancestor_with_no_common_ancestor_204_is_false(
+    fake: BitbucketDcFake, adapter: Any
+) -> None:
+    graph = _ancestry_graph(fake)
+    orphan = fake.add_commit((), "orphan")
+
+    assert await adapter.is_ancestor(fake.repository(), orphan, graph["merge"]) is False
+    (request,) = _api_requests(fake, f"/commits/{orphan}/merge-base")
+    assert request.param("otherCommitId") == graph["merge"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "body",
+    [{"displayId": "abc"}, {"id": None}, {"id": 7}, ["not", "an", "object"]],
+    ids=("no-id", "null-id", "non-string-id", "not-an-object"),
+)
+async def test_bitbucket_dc_is_ancestor_on_a_malformed_merge_base_is_unavailable(
+    fake: BitbucketDcFake, adapter: Any, body: Any
+) -> None:
+    graph = _ancestry_graph(fake)
+    fake.answer_next(200, body=body, when="/merge-base")
+
+    with pytest.raises(Unavailable):
+        await adapter.is_ancestor(fake.repository(), graph["root"], graph["merge"])
+    # Liveness twin: the same question answers once the forge answers well.
+    assert await adapter.is_ancestor(fake.repository(), graph["root"], graph["merge"])
+
+
+@pytest.mark.anyio
+async def test_bitbucket_dc_is_ancestor_of_a_missing_commit_404_is_unavailable(
+    fake: BitbucketDcFake, adapter: Any
+) -> None:
+    graph = _ancestry_graph(fake)
+
+    with pytest.raises(Unavailable):
+        await adapter.is_ancestor(fake.repository(), "f" * 40, graph["merge"])
+    with pytest.raises(Unavailable):
+        await adapter.is_ancestor(fake.repository(), graph["root"], "f" * 40)
 
 
 # Pull requests (decision 8) --------------------------------------------------

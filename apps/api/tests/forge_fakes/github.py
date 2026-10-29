@@ -520,6 +520,7 @@ class GitHubRepositoryFake:
         self.statuses: dict[str, dict[str, dict[str, Any]]] = {}
         self.default_branch = "main"
         self.writes = 0
+        self.label_requests: list[httpx.Request] = []
         self._event_ids = itertools.count(70001)
         self._comment_ids = itertools.count(80001)
         self._check_ids = itertools.count(90001)
@@ -727,6 +728,30 @@ class GitHubRepositoryFake:
             "base": {"ref": pull["base"], **side},
         }
 
+    def _history(self, sha: str) -> list[str]:
+        """``sha`` and every commit reachable through any parent, nearest first."""
+
+        seen, queue = [sha], [sha]
+        while queue:
+            for parent in self.commits.get(queue.pop(0), {}).get("parents", []):
+                if parent["sha"] not in seen:
+                    seen.append(parent["sha"])
+                    queue.append(parent["sha"])
+        return seen
+
+    def _compare(self, base: str, head: str) -> httpx.Response:
+        # https://docs.github.com/en/rest/commits/commits#compare-two-commits
+        if base not in self.commits or head not in self.commits:
+            return httpx.Response(404, json={"message": "Not Found"})
+        status = "diverged"
+        if base == head:
+            status = "identical"
+        elif base in self._history(head):
+            status = "ahead"
+        elif head in self._history(base):
+            status = "behind"
+        return httpx.Response(200, json={"status": status})
+
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if self._listing_fails(path):
@@ -782,6 +807,9 @@ class GitHubRepositoryFake:
             if commit is None:
                 return httpx.Response(404, json={"message": "Not Found"})
             return httpx.Response(200, json=commit)
+        matched = re.fullmatch(rf"{repo}/compare/([0-9a-f]+)\.\.\.([0-9a-f]+)", path)
+        if matched:
+            return self._compare(matched[1], matched[2])
         if path == f"{repo}/pulls":
             assert request.url.params.get("state") == "all"
             if "head" not in request.url.params:
@@ -853,6 +881,9 @@ class GitHubRepositoryFake:
             issue = self.issues[int(matched[1])]
             names = [entry["name"] for entry in issue["labels"]]
             if request.method == "POST":
+                # GitHub labels also address PR numbers through the issues API:
+                # https://docs.github.com/en/rest/issues/labels?apiVersion=2022-11-28#add-labels-to-an-issue
+                self.label_requests.append(request)
                 names.extend(name for name in body["labels"] if name not in names)
             elif matched[2] is not None and unquote(matched[2]) in names:
                 names.remove(unquote(matched[2]))
@@ -870,7 +901,12 @@ class GitHubRepositoryFake:
             if body["head"] not in self.branches or body["base"] not in self.branches:
                 return httpx.Response(422, json={"message": "Validation Failed"})
             number = self._number()
-            self.issues[number] = {"number": number, "state": "open", "pull_request": {}}
+            self.issues[number] = {
+                "number": number,
+                "state": "open",
+                "pull_request": {},
+                "labels": [],
+            }
             self.pulls[number] = {
                 "head": body["head"],
                 "base": body["base"],

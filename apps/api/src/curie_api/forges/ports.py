@@ -203,6 +203,14 @@ class CodeHost(Protocol):
 
     async def read_commit(self, repository: RepositoryRef, sha: str) -> Commit: ...
 
+    async def is_ancestor(self, repository: RepositoryRef, ancestor: str, descendant: str) -> bool:
+        """Whether ``ancestor`` is reachable from ``descendant`` through any parent.
+
+        Equal shas are true. False only when the forge answers that it is not;
+        `Unavailable` when the forge cannot answer, including a missing commit.
+        """
+        ...
+
     async def find_pull_request(
         self, repository: RepositoryRef, *, head_ref: str
     ) -> PullRequest | None:
@@ -257,7 +265,7 @@ class CodeHost(Protocol):
         """Optional: check names the code host requires on ``branch`` before merge.
 
         GitHub unions ruleset contexts and branch protection contexts. Other
-        code hosts declare this unsupported. The factory does not apply labels
+        code hosts declare this unsupported. This read does not apply labels
         or start workflows to make a required check run.
         """
         ...

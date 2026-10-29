@@ -101,10 +101,10 @@ impl OverrideChange {
     ///
     /// Returns:
     ///   The intent, or a usage error when both were passed, the value is not
-    ///   an integer, or it falls outside 60..=10800 seconds.
+    ///   an integer, or it falls outside 60..=43200 seconds.
     pub fn resolve_execution_deadline(value: Option<String>, clear: bool) -> Result<Self> {
         const MIN_SECONDS: i64 = 60;
-        const MAX_SECONDS: i64 = 10800;
+        const MAX_SECONDS: i64 = 43200;
         match (value, clear) {
             (Some(_), true) => Err(crate::exit::usage(
                 "--execution-deadline and --clear-execution-deadline contradict each other; \
@@ -873,7 +873,7 @@ mod overrides_tests {
     // Same three-way PATCH semantics as `model`/`thinking`, plus one thing
     // neither of those has: the wire field, `execution_deadline_seconds`, is a
     // JSON NUMBER, not a string, so a `Set` value has to be parsed and range
-    // checked (60..10800) client-side rather than forwarded as typed text.
+    // checked (60..43200) client-side rather than forwarded as typed text.
 
     #[test]
     fn a_set_execution_deadline_carries_a_json_number_not_a_string() {
@@ -928,16 +928,16 @@ mod overrides_tests {
             .expect_err("below the 60s floor must be refused");
         let msg = err.to_string();
         assert!(msg.contains("60"), "{msg}");
-        assert!(msg.contains("10800"), "{msg}");
+        assert!(msg.contains("43200"), "{msg}");
     }
 
     #[test]
     fn an_execution_deadline_above_the_maximum_is_refused_client_side() {
-        let err = OverrideChange::resolve_execution_deadline(Some("10801".into()), false)
-            .expect_err("above the 10800s ceiling must be refused");
+        let err = OverrideChange::resolve_execution_deadline(Some("43201".into()), false)
+            .expect_err("above the 43200s ceiling must be refused");
         let msg = err.to_string();
         assert!(msg.contains("60"), "{msg}");
-        assert!(msg.contains("10800"), "{msg}");
+        assert!(msg.contains("43200"), "{msg}");
     }
 
     #[test]
@@ -947,8 +947,8 @@ mod overrides_tests {
             OverrideChange::Set("60".into())
         );
         assert_eq!(
-            OverrideChange::resolve_execution_deadline(Some("10800".into()), false).unwrap(),
-            OverrideChange::Set("10800".into())
+            OverrideChange::resolve_execution_deadline(Some("43200".into()), false).unwrap(),
+            OverrideChange::Set("43200".into())
         );
     }
 

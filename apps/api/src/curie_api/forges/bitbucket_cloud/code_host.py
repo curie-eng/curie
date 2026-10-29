@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -77,6 +78,7 @@ OVERLAP = timedelta(seconds=120)
 # Bitbucket Cloud's page length ceiling on pull request listings; most others allow 100.
 _PULL_PAGELEN = 50
 _FULL_HASH = 40
+_COMMIT_SHA = re.compile(r"[0-9a-f]{40,64}")
 # Where Bitbucket Cloud's pull request pages live; a listed URL must be on it.
 _WEB_BASE = f"https://{HOST}"
 
@@ -330,6 +332,21 @@ class BitbucketCloudCodeHost:
             ),
             message=_text(payload.get("message")),
         )
+
+    async def is_ancestor(self, repository: RepositoryRef, ancestor: str, descendant: str) -> bool:
+        if ancestor == descendant:
+            return True
+        revspec = f"{quote(ancestor, safe='')}..{quote(descendant, safe='')}"
+        try:
+            base = await self._http.json(
+                "GET", f"{self.repo_url(repository)}/merge-base/{revspec}", what="merge_base"
+            )
+        except NotFound:
+            raise Unavailable("merge_base") from None
+        found = base.get("hash")
+        if not isinstance(found, str) or _COMMIT_SHA.fullmatch(found) is None:
+            raise Unavailable("merge_base")
+        return found == ancestor
 
     async def _read_commit(self, repo: str, sha: str) -> dict[str, Any]:
         return await self._http.json("GET", f"{repo}/commit/{quote(sha, safe='')}", what="commit")

@@ -342,7 +342,7 @@ pub struct Agent {
     #[serde(default)]
     pub thinking: Option<String>,
     /// Per-agent execution deadline in seconds for factory work items (#3071),
-    /// 60 to 10800. `None` means the 1800 s default. Same three-way PATCH
+    /// 60 to 43200. `None` means the 1800 s default. Same three-way PATCH
     /// semantics as `model`.
     #[serde(default)]
     pub execution_deadline_seconds: Option<u32>,

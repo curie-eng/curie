@@ -298,6 +298,21 @@
           "exclusiveMinimum": 0,
           "description": "Positive cadence in seconds for reconciling accepted GitHub review feedback."
         },
+        "factoryPublicationLabels": {
+          "type": "object",
+          "propertyNames": {
+            "allOf": [
+              {"pattern": "^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*/[A-Za-z0-9._-]+$"},
+              {"pattern": "^[^/]{1,39}/[^/]{1,100}$"},
+              {"not": {"pattern": "/\\.{1,2}$"}}
+            ]
+          },
+          "additionalProperties": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {"type": "string", "minLength": 1, "maxLength": 50}
+          }
+        },
         "githubRepoAllowlist": {
           "type": "array",
           "uniqueItems": true,
@@ -357,21 +372,21 @@
               "type": "integer",
               "minimum": 3600,
               "maximum": 31536000,
-              "description": "Seconds a settled stream entry is kept before the worker trims it (ADR 0184). At least 3600, above the three-hour delivery budget ceiling, and at most 31536000 (one year). Integer for the same reason as routeTtlSeconds."
+              "description": "Seconds a settled stream entry is kept before the worker trims it (ADR 0184). At least 3600; the default day keeps the trim clear of any delivery still inside its budget (at most 43200 seconds). At most 31536000 (one year). Integer for the same reason as routeTtlSeconds."
             }
           }
         },
         "deliveryBudgetSeconds": {
           "type": "integer",
           "minimum": 60,
-          "maximum": 10800,
-          "description": "Overall wall-clock deadline for one delivery (ADR-0131). The shipped default is 10800, equal to the factory maximum execution deadline. Below 60s a budget cannot cover claim + one runner request + settle; at most 10800s (three hours, #3071). The rendered termination grace follows it: max(terminationGracePeriodSeconds, this + deliveryShutdownReserveSeconds). runnerTotalTimeoutSeconds must be no greater than deliveryBudgetSeconds."
+          "maximum": 43200,
+          "description": "Overall wall-clock deadline for one delivery (ADR-0131). The shipped default is 10800 (a three hour run). Below 60s a budget cannot cover claim + one runner request + settle; at most 43200s (twelve hours, the factory maximum execution deadline, #5067). The rendered termination grace follows it: max(terminationGracePeriodSeconds, this + deliveryShutdownReserveSeconds). runnerTotalTimeoutSeconds must be no greater than deliveryBudgetSeconds."
         },
         "runnerTotalTimeoutSeconds": {
           "type": "number",
           "exclusiveMinimum": 0,
-          "maximum": 10800,
-          "description": "Positive per-request ceiling for runner work. The shipped default is 10800, equal to the factory maximum execution deadline, and at most 10800 seconds. Must be no greater than worker.deliveryBudgetSeconds; the worker template enforces this cross-field relationship at render time."
+          "maximum": 43200,
+          "description": "Positive per-request ceiling for runner work. The shipped default is 10800 (a three hour run), and at most 43200 seconds (twelve hours, the factory maximum execution deadline, #5067). Must be no greater than worker.deliveryBudgetSeconds; the worker template enforces this cross-field relationship at render time."
         },
         "deliveryLeaseTtlSeconds": {
           "type": "integer",
@@ -503,6 +518,22 @@
                 "sizeLimit": {"type": ["string", "null"], "minLength": 2},
                 "fetchTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 150},
                 "extractTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 150}
+              }
+            }
+          }
+        },
+        "resourceProfiles": {
+          "additionalProperties": {
+            "properties": {
+              "scratchVolume": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "description": "emptyDir (default) or ephemeral. Any other value fails the sandbox template render, which names this key."
+                  },
+                  "storageClassName": {"type": "string"}
+                }
               }
             }
           }

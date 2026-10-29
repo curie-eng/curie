@@ -18,7 +18,12 @@ from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     THREAD_HASH_LABEL,
+    AdmissionConfig,
+    AdmissionRejection,
     CapacityExhaustedError,
+    CapacityInventory,
+    CapacityPod,
+    CapacityRejection,
     ClaimTimeoutError,
     ClaimView,
     MissingAgentPoolError,
@@ -26,6 +31,7 @@ from .types import (
     PressureCandidate,
     PressureScanResult,
     QuotaRejection,
+    QuotaStatus,
     RepoRunnerPoolRefused,
     RouteChangedError,
     RouteRecord,
@@ -43,6 +49,12 @@ from .types import (
 )
 
 __all__ = [
+    "AdmissionConfig",
+    "AdmissionRejection",
+    "CapacityInventory",
+    "CapacityPod",
+    "CapacityRejection",
+    "QuotaStatus",
     "AGENT_LABEL",
     "EXECUTOR_THREAD_KEY_PREFIX",
     "HISTORY_ENV",

@@ -14,6 +14,7 @@ Every port call that changes forge state counts one write in a shared
 from __future__ import annotations
 
 import itertools
+import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -66,6 +67,7 @@ from curie_api.forges.types import (
 from curie_api.publication_policy import is_publication_branch
 
 BOT = Actor(id="1000", login="curie-bot")
+_COMMIT_SHA = re.compile(r"[0-9a-f]{40,64}")
 
 
 def all_supported(operations: frozenset[Operation]) -> dict[Operation, Support]:
@@ -732,6 +734,31 @@ class InMemoryCodeHost(_Declared):
         if found is None:
             raise NotFound("commit")
         return found
+
+    async def is_ancestor(self, repository: RepositoryRef, ancestor: str, descendant: str) -> bool:
+        self._gate(Operation.IS_ANCESTOR)
+        self._repository(repository)
+        if ancestor == descendant:
+            return True
+        # Every parent, not only the first: "not reachable" is proved only over a
+        # whole, well-formed graph.
+        seen: set[str] = set()
+        pending = [descendant]
+        while pending:
+            sha = pending.pop()
+            if sha in seen:
+                continue
+            seen.add(sha)
+            found = self._commits.get(sha)
+            if found is None or found.sha != sha:
+                raise Unavailable("commit")
+            for parent in found.parents:
+                if _COMMIT_SHA.fullmatch(parent) is None:
+                    raise Unavailable("commit")
+                if parent == ancestor:
+                    return True
+                pending.append(parent)
+        return False
 
     async def find_pull_request(
         self, repository: RepositoryRef, *, head_ref: str

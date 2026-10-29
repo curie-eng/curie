@@ -12,6 +12,9 @@ SLACK_ANSWER_MAX_BYTES = 4000
 # byte budget also leaves room for provider-side encoding differences.
 SLACK_VERBATIM_MAX_BYTES = 2800
 _ATOM = re.compile(r"```|`[^`\n]*`|<[^>\n]*>|\*[^*\n]+\*|_[^_\n]+_|~[^~\n]+~")
+_URL = re.compile(r"https?://[^\s<>\"]+")
+_URL_TRAILING = ".,;:!?'"
+_URL_CLOSERS = {")": "(", "]": "["}
 
 
 @dataclass(frozen=True)
@@ -25,31 +28,84 @@ class AnswerPart:
         return self.prefix + self.content + self.suffix
 
 
-def split_verbatim_answer(text: str) -> list[AnswerPart]:
+def _url_spans(text: str) -> list[tuple[int, int]]:
+    """Locate http(s) URLs, leaving trailing prose punctuation outside them."""
+    spans: list[tuple[int, int]] = []
+    for match in _URL.finditer(text):
+        start, end = match.span()
+        while end > start:
+            last = text[end - 1]
+            opener = _URL_CLOSERS.get(last)
+            if last in _URL_TRAILING or (
+                opener is not None and text.count(opener, start, end) < text.count(last, start, end)
+            ):
+                end -= 1
+                continue
+            break
+        if end - start > len(match.group().split("://", 1)[0]) + 3:
+            spans.append((start, end))
+    return spans
+
+
+def split_verbatim_answer(
+    text: str, *, max_bytes: int = SLACK_VERBATIM_MAX_BYTES
+) -> list[AnswerPart]:
     """Partition literal text without adding, removing or normalizing characters.
 
     The budget stays inside the 3,000-character limit Slack documents for a
     text object:
     https://docs.slack.dev/reference/block-kit/composition-objects/text-object/
     Count UTF-8 bytes more conservatively, without splitting a code point.
+    Prefer a line break, then a space, in the later half of a partition, and
+    never split inside a URL that fits in one partition (ADR 0250).
     """
     if not text:
         return []
+    spans = [
+        span
+        for span in _url_spans(text)
+        if len(text[span[0] : span[1]].encode("utf-8")) <= max_bytes
+    ]
     parts: list[AnswerPart] = []
     start = 0
-    size = 0
-    for index, char in enumerate(text):
-        encoded_size = len(char.encode("utf-8"))
-        if size + encoded_size > SLACK_VERBATIM_MAX_BYTES:
-            parts.append(AnswerPart(text[start:index]))
-            start = index
-            size = 0
-        size += encoded_size
+    while len(text[start:].encode("utf-8")) > max_bytes:
+        end = start + len(text[start:].encode("utf-8")[:max_bytes].decode("utf-8", "ignore"))
+        floor = start + (end - start) // 2
+        line = text.rfind("\n", floor, end)
+        space = text.rfind(" ", floor, end)
+        if line >= 0:
+            end = line + 1
+        elif space >= 0:
+            end = space + 1
+        for url_start, url_end in spans:
+            if url_start < end < url_end and url_start > start:
+                end = url_start
+                break
+        parts.append(AnswerPart(text[start:end]))
+        start = end
     parts.append(AnswerPart(text[start:]))
     return parts
 
 
-def split_answer(text: str) -> list[AnswerPart]:
+def verbatim_rich_text(text: str) -> dict[str, object]:
+    """One rich text section carrying `text` exactly, with URLs as links."""
+    elements: list[dict[str, str]] = []
+    cursor = 0
+    for start, end in _url_spans(text):
+        if start > cursor:
+            elements.append({"type": "text", "text": text[cursor:start]})
+        url = text[start:end]
+        elements.append({"type": "link", "url": url, "text": url})
+        cursor = end
+    if cursor < len(text):
+        elements.append({"type": "text", "text": text[cursor:]})
+    return {
+        "type": "rich_text",
+        "elements": [{"type": "rich_text_section", "elements": elements}],
+    }
+
+
+def split_answer(text: str, *, max_bytes: int = SLACK_ANSWER_MAX_BYTES) -> list[AnswerPart]:
     """Keep every source character, reopening long code fences between messages.
 
     Prefer a line boundary, then whitespace; preserve complete short mrkdwn
@@ -57,7 +113,7 @@ def split_answer(text: str) -> list[AnswerPart]:
     cross messages, but none of its content is discarded. Unicode code points,
     combining marks and joiner sequences are kept together when they fit.
     """
-    if len(text.encode()) <= SLACK_ANSWER_MAX_BYTES:
+    if len(text.encode()) <= max_bytes:
         return [AnswerPart(text)]
     atoms = list(_ATOM.finditer(text))
     parts: list[AnswerPart] = []
@@ -66,7 +122,7 @@ def split_answer(text: str) -> list[AnswerPart]:
     while start < len(text):
         prefix = "```\n" if fenced else ""
         # Reserve closing scaffolding even before a chunk opens a fence.
-        budget = SLACK_ANSWER_MAX_BYTES - len(prefix.encode()) - 4
+        budget = max_bytes - len(prefix.encode()) - 4
         end = start + len(text[start:].encode()[:budget].decode("utf-8", "ignore"))
         code_point_end = end
         if end < len(text):

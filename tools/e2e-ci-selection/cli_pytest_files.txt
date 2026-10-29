@@ -26,6 +26,7 @@ apps/worker/tests/test_publication_validation.py
 apps/worker/tests/test_stream_retention.py
 charts/curie/ci/repro/test_classify_recovery.py
 charts/curie/ci/runtime/test_docker_daemon_fixture.py
+charts/curie/ci/runtime/test_quota_observation_clock.py
 charts/curie/ci/test_cron_approval_receipt.py
 charts/curie/ci/test_factory_resource_profile_runtime.py
 charts/curie/ci/test_quota_progress_inputs.py
@@ -58,6 +59,8 @@ release/tests/test_atlas.py
 release/tests/test_authorize.py
 release/tests/test_get_curie.py
 release/tests/test_kind_ci.py
+release/tests/test_nightly_gate.py
+release/tests/test_preserve_next.py
 release/tests/test_sdk_approval_gate_workflow.py
 runner/tests/test_dark_factory_runner_toolchain.py
 runner/tests/test_dockerfile_registry_layer.py

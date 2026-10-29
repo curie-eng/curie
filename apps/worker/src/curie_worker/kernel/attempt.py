@@ -57,7 +57,7 @@ from ..runner_client import (
     RunnerStreamTimeout,
     TurnStream,
 )
-from ..sandbox.quota import quota_rejection_is_valid
+from ..sandbox.quota import capacity_rejection_is_valid
 from ..sandbox.types import (
     CapacityExhaustedError,
     MissingAgentPoolError,
@@ -78,6 +78,7 @@ from ..workitem_dispatch import (
 from ..workspace import (
     WorkspacePreparationError,
     WorkspaceSelectionRefused,
+    WorkspaceStageTimeout,
 )
 
 if TYPE_CHECKING:
@@ -433,7 +434,7 @@ async def _attempt_turn(
             self._record_pressure_outcome("reclaimed-retry-refused")
             return await capacity_refusal()
 
-        if not quota_rejection_is_valid(rejection):
+        if not capacity_rejection_is_valid(rejection):
             self._record_pressure_outcome("refused-invalid-quota")
             return await capacity_refusal()
 
@@ -545,6 +546,7 @@ async def _attempt_turn(
         return failures.TurnOutcome(
             terminal_ok=False,
             classification="workspace-error",
+            workspace_stage_timeout=isinstance(exc, WorkspaceStageTimeout),
             error_message=" ".join(redact_text(str(exc)).split())[
                 : constants._ESCALATION_DETAIL_MAX
             ],

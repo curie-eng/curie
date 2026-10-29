@@ -17,6 +17,7 @@ import contextlib
 import os
 import socket
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -529,6 +530,7 @@ class FakeK8s:
         labels: dict[str, str] | None = None,
         runner_resources: dict[str, object] | None = None,
         agent_name: str | None = None,
+        executor_secret_names: frozenset[str] | None = None,
     ) -> None:
         self.claim_envs.append(env)
         sandbox_name = f"sbx-{name}"
@@ -550,6 +552,76 @@ class FakeK8s:
         )
         self.sandboxes[sandbox_name] = _FakeSandbox(
             name=sandbox_name, port=self._take_port(sandbox_name)
+        )
+
+    def claim_resources(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+        executor_secret_names: frozenset[str] | None,
+    ) -> dict[str, str]:
+        return {
+            "pods": "1",
+            "requests.cpu": "250m",
+            "requests.memory": "256Mi",
+            "limits.cpu": "1",
+            "limits.memory": "1Gi",
+        }
+
+    def capacity_inventory(
+        self,
+        *,
+        priority_class: str,
+        known_claim_resources: Mapping[str, Mapping[str, str]],
+        request_timeout_seconds: float,
+    ) -> Any:
+        from curie_worker.sandbox.types import CapacityInventory, CapacityPod
+
+        del known_claim_resources
+        assert 0 < request_timeout_seconds <= 1.0
+        resources = self.claim_resources(
+            pool="test-pool", runner_resources=None, agent_name=None, executor_secret_names=None
+        )
+        owners = {claim.sandbox_name: claim.name for claim in self.claims.values()}
+        suspended = frozenset(
+            owners[sandbox.name]
+            for sandbox in self.sandboxes.values()
+            if sandbox.operating_mode == "Suspended"
+        )
+        return CapacityInventory(
+            claims=frozenset(self.claims),
+            sandboxes={
+                sandbox.name: owners.get(sandbox.name) for sandbox in self.sandboxes.values()
+            },
+            pods={
+                sandbox.name: CapacityPod(claim_name=owners[sandbox.name], resources=resources)
+                for sandbox in self.sandboxes.values()
+                if owners[sandbox.name] not in suspended
+            },
+            claim_resources=dict.fromkeys(self.claims, resources),
+            suspended_claims=suspended,
+            observed_at=time.time(),
+        )
+
+    def read_quota(self, quota_name: str, *, request_timeout_seconds: float) -> Any:
+        from curie_worker.sandbox.types import QuotaStatus
+
+        assert 0 < request_timeout_seconds <= 1.0
+        hard = {
+            "pods": "2",
+            "requests.cpu": "500m",
+            "requests.memory": "512Mi",
+            "limits.cpu": "2",
+            "limits.memory": "2Gi",
+        }
+        return QuotaStatus(
+            name=quota_name,
+            namespace=self.namespace,
+            spec_hard=hard,
+            status_hard=hard,
+            status_used=dict.fromkeys(hard, "0"),
         )
 
     def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
@@ -1057,6 +1129,7 @@ async def kernel_harness(
     actions: object | None = None,
     publication_creator: object | None = None,
     workspace_factory: Callable[[SandboxSubstrate], object] | None = None,
+    work_items: object | None = None,
     sink: object | None = None,
     runner_app: web.Application | None = None,
     claim_timeout_seconds: float = 3.0,
@@ -1173,6 +1246,7 @@ async def kernel_harness(
         actions=actions,  # type: ignore[arg-type]
         publication_creator=publication_creator,  # type: ignore[arg-type]
         workspace=(workspace_factory(substrate) if workspace_factory else None),  # type: ignore[arg-type]
+        work_items=work_items,  # type: ignore[arg-type]
         card_store=card_store,
         route_ttl_seconds=substrate._config.route_ttl_seconds,
         suspended_route_ttl_seconds=substrate._config.suspended_route_ttl_seconds,

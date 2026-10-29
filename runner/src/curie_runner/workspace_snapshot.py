@@ -347,6 +347,16 @@ def capture_workspace_snapshot(
         "--",
     ).stdout
     patch += _untracked_patch(repo, changed_paths)
+    # Capture is several git calls with no isolation between them. A write
+    # landing between them can patch a path the disclosed list omits, or add
+    # one the patch never reads, so re-enumerate and refuse a moved tree.
+    if (
+        _git(repo, "rev-parse", "HEAD").stdout.decode().strip().lower() != base_sha
+        or _changed_paths(repo) != changed_paths
+    ):
+        raise WorkspaceSnapshotError(
+            "the workspace changed during snapshot capture; retry once writes stop"
+        )
     validate_patch(patch)
     return WorkspaceSnapshot(
         repo_full_name=actual_repo,

@@ -64,6 +64,14 @@ kind create cluster --name "$cluster" --kubeconfig "$KUBECONFIG" --wait 120s \
   --image kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
 
 kubectl --kubeconfig "$KUBECONFIG" --context "$context" apply --server-side -f charts/curie/crds
+# A new CRD is served with status.conditions null until the naming controller
+# accepts its names, and kubectl wait --for=condition fails on a null list
+# instead of waiting. acceptedNames.plural is "" until that same status update.
+for crd in sandboxes.agents.x-k8s.io sandboxclaims.extensions.agents.x-k8s.io \
+  sandboxtemplates.extensions.agents.x-k8s.io sandboxwarmpools.extensions.agents.x-k8s.io; do
+  kubectl --kubeconfig "$KUBECONFIG" --context "$context" wait --timeout=120s \
+    --for=jsonpath='{.status.acceptedNames.plural}'="${crd%%.*}" "crd/$crd"
+done
 kubectl --kubeconfig "$KUBECONFIG" --context "$context" wait --for=condition=Established --timeout=120s \
   crd/sandboxes.agents.x-k8s.io \
   crd/sandboxclaims.extensions.agents.x-k8s.io \

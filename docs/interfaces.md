@@ -24,7 +24,7 @@ is documentation of where the code already draws the line, not a new abstraction
 | Relational DB (Postgres) | SOFT | 1 | A- | #84 | [Relational DB (Postgres)](interfaces/relational-db/INTERFACE.md) |
 | Queue / stream (Valkey) | CLEAN | 1 (redis-py) behind the broker port | not separately graded | #85, #7 | [Queue / stream (Valkey)](interfaces/queue-stream/INTERFACE.md) |
 | Bundle format | CLEAN, frozen | 1 | not separately graded | #30 | [Bundle format](interfaces/bundle-format/INTERFACE.md) |
-| Approval / authorizer | CLEAN | 5 approver sets behind one authorizer (Slack channel, Slack user group, explicit user list, email list, no verifiable approvers) | not separately graded | #22 | [Approval / authorizer](interfaces/approval/INTERFACE.md) |
+| Approval / authorizer | CLEAN | 6 approver sets behind one authorizer (Slack channel, Slack user group, explicit user list, email list, no verifiable approvers, IdP approver team) | not separately graded | #22 | [Approval / authorizer](interfaces/approval/INTERFACE.md) |
 | Workflow state store | SOFT | 1 (API state router) | not separately graded | #23, #248 | [Workflow state store](interfaces/workflow-state/INTERFACE.md) |
 | Memory | CLEAN | 1 loader (StateApiMemoryStore) + facts store (MemoryFactsStore) | not separately graded | #28 | [Memory](interfaces/memory/INTERFACE.md) |
 | Conversation history | CLEAN | 1 loader (StateApiTranscriptStore) | not separately graded | #20 | [Conversation history](interfaces/conversation-history/INTERFACE.md) |
@@ -42,6 +42,7 @@ is documentation of where the code already draws the line, not a new abstraction
 | Protected hook source authority | CLEAN | 1 production resolver (ProvisionedSourceAuthority) + 2 test resolvers | not separately graded | #3603 | [Protected hook source authority](interfaces/protected-hook-source-authority/INTERFACE.md) |
 | Channel read | CLEAN | 1 Slack reader pair (history and canvas) plus HTTP test fakes | not separately graded | ADR-0100, ADR-0200, #2877, #3819 | [Channel read](interfaces/channel-read/INTERFACE.md) |
 | Mail provider | CLEAN | 1 in-tree (AgentMail) + out-of-tree providers loaded from the `curie.mail_provider` entry-point group | not separately graded | ADR-0228 | [Mail provider](interfaces/mail-provider/INTERFACE.md) |
+| Commissioning network producer | CLEAN | ProbeKit (managed-behavioral-v1) and LocalCiliumNetworkProducer (local-cilium-v1) | not separately graded | ADR-0236, ADR-0238, #4557 | [Commissioning network producer](interfaces/commissioning-network-producer/INTERFACE.md) |
 <!-- END GENERATED: seam-table -->
 
 ## Kind legend

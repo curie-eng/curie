@@ -1,12 +1,16 @@
-"""Exercise the quota scenario's caller-supplied input boundary."""
+"""Exercise quota scenario inputs and pod observations."""
 
 from __future__ import annotations
 
+import ast
+import json
 import os
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -375,3 +379,121 @@ def test_empty_inventory_advances_to_install_and_cleans_up_failed_install(
 def test_candidate_stack_provisioning_header_is_declared_once_in_first_twenty_lines() -> None:
     header = SCRIPT.read_text().splitlines()[:20]
     assert header.count("# fix-pin-provision: candidate-stack") == 1
+
+
+@pytest.mark.parametrize(
+    ("phase", "deletion_grace", "created", "fetch_finished", "accepted"),
+    [
+        ("Running", 30, 990, 1031, True),
+        ("Running", 30, 990, 1029, False),
+        ("Running", 30, 990, 1030, False),
+        ("Running", 0, 990, 1001, True),
+        ("Running", None, 990, 1031, False),
+        ("Pending", None, 1001, 1031, True),
+        ("Pending", None, 1000, 1031, False),
+        ("Succeeded", None, 990, 1031, True),
+        ("Failed", None, 990, 1031, True),
+    ],
+    ids=[
+        "grace-expires-during-fetch",
+        "within-grace",
+        "at-deadline",
+        "zero-grace",
+        "live-running",
+        "fresh-live-pending",
+        "expired-live-pending",
+        "succeeded",
+        "failed",
+    ],
+)
+def test_burst_quota_snapshot_at_fetch_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    deletion_grace: int | None,
+    created: int,
+    fetch_finished: int,
+    accepted: bool,
+) -> None:
+    # Replay Kubernetes v1.31 QuotaV1Pod's terminal and deletion-grace rules:
+    # https://github.com/kubernetes/kubernetes/blob/v1.31.0/pkg/quota/v1/evaluator/core/pods.go
+    source = SCRIPT.read_text().split("cat >\"$WORKDIR/driver.py\" <<'PY'\n", 1)[1]
+    driver = ast.parse(source.split("\nPY\n", 1)[0])
+    helpers = ast.Module(
+        body=[
+            node
+            for node in ast.walk(driver)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"run", "get", "counts_against_quota", "quota_pods"}
+        ],
+        type_ignores=[],
+    )
+    namespace = dict(
+        json=json,
+        subprocess=subprocess,
+        sys=sys,
+        time=time,
+        datetime=datetime,
+        kube=["kubectl", "--context", "acme", "-n", "acme"],
+        fullname="acme",
+    )
+    exec(compile(helpers, "<quota-scenario-driver>", "exec"), namespace)
+    clock = [1000]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    retired = {
+        "metadata": {
+            "uid": "retired",
+            "creationTimestamp": datetime.fromtimestamp(created, UTC).isoformat(),
+        },
+        "spec": {"priorityClassName": "sandbox"},
+        "status": {"phase": phase},
+    }
+    if deletion_grace is not None:
+        retired["metadata"].update(
+            deletionTimestamp="1970-01-01T00:16:40Z", deletionGracePeriodSeconds=deletion_grace
+        )
+    pods = [
+        retired,
+        *[
+            {
+                "metadata": {"uid": uid},
+                "spec": {"priorityClassName": "sandbox"},
+                "status": {"phase": "Running"},
+            }
+            for uid in ("retained", "replacement")
+        ],
+        {
+            "metadata": {"uid": "platform"},
+            "spec": {"priorityClassName": "platform"},
+            "status": {"phase": "Running"},
+        },
+    ]
+    calls = []
+
+    def kubectl(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args[6])
+        if args[6] == "resourcequota":
+            payload = {
+                "spec": {
+                    "hard": {"pods": "2"},
+                    "scopeSelector": {"matchExpressions": [{"values": ["sandbox"]}]},
+                },
+                "status": {"used": {"pods": "2"}},
+            }
+        else:
+            assert args[6] == "pods", args
+            clock[0] = fetch_finished
+            payload = {"items": pods}
+        return subprocess.CompletedProcess(args, 0, json.dumps(payload), "")
+
+    monkeypatch.setattr(subprocess, "run", kubectl)
+    if accepted:
+        namespace["quota_pods"]()
+    else:
+        error = (
+            "excess pre-runtime Pending sandbox pod exceeded 30 seconds"
+            if phase == "Pending"
+            else "observed more than two chargeable sandbox pods holding runtime"
+        )
+        with pytest.raises(AssertionError, match=f"^{error}$"):
+            namespace["quota_pods"]()
+    assert calls == ["resourcequota", "pods"]

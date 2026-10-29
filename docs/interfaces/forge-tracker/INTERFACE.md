@@ -65,17 +65,23 @@ marked and described:
    GitHub's closing reference, GitLab's `Closes #<iid>` only in the issue's own
    project, and Jira's reference for the current key and every key the issue
    held before a move. An unreadable answer raises `Unavailable`.
-10. Optional: `link_pull_request` and `dependencies`.
+10. `issue_url` gives the issue's web URL, which work item links come from.
+    It makes no request and raises `NotFound` for an issue outside the tracker.
+11. Optional: `link_pull_request`, `dependencies` and `in_group` (group start
+    authority).
 
 ### CodeHost
 
 `CodeHost` (`apps/api/src/curie_api/forges/ports.py::CodeHost`) is where code,
 pull requests, CI and review live: `resolve_repository` from an immutable id;
 `credential` for clone or push scope; `branch_head` and `read_commit`;
+`is_ancestor`, one forge request asking whether a commit is another's ancestor;
 `find_pull_request`, `open_pull_request`, `update_pull_request` and
 `read_pull_request`; `list_factory_publications`; `observe_ci` on an exact
 head; `list_review_feedback` since a cursor and `verify_feedback`. Optional:
-`ci_diagnostics`, `rerun_failed` and `user_can_write`.
+`ci_diagnostics`, `rerun_failed`, `user_can_write` and `required_checks`
+(GitHub only among the shipped code hosts; GitLab and both Bitbucket adapters
+raise `Unsupported`).
 
 `list_factory_publications` returns, as `FactoryPublication` values, every pull
 request in any state that the adapter's own identity opened in the repository
@@ -196,6 +202,8 @@ comments, injects a page failure and counts writes. One module per behavior:
    is ignored, and an upsert edits only our own.
 9. `test_capabilities.py`: a no-op writes nothing, an unsupported operation
    raises `Unsupported`, and the allowlist fallback answers.
+10. `test_issue_url.py`: an issue link names the issue on the tracker host,
+    writes nothing, and an issue in another scope has no link.
 
 The GitHub identity golden test is
 `apps/api/tests/forges/test_identity_golden.py`.

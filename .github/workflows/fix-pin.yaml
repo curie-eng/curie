@@ -92,7 +92,7 @@ jobs:
           echo "CURIE_C4_RELEASE_ASSETS=$GITHUB_WORKSPACE/.projects/4628/assets" >> "$GITHUB_ENV"
       - name: Cargo cache
         if: steps.fix-pin-curie.outputs.needed == 'true'
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: cli
           shared-key: curie-cli-release
@@ -125,7 +125,7 @@ jobs:
         uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           version: v0.24.0
-          node_image: kindest/node:v1.31.0
+          node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
           install_only: true
       - name: Back off before retrying Install kind and kubectl without creating a cluster
         if: steps.fix-pin-curie.outputs.needs_kind == 'true' && steps.install_kind.outcome == 'failure'
@@ -138,7 +138,7 @@ jobs:
         uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           version: v0.24.0
-          node_image: kindest/node:v1.31.0
+          node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
           install_only: true
       - name: Download and verify the exact public v0.12.5 factory upgrade assets
         if: steps.fix-pin-curie.outputs.needs_factory_upgrade == 'true'

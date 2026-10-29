@@ -44,12 +44,19 @@ with no fallback between the two modes.
 
 ## Current contract
 
-1. **The client credential is a named secret.** `_derived_headers`
+1. **The client credential is a named secret unless explicitly declined.** `_derived_headers`
    (`packages/plugin-format/src/plugin_format/connector_render.py::_derived_headers`)
    gives a hosted connector `Authorization: Bearer ${NAME}`, where `NAME` is
    `bearer_secret` on the `ConnectorSpec`
    (`packages/plugin-format/src/plugin_format/connectors.py::ConnectorSpec`)
-   when set, or else the one plain-string secret. A connector whose secrets are
+   when set, or else the one plain-string secret. A hosted connector may instead
+   declare `no_client_auth` with a nonblank reviewer-facing reason. That derives
+   no Authorization header and binds no client secret name into the sandbox;
+   declared secrets keep their pod-side delivery. Validation rejects it beside
+   `bearer_secret` (`connectors.no_client_auth_with_bearer_secret`) or on a `url`
+   connector (`connectors.remote_has_no_client_auth`), and rejects a blank reason
+   (`connectors.bad_no_client_auth`). The caller-token and tool-grant checks below
+   still apply. A connector whose secrets are
    all `SecretRef` derives no header when `bearer_secret` is absent, because a
    referenced value is the server's own upstream credential and reaches only the
    connector pod. An explicitly selected `bearer_secret` that is a `SecretRef`
@@ -142,8 +149,9 @@ with no fallback between the two modes.
 
 ## Implementations today
 
-One mode: a deployment-owned service identity, a per-agent Bearer secret plus
-the signed caller token, enforced by the proxy on Kubernetes.
+One mode: a deployment-owned service identity with a per-agent Bearer secret
+unless `no_client_auth` explicitly declines client authentication at the server.
+The signed caller token remains enforced by the proxy on Kubernetes.
 
 1. **Signer:** the worker, `apps/worker/src/curie_worker/caller_token.py` and
    `apps/worker/src/curie_worker/connector_grant.py`.

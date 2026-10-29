@@ -226,9 +226,16 @@ agent-authored envelope path drops it, since
 `apps/worker/src/curie_worker/blocks.py::_reply_from_message` never reads the
 field. See Known leakage for why that is not simply a bug.
 
-The split is the point: Block Kit lives only in the two Slack-side modules named
-above (`blocks.py` and `approval_actions.py`), the numbered selector only in
-`channel.rs`, and the agent authors none of them.
+The Slack answer and approval renderers build Block Kit in the two modules named
+above (`blocks.py` and `approval_actions.py`).
+`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter._deliver_answer`
+also builds rich-text section blocks, with literal URL links, for verbatim
+replies (ADR 0250), preserving the approved text while bypassing envelope and
+Markdown rendering. Separately,
+`apps/dispatcher/src/curie_dispatcher/handlers.py::_refused_caller` builds the
+private account-connect prompt's section and button blocks. The terminal action
+mapping is parsed in `cli/src/channel.rs` and drawn as a numbered selector in
+`cli/src/interactive.rs`; the agent authors none of these widgets.
 
 The Slack and Discord renderers consume progress; the terminal and mail ones do not. A card and a
 milestone become Block Kit in

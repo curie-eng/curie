@@ -159,6 +159,47 @@ pub fn next_release_head(app_version: &str) -> Option<String> {
         .map(|(_, window)| window.schema_head.clone())
 }
 
+/// `candidate` sorts strictly after `current`, or `current` is `None`. An
+/// unparseable `candidate` never outranks; an unparseable `current` is
+/// outranked by any parseable one.
+pub fn version_outranks(candidate: &str, current: Option<&str>) -> bool {
+    let Some(key) = version_key(candidate) else {
+        return false;
+    };
+    current.is_none_or(|current| Some(key) > version_key(current))
+}
+
+/// ADR 0142 bounds on a build's own declared window: the version is catalogued
+/// and not marked `artifact_identity_ambiguous`, the declared head is strictly
+/// later than the catalog head, and it is no later than the next catalogued
+/// release's head (open when none). Requiring a later head keeps every
+/// published release judged by its catalog window. The upper bound admits only
+/// a build cut between its release and the next one, so a chart packaged from a
+/// newer tree under an older version stays out.
+pub fn declared_window_within_release(app_version: &str, declared: &Window) -> bool {
+    let Some(catalog) = window_for(app_version) else {
+        return false;
+    };
+    if catalog.artifact_identity_ambiguous {
+        return false;
+    }
+    // candidate_window refuses a min after its head, so this orders the heads.
+    let later_head = declared.schema_head != catalog.schema_head
+        && candidate_window(&catalog.schema_head, &declared.schema_head).is_ok();
+    let before_next_release = next_release_head(app_version)
+        .is_none_or(|next_head| candidate_window(&declared.schema_head, &next_head).is_ok());
+    later_head && before_next_release
+}
+
+/// A Helm history build whose retained manifest declares its own ADR 0142
+/// schema window.
+#[derive(Debug, Clone)]
+pub struct DeclaredBuild {
+    pub app_version: String,
+    pub helm_revision: u32,
+    pub window: Window,
+}
+
 /// Newest catalogued application version in `candidates` whose window contains
 /// `live`. That is the fail-forward target a refused rollback must name.
 pub fn newest_fail_forward<'a>(
@@ -192,15 +233,68 @@ pub fn newest_fail_forward<'a>(
 }
 
 #[derive(Debug)]
+enum FailForward<'a> {
+    Catalog(String),
+    Declared(&'a DeclaredBuild),
+}
+
+/// The fail-forward target: [`newest_fail_forward`] over `history_apps`, or a
+/// newer declared build that passes [`declared_window_within_release`] and
+/// whose window contains `live`. A catalog match wins a version tie because it
+/// needs no qualifier; among declared builds of one version the highest Helm
+/// revision wins.
+fn select_fail_forward<'a>(
+    history_apps: &[String],
+    declared: &'a [DeclaredBuild],
+    live: &str,
+) -> Option<FailForward<'a>> {
+    let catalog = newest_fail_forward(history_apps.iter().map(String::as_str), live);
+    let mut best: Option<&DeclaredBuild> = None;
+    for build in declared {
+        if !live_in_window(live, &build.window)
+            || !declared_window_within_release(&build.app_version, &build.window)
+        {
+            continue;
+        }
+        let replaces = match best {
+            None => version_key(&build.app_version).is_some(),
+            Some(current) => {
+                version_outranks(&build.app_version, Some(&current.app_version))
+                    || (version_key(&build.app_version) == version_key(&current.app_version)
+                        && build.helm_revision > current.helm_revision)
+            }
+        };
+        if replaces {
+            best = Some(build);
+        }
+    }
+    match (catalog, best) {
+        (Some(version), Some(build)) if !version_outranks(&build.app_version, Some(&version)) => {
+            Some(FailForward::Catalog(version))
+        }
+        (_, Some(build)) => Some(FailForward::Declared(build)),
+        (Some(version), None) => Some(FailForward::Catalog(version)),
+        (None, None) => None,
+    }
+}
+
+#[derive(Debug)]
 pub struct SchemaRefusal {
     pub message: String,
     pub fix: String,
 }
 
-fn fail_forward_fix(forward: Option<String>, live: &str) -> String {
+fn fail_forward_fix(forward: Option<FailForward<'_>>, live: &str) -> String {
     match forward {
-        Some(version) => format!(
+        Some(FailForward::Catalog(version)) => format!(
             "fail forward to application {version}, which can start against revision {live}"
+        ),
+        // The published artifact of this version may not start; only the build
+        // that revision installed declared a window containing `live`.
+        Some(FailForward::Declared(build)) => format!(
+            "fail forward to application {} using the build Helm revision {} installed, which can start against revision {live}",
+            normalize_app_version(&build.app_version),
+            build.helm_revision
         ),
         None => format!(
             "no catalogued application version in this release history can start against revision {live}; stay on the current revision"
@@ -209,15 +303,16 @@ fn fail_forward_fix(forward: Option<String>, live: &str) -> String {
 }
 
 /// Check that `target_app` can start against `live` using its resolved artifact
-/// window. `history_apps` supplies fail forward candidates from Helm history.
+/// window. `history_apps` and `declared` supply fail forward candidates from
+/// Helm history.
 pub fn check_target_schema(
     target_app: &str,
     window: &Window,
     live: &str,
     history_apps: &[String],
+    declared: &[DeclaredBuild],
 ) -> Result<(), SchemaRefusal> {
     let target = normalize_app_version(target_app);
-    let candidates: Vec<&str> = history_apps.iter().map(String::as_str).collect();
     if live_in_window(live, window) {
         return Ok(());
     }
@@ -226,7 +321,7 @@ pub fn check_target_schema(
             "refusing rollback to application {target}: live database revision {live} is outside its declared schema range (head {})",
             window.schema_head
         ),
-        fix: fail_forward_fix(newest_fail_forward(candidates, live), live),
+        fix: fail_forward_fix(select_fail_forward(history_apps, declared, live), live),
     })
 }
 
@@ -242,11 +337,11 @@ pub fn missing_target_window_refusal(
     target_app: &str,
     live: &str,
     history_apps: &[String],
+    declared: &[DeclaredBuild],
 ) -> SchemaRefusal {
-    let candidates: Vec<&str> = history_apps.iter().map(String::as_str).collect();
     SchemaRefusal {
         message: missing_target_window_message(target_app),
-        fix: fail_forward_fix(newest_fail_forward(candidates, live), live),
+        fix: fail_forward_fix(select_fail_forward(history_apps, declared, live), live),
     }
 }
 
@@ -417,7 +512,7 @@ print(json.dumps(graph))
         let history = ["0.8.4".to_string(), "0.8.5".to_string()];
         let window = window_for("0.8.4").expect("0.8.4 window");
         let err =
-            check_target_schema("0.8.4", &window, "0039", &history).expect_err("incompatible");
+            check_target_schema("0.8.4", &window, "0039", &history, &[]).expect_err("incompatible");
         assert!(err.message.contains("0039") && err.message.contains("0.8.4"));
         assert!(err.message.contains("0038"));
         assert!(err.fix.contains("0.8.5"), "{}", err.fix);
@@ -427,7 +522,8 @@ print(json.dumps(graph))
     #[test]
     fn compatible_v085_to_v085_is_allowed() {
         let window = window_for("0.8.5").expect("0.8.5 window");
-        check_target_schema("0.8.5", &window, "0039", &["0.8.5".to_string()]).expect("compatible");
+        check_target_schema("0.8.5", &window, "0039", &["0.8.5".to_string()], &[])
+            .expect("compatible");
     }
 
     #[test]
@@ -436,9 +532,100 @@ print(json.dumps(graph))
             "0.7.3",
             "0039",
             &["0.7.3".to_string(), "0.8.5".to_string()],
+            &[],
         );
         assert!(err.message.contains("0.7.3"));
         assert!(err.fix.contains("0.8.5"));
+    }
+
+    fn declared(app_version: &str, helm_revision: u32, min: &str, head: &str) -> DeclaredBuild {
+        DeclaredBuild {
+            app_version: app_version.to_string(),
+            helm_revision,
+            window: candidate_window(min, head).expect("declared bounds are catalogued"),
+        }
+    }
+
+    fn fix_for(history: &[&str], builds: &[DeclaredBuild], live: &str) -> String {
+        let history: Vec<String> = history.iter().map(|app| app.to_string()).collect();
+        missing_target_window_refusal("sha-4498fa0", live, &history, builds).fix
+    }
+
+    #[test]
+    fn declared_window_within_release_refuses_ambiguous_and_uncatalogued_versions() {
+        // 0.10.2 is catalogued 0060..0062; 0.10.3's head 0063 bounds its builds.
+        assert!(declared_window_within_release(
+            "0.10.2",
+            &candidate_window("0045", "0063").unwrap()
+        ));
+        assert!(!declared_window_within_release(
+            "0.10.2",
+            &candidate_window("0045", "0062").unwrap()
+        ));
+        assert!(!declared_window_within_release(
+            "0.10.1",
+            &candidate_window("0045", "0063").unwrap()
+        ));
+        // 0.8.9 would pass the head bounds (0039 < 0044 <= 0.9.0's 0044) but its
+        // artifact identity is ambiguous.
+        assert!(window_for("0.8.9").unwrap().artifact_identity_ambiguous);
+        assert!(!declared_window_within_release(
+            "0.8.9",
+            &candidate_window("0001", "0044").unwrap()
+        ));
+        assert!(!declared_window_within_release(
+            "sha-4498fa0",
+            &candidate_window("0108", "0120").unwrap()
+        ));
+    }
+
+    #[test]
+    fn fail_forward_tie_prefers_the_catalog_match() {
+        let builds = [declared("0.10.2", 4, "0045", "0063")];
+        assert_eq!(
+            fix_for(&["0.10.1", "0.10.2"], &builds, "0060"),
+            "fail forward to application 0.10.2, which can start against revision 0060"
+        );
+    }
+
+    #[test]
+    fn fail_forward_names_a_newer_declared_build_over_a_lower_catalog_match() {
+        assert_eq!(
+            fix_for(&["0.10.1", "0.10.2"], &[], "0058"),
+            "fail forward to application 0.10.1, which can start against revision 0058"
+        );
+        let builds = [
+            declared("0.10.2", 4, "0045", "0063"),
+            declared("0.10.2", 6, "0045", "0063"),
+            declared("0.10.2", 5, "0045", "0063"),
+        ];
+        assert_eq!(
+            fix_for(&["0.10.1", "0.10.2"], &builds, "0058"),
+            "fail forward to application 0.10.2 using the build Helm revision 6 installed, which can start against revision 0058"
+        );
+    }
+
+    #[test]
+    fn fail_forward_ignores_declared_builds_outside_their_release_bounds() {
+        let lower = "fail forward to application 0.10.1, which can start against revision 0058";
+        // Head equal to the catalog head: the published artifact's own metadata.
+        let published = [declared("0.10.2", 4, "0045", "0062")];
+        assert_eq!(fix_for(&["0.10.1", "0.10.2"], &published, "0058"), lower);
+        // Head past the next catalogued release's head (0.10.3, 0063).
+        let too_new = [declared("0.10.2", 4, "0045", "0070")];
+        assert_eq!(fix_for(&["0.10.1", "0.10.2"], &too_new, "0058"), lower);
+        // Window that does not contain live.
+        let excludes = [declared("0.10.2", 4, "0060", "0063")];
+        assert_eq!(fix_for(&["0.10.1", "0.10.2"], &excludes, "0058"), lower);
+        // Ambiguous and uncatalogued versions are never named.
+        let unnamed = [
+            declared("0.8.9", 4, "0001", "0044"),
+            declared("sha-4498fa0", 5, "0108", "0120"),
+        ];
+        assert_eq!(
+            fix_for(&[], &unnamed, "0044"),
+            "no catalogued application version in this release history can start against revision 0044; stay on the current revision"
+        );
     }
 
     #[test]
@@ -494,6 +681,7 @@ print(json.dumps(graph))
             &v091,
             "0046",
             &["0.9.1".to_string(), "0.10.0".to_string()],
+            &[],
         )
         .expect_err("published 0.9.1 must refuse live revision 0046");
         assert!(err.message.contains("0.9.1"));
@@ -512,6 +700,7 @@ print(json.dumps(graph))
             &v092,
             "0045",
             &["0.9.2".to_string(), "0.10.0".to_string()],
+            &[],
         )
         .expect("published 0.9.2 accepts its adapter schema");
 
@@ -521,6 +710,7 @@ print(json.dumps(graph))
                 &v092,
                 live,
                 &["0.9.2".to_string(), "0.10.0".to_string()],
+                &[],
             )
             .expect_err("published 0.9.2 must refuse later live revisions");
             assert!(err.message.contains("0.9.2"));
@@ -543,6 +733,7 @@ print(json.dumps(graph))
             &n,
             "0058",
             &["0.10.0".to_string(), "0.10.1".to_string()],
+            &[],
         )
         .expect("N+1 to N is the same schema window");
         let err = check_target_schema(
@@ -550,6 +741,7 @@ print(json.dumps(graph))
             &window_for("0.8.7").expect("0.8.7 window"),
             &n.schema_head,
             &["0.8.7".to_string(), "0.10.0".to_string()],
+            &[],
         )
         .expect_err("0.8.7 cannot start on the released 0.10.0 head");
         assert!(
@@ -564,8 +756,8 @@ print(json.dumps(graph))
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
         // @spec DEPLOY-NOTICE-RELEASE-1.
         let candidate = source_candidate_window();
-        assert_eq!(candidate.schema_min, "0123");
-        assert_eq!(candidate.schema_head, "0123");
+        assert_eq!(candidate.schema_min, "0140");
+        assert_eq!(candidate.schema_head, "0140");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -585,7 +777,8 @@ print(json.dumps(graph))
         assert!(!live_in_window("0120", &current));
         assert!(!live_in_window("0121", &current));
         assert!(!live_in_window("0122", &current));
-        assert!(live_in_window("0123", &current));
+        assert!(!live_in_window("0123", &current));
+        assert!(live_in_window("0140", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

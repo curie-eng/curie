@@ -59,6 +59,56 @@ description = "Slack conversation id (channel/group/DM) -- use an EXAMPLE id in 
 regex = '''\b[CGD][0-9][A-Z0-9]{7,9}\b'''
 tags = ["identifier", "slack"]
 
+  # f0c43984 is only on unmerged task branches. The constant spells SYNTHETIC,
+  # so it is not a live channel id. History on those branches cannot be rewritten
+  # from a release line. AND keeps the excuse on that one commit and path.
+  [[rules.allowlists]]
+  description = "Synthetic channel constant SYNTHETIC_CHANNEL in f0c43984edaf749321d5aa0bbc0854160ba15fbf. The value spells SYNTHETIC and is not a live channel. The commit is only on unmerged task branches. AND pins the excuse to that commit and this path, so the same text in any other commit or file still matches."
+  condition = "AND"
+  commits = ["f0c43984edaf749321d5aa0bbc0854160ba15fbf"]
+  paths = [
+    '''^apps/worker/src/curie_worker/eval/learning\.py$''',
+  ]
+
+  # b0dc00db and 340c0972 are only on an unmerged task branch. The value is
+  # C0UNBOUND, used as a synthetic prefix and as a reply channel whose adapter
+  # is synthetic-unbound. That branch cannot be rewritten from a release line.
+  # Each AND excuse is one commit and one test path.
+  [[rules.allowlists]]
+  description = "Synthetic unbound channel prefix C0UNBOUND in b0dc00db025319d7e5dd38a62c4d9c5b3f246484. The test concatenates it with a generated suffix. The commit is only on an unmerged branch. AND pins the excuse to that commit and this path, so the same text in any other commit or file still matches."
+  condition = "AND"
+  commits = ["b0dc00db025319d7e5dd38a62c4d9c5b3f246484"]
+  paths = [
+    '''^apps/api/tests/test_http_approval_legacy_writers\.py$''',
+  ]
+
+  [[rules.allowlists]]
+  description = "Synthetic unbound reply channel C0UNBOUND in 340c09720fd79c2229a64d3d7702fc8882f7c7c9. The tests set reply_adapter to synthetic-unbound. The commit is only on an unmerged branch. AND pins the excuse to that commit and this path, so the same text in any other commit or file still matches."
+  condition = "AND"
+  commits = ["340c09720fd79c2229a64d3d7702fc8882f7c7c9"]
+  paths = [
+    '''^apps/api/tests/test_http_approval_creation\.py$''',
+  ]
+
+  # 526a02e9 and ecbf8115 are the same fixture files after that unmerged branch
+  # was rewritten. The bytes match the earlier pins. The new commits are not on
+  # main or next, and the branch cannot be rewritten from a release line.
+  [[rules.allowlists]]
+  description = "Synthetic unbound channel prefix C0UNBOUND in 526a02e9a0c949022c3f46000d7e9b477068abcd. The file bytes match the earlier pin. The commit is only on an unmerged branch. AND pins the excuse to that commit and this path, so the same text in any other commit or file still matches."
+  condition = "AND"
+  commits = ["526a02e9a0c949022c3f46000d7e9b477068abcd"]
+  paths = [
+    '''^apps/api/tests/test_http_approval_legacy_writers\.py$''',
+  ]
+
+  [[rules.allowlists]]
+  description = "Synthetic unbound reply channel C0UNBOUND in ecbf8115d60ff9188826637e4c52995d6204bf25. The file bytes match the earlier pin. The commit is only on an unmerged branch. AND pins the excuse to that commit and this path, so the same text in any other commit or file still matches."
+  condition = "AND"
+  commits = ["ecbf8115d60ff9188826637e4c52995d6204bf25"]
+  paths = [
+    '''^apps/api/tests/test_http_approval_creation\.py$''',
+  ]
+
 [[rules]]
 id = "aws-account-id"
 description = "AWS account id -- use 000000000000 in docs and tests"
@@ -136,7 +186,7 @@ description = "Cross-repo issue reference -- cite this repo's issues, or describ
 regex = '''(?i)\b[A-Za-z][A-Za-z0-9-]*/[A-Za-z0-9._-]+#[0-9]+\b'''
 tags = ["identifier", "repo"]
 
-  [rules.allowlist]
+  [[rules.allowlists]]
   description = "This repo's own issues and the Slack setup Markdown heading link"
   regexTarget = "match"
   regexes = [
@@ -144,6 +194,20 @@ tags = ["identifier", "repo"]
     # The README's local heading link is matched only through its numeric prefix.
     # Exempt that exact match for this rule; every file and other rule stays scanned.
     '''^docs/your-first-slack-agent\.md#2$''',
+  ]
+
+  # 5f98d1bc introduced factory-e2e display keys and is an ancestor of next.
+  # The following commit removed the joined form from the tree. next cannot be
+  # rewritten, so the weekly full-history scan will keep seeing that commit.
+  # AND pins the excuse to the commit and the three test paths.
+  [[rules.allowlists]]
+  description = "Factory e2e fixture display keys in 5f98d1bce852a94c4545c27a599d24a314a23f59 (acme/fixture#7, acme/fixture#3, acme/fixture#41). They are fixture labels, not credentials. The commit is an ancestor of next, so it cannot be rewritten. AND pins the excuse to that commit and these three test paths. The same text in any other commit or file still matches."
+  condition = "AND"
+  commits = ["5f98d1bce852a94c4545c27a599d24a314a23f59"]
+  paths = [
+    '''^tools/factory-e2e/tests/test_acceptance\.py$''',
+    '''^tools/factory-e2e/tests/test_factory_e2e_loop\.py$''',
+    '''^tools/factory-e2e/tests/test_gitlab_acceptance\.py$''',
   ]
 
 [allowlist]

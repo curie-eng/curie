@@ -119,21 +119,35 @@ PR and candidate CI round are not required.
    permitted paths, including an empty delta. A non-version merge change
    requires a new pin and snapshot before tagging.
 
-The atlas pin and the CI proof commit serve different gates. Under current
-[ADR 0195](adr/0195-a-version-only-delta-reuses-its-parents-checks.md), the release
-authorizer can reuse only a green first-parent ancestor across a version-only
-delta. A combined preparation merge contains fixes relative to its first
-parent, and its checked PR head is the second parent. The authorizer does not
-accept that head as inherited proof. Direct tagging of this combined merge
-therefore waits for its own complete required checks on `main`, along with the
-other release gates.
+The atlas pin and the CI proof commit serve different gates. Under
+[ADR 0195](adr/0195-a-version-only-delta-reuses-its-parents-checks.md) as amended
+by [ADR 0247](adr/0247-a-tree-identical-parent-or-a-schema-window-registration-reuses-checks.md),
+the release authorizer can reuse green required checks from two kinds of commit
+when the tagged commit's own checks are absent or still running.
 
-[Draft ADR 0196](adr/0196-combined-preparation-pr-checks.md) proposes reusing full
-green preparation-head checks when an up-to-date merge has only a version-only
-or empty delta from that head. It does not authorize this path until the ADR is
-Accepted and the release authorizer implements it. The proposed single
-preparation CI run followed by tag publication is conditional on that change;
-there is no separate candidate CI round.
+1. A tree-identical parent. A parent of the tagged commit, including the second
+   parent of a merge, whose git tree equals the tagged commit's tree, with every
+   required check green, is the proof. An up-to-date preparation merge has the
+   same tree as its checked PR head, so that head is accepted. This is checked
+   first.
+2. A version-only first-parent ancestor. The walk continues across the
+   version-only path set. A delta that also changes
+   `cli/src/application_schema_windows.json` continues the walk only when it
+   adds exactly the release's own schema window, equal to the ancestor's
+   candidate, and changes nothing else. This is the authorizer's walk, not the
+   atlas pin rule above.
+
+The authorizer prints which path it used and the proof commit, for example
+`checked via tree-identical parent <sha> ...` or
+`checked via version-only ancestor <sha> ...`. A merge that is not tree-identical
+to its head, because `main` moved after the branch was last updated, still waits
+for its own required checks on `main`. Contrary required evidence on the tagged
+commit itself, such as a failed, cancelled, or skipped required check, still
+refuses in both cases.
+
+[Draft ADR 0196](adr/0196-combined-preparation-pr-checks.md) remains a Draft and
+is not authority. The tree-identical case above covers the up-to-date
+preparation merge it describes.
 
 ## What each release publishes
 

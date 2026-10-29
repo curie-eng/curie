@@ -1,0 +1,32 @@
+{
+  "id": 7,
+  "version": 3,
+  "title": "Add nautical miles to unitconv",
+  "description": "Adds a round trip unit test.",
+  "state": "OPEN",
+  "open": true,
+  "closed": false,
+  "createdDate": 1760227200000,
+  "updatedDate": 1760227500000,
+  "fromRef": {
+    "id": "refs/heads/curie/kan-1",
+    "displayId": "curie/kan-1",
+    "latestCommit": "cccccccccccccccccccccccccccccccccccccccc",
+    "repository": {"slug": "demo", "project": {"key": "FAC"}}
+  },
+  "toRef": {
+    "id": "refs/heads/main",
+    "displayId": "main",
+    "latestCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "repository": {"slug": "demo", "project": {"key": "FAC"}}
+  },
+  "author": {
+    "user": {"name": "example-factory", "displayName": "Example Factory"},
+    "role": "AUTHOR",
+    "approved": false,
+    "status": "UNAPPROVED"
+  },
+  "links": {
+    "self": [{"href": "https://example.invalid/projects/FAC/repos/demo/pull-requests/7"}]
+  }
+}

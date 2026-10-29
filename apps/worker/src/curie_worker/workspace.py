@@ -1317,6 +1317,8 @@ class WorkspacePreparer:
                         )
                 except TimeoutError as exc:
                     raise WorkspaceStageTimeout("clone", self.limits.clone_timeout_seconds) from exc
+                except WorkspaceStageTimeout:
+                    raise
                 except WorkspacePreparationError as exc:
                     raise WorkspacePreparationError(
                         "clone", "git refused the server-derived repository checkout"

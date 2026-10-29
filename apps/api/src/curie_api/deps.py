@@ -1,6 +1,7 @@
 """FastAPI dependencies that pull shared resources off app.state."""
 
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, Request
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from .approvers import ApproverSetSelector
 from .evalqueue import EvalQueue
 from .github_checks import GitHubStatusReporter
+from .identity_fence import request_owned_session
 from .k8s import PodLister, PodLogReader
 from .killswitch import KillSwitch
 from .langfuse import LangfuseClient
@@ -17,9 +19,21 @@ from .storage import ObjectStore
 from .threadreset import ThreadResetRequests
 
 
-async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
+@asynccontextmanager
+async def request_session(request: Request) -> AsyncIterator[AsyncSession]:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-2."""
+    owned = request_owned_session(request)
+    if owned is not None:
+        yield owned
+        return
     sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.sessionmaker
     async with sessionmaker() as session:
+        yield session
+
+
+async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-2."""
+    async with request_session(request) as session:
         yield session
 
 

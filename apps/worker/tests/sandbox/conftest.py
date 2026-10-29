@@ -10,13 +10,16 @@ client is exercised by the env-gated k8scratch e2e in ``test_e2e_k8scratch.py``.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
+import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 import redis
@@ -320,21 +323,32 @@ def _seed_source(client: _RecordingDocker, target: str) -> Path:
 
 
 @pytest.fixture
-def redis_client() -> Iterator[redis.Redis]:
+def redis_client(request: pytest.FixtureRequest) -> redis.Redis:
+    client: redis.Redis | None = None
+
+    def cleanup() -> None:
+        if client is not None:
+            client.close()
+
+    request.addfinalizer(cleanup)
     client = connect_or_skip(decode_responses=False)
-    yield client
-    client.close()
+    return client
 
 
 @pytest.fixture
-def key_prefix(redis_client: redis.Redis) -> Iterator[str]:
+def key_prefix(redis_client: redis.Redis, request: pytest.FixtureRequest) -> str:
     """Per-test-unique key prefix on the shared Valkey, cleaned up after."""
 
     prefix = f"test:curie:sandbox:{uuid.uuid4().hex}"
-    yield prefix
-    keys = list(redis_client.scan_iter(match=f"{prefix}:*"))
-    if keys:
-        redis_client.delete(*keys)
+
+    def cleanup() -> None:
+        keys = list(redis_client.scan_iter(match=f"{prefix}:*"))
+        if keys:
+            redis_client.delete(*keys)
+        assert not list(redis_client.scan_iter(match=f"{prefix}:*"))
+
+    request.addfinalizer(cleanup)
+    return prefix
 
 
 @pytest.fixture
@@ -360,14 +374,15 @@ def affinity(
     redis_client: redis.Redis,
     pressure_redis_factory: Callable[[], AsyncRedis],
     key_prefix: str,
-) -> Iterator[AffinityStore]:
+    request: pytest.FixtureRequest,
+) -> AffinityStore:
     pressure_client = pressure_redis_factory()
-    yield AffinityStore(
+    request.addfinalizer(lambda: asyncio.run(pressure_client.aclose()))
+    return AffinityStore(
         redis_client,
         pressure_client=pressure_client,
         key_prefix=key_prefix,
     )
-    asyncio.run(pressure_client.aclose())
 
 
 @pytest.fixture
@@ -401,6 +416,8 @@ class FakeClaim:
     ready_message: str | None = None
     # The executor claim's header set (ACTION-EXECUTOR-5); None is an ordinary claim.
     executor_secret_names: frozenset[str] | None = None
+    runner_resources: dict[str, object] | None = None
+    agent_name: str | None = None
 
 
 @dataclass
@@ -467,12 +484,102 @@ class FakeSandboxClient:
             ready_reason=self.ready_reason,
             ready_message=self.ready_message,
             executor_secret_names=executor_secret_names,
+            runner_resources=copy.deepcopy(runner_resources),
+            agent_name=agent_name,
         )
         self.sandboxes[sandbox_name] = FakeSandbox(
             name=sandbox_name,
             service_fqdn=f"{sandbox_name}.{self.namespace}.svc.cluster.local",
         )
         self.created.append(name)
+
+    def claim_resources(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+        executor_secret_names: frozenset[str] | None,
+    ) -> dict[str, str]:
+        if runner_resources is None:
+            return {
+                "pods": "1",
+                "requests.cpu": "250m",
+                "requests.memory": "256Mi",
+                "limits.cpu": "1",
+                "limits.memory": "1Gi",
+            }
+        result = {"pods": "1"}
+        for side in ("requests", "limits"):
+            values = runner_resources[side]
+            assert isinstance(values, dict)
+            for resource in ("cpu", "memory"):
+                result[f"{side}.{resource}"] = str(values[resource])
+        return result
+
+    def capacity_inventory(
+        self,
+        *,
+        priority_class: str,
+        known_claim_resources: Mapping[str, Mapping[str, str]],
+        request_timeout_seconds: float,
+    ) -> Any:
+        from curie_worker.sandbox.types import CapacityInventory, CapacityPod
+
+        del known_claim_resources
+        assert 0 < request_timeout_seconds <= 1.0
+        observed_at = time.time()
+        owners = {claim.sandbox_name: claim.name for claim in self.claims.values()}
+        resources = {
+            claim.name: self.claim_resources(
+                pool=claim.pool,
+                runner_resources=claim.runner_resources,
+                agent_name=claim.agent_name,
+                executor_secret_names=claim.executor_secret_names,
+            )
+            for claim in self.claims.values()
+        }
+        default = self.claim_resources(
+            pool="", runner_resources=None, agent_name=None, executor_secret_names=None
+        )
+        return CapacityInventory(
+            claims=frozenset(self.claims),
+            sandboxes={name: owners.get(name) for name in self.sandboxes},
+            pods={
+                name: CapacityPod(
+                    claim_name=owners.get(name),
+                    resources=resources.get(owners.get(name, ""), default),
+                )
+                for name, sandbox in self.sandboxes.items()
+                if sandbox.operating_mode != "Suspended"
+            },
+            claim_resources=resources,
+            suspended_claims=frozenset(
+                owners[name]
+                for name, sandbox in self.sandboxes.items()
+                if sandbox.operating_mode == "Suspended" and name in owners
+            ),
+            observed_at=observed_at,
+        )
+
+    def read_quota(self, quota_name: str, *, request_timeout_seconds: float) -> Any:
+        from curie_worker.sandbox.types import QuotaStatus
+
+        assert 0 < request_timeout_seconds <= 1.0
+        hard = {
+            "pods": "2",
+            "requests.cpu": "500m",
+            "requests.memory": "512Mi",
+            "limits.cpu": "2",
+            "limits.memory": "2Gi",
+        }
+        return QuotaStatus(
+            name=quota_name,
+            namespace=self.namespace,
+            spec_hard=hard,
+            status_hard=hard,
+            status_used=dict.fromkeys(hard, "0"),
+        )
 
     def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
         assert request_timeout_seconds > 0

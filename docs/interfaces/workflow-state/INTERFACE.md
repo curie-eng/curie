@@ -161,7 +161,9 @@ the `curie_api.state_mutation` logger, plus one `curie.state.mutation` count
 when it changed stored state (#3673,
 `apps/api/src/curie_api/state_mutation.py::record`). The line names the
 operation, agent, scope, namespace, key or memory index, whether anything was
-removed, and the `StateCaller` kind that authenticated the call. It never
+removed, and the `StateCaller` kind that authenticated the call (the memory
+router always records `platform`, including for a Console session, which its
+`require_api_key` dependency also accepts). It never
 carries the stored value or a memory entry's content. A compare-and-delete that
 conflicts is refused before anything is recorded, and a write that bypasses the
 API, such as a direct database statement, leaves no record here. The memory
@@ -250,6 +252,13 @@ The guidance endpoints are another direct ORM path through the same router:
 `memory/guidance` row without calling the state API. PUT borrows `enforce_caps`,
 but neither PUT nor DELETE calls `state_mutation.record`. A replacement state
 backend must cover these paths as well as the legacy log operations.
+
+Transcript rows are also deleted in-process. Work-item terminal transitions
+(`apps/api/src/curie_api/workitems/lifecycle.py`) call
+`apps/api/src/curie_api/transcripts.py::expire_for_work_item`, and the attachment
+ledger's `apps/api/src/curie_api/thread_attachments.py::_settle` deletes an expired
+`ThreadTranscript` row before an append; neither leaves a mutation record. A
+replacement backend must cover them too.
 
 ## Cross-links
 

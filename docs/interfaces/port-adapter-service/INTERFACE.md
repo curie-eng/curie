@@ -103,12 +103,16 @@ generic endpoints as a plugin API:
   credential rather than platform model credentials.
 - **The reply wire is versioned per body.** Version 1.0
   (`packages/channel-protocol/src/channel_protocol/reply.py::REPLY_WIRE_VERSION`)
-  is the baseline for the current non-Slack producers. Version 1.1
+  is the baseline for streamed edits, `turn.status` and `turn.completed`. Version 1.1
   (`packages/channel-protocol/src/channel_protocol/reply.py::PROGRESS_REPLY_WIRE_VERSION`,
   ADR-0130) adds an outbound `delivery_id` and a `progress` payload to
-  `reply.update` and `reply.post`. A body is 1.1 exactly when it carries
-  `delivery_id`, so a 1.0 adapter still decodes every body except progress and
-  a delivery-identified post or edit. The reply models are closed, so a 1.0
+  `reply.update` and `reply.post`. Version 1.2
+  (`packages/channel-protocol/src/channel_protocol/reply.py::VERBATIM_REPLY_WIRE_VERSION`,
+  ADR-0227) is exclusively a text-only `reply.update` with `text_mode: "verbatim"`,
+  nonempty text and a `delivery_id`, for a final answer published verbatim. A body
+  is 1.1 when it carries `delivery_id` without `text_mode` and 1.2 exactly when it
+  carries `text_mode`, so a 1.0 adapter still decodes every body except progress,
+  a delivery-identified post or edit, and a verbatim update. The reply models are closed, so a 1.0
   adapter refuses a 1.1 body, and the worker counts that refusal as a delivery
   failure like any other status at or above 400. The outbound `delivery_id` is
   the platform's idempotency key for one post or edit. It is unrelated to the
@@ -236,16 +240,25 @@ service is material:
 - **No adapter declares the reply-wire version it decodes.** The manifest that
   would carry an adapter's targeted contract version is unbuilt, so the
   platform cannot tell an adapter that decodes 1.1 from one that decodes only
-  1.0. Slack deployment notices already send delivery-identified 1.1 posts
+  1.0 or a verbatim 1.2 update. Slack deployment notices already send
+  delivery-identified 1.1 posts
   (`apps/worker/src/curie_worker/deploy_notice.py::DeployNoticeConsumer`).
   Progress is also a 1.1 contract, but its coordinator accepts only eligible
   Slack turns (`apps/worker/src/curie_worker/turn_progress.py::progress_eligible`)
   and the worker has no progress deliverer on any path. Enabling progress
   rendering is refused
   (`apps/worker/src/curie_worker/config.py::WorkerConfig._progress_render_needs_a_deliverer`),
-  and the maintenance sweep runs without a deliverer. No non-Slack producer
-  sends 1.1. Before one does, it must supply that version declaration or exclude
-  routes whose adapters cannot decode it.
+  and the maintenance sweep runs without a deliverer. Final answers are
+  different: on every lane with the answer outbox (every lane except the
+  protected one, whose `ProtectedMarkers` sets `supports_answer_outbox` false),
+  `_ThrottledReply.prepare_final`
+  (`apps/worker/src/curie_worker/kernel/delivery.py::_ThrottledReply.prepare_final`)
+  freezes the final answer as a 1.1 `reply.update` carrying `delivery_id`, or a 1.2
+  verbatim update, and completion delivery sends it on whatever route the turn
+  has, Discord and email through `HttpReplyAdapter` included. Every such adapter
+  therefore already receives 1.1 bodies, and 1.2 ones when a turn publishes
+  verbatim, with no version declaration to check against; the protected lane's
+  final remains a 1.0 edit unless verbatim.
 - **Packaging, installation, discovery, lifecycle, and conformance remain
   unbuilt.** A binding's configured route is not an adapter registry or an
   install experience, and the generic HTTP edges do not establish a supported
@@ -262,4 +275,4 @@ service is material:
 - **Related seam:** [channel-interaction](../channel-interaction/INTERFACE.md) — the neutral interaction primitives used by the reply edge; they are not a third-party adapter conformance contract.
 - **Epic(s):** #19 — per-turn reply endpoint routing, which the generic egress edge builds on; #158 — multi-tenancy, deliberately out of scope until it settles what a tenant owns
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — the standing restraint that no speculative adapter layer is written ahead of a real second implementation; this is not one of the six swap-readiness Jobs, so it is not separately graded
-- **ADR(s):** [ADR-0096](../../adr/0096-port-adapters-are-deployed-services.md) — a third-party port adapter is a deployed service, not a loaded plugin; [ADR-0156](../../adr/0156-adapter-principal-with-a-scoped-credential.md), the scoped credential and authenticated adapter principal; [ADR-0130](../../adr/0130-deliberate-progress-is-bounded-durable-channel-state.md), the reply wire's 1.1 delivery identity and progress payload; [ADR-0060](../../adr/0060-the-harness-is-a-declared-package.md) — the harness registry it generalizes; [ADR-0086](../../adr/0086-bundles-declare-connectors-the-platform-hosts-them.md) — the declare-and-host precedent moved up one scope; [ADR-0040](../../adr/0040-adopt-acp-as-an-edge-projection.md) — the trust rule inherited verbatim: an adapter is a rendering and transport contract, never a trust boundary; [ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md), the approval an adapter carries back from its own channel
+- **ADR(s):** [ADR-0096](../../adr/0096-port-adapters-are-deployed-services.md) — a third-party port adapter is a deployed service, not a loaded plugin; [ADR-0156](../../adr/0156-adapter-principal-with-a-scoped-credential.md), the scoped credential and authenticated adapter principal; [ADR-0130](../../adr/0130-deliberate-progress-is-bounded-durable-channel-state.md), the reply wire's 1.1 delivery identity and progress payload; [ADR-0227](../../adr/0227-opt-in-final-answer-publication-validation.md), the reply wire's 1.2 verbatim final-answer update; [ADR-0060](../../adr/0060-the-harness-is-a-declared-package.md) — the harness registry it generalizes; [ADR-0086](../../adr/0086-bundles-declare-connectors-the-platform-hosts-them.md) — the declare-and-host precedent moved up one scope; [ADR-0040](../../adr/0040-adopt-acp-as-an-edge-projection.md) — the trust rule inherited verbatim: an adapter is a rendering and transport contract, never a trust boundary; [ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md), the approval an adapter carries back from its own channel

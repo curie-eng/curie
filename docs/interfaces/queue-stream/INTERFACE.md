@@ -152,8 +152,13 @@ EVAL Lua script (`_MARK_AND_XADD`).
 
 ## Declared producers and keyspace
 
-Every production append site is declared in the inventory read by
+Every production append site the wire gate detects is declared in the inventory
+read by
 `packages/curie-internal/src/curie_internal/wire_inventory.py::validate_inventory`.
+The gate matches `xadd` attribute, alias and `getattr` calls and Lua `redis.call`
+strings, so a command name passed as a plain string argument
+(`execute("XADD", ...)`) is not detected; the commissioning ingress below is such a
+site and is not in `wire_sites.json`.
 The collected `tests/test_wire_state.py` gate scans Python calls, embedded Lua
 commands, and Rust commands. Site identity includes source path, enclosing scope,
 and ordinal, so a second identical append in an already declared scope still
@@ -173,6 +178,7 @@ The complete runs capable producer set is:
 | `apps/worker/src/curie_worker/markers.py` | Lua `_SETTLE_FENCED_AND_PUBLISH_LUA` | Fenced successor publication with predecessor settlement |
 | `packages/protected-hooks/src/curie_protected_hooks/admission_scripts.py` | First `XADD` in `TRANSACTION` (`module:1` in `wire_sites.json`) | Initial protected admission at the newly reserved stream id, carrying the protected envelope |
 | `packages/protected-hooks/src/curie_protected_hooks/admission_scripts.py` | Second `XADD` in `TRANSACTION` (`module:2` in `wire_sites.json`) | Protected admission recovery when the reserved entry is absent, carrying the protected envelope |
+| `apps/api/src/curie_commissioning_ingress/ingress.py::CommissioningIngress.admit` | Session `execute("XADD", ...)` | Commissioning admission onto the permit-derived `protected:commissioning:lane:<digest>:runs` stream, carrying payload and envelope; not detected by the wire gate |
 | `cli/src/queue.rs` | Rust `queue::xadd` | Generic stream append used by runs and eval callers; the runtime stream argument makes this site runs capable |
 
 Sibling append sites are declared separately: API `EvalQueue.enqueue` in
@@ -255,6 +261,15 @@ use the private broker. Protected worker paths also issue direct `XRANGE`,
 `apps/worker/src/curie_worker/protected_markers.py`). These direct calls bypass
 `StreamBroker`; a broker swap must preserve their exact-row, generation and
 ownership fences as well as the ordinary stream semantics.
+
+The commissioning ingress
+(`apps/api/src/curie_commissioning_ingress/ingress.py::CommissioningIngress.admit`)
+also appends outside `StreamPublisher`: it issues `XADD` through its authenticated
+`CommissioningSession` onto the lane that
+`packages/protected-hooks/src/curie_protected_hooks/commissioning_acl.py::derive_commissioning_lane`
+derives from the permit. Its consumer,
+`apps/worker/src/curie_commissioning_worker/consumer.py::CommissioningConsumer`,
+subclasses `Consumer` and stays on `StreamBroker`.
 
 Queue-state observation is another off-port reader:
 `Consumer._observe_queue_state` reads `xpending`, `xlen` and `xinfo_groups`

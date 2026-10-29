@@ -1,0 +1,72 @@
+{{- if .Values.worker.deploy }}
+{{- if .Values.worker.serviceAccount.create }}
+{{- if and .Values.agentSandbox.deploy .Values.resourceQuota.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "curie.fullname" . }}-worker-admission
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sandbox-admission
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "curie.fullname" . }}-worker-admission
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sandbox-admission
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "curie.fullname" . }}-worker-admission
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "curie.fullname" . }}-worker
+    namespace: {{ .Release.Namespace }}
+---
+{{- $runtimeClass := include "curie.gvisor.runtimeClassName" . | trim }}
+{{- if $runtimeClass }}
+{{- $runtimeClassRole := printf "%s-worker-runtimeclass-%s" (include "curie.fullname" .) .Release.Namespace }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $runtimeClassRole }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+rules:
+  - apiGroups: ["node.k8s.io"]
+    resources: ["runtimeclasses"]
+    resourceNames: [{{ $runtimeClass | quote }}]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $runtimeClassRole }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $runtimeClassRole }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "curie.fullname" . }}-worker
+    namespace: {{ .Release.Namespace }}
+---
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

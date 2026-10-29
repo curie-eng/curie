@@ -407,6 +407,24 @@ class GithubStub:
             ],
         }
 
+    def _compare(self, base: str, head: str) -> dict[str, Any] | None:
+        """GitHub's compare of ``base...head`` over every parent, or None if unknown."""
+
+        if self._commit(base) is None or self._commit(head) is None:
+            return None
+
+        command = ("git", "--git-dir", str(self._repository), "merge-base", base, head)
+        found = subprocess.run(command, capture_output=True, timeout=30, check=False)
+        merge_base = found.stdout.decode().strip() if found.returncode == 0 else None
+        status = "diverged"
+        if base == head:
+            status = "identical"
+        elif merge_base == base:
+            status = "ahead"
+        elif merge_base == head:
+            status = "behind"
+        return {"status": status}
+
     def _repository_row(self) -> dict[str, Any]:
         return {
             "id": 4401,
@@ -572,6 +590,13 @@ class GithubStub:
             if commit is None:
                 return 404, {"message": "Not Found"}
             return 200, commit
+        if method == "GET" and tail.startswith("compare/"):
+            # https://docs.github.com/en/rest/commits/commits#compare-two-commits
+            base, _, head = tail.removeprefix("compare/").partition("...")
+            compared = self._compare(base, head)
+            if compared is None:
+                return 404, {"message": "Not Found"}
+            return 200, compared
         if method == "GET" and tail.startswith("commits/"):
             if tail.endswith("/check-runs"):
                 runs = self._checks()

@@ -1750,11 +1750,14 @@ failed or capped review the agent ends its reply with `Could not complete:` and
 the unresolved findings, and the factory status comment on the issue carries
 that result. The chart now ships
 `worker.deliveryBudgetSeconds` and `worker.runnerTotalTimeoutSeconds` at 10800,
-matching the factory maximum execution deadline, so a stock install does not
-cut a factory run at 600 seconds. The agent execution deadline still defaults
-to 1800, so a three hour run still needs
-`curie cluster overrides <agent> --execution-deadline 10800`. The chart raises
-termination grace with the budget (10860 seconds at the default). Whether a run
+matching a three hour run, so a stock install does not cut a factory run at 600
+seconds. The agent execution deadline still defaults to 1800, so a three hour
+run still needs `curie cluster overrides <agent> --execution-deadline 10800`.
+The platform ceiling for the deadline is 43200 seconds (twelve hours, ADR 0249).
+A run longer than three hours also needs `worker.deliveryBudgetSeconds` and
+`worker.runnerTotalTimeoutSeconds` raised (each up to 43200) alongside
+`--execution-deadline`. The chart raises termination grace with the budget
+(10860 seconds at the default). Whether a run
 executes the repository's tests is the bundle's instruction. The platform does
 not check it. To let the agent install dependencies (`npm ci`, `pip install`)
 and run those checks, declare its package registry CIDRs under
@@ -1874,12 +1877,14 @@ until chart-owned values land):
 | `CURIE_CONSUMER_GROUP` | `curie-workers` | Runs consumer group the reconciler ensures |
 
 There are two time bounds after start: the ExecutionRequest deadline (the
-agent's `execution_deadline_seconds`, 60 to 10800, default 1800) and the worker
+agent's `execution_deadline_seconds`, 60 to 43200, default 1800) and the worker
 delivery budget. The chart default delivery budget and runner ceiling are 10800.
 The runner request is still bounded by the smaller of the remaining execution
 deadline and the delivery budget. An agent left at the 1800 second platform
 default is still bounded by 1800. An agent set to 10800 is no longer cut by
-the worker ceiling.
+the worker ceiling. A deadline above 10800 also needs the delivery budget and
+runner ceiling raised (`worker.deliveryBudgetSeconds` and
+`worker.runnerTotalTimeoutSeconds`, each up to 43200).
 
 A work item run boots its runner with a turn budget of `worker.workItemMaxTurns`
 (default 1000), so the deadline rather than the runner's default of 20 turns
@@ -1891,8 +1896,8 @@ Capacity wait expiry is visible as `expired` / `capacity_wait_expired` on
 `GET /v1/internal/work-items/requests/{id}`. It is not written to the
 dead-letter graveyard.
 
-A delivery whose sandbox did not start defers with a `not_started` reason on
-the same backoff curve as capacity, counted separately. Only `not_started`
+Counted pre-start failures defer with a `not_started` reason on the same
+backoff curve as capacity, counted separately. Only `not_started`
 defers count toward the limit. The one that reaches
 `CURIE_WORK_ITEM_START_DEFERRAL_LIMIT` ends the request as `failed` /
 `start_failed`, frees its quota slot, and names the attempt count and the last
@@ -1900,6 +1905,11 @@ deferral reason on the status comment. Every other non-capacity defer is a
 wait rather than a failed start, such as `thread_busy` while another turn holds
 the work item's thread: it waits `CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS` and
 never counts.
+
+A structural workspace stage timeout defers as `workspace_timeout`,
+using the flat base backoff without charging start or capacity deferrals.
+The SQL wait retains its original deadline and bounded stage diagnostic.
+Other workspace preparation faults keep the counted `not_started` behavior.
 
 Each factory execution request owns exactly one App-authored status comment.
 The reconciler creates it on its first pass after admission and then edits it
