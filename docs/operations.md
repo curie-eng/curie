@@ -1745,6 +1745,20 @@ The empty commit remains in branch history and is an ancestor of later fixes.
 Old approvals and checks do not authorize the new head and base. Durable
 progress lets reconciliation resume after a restart.
 
+Base-label observation continues after a successful request completes while
+its factory PR remains open. A changed base creates a distinct waiting request
+through the same fenced transition path only when the stored repository and
+base pins match the current lineage, with an acknowledged successful current
+publication or an acknowledged, successfully settled base move. That authority
+may belong to an earlier completed request, including after a no-change
+follow-up; its operation and CI owners stay unchanged.
+
+Completed work without a PR, failed or cancelled requests, and locally closed
+lineages do not enter this polling path. Stale revision, head, base or owner
+evidence also excludes a completed request, as do an unacknowledged outcome,
+an unfinished move, an active publication or a reserved review. An old
+publication cannot authorize a head changed by a later applied base move.
+
 A replay conflict changes neither the remote branch nor the PR target. The
 status comment keeps the conflict visible until the factory selection label is
 reapplied to retry with current labels and remote state. Editing a base label

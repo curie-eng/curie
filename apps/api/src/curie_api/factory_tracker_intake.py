@@ -42,7 +42,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from . import factory_rediscovery, workitem_dispatch
@@ -313,7 +313,7 @@ async def _poll_binding(
 async def _observe_existing_bases(
     sessionmaker: async_sessionmaker[AsyncSession], scope: _Scope, tracker: Tracker, label: str
 ) -> None:
-    from .factory_base_reconcile import observe_base_labels
+    from .factory_base_reconcile import completed_base_relabel_authority, observe_base_labels
     from .forges.trackers import code_host_for_repository
 
     latest_status = (
@@ -332,7 +332,10 @@ async def _observe_existing_bases(
                     WorkItem.tracker_scope_id == scope.binding.tracker_scope_id,
                     WorkItem.trigger_label == label,
                     WorkItem.cancelled_at.is_(None),
-                    latest_status.in_(("waiting", "running")),
+                    or_(
+                        latest_status.in_(("waiting", "running")),
+                        completed_base_relabel_authority(),
+                    ),
                 )
             )
         )

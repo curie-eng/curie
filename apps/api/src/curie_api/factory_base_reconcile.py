@@ -9,8 +9,10 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
-from sqlalchemy import and_, exists, func, or_, select, update
+from sqlalchemy import TIMESTAMP, Text, and_, cast, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
+from sqlalchemy.sql.elements import ColumnElement
 
 from . import factory_base, transcripts
 from .config import Settings
@@ -60,6 +62,122 @@ def lineage_empty(lineage: ThreadPublicationLineage) -> bool:
         and lineage.pr_number is None
         and lineage.pr_url is None
         and lineage.code_host_pr_id is None
+    )
+
+
+def completed_base_relabel_authority() -> ColumnElement[bool]:
+    latest = aliased(ExecutionRequest)
+    sequence = aliased(ExecutionRequest)
+    lineage = aliased(ThreadPublicationLineage)
+    publication_owner = aliased(ExecutionRequest)
+    ci_owner = aliased(ExecutionRequest)
+    applied_move = aliased(FactoryBaseTransition)
+    latest_sequence = (
+        select(func.max(sequence.sequence))
+        .where(sequence.work_item_id == WorkItem.id)
+        .correlate(WorkItem)
+        .scalar_subquery()
+    )
+    later_move = (
+        exists()
+        .where(
+            applied_move.lineage_id == lineage.id,
+            applied_move.phase == "applied",
+            applied_move.applied_at > cast(Publication.terminal_at, TIMESTAMP(timezone=True)),
+        )
+        .correlate(Publication, lineage)
+    )
+    publication = exists(
+        select(Publication.id)
+        .join(publication_owner, publication_owner.id == Publication.execution_request_id)
+        .where(
+            Publication.lineage_id == lineage.id,
+            Publication.status == "succeeded",
+            Publication.revision_number == lineage.latest_revision,
+            Publication.result_url == lineage.pr_url,
+            Publication.terminal_at.is_not(None),
+            Publication.outcome_history_ready_at.is_not(None),
+            publication_owner.work_item_id == WorkItem.id,
+            publication_owner.status == "completed",
+            publication_owner.terminal_cause == "completed",
+            publication_owner.terminal_at.is_not(None),
+            or_(
+                and_(Publication.revision_number == 1, Publication.base_sha == lineage.base_sha),
+                and_(
+                    Publication.revision_number > 1,
+                    Publication.base_sha == Publication.expected_prior_head,
+                ),
+            ),
+            ~later_move,
+        )
+        .correlate(WorkItem, lineage)
+    )
+    transition = exists(
+        select(FactoryBaseTransition.id)
+        .join(ci_owner, ci_owner.id == FactoryBaseTransition.ci_request_id)
+        .where(
+            FactoryBaseTransition.work_item_id == WorkItem.id,
+            FactoryBaseTransition.lineage_id == lineage.id,
+            FactoryBaseTransition.phase == "applied",
+            FactoryBaseTransition.outcome_ready_at.is_not(None),
+            FactoryBaseTransition.ci_settled_at.is_not(None),
+            FactoryBaseTransition.verification_head_sha == lineage.head_sha,
+            FactoryBaseTransition.target_base_ref == lineage.base_ref,
+            FactoryBaseTransition.target_base_sha == lineage.base_sha,
+            FactoryBaseTransition.branch == lineage.branch,
+            FactoryBaseTransition.pull_request_number == cast(lineage.pr_number, Text),
+            ci_owner.work_item_id == WorkItem.id,
+            ci_owner.status == "completed",
+            ci_owner.terminal_cause == "completed",
+            ci_owner.terminal_at.is_not(None),
+        )
+        .correlate(WorkItem, lineage)
+    )
+    return exists(
+        select(latest.id)
+        .join(lineage, lineage.id == WorkItem.publication_lineage_id)
+        .where(
+            latest.work_item_id == WorkItem.id,
+            latest.sequence == latest_sequence,
+            latest.status == "completed",
+            latest.terminal_cause == "completed",
+            latest.terminal_at.is_not(None),
+            WorkItem.cancelled_at.is_(None),
+            WorkItem.base_resolved_request_id == latest.id,
+            WorkItem.base_branch == lineage.base_ref,
+            WorkItem.base_commit == lineage.base_sha,
+            lineage.status == "open",
+            lineage.pr_number.is_not(None),
+            lineage.pr_url.is_not(None),
+            lineage.head_sha.is_not(None),
+            lineage.code_host_pr_id.is_not(None),
+            lineage.agent_id == WorkItem.agent_id,
+            lineage.conversation_id == WorkItem.conversation_id,
+            lineage.code_host_kind == WorkItem.code_host_kind,
+            lineage.code_host_host == WorkItem.code_host_host,
+            lineage.repository_project_id == WorkItem.repository_project_id,
+            lineage.repo_full_name == WorkItem.repository_path,
+            lineage.code_host_installation_id.is_not_distinct_from(
+                WorkItem.code_host_installation_id
+            ),
+            or_(publication, transition),
+            ~exists().where(
+                FactoryBaseTransition.work_item_id == WorkItem.id,
+                transition_blocks(),
+            ),
+            ~exists().where(
+                Publication.lineage_id == lineage.id,
+                or_(
+                    Publication.status.in_(lifecycle.IN_FLIGHT_PUBLICATION),
+                    Publication.outcome_history_ready_at.is_(None),
+                ),
+            ),
+            ~exists().where(
+                PublicationReviewReservation.lineage_id == lineage.id,
+                PublicationReviewReservation.status == "reserved",
+            ),
+        )
+        .correlate(WorkItem)
     )
 
 
@@ -635,9 +753,17 @@ async def _observe_base_labels_once(
         )
     )
     if safe and previous.status not in {"waiting", "running", "cancellation_requested"}:
-        if lineage is not None and lineage.head_sha is not None and lineage.pr_number is not None:
-            await _record_requested_base(session, item, choice)
-        return None
+        eligible = await session.scalar(
+            select(completed_base_relabel_authority()).where(WorkItem.id == item.id)
+        )
+        if not eligible:
+            if (
+                lineage is not None
+                and lineage.head_sha is not None
+                and lineage.pr_number is not None
+            ):
+                await _record_requested_base(session, item, choice)
+            return None
     await _record_requested_base(session, item, choice)
     if not safe:
         item.base_selection_fingerprint = None
