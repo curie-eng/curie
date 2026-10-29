@@ -7,9 +7,9 @@ Status: Accepted
 **Partially amended by [ADR 0253](0253-factory-base-labels-resolve-at-claim-and-follow-relabels.md)**
 (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 sections 1, 3, 4, 5 and 6 now allow branch patterns, resolve the base at claim
-after labels settle, and follow ordinary base relabels through restart in
-stage one and rebase and retarget in the recorded second stage. The explicit
-restoration exception below remains.
+after labels settle, and follow ordinary base relabels through pre-PR restart
+or durable post-PR rebase and retargeting with final-head CI ownership. The
+explicit restoration exception below remains.
 
 **Partially amended by [ADR 0251](0251-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md)**
 (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):

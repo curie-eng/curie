@@ -5,18 +5,19 @@ Date: 2026-10-28
 Status: Accepted
 
 Accepted with explicit maintainer approval on 2026-10-28, authorizing
-implementation in two stacked pull requests against `next`. This uses the
+implementation in one pull request against `next`. This uses the
 coordinated exception in
 [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
-Stage one, this pull request, realizes branch patterns, settling, claim-time
+This pull request realizes branch patterns, label settling, claim-time
 resolution and pins, and pre-PR restart after teardown through
 `apps/api/src/curie_api/factory_base.py`,
 `apps/api/src/curie_api/workitem_dispatch.py`, and
-`apps/api/src/curie_api/factory_base_reconcile.py`. Published work stays frozen
-with a recorded requested base. Stage two, the follow-up pull request,
-realizes the post-PR rebase, retargeting and CI ownership decisions below.
-Acceptance authorizes both stages; it does not claim completed implementation
-or verification of stage two in this pull request.
+`apps/api/src/curie_api/factory_base_reconcile.py`. Durable post-PR rebase,
+retargeting and final-head CI ownership are realized through
+`apps/api/src/curie_api/factory_base_reconcile.py` and
+`apps/api/src/curie_api/factory_ci.py`. Acceptance authorizes this coordinated
+implementation; it does not claim completed verification or live external
+proof.
 
 This ADR partially amends
 [ADR 0186](0186-a-factory-ticket-declares-its-base-and-keeps-it.md), sections
