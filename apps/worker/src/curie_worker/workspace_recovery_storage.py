@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -349,8 +349,6 @@ async def _ledger_call(
     """
 
     try:
-        if timeout is None:
-            return await call(payload)
         return await asyncio.wait_for(call(payload), timeout)
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
@@ -489,12 +487,7 @@ class RecoveryCheckpointWriter:
         payload = {
             **request.authority.payload(),
             "idempotency_key": request.idempotency_key,
-            "repository": {
-                "provider": request.repository.provider,
-                "host": request.repository.host,
-                "project_id": request.repository.project_id,
-                "path": request.repository.path,
-            },
+            "repository": asdict(request.repository),
             "base_commit": request.base_commit,
             "target_branch": request.target_branch,
             "base_archive_limit_bytes": self._base_limit,
@@ -534,7 +527,7 @@ class RecoveryCheckpointWriter:
         limit = self._base_limit
         clock = self._clock
 
-        def spool() -> tuple[int, str, bool] | FailureCode:
+        def spool() -> tuple[int, str, bool]:
             digest = hashlib.sha256()
             total = 0
             fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -543,7 +536,7 @@ class RecoveryCheckpointWriter:
                 with os.fdopen(fd, "wb") as handle:
                     for chunk in chunks:
                         if cancel.is_set() or clock() >= deadline:
-                            return "capture_timeout"
+                            raise _CaptureFailure("capture_timeout")
                         total += len(chunk)
                         digest.update(chunk)
                         if total <= limit:
@@ -562,10 +555,10 @@ class RecoveryCheckpointWriter:
         except TimeoutError:
             cancel.set()
             raise _CaptureFailure("capture_timeout") from None
+        except _CaptureFailure:
+            raise
         except Exception:  # noqa: BLE001 - typed fault boundary
             raise _CaptureFailure("base_unavailable") from None
-        if isinstance(outcome, str):
-            raise _CaptureFailure(outcome)
         size, digest, oversized = outcome
         if not oversized and digest != base.sha256:
             raise _CaptureFailure("base_digest_mismatch")
@@ -604,13 +597,11 @@ class RecoveryCheckpointWriter:
                 cancel.set()
                 raise _CaptureFailure("capture_timeout") from None
             except RecoveryStorageError as exc:
-                code: FailureCode = (
-                    "digest_mismatch"
-                    if exc.code == "digest_mismatch"
-                    else "capture_timeout"
-                    if exc.code == "capture_timeout"
-                    else "upload_failed"
-                )
+                code: FailureCode = "upload_failed"
+                if exc.code == "digest_mismatch":
+                    code = "digest_mismatch"
+                elif exc.code == "capture_timeout":
+                    code = "capture_timeout"
                 raise _CaptureFailure(code) from None
             except Exception:  # noqa: BLE001 - typed fault boundary
                 raise _CaptureFailure("upload_failed") from None
@@ -754,13 +745,6 @@ def _aware_utc(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def _remove(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
-
-
 class RecoveryCheckpointReader:
     """Reader leases plus signed, verified reads of one checkpoint's objects."""
 
@@ -883,7 +867,7 @@ class RecoveryCheckpointReader:
         except Exception:  # noqa: BLE001 - typed fault boundary
             failure = "read_failed"
         if failure is not None:
-            _remove(destination)
+            destination.unlink(missing_ok=True)
             logger.info(
                 "workspace recovery read refused lease_id=%s kind=%s code=%s",
                 lease.lease_id,
