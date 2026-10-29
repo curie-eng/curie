@@ -1,5 +1,6 @@
 """Database access for errors."""
 
+
 class PublicationReplayConflict(RuntimeError):
     """A publication dedupe key was replayed with different private facts."""
 
@@ -11,6 +12,10 @@ class PublicationLineageConflict(RuntimeError):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class PublicationAuthorityExpired(RuntimeError):
+    """The running request lost its runtime lease or deadline before a new proposal committed."""
 
 
 class PublicationSettlementConflict(Exception):

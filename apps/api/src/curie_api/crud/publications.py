@@ -43,7 +43,11 @@ from .agents import get_agent
 from .approvals import get_approval_by_dedupe_key
 from .channels import AmbiguousRoute, binding_for_route, normalized_reply_identity
 from .deployments import get_deployment
-from .errors import PublicationLineageConflict, PublicationReplayConflict
+from .errors import (
+    PublicationAuthorityExpired,
+    PublicationLineageConflict,
+    PublicationReplayConflict,
+)
 from .lineages import require_review_binding, select_thread_publication_lineage
 from .publication_queries import get_publication_by_approval
 from .workspaces import get_thread_workspace
@@ -249,6 +253,32 @@ async def publication_cancellation_conflict(
     )
 
 
+async def _require_new_publication_runtime(
+    session: AsyncSession, request: ExecutionRequest | None
+) -> None:
+    """Refuse a new proposal from a running request without lease authority.
+
+    ADR 0174: a running request publishes only while it holds its runtime
+    owner, an unexpired heartbeat lease and an unexpired execution deadline,
+    read against the database clock. A heartbeat renewal before the deadline
+    restores authority, so this is the live lease, not the owner-loss lapse.
+    """
+
+    if request is None or request.status != "running":
+        return
+    # The pending Approval and Publication must not flush on the clock read.
+    with session.no_autoflush:
+        now = (await session.execute(select(func.clock_timestamp()))).scalar_one()
+    if (
+        not request.runtime_owner
+        or request.runtime_heartbeat_expires_at is None
+        or request.runtime_heartbeat_expires_at <= now
+        or request.execution_deadline is None
+        or request.execution_deadline <= now
+    ):
+        raise PublicationAuthorityExpired
+
+
 async def _refuse_fenced_work_item(
     session: AsyncSession,
     *,
@@ -277,6 +307,11 @@ async def _refuse_fenced_work_item(
         .execution_options(populate_existing=True)
     )
     if active is None:
+        if request_id is not None or runtime_epoch is not None:
+            raise PublicationLineageConflict(
+                "publication.work_item_stale_owner",
+                "the publication has no active work item request",
+            )
         return None
     if active.status == "cancellation_requested":
         raise PublicationLineageConflict(
@@ -286,14 +321,18 @@ async def _refuse_fenced_work_item(
     # A resumed approval turn does not carry the execute event id. The only
     # running request for this conversation owns the publication.
     if request_id is None and runtime_epoch is None:
+        await _require_new_publication_runtime(session, active)
         return active
-    if active.status == "running" and (
-        request_id != active.id or runtime_epoch != active.runtime_epoch
+    if (
+        active.status != "running"
+        or request_id != active.id
+        or runtime_epoch != active.runtime_epoch
     ):
         raise PublicationLineageConflict(
             "publication.work_item_stale_owner",
             "the publication is not owned by the running work item request",
         )
+    await _require_new_publication_runtime(session, active)
     return active
 
 
@@ -643,6 +682,14 @@ async def create_publication(
                 },
             )
         )
+    if owned_request is not None:
+        # Lock waits above can outlast the lease, so recheck the database
+        # clock last. The request row stays locked FOR UPDATE since the fence.
+        try:
+            await _require_new_publication_runtime(session, owned_request)
+        except PublicationAuthorityExpired:
+            await session.rollback()
+            raise
     try:
         await session.commit()
     except IntegrityError as exc:
