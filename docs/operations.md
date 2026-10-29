@@ -1906,7 +1906,7 @@ wait rather than a failed start, such as `thread_busy` while another turn holds
 the work item's thread: it waits `CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS` and
 never counts.
 
-A structural workspace stage timeout defers as `workspace_stage_timeout`,
+A structural workspace stage timeout defers as `workspace_timeout`,
 using the flat base backoff without charging start or capacity deferrals.
 The SQL wait retains its original deadline and bounded stage diagnostic.
 Other workspace preparation faults keep the counted `not_started` behavior.
