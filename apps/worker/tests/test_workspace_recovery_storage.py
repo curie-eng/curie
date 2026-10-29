@@ -1881,6 +1881,43 @@ async def _case_unavailable_completion_under_proven_lease(ctx: _Ctx) -> None:
     await _assert_readable(ctx, source, committed, ctx.harness.good_digests())
 
 
+async def _case_cleanup_fence_hangs(ctx: _Ctx) -> None:
+    """A post-failure fence that never answers counts as lost; the retraction still lands.
+
+    The fence has its own bound inside the cleanup allowance, so a hung lock
+    store cannot use up the time the ``lease_lost`` retraction needs.
+    """
+
+    source = await _seed(ctx)
+    previous = await _good_checkpoint(ctx, source, base=ctx.harness.base_source())
+    never = asyncio.Event()
+    fenced: list[int] = []
+
+    async def fence() -> None:
+        fenced.append(1)
+        if len(fenced) > 2:
+            # Injected fault: the lock store stops answering at the cleanup check.
+            await never.wait()
+
+    fault = _UnconfirmedCompletion("unavailable")
+    budget = 20.0
+    started = time.monotonic()
+    async with httpx.AsyncClient(transport=fault, timeout=30.0) as faulty:
+        result = await _writer(
+            ctx, ledger=_ledger(ctx.harness, faulty), capture_budget=budget
+        ).capture(
+            _request(source, patch=ctx.harness.patch, manifest=ctx.harness.manifest, base=None),
+            fence=fence,
+        )
+    elapsed = time.monotonic() - started
+    assert elapsed <= budget + CLEANUP_BUDGET_SECONDS + 3.0, elapsed
+    assert fault.complete_calls == 2
+    assert fenced == [1, 1, 1], "the cleanup did not re-check the lease"
+    assert result.status == "failed", result
+    assert result.checkpoint_id is not None
+    await _assert_retracted_to(ctx, source, result.checkpoint_id, previous)
+
+
 async def _case_retracted_checkpoint_is_never_discarded(ctx: _Ctx) -> None:
     """After a retraction every repeated ``fail`` answers ``retracted``, never ``tombstoned``.
 
@@ -2143,6 +2180,7 @@ _FAULT_CASES: dict[str, Callable[[_Ctx], Awaitable[None]]] = {
     ),
     "unavailable_completion_then_lease_lost": _case_unavailable_completion_then_lease_lost,
     "unavailable_completion_under_proven_lease": _case_unavailable_completion_under_proven_lease,
+    "cleanup_fence_hangs": _case_cleanup_fence_hangs,
     "retracted_checkpoint_is_never_discarded": _case_retracted_checkpoint_is_never_discarded,
     "patch_at_limit": _case_patch_at_limit,
     "patch_over_limit": _case_patch_over_limit,
