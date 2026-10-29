@@ -66,3 +66,6 @@ limits in the operator's private record. If build or image probes fail, stop
 before binding. Sandbox checks run after the binding upgrade; if they fail,
 restore the recorded prior binding, hold further selection for that repository, and
 record the failed validation.
+
+After a Curie CLI upgrade, rerun `curie factory skills install --agent <client>`
+to update an exact shipped copy; review local edits before replacing them.

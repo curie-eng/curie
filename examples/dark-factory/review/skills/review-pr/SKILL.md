@@ -87,3 +87,6 @@ updates. Follow repository closure policy, including release branches whose link
 issues remain open until promotion. Finish with exact links, actions completed,
 test evidence and any remaining gaps; do not claim a posted review, queued build,
 published revision, merge or issue closure without its corresponding observation.
+
+After a Curie CLI upgrade, rerun `curie factory skills install --agent <client>`
+to update an exact shipped copy; review local edits before replacing them.
