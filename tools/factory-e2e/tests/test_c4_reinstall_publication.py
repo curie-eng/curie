@@ -949,6 +949,7 @@ def install(
     router = Router()
     env = {
         "FACTORY_ENABLED": "true",
+        "FACTORY_BASE_LABEL_SETTLE_S": "0",
         "FACTORY_INTAKE": "poll",
         "FACTORY_RECONCILE_INTERVAL_S": "300",
         "GITHUB_WEBHOOK_SECRET": "example-factory-hmac-secret",
