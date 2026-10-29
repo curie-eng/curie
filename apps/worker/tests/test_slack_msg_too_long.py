@@ -118,12 +118,25 @@ class Slack:
         if len(body["text"].encode()) > self.limit:
             raise refusal()
 
+    def _deduped(self, body):
+        # Slack dedupes chat.postMessage by client_msg_id and answers ok with the
+        # FIRST message's ts even when the text differs (the observation recorded in
+        # SlackReplyAdapter._adopt_posted_ts). That happens before any length check.
+        key = body.get("client_msg_id")
+        if key in self.created:
+            self.calls.append(("post-dedupe", body))
+            return {"ok": True, "ts": self.created[key]["ts"]}
+        return None
+
     async def update(self, **body):
         self._check("update", body)
         self.calls[-1] = ("update-ok", body)
         return {"ok": True, "ts": body["ts"]}
 
     async def post(self, **body):
+        deduped = self._deduped(body)
+        if deduped is not None:
+            return deduped
         self._check("post", body)
         self.calls[-1] = ("post-ok", body)
         key = body["client_msg_id"]
@@ -154,6 +167,14 @@ def test_msg_too_long_part_is_redelivered_as_smaller_parts(mode, size, outcomes)
         assert slack.calls[0][0] == "update"
         assert [m for m, _ in slack.calls if m.endswith("-ok")][0] == "update-ok"
         assert "".join(delivered) == rendered(text, mode)
+        if mode == "verbatim":
+            originals = [p.content for p in split_verbatim_answer(text)]
+        else:
+            originals = [p.text for p in split_answer(rendered(text, mode))]
+        accepted_whole = {o for o in originals if len(o.encode()) <= 2000}
+        # Every accepted part of a refused original honours the 800 byte resend budget.
+        assert all(len(t.encode()) <= 800 for t in delivered if t not in accepted_whole)
+        assert len(accepted_whole) < len(originals)  # some part was actually refused
         assert MSG_TOO_LONG_NOTICE not in delivered
         assert ("curie.reply.delivery", "success") in outcomes
         assert ("curie.reply.delivery", "failure") not in outcomes
@@ -202,6 +223,58 @@ def test_retry_after_partial_smaller_delivery_reuses_every_smaller_key():
         assert len(texts) == len(set(texts))
         placeholder = next(body["text"] for m, body in retry.calls if m == "update-ok")
         assert placeholder + "".join(texts) == rendered(text, "mrkdwn")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("reply_ref", ["1.2", None])
+@pytest.mark.parametrize("mode", ["mrkdwn", "verbatim"])
+def test_retry_after_lost_ack_on_later_smaller_piece_does_not_truncate(mode, reply_ref, outcomes):
+    """A dedupe on the refused part's own key must not swallow the retry."""
+
+    async def run():
+        text = prose(12000)
+        if mode == "verbatim":
+            parts = [p.content for p in split_verbatim_answer(text)]
+        else:
+            parts = [p.text for p in split_answer(render(text, None)[0])]
+        budget = slack_sink._MSG_TOO_LONG_RESEND_BYTES
+
+        def pieces(part):
+            if mode == "verbatim":
+                return [s.content for s in split_verbatim_answer(part, max_bytes=budget)]
+            return [s.text for s in split_answer(part, max_bytes=budget)]
+
+        assert len(parts) >= 3
+        assert all(len(p.encode()) > 2000 for p in parts[:2])
+        # Creates before part 1: part 0's pieces, minus the placeholder edit.
+        before = len(pieces(parts[0])) - (1 if reply_ref is not None else 0)
+        assert len(pieces(parts[1])) >= 2
+        sink = SlackReplyAdapter("xoxb-test")
+        slack = Slack(sink, limit=2000)
+        # Lose the ack on part 1's second smaller piece, after piece 0 was accepted.
+        slack.fail_index = before + 2
+        with pytest.raises(TimeoutError):
+            await emit(sink, event(text, mode, ref=reply_ref))
+        retry_sink = SlackReplyAdapter("xoxb-test")
+        retry = Slack(retry_sink, limit=2000, created=slack.created)
+        await emit(retry_sink, event(text, mode, ref=reply_ref))
+        texts = [body["text"] for body in retry.created.values()]
+        # A part within the limit (the short last one) is accepted whole.
+        expected = [
+            piece
+            for part in parts
+            for piece in (pieces(part) if len(part.encode()) > 2000 else [part])
+        ]
+        placeholder = (
+            [next(body["text"] for m, body in slack.calls if m == "update-ok")]
+            if reply_ref is not None
+            else []
+        )
+        assert placeholder + texts == expected
+        assert len(texts) == len(set(texts))
+        assert "".join(placeholder + texts) == rendered(text, mode)
+        assert ("curie.reply.delivery", "success") in outcomes
 
     asyncio.run(run())
 
