@@ -63,7 +63,7 @@ The `{address}` segment carries the address with only `%` and `/` escaped (`%` a
 decodes the segment once more
 (`apps/api/src/curie_api/routers/state.py::_binding_address`). The callers are
 `apps/worker/src/curie_worker/binding.py::binding_state_path` and
-`cli/src/api.rs::binding_address_segment`. The server decodes the request path before
+`cli/src/api.rs` (its `binding_address_segment` function). The server decodes the request path before
 it routes, so an address encoded only once loses its escapes there, and one holding a
 `/`, such as a GitHub `owner/name`, splits into two segments.
 
