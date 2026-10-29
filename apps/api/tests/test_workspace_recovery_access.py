@@ -118,9 +118,7 @@ def _store_proxy(upstream: str) -> Iterator[StoreProxy]:
                 )
                 response = connection.getresponse()
                 self.send_response(response.status)
-                for key, value in response.getheaders():
-                    if key.lower() not in {"connection", "transfer-encoding"}:
-                        self.send_header(key, value)
+                self.send_header("Content-Type", "application/octet-stream")
                 self.end_headers()
                 if mode == "body" and not proxy.release.wait(15):
                     return
