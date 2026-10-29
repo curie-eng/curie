@@ -1481,6 +1481,20 @@ def test_renewal_and_late_start_revalidate_granted_binding(
     assert datetime.fromisoformat(grant["wait_deadline"]) == datetime.fromisoformat(
         before["wait_deadline"]
     )
+    settle_seconds = run.kubectl(
+        "-n",
+        run.namespace,
+        "exec",
+        "deployment/curie-api",
+        "--",
+        "python",
+        "-c",
+        "from curie_api.config import get_settings; "
+        "print(get_settings().factory_base_label_settle_s)",
+    )
+    assert int(settle_seconds.strip()) == 0, (
+        "the admitted-agent fixture API did not consume a zero base-label settle interval"
+    )
     run.api(
         "DELETE", query_path(
             f"/agents/{ticket.agent.id}/channels", kind="github", address=REPOSITORY
