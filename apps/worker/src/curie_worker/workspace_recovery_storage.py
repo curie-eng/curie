@@ -524,7 +524,7 @@ class RecoveryCheckpointWriter:
         except _CaptureFailure as failure:
             cancel.set()
             failure.retract = may_retract()
-            result = await self._failed(request, reservation, set(declarations), failure)
+            result = await self._failed(request, reservation, set(declarations), failure, fence)
         except Exception:  # noqa: BLE001 - typed fault boundary
             cancel.set()
             code: FailureCode = "ledger_unavailable" if reservation is None else "upload_failed"
@@ -533,6 +533,7 @@ class RecoveryCheckpointWriter:
                 reservation,
                 set(declarations),
                 _CaptureFailure(code, retract=may_retract()),
+                fence,
             )
         finally:
             cancel.set()
@@ -713,15 +714,33 @@ class RecoveryCheckpointWriter:
         reservation: dict[str, Any] | None,
         declared: set[str],
         failure: _CaptureFailure,
+        fence: Fence | None,
     ) -> RecoveryCaptureResult:
         if reservation is None:
             return RecoveryCaptureResult("failed", None, failure.code, failure.refusal)
         checkpoint_id = _checkpoint_id(reservation)
+
+        async def settle() -> bool:
+            # One rule for every retract-eligible failure (a reservation this call
+            # created, with a ``complete`` sent) whose lease was not already lost:
+            # re-run the fence. A passing fence proves ownership was continuous from
+            # acquisition through now, covering any commit, so the original reason
+            # goes without ``retract`` and a complete checkpoint stands. A failing or
+            # unanswerable fence means a commit may have landed without ownership.
+            if failure.retract and failure.code != "lease_lost":
+                try:
+                    await _fenced(fence)
+                except _CaptureFailure:
+                    failure.code = "lease_lost"
+                else:
+                    failure.retract = False
+            return await self._cleanup(request, reservation, declared, failure)
+
+        # Accepted residual: an asyncio.CancelledError (shutdown) during an in-flight
+        # ``complete`` bypasses this cleanup. It only happens while this process still
+        # holds the lease; the ledger's staging rows are what the collector acts on.
         try:
-            cleanup_complete = await asyncio.wait_for(
-                self._cleanup(request, reservation, declared, failure),
-                self._cleanup_budget,
-            )
+            cleanup_complete = await asyncio.wait_for(settle(), self._cleanup_budget)
         except Exception:  # noqa: BLE001 - typed fault boundary
             cleanup_complete = False
         return RecoveryCaptureResult(
@@ -737,8 +756,8 @@ class RecoveryCheckpointWriter:
     ) -> bool:
         """Tombstone the reservation, then discard exactly the keys this capture declared.
 
-        Only a failure carrying ``retract`` (this call's own completion returned,
-        then its fence failed) asks the ledger to withdraw a complete checkpoint.
+        Only a failure carrying ``retract`` (this call sent its own completion and
+        its fence then failed) asks the ledger to withdraw a complete checkpoint.
         A ``retracted`` answer, including a repeated fail on a checkpoint that was
         once complete, discards nothing.
 

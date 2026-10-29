@@ -699,8 +699,10 @@ async def _release_with_recovery(self: Kernel, run: WorkItemRun, claim_name: str
                     thread_key,
                 )
             await fence()
-            release_ran = True
             await _release_claim(self, thread_key, claim_name)
+            # Set only once the release returned: a raise inside it, even under a
+            # valid lease, takes the reacquire-and-release path below.
+            release_ran = True
     except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
         if not entered:
             logger.warning(
