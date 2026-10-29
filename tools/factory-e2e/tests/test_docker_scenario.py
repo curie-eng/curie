@@ -1311,9 +1311,11 @@ sys.exit(code)
 # daemon-service.json, runner-pod.json) by namespace and name, serves the client
 # Secret one jsonpath key at a time from the test's FAKE_SECRET file, and runs every
 # `exec ... -- sh -c SCRIPT` for real with the dockerd shims below first on PATH and
-# TMPDIR under the test's tmp_path, so the staging, the private mount and the
-# removal scripts execute and their effects can be observed. It appends kubectl's
-# "command terminated" line on a nonzero exec, as the real CLI does.
+# the container's /tmp mapped under the test's tmp_path (in the script's arguments and
+# as TMPDIR), so the staging, the private mount and the removal scripts execute and
+# their effects can be observed. It appends kubectl's "command terminated" line on a
+# nonzero exec, as the real CLI does. FAKE_STAGE_ACK_FAIL lets the staging run and
+# then drops its result, exiting nonzero with no stdout, as a lost exec stream does.
 FAKE_KUBECTL = r"""
 import io, json, os, subprocess, sys, tarfile
 from pathlib import Path
@@ -1361,9 +1363,16 @@ if rest[:1] == ["exec"] and "--" in rest:
     if os.environ.get("FAKE_CLEANUP_FAIL") and command[2].startswith("rm -rf"):
         busy = f"rm: can't remove '{command[-1]}': Resource busy"
         fail(busy + "\ncommand terminated with exit code 1")
-    env = dict(os.environ, TMPDIR=os.environ["FAKE_DOCKERD_TMP"])
+    tmp = os.environ["FAKE_DOCKERD_TMP"]
+    command = command[:4] + [tmp + t[4:] if t.startswith("/tmp/") else t for t in command[4:]]
+    env = dict(os.environ, TMPDIR=tmp)
     env["PATH"] = os.environ["FAKE_DOCKERD_BIN"] + os.pathsep + env["PATH"]
     proc = subprocess.run(command, input=data, capture_output=True, env=env)
+    if stdin and os.environ.get("FAKE_STAGE_ACK_FAIL"):
+        made = sorted(os.listdir(command[4])) if proc.returncode == 0 else None
+        with open(os.environ["FAKE_DOCKERD_LOG"], "a") as log:
+            log.write(json.dumps({"dropped": made}) + "\n")
+        fail("error: unexpected EOF reading the exec stream")
     sys.stdout.buffer.write(proc.stdout)
     sys.stderr.buffer.write(proc.stderr)
     if proc.returncode:
@@ -1501,6 +1510,7 @@ class FakeCluster:
             self.monkeypatch.setenv(env, str(RAW / name))
         self.secret({key: _b64(text) for key, text in self.pems.items()})
         self.monkeypatch.delenv("FAKE_CLEANUP_FAIL", raising=False)
+        self.monkeypatch.delenv("FAKE_STAGE_ACK_FAIL", raising=False)
 
     def secret(self, data: dict[str, str]) -> None:
         body = {"namespace": RUNNER_NAMESPACE, "name": CLIENT_SECRET, "data": data}
@@ -1520,6 +1530,12 @@ class FakeCluster:
 
     def leftovers(self) -> list[str]:
         return sorted(p.name for p in self.tmp.iterdir())
+
+    def mapped(self, directory: str) -> Path:
+        """Where the fake keeps a dockerd container path under /tmp."""
+
+        assert directory.startswith("/tmp/"), directory
+        return self.tmp / directory.removeprefix("/tmp/")
 
 
 @pytest.fixture
@@ -1752,6 +1768,14 @@ def test_collect_replays_recordings(
         assert call[call.index("-c") + 1] == "dockerd", call
         assert DAEMON_NAME in call[: call.index("--")]
     assert "-i" in execs[0][: execs[0].index("--")]
+    scripts = [c[c.index("--") + 3] for c in execs]
+    assert scripts == [docker_scenario.COLLECT_STAGE] + [docker_scenario.COLLECT_RUN] * 2 + [
+        docker_scenario.COLLECT_REMOVE
+    ]
+    directory = execs[0][-2]
+    assert re.fullmatch(r"/tmp/curie-collect-[0-9a-f]{32}", directory), directory
+    assert execs[0][-1] == DAEMON_SERVER.rsplit(":", 1)[0]
+    assert [c[c.index("--") + 5] for c in execs[1:]] == [directory] * 3
     events = next(c for c in execs if "events" in c)
     assert events[events.index("--since") + 1] == "1792669432"
     assert events[events.index("--until") + 1] == "1792669451"
@@ -1768,11 +1792,12 @@ def test_collect_replays_recordings(
     assert [d["docker"][9] for d in dockers] == ["info", "events"]
     for record in dockers:
         argv = record["docker"]
-        directory = mounts[0]["mount"][1].removesuffix("/hosts")
+        local = str(cluster.mapped(directory))
+        assert all(m["mount"][1] == f"{local}/hosts" for m in mounts)
         assert argv[:9] == [
             "-H", f"tcp://{DAEMON_SERVER}", "--tlsverify",
-            "--tlscacert", f"{directory}/ca.pem", "--tlscert", f"{directory}/cert.pem",
-            "--tlskey", f"{directory}/key.pem",
+            "--tlscacert", f"{local}/ca.pem", "--tlscert", f"{local}/cert.pem",
+            "--tlskey", f"{local}/key.pem",
         ]  # fmt: skip
         assert record["sha256"] == {
             "ca": _sha(client_pems["ca.pem"]),
@@ -2014,7 +2039,42 @@ def test_collect_reports_both_a_refusal_and_a_failed_removal(
     assert "staged credentials not removed" in err
 
 
-@pytest.mark.parametrize("fault", ["malformed", "foreign", "mismatch", "removal"])
+def test_collect_removes_the_staged_directory_when_the_staging_ack_is_lost(
+    tmp_path: Path,
+    fake_bin: Path,
+    cluster: FakeCluster,
+    client_pems: dict[str, str],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FAKE_STAGE_ACK_FAIL", "1")
+    with pytest.raises(docker_scenario.CommandError) as exc:
+        docker_scenario.collect(
+            "scratch-ctx", DAEMON_NAMESPACE, DAEMON_NAME, RUNNER_NAMESPACE, RUNNER_POD,
+            NONCE, "1792669432", "1792669451",
+        )  # fmt: skip
+    assert "unexpected EOF" in str(exc.value)
+    _no_material([str(exc.value)], client_pems)
+    execs = _execs(_logged(fake_bin))
+    scripts = [c[c.index("--") + 3] for c in execs]
+    assert scripts == [docker_scenario.COLLECT_STAGE, docker_scenario.COLLECT_REMOVE]
+    directory = execs[0][-2]
+    assert execs[1][-1] == directory
+    # The stage really ran and created the directory before its result was dropped.
+    records = cluster.records()
+    assert [r["staged"] for r in records if "staged" in r] == [
+        [[key, 0o600, True] for key in CLIENT_KEYS]
+    ]
+    assert [r["dropped"] for r in records if "dropped" in r] == [sorted([*CLIENT_KEYS, "hosts"])]
+    assert not cluster.mapped(directory).exists()
+    assert cluster.leftovers() == []
+
+    err = _refused(tmp_path, capsys, client_pems)
+    assert "unexpected EOF" in err and "not removed" not in err
+    assert cluster.leftovers() == []
+
+
+@pytest.mark.parametrize("fault", ["malformed", "foreign", "mismatch", "removal", "stage-ack"])
 def test_collect_recovers_after_a_refused_run(
     tmp_path: Path,
     cluster: FakeCluster,
@@ -2032,6 +2092,8 @@ def test_collect_recovers_after_a_refused_run(
         cluster.secret({**data, "cert.pem": _b64(foreign_pems["cert.pem"])})
     elif fault == "mismatch":
         cluster.edit("runner-pod", MISMATCHES["runner-names-another-claim"][1])
+    elif fault == "stage-ack":
+        monkeypatch.setenv("FAKE_STAGE_ACK_FAIL", "1")
     else:
         monkeypatch.setenv("FAKE_CLEANUP_FAIL", "1")
     _refused(tmp_path, capsys, client_pems, foreign_pems)

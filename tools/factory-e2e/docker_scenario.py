@@ -174,13 +174,16 @@ KEY_PEM = re.compile(
     r"-----BEGIN ([A-Z]+ )?PRIVATE KEY-----\n[A-Za-z0-9+/=\n]+-----END ([A-Z]+ )?PRIVATE KEY-----"
 )
 CLIENT_PEM = {"ca.pem": CERT_PEM, "cert.pem": CERT_PEM, "key.pem": KEY_PEM}
-# Run in the dockerd container with the client files as a tar on stdin and the daemon's
-# Service name as $1: a private directory holding them and a hosts file naming the
-# Service as 127.0.0.1. Prints the directory; removes it on any later failure.
+# Run in the dockerd container with the client files as a tar on stdin, $1 the
+# directory the collector chose (STAGE_DIR) and $2 the daemon's Service name: creates
+# exactly that private directory, failing if it already exists, holding the files and
+# a hosts file naming the Service as 127.0.0.1. Removes it on any failure after the
+# mkdir. The collector knows the path before staging, so it can remove it whatever
+# the staging outcome, including a lost acknowledgement.
 COLLECT_STAGE = (
-    "umask 077 && d=$(mktemp -d) || exit 1; "
-    'if tar -x -f - -C "$d" && printf \'127.0.0.1 %s\\n\' "$1" > "$d/hosts"; '
-    'then printf \'%s\\n\' "$d"; else rm -rf -- "$d"; exit 1; fi'
+    'umask 077 && mkdir -- "$1" || exit 1; '
+    'if tar -x -f - -C "$1" && printf \'127.0.0.1 %s\\n\' "$2" > "$1/hosts"; '
+    'then exit 0; else rm -rf -- "$1"; exit 1; fi'
 )
 # $1 the staged directory, $2 HOST:PORT, then the docker argv. In a private mount
 # namespace the staged hosts file covers /etc/hosts, so the Service name reaches the
@@ -192,7 +195,8 @@ COLLECT_RUN = (
     ' --tlscacert "$d/ca.pem" --tlscert "$d/cert.pem" --tlskey "$d/key.pem" "$@"\' "$d" "$@"'
 )
 COLLECT_REMOVE = 'rm -rf -- "$1" && test ! -e "$1"'
-STAGED_DIR = re.compile(r"/[^\s'\"\\]+")
+# The staging directory in the dockerd container, with a random 128-bit component.
+STAGE_DIR = "/tmp/curie-collect-{token}"
 
 EPILOG = """\
 envelope (docker-scenario/v1) sections:
@@ -1304,14 +1308,12 @@ def collect(
         files[key] = _client_file(secret, key, data)
 
     dockerd = ["exec", pod, "-c", "dockerd", "--", "sh", "-c"]
-    stage = ["exec", "-i", pod, "-c", "dockerd", "--", "sh", "-c", COLLECT_STAGE, "sh", host]
-    staged = kubectl(namespace, stage, input=_client_tar(files)).splitlines()
-    if len(staged) != 1 or not STAGED_DIR.fullmatch(staged[0]):
-        raise CommandError("staging in the dockerd container printed no usable directory")
-    directory = staged[0]
+    directory = STAGE_DIR.format(token=secrets.token_hex(16))
+    stage = ["exec", "-i", pod, "-c", "dockerd", "--", "sh", "-c", COLLECT_STAGE, "sh"]
     docker = [*dockerd, COLLECT_RUN, "sh", directory, f"{host}:{port}"]
     failure: BaseException | None = None
     try:
+        kubectl(namespace, [*stage, directory, host], input=_client_tar(files))
         info = kubectl(namespace, [*docker, "info", "--format", INFO_FORMAT])
         events = kubectl(
             namespace,
