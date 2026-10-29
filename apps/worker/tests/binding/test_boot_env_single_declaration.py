@@ -194,6 +194,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_WORKSPACE_MAX_COMPRESSION_RATIO",
         "CURIE_WORKSPACE_REFERENCE_TTL_SECONDS",
         "CURIE_WORKSPACE_MAX_CONCURRENT_CLONES",
+        # The worker's recovery collector switch and pass interval (ADR 0251);
+        # the API reads the same enable switch. Neither reaches the sandbox.
+        "CURIE_WORKSPACE_RECOVERY_ENABLED",
+        "CURIE_WORKSPACE_RECOVERY_COLLECT_INTERVAL_S",
         # WorkspaceClaimCoordinator injects these exact-object handoff values
         # into a claim for the workspace-init container
         # to consume. They are substrate-local delivery inputs, not fields read

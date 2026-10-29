@@ -1232,8 +1232,26 @@ have a 60-second completion deadline and 600-second staging lifetime.
 `acquire-reader` and `release-reader` manage at most eight readers per WorkItem,
 each bounded to 300 seconds. Two-phase metadata collection uses `claim-collection`
 to fence eligible objects against readers, then `finalize-collection` after deletion.
-This slice supplies metadata and the client only: terminal capture, object
-transfer and deletion, and restoration are not wired.
+
+`curie_worker.workspace_recovery_storage` moves recovery objects. They live in the
+private workspace bucket under `private/workspace-recovery/`, a subtree disjoint
+from claim objects, so releasing a claim never deletes them. The checkpoint writer
+reserves capacity before any upload, uploads each object by explicit multipart
+upload within a 60-second aggregate budget, verifies the stored size and SHA-256
+by HEAD and a full read-back, and only then completes the checkpoint. A failed or
+late capture gets five seconds of foreground cleanup: a ledger `fail`, then, only
+once the tombstone is confirmed, multipart abort and deletion of the keys it
+declared. Anything left stays staging until the collector removes it. The reader holds a non-renewable reader lease and signs a
+GET for exactly one object, expiring at the lesser of
+`CURIE_WORKSPACE_REFERENCE_TTL_SECONDS` and the lease's remaining time, then
+streams and verifies the download. When `CURIE_WORKSPACE_RECOVERY_ENABLED` is set
+on the worker and the internal worker token is present, the worker supervises the
+`workspace-recovery-gc` collector every
+`CURIE_WORKSPACE_RECOVERY_COLLECT_INTERVAL_S` seconds (default 30): it claims
+eligible objects, deletes them outside any lock, and finalizes each claim, so a
+collector interrupted between deletion and finalization repeats both after
+restart. Logs carry ids, kinds, sizes and typed codes only. Capture call sites in
+the run path and restoration are not wired yet.
 
 ### Retained thread attachments
 
