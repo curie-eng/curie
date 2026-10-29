@@ -231,6 +231,7 @@ class TurnOutcome:
     tools_called: frozenset[str] = frozenset()
     assistant_text: str = ""
     continued: bool = False
+    workspace_stage_timeout: bool = False
 
 
 class _FactoryExecutionEnded(Exception):

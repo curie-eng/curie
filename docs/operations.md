@@ -1896,8 +1896,8 @@ Capacity wait expiry is visible as `expired` / `capacity_wait_expired` on
 `GET /v1/internal/work-items/requests/{id}`. It is not written to the
 dead-letter graveyard.
 
-A delivery whose sandbox did not start defers with a `not_started` reason on
-the same backoff curve as capacity, counted separately. Only `not_started`
+Counted pre-start failures defer with a `not_started` reason on the same
+backoff curve as capacity, counted separately. Only `not_started`
 defers count toward the limit. The one that reaches
 `CURIE_WORK_ITEM_START_DEFERRAL_LIMIT` ends the request as `failed` /
 `start_failed`, frees its quota slot, and names the attempt count and the last
@@ -1905,6 +1905,11 @@ deferral reason on the status comment. Every other non-capacity defer is a
 wait rather than a failed start, such as `thread_busy` while another turn holds
 the work item's thread: it waits `CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS` and
 never counts.
+
+A structural workspace stage timeout defers as `workspace_stage_timeout`,
+using the flat base backoff without charging start or capacity deferrals.
+The SQL wait retains its original deadline and bounded stage diagnostic.
+Other workspace preparation faults keep the counted `not_started` behavior.
 
 Each factory execution request owns exactly one App-authored status comment.
 The reconciler creates it on its first pass after admission and then edits it

@@ -78,6 +78,7 @@ from ..workitem_dispatch import (
 from ..workspace import (
     WorkspacePreparationError,
     WorkspaceSelectionRefused,
+    WorkspaceStageTimeout,
 )
 
 if TYPE_CHECKING:
@@ -545,6 +546,7 @@ async def _attempt_turn(
         return failures.TurnOutcome(
             terminal_ok=False,
             classification="workspace-error",
+            workspace_stage_timeout=isinstance(exc, WorkspaceStageTimeout),
             error_message=" ".join(redact_text(str(exc)).split())[
                 : constants._ESCALATION_DETAIL_MAX
             ],
