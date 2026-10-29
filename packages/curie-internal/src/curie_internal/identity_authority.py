@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, Never, Self
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, model_validator
 
 from curie_internal.identity_context import (
     CanonicalUUID,
@@ -85,3 +85,20 @@ class TurnAuthorityResponseV1(_Observation):
         if self.reason not in reasons[self.decision]:
             raise ValueError("invalid_turn_authority_decision")
         return self
+
+
+class BindingClassificationRequestV1(_Observation):
+    """@spec HTTP-INVOCATION-EXECUTION-22."""
+
+    schema_version: Version
+    request_id: CanonicalUUID
+    scope: TurnAuthorityScopeV1
+
+
+class BindingClassificationResponseV1(_Observation):
+    """Classification, not permission. @spec HTTP-INVOCATION-EXECUTION-22."""
+
+    schema_version: Version
+    request_id: CanonicalUUID
+    scope: TurnAuthorityScopeV1
+    http_identity_required: StrictBool

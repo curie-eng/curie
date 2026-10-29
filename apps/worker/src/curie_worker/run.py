@@ -535,7 +535,6 @@ def build(
         snapshot_patch_max_bytes=config.publication_patch_max_bytes,
     )
     owner.register_close("runner", runner.close, order=10)
-    binding = BindingResolver(engine, config)
     workspace_s3 = build_s3_client(
         endpoint_url=config.s3_endpoint_url,
         access_key=config.s3_access_key,
@@ -606,6 +605,16 @@ def build(
     # eval-lane reporters below; httpx.AsyncClient is task-safe.
     eval_http = httpx.AsyncClient(timeout=30.0)
     owner.register_close("eval-http", eval_http.aclose, order=30)
+    # @spec HTTP-INVOCATION-EXECUTION-18/22: one client answers the kernel's
+    # current checks and the binding owner's per-identity classification.
+    identity_authority = (
+        HttpTurnAuthorityClient(
+            api_base_url=config.api_base_url, worker_token=config.internal_worker_token,
+            client=eval_http,
+        )
+        if config.internal_worker_token else None
+    )
+    binding = BindingResolver(engine, config, identity_classifier=identity_authority)
     recovery_gc: RecoveryCollector | None = None
     recovery_capture: WorkspaceRecoveryCapture | None = None
     if config.workspace_recovery_enabled and config.internal_worker_token:
@@ -750,13 +759,7 @@ def build(
         markers=Markers(async_redis, config),
         config=config,
         binding=binding,
-        identity_authority=(
-            HttpTurnAuthorityClient(
-                api_base_url=config.api_base_url, worker_token=config.internal_worker_token,
-                client=eval_http,
-            )
-            if config.internal_worker_token else None
-        ),
+        identity_authority=identity_authority,
         workspace=workspace,
         recovery=recovery_capture,
         attachments=attachments,

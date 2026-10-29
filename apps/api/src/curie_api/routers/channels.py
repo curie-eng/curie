@@ -104,9 +104,9 @@ from ..delivery import (
 )
 from ..deps import SessionDep
 from ..identity import connect
-from ..identity.http_invocation import current_http_invocation
+from ..identity.http_invocation import binding_requires_http_identity, current_http_invocation
 from ..identity.slack import SlackEvidence
-from ..models import AgentChannel, TenantIdentityProvider
+from ..models import AgentChannel
 from ..wirebody import read_bounded_body
 from .identity_connect import public_api_prefix
 
@@ -680,13 +680,12 @@ async def ingest_turn(
         raise _unroutable(body.kind, body.address)
 
     # @spec HTTP-INVOCATION-EXECUTION-2 HTTP-INVOCATION-EXECUTION-3
-    # SQL presence keeps corrupt JSON null out of the legacy authorization path.
-    http_mode = await session.scalar(
-        select(TenantIdentityProvider.http_selection.is_not(None)).where(
-            TenantIdentityProvider.tenant_id == row.tenant_id,
-        )
+    # HTTP-INVOCATION-EXECUTION-22: the binding's registered identity, not the
+    # tenant alone, selects this lane; a supplied proof always enters it.
+    http_mode = await binding_requires_http_identity(
+        session, getattr(request.app.state, "http_identity_runtime", None), row,
     )
-    if http_mode is True or x_curie_receiver_proof is not None:
+    if http_mode or x_curie_receiver_proof is not None:
         if claims is None or not x_curie_receiver_proof:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_http_receiver")
         # @spec HTTP-INVOCATION-EXECUTION-4/15: external lookup holds no reader.
