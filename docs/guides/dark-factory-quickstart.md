@@ -66,13 +66,9 @@ builds and other toolchains need the setup described in the
 | A GitHub account | your own GitHub App and the trial repository |
 
 For the default new-kind path on Docker Desktop, plan for **at least 16 GiB
-allocated to Docker** before creating the cluster. The factory work pod
-requests 8 GiB by default, in addition to the Curie services and Kubernetes
-overhead. A trial on a 7.75 GiB Docker VM could install Curie and publish an
-App link but could not schedule the work pod. The 16 GiB allowance is based on
-those resource requests, not a benchmark or a guaranteed minimum. For an
-existing cluster, check its node allocatable memory and other workloads rather
-than using the Docker Desktop figure. See [local kind capacity and recovery](#local-kind-capacity-and-recovery).
+allocated to Docker** before creating the cluster. Larger repositories may
+need more. For an existing cluster, check its available capacity instead.
+See [local kind capacity and recovery](#local-kind-capacity-and-recovery).
 
 The command checks all required tools on `PATH` before running any command or
 changing the cluster. If tools are missing, it lists every missing tool with
@@ -981,33 +977,19 @@ For a Pending `curie-thread-...` pod, run
 `kubectl describe pod -n "$CURIE_NAMESPACE" POD_NAME` (replace `POD_NAME` with
 the name shown above) and read its Events. An `Insufficient memory` event
 means the scheduler cannot place that pod; waiting longer does not
-increase node capacity. The default factory work pod requests 8 GiB, while
-Curie's other workloads also reserve memory. In the released-version local
-trial, a 7.75 GiB Docker VM left that pod Pending. Plan for at least 16 GiB in
-Docker Desktop for the default path, then recreate the disposable cluster and
-repeat the [first](#choose-the-target-and-run-the-command) and
+increase node capacity. Increase Docker Desktop's memory allocation to at
+least 16 GiB and recreate the disposable cluster. Alternatively, select a
+Kubernetes cluster with more available capacity. Then repeat the
+[first](#choose-the-target-and-run-the-command) and
 [second](#rerun-with-the-app) commands. Reuse an App already installed on the
 trial repository; cluster recreation does not require another App.
 
-For a deliberately small test repository on a smaller node, you can set
-per-agent runner resources instead. The following 2 GiB request and 6 GiB
-limit allowed one small Python trial to run; it is **not** a validated size for
-larger builds, which may run out of memory or disk:
-
-```bash
-curie cluster overrides dark-factory --context "$CURIE_CONTEXT" \
-  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" \
-  --runner-resources \
-  '{"requests":{"cpu":"500m","memory":"2Gi","ephemeral-storage":"2Gi"},"limits":{"cpu":"2","memory":"6Gi","ephemeral-storage":"8Gi"}}'
-```
-
-The existing Pending claim keeps its old resources. If it has not published
-a PR, remove `curie-factory` from the issue, wait for the status comment to
-report cancellation, then add the label again. Confirm a **new** work pod
-starts and the issue moves from queued to running. Relabelling can start a
-new model run and incur another charge; inspect the issue and PR first.
-For larger work, size the agent from measured usage as in the
-[bundle reference](../../examples/dark-factory/README.md#deploy-it-as-the-factory-agent).
+If the issue is still queued after the new cluster is ready, remove
+`curie-factory` from the issue, wait for the status comment to report
+cancellation, then add the label again. Confirm the issue moves to running.
+Relabelling can start a new model run and incur another charge; inspect the
+issue and PR first. Administrators sizing agents for larger workloads can use
+the [bundle reference](../../examples/dark-factory/README.md#deploy-it-as-the-factory-agent).
 
 ## What a repository with no CI sees
 

@@ -35,7 +35,7 @@ their limits.
 | Before setup | What to expect |
 |---|---|
 | Host | Released CLI assets support Linux x86_64, Linux arm64, and Apple silicon macOS. The quickstart has no Intel macOS asset. |
-| Cluster | Kubernetes with `kubectl` and Helm; Docker and kind v0.24+ are needed only if quickstart must create a local cluster. Review the selected context before installing. For the default local kind trial, plan for at least 16 GiB in Docker Desktop: the work pod requests 8 GiB plus Curie's other workloads. See [local capacity and recovery](guides/dark-factory-quickstart.md#local-kind-capacity-and-recovery). |
+| Cluster | Kubernetes with `kubectl` and Helm; Docker and kind v0.24+ are needed only if quickstart must create a local cluster. Review the selected context before installing. For a local kind trial, allocate at least 16 GiB to Docker Desktop; larger repositories may need more. See [local capacity and recovery](guides/dark-factory-quickstart.md#local-kind-capacity-and-recovery). |
 | Model | An Anthropic or OpenRouter credential, with available provider credit. Implementation and review use separately configured models. |
 | Repository | A small repository with an initial commit and a bounded issue. GitHub and Jira Cloud with GitHub need a GitHub App installed on the repository. GitLab needs an active token with `api` and `write_repository` scopes and Developer access or higher. |
 | Tracker authority | GitHub requires a permitted user with repository write or admin access; GitLab requires Developer access or higher. Jira Cloud requires an explicit account or group allowed to start work, plus the factory account's project permissions. |

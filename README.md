@@ -109,10 +109,9 @@ Before starting, check that you have a supported released CLI, Docker and kind,
 `kubectl`, Helm, a model credential with available credit, and permission to
 create and install a GitHub App on the repository. For the default local kind
 trial, plan for **at least 16 GiB allocated to Docker Desktop**: the factory
-work pod requests 8 GiB on its own, and Curie's services also need memory. A
-7.75 GiB Docker VM left the work pod Pending with `Insufficient memory` in a
-released-version trial. The 16 GiB figure is a planning allowance, not a
-measured minimum for every host. See the [capacity and recovery details](docs/guides/dark-factory-quickstart.md#local-kind-capacity-and-recovery).
+trial. Larger repositories may need more. If you use an existing Kubernetes
+cluster, check its available capacity instead. See the
+[capacity and recovery details](docs/guides/dark-factory-quickstart.md#local-kind-capacity-and-recovery).
 Expect a reviewable PR or a stated failure reason, then inspect the final
 issue status after CI handling. Allow variable setup time plus about 190
 minutes of configured waiting windows; this is not a measured completion
