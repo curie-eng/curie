@@ -1,13 +1,15 @@
 # Administering Curie co-workers
 
-Operate a Curie installation with explicit workspace bindings, human approval,
-model settings and visibility into work. Start with the
+Configure the controls for a Curie installation: workspace bindings, human
+approval, model settings, memory, visibility, and stopping work. Start with the
 [Software Factory](software-factory.md), then apply these controls to other
 supported [co-workers](co-workers.md).
 
-See the [capability reference](capabilities.md) for supported controls and the
-[operations guide](operations.md) for complete procedures. Check the help for
-your installed CLI before applying a configuration change.
+For the ordered path from cluster readiness through installation, verification,
+and recovery, use the [production operator journey](production-operations.md).
+The [operations guide](operations.md) holds the detailed cluster procedures.
+See the [capability reference](capabilities.md) for supported controls and limits.
+Check the help for your installed CLI before applying a configuration change.
 
 ## Own the installation and its external connections
 
