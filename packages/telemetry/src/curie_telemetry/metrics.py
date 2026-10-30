@@ -527,6 +527,9 @@ _HTTP_OPERATIONS = [
     "/work-items/issue-read",
     "/work-items/{work_item_id}",
     "/work-items/{work_item_id}/usage",
+    "/work-items/{work_item_id}/recovery",
+    "/work-items/{work_item_id}/recovery/{checkpoint_id}",
+    "/work-items/{work_item_id}/recovery/{checkpoint_id}/objects/{kind}",
     "unmatched",
 ]
 _HTTP_ATTRIBUTES = {

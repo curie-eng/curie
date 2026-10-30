@@ -27,6 +27,7 @@ from curie_telemetry import (
 from fastapi import FastAPI, HTTPException, Request
 from opentelemetry.trace import SpanKind, StatusCode
 from starlette.routing import Match
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from curie_api.crud import agents as crud_agents
 
@@ -118,6 +119,7 @@ from .routers import (
     work_item_outcomes,
     work_items,
     workspace_recovery,
+    workspace_recovery_access,
     workspaces,
 )
 from .schema_compat import assert_servable
@@ -526,6 +528,77 @@ def _metric_http_method(method: str) -> str:
     return normalized if normalized in _HTTP_METHOD_DOMAIN else "OTHER"
 
 
+class HttpTelemetryMiddleware:
+    def __init__(self, app: ASGIApp, *, application: FastAPI) -> None:
+        self.app = app
+        self.application = application
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope)
+        operation = _route_template(self.application, request)
+        inbound_traceparent = request.headers.get(TRACEPARENT_STREAM_FIELD)
+        canonical_traceparent = canonicalize_traceparent(inbound_traceparent)
+        parent = extract_trace_context(
+            {TRACEPARENT_STREAM_FIELD: canonical_traceparent}
+            if canonical_traceparent is not None
+            else {}
+        )
+        diagnostic = (
+            "trace.context.missing"
+            if inbound_traceparent is None
+            else "trace.context.malformed"
+            if canonical_traceparent is None
+            else None
+        )
+        active_attributes = {
+            "service.name": "curie-api",
+            "operation": operation,
+            "role": "server",
+            "source": _metric_http_method(request.method),
+        }
+        started = time.monotonic()
+        status_code = 500
+        record_metric("curie.http.server.active", 1, attributes=active_attributes)
+        try:
+            with operation_span(
+                "http.server.request",
+                kind=SpanKind.SERVER,
+                parent=parent,
+                attributes=active_attributes,
+            ) as span:
+                if diagnostic is not None:
+                    span.add_event(diagnostic)
+
+                async def observe_send(message: Message) -> None:
+                    nonlocal status_code
+                    if message["type"] == "http.response.start":
+                        status_code = message["status"]
+                        if status_code >= 500 and hasattr(span, "set_status"):
+                            span.set_status(StatusCode.ERROR)
+                        _LOG.info(
+                            "http request completed method=%s route=%s status_class=%s",
+                            _metric_http_method(request.method),
+                            operation,
+                            f"{status_code // 100}xx",
+                        )
+                    await send(message)
+
+                await self.app(scope, receive, observe_send)
+        finally:
+            outcome = f"{status_code // 100}xx" if 100 <= status_code < 600 else "5xx"
+            completed_attributes = {**active_attributes, "outcome": outcome}
+            record_metric("curie.http.server.request", attributes=completed_attributes)
+            record_metric(
+                "curie.http.server.request.duration",
+                time.monotonic() - started,
+                attributes=completed_attributes,
+            )
+            record_metric("curie.http.server.active", -1, attributes=active_attributes)
+
+
 # @spec HTTP-INVOCATION-EXECUTION-15
 def create_app(
     *, http_identity_runtime: HttpInvocationRuntime | None = None,
@@ -653,6 +726,7 @@ def create_app(
     app.include_router(cluster_message_replies.router)
     app.include_router(cluster_message_replies.internal_router)
     app.include_router(workspace_recovery.router)
+    app.include_router(workspace_recovery_access.router)
     app.include_router(workspaces.router)
     app.include_router(channels.router)
     app.include_router(provider_installations.router)
@@ -672,62 +746,7 @@ def create_app(
     # @spec IDENTITY-WRITER-LIFETIME-V1-8. Telemetry stays outside preparation.
     app.add_middleware(IdentityFenceMiddleware)
 
-    @app.middleware("http")
-    async def observe_http(request: Request, call_next):  # type: ignore[no-untyped-def]
-        operation = _route_template(app, request)
-        inbound_traceparent = request.headers.get(TRACEPARENT_STREAM_FIELD)
-        canonical_traceparent = canonicalize_traceparent(inbound_traceparent)
-        parent = extract_trace_context(
-            {TRACEPARENT_STREAM_FIELD: canonical_traceparent}
-            if canonical_traceparent is not None
-            else {}
-        )
-        diagnostic = (
-            "trace.context.missing"
-            if inbound_traceparent is None
-            else "trace.context.malformed"
-            if canonical_traceparent is None
-            else None
-        )
-        active_attributes = {
-            "service.name": "curie-api",
-            "operation": operation,
-            "role": "server",
-            "source": _metric_http_method(request.method),
-        }
-        started = time.monotonic()
-        status_code = 500
-        record_metric("curie.http.server.active", 1, attributes=active_attributes)
-        try:
-            with operation_span(
-                "http.server.request",
-                kind=SpanKind.SERVER,
-                parent=parent,
-                attributes=active_attributes,
-            ) as span:
-                if diagnostic is not None:
-                    span.add_event(diagnostic)
-                response = await call_next(request)
-                status_code = response.status_code
-                if status_code >= 500 and hasattr(span, "set_status"):
-                    span.set_status(StatusCode.ERROR)
-                _LOG.info(
-                    "http request completed method=%s route=%s status_class=%s",
-                    _metric_http_method(request.method),
-                    operation,
-                    f"{status_code // 100}xx",
-                )
-                return response
-        finally:
-            outcome = f"{status_code // 100}xx" if 100 <= status_code < 600 else "5xx"
-            completed_attributes = {**active_attributes, "outcome": outcome}
-            record_metric("curie.http.server.request", attributes=completed_attributes)
-            record_metric(
-                "curie.http.server.request.duration",
-                time.monotonic() - started,
-                attributes=completed_attributes,
-            )
-            record_metric("curie.http.server.active", -1, attributes=active_attributes)
+    app.add_middleware(HttpTelemetryMiddleware, application=app)
 
     return app
 

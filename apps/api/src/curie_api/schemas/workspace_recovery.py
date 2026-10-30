@@ -141,6 +141,38 @@ class RecoveryAcknowledged(RecoveryMessage):
     released: bool = True
 
 
+class RecoveryPublicObject(RecoveryMessage):
+    kind: Literal["base", "patch", "manifest"]
+    size_bytes: Annotated[StrictInt, Field(ge=0, le=9223372036854775807)]
+    sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+class RecoveryPublicCheckpoint(RecoveryMessage):
+    checkpoint_id: uuid.UUID
+    work_item_id: uuid.UUID
+    source_request_id: uuid.UUID
+    repository: RecoveryRepository
+    base_commit: Annotated[str, Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")]
+    target_branch: Annotated[str, Field(min_length=1, max_length=1024, pattern=r"\S")]
+    source_sequence: PositiveInt
+    source_status: BoundedIdentity
+    completed_at: datetime | None
+    expires_at: datetime | None
+    age_seconds: Annotated[float, Field(ge=0)]
+    status: Literal["staging", "complete", "tombstoned"]
+    available: bool
+    total_bytes: Annotated[StrictInt, Field(ge=0)]
+    objects: Annotated[list[RecoveryPublicObject], Field(max_length=3)]
+
+
+class RecoveryPublicList(RecoveryMessage):
+    work_item_id: uuid.UUID
+    repository: RecoveryRepository
+    capture_outcome: BoundedIdentity | None
+    capture_outcome_at: datetime | None
+    checkpoints: Annotated[list[RecoveryPublicCheckpoint], Field(max_length=3)]
+
+
 class RecoveryClaimCollection(RecoveryMessage):
     collector_id: BoundedIdentity
     limit: Annotated[StrictInt, Field(ge=1, le=100)] = 100

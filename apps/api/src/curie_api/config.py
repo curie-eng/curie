@@ -171,6 +171,12 @@ class Settings(BaseSettings):
     workspace_recovery_enabled: bool = Field(
         default=False, validation_alias="CURIE_WORKSPACE_RECOVERY_ENABLED"
     )
+    workspace_bucket: str = Field(
+        default="curie-workspaces", min_length=1, validation_alias="CURIE_WORKSPACE_BUCKET"
+    )
+    workspace_reference_ttl_seconds: int = Field(
+        default=300, ge=1, validation_alias="CURIE_WORKSPACE_REFERENCE_TTL_SECONDS"
+    )
     workspace_recovery_max_bytes: int | None = Field(
         default=None, gt=0, validation_alias="CURIE_WORKSPACE_RECOVERY_MAX_BYTES"
     )

@@ -26,6 +26,7 @@ import redis
 from aci_protocol.s3 import build_s3_client
 from aci_protocol.turn import DEFAULT_IDENTITY
 from aiohttp import web
+from curie_internal.workspace_objects import WorkspaceObjectPort
 from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import bootstrap_service_telemetry, record_metric
 from redis.asyncio import Redis as AsyncRedis
@@ -117,7 +118,6 @@ from .workspace import (
     WorkspaceClaimCoordinator,
     WorkspaceCredentialClient,
     WorkspaceLimits,
-    WorkspaceObjectPort,
     WorkspaceObjectStore,
     WorkspacePreparer,
 )
