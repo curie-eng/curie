@@ -643,7 +643,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1608,
+      "cardinality_bound": 1632,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -881,7 +881,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 8040,
+      "cardinality_bound": 8160,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -1119,7 +1119,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 8040,
+      "cardinality_bound": 8160,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",
