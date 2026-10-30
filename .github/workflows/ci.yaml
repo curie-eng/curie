@@ -5089,6 +5089,22 @@ jobs:
           kubectl logs -n curie-negative deploy/curie-worker --tail=100 || true
           kubectl get events -n curie-profile --sort-by=.lastTimestamp | tail -50 || true
           kubectl get sandboxtemplates.extensions.agents.x-k8s.io -n curie-profile -o yaml || true
+      # @spec NAMESPACE-CLEANUP-EVIDENCE-4
+      - name: Collect safe namespace cleanup evidence
+        if: failure()
+        run: |
+          python3 tools/released-upgrade/namespace_cleanup_evidence.py \
+            --context kind-curie-upgrade-negative \
+            --namespace curie-negative --namespace curie-profile \
+            > namespace-cleanup-evidence.json || true
+          cat namespace-cleanup-evidence.json
+      - name: Retain safe namespace cleanup evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: namespace-cleanup-evidence
+          path: namespace-cleanup-evidence.json
+          if-no-files-found: warn
       - name: Tear down the disposable negative control cluster
         if: always()
         run: |

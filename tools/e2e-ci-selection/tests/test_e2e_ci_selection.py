@@ -5792,3 +5792,8 @@ def test_connector_secret_rotation_selects_candidate_runtime(tmp_path: Path) -> 
     selected = json.loads(_outputs_of(output)["chart_scenarios"])
     if "connector-secret-rotation" in selected:
         raise AssertionError("an unrelated path selected connector rotation")
+
+
+def test_namespace_cleanup_collector_source_selects_its_released_upgrade_owner() -> None:
+    """@spec NAMESPACE-CLEANUP-EVIDENCE-4."""
+    assert _selects_released_upgrade("tools/released-upgrade/namespace_cleanup_evidence.py")
