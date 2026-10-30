@@ -104,8 +104,9 @@ stop or refusal carries the unresolved reviewer findings the hook retained, so
 the final reply can list them; those findings never reach the pod log.
 
 A run continues across prompts. Its state is keyed by `CURIE_SESSION_ID`
-(else the hook's own session id) plus the workspace recorded at its first
-prompt. A later prompt in the same session and workspace keeps the spent
+(else the hook's own session id) plus the workspace, the root of the checkout
+the prompt runs in, so every directory of one checkout names the same run. A
+later prompt in the same session and workspace keeps the spent
 rounds, the completed plan review, the findings and any stop, and a platform
 `wait_ci` message opens one new diff loop in it. A new session, or a prompt
 from another checkout, starts a fresh run.

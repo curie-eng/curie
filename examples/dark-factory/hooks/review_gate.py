@@ -64,11 +64,13 @@ One script handles every hook event the bundle registers:
 
 ``PreToolUse`` on ``Edit``/``Write``/``MultiEdit``/``NotebookEdit``
     An edit under the workspace's root ``.github`` directory stops the run in
-    every phase. The first path component is matched case-insensitively in
-    the path's lexical form (normalized against the workspace) and in its
-    resolved form (symlinks followed, against the resolved workspace), so
-    neither a ``.github`` symlink nor a symlinked workspace prefix escapes
-    it. No repository edit before the workflow is loaded and
+    every phase. The path is resolved one component at a time, following
+    every symlink, and refused when a step is ``.github`` (matched
+    case-insensitively) directly under the real workspace that the rest of
+    the path does not leave again, so neither a
+    ``.github`` symlink, a workspace alias, a link back to the root nor
+    ``..`` escapes it; its lexically normalized form is checked the same
+    way. No repository edit before the workflow is loaded and
     the plan review completed (either verdict), and none the timing refuses
     (that refusal writes ``timing_refused``, not ``edit_refused``). Right
     after the plan review (phase ``failing_test``) only test edits may
@@ -202,8 +204,11 @@ One script handles every hook event the bundle registers:
     current run: saved state is left as it is, the fingerprint is not
     retaken, and the hook returns no additional context.
 
-    Any other prompt resolves its workspace as the real path of
-    ``DARK_FACTORY_WORKSPACE`` or the payload ``cwd``, without calling git. A
+    Any other prompt resolves its workspace as the checkout root of the real
+    path of ``DARK_FACTORY_WORKSPACE`` or the payload ``cwd``: the nearest
+    directory at or above it that holds a ``.git`` entry, else that path
+    itself, found without calling git. Every directory of one checkout so
+    names the same workspace. A
     workspace equal to a run's workspace, or inside it, is that run's
     checkout. A prompt from another checkout than the active run's parks the
     active run under ``others``, then resumes the parked run of its own
@@ -296,6 +301,8 @@ TEST_FILES = ("test_*", "*_test.*", "*.test.*", "*.spec.*", "*_spec.*", "conftes
 # The hook itself has 10 seconds; the git calls share most of it.
 GIT_BUDGET_SECONDS = 7.0
 GIT_CALL_SECONDS = 3.0
+# Linux's own limit on symlinks followed in one path lookup.
+SYMLINK_HOPS = 40
 FINGERPRINT_MISSING = (
     "The initial checkout fingerprint could not be captured (checkout_unverifiable). "
     "Ensure the checkout is readable by Git within the seven-second budget, "
@@ -604,23 +611,52 @@ def _git(top: str, deadline: float, *args: str) -> bytes:
 
 
 def _github_path(path: str, workspace: str) -> str | None:
-    """A refused workspace-relative path, lexical form first, then resolved.
+    """A refused path, from its root ``.github`` step on, or ``None``.
 
-    The lexical form (normalized against the workspace) catches a root
-    ``.github`` that is itself a symlink to an ordinary directory. The
-    resolved form catches a path through a symlinked workspace prefix, since
-    the workspace is recorded as a real path.
+    The path, joined to the real workspace, is resolved one component at a
+    time as the kernel does, following every symlink, and refused when a step
+    is ``.github`` directly under the real workspace and the rest of the path
+    does not leave it again (``.github/../pkg`` is ``pkg``). That holds through a
+    workspace alias, a link back to the root and ``..``, and whether
+    ``.github`` itself is a directory or a symlink. Its lexically normalized
+    form, which an editor may write instead, is walked the same way.
     """
     if not path or not workspace:
         return None
-    for normalize in (os.path.abspath, os.path.realpath):
-        root = normalize(workspace)
-        try:
-            relative = Path(normalize(os.path.join(root, path))).relative_to(root)
-        except ValueError:
-            continue
-        if relative.parts and relative.parts[0].casefold() == ".github":
-            return relative.as_posix()
+    root = os.path.realpath(workspace)
+    joined = os.path.join(root, path)
+    for form in dict.fromkeys((joined, os.path.normpath(joined))):
+        if (refused := _github_step(form, root)) is not None:
+            return refused
+    return None
+
+
+def _github_step(path: str, root: str) -> str | None:
+    """The rest of ``path``, normalized, from a ``.github`` step under ``root``
+    that the rest does not leave again."""
+    pending = list(reversed(Path(path).parts))
+    current, hops = os.sep, 0
+    while pending:
+        part = pending.pop()
+        if part == os.sep:
+            current = os.sep
+        elif part == "..":
+            current = os.path.dirname(current)
+        else:
+            if current == root and part.casefold() == ".github":
+                inside = os.path.normpath(os.path.join(part, *reversed(pending)))
+                if inside.split(os.sep)[0].casefold() == ".github":
+                    return Path(inside).as_posix()
+            step = os.path.join(current, part)
+            try:
+                target = os.readlink(step) if hops < SYMLINK_HOPS else None
+            except OSError:
+                target = None
+            if target is None:
+                current = step
+            else:
+                hops += 1
+                pending.extend(reversed(Path(target).parts))
     return None
 
 
@@ -1614,9 +1650,17 @@ def _continues_current_run(prompt: str) -> bool:
 
 
 def _workspace(data: dict[str, Any]) -> str:
-    """The prompt's checkout as a real path, resolved without calling git."""
+    """The prompt's checkout root as a real path, found without calling git:
+    the nearest directory at or above the prompt's real directory that holds
+    a ``.git`` entry, else that directory itself."""
     raw = os.environ.get("DARK_FACTORY_WORKSPACE") or str(data.get("cwd") or "")
-    return os.path.realpath(raw) if raw else ""
+    if not raw:
+        return ""
+    start = Path(os.path.realpath(raw))
+    for directory in (start, *start.parents):
+        if os.path.lexists(directory / ".git"):
+            return str(directory)
+    return str(start)
 
 
 def _same_checkout(state: dict[str, Any], workspace: str) -> bool:

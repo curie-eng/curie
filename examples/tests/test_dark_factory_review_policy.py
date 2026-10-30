@@ -1511,6 +1511,55 @@ def test_continuation_a_prompt_in_a_subdirectory_of_the_workspace_continues(
     assert _review_refusals(s) == [("planning_complete", "plan_review")]
 
 
+def test_continuation_a_run_started_in_a_subdirectory_keeps_its_stop_at_the_checkout_root(
+    tmp_path: Path,
+) -> None:
+    s = _session(tmp_path)
+    first = s.fire("UserPromptSubmit", prompt=ISSUE, cwd=str(s.cwd / "pkg"))
+    assert gate.contract() in gate.context_of(first)
+    # The run belongs to the checkout, not to the directory its first prompt came from.
+    assert _state(s)["workspace"] == os.path.realpath(s.cwd)
+    s.load_workflow()
+    _plan_approved(s)
+    assert _capped(s, FINDING).startswith("STOP.")
+
+    context = gate.context_of(s.fire("UserPromptSubmit", prompt="go on", cwd=str(s.cwd)))
+
+    assert context.startswith("STOP.") and FINDING in context
+    state = _state(s)
+    assert state["workspace"] == os.path.realpath(s.cwd)
+    assert "others" not in state
+    assert state["stopped"]
+    assert state["diff"]["round"] == 5
+    assert state["plan"] == {"round": 1, "verdict": "APPROVE"}
+    assert FINDING in state["findings"]["text"]
+    diff = _deny(s.pre("Agent", DIFF_INPUT))
+    assert diff.startswith("STOP.") and FINDING in diff
+
+
+def test_continuation_a_sibling_directory_of_the_same_checkout_continues(tmp_path: Path) -> None:
+    s = _session(tmp_path)
+    s.fire("UserPromptSubmit", prompt=ISSUE, cwd=str(s.cwd / "pkg"))
+    s.load_workflow()
+    _plan_approved(s)
+    _edit_source(s, "fix")
+    _diff_changes(s, FINDING)
+
+    context = gate.context_of(s.fire("UserPromptSubmit", prompt="go on", cwd=str(s.cwd / "tests")))
+
+    assert gate.contract() in context and not context.startswith("STOP.")
+    state = _state(s)
+    assert state["workspace"] == os.path.realpath(s.cwd)
+    assert state["plan"] == {"round": 1, "verdict": "APPROVE"}
+    assert state["diff"] == {"round": 1, "verdict": "CHANGES"}
+    assert FINDING in state["findings"]["text"]
+    # The rejected candidate stays rejected; a real change is the next round.
+    assert FINDING in _deny(s.pre("Agent", DIFF_INPUT))
+    assert _review_refusals(s)[-1] == ("no_progress", "review_diff")
+    _edit_source(s, "rework")
+    assert "round 3 of 5" in _diff_changes(s, "second finding")
+
+
 def test_continuation_recovers_a_missing_fingerprint_before_planning(tmp_path: Path) -> None:
     s = _session(tmp_path)
     readable = s.env["PATH"]
@@ -1646,8 +1695,9 @@ def test_approval_after_edit_requested_but_never_run_keeps_it(tmp_path: Path) ->
 
 
 # --- The root .github stays protected through symlinks --------------------------
-# A path is refused when its lexical form (relative to the stored workspace) or
-# its resolved form (relative to the resolved workspace) starts at ``.github``.
+# A path is refused when resolving it one component at a time, through any
+# symlink, workspace alias or ``..``, steps into ``.github`` directly under the
+# real workspace, whether that entry is a directory or a symlink.
 
 
 def _assert_github_stop(s: Any, reason: str) -> None:
@@ -1723,5 +1773,32 @@ def test_protected_path_a_symlinked_workspace_prefix_still_guards_github(tmp_pat
 
     workflow = link / ".github" / "workflows" / "ci.yaml"
     out = s.edit_with("Edit", gate.edit_input("Edit", str(workflow)))
+
+    _assert_github_stop(s, gate.deny_reason(out))
+
+
+@pytest.mark.parametrize("route", ["workspace alias", "link back to the root"])
+def test_protected_path_combined_symlinks_never_escape_the_github_check(
+    tmp_path: Path, route: str
+) -> None:
+    s = _prompted(tmp_path)
+    _plan_approved(s)
+    repo = s.cwd
+    # The root .github is itself a symlink into an ordinary directory.
+    os.symlink("pkg", repo / ".github")
+    if route == "workspace alias":
+        base = tmp_path / "alias"
+        base.symlink_to(repo, target_is_directory=True)
+    else:
+        # A link inside the checkout that leads back to its root.
+        os.symlink("..", repo / "pkg" / "up")
+        base = repo / "pkg" / "up"
+
+    # Ordinary source edits on the same route, and directly, stay allowed.
+    for path in (base / SOURCE, repo / SOURCE):
+        assert gate.allowed(s.edit_with("Edit", gate.edit_input("Edit", str(path))))
+    assert _gates(s, "github_path_refused") == []
+
+    out = s.edit_with("Edit", gate.edit_input("Edit", str(base / ".github" / "calc.py")))
 
     _assert_github_stop(s, gate.deny_reason(out))
