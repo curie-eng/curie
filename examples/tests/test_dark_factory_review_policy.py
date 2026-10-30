@@ -1560,6 +1560,69 @@ def test_continuation_a_sibling_directory_of_the_same_checkout_continues(tmp_pat
     assert "round 3 of 5" in _diff_changes(s, "second finding")
 
 
+def _prompt_from(s: Any, checkout: Path, prompt: str) -> str:
+    """A prompt whose cwd is ``checkout``; later hook events come from there too."""
+    s.cwd = checkout
+    return str(gate.context_of(s.fire("UserPromptSubmit", prompt=prompt)))
+
+
+def _nested_checkout(outer: Path) -> Path:
+    """A checkout inside ``outer`` that ``outer`` ignores, so both stay fingerprintable."""
+    (outer / ".git" / "info" / "exclude").write_text("nested/\n")
+    return Path(gate.make_repo(outer / "nested"))
+
+
+def test_continuation_a_nested_checkout_keeps_its_own_stop(tmp_path: Path) -> None:
+    s = _session(tmp_path)
+    outer = s.cwd
+    nested = _nested_checkout(outer)
+    assert gate.contract() in _prompt_from(s, nested, ISSUE)
+    s.load_workflow()
+    _plan_approved(s)
+    assert _capped(s, FINDING).startswith("STOP.")
+
+    # The enclosing checkout is another checkout: a fresh run of its own.
+    context = _prompt_from(s, outer, ISSUE)
+    assert gate.contract() in context and not context.startswith("STOP.")
+    state = _state(s)
+    assert state["workspace"] == os.path.realpath(outer)
+    assert state["plan"] == {"round": 0, "verdict": None}
+    assert state["stopped"] is None
+
+    # Back in the nested checkout: its stop, spent rounds and findings, not the outer run.
+    context = _prompt_from(s, nested, "go on")
+    assert context.startswith("STOP.") and FINDING in context
+    state = _state(s)
+    assert state["workspace"] == os.path.realpath(nested)
+    assert state["stopped"]
+    assert state["diff"]["round"] == 5
+    assert FINDING in state["findings"]["text"]
+    diff = _deny(s.pre("Agent", DIFF_INPUT))
+    assert diff.startswith("STOP.") and FINDING in diff
+
+
+def test_continuation_a_nested_checkout_never_continues_its_parents_run(tmp_path: Path) -> None:
+    s = _session(tmp_path)
+    outer = s.cwd
+    nested = _nested_checkout(outer)
+    assert gate.contract() in _prompt_from(s, outer, ISSUE)
+    s.load_workflow()
+    _plan_approved(s)
+    assert _capped(s, FINDING).startswith("STOP.")
+
+    context = _prompt_from(s, nested, ISSUE)
+
+    assert gate.contract() in context and not context.startswith("STOP.")
+    state = _state(s)
+    assert state["workspace"] == os.path.realpath(nested)
+    assert state["plan"] == {"round": 0, "verdict": None}
+    assert state["stopped"] is None
+    # The parent's stop is kept for its own checkout.
+    context = _prompt_from(s, outer, "go on")
+    assert context.startswith("STOP.") and FINDING in context
+    assert _state(s)["diff"]["round"] == 5
+
+
 def test_continuation_recovers_a_missing_fingerprint_before_planning(tmp_path: Path) -> None:
     s = _session(tmp_path)
     readable = s.env["PATH"]
@@ -1821,6 +1884,30 @@ def test_protected_path_a_link_inside_github_cannot_hide_a_path_that_lands_in_it
     assert _gates(s, "github_path_refused") == []
 
     inward = github / "jump" / ".." / ".." / "workflows" / "ci.yaml"
+    out = s.edit_with("Edit", gate.edit_input("Edit", str(inward)))
+
+    _assert_github_stop(s, gate.deny_reason(out))
+
+
+def test_protected_path_a_github_symlink_whose_target_holds_a_link_cannot_hide_a_path(
+    tmp_path: Path,
+) -> None:
+    s = _prompted(tmp_path)
+    _plan_approved(s)
+    repo = s.cwd
+    os.symlink("pkg", repo / ".github")
+    (repo / "pkg" / "nested" / "deep").mkdir(parents=True)
+    os.symlink("nested/deep", repo / "pkg" / "jump")
+
+    # Lexically leaving .github, through the same link to a file outside its target: allowed,
+    # as is the target's file by its own path.
+    outward = repo / ".github" / "jump" / ".." / ".." / ".." / TEST
+    for path in (outward, repo / SOURCE):
+        assert gate.allowed(s.edit_with("Edit", gate.edit_input("Edit", str(path))))
+    assert _gates(s, "github_path_refused") == []
+
+    # Lexically ``calc.py``; really inside the directory .github resolves to.
+    inward = repo / ".github" / "jump" / ".." / ".." / "calc.py"
     out = s.edit_with("Edit", gate.edit_input("Edit", str(inward)))
 
     _assert_github_stop(s, gate.deny_reason(out))

@@ -67,10 +67,12 @@ One script handles every hook event the bundle registers:
     every phase. The path is resolved one component at a time, following
     every symlink, and refused when a step is ``.github`` (matched
     case-insensitively) directly under the real workspace that the rest of
-    the path does not leave again, or when the path lands under the real
-    workspace's ``.github``, so neither a ``.github`` symlink, a workspace
-    alias, a link back to the root, a link inside ``.github`` nor ``..``
-    escapes it; its lexically normalized form is checked the same way. No
+    the path does not leave again lexically, or does leave but really lands
+    in the directory ``.github`` resolves to, or when the path lands under
+    the real workspace's ``.github``, so neither a ``.github`` symlink, a
+    workspace alias, a link back to the root, a link inside ``.github`` or
+    its target nor ``..`` escapes it; its lexically normalized form is
+    checked the same way. No
     repository edit before the workflow is loaded and
     the plan review completed (either verdict), and none the timing refuses
     (that refusal writes ``timing_refused``, not ``edit_refused``). Right
@@ -209,11 +211,11 @@ One script handles every hook event the bundle registers:
     path of ``DARK_FACTORY_WORKSPACE`` or the payload ``cwd``: the nearest
     directory at or above it that holds a ``.git`` entry, else that path
     itself, found without calling git. Every directory of one checkout so
-    names the same workspace. A
-    workspace equal to a run's workspace, or inside it, is that run's
-    checkout. A prompt from another checkout than the active run's parks the
-    active run under ``others``, then resumes the parked run of its own
-    checkout (the innermost match) as a continuation, if there is one.
+    names the same workspace, and a checkout nested in another is a
+    workspace of its own. Only an equal workspace is a run's checkout. A
+    prompt from another checkout than the active run's parks the active run
+    under ``others``, then resumes the parked run of its own checkout as a
+    continuation, if there is one.
     Otherwise, and with no readable saved state for the session key, it
     starts a new run there, keeping the parked runs: the reset state is
     saved with them, then the checkout fingerprint is taken with at most two
@@ -617,9 +619,10 @@ def _github_path(path: str, workspace: str) -> str | None:
     The path, joined to the real workspace, is resolved one component at a
     time as the kernel does, following every symlink, and refused when a step
     is ``.github`` directly under the real workspace and the rest of the path
-    does not leave it again (``.github/../pkg`` is ``pkg``), or when the path
-    lands under the real workspace's ``.github``. That holds through a
-    workspace alias, a link back to the root, a link inside ``.github`` and
+    does not leave it again (``.github/../pkg`` is ``pkg``) or really lands in
+    the directory ``.github`` resolves to, or when the path lands under the
+    real workspace's ``.github``. That holds through a workspace alias, a
+    link back to the root, a link inside ``.github`` or its target and
     ``..``, and whether ``.github`` itself is a directory or a symlink. Its
     lexically normalized form, which an editor may write instead, is walked
     the same way.
@@ -635,11 +638,16 @@ def _github_path(path: str, workspace: str) -> str | None:
 
 
 def _github_step(path: str, root: str) -> str | None:
-    """The rest of ``path``, normalized, from a ``.github`` step under ``root``
-    that the rest does not leave again, else where it lands under
-    ``root/.github``."""
+    """The refused part of ``path`` from its ``.github`` step under ``root``,
+    or where it lands under ``root/.github``.
+
+    A rest that stays in ``.github`` lexically is refused at once. A rest that
+    leaves it lexically is refused too when the path really lands in the
+    directory ``.github`` resolves to, which a link inside it can arrange.
+    """
     pending = list(reversed(Path(path).parts))
     current, hops = os.sep, 0
+    entered: tuple[str, str] | None = None
     while pending:
         part = pending.pop()
         if part == os.sep:
@@ -648,9 +656,12 @@ def _github_step(path: str, root: str) -> str | None:
             current = os.path.dirname(current)
         else:
             if current == root and part.casefold() == ".github":
-                inside = os.path.normpath(os.path.join(part, *reversed(pending)))
+                named = Path(part, *reversed(pending))
+                inside = os.path.normpath(named)
                 if inside.split(os.sep)[0].casefold() == ".github":
                     return Path(inside).as_posix()
+                if entered is None:
+                    entered = (os.path.realpath(os.path.join(root, part)), named.as_posix())
             step = os.path.join(current, part)
             try:
                 target = os.readlink(step) if hops < SYMLINK_HOPS else None
@@ -661,14 +672,15 @@ def _github_step(path: str, root: str) -> str | None:
             else:
                 hops += 1
                 pending.extend(reversed(Path(target).parts))
-    # Where the path lands, which a link inside ``.github`` can make differ
-    # from what its lexical rest says.
+    landed = Path(current)
+    if entered is not None and landed.is_relative_to(entered[0]):
+        return entered[1]
     try:
-        landed = Path(current).relative_to(root)
+        relative = landed.relative_to(root)
     except ValueError:
         return None
-    if landed.parts and landed.parts[0].casefold() == ".github":
-        return landed.as_posix()
+    if relative.parts and relative.parts[0].casefold() == ".github":
+        return relative.as_posix()
     return None
 
 
@@ -1676,17 +1688,9 @@ def _workspace(data: dict[str, Any]) -> str:
 
 
 def _same_checkout(state: dict[str, Any], workspace: str) -> bool:
-    """Whether a prompt from ``workspace`` belongs to the saved run: its
-    workspace or a directory inside it."""
-    saved = str(state.get("workspace") or "")
-    if not workspace or workspace == saved:
-        return True
-    if not saved:
-        return False
-    try:
-        return os.path.commonpath([saved, workspace]) == saved
-    except ValueError:
-        return False
+    """Whether a prompt from ``workspace`` belongs to the saved run: the same
+    checkout root. A checkout nested in another is a checkout of its own."""
+    return not workspace or workspace == str(state.get("workspace") or "")
 
 
 def _prompt_fingerprint(workspace: str) -> str | None:
@@ -1712,15 +1716,10 @@ def _parked(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _resume(others: dict[str, Any], workspace: str) -> dict[str, Any] | None:
-    """The parked run ``workspace`` belongs to (the innermost match), taken out."""
-    matches = [
-        key
-        for key, run in others.items()
-        if key and isinstance(run, dict) and _same_checkout(run, workspace)
-    ]
-    if not matches:
+    """The parked run of ``workspace``'s checkout, taken out."""
+    resumed = others.pop(workspace, None)
+    if not isinstance(resumed, dict):
         return None
-    resumed: dict[str, Any] = others.pop(max(matches, key=len))
     if others:
         resumed["others"] = others
     return resumed
