@@ -5,6 +5,7 @@ Factory decisions are exercised by the review gate tests and graded eval cases.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -244,3 +245,52 @@ def test_delegation_binds_to_the_resolved_declaration_and_plan_review_judges_the
     assert "the reviewer judges the proposed test as the plan describes it" in contract
     assert "never demands the written test" in contract
     assert "At diff review the reviewer reads the written test." in contract
+
+
+HOOK = BUNDLE / "hooks" / "review_gate.py"
+README = BUNDLE / "README.md"
+SKILL = BUNDLE / "skills" / "implement-issue" / "SKILL.md"
+DIFF_REVIEWER = BUNDLE / "agents" / "diff-reviewer.md"
+
+
+def _between(text: str, start: str, end: str) -> str:
+    """The text after the first ``start`` and before the next ``end``."""
+    assert start in text and end in text, (start, end)
+    return text.split(start, 1)[1].split(end, 1)[0]
+
+
+def test_timeout_prose_never_promises_a_command_ends() -> None:
+    """A Bash timeout bounds the foreground wait; a command can outlive it (#5214).
+
+    A command still running at its timeout keeps running in the background until the
+    execution deadline, so no text may promise that a command ends by wrap up, and a
+    command whose exit status was not observed counts as unfinished.
+    """
+    hook = HOOK.read_text()
+    hook_doc = ast.get_docstring(ast.parse(hook)) or ""
+    readme = README.read_text()
+    skill = SKILL.read_text()
+    # The whole hook source, so its comments are held to the same rule as its docstring.
+    for name, text in (("hook", hook), ("README", readme), ("SKILL.md", skill)):
+        flat = _flat(text).lower()
+        assert re.search(r"\bends? by\b", flat) is None, name
+        assert "cut so it ends" not in flat, name
+    budgets = {
+        "README": _between(
+            _flat(readme), "enforces the time budget", "A run continues across prompts"
+        ),
+        "SKILL.md": _between(skill, "## Time budget", "\n## "),
+    }
+    for name, text in budgets.items():
+        flat = _flat(text).lower()
+        assert "background" in flat, name
+        assert "exit status" in flat, name
+    assert "background" in hook_doc.lower()
+
+
+def test_base_claims_name_their_local_ref() -> None:
+    """A claim about the base names the local ref it came from and that ref's age (#5214)."""
+    for path in (SKILL, DIFF_REVIEWER):
+        flat = _flat(path.read_text()).lower()
+        assert "local ref" in flat, path.name
+        assert "last fetch" in flat, path.name

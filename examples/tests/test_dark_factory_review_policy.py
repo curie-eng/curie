@@ -12,7 +12,8 @@ The name prefixes select the acceptance criteria: ``test_advisory_plan_*``
 ``test_timing_*`` (AC4), ``test_unchanged_candidate_*`` (AC5),
 ``test_continuation_*``, ``test_retained_findings_*`` and
 ``test_approval_after_edit_*`` (AC6). ``test_protected_path_*`` keeps the root
-``.github`` refused through symlinks.
+``.github`` refused through symlinks. ``test_round_cap_*`` keeps the diff round
+cap's own ``review_refused`` line (cause ``round_cap``).
 """
 
 from __future__ import annotations
@@ -143,6 +144,13 @@ def _capped(s: Any, last: str) -> str:
     return _diff_changes(s, last)
 
 
+def _four_changes(s: Any, finding: str) -> None:
+    """Four diff CHANGES, each followed by an accepted edit: the fifth candidate is ready."""
+    for round_ in range(1, 5):
+        _diff_changes(s, finding)
+        _edit_source(s, f"rework {round_}")
+
+
 def _read_timing(s: Any, *, deadline_in: int, seconds: int) -> int:
     """Record execution timing whose deadline is ``deadline_in`` seconds away; its epoch."""
     deadline = _now() + deadline_in
@@ -188,6 +196,20 @@ def _timing_refusals(s: Any) -> list[tuple[str, str]]:
 
 def _review_refusals(s: Any) -> list[tuple[str, str | None]]:
     return [(e["cause"], e.get("stage")) for e in _gates(s, "review_refused")]
+
+
+def _round_cap_fields(s: Any) -> list[tuple[Any, Any, Any]]:
+    """The ``(stage, round, cap)`` of every round cap line, in pod log order."""
+    return [
+        (e.get("stage"), e.get("round"), e.get("cap"))
+        for e in _gates(s, "review_refused")
+        if e.get("cause") == "round_cap"
+    ]
+
+
+def _finding_never_logged(s: Any) -> None:
+    """The retained findings reach the reply, never the pod log (raw text, not parsed lines)."""
+    assert FINDING not in s.log.read_text()
 
 
 def _deny(decision: dict[str, Any]) -> str:
@@ -475,6 +497,86 @@ def test_diff_round_ci_rounds_keep_their_three_round_marker(
     (line,) = [line for line in s.lines() if line.get("curie_phase") == "wait_ci"]
     assert line["round"] == 2
     assert "of 3" in line["note"]
+
+
+# --- the diff round cap writes its own gate line --------------------------------
+
+
+def test_round_cap_five_changes_log_one_review_refused_line(tmp_path: Path) -> None:
+    s = _prompted(tmp_path)
+    _plan_approved(s)
+
+    context = _capped(s, FINDING)
+
+    assert context.startswith("STOP.")
+    assert FINDING in context
+    lines = _gates(s, "review_refused")
+    assert len(lines) == 1, lines
+    line = lines[0]
+    assert set(line) == {"curie_gate", "cause", "stage", "round", "cap", "seq", "ts"}
+    assert line["cause"] == "round_cap"
+    assert line["stage"] == "review_diff"
+    assert (line["round"], line["cap"]) == (5, 5)
+    _finding_never_logged(s)
+
+
+def test_round_cap_a_sixth_diff_review_is_refused_and_logs_the_cap_again(tmp_path: Path) -> None:
+    s = _prompted(tmp_path)
+    _plan_approved(s)
+    _capped(s, FINDING)
+
+    (s.cwd / SOURCE).write_text("def add(a, b):\n    return b + a\n")
+    sixth = _deny(s.pre("Agent", DIFF_INPUT))
+
+    assert sixth.startswith("STOP.")
+    assert FINDING in sixth
+    assert _round_cap_fields(s) == [("review_diff", 5, 5)] * 2
+    assert ("review_diff", 6) not in s.phases()
+    _finding_never_logged(s)
+
+
+def test_round_cap_an_edit_after_the_fifth_approve_meets_the_cap_at_the_next_review(
+    tmp_path: Path,
+) -> None:
+    s = _prompted(tmp_path)
+    _plan_approved(s)
+    _four_changes(s, FINDING)
+    s.review(DIFF, gate.reply(DIFF, "APPROVE"))
+    assert _state(s)["diff"] == {"round": 5, "verdict": "APPROVE"}
+    # An accepted edit clears the approval; the next review would be a sixth round.
+    _edit_source(s, "after approval")
+
+    reason = _deny(s.pre("Agent", DIFF_INPUT))
+
+    assert reason.startswith("STOP.")
+    assert _round_cap_fields(s) == [("review_diff", 5, 5)]
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
+    assert _round_cap_fields(s) == [("review_diff", 5, 5)]
+    _finding_never_logged(s)
+
+
+def test_round_cap_an_approve_on_the_fifth_round_writes_no_cap_line(tmp_path: Path) -> None:
+    s = _prompted(tmp_path)
+    _plan_approved(s)
+    _four_changes(s, FINDING)
+
+    _, context = s.review(DIFF, gate.reply(DIFF, "APPROVE"))
+
+    assert "round 5: APPROVED" in context
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
+    assert _gates(s, "review_refused") == []
+
+
+def test_round_cap_a_plan_review_on_a_capped_run_writes_no_cap_line(tmp_path: Path) -> None:
+    s = _prompted(tmp_path)
+    _plan_approved(s)
+    _capped(s, FINDING)
+    assert _review_refusals(s) == [("round_cap", "review_diff")]
+
+    reason = _deny(s.pre("Agent", PLAN_INPUT))
+
+    assert reason.startswith("STOP.")
+    assert _review_refusals(s) == [("round_cap", "review_diff")]
 
 
 # --- AC3: only the reviewers run as sub-agents ---------------------------------
