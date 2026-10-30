@@ -30,7 +30,7 @@ If installation fails, use the [cluster status diagnosis](operations.md#curie-cl
 
 Choose an operator owned backup and restore procedure before accepting durable work. The installation may use PostgreSQL, the configured bundle object store, Valkey, and, when the mail adapter is enabled, its durable delivery state. Inventory the actual stores and encryption keys in your deployment, define a consistent backup point, retain the values and release metadata needed to recreate the installation, and test a restore into an isolated environment. Verify that the restored platform can read its records and bundle objects and that pending deliveries or work are accounted for before resuming intake.
 
-The repository provides a [synthetic Compose restore drill](../cli/scripts/restore-drill.sh) and [inventory checks](../tools/restore-drill/restore_inventory.py). Those checks exercise a disposable environment. They do not provide a production backup product or an RPO or RTO commitment. This production restore path remains unverified for this guide. If your operator procedure has not been rehearsed, do not assume a Helm rollback can restore lost data. Preserve the affected state and escalate through your deployment's incident process.
+The repository provides a [synthetic Compose restore drill](../cli/scripts/restore-drill.sh) and [inventory checks](../tools/restore-drill/restore_inventory.py). Those checks exercise a disposable environment. They do not provide a production backup product or an RPO or RTO commitment. If your operator procedure has not been rehearsed, do not assume a Helm rollback can restore lost data. Preserve the affected state and escalate through your deployment's incident process.
 
 ## Operate and respond
 
