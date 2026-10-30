@@ -105,11 +105,16 @@ release/pod health inspection in the quickstart. See
 ## What review and publication enforce
 
 The default bundle has an implementer, a plan reviewer, and a diff reviewer.
-It requires a plan verdict before source edits and a diff verdict before a
-publication request. Each review loop has at most three rounds. Blocking
-findings request changes; nonblocking notes can accompany approval. Ambiguous
-requirements, exhausted review rounds, and unavailable reviewer calls end
-with `Could not complete:` rather than an invented result.
+It requires a plan verdict before source edits and a diff approval before a
+publication request. The plan review runs once and is advisory: its findings
+carry into the failing test and the implementation. The diff review loop has
+at most five completed rounds, and a review call that returns no verdict does
+not count as one. Blocking findings request changes; nonblocking notes can
+accompany approval. The bundle's review gate also stops new work late in the
+execution: no new implementation round near the deadline, and only an
+approved change may still be published at the end. Ambiguous requirements,
+exhausted review rounds, unavailable reviewer calls, and a run out of time
+end with `Could not complete:` rather than an invented result.
 
 These gates belong to the installed bundle. The platform does not claim that
 all bundles ran tests or that a model's approval proves correctness. The

@@ -1,23 +1,70 @@
 #!/usr/bin/env python3
-"""Review gate for the dark factory: the two reviewer loops, enforced in code.
+"""Review gate for the dark factory: the review policy, enforced in code.
 
 The main loop runs on a model that does not reliably follow the review
 protocol. It drops ``subagent_type`` (so a "review" silently runs as a
 general-purpose agent on the main model), adds ``isolation: worktree`` (which
 the sandbox refuses), and omits ``run_in_background`` (which CLI 2.1.280
 treats as a background launch that stalls the turn). It also forgets to report
-phases and rounds. This hook takes all of that out of the model's hands.
+phases and rounds, and to pace itself against the execution deadline. This
+hook takes all of that out of the model's hands.
+
+The policy: one advisory plan review (``PLAN_REVIEWS``), at most
+``DIFF_ROUNDS`` (5) completed diff reviews per diff loop, and the platform's
+wait_ci loop of ``CI_ROUNDS`` (3), whose marker is ``Curie wait_ci round N of
+3:``. A round counts only when a reviewer call completes with a verdict, at
+``PostToolUse``. An admission this hook refuses, a call the runner refuses
+after this hook allowed it, and a call that returns no verdict never count.
+
+State lives in one JSON file per run under ``DARK_FACTORY_STATE_DIR``. Its key
+is the Curie session: ``CURIE_SESSION_ID`` when it is set and not blank (the
+runner keeps it when it rotates the SDK session), else the hook payload's
+``session_id``. A key missing from an older state file reads as unset.
+
+Timing. ``execution_deadline`` (D) and ``execution_seconds`` (S) come only from
+a completed ``mcp__curie__get_issue`` call. The round cutoff is ``D - S // 6``
+and wrap up starts at ``D - S // 12``, both in whole UTC epoch seconds;
+reaching a cutoff counts as passing it. Each timing refusal writes a
+``curie_gate: timing_refused`` line with ``action`` and ``cause``
+(``timing_missing``, ``deadline_passed``, ``round_cutoff`` or ``wrap_up``).
+Unknown timing refuses plan review, diff review, edits and publication without
+stopping the run, so an issue read recovers. Past D, everything but Bash
+stops the run. From the round cutoff, a plan review or a new implementation
+round stops the run, and so does an edit or diff review in a round that opened
+at or after the cutoff. From wrap up, an edit is refused without a stop, a
+diff review stops the run, and publication of a checkout the diff reviewer
+approved is still allowed until D.
+
+Findings. A completed ``CHANGES`` keeps the reviewer's reply after its
+``VERDICT:`` line, up to its ``VERIFICATION:`` block, cut to 4000 characters.
+A wait_ci round keeps the failing check names and states from its CI JSON
+(each cut to 200 characters), else the message text after its marker line. A
+diff ``APPROVE`` clears them. Every stop text, and every timing, no progress
+and cap refusal, carries them, so the final ``Could not complete:`` reply can
+list them. Findings, ticket text and command text never reach the pod log.
 
 One script handles every hook event the bundle registers:
 
 ``PostToolUse`` on ``Skill``
     Loading ``dark-factory:implement-issue`` marks the workflow as loaded.
 
+``PostToolUse`` on a tool whose name ends with ``get_issue``
+    Reads the first text block of the result (a list of content blocks, a
+    dict whose ``content`` is one, or a bare string) that parses as a JSON
+    object holding both ``execution_deadline`` (ISO 8601 with an offset) and
+    ``execution_seconds`` (an integer above 0). Only those top level keys
+    count, so ticket text cannot forge timing. A valid read records the
+    timing, replacing any earlier one, and writes ``curie_gate:
+    timing_recorded``; any other result, an error result included, records
+    nothing and writes ``timing_unreadable``.
+
 ``PreToolUse`` on ``Edit``/``Write``/``MultiEdit``/``NotebookEdit``
     An edit under the workspace's root ``.github`` directory stops the run in
-    every phase, matching the first path component case-insensitively. No
-    repository edit before the workflow is loaded and the plan reviewer
-    approved. Right after approval (phase ``failing_test``) only test edits may
+    every phase, matching the first path component case-insensitively after
+    resolving the path. No repository edit before the workflow is loaded and
+    the plan review completed (either verdict), and none the timing refuses
+    (that refusal writes ``timing_refused``, not ``edit_refused``). Right
+    after the plan review (phase ``failing_test``) only test edits may
     run: an edit to a test file, or an edit that adds a test (an inline Rust
     ``#[test]`` module, a ``def test_`` function, and so on): its inserted text
     holds more test markers than the text it replaces (for ``Write``, the file
@@ -26,18 +73,25 @@ One script handles every hook event the bundle registers:
     ``report_progress`` with phase ``implement``, then edit source. When no
     test is feasible, report ``implement`` directly and say why. No ``Bash``
     command opens source edits by itself. An allowed edit gets no decision, so
-    the hook never grants a permission the runner would not. Every refusal
-    writes a ``curie_gate: edit_refused`` line.
+    the hook never grants a permission the runner would not. Every other
+    refusal writes a ``curie_gate: edit_refused`` line.
 
 ``PostToolUse`` on ``Edit``/``Write``/``MultiEdit``/``NotebookEdit``
-    A completed test edit during ``failing_test`` is the evidence: the first one
-    writes the ``failing_test`` phase line. Only an edit to a test path, or one
-    the ``PreToolUse`` gate allowed as a test edit, counts; a requested, failed
-    or never-allowed edit counts for nothing.
+    A completed edit while the diff reviewer's approval stands clears that
+    approval and writes ``curie_gate: diff_approval_cleared``. A completed test
+    edit during ``failing_test`` is the evidence: the first one writes the
+    ``failing_test`` phase line. Only an edit to a test path, or one the
+    ``PreToolUse`` gate allowed as a test edit, counts; a requested, failed or
+    never-allowed edit counts for nothing.
 
 ``PreToolUse`` on ``Bash``
-    Refuses background shell commands. Run the command in the foreground and
-    wait for its result before continuing or ending the turn.
+    Refuses background shell commands and forces the foreground. With timing
+    known, a command at or after wrap up or D is refused without a stop, and
+    a command's timeout is cut so it ends by wrap up: a larger requested
+    timeout is lowered, and an omitted one is set only when the time left is
+    below the default (``BASH_DEFAULT_TIMEOUT_MS`` when it is a positive
+    integer, else 120000 ms). Without timing, and on a stopped run, Bash runs
+    as requested in the foreground.
 
 ``PostToolUse`` / ``PostToolUseFailure`` on ``Bash``
     Evidence only, never a transition. During ``failing_test``, after a
@@ -47,33 +101,62 @@ One script handles every hook event the bundle registers:
     the pod log can leak secrets.
 
 ``PreToolUse`` on ``Agent``/``Task``
-    Only ``plan-reviewer`` and ``diff-reviewer`` may run. The type is kept when
-    it names a reviewer, otherwise inferred from the description and prompt.
-    ``isolation`` and ``model`` are stripped and ``run_in_background`` is forced
-    to ``false``. The call is refused out of order: no diff review before the
-    plan is approved, and no plan review after it (a diff rejection returns to
-    implement, not to plan). Before a diff review, a changed or untracked root
-    ``.github`` path stops the run. An unreadable git status does not emit
-    ``github_path_refused`` and does not by itself stop the run. The same
-    invocation then fingerprints the checkout. A fingerprint that cannot be
-    taken denies that diff review without spending a round and without stopping
-    the run. The hook numbers the round itself and writes the
-    ``plan_review`` or ``review_diff`` phase line to the pod log. It appends
-    the bundle's verification contract to the prompt, the same bytes for both
-    reviewers, followed by the bundle's ``verification/checks.json`` when the
-    bundle declares one, fenced as declared data. When either cannot be read
-    the call is denied and the run stops. A missing prompt fingerprint denies
-    plan review before spending a round; it cannot be captured later in the run.
+    Only ``plan-reviewer`` and ``diff-reviewer`` may run. A ``subagent_type``
+    that is not blank must name one of them (``plan-reviewer``,
+    ``diff-reviewer`` or the ``dark-factory:`` form); any other is refused
+    with ``curie_gate: review_refused`` (cause ``not_a_reviewer``). Only an
+    omitted or blank type is inferred from the description, then the
+    prompt. ``isolation`` and ``model`` are stripped and ``run_in_background``
+    is forced to ``false``. A stopped run refuses every review.
+
+    Plan review runs once. After its verdict a second one is refused
+    (``review_refused``, cause ``planning_complete``): a diff review rejection
+    returns to implement, not to plan. A missing prompt fingerprint stops the
+    run before the review. Then the timing check.
+
+    Diff review: a changed or untracked root ``.github`` path stops the run
+    (an unreadable git status does not emit ``github_path_refused`` and does
+    not by itself stop the run). No diff review before the plan review
+    completes. The same invocation then fingerprints the checkout; a
+    fingerprint that cannot be taken refuses the review without a stop. A
+    checkout the diff reviewer already approved is refused (cause
+    ``already_approved``): go to publish. An approval of another checkout is
+    cleared. Then the timing check. A checkout identical to the last one that
+    got ``CHANGES`` is refused without a stop (cause ``no_progress``). With
+    ``DIFF_ROUNDS`` rounds completed the run stops.
+
+    Both reviewers get the bundle's verification contract appended to the
+    prompt, the same bytes for both, followed by the bundle's
+    ``verification/checks.json`` when the bundle declares one, fenced as
+    declared data. When either cannot be read the call is denied and the run
+    stops. An admitted call writes the ``plan_review`` or ``review_diff``
+    phase line with the round it would complete. Admission never spends a
+    round.
 
 ``PostToolUse`` / ``PostToolUseFailure`` on ``Agent``/``Task``
-    Reads the reviewer's ``REVIEWER:`` and ``VERDICT:`` lines. A reply without
-    them, or a call that errored, fails the run. ``VERDICT: CHANGES`` on round
-    ``MAX_ROUNDS`` caps the loop. A plan ``APPROVE`` is refused, and the run
-    stops, when the checkout fingerprint differs from the one taken at the
-    prompt or cannot be computed. A diff ``APPROVE`` or ``CHANGES`` is not
-    recorded when the checkout fingerprint differs from the one taken at the
-    start of that review or cannot be computed. That refusal does not stop
-    the run or change the round. When a verdict is recorded, the reviewer's
+    Reads the reviewer's ``REVIEWER:`` and ``VERDICT:`` lines from its reply,
+    never from the echoed prompt. A call that errored, or a reply without
+    them, did not complete: it writes ``curie_gate: review_incomplete``,
+    grants nothing, counts nothing and does not stop the run, so the review
+    may be retried. On a stopped run nothing is recorded, and so is a plan
+    review result after planning completed.
+
+    A plan verdict is refused, and the run stops, when the checkout
+    fingerprint differs from the one taken at the prompt or cannot be
+    computed. Otherwise either verdict completes planning and opens the
+    failing test; ``CHANGES`` carries its findings forward to be resolved
+    before the diff review.
+
+    A diff verdict is not recorded when the checkout fingerprint differs from
+    the one taken at the start of that review or cannot be computed. That
+    refusal does not stop the run or count a round. A recorded verdict counts
+    the round. ``APPROVE`` binds the approval to that fingerprint.
+    ``CHANGES`` marks the checkout rejected, and on round ``DIFF_ROUNDS`` it
+    stops the run.
+
+    A verdict that opens an implementation round (either plan verdict, or a
+    diff ``CHANGES`` before the cap) stops the run instead at or after the
+    round cutoff or D. When a verdict is recorded, the reviewer's
     ``VERIFICATION:`` block is written as one ``curie_gate:
     verification_classified`` line (stage, round, verdict and each
     criterion's route); a reply without the block is recorded as absent. A
@@ -88,12 +171,13 @@ One script handles every hook event the bundle registers:
     denies. The block is evidence only and never changes the verdict.
 
 ``PreToolUse`` on ``publish_changes``
-    Allowed only after the diff reviewer approved, and never after a failed or
-    capped review. The approval is bound to the checkout fingerprint from the
-    diff review that approved. A changed or unreadable checkout clears that
-    verdict and requires a fresh diff review. The round counter is kept. This
-    hook decision is not atomic with the later publication snapshot. A write
-    after the hook allows publish can still reach that snapshot.
+    Refused on a stopped run, refused without timing, and refused with a stop
+    at or after D. Otherwise allowed only after the diff reviewer approved.
+    The approval is bound to the checkout fingerprint from the diff review
+    that approved. A changed or unreadable checkout clears that verdict and
+    requires a fresh diff review. The round counter is kept. This hook
+    decision is not atomic with the later publication snapshot. A write after
+    the hook allows publish can still reach that snapshot.
 
 ``PreToolUse`` on ``report_progress``
     Never decided. Writes a ``curie_reported`` line with the reported phase,
@@ -105,18 +189,39 @@ One script handles every hook event the bundle registers:
     claims a test ran.
 
 ``UserPromptSubmit``
-    A new message starts a new run: the reset state is saved, then the checkout
-    fingerprint is taken with at most two attempts sharing a seven-second
-    deadline that also bounds hashing untracked files. If neither succeeds,
-    the run stops with the prerequisite failure. A prompt whose first line is
-    exactly ``<task-notification>`` (the text before the first newline,
-    compared with no stripping) continues the current run: saved state is
-    loaded and left as it is, the fingerprint is
-    not retaken, and the hook returns no additional context. Every other
-    prompt, including one that contains that line anywhere else, still starts
-    a new run. A CI fix round starts at ``implement``. A fresh run and a CI fix
-    round both return the verification contract as additional context; an
-    unreadable contract stops the run instead.
+    A prompt whose first line is exactly ``<task-notification>`` (the text
+    before the first newline, compared with no stripping) continues the
+    current run: saved state is left as it is, the fingerprint is not
+    retaken, and the hook returns no additional context.
+
+    Any other prompt resolves its workspace as the real path of
+    ``DARK_FACTORY_WORKSPACE`` or the payload ``cwd``, without calling git.
+    With no readable saved state for the session key, or a workspace outside
+    the saved one, it starts a new run: the reset state is saved, then the
+    checkout fingerprint is taken with at most two attempts sharing a
+    seven-second deadline that also bounds hashing untracked files. If
+    neither succeeds, the run stops with the prerequisite failure. A CI fix
+    round starts at ``implement`` with planning complete and takes no
+    fingerprint.
+
+    Otherwise (the saved workspace or a directory inside it) the prompt
+    continues the run: rounds, planning, the fingerprint, timing, findings and
+    any stop are kept. A stop is never cleared, with one exception: a run
+    stopped for a missing prompt fingerprint before planning completed
+    retakes the fingerprint the same way, and a success clears that stop. A
+    genuine CI marker on a run that is not stopped opens one repair round:
+    planning complete, stage ``implement``, a new diff loop at round 0, every
+    approval and the rejected checkout cleared, and the CI findings kept.
+
+    A CI marker is detected from the user message's second line only (the
+    platform's marker; the runner frames the message with its sender header
+    first); a match anywhere else, including inside the untrusted CI JSON
+    that follows, has no effect. A CI round writes the ``wait_ci`` phase line
+    and opens its implementation round; with timing known it stops the run
+    at or after the round cutoff or D. Every prompt returns the verification
+    contract as additional context (a CI round prefixes its instructions), or
+    the stop text when the run is stopped; an unreadable contract stops the
+    run instead.
 
 The verification contract is ``verification/contract.md`` in this bundle, next
 to ``hooks/``. It is read on every use and never cached. A missing, empty or
@@ -146,11 +251,18 @@ import time
 from pathlib import Path
 from typing import Any
 
-MAX_ROUNDS = 3
+PLAN_REVIEWS = 1
+DIFF_ROUNDS = 5
+CI_ROUNDS = 3
 PLAN, DIFF = "dark-factory:plan-reviewer", "dark-factory:diff-reviewer"
 PHASE = {PLAN: "plan_review", DIFF: "review_diff"}
 LOOP = {PLAN: "plan", DIFF: "diff"}
-BACK_TO = {PLAN: "plan", DIFF: "implement"}
+# Every subagent_type that names a reviewer; any other named type is refused.
+REVIEWER_TYPES = {PLAN: PLAN, "plan-reviewer": PLAN, DIFF: DIFF, "diff-reviewer": DIFF}
+# Retained reviewer findings, and one CI check name or state, in characters.
+FINDINGS_LIMIT = 4000
+CI_FIELD_LIMIT = 200
+DEFAULT_BASH_TIMEOUT_MS = 120_000
 AGENT_TOOLS = {"Agent", "Task"}
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 WORKFLOW_SKILL = "dark-factory:implement-issue"
@@ -202,6 +314,30 @@ CHECKS_UNREADABLE = (
 REFUSAL_REASONS = frozenset(
     {"missing_coverage", "invalid_test", "failing_check", "missing_ci_route", "package_dependency"}
 )
+TIMING_MISSING = (
+    "The execution timing is unknown. Call mcp__curie__get_issue and use its "
+    "execution_deadline and execution_seconds; no review, edit or publication runs "
+    "before it."
+)
+DEADLINE_PASSED = "The execution deadline (execution_deadline) has passed."
+ROUND_CUTOFF = (
+    "The round cutoff (execution_deadline minus execution_seconds/6) has passed, so no "
+    "plan review or new implementation round starts."
+)
+ROUND_OPENED_LATE = (
+    "The current implementation round opened at or after the round cutoff "
+    "(execution_deadline minus execution_seconds/6), so no edit or diff review runs in it."
+)
+WRAP_UP = (
+    "Wrap up (execution_deadline minus execution_seconds/12) has started: no edit, "
+    "command or diff review runs now. Only a checkout the diff reviewer approved may "
+    "still be published."
+)
+NO_PROGRESS = (
+    "The diff reviewer already returned CHANGES for this exact checkout. Make the "
+    "changes its findings ask for before the next diff review; no round was spent."
+)
+NO_FINDINGS = "No reviewer findings were recorded; state the reason above as the finding."
 
 _VERDICT = re.compile(r"^\s*VERDICT:\s*(APPROVE|CHANGES)\b", re.MULTILINE)
 _CI_ROUND = re.compile(r"^Curie wait_ci round ([23]) of 3: ")
@@ -270,20 +406,64 @@ def _message_lines(prompt: str) -> list[str]:
     return lines[start + 1 :]
 
 
-def _fresh(prompt: str = "") -> dict[str, Any]:
-    """Fresh state for a new run, or for a CI fix round.
+def _ci_round(prompt: str) -> int | None:
+    """The wait_ci round a platform CI marker names, else ``None``.
 
-    A CI fix round is detected from the user message's second line only (the
-    hook's own marker, written by the platform; the runner frames the message
-    with its sender header first); a match anywhere else,
-    including inside the untrusted CI JSON that follows, has no effect. A CI
-    fix round starts with the plan already approved (plan review already
-    happened), the workflow loaded, the stage at ``implement``, and the diff
-    loop at round 0.
+    The marker is read from the user message's second line only (the hook's
+    own marker, written by the platform; the runner frames the message with
+    its sender header first); a match anywhere else, including inside the
+    untrusted CI JSON that follows, has no effect.
     """
     lines = _message_lines(prompt)
     ci_match = _CI_ROUND.match(lines[1]) if len(lines) > 1 else None
-    ci_round = int(ci_match.group(1)) if ci_match else None
+    return int(ci_match.group(1)) if ci_match else None
+
+
+def _ci_findings(prompt: str, ci_round: int) -> dict[str, str]:
+    """What a wait_ci round must fix, kept for its stop texts. Never logged.
+
+    Each failing check or status in the message's CI JSON contributes its name
+    and state; without that JSON, the message text after the marker line.
+    """
+    after = _message_lines(prompt)[2:]
+    entries: list[str] = []
+    for line in after:
+        try:
+            report = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(report, dict):
+            continue
+        items = [
+            item
+            for key in ("failing_checks", "failing_statuses")
+            if isinstance(report.get(key), list)
+            for item in report[key]
+            if isinstance(item, dict)
+        ]
+        for item in items:
+            name = str(item.get("name") or item.get("context") or "unnamed")
+            state = str(item.get("conclusion") or item.get("state") or "unknown")
+            entries.append(f"{name[:CI_FIELD_LIMIT]}: {state[:CI_FIELD_LIMIT]}")
+        if items:
+            break
+    if not entries:
+        entries = [line for line in after if not line.startswith("[end-user-message ")]
+    return {"source": f"wait_ci round {ci_round}", "text": _bounded("\n".join(entries).strip())}
+
+
+def _bounded(text: str) -> str:
+    return text if len(text) <= FINDINGS_LIMIT else f"{text[:FINDINGS_LIMIT]}\n[truncated]"
+
+
+def _fresh(prompt: str = "") -> dict[str, Any]:
+    """Fresh state for a new run, or for a CI fix round.
+
+    A CI fix round (see ``_ci_round``) starts with planning complete (plan
+    review already happened), the workflow loaded, the stage at
+    ``implement``, and the diff loop at round 0.
+    """
+    ci_round = _ci_round(prompt)
     plan = {"round": 0, "verdict": "APPROVE"} if ci_round else {"round": 0, "verdict": None}
     return {
         "plan": plan,
@@ -300,7 +480,21 @@ def _fresh(prompt: str = "") -> dict[str, Any]:
         "seq": 0,
         "workspace": "",
         "fingerprint": None,
+        # {"deadline": epoch seconds, "seconds": execution seconds} from get_issue.
+        "timing": None,
+        # Epoch seconds when the current implementation round opened.
+        "round_opened": None,
+        # {"source": ..., "text": ...}: the unresolved findings every stop carries.
+        "findings": None,
+        # The fingerprint of the last diff candidate that got CHANGES.
+        "rejected": None,
     }
+
+
+def session_key(data: dict[str, Any]) -> str:
+    """The run's state key: the Curie session, which outlives an SDK session reset."""
+    curie = os.environ.get("CURIE_SESSION_ID") or ""
+    return curie if curie.strip() else str(data.get("session_id") or "")
 
 
 def state_path(session_id: str) -> Path:
@@ -311,12 +505,17 @@ def state_path(session_id: str) -> Path:
     return Path(base) / f"{name}.json"
 
 
-def load(path: Path) -> dict[str, Any]:
+def _saved(path: Path) -> dict[str, Any] | None:
+    """The saved state, or ``None`` when there is none or it cannot be read."""
     try:
-        state: dict[str, Any] = json.loads(path.read_text())
+        state = json.loads(path.read_text())
     except (OSError, ValueError):
-        return _fresh()
-    return state
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def load(path: Path) -> dict[str, Any]:
+    return _saved(path) or _fresh()
 
 
 def save(path: Path, state: dict[str, Any]) -> None:
@@ -392,11 +591,15 @@ def _git(top: str, deadline: float, *args: str) -> bytes:
 
 
 def _github_path(path: str, workspace: str) -> str | None:
-    """A refused workspace-relative path, after lexical normalization."""
+    """A refused workspace-relative path, after resolving it.
+
+    The workspace is recorded as a real path, so the target is resolved too:
+    a path through a symlinked workspace prefix still lands under it.
+    """
     if not path or not workspace:
         return None
-    root = os.path.abspath(workspace)
-    target = Path(os.path.abspath(os.path.join(root, path)))
+    root = os.path.realpath(workspace)
+    target = Path(os.path.realpath(os.path.join(root, path)))
     try:
         relative = target.relative_to(root)
     except ValueError:
@@ -562,10 +765,10 @@ def edit_path(tool_input: dict[str, Any]) -> str:
 
 def reviewer_kind(tool_input: dict[str, Any]) -> str | None:
     kind = str(tool_input.get("subagent_type") or "").strip()
-    if kind in (PLAN, "plan-reviewer"):
-        return PLAN
-    if kind in (DIFF, "diff-reviewer"):
-        return DIFF
+    if kind:
+        # A named type is taken at its word: a non-reviewer is never inferred
+        # into a reviewer from its description.
+        return REVIEWER_TYPES.get(kind)
     # The description names the review ("Plan review round 1"); the prompt
     # quotes the issue, which may mention either word, so it is only a fallback.
     for text in (
@@ -613,13 +816,32 @@ def parse_verdict(kind: str, response: Any) -> str | None:
     in the reviewer's reply only, so a verdict in the echoed prompt or in
     text ahead of the header is never taken for the reviewer's own.
     """
-    text = _reply_text(response)
+    match = _verdict_match(kind, _reply_text(response))
+    return match.group(1) if match else None
+
+
+def _verdict_match(kind: str, text: str) -> re.Match[str] | None:
+    """The first ``VERDICT:`` line after the reviewer's ``REVIEWER:`` header."""
     name = kind.split(":", 1)[1]
     header = re.search(rf"^\s*REVIEWER:\s*{re.escape(name)}\s*$", text, re.MULTILINE)
-    if header is None:
-        return None
-    match = _VERDICT.search(text, header.end())
-    return match.group(1) if match else None
+    return None if header is None else _VERDICT.search(text, header.end())
+
+
+def findings_of(kind: str, response: Any) -> str:
+    """The reviewer's findings: its reply after the verdict, up to ``VERIFICATION:``.
+
+    Cut to ``FINDINGS_LIMIT`` characters. Kept for stop texts, never logged.
+    """
+    text = _reply_text(response)
+    match = _verdict_match(kind, text)
+    if match is None:
+        return ""
+    kept: list[str] = []
+    for line in text[match.end() :].split("\n"):
+        if _VERIFICATION_HEAD.match(line):
+            break
+        kept.append(line)
+    return _bounded("\n".join(kept).strip())
 
 
 def _deny(reason: str) -> dict[str, Any]:
@@ -887,49 +1109,213 @@ def record_verification(
     )
 
 
-def _stop_text(reason: str) -> str:
+def _utc_now() -> int:
+    """The wall clock in whole UTC epoch seconds, the unit of every cutoff."""
+    return int(datetime.datetime.now(datetime.UTC).timestamp())
+
+
+def planned(state: dict[str, Any]) -> bool:
+    """Whether the one advisory plan review completed, with either verdict."""
+    return state["plan"]["verdict"] in ("APPROVE", "CHANGES")
+
+
+def _findings_block(state: dict[str, Any]) -> str | None:
+    findings = state.get("findings")
+    if not findings:
+        return None
+    return (
+        f"Unresolved findings retained by the review gate ({findings['source']}):\n"
+        f"{findings['text']}"
+    )
+
+
+def _retain(state: dict[str, Any], source: str, text: str) -> None:
+    state["findings"] = {"source": source, "text": text} if text else None
+
+
+def _with_findings(reason: str, state: dict[str, Any]) -> str:
+    block = _findings_block(state)
+    return f"{reason}\n\n{block}" if block else reason
+
+
+def _stop_text(reason: str, state: dict[str, Any]) -> str:
     return (
         f"STOP. {reason} Do not publish. End your reply with `Could not complete:` "
         "and the reviewer's unresolved findings and open questions as a list; "
-        "the platform posts that reply on the issue."
+        "the platform posts that reply on the issue.\n\n"
+        f"{_findings_block(state) or NO_FINDINGS}"
     )
 
 
 def _stop_for_github_path(state: dict[str, Any], path: str) -> str:
     state["stopped"] = f"The factory cannot publish GitHub metadata changes: {path}."
     emit_gate(state, "github_path_refused", path=path)
-    return _stop_text(state["stopped"])
+    return _stop_text(state["stopped"], state)
+
+
+def _cutoffs(timing: dict[str, Any]) -> tuple[int, int, int]:
+    """The deadline, the round cutoff and the start of wrap up, in epoch seconds."""
+    deadline, seconds = int(timing["deadline"]), int(timing["seconds"])
+    return deadline, deadline - seconds // 6, deadline - seconds // 12
+
+
+def _timing_refusal(state: dict[str, Any], action: str) -> tuple[str, str] | None:
+    """``(cause, reason)`` when the execution timing forbids ``action`` now.
+
+    ``action`` is ``plan_review``, ``open_round``, ``edit``, ``review_diff``,
+    ``bash`` or ``publish``. Every refusal writes a ``timing_refused`` line.
+    """
+    timing = state.get("timing")
+    if not timing:
+        cause, reason = "timing_missing", TIMING_MISSING
+    else:
+        now = _utc_now()
+        deadline, round_cutoff, wrap_cutoff = _cutoffs(timing)
+        opened = state.get("round_opened")
+        if now >= deadline:
+            cause, reason = "deadline_passed", DEADLINE_PASSED
+        elif action in ("plan_review", "open_round") and now >= round_cutoff:
+            cause, reason = "round_cutoff", ROUND_CUTOFF
+        elif action in ("edit", "review_diff") and opened is not None and opened >= round_cutoff:
+            cause, reason = "round_cutoff", ROUND_OPENED_LATE
+        elif action in ("edit", "review_diff", "bash") and now >= wrap_cutoff:
+            cause, reason = "wrap_up", WRAP_UP
+        else:
+            return None
+    emit_gate(state, "timing_refused", action=action, cause=cause)
+    return cause, reason
+
+
+def _timing_check(state: dict[str, Any], action: str) -> str | None:
+    """The refusal text when timing forbids ``action``, else ``None``.
+
+    Unknown timing never stops the run (an issue read recovers), nor does wrap
+    up on an edit (an approved checkout may still publish). Every other
+    timing refusal stops it.
+    """
+    refusal = _timing_refusal(state, action)
+    if refusal is None:
+        return None
+    cause, reason = refusal
+    if cause == "timing_missing" or (cause == "wrap_up" and action == "edit"):
+        return _with_findings(reason, state)
+    state["stopped"] = reason
+    return _stop_text(reason, state)
+
+
+def _open_round(state: dict[str, Any]) -> str | None:
+    """Open the next implementation round, or stop the run when it is too late.
+
+    With unknown timing the round opens; its first edit or diff review checks
+    when it opened once the timing is read.
+    """
+    if state.get("timing") and (stop := _timing_check(state, "open_round")) is not None:
+        return stop
+    state["round_opened"] = _utc_now()
+    return None
+
+
+def _timing_payload(response: Any) -> dict[str, Any] | None:
+    """The first text block of a get_issue result that is a JSON object holding
+    both timing fields, else ``None``. Only its top level keys count, so the
+    ticket text inside it cannot forge them."""
+    if isinstance(response, dict):
+        if response.get("is_error") is True:
+            return None
+        response = response.get("content")
+    if isinstance(response, str):
+        response = [{"type": "text", "text": response}]
+    if not isinstance(response, list):
+        return None
+    for block in response:
+        if not isinstance(block, dict) or not isinstance(block.get("text"), str):
+            continue
+        try:
+            data = json.loads(block["text"])
+        except ValueError:
+            continue
+        if isinstance(data, dict) and {"execution_deadline", "execution_seconds"} <= set(data):
+            return data
+    return None
+
+
+def _issue_timing(response: Any) -> tuple[int, int] | None:
+    """``(deadline epoch, execution seconds)`` from a get_issue result, else ``None``."""
+    data = _timing_payload(response)
+    if data is None:
+        return None
+    seconds, deadline = data["execution_seconds"], data["execution_deadline"]
+    if type(seconds) is not int or seconds <= 0 or not isinstance(deadline, str):
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(deadline)
+        if parsed.utcoffset() is None:
+            return None
+        return int(parsed.timestamp()), seconds
+    except (ValueError, OverflowError):
+        return None
+
+
+def post_issue_read(state: dict[str, Any], response: Any) -> None:
+    """Record the execution timing. No ticket content reaches the pod log."""
+    timing = _issue_timing(response)
+    if timing is None:
+        emit_gate(state, "timing_unreadable")
+        return
+    deadline, seconds = timing
+    state["timing"] = {"deadline": deadline, "seconds": seconds}
+    emit_gate(
+        state,
+        "timing_recorded",
+        execution_seconds=seconds,
+        execution_deadline=datetime.datetime.fromtimestamp(deadline, datetime.UTC).isoformat(),
+    )
 
 
 def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, Any]:
     kind = reviewer_kind(tool_input)
     if kind is None:
+        emit_gate(state, "review_refused", cause="not_a_reviewer")
         return _deny(
             "Only the reviewers may run as sub-agents: pass subagent_type "
             f"{PLAN!r} (phase plan_review) or {DIFF!r} (phase review_diff)."
         )
     if state["stopped"]:
-        return _deny(_stop_text(state["stopped"]))
-    # One budget covers the status check and the checkout fingerprint below.
-    diff_deadline = time.monotonic() + GIT_BUDGET_SECONDS if kind == DIFF else None
-    if diff_deadline is not None and (
-        (path := _github_changed_path(state["workspace"], diff_deadline)) is not None
-    ):
-        return _deny(_stop_for_github_path(state, path))
-    plan, diff = state["plan"], state["diff"]
-    if kind == DIFF and plan["verdict"] != "APPROVE":
-        return _deny("The plan reviewer has not approved the plan yet; run the plan review first.")
-    if kind == PLAN and plan["verdict"] == "APPROVE":
-        return _deny(
-            "The plan is already approved. A diff review rejection returns to "
-            "implement, not to plan: fix the diff and call the diff reviewer."
-        )
-    if kind == PLAN and state["fingerprint"] is None:
-        state["stopped"] = FINGERPRINT_MISSING
-        emit_gate(state, "fingerprint_unavailable", stage="plan_review")
-        return _deny(_stop_text(state["stopped"]))
-    if kind == DIFF and diff["verdict"] == "APPROVE":
-        return _deny("The diff reviewer already approved; go to publish.")
+        return _deny(_stop_text(state["stopped"], state))
+    diff = state["diff"]
+    digest: str | None = None
+    if kind == PLAN:
+        if planned(state):
+            emit_gate(state, "review_refused", cause="planning_complete", stage="plan_review")
+            return _deny(
+                "Planning is complete: the one advisory plan review returned "
+                f"{state['plan']['verdict']}. Carry its findings into failing_test and "
+                "implement; a diff review CHANGES returns to implement, not to plan."
+            )
+        if state["fingerprint"] is None:
+            state["stopped"] = FINGERPRINT_MISSING
+            emit_gate(state, "fingerprint_unavailable", stage="plan_review")
+            return _deny(_stop_text(state["stopped"], state))
+        if (refused := _timing_check(state, "plan_review")) is not None:
+            return _deny(refused)
+    else:
+        # One budget covers the status check and the checkout fingerprint below.
+        deadline = time.monotonic() + GIT_BUDGET_SECONDS
+        if (path := _github_changed_path(state["workspace"], deadline)) is not None:
+            return _deny(_stop_for_github_path(state, path))
+        if not planned(state):
+            return _deny("The plan review has not completed yet; run the plan review first.")
+        digest = fingerprint(state["workspace"], deadline)
+        if digest is None:
+            return _deny("Diff checkout is unverifiable; restore it before review.")
+        if diff["verdict"] == "APPROVE":
+            if digest == state.get("diff_approved_fingerprint"):
+                emit_gate(state, "review_refused", cause="already_approved", stage="review_diff")
+                return _deny("The diff reviewer already approved this checkout; go to publish.")
+            diff["verdict"] = None
+            state.pop("diff_approved_fingerprint", None)
+        if (refused := _timing_check(state, "review_diff")) is not None:
+            return _deny(refused)
     contract = contract_text()
     checks = declared_checks()
     if contract is None or checks is None:
@@ -938,19 +1324,19 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
         else:
             state["stopped"], gate = CHECKS_UNREADABLE, "checks_unavailable"
         emit_gate(state, gate, stage=PHASE[kind])
-        return _deny(_stop_text(state["stopped"]))
-    if kind == DIFF and diff_deadline is not None:
-        digest = fingerprint(state["workspace"], diff_deadline)
-        if digest is None:
-            return _deny("Diff checkout is unverifiable; restore it before review.")
+        return _deny(_stop_text(state["stopped"], state))
+    if kind == PLAN:
+        round_ = PLAN_REVIEWS
+    else:
+        if digest == state.get("rejected"):
+            emit_gate(state, "review_refused", cause="no_progress", stage="review_diff")
+            return _deny(_with_findings(NO_PROGRESS, state))
+        if diff["round"] >= DIFF_ROUNDS:
+            state["stopped"] = f"The review_diff loop hit its {DIFF_ROUNDS} round cap."
+            return _deny(_stop_text(state["stopped"], state))
         state["diff_review_fingerprint"] = digest
-    loop = state[LOOP[kind]]
-    round_ = loop["round"] + 1
-    if round_ > MAX_ROUNDS:
-        state["stopped"] = f"The {PHASE[kind]} loop hit its {MAX_ROUNDS} round cap."
-        return _deny(_stop_text(state["stopped"]))
-    loop["round"] = round_
-    loop["verdict"] = None
+        round_ = diff["round"] + 1
+    # The round this call completes; only its verdict, at PostToolUse, counts it.
     emit_phase(state, PHASE[kind], round_, f"{kind.split(':', 1)[1]} round {round_}")
     updated = dict(tool_input)
     updated["subagent_type"] = kind
@@ -964,6 +1350,15 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
     return _allow(f"routed to {kind}, round {round_}", updated)
 
 
+def _default_bash_timeout() -> int:
+    """The CLI's default Bash timeout in milliseconds."""
+    try:
+        value = int(os.environ.get("BASH_DEFAULT_TIMEOUT_MS") or "")
+    except ValueError:
+        return DEFAULT_BASH_TIMEOUT_MS
+    return value if value > 0 else DEFAULT_BASH_TIMEOUT_MS
+
+
 def pre_bash(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, Any]:
     if tool_input.get("run_in_background") is True:
         return _deny(
@@ -972,13 +1367,26 @@ def pre_bash(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, Any
         )
     updated = dict(tool_input)
     updated["run_in_background"] = False
+    timing = state.get("timing")
+    if timing:
+        refusal = _timing_refusal(state, "bash")
+        if refusal is not None:
+            return _deny(_with_findings(refusal[1], state))
+        # Every command ends by wrap up; a shorter request or default is kept.
+        limit = max(1, _cutoffs(timing)[2] - _utc_now()) * 1000
+        requested = tool_input.get("timeout")
+        if isinstance(requested, bool) or not isinstance(requested, (int, float)):
+            if requested is None and limit < _default_bash_timeout():
+                updated["timeout"] = limit
+        elif requested > limit:
+            updated["timeout"] = limit
     return _allow("Bash runs in the foreground", updated)
 
 
 def pre_edit(state: dict[str, Any], tool: str, tool_input: dict[str, Any]) -> dict[str, Any] | None:
     path = edit_path(tool_input)
     if state["stopped"]:
-        reason = _stop_text(state["stopped"])
+        reason = _stop_text(state["stopped"], state)
     elif (github_path := _github_path(path, state["workspace"])) is not None:
         reason = _stop_for_github_path(state, github_path)
     elif not state["workflow"]:
@@ -986,11 +1394,13 @@ def pre_edit(state: dict[str, Any], tool: str, tool_input: dict[str, Any]) -> di
             "No repository edit before the workflow is loaded. Call the Skill tool "
             "with skill 'dark-factory:implement-issue' and follow it."
         )
-    elif state["plan"]["verdict"] != "APPROVE":
+    elif not planned(state):
         reason = (
-            "No repository edit before plan review approves the plan. Finish phase "
-            f"plan and call {PLAN!r}; edits open after its VERDICT: APPROVE."
+            "No repository edit before the plan review completes. Finish phase "
+            f"plan and call {PLAN!r}; edits open after its verdict."
         )
+    elif (refused := _timing_check(state, "edit")) is not None:
+        return _deny(refused)
     elif state["stage"] == "failing_test" and not is_test_edit(state, tool, path, tool_input):
         reason = (
             "Phase failing_test comes first: write the failing test (a test file, or "
@@ -1009,6 +1419,12 @@ def pre_edit(state: dict[str, Any], tool: str, tool_input: dict[str, Any]) -> di
 
 
 def post_edit(state: dict[str, Any], tool_input: dict[str, Any]) -> None:
+    if state["diff"]["verdict"] == "APPROVE":
+        # The approval covers the checkout it read; a completed edit ends it,
+        # even one that writes the same bytes back.
+        state["diff"]["verdict"] = None
+        state.pop("diff_approved_fingerprint", None)
+        emit_gate(state, "diff_approval_cleared", cause="edit")
     if state["stage"] != "failing_test" or state["test_edited"]:
         return
     path = edit_path(tool_input)
@@ -1068,53 +1484,94 @@ def post_agent(
     kind = reviewer_kind(tool_input)
     if kind is None:
         return None
-    loop = state[LOOP[kind]]
-    round_ = loop["round"]
+    if state["stopped"]:
+        return _context(event, _stop_text(state["stopped"], state))
+    if kind == PLAN and planned(state):
+        return _context(event, "Planning is already complete; this plan review is not counted.")
+    round_ = state[LOOP[kind]]["round"] + 1
     verdict = None if event == "PostToolUseFailure" else parse_verdict(kind, response)
     if verdict is None:
-        state["stopped"] = (
-            f"The {PHASE[kind]} call failed on round {round_}: no reviewer verdict came back."
+        emit_gate(state, "review_incomplete", stage=PHASE[kind], round=round_)
+        return _context(
+            event,
+            f"{PHASE[kind]} round {round_} did not complete: no reviewer verdict came "
+            "back. It grants nothing and does not count as a round. Retry the review, "
+            "or end with `Could not complete:` if the reviewer stays unavailable.",
         )
-        return _context(event, _stop_text(state["stopped"]))
-    if kind == DIFF:
-        digest = fingerprint(state["workspace"], time.monotonic() + GIT_BUDGET_SECONDS)
-        reviewed = state.get("diff_review_fingerprint")
-        if digest is None or reviewed is None or digest != reviewed:
-            emit_gate(state, "diff_approval_refused", cause="checkout_changed_or_unverifiable")
-            return _context(
-                event, "Fresh diff review required: checkout changed or is unverifiable."
-            )
-        if verdict == "APPROVE":
-            state["diff_approved_fingerprint"] = digest
-    record_verification(state, kind, round_, verdict, response)
-    if kind == PLAN and verdict == "APPROVE":
-        cause = refuse_approval(state)
-        if cause is not None:
-            state["stopped"] = (
-                f"The plan approval on round {round_} is refused ({cause}): the "
-                "repository checkout must not change before the plan reviewer approves."
-            )
-            return _context(event, _stop_text(state["stopped"]))
-        state["stage"] = "failing_test"
-    loop["verdict"] = verdict
+    if kind == PLAN:
+        return _post_plan(state, event, verdict, response)
+    return _post_diff(state, event, round_, verdict, response)
+
+
+def _post_plan(state: dict[str, Any], event: str, verdict: str, response: Any) -> dict[str, Any]:
+    """Either verdict completes planning; the review is advisory and runs once."""
+    record_verification(state, PLAN, PLAN_REVIEWS, verdict, response)
+    cause = refuse_approval(state)
+    if cause is not None:
+        state["stopped"] = (
+            f"The plan review verdict is refused ({cause}): the repository checkout "
+            "must not change before the plan review completes."
+        )
+        return _context(event, _stop_text(state["stopped"], state))
+    state["plan"] = {"round": PLAN_REVIEWS, "verdict": verdict}
+    state["stage"] = "failing_test"
+    findings = findings_of(PLAN, response) if verdict == "CHANGES" else ""
+    _retain(state, "plan_review round 1", findings)
+    if (stop := _open_round(state)) is not None:
+        return _context(event, stop)
     if verdict == "APPROVE":
-        nxt = "failing_test" if kind == PLAN else "publish"
-        return _context(event, f"{PHASE[kind]} round {round_}: APPROVED. Go to phase {nxt}.")
-    if round_ >= MAX_ROUNDS:
-        state["stopped"] = (
-            f"The {PHASE[kind]} loop hit its {MAX_ROUNDS} round cap without approval."
-        )
-        return _context(event, _stop_text(state["stopped"]))
+        return _context(event, "plan_review round 1: APPROVED. Go to phase failing_test.")
     return _context(
         event,
-        f"{PHASE[kind]} round {round_}: CHANGES. Go back to phase {BACK_TO[kind]}, "
-        f"round {round_ + 1} of {MAX_ROUNDS}, and address every finding.",
+        _with_findings(
+            "plan_review round 1: CHANGES. Planning is complete; the plan review is "
+            "advisory. Do not revise the plan or call the plan reviewer again. Carry "
+            "every finding into failing_test and implement, and resolve each before "
+            "the diff review.",
+            state,
+        ),
+    )
+
+
+def _post_diff(
+    state: dict[str, Any], event: str, round_: int, verdict: str, response: Any
+) -> dict[str, Any]:
+    """A verdict on the checkout the review started from counts the round."""
+    digest = fingerprint(state["workspace"], time.monotonic() + GIT_BUDGET_SECONDS)
+    reviewed = state.get("diff_review_fingerprint")
+    if digest is None or reviewed is None or digest != reviewed:
+        emit_gate(state, "diff_approval_refused", cause="checkout_changed_or_unverifiable")
+        return _context(event, "Fresh diff review required: checkout changed or is unverifiable.")
+    diff = state["diff"]
+    diff["round"] = round_
+    record_verification(state, DIFF, round_, verdict, response)
+    if verdict == "APPROVE":
+        diff["verdict"] = "APPROVE"
+        state["diff_approved_fingerprint"] = digest
+        state["rejected"] = None
+        state["findings"] = None
+        return _context(event, f"review_diff round {round_}: APPROVED. Go to phase publish.")
+    diff["verdict"] = "CHANGES"
+    state["rejected"] = digest
+    _retain(state, f"review_diff round {round_}", findings_of(DIFF, response))
+    if round_ >= DIFF_ROUNDS:
+        state["stopped"] = f"The review_diff loop hit its {DIFF_ROUNDS} round cap without approval."
+        return _context(event, _stop_text(state["stopped"], state))
+    if (stop := _open_round(state)) is not None:
+        return _context(event, stop)
+    return _context(
+        event,
+        f"review_diff round {round_}: CHANGES. Go back to phase implement, round "
+        f"{round_ + 1} of {DIFF_ROUNDS}, and address every finding. A diff review of "
+        "this unchanged checkout is refused.",
     )
 
 
 def pre_publish(state: dict[str, Any]) -> dict[str, Any]:
     if state["stopped"]:
-        return _deny(_stop_text(state["stopped"]))
+        return _deny(_stop_text(state["stopped"], state))
+    if (refused := _timing_check(state, "publish")) is not None:
+        return _deny(refused)
     if state["diff"]["verdict"] != "APPROVE":
         return _deny("Nothing is published without a diff reviewer VERDICT: APPROVE.")
     digest = fingerprint(state["workspace"], time.monotonic() + GIT_BUDGET_SECONDS)
@@ -1141,50 +1598,117 @@ def _continues_current_run(prompt: str) -> bool:
     return first == _TASK_NOTIFICATION_LINE
 
 
+def _workspace(data: dict[str, Any]) -> str:
+    """The prompt's checkout as a real path, resolved without calling git."""
+    raw = os.environ.get("DARK_FACTORY_WORKSPACE") or str(data.get("cwd") or "")
+    return os.path.realpath(raw) if raw else ""
+
+
+def _same_checkout(state: dict[str, Any], workspace: str) -> bool:
+    """Whether a prompt from ``workspace`` belongs to the saved run: its
+    workspace or a directory inside it."""
+    saved = str(state.get("workspace") or "")
+    if not workspace or workspace == saved:
+        return True
+    if not saved:
+        return False
+    try:
+        return os.path.commonpath([saved, workspace]) == saved
+    except ValueError:
+        return False
+
+
+def _prompt_fingerprint(workspace: str) -> str | None:
+    """At most two attempts sharing one seven-second deadline."""
+    deadline = time.monotonic() + GIT_BUDGET_SECONDS
+    for _ in range(2):
+        if time.monotonic() >= deadline:
+            break
+        digest = fingerprint(workspace, deadline)
+        if digest is not None:
+            return digest
+    return None
+
+
+def _start_run(path: Path, prompt: str, workspace: str) -> dict[str, Any]:
+    state = _fresh(prompt)
+    state["workspace"] = workspace
+    ci_round = state["ci_round"]
+    if ci_round:
+        _begin_ci_round(state, prompt, ci_round)
+    else:
+        # Saved first: a hook killed mid-fingerprint must not leave the last
+        # run's approvals in place.
+        save(path, state)
+        state["fingerprint"] = _prompt_fingerprint(workspace)
+        if state["fingerprint"] is None:
+            state["stopped"] = FINGERPRINT_MISSING
+            emit_gate(state, "fingerprint_unavailable", stage="prompt")
+    return _prompt_reply(path, state, bool(ci_round))
+
+
+def _continue_run(path: Path, state: dict[str, Any], prompt: str) -> dict[str, Any]:
+    """Another prompt of the same run: nothing spent or decided is reset."""
+    if state["stopped"] == FINGERPRINT_MISSING and not planned(state):
+        # The one stop a later prompt may clear: the baseline the plan review
+        # needs was never taken.
+        digest = _prompt_fingerprint(state["workspace"])
+        if digest is None:
+            emit_gate(state, "fingerprint_unavailable", stage="prompt")
+        else:
+            state["fingerprint"], state["stopped"] = digest, None
+    ci_round = _ci_round(prompt)
+    if ci_round and not state["stopped"]:
+        # The platform's wait_ci round opens one new diff loop in this run.
+        if not planned(state):
+            state["plan"] = {"round": 0, "verdict": "APPROVE"}
+        state.update(
+            workflow=True, stage="implement", diff={"round": 0, "verdict": None}, rejected=None
+        )
+        state.pop("diff_approved_fingerprint", None)
+        state.pop("diff_review_fingerprint", None)
+        state["ci_round"] = ci_round
+        _begin_ci_round(state, prompt, ci_round)
+    return _prompt_reply(path, state, bool(ci_round))
+
+
+def _begin_ci_round(state: dict[str, Any], prompt: str, ci_round: int) -> None:
+    state["findings"] = _ci_findings(prompt, ci_round)
+    emit_phase(state, "wait_ci", ci_round, f"checks failed; fix round {ci_round} of {CI_ROUNDS}")
+    _open_round(state)
+
+
+def _prompt_reply(path: Path, state: dict[str, Any], ci_round: bool) -> dict[str, Any]:
+    """Save the run; the stop text when it is stopped, else the contract."""
+    contract = contract_text()
+    if contract is None:
+        state["stopped"] = state["stopped"] or CONTRACT_MISSING
+        emit_gate(state, "contract_unavailable", stage="prompt")
+    save(path, state)
+    if contract is None or state["stopped"]:
+        return _context("UserPromptSubmit", _stop_text(state["stopped"], state))
+    if ci_round:
+        return _context(
+            "UserPromptSubmit",
+            "CI fix round: go to phase implement, fix what the failing checks show, "
+            "call the diff reviewer, then publish to the same pull request.\n\n"
+            + contract_block(contract),
+        )
+    return _context("UserPromptSubmit", contract_block(contract))
+
+
 def handle(data: dict[str, Any]) -> dict[str, Any] | None:
     event = data.get("hook_event_name", "")
-    path = state_path(str(data.get("session_id") or ""))
+    path = state_path(session_key(data))
     if event == "UserPromptSubmit":
         prompt = str(data.get("prompt") or "")
         if _continues_current_run(prompt):
-            load(path)
             return None
-        state = _fresh(prompt)
-        state["workspace"] = os.environ.get("DARK_FACTORY_WORKSPACE") or str(data.get("cwd") or "")
-        ci_round = state["ci_round"]
-        if not ci_round:
-            # Saved first: a hook killed mid-fingerprint must not leave the last
-            # run's approvals in place.
-            save(path, state)
-            deadline = time.monotonic() + GIT_BUDGET_SECONDS
-            for _ in range(2):
-                if time.monotonic() >= deadline:
-                    break
-                state["fingerprint"] = fingerprint(state["workspace"], deadline)
-                if state["fingerprint"] is not None:
-                    break
-            if state["fingerprint"] is None:
-                state["stopped"] = FINGERPRINT_MISSING
-                emit_gate(state, "fingerprint_unavailable", stage="prompt")
-        else:
-            emit_phase(
-                state, "wait_ci", ci_round, f"checks failed; fix round {ci_round} of {MAX_ROUNDS}"
-            )
-        contract = contract_text()
-        if contract is None:
-            state["stopped"] = CONTRACT_MISSING
-            emit_gate(state, "contract_unavailable", stage="prompt")
-        save(path, state)
-        if contract is None or state["stopped"]:
-            return _context("UserPromptSubmit", _stop_text(state["stopped"]))
-        if ci_round:
-            return _context(
-                "UserPromptSubmit",
-                "CI fix round: go to phase implement, fix what the failing checks show, "
-                "call the diff reviewer, then publish to the same pull request.\n\n"
-                + contract_block(contract),
-            )
-        return _context("UserPromptSubmit", contract_block(contract))
+        workspace = _workspace(data)
+        saved = _saved(path)
+        if saved is not None and _same_checkout(saved, workspace):
+            return _continue_run(path, saved, prompt)
+        return _start_run(path, prompt, workspace)
     tool = str(data.get("tool_name") or "")
     tool_input = dict(data.get("tool_input") or {})
     state = load(path)
@@ -1197,6 +1721,8 @@ def handle(data: dict[str, Any]) -> dict[str, Any] | None:
             out = post_agent(state, event, tool_input, response)
     elif event == "PostToolUse" and tool == "Skill":
         post_skill(state, tool_input)
+    elif event == "PostToolUse" and tool.endswith("get_issue"):
+        post_issue_read(state, data.get("tool_response"))
     elif event == "PostToolUse" and tool in EDIT_TOOLS:
         post_edit(state, tool_input)
     elif event in ("PostToolUse", "PostToolUseFailure") and tool == "Bash":
