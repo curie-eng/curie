@@ -2024,6 +2024,46 @@ def test_key_limit_403_ends_credit_exhausted_not_credential_rejected() -> None:
     assert runner.status == SessionStatus.CLASSIFIED_FAILURE
 
 
+# Observed 2026-10-29. An OpenRouter workspace daily budget refusal is HTTP 403,
+# and the SDK reports error="authentication_failed" (#5163).
+_OPENROUTER_WORKSPACE_BUDGET_403 = (
+    'API Error: 403 {"error":{"message":"Workspace daily budget of $20.00 exceeded. '
+    'Contact your org admin. $20.08 of $20.00 used; resets 2026-10-30T00:00:00.000Z.",'
+    '"code":403}}'
+)
+
+
+def test_workspace_budget_403_ends_credit_exhausted_not_credential_rejected() -> None:
+    script = [
+        AssistantMessage(
+            content=[TextBlock(text=_OPENROUTER_WORKSPACE_BUDGET_403)],
+            model="<synthetic>",
+            error="authentication_failed",
+        ),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=True,
+            num_turns=1,
+            session_id="s",
+            result=_OPENROUTER_WORKSPACE_BUDGET_403,
+        ),
+    ]
+    runner, _ = _runner(lambda: script)
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    errors = [e for e in events if e.type == "error"]
+    classifications = [e.classification for e in errors]
+    assert "model-credential-rejected" not in classifications
+    # The worker maps the last ErrorEvent before the Final.
+    assert errors[-1].classification == "model-credit-exhausted"
+    assert "Workspace daily budget" in errors[0].message
+    assert events[-1].type == "final"
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert runner.status == SessionStatus.CLASSIFIED_FAILURE
+
+
 def test_no_auth_credentials_401_still_fails_fast_as_credential_rejected() -> None:
     sentinel = "SHOULD-NOT-APPEAR-AFTER-AUTH-FAIL"
     script = [

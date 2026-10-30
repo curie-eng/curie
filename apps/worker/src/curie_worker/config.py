@@ -1150,7 +1150,7 @@ class WorkerConfig(BaseSettings):
     workspace_max_concurrent_clones: int = Field(
         default=2, gt=0, validation_alias="CURIE_WORKSPACE_MAX_CONCURRENT_CLONES"
     )
-    # Recovery checkpoint objects (ADR 0251). Off by default; when on (which
+    # Recovery checkpoint objects (ADR 0255). Off by default; when on (which
     # requires the internal worker token and managed workspaces), the worker
     # captures a failed run's workspace before releasing its claim (#5143) and
     # supervises the recovery object collector. Recovery never changes

@@ -28,8 +28,9 @@ import secrets
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from aci_protocol import BootEnv
 from curie_telemetry import operation_span, record_metric
@@ -50,6 +51,7 @@ from . import tool_daemon
 from .affinity import AffinityStore
 from .docker import DockerSandboxClient
 from .k8s import KubernetesSandboxClient
+from .quota import admission_quota_headroom, resource_vector
 from .types import (
     AGENT_LABEL,
     EXECUTOR_THREAD_KEY_PREFIX,
@@ -57,7 +59,11 @@ from .types import (
     MANAGED_BY_VALUE,
     THREAD_HASH_LABEL,
     TURN_PROGRESS_ELIGIBILITY_ENV,
+    AdmissionRejection,
+    AdmissionReservation,
     CapacityExhaustedError,
+    CapacityInventory,
+    CapacityRejection,
     ClaimNameConflict,
     ClaimTimeoutError,
     KubeTransientError,
@@ -244,6 +250,153 @@ class SandboxSubstrate:
 
         self._boot_credential_minter = minter
 
+    @staticmethod
+    def _capacity_contains(inventory: CapacityInventory, name: str) -> bool:
+        return (
+            name in inventory.claims
+            or name in inventory.sandboxes.values()
+            or any(pod.claim_name == name for pod in inventory.pods.values())
+        )
+
+    def _admission_inventory(
+        self, *, known_claim_resources: Mapping[str, Mapping[str, str]], timeout: float = 1.0
+    ) -> CapacityInventory:
+        config = self._config.admission
+        assert config is not None
+        return self._k8s.capacity_inventory(
+            priority_class=config.priority_class,
+            known_claim_resources=known_claim_resources,
+            request_timeout_seconds=min(1.0, timeout),
+        )
+
+    def _reconcile_admission(self, *, deadline: float | None = None) -> CapacityInventory:
+        config = self._config.admission
+        assert config is not None
+        namespace = self._config.namespace
+        entries = self._affinity.admission_entries(namespace, config.quota_name)
+
+        def read() -> CapacityInventory:
+            remaining = 1.0 if deadline is None else deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("sandbox admission reconciliation deadline expired")
+            return self._admission_inventory(
+                known_claim_resources={name: row.resources for name, row in entries.items()},
+                timeout=remaining,
+            )
+
+        inventory = read()
+        grace = self._config.claim_timeout_seconds + REAP_GRACE_MARGIN_SECONDS
+        for name, row in entries.items():
+            if inventory.observed_at <= row.updated_at:
+                continue
+            present = self._capacity_contains(inventory, name)
+            if row.state == "bound":
+                if not present:
+                    self._affinity.admission_update(namespace, config.quota_name, name, row, None)
+                continue
+            if row.state != "retiring":
+                if inventory.observed_at - row.updated_at < grace:
+                    continue
+                retiring = replace(row, state="retiring", updated_at=time.time())
+                if not self._affinity.admission_update(
+                    namespace, config.quota_name, name, row, retiring
+                ):
+                    continue
+                row = retiring
+            if present or inventory.observed_at <= row.updated_at:
+                try:
+                    remaining = 1.0 if deadline is None else deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("sandbox admission reconciliation deadline expired")
+                    self._retire_claim(name, request_timeout_seconds=min(1.0, remaining))
+                except Exception as exc:  # noqa: BLE001 - uncertain deletion stays charged
+                    logger.warning(
+                        "sandbox admission retirement unconfirmed (%s)", type(exc).__name__
+                    )
+                    continue
+                inventory = read()
+            if (
+                inventory.observed_at > row.updated_at
+                and not self._capacity_contains(inventory, name)
+            ):
+                self._affinity.admission_update(namespace, config.quota_name, name, row, None)
+        return inventory
+
+    def _refuse_admission(self, rejection: AdmissionRejection) -> None:
+        logger.warning(
+            "sandbox admission refused evidence_type=admission "
+            "quota=%s requested=%s used=%s hard=%s",
+            rejection.quota_name, rejection.requested, rejection.used, rejection.hard,
+            extra={"evidence_type": "admission"},
+        )
+        raise CapacityExhaustedError(rejection)
+
+    def _evaluate_admission(
+        self,
+        name: str,
+        *,
+        operation: Literal["reserve", "inspect"],
+        pool: str,
+        runner_resources: dict[str, Any] | None,
+        agent_name: str | None,
+        executor_secret_names: frozenset[str] | None,
+    ) -> AdmissionReservation | None:
+        config = self._config.admission
+        if config is None:
+            return None
+        requested = resource_vector(self._k8s.claim_resources(
+            pool=pool, runner_resources=runner_resources, agent_name=agent_name,
+            executor_secret_names=executor_secret_names,
+        ))
+        if set(requested) != set(config.hard):
+            raise ValueError("sandbox admission footprint is incomplete")
+        inventory = self._reconcile_admission()
+        quota = self._k8s.read_quota(config.quota_name, request_timeout_seconds=1.0)
+        live_headroom = admission_quota_headroom(config, self._config.namespace, requested, quota)
+        hard = resource_vector(config.hard)
+        if config.ceiling == 0:
+            self._refuse_admission(AdmissionRejection(
+                config.quota_name, requested, dict.fromkeys(hard, "0"), {**hard, "pods": "0"}
+            ))
+        if not live_headroom:
+            self._refuse_admission(AdmissionRejection(
+                config.quota_name, requested, quota.status_used, hard
+            ))
+        now = time.time()
+        reservation = AdmissionReservation(
+            state="preparing",
+            resources=requested,
+            owner_token=secrets.token_hex(16) if operation == "reserve" else "",
+            created_at=now,
+            updated_at=now,
+        )
+        accepted, used = self._affinity.reserve_admission(
+            self._config.namespace,
+            config.quota_name,
+            name,
+            reservation,
+            hard,
+            inventory,
+            operation=operation,
+        )
+        if not accepted:
+            self._refuse_admission(AdmissionRejection(config.quota_name, requested, used, hard))
+        return reservation if operation == "reserve" else None
+
+    def _advance_admission(
+        self, name: str, row: AdmissionReservation | None, state: Literal["submitted", "bound"]
+    ) -> AdmissionReservation | None:
+        if row is None:
+            return None
+        config = self._config.admission
+        assert config is not None
+        updated = replace(row, state=state, updated_at=time.time())
+        if not self._affinity.admission_update(
+            self._config.namespace, config.quota_name, name, row, updated
+        ):
+            raise RouteChangedError("sandbox admission creator lost ownership")
+        return updated
+
     def _remember_claim_credential(self, claim_name: str, env: Mapping[str, str] | None) -> None:
         token = None
         if env is not None:
@@ -319,8 +472,10 @@ class SandboxSubstrate:
         the claim delete raised, with its own ``request_timeout_seconds`` budget
         so a delete that timed out cannot starve it, and the claim's error is the
         one raised. ``daemon=False`` is a caller that retires the daemon itself.
+        Its admission reservation, if any, is marked retiring first.
         """
 
+        self._mark_admission_retiring(name)
         try:
             self._report_boot_credential(claim_name=name, handle=handle, env=env)
             self._k8s.delete_claim(name, request_timeout_seconds=request_timeout_seconds)
@@ -331,6 +486,48 @@ class SandboxSubstrate:
             raise
         if daemon:
             self._retire_daemon(name, handle, time.monotonic() + request_timeout_seconds)
+
+    def _mark_admission_retiring(self, name: str) -> None:
+        """Mark claim ``name``'s admission reservation retiring, if it has one."""
+
+        admission = self._config.admission
+        if admission is None:
+            return
+        row = self._affinity.admission_entries(
+            self._config.namespace, admission.quota_name
+        ).get(name)
+        if row is not None and row.state != "retiring":
+            self._affinity.admission_update(
+                self._config.namespace, admission.quota_name, name, row,
+                replace(row, state="retiring", updated_at=time.time()),
+            )
+
+    def _abandon_unsubmitted_quietly(self, name: str, *, env: Mapping[str, str] | None) -> None:
+        """Release what an attempt that never created claim ``name`` holds.
+
+        Marks its reservation retiring, so the next reconciliation drops it once
+        no claim is observed, and reports its boot credential. It deletes
+        nothing: before the create, the name is not this attempt's to delete.
+        """
+
+        try:
+            self._mark_admission_retiring(name)
+            self._report_boot_credential(claim_name=name, env=env)
+        except Exception as exc:  # noqa: BLE001 - the primary error wins
+            logger.warning("unsubmitted claim %s not released (%s)", name, type(exc).__name__)
+
+    def _drop_reservation_quietly(self, name: str, row: AdmissionReservation | None) -> None:
+        """Remove exactly ``row``, this attempt's reservation, and nothing else."""
+
+        admission = self._config.admission
+        if admission is None or row is None:
+            return
+        try:
+            self._affinity.admission_update(
+                self._config.namespace, admission.quota_name, name, row, None
+            )
+        except Exception as exc:  # noqa: BLE001 - the primary error wins
+            logger.warning("reservation of %s not dropped (%s)", name, type(exc).__name__)
 
     def _daemon_configs(self) -> dict[str, ToolDaemonConfig]:
         """The configured tool daemons by namespace; none on the Docker substrate."""
@@ -1336,7 +1533,7 @@ class SandboxSubstrate:
     def delete_detached(
         self,
         record: RouteRecord,
-        rejection: QuotaRejection,
+        rejection: CapacityRejection,
         *,
         deadline: float,
     ) -> bool:
@@ -1389,9 +1586,38 @@ class SandboxSubstrate:
                     if remaining <= 0:
                         return False
                     try:
-                        if self._k8s.quota_has_headroom(
-                            rejection,
-                            request_timeout_seconds=min(_GONE_READ_TIMEOUT_S, remaining),
+                        if self._config.admission is not None:
+                            inventory = self._reconcile_admission(deadline=deadline)
+                            admission = self._config.admission
+                            rows = self._affinity.admission_entries(
+                                self._config.namespace, admission.quota_name
+                            )
+                            if (
+                                record.handle.claim_name not in rows
+                                and not self._capacity_contains(inventory, record.handle.claim_name)
+                            ):
+                                probe = AdmissionReservation(
+                                    state="preparing",
+                                    resources=resource_vector(rejection.requested),
+                                    owner_token="", created_at=time.time(), updated_at=time.time(),
+                                )
+                                headroom, _used = self._affinity.reserve_admission(
+                                    self._config.namespace, admission.quota_name, "", probe,
+                                    admission.hard, inventory, operation="inspect",
+                                )
+                                remaining = deadline - time.monotonic()
+                                if remaining <= 0:
+                                    return False
+                                quota = self._k8s.read_quota(
+                                    admission.quota_name,
+                                    request_timeout_seconds=min(_GONE_READ_TIMEOUT_S, remaining),
+                                )
+                                if headroom and admission_quota_headroom(
+                                    admission, self._config.namespace, rejection.requested, quota
+                                ):
+                                    return True
+                        elif isinstance(rejection, QuotaRejection) and self._k8s.quota_has_headroom(
+                            rejection, request_timeout_seconds=min(_GONE_READ_TIMEOUT_S, remaining)
                         ):
                             return True
                     except Exception as exc:  # noqa: BLE001 - quota state is unknown
@@ -1435,6 +1661,8 @@ class SandboxSubstrate:
                 self._retry_unreported_credentials()
                 inventory = self._affinity.route_inventory()
                 deleted, observed_claims = self._reap_orphans(inventory)
+                if self._config.admission is not None:
+                    self._reconcile_admission()
             except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
@@ -1743,6 +1971,55 @@ class SandboxSubstrate:
             deadline - time.monotonic(),
         )
 
+    def _claim_pool(
+        self,
+        *,
+        env: Mapping[str, str] | None,
+        agent_name: str | None,
+        runner: RepoRunnerPool | None,
+    ) -> str:
+        config = self._config
+        if isinstance(self._k8s, DockerSandboxClient):
+            return config.warm_pool
+        if runner is not None:
+            return runner.pool
+        pool = claim_warm_pool(
+            config.warm_pool,
+            env,
+            agent_name,
+            config.agent_pools,
+            config.connector_secret_pools,
+        )
+        # A per-agent pool cloned after a hosted connector deploy is usable
+        # even when the chart did not list the agent. Absence keeps the
+        # choice above, including the generic pool and the secret refusal.
+        if pool == config.warm_pool:
+            derived = self._existing_agent_pool(config.warm_pool, agent_name)
+            if derived is not None:
+                pool = derived
+        return pool
+
+    def preflight_capacity(
+        self,
+        *,
+        env: dict[str, str] | None = None,
+        workspace_repo: str | None = None,
+        agent_name: str | None = None,
+        runner_resources: dict[str, Any] | None = None,
+    ) -> None:
+        if self._config.admission is None:
+            return
+        runner = self._preflight_repo_runner(workspace_repo, env, agent_name)
+        pool = self._claim_pool(env=env, agent_name=agent_name, runner=runner)
+        self._evaluate_admission(
+            "",
+            operation="inspect",
+            pool=pool,
+            runner_resources=runner_resources,
+            agent_name=agent_name,
+            executor_secret_names=None,
+        )
+
     def _claim_fresh(
         self,
         thread_key: str,
@@ -1784,28 +2061,15 @@ class SandboxSubstrate:
             if repo_runner is not None
             else self._preflight_repo_runner(workspace_repo, env, agent_name)
         )
-        if isinstance(self._k8s, DockerSandboxClient):
-            pool = config.warm_pool
-        elif runner is not None:
-            pool = runner.pool
-        else:
-            pool = claim_warm_pool(
-                config.warm_pool,
-                env,
-                agent_name,
-                config.agent_pools,
-                config.connector_secret_pools,
-            )
-            # A per-agent pool cloned after a hosted connector deploy is usable
-            # even when the chart did not list the agent. Absence keeps the
-            # choice above, including the generic pool and the secret refusal.
-            if pool == config.warm_pool:
-                derived = self._existing_agent_pool(config.warm_pool, agent_name)
-                if derived is not None:
-                    pool = derived
-        if env is not None and self._boot_credential_minter is not None:
-            env = self._boot_credential_minter(env)
-        self._remember_claim_credential(name, env)
+        pool = self._claim_pool(env=env, agent_name=agent_name, runner=runner)
+        reservation = self._evaluate_admission(
+            name,
+            pool=pool,
+            runner_resources=runner_resources,
+            agent_name=agent_name,
+            executor_secret_names=executor_secret_names,
+            operation="reserve",
+        )
         # Passed only for an executor claim, so a client that predates the
         # keyword keeps serving ordinary claims unchanged.
         executor_kwargs: dict[str, Any] = (
@@ -1820,6 +2084,10 @@ class SandboxSubstrate:
         provisioned: tool_daemon.Provisioned | None = None
         marked = remembered = created = False
         try:
+            if env is not None and self._boot_credential_minter is not None:
+                env = self._boot_credential_minter(env)
+            self._remember_claim_credential(name, env)
+            reservation = self._advance_admission(name, reservation, "submitted")
             if daemon is not None:
                 # Associated before the first object exists, so even a crash
                 # mid-provision leaves the claim's daemon findable.
@@ -1850,6 +2118,7 @@ class SandboxSubstrate:
                 tool_daemon=None if provisioned is None else provisioned.mount,
                 **executor_kwargs,
             )
+            reservation = self._advance_admission(name, reservation, "bound")
             sandbox_name = self._await_bound(name, deadline)
             bound = self._await_service_fqdn(sandbox_name, deadline)
             if provisioned is not None:
@@ -1858,6 +2127,12 @@ class SandboxSubstrate:
             # A 409 means the name is someone else's claim: never retire it.
             if created and not isinstance(exc, ClaimNameConflict):
                 self._retire_claim_quietly(name, env=env, daemon=False)
+            elif not created:
+                self._abandon_unsubmitted_quietly(name, env=env)
+            else:
+                # Someone else's claim holds the name: drop only this attempt's
+                # reservation, so reconciliation never retires their claim.
+                self._drop_reservation_quietly(name, reservation)
             # Only what this attempt created goes: its objects by uid, and the
             # marker and credential only if this attempt wrote them.
             try:

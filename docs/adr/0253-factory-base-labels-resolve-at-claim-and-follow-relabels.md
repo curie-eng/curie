@@ -25,7 +25,7 @@ This ADR partially amends
 and ordinary factory work follows later base label changes. Its refusal of
 missing or disallowed branches and its visible base provenance remain.
 The explicit restoration exception in
-[ADR 0251](0251-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md)
+[ADR 0255](0255-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md)
 retains its exact checkpoint pins.
 
 ## Context
@@ -167,7 +167,7 @@ or rebase is needed.
 
 ### 6. Explicit restoration keeps its checkpoint base
 
-ADR 0251 restoration still starts a new request pinned to the checkpoint's
+ADR 0255 restoration still starts a new request pinned to the checkpoint's
 original trusted base commit and recorded PR target branch. It does not
 reinterpret the patch against current labels or a newer branch tip. The
 recorded target must pass the current repository and pattern allowlist

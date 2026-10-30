@@ -140,7 +140,7 @@ class Kernel:
         # and legacy deployments. A turn that requires a repository refuses when
         # this lane is unavailable instead of booting an empty directory.
         self._workspace = workspace
-        # The terminal recovery capture (ADR 0251, #5143). None, the default and
+        # The terminal recovery capture (ADR 0255, #5143). None, the default and
         # the disabled configuration, keeps every release on the plain path.
         self._recovery = recovery
         # The inbound-attachment lane (#2567), optional on exactly the same

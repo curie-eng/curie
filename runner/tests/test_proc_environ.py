@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -214,11 +215,55 @@ def test_unfiltered_sleep_environ_is_readable_and_contains_the_sentinel() -> Non
         stderr=subprocess.DEVNULL,
     )
     try:
-        _wait_until_comm(proc.pid, "sleep")
-        with open(f"/proc/{proc.pid}/environ", "rb") as environ:
-            assert _PARENT_SENTINEL.encode() in environ.read()
+        deadline = time.monotonic() + _COMM_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                comm = Path(f"/proc/{proc.pid}/comm").read_text(encoding="ascii").strip()
+            except FileNotFoundError:
+                comm = ""
+            if comm == "sleep":
+                with open(f"/proc/{proc.pid}/environ", "rb") as environ:
+                    snapshot = environ.read()
+                if snapshot:
+                    break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("sleep did not expose a nonempty environ")
+        contains_sentinel = _PARENT_SENTINEL.encode() in snapshot
+        assert contains_sentinel
     finally:
         _kill(proc)
+
+
+@pytest.mark.parametrize(
+    "sentinel_present", [True, False], ids=["sentinel-present", "sentinel-absent"]
+)
+def test_unfiltered_sleep_waits_for_nonempty_environ(
+    monkeypatch: pytest.MonkeyPatch, sentinel_present: bool
+) -> None:
+    reads = 0
+    snapshot = (
+        f"ANTHROPIC_API_KEY={_PARENT_SENTINEL}\0".encode()
+        if sentinel_present
+        else b"PROC_ENVIRON_TEST_SENTINEL=unfiltered-control\0"
+    )
+
+    def _observe_environ(path: str, mode: str) -> BytesIO:
+        nonlocal reads
+        assert path.startswith("/proc/") and path.endswith("/environ")
+        assert mode == "rb"
+        reads += 1
+        if reads > 2:
+            pytest.fail("environ was read again after the nonempty snapshot")
+        return BytesIO(b"" if reads == 1 else snapshot)
+
+    monkeypatch.setattr(sys.modules[__name__], "open", _observe_environ, raising=False)
+    if sentinel_present:
+        test_unfiltered_sleep_environ_is_readable_and_contains_the_sentinel()
+    else:
+        with pytest.raises(AssertionError):
+            test_unfiltered_sleep_environ_is_readable_and_contains_the_sentinel()
+    assert reads == 2
 
 
 def test_prelude_unsets_token_names_when_proc_environ_is_unreadable(tmp_path: Path) -> None:

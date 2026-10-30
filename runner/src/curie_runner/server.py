@@ -21,7 +21,7 @@ Productizes the prototype's aiohttp ``/run`` into the ACI session channel:
                          like /status and /healthz, so it takes no body
 - ``POST /v1/checkpoint`` capture the managed checkout against a worker-named
                          trusted base commit as a patch plus manifest (ADR
-                         0251); optional and runner-private, carries no ACI frame
+                         0255); optional and runner-private, carries no ACI frame
 
 One turn consumes the SDK generator at a time (enforced by the runner's turn
 lock); steer and interrupt are side-channel injections whose output surfaces on

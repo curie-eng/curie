@@ -251,6 +251,8 @@ def test_readyz_after_startup_makes_no_agentmail_call(
     proc = spawn_adapter(_env(mail, ingress, port, tmp_path / "mail-state.sqlite3"))
     try:
         wait_for_readyz(port, proc)
+        mail.hold_lists()
+        assert mail.list_entered.wait(20), "poll never reached the provider"
         calls_after_startup = mail.list_calls
         mail.fail_next_list = 500
 
@@ -260,6 +262,7 @@ def test_readyz_after_startup_makes_no_agentmail_call(
         assert mail.list_calls == calls_after_startup
         assert mail.fail_next_list == 500, "readiness consumed the armed provider failure"
     finally:
+        mail.release_lists()
         stop(proc)
 
 

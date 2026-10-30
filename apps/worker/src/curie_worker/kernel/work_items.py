@@ -659,7 +659,7 @@ async def _release_claim(self: Kernel, thread_key: str, claim_name: str) -> None
 
 
 async def _release_with_recovery(self: Kernel, run: WorkItemRun, claim_name: str) -> None:
-    """Capture a failed run's workspace, then release its claim (#5143, ADR 0251).
+    """Capture a failed run's workspace, then release its claim (#5143, ADR 0255).
 
     Runs under a renewable lease on the thread lock, which every route decision
     takes, so no new turn can start on the workspace while it is read. The

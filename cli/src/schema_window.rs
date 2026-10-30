@@ -761,8 +761,10 @@ print(json.dumps(graph))
         // @spec AUTOMATED-REMEDIATION-15: 0138 only widens a CHECK.
         // @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
         // Factory ORM reads require the transition table introduced by 0144.
-        assert_eq!(candidate.schema_min, "0144");
-        assert_eq!(candidate.schema_head, "0144");
+        // The empty 0145 joins it with stable 0140 (#5067), which the candidate's
+        // deadline writes also need.
+        assert_eq!(candidate.schema_min, "0145");
+        assert_eq!(candidate.schema_head, "0145");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -796,7 +798,9 @@ print(json.dumps(graph))
         assert!(!live_in_window("0139", &current));
         assert!(!live_in_window("0141", &current));
         assert!(!live_in_window("0143", &current));
-        assert!(live_in_window("0144", &current));
+        assert!(!live_in_window("0144", &current));
+        assert!(!live_in_window("0140", &current));
+        assert!(live_in_window("0145", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

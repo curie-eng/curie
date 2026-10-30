@@ -43,8 +43,8 @@
 The worker drives the Kubernetes API to claim and manage agent-sandbox custom
 resources (the substrate's SandboxClient). It gets a namespaced Role scoped to
 exactly the CRD verbs KubernetesSandboxClient uses -- SandboxClaims it
-creates/reads/deletes/lists, Sandboxes it reads and patches (suspend/resume) --
-and nothing else. RBAC does not require the CRDs to be installed for the Role to
+creates/reads/deletes/lists, Sandboxes it reads and patches (suspend/resume).
+RBAC does not require the CRDs to be installed for the Role to
 apply, so this is valid even when agentSandbox.deploy is false.
 */}}
 apiVersion: v1
@@ -109,8 +109,7 @@ rules:
     resources: ["secrets"]
     verbs: ["create"]
   {{- end }}
-  # The worker reads the exact sandbox pod for capacity and stream failure
-  # diagnosis. It lists only events for that named pod after a stream drop.
+  # Stream failure diagnosis reads the exact sandbox Pod and its events.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get"]
@@ -317,7 +316,7 @@ spec:
               value: {{ .Values.worker.workspace.maxCheckoutBytes | int64 | quote }}
             - name: CURIE_WORKSPACE_MAX_ARCHIVE_BYTES
               value: {{ .Values.worker.workspace.maxArchiveBytes | int64 | quote }}
-            # Workspace recovery capture (ADR 0251). The API renders the same
+            # Workspace recovery capture (ADR 0255). The API renders the same
             # value from the same helper.
             - name: CURIE_WORKSPACE_RECOVERY_ENABLED
               value: {{ include "curie.workspaceRecoveryEnabled" . | quote }}
@@ -555,6 +554,10 @@ spec:
                   key: langfuseInitProjectSecretKey
             - name: CURIE_WARM_POOL
               value: {{ $warmPool | quote }}
+            {{- if and .Values.agentSandbox.deploy .Values.resourceQuota.enabled }}
+            - name: CURIE_SANDBOX_ADMISSION
+              value: {{ include "curie.sandboxAdmission" . | quote }}
+            {{- end }}
             # Every agent agent-sandbox.yaml renders a per-agent pool for
             # (connectorSecrets, registryEgress, #3083, and runnerImages,
             # ADR-0173), or none when worker.warmPool is overridden and the

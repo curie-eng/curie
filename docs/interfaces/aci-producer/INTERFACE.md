@@ -80,7 +80,7 @@ frame and changes no ACI wire frame. It captures the managed workspace against a
 trusted base commit within a budget of at most 60 seconds and returns a patch and a manifest,
 bounded at 900000 and 1048576 bytes, with `409` when the session has no managed workspace. It
 stores nothing and conveys no credentials or authority
-([ADR 0251](../../adr/0251-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md));
+([ADR 0255](../../adr/0255-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md));
 `run_conformance` does not cover it, a server without it answers `404`, and executor mode answers
 `409` naming the mode
 ([`runner/src/curie_runner/workspace_checkpoint.py`](../../../runner/src/curie_runner/workspace_checkpoint.py)). The timeout

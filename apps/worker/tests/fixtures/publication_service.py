@@ -233,6 +233,25 @@ class FixtureState:
             "message": fields[3],
         }
 
+    def compare(self, base: str, head: str) -> dict[str, Any]:
+        git_dir = ("--git-dir", str(self.bare_repo))
+        for sha in (base, head):
+            if len(sha) != 40 or any(char not in "0123456789abcdef" for char in sha):
+                raise ValueError("invalid commit id")
+            _git(*git_dir, "cat-file", "-e", f"{sha}^{{commit}}")
+        try:
+            merge_base = _git(*git_dir, "merge-base", base, head)
+        except subprocess.CalledProcessError:
+            merge_base = None
+        status = "diverged"
+        if base == head:
+            status = "identical"
+        elif merge_base == base:
+            status = "ahead"
+        elif merge_base == head:
+            status = "behind"
+        return {"status": status}
+
     def begin_scenario(self, branch: str) -> dict[str, Any]:
         with self.lock:
             if self.scenario is not None:
@@ -440,6 +459,17 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 return
             try:
                 self._json(HTTPStatus.OK, self.server.state.commit(sha))
+            except subprocess.CalledProcessError:
+                self._json(HTTPStatus.NOT_FOUND, {"message": "commit not found"})
+            return
+        compare_prefix = f"{repo_path}/compare/"
+        if parsed.path.startswith(compare_prefix):
+            # https://docs.github.com/en/rest/commits/commits#compare-two-commits
+            base, _, head = parsed.path[len(compare_prefix) :].partition("...")
+            try:
+                self._json(HTTPStatus.OK, self.server.state.compare(base, head))
+            except ValueError:
+                self._json(HTTPStatus.BAD_REQUEST, {"message": "invalid commit"})
             except subprocess.CalledProcessError:
                 self._json(HTTPStatus.NOT_FOUND, {"message": "commit not found"})
             return

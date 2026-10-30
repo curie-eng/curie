@@ -101,6 +101,7 @@ from .sandbox import (
     SubstrateConfig,
     SuspendedThreadError,
 )
+from .sandbox.quota import parse_admission_config
 from .schema_startup import assert_worker_schema
 from .sibling_turns import build_sibling_limit
 from .slack_tokens import slack_bot_tokens
@@ -177,7 +178,7 @@ class Runtime:
     # None unless the end to end connector and the connector reconciler are
     # both on (#3245).
     e2e_reaper: E2EReaperLoop | None = None
-    # None unless workspace recovery is on with the internal token (ADR 0251).
+    # None unless workspace recovery is on with the internal token (ADR 0255).
     workspace_recovery_gc: RecoveryCollector | None = None
     deploy_notice_consumer: DeployNoticeConsumer | None = None
     # Trims settled entries off the runs and eval streams (ADR 0184). Optional
@@ -279,6 +280,9 @@ def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
     # authoritative default lives in SubstrateConfig. Keep any override below the
     # per-thread lock TTL (WorkerConfig.lock_ttl_ms) -- see that comment.
     overrides: dict[str, Any] = {}
+    admission = parse_admission_config(env.get("CURIE_SANDBOX_ADMISSION"))
+    if admission is not None and env.get("CURIE_SANDBOX_SUBSTRATE") == "docker":
+        raise ValueError("Docker substrate cannot use Kubernetes quota admission")
     claim_timeout = _bounded_seconds(env, "CURIE_CLAIM_TIMEOUT_SECONDS", float)
     if claim_timeout is not None:
         overrides["claim_timeout_seconds"] = claim_timeout
@@ -298,6 +302,7 @@ def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
     return SubstrateConfig(
         namespace=env.get("CURIE_NAMESPACE", "default"),
         warm_pool=env.get("CURIE_WARM_POOL", "curie-runner-pool"),
+        admission=admission,
         agent_pools=_agent_names(env, "CURIE_AGENT_SANDBOX_POOLS"),
         connector_secret_pools=_agent_names(env, "CURIE_AGENT_CONNECTOR_SECRET_POOLS"),
         # ADR 0216: malformed input fails worker startup rather than routing a

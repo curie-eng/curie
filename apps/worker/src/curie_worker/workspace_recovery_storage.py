@@ -1,4 +1,4 @@
-"""Recovery checkpoint object transport, signed reads and collection (ADR 0251).
+"""Recovery checkpoint object transport, signed reads and collection (ADR 0255).
 
 Recovery objects live under ``<prefix>/workspace-recovery/`` in the private
 workspace bucket, a subtree disjoint from claim objects, so a claim release can
@@ -458,7 +458,7 @@ class RecoveryCheckpointWriter:
         if deadline is None:
             deadline = self._clock() + self._capture_budget
         # Size caps are the ledger's: it records the refusal as the WorkItem's latest
-        # recovery outcome (ADR 0251 section 3), so there is no local precheck.
+        # recovery outcome (ADR 0255 section 3), so there is no local precheck.
         sizes: dict[str, int] = {"patch": len(request.patch), "manifest": len(request.manifest)}
         cancel = threading.Event()
         workdir: Path | None = None
@@ -937,7 +937,7 @@ class RecoveryCheckpointReader:
         url = self.capability(lease, kind)
         ref = lease.objects[kind]
         # The whole read (request, headers, body, writes, verification) must finish
-        # inside the lease that authorized it (ADR 0251 section 4).
+        # inside the lease that authorized it (ADR 0255 section 4).
         budget = lease.expires_at.timestamp() - self._wall_clock()
         if budget <= 0:
             raise RecoveryReadRefused("lease_expired")

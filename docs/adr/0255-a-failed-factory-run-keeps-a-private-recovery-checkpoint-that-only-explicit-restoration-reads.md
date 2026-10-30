@@ -1,4 +1,4 @@
-# 251. A failed factory run keeps a private recovery checkpoint that only explicit restoration reads
+# 255. A failed factory run keeps a private recovery checkpoint that only explicit restoration reads
 
 Date: 2026-10-27
 
@@ -10,6 +10,10 @@ the design and delivery umbrella for this decision.
 Accepted with explicit maintainer approval on 2026-10-27: "Accept ADR 0251 as
 written". Acceptance records the approved direction; the delivery slices below
 remain unimplemented.
+
+Renumbered from 0251 to 0255 when the stable v0.14.3 release, which published
+its own ADR 0251, was forward merged into `next`. The decision and its
+acceptance are unchanged; the quoted approval names its number at the time.
 
 ## Context
 
@@ -147,7 +151,7 @@ concurrency; and the 60-second aggregate capture deadline end to end.
 
    On ADR 0186:
 
-   > **Partially amended by [ADR 0251](0251-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md)**
+   > **Partially amended by [ADR 0255](0255-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md)**
    > (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
    > in section 5, for explicit restoration only, a new request pins the
    > checkpoint's original trusted base commit and recorded PR target branch

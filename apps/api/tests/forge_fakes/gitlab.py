@@ -1673,7 +1673,7 @@ class GitLabAPI:
         if kind == "merge_requests":
             return self._mrs_route(request, user, tail, params, query, method)
         if kind == "repository":
-            return self._repository_route(request, tail, params)
+            return self._repository_route(request, tail, params, query)
         if kind == "pipelines":
             return self._pipelines_route(request, tail, params)
         if kind == "jobs" and tail:
@@ -2003,8 +2003,14 @@ class GitLabAPI:
     # Repository ---------------------------------------------------------------
 
     def _repository_route(
-        self, request: httpx.Request, tail: list[str], params: dict[str, str]
+        self,
+        request: httpx.Request,
+        tail: list[str],
+        params: dict[str, str],
+        query: list[tuple[str, str]],
     ) -> httpx.Response:
+        if tail == ["merge_base"]:
+            return self._merge_base(request, [value for key, value in query if key == "refs[]"])
         if len(tail) == 2 and tail[0] == "branches":
             name = unquote(tail[1])
             if name not in self.branches:
@@ -2030,6 +2036,30 @@ class GitLabAPI:
             if tail[2:] == ["statuses"]:
                 return self._page(request, self._commit_statuses(sha, params))
         return self._error(request, 404, "Not found")
+
+    def _merge_base(self, request: httpx.Request, refs: list[str]) -> httpx.Response:
+        # https://docs.gitlab.com/api/repositories/#merge-base
+        # Fewer than two refs or an unknown ref is a 400; no common ancestor is a 404;
+        # otherwise the best common ancestor, shaped like a single commit.
+        if len(refs) < 2:
+            return httpx.Response(400, json={"message": "Provide at least 2 refs"}, request=request)
+        shas = [ref if ref in self.commits else self.branches.get(ref, ref) for ref in refs]
+        unknown = [ref for ref, sha in zip(refs, shas, strict=True) if sha not in self.commits]
+        if unknown:
+            noun = "ref" if len(unknown) == 1 else "refs"
+            return httpx.Response(
+                400, json={"message": f"{noun} not found: {', '.join(unknown)}"}, request=request
+            )
+        histories = [self._history(sha) for sha in shas]
+        common = set.intersection(*histories)
+        best = sorted(
+            sha
+            for sha in common
+            if not any(other != sha and sha in self._history(other) for other in common)
+        )
+        if not best:
+            return self._error(request, 404, "Merge Base Not Found")
+        return self._json(request, self._commit(best[0]))
 
     def _commit_statuses(self, sha: str, params: dict[str, str]) -> list[dict[str, Any]]:
         listed: list[tuple[datetime, int, dict[str, Any]]] = []

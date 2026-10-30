@@ -89,6 +89,42 @@ def test_snapshot_captures_staged_unstaged_untracked_and_binary_changes(
     _git(clean, "apply", "--check", "--binary", str(patch_file))
 
 
+def test_publication_snapshot_ignores_ignored_and_captures_untracked_mode(
+    snapshot: Any, tmp_path: Path
+) -> None:
+    repo, _ = _repo(tmp_path)
+    (repo / ".gitignore").write_text("ignored/\n")
+    _git(repo, "add", ".gitignore")
+    _git(
+        repo,
+        "-c",
+        "user.name=Curie Test",
+        "-c",
+        "user.email=curie@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "Ignore ignored",
+    )
+    clean = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO, **TRUSTED)
+    (repo / "ignored").mkdir()
+    (repo / "ignored" / "local.txt").write_text("not published\n")
+    ignored = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO, **TRUSTED)
+    assert ignored.patch == clean.patch
+    assert ignored.changed_paths == clean.changed_paths
+
+    untracked = repo / "new.py"
+    untracked.write_bytes(b"print(1)\n")
+    untracked.chmod(0o644)
+    plain = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO, **TRUSTED)
+    untracked.chmod(0o755)
+    executable = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO, **TRUSTED)
+    assert plain.changed_paths == ("new.py",)
+    assert executable.changed_paths == ("new.py",)
+    assert executable.patch != plain.patch
+    assert b"100755" in executable.patch
+
+
 @pytest.mark.parametrize("prefix", ["", "/forge"])
 def test_snapshot_accepts_a_ghes_origin_named_by_the_boot_env(
     snapshot: Any, tmp_path: Path, prefix: str
@@ -464,3 +500,31 @@ def test_snapshot_json_never_contains_raw_binary_or_credential_material(snapshot
     assert "Authorization" not in encoded
     assert "GITHUB_TOKEN" not in encoded
     assert "github.com@" not in encoded
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        ("README.md", "edited after the paths were listed\n"),
+        (".github/workflows/ci.yml", "name: ci\n"),
+        ("late-untracked.txt", "new after the paths were listed\n"),
+    ],
+)
+def test_snapshot_refuses_a_workspace_that_changes_during_capture(
+    snapshot: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, content: str
+) -> None:
+    # A write between the capture's git calls would patch a path the disclosed
+    # list omits, or drop a new file entirely; neither may reach an approver.
+    repo, _ = _repo(tmp_path)
+    (repo / "pre.txt").write_text("before capture\n")
+    original = snapshot._untracked_patch
+
+    def write_mid_capture(workspace: Path, paths: tuple[str, ...]) -> bytes:
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+        return original(workspace, paths)
+
+    monkeypatch.setattr(snapshot, "_untracked_patch", write_mid_capture)
+    with pytest.raises(snapshot.WorkspaceSnapshotError, match="changed during snapshot capture"):
+        snapshot.capture_workspace_snapshot(repo, **TRUSTED)

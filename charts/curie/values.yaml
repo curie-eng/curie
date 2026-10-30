@@ -2153,7 +2153,7 @@ worker:
     bucket: curie-workspaces
     cloneVolumeSize: 4Gi
     mountPath: /var/lib/curie/workspaces
-    # Workspace recovery capture (ADR 0251). Off by default. Enabling it keeps
+    # Workspace recovery capture (ADR 0255). Off by default. Enabling it keeps
     # a checkpoint of a terminated turn's workspace for 24 hours and requires
     # maxBytes, a positive installation-wide cap that counts every recovery
     # byte; the render fails without it. The API also receives
@@ -2790,6 +2790,12 @@ agentSandbox:
   # `standard`. The factory 2Gi is a headroom choice, not a measured need:
   # after #4895 the factory publication listing over 231 pages peaked near
   # 170 MB under both 512Mi and 2Gi limits.
+  #
+  # scratchVolume.type is emptyDir (the default) or ephemeral. emptyDir keeps
+  # today's sizeLimit. ephemeral uses that same size as requests.storage on
+  # workspace and the home writable volume only. /tmp and every other writable
+  # path stay emptyDir. Leave storageClassName unset so the cluster default
+  # class is used; an empty class is omitted rather than rendered as "".
   resourceProfiles:
     standard:
       resources:
@@ -2799,6 +2805,8 @@ agentSandbox:
       homeSizeLimit: 512Mi
       tmpSizeLimit: 512Mi
       writablePathSizeLimit: 512Mi
+      scratchVolume:
+        type: emptyDir
       apiMemoryLimit: 512Mi
     factory:
       resources:
@@ -2808,6 +2816,8 @@ agentSandbox:
       homeSizeLimit: 15Gi
       tmpSizeLimit: 4Gi
       writablePathSizeLimit: 512Mi
+      scratchVolume:
+        type: emptyDir
       apiMemoryLimit: 2Gi
   # Agents that get a labeled sandbox template and warm pool so connector
   # ingress can select curietech.ai/agent=<name>. A list of agent name strings.

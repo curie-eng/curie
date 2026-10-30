@@ -53,7 +53,7 @@ answers `404`, which the worker maps to `runner_unavailable`; a second
 implementation need not provide it.
 
 `POST /v1/checkpoint` is also optional and runner-private
-([ADR 0251](../../adr/0251-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md)). Like `/v1/turn-admit` and `/v1/execute` it is a
+([ADR 0255](../../adr/0255-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md)). Like `/v1/turn-admit` and `/v1/execute` it is a
 bearer-authenticated control route that carries no ACI frame and changes no ACI
 wire frame. The body names a trusted base commit (`base_sha`) and a budget of at
 most 60 seconds (`budget_seconds`); the runner answers a patch against that base

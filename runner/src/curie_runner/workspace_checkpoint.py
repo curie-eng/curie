@@ -1,4 +1,4 @@
-"""Trusted-base checkpoints of the managed repository workspace (ADR 0251).
+"""Trusted-base checkpoints of the managed repository workspace (ADR 0255).
 
 ``POST /v1/checkpoint`` captures every observed change in the managed checkout
 against a commit the worker names and trusts: tracked, staged and untracked

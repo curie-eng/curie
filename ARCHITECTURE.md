@@ -1007,7 +1007,7 @@ new head before retargeting. It then pushes a distinct empty commit with the
 same tree so required CI runs on the final head under the new target. That
 commit remains in history as an ancestor of later fixes. A conflict leaves the
 remote branch and target unchanged and stays visible until the selection label
-is reapplied. Explicit restoration keeps ADR 0251's exact checkpoint base and
+is reapplied. Explicit restoration keeps ADR 0255's exact checkpoint base and
 target pins.
 
 **Settlement.** An approval holds the request until its deadline. An unpublished
@@ -1065,13 +1065,13 @@ recorded in PR #5152.
 | 0162 | Execution deadline is exactly 1800 seconds | AMENDED | By ADR 0171. |
 | 0171 | Deadline is per agent, 60 to 10800 seconds, default 1800 | AMENDED | By ADR 0249. |
 | 0171 | Time, not turns, bounds a run | ENFORCED | `WorkerConfig.work_item_max_turns` (default 1000) sets the turn budget; `max-turns` is not retried. |
-| 0249 | Deadline is per agent, 60 to 43200 seconds, default 1800 | ENFORCED | `agents_execution_deadline_seconds_ck`, `execution_requests_deadline_ck` (migration 0136). |
+| 0249 | Deadline is per agent, 60 to 43200 seconds, default 1800 | ENFORCED | `agents_execution_deadline_seconds_ck`, `execution_requests_deadline_ck` (migrations 0136 and stable 0140). |
 | 0174 | `ppc` authorizes only the metadata comparison | ENFORCED | `require_publication_precheck`; no other route accepts it. |
 | 0174 | Precheck limits: 10 s and 5 per turn; 20 per lineage per 5 minutes | ENFORCED | [`runner/src/curie_runner/publication_precheck.py`](runner/src/curie_runner/publication_precheck.py) and [`apps/api/src/curie_api/routers/publication_precheck.py`](apps/api/src/curie_api/routers/publication_precheck.py). |
 | 0174 | An empty snapshot is refused without pending approval | ENFORCED | Runner refusals `body_required`, `stale_context`, `rate_limited`, `no_change`. |
 | 0186 | Base is one `base:` label or the default, from an allowlist | AMENDED | ADR 0253 permits case-sensitive glob patterns and resolves current labels at sandbox acquisition. |
 | 0186 | A bad base is refused with a comment, never substituted | ENFORCED | `factory_base.resolve_base` and `factory_base.comment_refusal`. |
-| 0186 | The base is frozen on the WorkItem | AMENDED | ADR 0253 follows ordinary base relabels; ADR 0251 restoration retains exact checkpoint pins. |
+| 0186 | The base is frozen on the WorkItem | AMENDED | ADR 0253 follows ordinary base relabels; ADR 0255 restoration retains exact checkpoint pins. |
 | 0253 | Current labels select an existing allowed remote branch after settling | ENFORCED | `factory_base_reconcile.resolve_for_acquire` and `workitem_dispatch.acquire`. |
 | 0253 | Relabels restart unpublished work or durably rebase and retarget its PR | ENFORCED | `factory_base_reconcile.observe_base_labels` and `factory_base_reconcile.reconcile_base_transitions`; final CI runs on a distinct commit pushed after retargeting. |
 | 0187 | Polling is the default, one replica, conditional reads | ENFORCED | `poll_once` holds `pg_try_advisory_lock` and stores ETags and cursors. |

@@ -194,7 +194,7 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_WORKSPACE_MAX_COMPRESSION_RATIO",
         "CURIE_WORKSPACE_REFERENCE_TTL_SECONDS",
         "CURIE_WORKSPACE_MAX_CONCURRENT_CLONES",
-        # The worker's recovery collector switch and pass interval (ADR 0251);
+        # The worker's recovery collector switch and pass interval (ADR 0255);
         # the API reads the same enable switch. Neither reaches the sandbox.
         "CURIE_WORKSPACE_RECOVERY_ENABLED",
         "CURIE_WORKSPACE_RECOVERY_COLLECT_INTERVAL_S",
@@ -355,6 +355,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_CONNECTOR_APP_NAME",
         "CURIE_RUNNER_IMAGE",
         "CURIE_SANDBOX_SUBSTRATE",
+        # Kubernetes quota admission policy, read by run._substrate_config from
+        # the worker's env for the substrate. Never a sandbox boot key.
+        "CURIE_SANDBOX_ADMISSION",
         "CURIE_WARM_POOL",
         # Agents with a per-agent pool (#3083, #2943), substrate only.
         "CURIE_AGENT_SANDBOX_POOLS",

@@ -74,7 +74,10 @@ def graph_payload() -> dict[str, Any]:
         ("0139", False),
         ("0141", False),
         ("0143", False),
-        ("0144", True),
+        ("0144", False),
+        # #5067: the candidate writes deadlines only the 0140 checks admit.
+        ("0140", False),
+        ("0145", True),
         ("0000", True),
         ("future-expand", True),
     ],

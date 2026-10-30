@@ -1,4 +1,4 @@
-"""Terminal recovery capture of a failed WorkItem run's workspace (ADR 0251, #5143).
+"""Terminal recovery capture of a failed WorkItem run's workspace (ADR 0255, #5143).
 
 The kernel calls ``WorkspaceRecoveryCapture.capture`` once, under the thread's
 lock lease, after an ordinary failed finish committed and before the run's claim

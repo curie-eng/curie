@@ -2604,7 +2604,7 @@ true
 {{- end -}}
 
 {{/*
-Workspace recovery (ADR 0251): off by default. Enabling it requires a positive
+Workspace recovery (ADR 0255): off by default. Enabling it requires a positive
 integer installation-wide byte cap that counts every recovery byte. Read
 through `default dict` for --reuse-values from a release that predates the key.
 The one helper both the API and the worker include, so a bad cap fails the
@@ -2622,11 +2622,11 @@ true
 {{- $recovery := dig "workspace" "recovery" dict (.Values.worker | default dict) -}}
 {{- $cap := get $recovery "maxBytes" -}}
 {{- if or (kindIs "invalid" $cap) (kindIs "string" $cap) (not (or (kindIs "float64" $cap) (kindIs "int64" $cap) (kindIs "int" $cap))) -}}
-{{- fail "worker.workspace.recovery.enabled=true requires worker.workspace.recovery.maxBytes to be a positive integer (ADR 0251): the installation-wide cap counts every recovery byte" -}}
+{{- fail "worker.workspace.recovery.enabled=true requires worker.workspace.recovery.maxBytes to be a positive integer (ADR 0255): the installation-wide cap counts every recovery byte" -}}
 {{- end -}}
 {{- $number := float64 $cap -}}
 {{- if or (le $number 0.0) (ne $number (floor $number)) -}}
-{{- fail "worker.workspace.recovery.maxBytes must be a positive integer (ADR 0251): the installation-wide cap counts every recovery byte" -}}
+{{- fail "worker.workspace.recovery.maxBytes must be a positive integer (ADR 0255): the installation-wide cap counts every recovery byte" -}}
 {{- end -}}
 {{- $cap | int64 -}}
 {{- end -}}

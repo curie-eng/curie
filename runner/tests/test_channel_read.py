@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import functools
+import itertools
 import json
 import logging
 import os
@@ -19,6 +20,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import anyio
@@ -128,6 +130,12 @@ def _token(
         .decode()
     )
     return f"chr.{payload}.{SENTINEL}-g{gen}-{turn}"
+
+
+@pytest.fixture
+def advancing_mint_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    seconds = itertools.count(int(time.time()))
+    monkeypatch.setitem(_token.__globals__, "time", SimpleNamespace(time=lambda: next(seconds)))
 
 
 def _frame(base: dict[str, Any], capability: Any = _OMIT) -> dict[str, Any]:
@@ -802,25 +810,33 @@ _STEER_SCENARIOS: dict[str, tuple[dict[str, Any] | None, list[tuple[str, Any]]]]
 
 
 @pytest.mark.parametrize(("opened", "steps"), _STEER_SCENARIOS.values(), ids=_STEER_SCENARIOS)
+@pytest.mark.usefixtures("advancing_mint_clock")
 def test_steer_replaces_clears_or_rejects_the_capability(
     drive: _Drive,
     opened: dict[str, Any] | None,
     steps: list[tuple[str, Any]],
 ) -> None:
     async def scenario(rig: _Rig) -> None:
-        response = await rig.open(None if opened is None else rig.capability(**opened))
+        minted: dict[str, str] = {}
+
+        def capability(claims: dict[str, Any]) -> dict[str, str]:
+            value = rig.capability(**claims)
+            minted.setdefault(json.dumps(claims, sort_keys=True), value["token"])
+            return value
+
+        response = await rig.open(None if opened is None else capability(opened))
         presented: list[str | None] = []
         for op, arg in steps:
             if op == "steer":
-                capability = arg if arg is None or arg is _OMIT else rig.capability(**arg)
-                assert await rig.steer(capability) == 200
+                steered = arg if arg is None or arg is _OMIT else capability(arg)
+                assert await rig.steer(steered) == 200
                 continue
             result = await rig.read()
             if arg is None:
                 _assert_refused(result, NO_CAP)
             else:
                 assert result["is_error"] is False, result
-                presented.append(_token(**arg))
+                presented.append(minted[json.dumps(arg, sort_keys=True)])
             assert rig.headers == presented
         assert (await rig.close_turn(response)).status is SessionStatus.DONE
 
@@ -828,6 +844,7 @@ def test_steer_replaces_clears_or_rejects_the_capability(
 
 
 @pytest.mark.parametrize("path", ["completion", "interrupt", "timeout", "disconnect"])
+@pytest.mark.usefixtures("advancing_mint_clock")
 def test_every_terminal_path_clears(drive: _Drive, path: str) -> None:
     async def scenario(rig: _Rig) -> None:
         if path == "disconnect":
@@ -838,17 +855,19 @@ def test_every_terminal_path_clears(drive: _Drive, path: str) -> None:
             _assert_refused(during, NO_CAP)
             assert len(rig.api.received) == 1
             return
-        response = await rig.open(rig.capability())
+        first_capability = rig.capability()
+        response = await rig.open(first_capability)
         assert (await rig.read())["is_error"] is False
         if path == "completion":
             await rig.close_turn(response)
             _assert_refused(await rig.read(), NO_CAP)
             # The next turn reads with its own capability; a stale timeout does not clear it.
-            second = await rig.open(rig.capability(turn="evt-2"))
+            second_capability = rig.capability(turn="evt-2")
+            second = await rig.open(second_capability)
             stale = {**_AUTH, _TURN_EPOCH_HEADER: response.headers[_TURN_EPOCH_HEADER]}
             assert (await rig.client.post("/v1/timeout", headers=stale)).status == 409
             assert (await rig.read())["is_error"] is False
-            assert rig.headers == [_token(), _token(turn="evt-2")]
+            assert rig.headers == [first_capability["token"], second_capability["token"]]
             assert (await rig.close_turn(second)).status is SessionStatus.DONE
             return
 
@@ -886,6 +905,7 @@ def _tool_results(record: TurnRecord) -> dict[str, tuple[str, Any]]:
     return results
 
 
+@pytest.mark.usefixtures("advancing_mint_clock")
 def test_persisted_records_keep_provenance_not_bodies_or_the_token(
     drive: _Drive, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -894,7 +914,8 @@ def test_persisted_records_keep_provenance_not_bodies_or_the_token(
         await rig.close_turn(await rig.open(rig.capability(turn="evt-0")))
 
         reading = await rig.open(rig.capability(turn="evt-1"))
-        assert await rig.steer(rig.capability(turn="evt-1", gen=2)) == 200
+        capability = rig.capability(turn="evt-1", gen=2)
+        assert await rig.steer(capability) == 200
         read = await rig.sdk.tool_round("call-read", "read_channel_history", HISTORY_ARGS)
         assert read["is_error"] is False
         assert MARKER in read["text"]
@@ -924,7 +945,7 @@ def test_persisted_records_keep_provenance_not_bodies_or_the_token(
         # An error carries no body and is kept verbatim.
         assert results["call-refused"] == (refused["text"], True)
 
-        assert rig.headers == [_token(turn="evt-1", gen=2)] * 2
+        assert rig.headers == [capability["token"]] * 2
         persisted = json.dumps([record.to_dict() for record in records])
         assert MARKER not in persisted and SENTINEL not in persisted
         assert SENTINEL not in json.dumps([body for _, _, body in rig.api.received])

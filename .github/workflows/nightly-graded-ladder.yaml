@@ -478,7 +478,7 @@ jobs:
         uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           version: v0.24.0
-          node_image: kindest/node:v1.31.0
+          node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
           cluster_name: curie-e2e
           config: kind-config.yaml
       # Load the four locally-built images into the node store so the install's

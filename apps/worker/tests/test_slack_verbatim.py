@@ -28,21 +28,38 @@ def _event(text: str, *, ref: str | None = "1.1") -> ReplyUpdate:
 def _assert_literal(call: dict[str, object]) -> str:
     blocks = call["blocks"]
     assert isinstance(blocks, list) and len(blocks) == 1
-    # A plain_text section renders its newlines as spaces in the Slack client;
-    # a preformatted rich_text element renders every character and line break.
-    assert blocks[0] == {
-        "type": "rich_text",
-        "elements": [
-            {
-                "type": "rich_text_preformatted",
-                "elements": [{"type": "text", "text": call["text"]}],
-            }
-        ],
-    }
+    # ADR 0250: an ordinary rich text section, not a preformatted code box.
+    block = blocks[0]
+    assert block["type"] == "rich_text"
+    assert len(block["elements"]) == 1
+    section = block["elements"][0]
+    assert set(section) == {"type", "elements"}
+    assert section["type"] == "rich_text_section"
+    visible = []
+    for element in section["elements"]:
+        assert element["type"] in {"text", "link"}
+        assert element["text"]
+        if element["type"] == "link":
+            assert set(element) == {"type", "url", "text"}
+            assert element["url"] == element["text"]
+        else:
+            assert set(element) == {"type", "text"}
+        visible.append(element["text"])
     text = call["text"]
     assert isinstance(text, str)
+    assert "".join(visible) == text
     assert len(text.encode("utf-8")) <= SLACK_VERBATIM_MAX_BYTES
     return text
+
+
+def _links(call: dict[str, object]) -> list[str]:
+    blocks = call["blocks"]
+    assert isinstance(blocks, list)
+    return [
+        element["url"]
+        for element in blocks[0]["elements"][0]["elements"]
+        if element["type"] == "link"
+    ]
 
 
 @pytest.mark.anyio
@@ -125,3 +142,77 @@ async def test_verbatim_rejected_blocks_do_not_fall_back_to_rendered_text() -> N
         await sink.emit(_event("literal"), route=TargetRoute())
     assert len(calls) == 1
     assert _assert_literal(calls[0]) == "literal"
+
+
+_REPORT = (
+    "Weekly summary\n"
+    "\n"
+    "  Revenue: 1,234,567.89\n"
+    "    - region A & region B (combined)\n"
+    "\n"
+    "\n"
+    "Details: https://reports.example.com/view?a=1&b=2&name=Q3_(final)%28v2%29.\n"
+    "Source (https://docs.example.com/page_(1)) and <https://x.example.com/p>, done\n"
+    "*not bold* _not italic_ <@U0EXAMPLE1> :smile:\n"
+)
+
+
+@pytest.mark.anyio
+async def test_verbatim_report_reads_as_a_section_with_exact_links() -> None:
+    sink = SlackReplyAdapter("xoxb-test")
+    calls: list[dict[str, object]] = []
+
+    async def update(**kwargs: object) -> None:
+        calls.append(kwargs)
+
+    sink._client_for(None).chat_update = update  # type: ignore[method-assign]
+    await sink.emit(_event(_REPORT), route=TargetRoute())
+    assert len(calls) == 1
+    assert _assert_literal(calls[0]) == _REPORT
+    assert _links(calls[0]) == [
+        "https://reports.example.com/view?a=1&b=2&name=Q3_(final)%28v2%29",
+        "https://docs.example.com/page_(1)",
+        "https://x.example.com/p",
+    ]
+
+
+@pytest.mark.anyio
+async def test_verbatim_long_report_splits_on_lines_and_never_inside_a_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def sleep(delay: float) -> None:
+        pass
+
+    monkeypatch.setattr(slack_sink, "_reply_sleep", sleep)
+    line = "  item é see https://reports.example.com/r?id=1&q=(x)%28y%29 now\n"
+    text = "Header\n\n" + line * 120 + "\nEnd."
+    assert len(text.encode("utf-8")) > 3000
+    sink = SlackReplyAdapter("xoxb-test")
+    calls: list[dict[str, object]] = []
+
+    async def update(**kwargs: object) -> None:
+        calls.append(kwargs)
+
+    async def post(**kwargs: object) -> dict[str, str]:
+        calls.append(kwargs)
+        return {"ts": f"2.{len(calls)}"}
+
+    sink._client_for(None).chat_update = update  # type: ignore[method-assign]
+    sink._client_for(None).chat_postMessage = post  # type: ignore[method-assign]
+    await sink.emit(_event(text), route=TargetRoute())
+    assert len(calls) > 1
+    parts = [_assert_literal(call) for call in calls]
+    assert "".join(parts) == text
+    assert all(part.endswith("\n") for part in parts[:-1])
+    url = "https://reports.example.com/r?id=1&q=(x)%28y%29"
+    assert all(set(_links(call)) == {url} for call in calls)
+    assert sum(len(_links(call)) for call in calls) == 120
+
+
+def test_verbatim_split_keeps_a_url_whole_without_a_line_break() -> None:
+    url = "https://reports.example.com/" + "a" * 200
+    text = ("word " * 540) + url + (" tail" * 10)
+    parts = split_verbatim_answer(text)
+    assert "".join(part.content for part in parts) == text
+    assert any(url in part.content for part in parts)
+    assert all(len(part.content.encode("utf-8")) <= SLACK_VERBATIM_MAX_BYTES for part in parts)

@@ -255,7 +255,7 @@ spec:
             - name: CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES
               value: {{ include "curie.actionExecutorMaxConcurrentSandboxes" . | quote }}
             {{- if eq (include "curie.workspaceRecoveryEnabled" .) "true" }}
-            # Workspace recovery (ADR 0251). The ledger compares the worker's
+            # Workspace recovery (ADR 0255). The ledger compares the worker's
             # archive limit with its own, so both render from the same value.
             - name: CURIE_WORKSPACE_RECOVERY_ENABLED
               value: "true"

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import re
 import uuid
 from dataclasses import dataclass
@@ -20,8 +19,6 @@ from .models import ExecutionRequest, Publication, ThreadPublicationLineage, Wor
 from .publication_pulls import PullRequestRefused, revision_refusal
 
 _COMMIT_SHA = re.compile(r"[0-9a-f]{40,64}")
-_ANCESTRY_READ_LIMIT = 1024
-_ANCESTRY_TIMEOUT_SECONDS = 10
 
 
 @dataclass(frozen=True)
@@ -203,46 +200,21 @@ async def verify_publication_commit(
     if refusal is not None:
         raise PullRequestRefused("revision_mismatch", refusal)
     if first_publication:
-        cache = {commit_sha: commit}
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + _ANCESTRY_TIMEOUT_SECONDS
-
-        async def reachable(start: str, target: str) -> bool:
-            pending = [start]
-            visited: set[str] = set()
-            while pending:
-                if loop.time() >= deadline:
-                    raise Unavailable("publication_ancestry_unproved")
-                sha = pending.pop()
-                if sha == target:
-                    return True
-                if sha in visited:
-                    continue
-                visited.add(sha)
-                if sha not in cache:
-                    if len(cache) - 1 >= _ANCESTRY_READ_LIMIT:
-                        raise Unavailable("publication_ancestry_unproved")
-                    ancestor = await code_host.read_commit(repository, sha)
-                    if not _valid_commit(ancestor, sha):
-                        raise Unavailable("publication_ancestry_unproved")
-                    cache[sha] = ancestor
-                pending.extend(reversed(cache[sha].parents))
-            return False
-
+        # One forge answer per relation; the HTTP client timeouts bound each.
         try:
-            async with asyncio.timeout_at(deadline):
-                tip = await code_host.branch_head(repository, base_branch)
-                if not isinstance(tip, str) or _COMMIT_SHA.fullmatch(tip) is None:
-                    raise Unavailable("publication_ancestry_unproved")
-                if not await reachable(parent_sha, snapshot[4]) or not await reachable(
-                    tip, parent_sha
-                ):
-                    raise PullRequestRefused(
-                        "base_ancestry_mismatch",
-                        "the publication parent is not on the approved base branch history",
-                    )
+            tip = await code_host.branch_head(repository, base_branch)
+            if not isinstance(tip, str) or _COMMIT_SHA.fullmatch(tip) is None:
+                raise Unavailable("publication_ancestry_unproved")
+            on_base = await code_host.is_ancestor(
+                repository, expected_prior_head, parent_sha
+            ) and await code_host.is_ancestor(repository, parent_sha, tip)
         except (ForgeError, TimeoutError):
             raise Unavailable("publication_ancestry_unproved") from None
+        if not on_base:
+            raise PullRequestRefused(
+                "base_ancestry_mismatch",
+                "the publication parent is not on the approved base branch history",
+            )
     return VerifiedPublicationCommit(
         *snapshot,
         commit_sha=commit_sha,

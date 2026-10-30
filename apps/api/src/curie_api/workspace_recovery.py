@@ -259,7 +259,7 @@ async def context(
 async def outcome(
     session: AsyncSession, settings: Settings, body: wire.RecoveryOutcome
 ) -> wire.RecoveryOutcomeRecorded:
-    """Record a capture that ended before any reservation (ADR 0251 section 3).
+    """Record a capture that ended before any reservation (ADR 0255 section 3).
 
     The source must be the latest failed request, but an expired heartbeat or
     deadline does not block it. An outcome written after the source's terminus

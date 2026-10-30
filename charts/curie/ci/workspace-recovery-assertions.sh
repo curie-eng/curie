@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Render assertions for workspace recovery capture (ADR 0251, #5143).
+# Render assertions for workspace recovery capture (ADR 0255, #5143).
 #
 # worker.workspace.recovery.enabled is off by default. When an operator turns it
 # on, the worker and the API must both see the switch, the API must see the

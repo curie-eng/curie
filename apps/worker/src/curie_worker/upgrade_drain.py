@@ -77,6 +77,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import fcntl
 import json
 import logging
 import math
@@ -85,15 +86,14 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict
 
 from curie_upgrade_pause import PAUSE_LEASE_S, marker_keys, renew_pause
-from redis.asyncio import Redis
-from redis.asyncio.retry import Retry
-from redis.backoff import NoBackoff
-from redis.exceptions import ResponseError
 
-from .config import WorkerConfig
+if TYPE_CHECKING:
+    from redis.asyncio import Redis
+
+    from .config import WorkerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -399,6 +399,8 @@ class UpgradeDrainGate:
         return tuple(sorted(found))
 
     async def _unsettled_in_lane(self, stream: str, group: str) -> list[str]:
+        from redis.exceptions import ResponseError
+
         cursor = "-"
         live: list[str] = []
         while True:
@@ -541,6 +543,8 @@ class UpgradeDrainGate:
 
 
 def _client(config: WorkerConfig) -> Redis:
+    from redis.asyncio import Redis
+
     return Redis(**config.valkey_client_kwargs())
 
 
@@ -655,6 +659,9 @@ async def run_gate(config: WorkerConfig, *, mode: str) -> int:
     redis = _client(config)
     try:
         if mode in {"attest", "hold"}:
+            from redis.asyncio.retry import Retry
+            from redis.backoff import NoBackoff
+
             # These hooks are one-shot steps. Redis.set_retry also applies to
             # future pooled connections, so a connection failure cannot spend
             # the hook budget on the client's default backoff and retries.
@@ -846,31 +853,39 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    config = WorkerConfig()
-    if args.mode == "status":
-        status = asyncio.run(_read_claim_status(config))
-        if not args.with_ttl:
-            status.pop("ttl_seconds", None)
-        if args.json:
-            sys.stdout.write(json.dumps(status, separators=(",", ":")) + "\n")
-        else:
-            ttl = status.get("ttl_seconds")
-            expiry = (
-                f"; the marker expires in {ttl}s unless released or renewed"
-                if ttl is not None
-                else ""
-            )
-            if status["state"] == "quiescing" and status["revision"] is not None:
-                logger.info(
-                    "worker claims are quiescing since %s for upgrade revision %d%s",
-                    status["since"],
-                    status["revision"],
-                    expiry,
-                )
+    status_context = open(__file__, "rb") if args.mode == "status" else contextlib.nullcontext()
+    with status_context as status_lock:
+        if status_lock is not None:
+            fcntl.flock(status_lock.fileno(), fcntl.LOCK_EX)
+
+        from .config import WorkerConfig
+
+        config = WorkerConfig()
+        if args.mode == "status":
+            status = asyncio.run(_read_claim_status(config))
+            if not args.with_ttl:
+                status.pop("ttl_seconds", None)
+            if args.json:
+                sys.stdout.write(json.dumps(status, separators=(",", ":")) + "\n")
+                sys.stdout.flush()
             else:
-                logger.info("worker claim state: %s%s", status["state"], expiry)
-        return 0
-    return asyncio.run(run_gate(config, mode=args.mode))
+                ttl = status.get("ttl_seconds")
+                expiry = (
+                    f"; the marker expires in {ttl}s unless released or renewed"
+                    if ttl is not None
+                    else ""
+                )
+                if status["state"] == "quiescing" and status["revision"] is not None:
+                    logger.info(
+                        "worker claims are quiescing since %s for upgrade revision %d%s",
+                        status["since"],
+                        status["revision"],
+                        expiry,
+                    )
+                else:
+                    logger.info("worker claim state: %s%s", status["state"], expiry)
+            return 0
+        return asyncio.run(run_gate(config, mode=args.mode))
 
 
 if __name__ == "__main__":  # pragma: no cover - process entry point

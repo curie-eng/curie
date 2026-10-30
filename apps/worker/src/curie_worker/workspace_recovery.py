@@ -1,4 +1,4 @@
-"""Authenticated recovery metadata client (ADR 0251); restoration is not wired."""
+"""Authenticated recovery metadata client (ADR 0255); restoration is not wired."""
 
 from typing import Any
 
