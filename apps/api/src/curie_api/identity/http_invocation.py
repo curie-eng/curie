@@ -699,6 +699,16 @@ async def current_http_invocation(
         yield current
 
 
+class _StaleCapture(Exception):
+    """Another identity writer committed after this attempt's capture.
+
+    @spec HTTP-INVOCATION-EXECUTION-4.
+    """
+
+
+_COMPOSITION_ATTEMPTS = 3
+
+
 @asynccontextmanager
 async def current_source_authority(
     request: Request, *, runtime: HttpInvocationRuntime, client: HttpIdentityClient,
@@ -712,92 +722,105 @@ async def current_source_authority(
     """
     factory = request.app.state.sessionmaker
     valkey = request.app.state.valkey
-    try:
-        async with factory() as session, session.begin():
-            await identity_fence.lock_identity_reader(session)
-            captured, _ = await capture_source(session, registration, source)
-            credential = runtime._providers.resolve(captured.authority.configuration)
-            if not isinstance(credential, ResolvedProviderCredential):
-                _unavailable()
-        lookup = lookup_request(registration, captured, credential, purpose="invocation")
-        observation = await client.lookup(
-            target=credential.target, bearer=credential.bearer, request=lookup,
-            limits=credential.limits,
-        )
-        if not isinstance(observation, HttpIdentityObservation):
-            _unavailable()
-        async with identity_fence.mutation(factory, valkey) as writer:
-            async with writer.begin():
-                current, _ = await capture_source(
-                    writer, registration, source, writer_agent=captured.agent_id,
-                )
-                if current != captured:
-                    _unavailable()
-                source_facts(observation.response_bytes, lookup, credential)
-                application = await principal_authority.apply_http_principal(
-                    writer, capture=captured.authority, request=lookup,
-                    response_bytes=observation.response_bytes,
-                )
-                await writer.commit()
-        # Leaving the writer successfully acknowledges stable settlement as well as COMMIT.
-    except HTTPException:
-        raise
-    except Exception:  # noqa: BLE001 - authority failures carry no provider or credential data.
-        _unavailable()
-    async with factory() as session, session.begin():
+    for _attempt in range(_COMPOSITION_ATTEMPTS):
         try:
-            await identity_fence.lock_identity_reader(session)
-            current, binding = await capture_source(session, registration, source)
-            if (
-                current.fingerprint != captured.fingerprint
-                or current.authority.lifecycle_generation != application.lifecycle_generation
-                or request.app.state.http_identity_runtime is not runtime
-                or request.app.state.http_identity_client is not client
-            ):
+            async with factory() as session, session.begin():
+                await identity_fence.lock_identity_reader(session)
+                captured, _ = await capture_source(session, registration, source)
+                credential = runtime._providers.resolve(captured.authority.configuration)
+                if not isinstance(credential, ResolvedProviderCredential):
+                    _unavailable()
+            lookup = lookup_request(registration, captured, credential, purpose="invocation")
+            observation = await client.lookup(
+                target=credential.target, bearer=credential.bearer, request=lookup,
+                limits=credential.limits,
+            )
+            if not isinstance(observation, HttpIdentityObservation):
                 _unavailable()
-            facts = source_facts(observation.response_bytes, lookup, credential)
-            if application.principal_id is not None:
-                principal = await session.get(Principal, application.principal_id)
+            async with identity_fence.mutation(factory, valkey) as writer:
+                async with writer.begin():
+                    current, _ = await capture_source(
+                        writer, registration, source, writer_agent=captured.agent_id,
+                    )
+                    if current != captured:
+                        raise _StaleCapture
+                    source_facts(observation.response_bytes, lookup, credential)
+                    application = await principal_authority.apply_http_principal(
+                        writer, capture=captured.authority, request=lookup,
+                        response_bytes=observation.response_bytes,
+                    )
+                    await writer.commit()
+            # Leaving the writer successfully acknowledges stable settlement as well as COMMIT.
+        except (HTTPException, _StaleCapture) as error:
+            if isinstance(error, HTTPException):
+                raise
+            continue
+        except Exception:  # noqa: BLE001 - authority failures carry no provider or credential data.
+            _unavailable()
+        live: CurrentHttpInvocation | None = None
+        async with factory() as session, session.begin():
+            try:
+                await identity_fence.lock_identity_reader(session)
+                current, binding = await capture_source(session, registration, source)
                 if (
-                    principal is None or str(principal.tenant_id) != registration.tenant_id
-                    or facts.identity is None or principal.idp_issuer != facts.identity.issuer
-                    or principal.idp_subject != facts.identity.subject or principal.type != "human"
-                    or principal.status != facts.identity.account_status
-                    or principal.authorization_version != application.authorization_version
+                    request.app.state.http_identity_runtime is not runtime
+                    or request.app.state.http_identity_client is not client
                 ):
                     _unavailable()
-            source_permission(
-                current, binding, facts,
-                current.sender.native_id in registration.human_native_ids, original,
-            )
-            stable = await valkey.get(identity_fence.FENCE_KEY)
-            if isinstance(stable, bytes):
-                stable = stable.decode("ascii")
-            if type(stable) is not str or not stable.startswith("stable:"):
-                _unavailable()
-            uuid.UUID(stable.removeprefix("stable:"))
-            validity = identity_delivery_window(facts, credential.limits)
-            principal_ref = None
-            if application.principal_id is not None:
-                assert application.authorization_version is not None
-                principal_ref = PrincipalRef(
-                    principal_id=str(application.principal_id),
-                    authorization_version=application.authorization_version,
+                if (
+                    current.fingerprint != captured.fingerprint
+                    or current.authority.lifecycle_generation != application.lifecycle_generation
+                ):
+                    raise _StaleCapture
+                facts = source_facts(observation.response_bytes, lookup, credential)
+                if application.principal_id is not None:
+                    principal = await session.get(Principal, application.principal_id)
+                    if (
+                        principal is None or str(principal.tenant_id) != registration.tenant_id
+                        or facts.identity is None or principal.idp_issuer != facts.identity.issuer
+                        or principal.idp_subject != facts.identity.subject
+                        or principal.type != "human"
+                        or principal.status != facts.identity.account_status
+                        or principal.authorization_version != application.authorization_version
+                    ):
+                        _unavailable()
+                source_permission(
+                    current, binding, facts,
+                    current.sender.native_id in registration.human_native_ids, original,
                 )
-            live = CurrentHttpInvocation(
-                binding, session, intent_digest,
-                principal_ref, runtime, registration, current, facts, application, stable, validity,
-                observation.response_bytes, lookup, credential, source, client, original,
-                _sealable=original is None,
-            )
-        except HTTPException:
-            raise
-        except Exception:  # noqa: BLE001 - fail closed without disclosing authority inputs.
-            _unavailable()
-        try:
-            yield live
-        finally:
-            object.__setattr__(live, "_open", False)
+                stable = await valkey.get(identity_fence.FENCE_KEY)
+                if isinstance(stable, bytes):
+                    stable = stable.decode("ascii")
+                if type(stable) is not str or not stable.startswith("stable:"):
+                    _unavailable()
+                uuid.UUID(stable.removeprefix("stable:"))
+                validity = identity_delivery_window(facts, credential.limits)
+                principal_ref = None
+                if application.principal_id is not None:
+                    assert application.authorization_version is not None
+                    principal_ref = PrincipalRef(
+                        principal_id=str(application.principal_id),
+                        authorization_version=application.authorization_version,
+                    )
+                live = CurrentHttpInvocation(
+                    binding, session, intent_digest,
+                    principal_ref, runtime, registration, current, facts, application, stable,
+                    validity, observation.response_bytes, lookup, credential, source, client,
+                    original, _sealable=original is None,
+                )
+            except _StaleCapture:
+                pass
+            except HTTPException:
+                raise
+            except Exception:  # noqa: BLE001 - fail closed without disclosing authority inputs.
+                _unavailable()
+            if live is not None:
+                try:
+                    yield live
+                finally:
+                    object.__setattr__(live, "_open", False)
+                return
+    _unavailable()
 
 
 def turn_authority_response(
