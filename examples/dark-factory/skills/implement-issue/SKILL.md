@@ -260,11 +260,11 @@ Call report_progress with phase `plan_review` and round `1`.
 
 Call the `Agent` tool (also called Task) once, with exactly these arguments:
 
-- `subagent_type`: `"dark-factory:plan-reviewer"` (required; never omit it)
-- `description`: `"Plan review round 1"`
-- `prompt`: the issue link and text, your numbered acceptance criteria, and
-  the full plan with its verification table.
-- `run_in_background`: `false` (required; never omit it)
+1. `subagent_type`: `"dark-factory:plan-reviewer"` (required; never omit it)
+2. `description`: `"Plan review round 1"`
+3. `prompt`: the issue link and text, your numbered acceptance criteria, and
+   the full plan with its verification table.
+4. `run_in_background`: `false` (required; never omit it)
 
 Do not pass `isolation` or `model`. Wait for the foreground call to return
 before any other tool call. A real review reply starts with the line

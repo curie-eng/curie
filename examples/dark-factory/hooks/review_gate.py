@@ -16,10 +16,14 @@ wait_ci loop of ``CI_ROUNDS`` (3), whose marker is ``Curie wait_ci round N of
 ``PostToolUse``. An admission this hook refuses, a call the runner refuses
 after this hook allowed it, and a call that returns no verdict never count.
 
-State lives in one JSON file per run under ``DARK_FACTORY_STATE_DIR``. Its key
-is the Curie session: ``CURIE_SESSION_ID`` when it is set and not blank (the
-runner keeps it when it rotates the SDK session), else the hook payload's
-``session_id``. A key missing from an older state file reads as unset.
+State lives in one JSON file per session under ``DARK_FACTORY_STATE_DIR``.
+Its key is the Curie session: ``CURIE_SESSION_ID`` when it is set and not
+blank (the runner keeps it when it rotates the SDK session), else the hook
+payload's ``session_id``. A run belongs to one session and one workspace: the
+active workspace's run is the file's top level, and the session's runs in
+other workspaces are parked under ``others``, keyed by workspace. Tool events
+read and write the active run only. A key missing from an older state file
+reads as unset.
 
 Timing. ``execution_deadline`` (D) and ``execution_seconds`` (S) come only from
 a completed ``mcp__curie__get_issue`` call. The round cutoff is ``D - S // 6``
@@ -60,8 +64,11 @@ One script handles every hook event the bundle registers:
 
 ``PreToolUse`` on ``Edit``/``Write``/``MultiEdit``/``NotebookEdit``
     An edit under the workspace's root ``.github`` directory stops the run in
-    every phase, matching the first path component case-insensitively after
-    resolving the path. No repository edit before the workflow is loaded and
+    every phase. The first path component is matched case-insensitively in
+    the path's lexical form (normalized against the workspace) and in its
+    resolved form (symlinks followed, against the resolved workspace), so
+    neither a ``.github`` symlink nor a symlinked workspace prefix escapes
+    it. No repository edit before the workflow is loaded and
     the plan review completed (either verdict), and none the timing refuses
     (that refusal writes ``timing_refused``, not ``edit_refused``). Right
     after the plan review (phase ``failing_test``) only test edits may
@@ -114,11 +121,12 @@ One script handles every hook event the bundle registers:
     returns to implement, not to plan. A missing prompt fingerprint stops the
     run before the review. Then the timing check.
 
-    Diff review: a changed or untracked root ``.github`` path stops the run
-    (an unreadable git status does not emit ``github_path_refused`` and does
-    not by itself stop the run). No diff review before the plan review
-    completes. The same invocation then fingerprints the checkout; a
-    fingerprint that cannot be taken refuses the review without a stop. A
+    Diff review: a changed or untracked root ``.github`` path, matched the
+    same way as for edits, stops the run (an unreadable git status does not
+    emit ``github_path_refused`` and does not by itself stop the run). No diff
+    review before the plan review completes. The same invocation then
+    fingerprints the checkout; a fingerprint that cannot be taken refuses the
+    review without a stop. A
     checkout the diff reviewer already approved is refused (cause
     ``already_approved``): go to publish. An approval of another checkout is
     cleared. Then the timing check. A checkout identical to the last one that
@@ -195,20 +203,25 @@ One script handles every hook event the bundle registers:
     retaken, and the hook returns no additional context.
 
     Any other prompt resolves its workspace as the real path of
-    ``DARK_FACTORY_WORKSPACE`` or the payload ``cwd``, without calling git.
-    With no readable saved state for the session key, or a workspace outside
-    the saved one, it starts a new run: the reset state is saved, then the
-    checkout fingerprint is taken with at most two attempts sharing a
-    seven-second deadline that also bounds hashing untracked files. If
+    ``DARK_FACTORY_WORKSPACE`` or the payload ``cwd``, without calling git. A
+    workspace equal to a run's workspace, or inside it, is that run's
+    checkout. A prompt from another checkout than the active run's parks the
+    active run under ``others``, then resumes the parked run of its own
+    checkout (the innermost match) as a continuation, if there is one.
+    Otherwise, and with no readable saved state for the session key, it
+    starts a new run there, keeping the parked runs: the reset state is
+    saved with them, then the checkout fingerprint is taken with at most two
+    attempts sharing a seven-second deadline that also bounds hashing
+    untracked files. If
     neither succeeds, the run stops with the prerequisite failure. A CI fix
     round starts at ``implement`` with planning complete and takes no
     fingerprint.
 
-    Otherwise (the saved workspace or a directory inside it) the prompt
-    continues the run: rounds, planning, the fingerprint, timing, findings and
-    any stop are kept. A stop is never cleared, with one exception: a run
-    stopped for a missing prompt fingerprint before planning completed
-    retakes the fingerprint the same way, and a success clears that stop. A
+    A prompt from the active run's checkout continues that run: rounds,
+    planning, the fingerprint, timing, findings and any stop are kept. A stop
+    is never cleared, with one exception: a run stopped for a missing prompt
+    fingerprint before planning completed retakes the fingerprint the same
+    way, and a success clears that stop. A
     genuine CI marker on a run that is not stopped opens one repair round:
     planning complete, stage ``implement``, a new diff loop at round 0, every
     approval and the rejected checkout cleared, and the CI findings kept.
@@ -591,21 +604,23 @@ def _git(top: str, deadline: float, *args: str) -> bytes:
 
 
 def _github_path(path: str, workspace: str) -> str | None:
-    """A refused workspace-relative path, after resolving it.
+    """A refused workspace-relative path, lexical form first, then resolved.
 
-    The workspace is recorded as a real path, so the target is resolved too:
-    a path through a symlinked workspace prefix still lands under it.
+    The lexical form (normalized against the workspace) catches a root
+    ``.github`` that is itself a symlink to an ordinary directory. The
+    resolved form catches a path through a symlinked workspace prefix, since
+    the workspace is recorded as a real path.
     """
     if not path or not workspace:
         return None
-    root = os.path.realpath(workspace)
-    target = Path(os.path.realpath(os.path.join(root, path)))
-    try:
-        relative = target.relative_to(root)
-    except ValueError:
-        return None
-    if relative.parts and relative.parts[0].casefold() == ".github":
-        return relative.as_posix()
+    for normalize in (os.path.abspath, os.path.realpath):
+        root = normalize(workspace)
+        try:
+            relative = Path(normalize(os.path.join(root, path))).relative_to(root)
+        except ValueError:
+            continue
+        if relative.parts and relative.parts[0].casefold() == ".github":
+            return relative.as_posix()
     return None
 
 
@@ -1630,9 +1645,38 @@ def _prompt_fingerprint(workspace: str) -> str | None:
     return None
 
 
-def _start_run(path: Path, prompt: str, workspace: str) -> dict[str, Any]:
+def _parked(state: dict[str, Any]) -> dict[str, Any]:
+    """Every workspace's run in this session except the active one, keyed by
+    workspace; the active one is parked with them. Never another level deep."""
+    others = state.pop("others", None)
+    if not isinstance(others, dict):
+        others = {}
+    others[str(state.get("workspace") or "")] = state
+    return others
+
+
+def _resume(others: dict[str, Any], workspace: str) -> dict[str, Any] | None:
+    """The parked run ``workspace`` belongs to (the innermost match), taken out."""
+    matches = [
+        key
+        for key, run in others.items()
+        if key and isinstance(run, dict) and _same_checkout(run, workspace)
+    ]
+    if not matches:
+        return None
+    resumed: dict[str, Any] = others.pop(max(matches, key=len))
+    if others:
+        resumed["others"] = others
+    return resumed
+
+
+def _start_run(path: Path, prompt: str, workspace: str, others: dict[str, Any]) -> dict[str, Any]:
     state = _fresh(prompt)
     state["workspace"] = workspace
+    if others:
+        # The session's runs in other workspaces ride along, so the early save
+        # below never loses one.
+        state["others"] = others
     ci_round = state["ci_round"]
     if ci_round:
         _begin_ci_round(state, prompt, ci_round)
@@ -1706,9 +1750,17 @@ def handle(data: dict[str, Any]) -> dict[str, Any] | None:
             return None
         workspace = _workspace(data)
         saved = _saved(path)
-        if saved is not None and _same_checkout(saved, workspace):
+        if saved is None:
+            return _start_run(path, prompt, workspace, {})
+        if _same_checkout(saved, workspace):
             return _continue_run(path, saved, prompt)
-        return _start_run(path, prompt, workspace)
+        # Another checkout in this session: park the active run, then resume
+        # that checkout's own run or start one there.
+        others = _parked(saved)
+        resumed = _resume(others, workspace)
+        if resumed is not None:
+            return _continue_run(path, resumed, prompt)
+        return _start_run(path, prompt, workspace, others)
     tool = str(data.get("tool_name") or "")
     tool_input = dict(data.get("tool_input") or {})
     state = load(path)
