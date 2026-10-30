@@ -570,6 +570,40 @@ def test_openrouter_key_limit_text_is_credit_exhausted() -> None:
     assert _is_credit_exhausted("authentication_failed", _OPENROUTER_KEY_LIMIT_403)
 
 
+# Observed 2026-10-29. An OpenRouter workspace daily budget refusal is HTTP 403,
+# and the SDK reports error="authentication_failed" (#5163).
+_OPENROUTER_WORKSPACE_BUDGET_403 = (
+    'API Error: 403 {"error":{"message":"Workspace daily budget of $20.00 exceeded. '
+    'Contact your org admin. $20.08 of $20.00 used; resets 2026-10-30T00:00:00.000Z.",'
+    '"code":403}}'
+)
+
+
+def test_openrouter_workspace_budget_text_is_credit_exhausted() -> None:
+    state = TurnState()
+    msg = AssistantMessage(
+        content=[TextBlock(text=_OPENROUTER_WORKSPACE_BUDGET_403)],
+        model="<synthetic>",
+        error="authentication_failed",
+    )
+    errors = [e for e in _translate(msg, state) if isinstance(e, ErrorEvent)]
+    assert len(errors) == 1
+    assert errors[0].classification == "model-credit-exhausted"
+    assert state.error_classification == "model-credit-exhausted"
+    assert _is_credit_exhausted("authentication_failed", _OPENROUTER_WORKSPACE_BUDGET_403)
+
+
+def test_budget_text_without_an_exceeded_amount_is_not_credit_exhausted() -> None:
+    # A 403 with no credit or budget text stays out of this class, as does a
+    # bare budget mention and Curie's own budget-exceeded token.
+    assert not _is_credit_exhausted(
+        "authentication_failed",
+        'API Error: 403 {"error":{"message":"invalid api key","code":403}}',
+    )
+    assert not _is_credit_exhausted("unknown", "daily budget remaining")
+    assert not _is_credit_exhausted("unknown", "budget-exceeded")
+
+
 def test_rate_limit_text_is_not_credit_exhausted() -> None:
     # A retryable rate limit must stay out of the terminal credit class.
     assert not _is_credit_exhausted("rate_limit", "API Error: 429 Rate limit exceeded")

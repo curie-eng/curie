@@ -1,9 +1,8 @@
 """Concurrent boot fetches: memory, history, and the MCP capability probe.
 
-A delay on each fake endpoint must overlap so boot finishes in under twice one
-delay. Memory and the MCP probe degrade independently; a configured history
-ref is fail-loud because answering without prior tool context can duplicate
-an operation.
+All three fake endpoints must enter before any responds. Memory and the MCP
+probe degrade independently; a configured history ref is fail-loud because
+answering without prior tool context can duplicate an operation.
 """
 
 from __future__ import annotations
@@ -11,7 +10,6 @@ from __future__ import annotations
 import json
 import logging
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +29,7 @@ _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 _SERVER = Path(__file__).parent / "fixtures" / "mcp_tool_capability_server.py"
 _DELAY = 1.5
 _TRANSCRIPT_CAP_HEADERS = {"X-Curie-Transcript-Max-Bytes": "65536"}
+_BOOT_FETCH_ENDPOINTS = frozenset({"memory", "history", "mcp"})
 
 _MEMORY_ITEM = {
     "content": "prefer ruff over flake8",
@@ -80,6 +79,37 @@ def _delayed_mcp(tmp_path: Path, delay: float) -> Path:
     return script
 
 
+class _BootFetchRendezvous:
+    def __init__(self) -> None:
+        self.entered: set[str] = set()
+        self.responded: set[str] = set()
+        self.first_response_entries: frozenset[str] | None = None
+        self.release = anyio.Event()
+
+    def enter(self, endpoint: str) -> None:
+        assert endpoint in _BOOT_FETCH_ENDPOINTS
+        assert endpoint not in self.entered
+        self.entered.add(endpoint)
+        if self.entered == _BOOT_FETCH_ENDPOINTS:
+            self.release.set()
+
+    async def wait(self) -> None:
+        await self.release.wait()
+
+    def respond(self, endpoint: str) -> None:
+        if self.first_response_entries is None:
+            self.first_response_entries = frozenset(self.entered)
+        self.responded.add(endpoint)
+
+    def assert_overlap(self) -> None:
+        assert self.first_response_entries == _BOOT_FETCH_ENDPOINTS, (
+            "a boot fetch responded before all endpoints entered",
+            self.first_response_entries,
+        )
+        assert self.entered == _BOOT_FETCH_ENDPOINTS
+        assert self.responded == _BOOT_FETCH_ENDPOINTS
+
+
 def _state_app(
     *,
     memory_delay: float = 0.0,
@@ -89,12 +119,18 @@ def _state_app(
     history_error_body: str | None = None,
     memory_value: list[dict[str, Any]] | None = None,
     history_value: list[dict[str, Any]] | None = None,
+    rendezvous: _BootFetchRendezvous | None = None,
 ) -> web.Application:
     app = web.Application()
 
     async def get_memory(_request: web.Request) -> web.Response:
+        if rendezvous is not None:
+            rendezvous.enter("memory")
         if memory_delay:
             await anyio.sleep(memory_delay)
+        if rendezvous is not None:
+            await rendezvous.wait()
+            rendezvous.respond("memory")
         if memory_status != 200:
             return web.json_response({"detail": "memory failed"}, status=memory_status)
         return web.json_response(
@@ -107,8 +143,13 @@ def _state_app(
         )
 
     async def get_history(_request: web.Request) -> web.Response:
+        if rendezvous is not None:
+            rendezvous.enter("history")
         if history_delay:
             await anyio.sleep(history_delay)
+        if rendezvous is not None:
+            await rendezvous.wait()
+            rendezvous.respond("history")
         if history_status != 200:
             return web.Response(
                 text=history_error_body or "history failed",
@@ -127,6 +168,15 @@ def _state_app(
 
     app.router.add_get("/agents/A/state/memory/log", get_memory)
     app.router.add_get("/agents/A/state/transcript/t1", get_history)
+    if rendezvous is not None:
+
+        async def list_tools(_request: web.Request) -> web.Response:
+            rendezvous.enter("mcp")
+            await rendezvous.wait()
+            rendezvous.respond("mcp")
+            return web.Response(status=204)
+
+        app.router.add_post("/boot-fetches/mcp", list_tools)
     return app
 
 
@@ -159,33 +209,41 @@ async def _run_fetches(
 
 
 def test_boot_fetches_overlap_three_delayed_endpoints(tmp_path: Path) -> None:
-    plugin_dir = _bundle(
-        tmp_path / "bundle",
-        mcp_command=[sys.executable, str(_delayed_mcp(tmp_path, _DELAY))],
-    )
-    app = _state_app(
-        memory_delay=_DELAY,
-        history_delay=_DELAY,
-        memory_value=[_MEMORY_ITEM],
-        history_value=[_HISTORY_ITEM],
-    )
+    mcp_script = _delayed_mcp(tmp_path, _DELAY)
 
     async def go() -> None:
+        rendezvous = _BootFetchRendezvous()
+        app = _state_app(
+            memory_delay=_DELAY,
+            history_delay=_DELAY,
+            memory_value=[_MEMORY_ITEM],
+            history_value=[_HISTORY_ITEM],
+            rendezvous=rendezvous,
+        )
         async with TestServer(app) as server:
-            started = time.monotonic()
-            fetches = await _run_fetches(server, plugin_dir)
-            elapsed = time.monotonic() - started
-            assert elapsed < 2 * _DELAY
-            assert fetches.memory_preamble == format_memory_preamble(
-                [MemoryRecord.from_dict(_MEMORY_ITEM)]
+            plugin_dir = _bundle(
+                tmp_path / "bundle",
+                mcp_command=[sys.executable, str(mcp_script)],
+                mcp_env={
+                    "CURIE_TEST_TOOL_MODE": "read-only",
+                    "CURIE_TEST_BOOT_RENDEZVOUS_URL": str(server.make_url("/boot-fetches/mcp")),
+                },
             )
-            expected_replay, _summary = build_conversation_replay(
-                [TurnRecord.from_dict(_HISTORY_ITEM)]
-            )
-            assert fetches.conversation_replay == expected_replay
-            assert fetches.mcp_capability is not None
-            assert fetches.mcp_capability.complete
-            assert not fetches.mcp_capability.has_potential_write_tool
+            try:
+                fetches = await _run_fetches(server, plugin_dir)
+                rendezvous.assert_overlap()
+                assert fetches.memory_preamble == format_memory_preamble(
+                    [MemoryRecord.from_dict(_MEMORY_ITEM)]
+                )
+                expected_replay, _summary = build_conversation_replay(
+                    [TurnRecord.from_dict(_HISTORY_ITEM)]
+                )
+                assert fetches.conversation_replay == expected_replay
+                assert fetches.mcp_capability is not None
+                assert fetches.mcp_capability.complete
+                assert not fetches.mcp_capability.has_potential_write_tool
+            finally:
+                rendezvous.release.set()
 
     anyio.run(go)
 

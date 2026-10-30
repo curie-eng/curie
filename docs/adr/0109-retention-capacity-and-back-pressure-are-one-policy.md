@@ -2,7 +2,9 @@
 
 Date: 2026-08-14
 
-Status: Draft
+Status: Accepted
+
+Accepted on 2026-10-27 with explicit maintainer approval.
 
 Extends [ADR-0059](0059-sandbox-is-a-bounded-resource-envelope.md) (the sandbox
 is a bounded resource envelope) by closing the throughput question that ADR

@@ -551,6 +551,16 @@ async def _first_parent_proof(
             assert sha == publication.base_sha
             return Commit(sha=sha, parents=(), message="Approved base")
 
+        async def is_ancestor(
+            self, repository: RepositoryRef, ancestor: str, descendant: str
+        ) -> bool:
+            assert repository.path == REPO
+            # The graph is base <- (moved parent) <- head; the branch tip is the parent.
+            reachable = {descendant}
+            if descendant in (head_sha, parent):
+                reachable |= {parent, publication.base_sha}
+            return ancestor in reachable
+
     code_host = cast(Any, CodeHostGraph())
     repository = RepositoryRef("github", "github.com", "101", REPO, default_branch="main")
     base_branch = await publication_base_ref(session, code_host, publication, repository)

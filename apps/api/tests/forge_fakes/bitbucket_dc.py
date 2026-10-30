@@ -316,6 +316,13 @@ class BitbucketDcFake:
         """A new commit on ``branch``; returns its 40-hex sha."""
 
         parent = self.branches.get(branch) or self.branches.get(self.default_branch)
+        sha = self.add_commit(() if parent is None else (parent,), message, branch=branch)
+        self.branches[branch] = sha
+        return sha
+
+    def add_commit(self, parents: tuple[str, ...], message: str, *, branch: str = "") -> str:
+        """One commit with exactly ``parents`` and on no branch: a merge, a fork, a root."""
+
         seq = next(self._commit_seq)
         sha = hashlib.sha1(f"{branch}:{seq}:{message}".encode()).hexdigest()
         stamp = self.now()
@@ -331,9 +338,8 @@ class BitbucketDcFake:
             "committer": author,
             "committerTimestamp": stamp,
             "message": message,
-            "parents": [] if parent is None else [{"id": parent, "displayId": parent[:11]}],
+            "parents": [{"id": parent, "displayId": parent[:11]} for parent in parents],
         }
-        self.branches[branch] = sha
         return sha
 
     def post_status(
@@ -744,6 +750,7 @@ class BitbucketDcFake:
             Route(f"{repo}/default-branch", self._get_default_branch),
             Route(f"{repo}/branches", self._list_branches),
             Route(f"{repo}/commits/{{sha}}/builds", self._builds, methods=["GET", "POST"]),
+            Route(f"{repo}/commits/{{sha}}/merge-base", self._merge_base),
             Route(f"{repo}/commits/{{sha}}", self._get_commit),
             Route(f"{repo}/pull-requests", self._pulls, methods=["GET", "POST"]),
             Route(pr, self._pull, methods=["GET", "PUT"]),
@@ -862,6 +869,45 @@ class BitbucketDcFake:
                 status_code=404,
             )
         return JSONResponse(found)
+
+    def _history(self, sha: str) -> set[str]:
+        seen: set[str] = set()
+        pending = [sha]
+        while pending:
+            current = pending.pop()
+            if current not in seen and current in self.commits:
+                seen.add(current)
+                pending.extend(parent["id"] for parent in self.commits[current]["parents"])
+        return seen
+
+    async def _merge_base(self, request: Request) -> Response:
+        # Bitbucket Data Center REST "Get merge base" (repository group,
+        # https://developer.atlassian.com/server/bitbucket/rest/), as
+        # GET .../commits/{commitId}/merge-base?otherCommitId=:
+        # 200 with the best common ancestor as a commit, 204 when the two commits
+        # share no history, 404 when either commit does not exist.
+        uid = await self._guard(request)
+        if isinstance(uid, Response):
+            return uid
+        shas = (request.path_params["sha"], request.query_params.get("otherCommitId", ""))
+        for sha in shas:
+            if sha not in self.commits:
+                return JSONResponse(
+                    _errors(
+                        f"Commit '{sha}' does not exist in repository '{self.slug}'.",
+                        "com.atlassian.bitbucket.commit.NoSuchCommitException",
+                    ),
+                    status_code=404,
+                )
+        common = self._history(shas[0]) & self._history(shas[1])
+        best = sorted(
+            sha
+            for sha in common
+            if not any(other != sha and sha in self._history(other) for other in common)
+        )
+        if not best:
+            return Response(status_code=204)
+        return JSONResponse(self.commits[best[0]])
 
     async def _builds(self, request: Request) -> Response:
         # As Data Center 9.4.24 answers it on the live fixture: the repository

@@ -199,6 +199,7 @@ class TurnOutcome:
     execution_uncertain: bool = False
     classification: str | None = None
     error_message: str | None = None
+    workspace_stage_timeout: bool = False
     text: str = ""
     status: SessionStatus | None = None
     steered: bool = False

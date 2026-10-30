@@ -18,6 +18,7 @@ import json
 import os
 import pathlib
 import signal
+import subprocess
 import threading
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -411,10 +412,65 @@ def _process_gone(pid: int) -> bool:
         return False
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return True
     state, ppid = stat.rsplit(")", 1)[1].split()[:2]
     return state == "Z" and int(ppid) != os.getpid()
+
+
+def _leader_exited(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    return stat.rsplit(")", 1)[1].split()[0] == "Z"
+
+
+@pytest.mark.parametrize("observe_exit", [_process_gone, _leader_exited])
+def test_exit_observers_handle_reap_between_stat_open_and_read(
+    monkeypatch: pytest.MonkeyPatch, observe_exit: Callable[[int], bool]
+) -> None:
+    child = subprocess.Popen(["/bin/sleep", "120"])
+    try:
+        target = Path(f"/proc/{child.pid}/stat")
+        original_open = Path.open
+        opened_and_reaped = False
+
+        # Linux proc_single_show returns ESRCH when the opened task has been reaped:
+        # https://github.com/torvalds/linux/blob/v6.8/fs/proc/base.c#L766-L781
+        def open_then_reap(path: Path, *args: Any, **kwargs: Any) -> Any:
+            nonlocal opened_and_reaped
+            stream = original_open(path, *args, **kwargs)
+            if path == target:
+                try:
+                    child.kill()
+                    child.wait()
+                    opened_and_reaped = True
+                except BaseException:
+                    stream.close()
+                    raise
+            return stream
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(Path, "open", open_then_reap)
+            assert observe_exit(child.pid)
+        assert opened_and_reaped, "the child must be reaped after opening its real stat file"
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            child.kill()
+        child.wait()
+
+
+@pytest.mark.parametrize("observe_exit", [_process_gone, _leader_exited])
+def test_exit_observers_keep_live_process(observe_exit: Callable[[int], bool]) -> None:
+    child = subprocess.Popen(["/bin/sleep", "120"])
+    try:
+        assert not observe_exit(child.pid)
+        assert child.poll() is None
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            child.kill()
+        child.wait()
 
 
 # --- the fix pin --------------------------------------------------------------------
@@ -728,11 +784,7 @@ def test_cleanup_kills_a_descendant_holding_the_check_pipes(
                 # descendant still holds the pipes.
                 deadline = loop.time() + 5
                 while loop.time() < deadline:
-                    try:
-                        state = Path(f"/proc/{leader}/stat").read_text(encoding="utf-8")
-                    except FileNotFoundError:
-                        break
-                    if state.rsplit(")", 1)[1].split()[0] == "Z":
+                    if _leader_exited(leader):
                         break
                     await asyncio.sleep(0.05)
                 else:
