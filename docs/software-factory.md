@@ -36,7 +36,7 @@ their limits.
 |---|---|
 | Host | Released CLI assets support Linux x86_64, Linux arm64, and Apple silicon macOS. The quickstart has no Intel macOS asset. |
 | Cluster | Kubernetes with `kubectl` and Helm; Docker and kind v0.24+ are needed only if quickstart must create a local cluster. Review the selected context before installing. |
-| Model | An Anthropic or OpenRouter credential, with available provider credit. Implementation and review use separately configured models. |
+| Model | An Anthropic or OpenRouter credential, with available provider credit. Implementation and review use separately configured models. The issue's status card names the implementation model and the reviewer model for each run. |
 | Repository | A small repository with an initial commit and a bounded issue. GitHub and Jira Cloud with GitHub need a GitHub App installed on the repository. GitLab needs an active token with `api` and `write_repository` scopes and Developer access or higher. |
 | Tracker authority | GitHub requires a permitted user with repository write or admin access; GitLab requires Developer access or higher. Jira Cloud requires an explicit account or group allowed to start work, plus the factory account's project permissions. |
 | Task | Clear acceptance criteria and documented checks. A small repository is the first trial; Curie-sized builds need additional disk, memory, registry access, and CI configuration. |
