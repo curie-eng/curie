@@ -13,7 +13,12 @@ from curie_internal.identity_approval import (
     ApprovalGrantAuthorityRequestV1,
     ApprovalGrantAuthorityResponseV1,
 )
-from curie_internal.identity_authority import TurnAuthorityRequestV1, TurnAuthorityResponseV1
+from curie_internal.identity_authority import (
+    BindingClassificationRequestV1,
+    BindingClassificationResponseV1,
+    TurnAuthorityRequestV1,
+    TurnAuthorityResponseV1,
+)
 
 
 class TurnAuthorityUnavailable(RuntimeError):
@@ -98,6 +103,9 @@ class HttpTurnAuthorityClient:
             raise ValueError("invalid_turn_authority_client") from None
         self._url = api_base_url.rstrip("/") + "/v1/internal/identity/turn-authority/check"
         self._grant_url = api_base_url.rstrip("/") + "/v1/internal/identity/approval-grant/check"
+        self._classification_url = (
+            api_base_url.rstrip("/") + "/v1/internal/identity/binding-classification/check"
+        )
         self._token = worker_token
         self._client = client
 
@@ -187,4 +195,31 @@ class HttpTurnAuthorityClient:
                 raise ValueError
             return result
         except Exception:  # noqa: BLE001 - no transport, credential or effect bytes escape.
+            raise TurnAuthorityUnavailable() from None
+
+    async def classify_binding(
+        self, request: BindingClassificationRequestV1,
+    ) -> BindingClassificationResponseV1:
+        """Whether the binding identity is registered. @spec HTTP-INVOCATION-EXECUTION-22."""
+        try:
+            if type(request) is not BindingClassificationRequestV1:
+                raise ValueError
+            captured = BindingClassificationRequestV1.model_validate(request)
+            payload = captured.model_dump_json().encode("utf-8")
+        except (ValueError, TypeError, AttributeError, RecursionError):
+            raise ValueError("invalid_binding_classification_request") from None
+        try:
+            outgoing = httpx.Request(
+                "POST", self._classification_url, content=payload,
+                headers={"X-Curie-Worker-Token": self._token, "Content-Type": "application/json"},
+                extensions={"timeout": httpx.Timeout(5.0).as_dict()},
+            )
+            status, body = await exchange_identity_json(self._client, outgoing, budget_s=5.0)
+            if status != 200:
+                raise ValueError
+            result = BindingClassificationResponseV1.model_validate(body)
+            if result.request_id != captured.request_id or result.scope != captured.scope:
+                raise ValueError
+            return result
+        except Exception:  # noqa: BLE001 - no transport or credential bytes escape.
             raise TurnAuthorityUnavailable() from None

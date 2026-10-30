@@ -3494,6 +3494,61 @@
         "title": "BehaviorPacksConfig",
         "type": "object"
       },
+      "BindingClassificationRequestV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-INVOCATION-EXECUTION-22.",
+        "properties": {
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/TurnAuthorityScopeV1"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "scope"
+        ],
+        "title": "BindingClassificationRequestV1",
+        "type": "object"
+      },
+      "BindingClassificationResponseV1": {
+        "additionalProperties": false,
+        "description": "Classification, not permission. @spec HTTP-INVOCATION-EXECUTION-22.",
+        "properties": {
+          "http_identity_required": {
+            "title": "Http Identity Required",
+            "type": "boolean"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/TurnAuthorityScopeV1"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "scope",
+          "http_identity_required"
+        ],
+        "title": "BindingClassificationResponseV1",
+        "type": "object"
+      },
       "Body_confirm_connection_identity_connect__token__confirm_post": {
         "properties": {
           "csrf": {
@@ -29281,6 +29336,66 @@
           }
         },
         "summary": "Create Identity Approval",
+        "tags": [
+          "internal-identity-authority"
+        ]
+      }
+    },
+    "/v1/internal/identity/binding-classification/check": {
+      "post": {
+        "description": "The worker's per-identity question. Writes and grants nothing.\n\n@spec HTTP-INVOCATION-EXECUTION-22.",
+        "operationId": "check_binding_classification_v1_internal_identity_binding_classification_check_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BindingClassificationRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BindingClassificationResponseV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check Binding Classification",
         "tags": [
           "internal-identity-authority"
         ]

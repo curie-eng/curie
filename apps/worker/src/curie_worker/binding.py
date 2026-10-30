@@ -70,7 +70,7 @@ import urllib.request
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from urllib.parse import quote
 
 import aiohttp
@@ -85,6 +85,11 @@ from aci_protocol.turn import (
 )
 from curie_internal import sandbox_token
 from curie_internal.identity_approval import ApprovalGrantExpectationV1
+from curie_internal.identity_authority import (
+    BindingClassificationRequestV1,
+    BindingClassificationResponseV1,
+    TurnAuthorityScopeV1,
+)
 from curie_internal.sealing_key import is_sealing_key_name
 from plugin_format import is_reserved_boot_env_name
 from pydantic import BaseModel, ConfigDict, Field
@@ -314,11 +319,13 @@ def _parse_resume_event_id(event_id: str) -> uuid.UUID | None:
 # a second tenant exists. A frozen copy: this package does not import the API's.
 DEFAULT_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
-# @spec HTTP-INVOCATION-EXECUTION-17
+# @spec HTTP-INVOCATION-EXECUTION-17 HTTP-INVOCATION-EXECUTION-22
+# The SQL non-nullness of the tenant's selection only says whether to ask the
+# API: the registered identity decides whether this binding requires HTTP.
 _IDENTITY_BINDING_SQL = """
 SELECT c.id AS binding_id, c.agent_id, c.tenant_id,
        c.generation AS binding_generation, c.kind, c.address, c.endpoint, c.adapter,
-       (i.http_selection IS NOT NULL) AS http_identity_required
+       (i.http_selection IS NOT NULL) AS http_selected
 FROM {schema}.agent_channels c
 JOIN {schema}.agents a ON a.id = c.agent_id AND a.tenant_id = c.tenant_id
 LEFT JOIN {schema}.tenant_identity_providers i ON i.tenant_id = c.tenant_id
@@ -705,6 +712,16 @@ class ChannelReadGrantAbsent(Exception):
     and stop asking; every other refusal or failure is None."""
 
 
+class BindingIdentityClassifier(Protocol):
+    """The API's per-identity answer. @spec HTTP-INVOCATION-EXECUTION-22."""
+
+    async def classify_binding(
+        self, request: BindingClassificationRequestV1,
+    ) -> BindingClassificationResponseV1:
+        """Whether this exact binding's identity is HTTP-registered."""
+        ...
+
+
 class BindingResolver:
     """Resolves a channel address to its active agent deployment (read-only).
 
@@ -726,10 +743,12 @@ class BindingResolver:
         config: WorkerConfig,
         *,
         tenant_id: uuid.UUID = DEFAULT_TENANT_ID,
+        identity_classifier: BindingIdentityClassifier | None = None,
     ) -> None:
         self._engine = engine
         self._config = config
         self._tenant_id = tenant_id
+        self._identity_classifier = identity_classifier
         # Table identifiers are not user input; the schema comes from config.
         self._sql = text(_RESOLVE_SQL.format(schema=config.db_schema))
         self._identity_binding_sql = text(_IDENTITY_BINDING_SQL.format(schema=config.db_schema))
@@ -752,6 +771,8 @@ class BindingResolver:
         if not matches:
             return None
         mapped = [dict(row._mapping) for row in matches]
+        for row in mapped:
+            row["http_identity_required"] = await self._requires_http_identity(row)
         if len({row["agent_id"] for row in mapped}) > 1:
             # Every candidate is classified: an HTTP-selected one is a definitive
             # refusal; otherwise, as for trigger-labelled trackers, no HTTP binding.
@@ -764,6 +785,34 @@ class BindingResolver:
             binding_id=current["binding_id"], binding_generation=current["binding_generation"],
             http_identity_required=current["http_identity_required"],
         )
+
+    async def _requires_http_identity(self, row: Mapping[str, Any]) -> bool:
+        """Ask the API only for a selected tenant. @spec HTTP-INVOCATION-EXECUTION-22.
+
+        Without a classifier a selected tenant still requires HTTP identity, as
+        before per-identity application. A classifier failure propagates, so the
+        kernel treats it as unavailable and never as legacy.
+        """
+        if row["http_selected"] is not True:
+            return False
+        if self._identity_classifier is None:
+            return True
+        request = BindingClassificationRequestV1(
+            schema_version=1,
+            request_id=str(uuid.uuid4()),
+            scope=TurnAuthorityScopeV1(
+                tenant_id=str(row["tenant_id"]), agent_id=str(row["agent_id"]),
+                binding_id=str(row["binding_id"]),
+                binding_generation=row["binding_generation"],
+            ),
+        )
+        result = await self._identity_classifier.classify_binding(request)
+        if (
+            type(result) is not BindingClassificationResponseV1
+            or result.request_id != request.request_id or result.scope != request.scope
+        ):
+            raise ValueError("invalid_binding_classification")
+        return result.http_identity_required
 
     async def resolve(
         self, kind: str, adapter: str | None, address: str

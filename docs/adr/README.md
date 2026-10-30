@@ -273,5 +273,6 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0251 | [A failed factory run keeps a private recovery checkpoint that only explicit restoration reads](0251-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md) | Accepted |
 | 0252 | [HTTP identity resolves Enterprise Grid senders in their organisation](0252-http-identity-resolves-enterprise-grid-senders-in-their-organisation.md) | Accepted |
 | 0253 | [Factory base labels resolve at claim and follow relabels](0253-factory-base-labels-resolve-at-claim-and-follow-relabels.md) | Accepted |
+| 0254 | [HTTP identity applies to the channel identities an operator registers](0254-http-identity-applies-to-the-channel-identities-an-operator-registers.md) | Accepted |
 | 0255 | [Claim-backed sandbox scratch is bounded by its storage request](0255-claim-backed-sandbox-scratch-is-bounded-by-its-storage-request.md) | Draft |
 <!-- END GENERATED: adr-index -->

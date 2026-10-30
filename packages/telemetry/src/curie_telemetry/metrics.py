@@ -393,6 +393,8 @@ _HTTP_OPERATIONS = [
     "/v1/internal/identity/approvals",
     # @spec HTTP-APPROVAL-CONTINUITY-12
     "/v1/internal/identity/approval-grant/check",
+    # @spec HTTP-INVOCATION-EXECUTION-22
+    "/v1/internal/identity/binding-classification/check",
     "/channel-read",
     "/channels/admission",
     "/channels/token",

@@ -209,6 +209,72 @@ def build_http_invocation_runtime(
         raise ValueError("invalid_http_invocation_runtime") from None
 
 
+def registers_binding_identity(
+    runtime: HttpInvocationRuntime | None, *, tenant_id: uuid.UUID, kind: str, adapter: str | None,
+) -> bool:
+    """Whether an operator registration names this binding's Slack identity.
+
+    Every binding of a registered identity counts, listed in binding_ids or not,
+    so an unlisted one refuses at ingress instead of staying legacy. No runtime
+    registers nothing. @spec HTTP-INVOCATION-EXECUTION-22.
+    """
+    if runtime is None or kind != "slack":
+        return False
+    name = adapter or "default"
+    return any(
+        registration.tenant_id == str(tenant_id) and registration.channel_identity_name == name
+        for registration in runtime._receivers.values()
+    )
+
+
+async def binding_requires_http_identity(
+    session: AsyncSession, runtime: HttpInvocationRuntime | None, binding: AgentChannel,
+) -> bool:
+    """The one per-binding HTTP classification. @spec HTTP-INVOCATION-EXECUTION-22.
+
+    SQL presence keeps corrupt JSON null out of the legacy path (criteria 15 and
+    17). In a selected tenant a registered identity requires HTTP identity, and
+    so does an agent whose invocation filter only HTTP facts can evaluate.
+    """
+    selected = await session.scalar(
+        select(TenantIdentityProvider.http_selection.is_not(None)).where(
+            TenantIdentityProvider.tenant_id == binding.tenant_id,
+        )
+    )
+    if selected is not True:
+        return False
+    if registers_binding_identity(
+        runtime, tenant_id=binding.tenant_id, kind=binding.kind, adapter=binding.adapter,
+    ):
+        return True
+    return await _invocation_needs_http_facts(session, binding)
+
+
+async def _invocation_needs_http_facts(session: AsyncSession, binding: AgentChannel) -> bool:
+    """A migrated or filtered invocation role is never legacy-evaluable.
+
+    A migrated role keeps no team requirement and agent-owned filters are read
+    only from HTTP facts, so the legacy path would admit callers they exclude.
+    An unreadable policy fails closed. @spec HTTP-INVOCATION-EXECUTION-22.
+    """
+    result = (await session.execute(select(
+        AgentAccessPolicy, AgentAccessPolicy.role_configuration.is_(None),
+    ).where(AgentAccessPolicy.agent_id == binding.agent_id))).one_or_none()
+    if result is None:
+        return False
+    row, sql_null = result
+    try:
+        policy = agent_role_policy.stored_snapshot(
+            row, sql_null, tenant_id=binding.tenant_id, agent_id=binding.agent_id,
+        )
+    except agent_role_policy.RolePolicyRefusal:
+        return True
+    invocation = None if policy is None else policy.roles.invocation
+    return invocation is not None and (
+        invocation.legacy_state == "migrated" or invocation.filter is not None
+    )
+
+
 def _invalid_receiver() -> Never:
     """@spec HTTP-INVOCATION-EXECUTION-2/15."""
     raise HTTPException(401, "invalid_http_receiver")
