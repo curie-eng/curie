@@ -99,11 +99,15 @@ One script handles every hook event the bundle registers:
 ``PreToolUse`` on ``Bash``
     Refuses background shell commands and forces the foreground. With timing
     known, a command at or after wrap up or D is refused without a stop, and
-    a command's timeout is cut so it ends by wrap up: a larger requested
-    timeout is lowered, and an omitted one is set only when the time left is
-    below the default (``BASH_DEFAULT_TIMEOUT_MS`` when it is a positive
-    integer, else 120000 ms). Without timing, and on a stopped run, Bash runs
-    as requested in the foreground.
+    a command's timeout is cut to the time left before wrap up: a larger
+    requested timeout is lowered, and an omitted one is set only when the time
+    left is below the default (``BASH_DEFAULT_TIMEOUT_MS`` when it is a
+    positive integer, else 120000 ms). The timeout bounds only how long the
+    agent waits in the foreground. A command still running at its timeout
+    keeps running in the background until the execution deadline ends the
+    sandbox, so a command whose exit status was not observed is unfinished.
+    Without timing, and on a stopped run, Bash runs as requested in the
+    foreground.
 
 ``PostToolUse`` / ``PostToolUseFailure`` on ``Bash``
     Evidence only, never a transition. During ``failing_test``, after a
@@ -136,7 +140,11 @@ One script handles every hook event the bundle registers:
     ``already_approved``): go to publish. An approval of another checkout is
     cleared. Then the timing check. A checkout identical to the last one that
     got ``CHANGES`` is refused without a stop (cause ``no_progress``). With
-    ``DIFF_ROUNDS`` rounds completed the run stops.
+    ``DIFF_ROUNDS`` rounds completed the run stops and writes ``curie_gate:
+    review_refused`` with cause ``round_cap``, stage ``review_diff``, the
+    completed ``round`` and the ``cap``. Each later diff review that the stop
+    refuses writes the same line again. Plan reviews on a stopped run write
+    none, and no finding text is logged.
 
     Both reviewers get the bundle's verification contract appended to the
     prompt, the same bytes for both, followed by the bundle's
@@ -165,7 +173,8 @@ One script handles every hook event the bundle registers:
     refusal does not stop the run or count a round. A recorded verdict counts
     the round. ``APPROVE`` binds the approval to that fingerprint.
     ``CHANGES`` marks the checkout rejected, and on round ``DIFF_ROUNDS`` it
-    stops the run.
+    stops the run and writes the ``round_cap`` line (``curie_gate:
+    review_refused``, with ``stage``, ``round`` and ``cap``).
 
     A verdict that opens an implementation round (either plan verdict, or a
     diff ``CHANGES`` before the cap) stops the run instead at or after the
@@ -360,6 +369,7 @@ NO_PROGRESS = (
     "The diff reviewer already returned CHANGES for this exact checkout. Make the "
     "changes its findings ask for before the next diff review; no round was spent."
 )
+ROUND_CAP_STOP = f"The review_diff loop hit its {DIFF_ROUNDS} round cap without approval."
 NO_FINDINGS = "No reviewer findings were recorded; state the reason above as the finding."
 
 _VERDICT = re.compile(r"^\s*VERDICT:\s*(APPROVE|CHANGES)\b", re.MULTILINE)
@@ -1228,6 +1238,25 @@ def _stop_for_github_path(state: dict[str, Any], path: str) -> str:
     return _stop_text(state["stopped"], state)
 
 
+def _emit_round_cap(state: dict[str, Any]) -> None:
+    """The diff round cap refusal. Only counts; the findings never reach the pod log."""
+    emit_gate(
+        state,
+        "review_refused",
+        cause="round_cap",
+        stage="review_diff",
+        round=state["diff"]["round"],
+        cap=DIFF_ROUNDS,
+    )
+
+
+def _cap_stop(state: dict[str, Any]) -> str:
+    """Stop the run at the diff round cap, log it, and return the stop text."""
+    state["stopped"] = ROUND_CAP_STOP
+    _emit_round_cap(state)
+    return _stop_text(ROUND_CAP_STOP, state)
+
+
 def _cutoffs(timing: dict[str, Any]) -> tuple[int, int, int]:
     """The deadline, the round cutoff and the start of wrap up, in epoch seconds."""
     deadline, seconds = int(timing["deadline"]), int(timing["seconds"])
@@ -1356,6 +1385,8 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
             f"{PLAN!r} (phase plan_review) or {DIFF!r} (phase review_diff)."
         )
     if state["stopped"]:
+        if kind == DIFF and state["stopped"] == ROUND_CAP_STOP:
+            _emit_round_cap(state)
         return _deny(_stop_text(state["stopped"], state))
     diff = state["diff"]
     digest: str | None = None
@@ -1407,8 +1438,7 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
             emit_gate(state, "review_refused", cause="no_progress", stage="review_diff")
             return _deny(_with_findings(NO_PROGRESS, state))
         if diff["round"] >= DIFF_ROUNDS:
-            state["stopped"] = f"The review_diff loop hit its {DIFF_ROUNDS} round cap."
-            return _deny(_stop_text(state["stopped"], state))
+            return _deny(_cap_stop(state))
         state["diff_review_fingerprint"] = digest
         round_ = diff["round"] + 1
     # The round this call completes; only its verdict, at PostToolUse, counts it.
@@ -1447,7 +1477,8 @@ def pre_bash(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, Any
         refusal = _timing_refusal(state, "bash")
         if refusal is not None:
             return _deny(_with_findings(refusal[1], state))
-        # Every command ends by wrap up; a shorter request or default is kept.
+        # The timeout is cut to the time left before wrap up; a shorter request or
+        # default is kept. It bounds the foreground wait, not the command itself.
         limit = max(1, _cutoffs(timing)[2] - _utc_now()) * 1000
         requested = tool_input.get("timeout")
         if isinstance(requested, bool) or not isinstance(requested, (int, float)):
@@ -1630,8 +1661,7 @@ def _post_diff(
     state["rejected"] = digest
     _retain(state, f"review_diff round {round_}", findings_of(DIFF, response))
     if round_ >= DIFF_ROUNDS:
-        state["stopped"] = f"The review_diff loop hit its {DIFF_ROUNDS} round cap without approval."
-        return _context(event, _stop_text(state["stopped"], state))
+        return _context(event, _cap_stop(state))
     if (stop := _open_round(state)) is not None:
         return _context(event, stop)
     return _context(

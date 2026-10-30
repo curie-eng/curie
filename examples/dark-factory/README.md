@@ -78,7 +78,8 @@ and it stops the run when the diff loop reaches its cap. A completed edit
 after a diff approval clears that approval. It refuses `publish_changes` until
 the diff reviewer approves the current checkout. It writes the `plan_review`
 and `review_diff` phase lines, with the round, to the pod log, along with
-`curie_gate` lines such as `review_refused`, `review_incomplete`,
+`curie_gate` lines such as `review_refused` (its causes include `round_cap`,
+written when the diff loop reaches its cap), `review_incomplete`,
 `timing_recorded` and `timing_refused`. `report_progress` cannot record
 `implement` rounds 4 and 5 until #5203 is fixed, because the runner takes the
 `implement` cap from the `wait_ci` loop; the hook's own `review_diff` phase
@@ -98,7 +99,12 @@ review, diff review, edits and publication until it has them. At or after
 `execution_deadline - execution_seconds/6` no plan review or new
 implementation round starts. At or after
 `execution_deadline - execution_seconds/12` no edit, Bash command or diff
-review runs, and every earlier Bash timeout is cut to end by then. A checkout
+review runs, and every earlier Bash timeout is cut to the time left before
+then. That timeout bounds only how long the agent waits in the foreground: a
+command still running at its timeout keeps running in the background until the
+execution deadline ends the sandbox. A command whose exit status was not
+observed is unfinished, so its check is never reported as passed, it supports
+no verification claim, and nothing is published on it. A checkout
 the diff reviewer approved may still be published until the deadline. Every
 stop or refusal carries the unresolved reviewer findings the hook retained, so
 the final reply can list them; those findings never reach the pod log.
