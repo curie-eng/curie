@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/curie-eng/curie/actions/workflows/ci.yaml/badge.svg)](https://github.com/curie-eng/curie/actions/workflows/ci.yaml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Latest release](https://img.shields.io/github/v/release/curie-eng/curie)](https://github.com/curie-eng/curie/releases)
+[![Releases](https://img.shields.io/badge/Releases-latest-blue.svg)](https://github.com/curie-eng/curie/releases/latest)
 [![Docs](https://img.shields.io/badge/Docs-index-blue.svg)](docs/README.md)
 
 **Turn agents into co-workers. Run them in your infrastructure. Start with a Software Factory co-worker**
