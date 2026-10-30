@@ -361,6 +361,44 @@ def test_claim_template_spec_labels_a_pod_template_with_no_metadata(
     assert "metadata" not in source["podTemplate"]
 
 
+def test_claim_template_spec_keeps_an_ephemeral_scratch_volume() -> None:
+    source = _chart_spec()
+    volume = {
+        "name": "workspace",
+        "ephemeral": {
+            "volumeClaimTemplate": {
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "resources": {"requests": {"storage": "15Gi"}},
+                }
+            }
+        },
+    }
+    stamp = (
+        '{"workspace":{"key":"agentSandbox.resourceProfiles.factory.workspaceSizeLimit",'
+        '"ephemeral":true}}'
+    )
+    source["podTemplate"]["spec"]["volumes"] = [volume]
+    source["podTemplate"]["metadata"]["annotations"] = {
+        "curie.ai/sandbox-scratch-size-keys": stamp
+    }
+    pristine = copy.deepcopy(source)
+
+    spec = claim_template_spec(
+        source,
+        secret_name="c-tokens",
+        token_names=[BootEnv.env_key("runner_token")],
+        runner_resources=None,
+        claim="curie-thread-1-abc",
+    )
+
+    assert source == pristine, "the source template spec must not be mutated"
+    assert spec["podTemplate"]["spec"]["volumes"] == [volume]
+    assert spec["podTemplate"]["metadata"]["annotations"] == {
+        "curie.ai/sandbox-scratch-size-keys": stamp
+    }
+
+
 # -- 5. no runner container ---------------------------------------------------
 
 

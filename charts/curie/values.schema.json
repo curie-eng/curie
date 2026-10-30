@@ -547,6 +547,22 @@
               }
             }
           }
+        },
+        "resourceProfiles": {
+          "additionalProperties": {
+            "properties": {
+              "scratchVolume": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "description": "emptyDir (default) or ephemeral. Any other value fails the sandbox template render, which names this key."
+                  },
+                  "storageClassName": {"type": "string"}
+                }
+              }
+            }
+          }
         }
       }
     },

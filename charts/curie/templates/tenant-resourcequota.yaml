@@ -69,19 +69,10 @@ at `resourceQuota` in values.yaml; NOTES.txt (curie.sandboxCapacity in
 _capacity.tpl) compares the ceiling to live node capacity at install time.
 */}}
 {{- if and .Values.agentSandbox.deploy .Values.resourceQuota.enabled }}
-{{- $rq := .Values.resourceQuota }}
-{{/*
-  Derive from the name the sandbox pods actually carry. An explicit
-  `sandboxPriorityClassName` still wins, for an externally-managed class.
-*/}}
-{{- $sandboxPriorityClass := $rq.sandboxPriorityClassName | default .Values.priorityClasses.sandbox.name }}
-{{- if not $sandboxPriorityClass }}
-{{- fail "resourceQuota.enabled is true but no sandbox PriorityClass name resolves: set priorityClasses.sandbox.name, or resourceQuota.sandboxPriorityClassName for an externally-managed class. A quota scoped to an empty name matches no pods and silently enforces nothing." }}
-{{- end }}
 apiVersion: v1
 kind: ResourceQuota
 metadata:
-  name: {{ include "curie.fullname" . }}-sandbox-quota
+  name: {{ include "curie.sandboxQuota.name" . }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: tenant-capacity
@@ -91,17 +82,10 @@ spec:
       - operator: In
         scopeName: PriorityClass
         values:
-          - {{ $sandboxPriorityClass | quote }}
+          - {{ include "curie.sandboxQuota.priorityClass" . | quote }}
   # Only cpu/memory/pods: a PriorityClass-scoped quota cannot list
   # ephemeral-storage (see the header). Per-pod ephemeral limits x the pods cap
   # give the aggregate disk ceiling instead.
   hard:
-    requests.cpu: {{ $rq.hard.requestsCpu | quote }}
-    requests.memory: {{ $rq.hard.requestsMemory | quote }}
-    limits.cpu: {{ $rq.hard.limitsCpu | quote }}
-    limits.memory: {{ $rq.hard.limitsMemory | quote }}
-    # Scoped by the same scopeSelector, so this bounds sandbox pod COUNT, not
-    # every pod in the namespace -- a tenant cannot route around the
-    # cpu/memory ceiling above by simply claiming more, smaller sandboxes.
-    pods: {{ $rq.hard.sandboxPodCount | quote }}
+    {{- include "curie.sandboxQuota.hard" . | fromJson | toYaml | nindent 4 }}
 {{- end }}

@@ -64,6 +64,7 @@ def _stall(kernel: Any) -> tuple[asyncio.Event, asyncio.Event, dict[str, Deliver
 
 async def _settle(consumer: Consumer) -> None:
     await asyncio.gather(*list(consumer._inflight))
+    await asyncio.gather(*list(consumer._lease_loss_tasks))
 
 
 async def _vanished_rows(redis: Any, stream: str, entry_id: str) -> list[dict[str, str]]:
@@ -126,6 +127,7 @@ def test_a_deleted_stream_entry_graveyards_as_vanished_and_edits_the_placeholder
                 rows = await _wait_vanished(
                     h.async_redis, h.config.dead_letter_stream_name(), entry_id
                 )
+                await asyncio.gather(*list(consumer._lease_loss_tasks))
                 assert len(rows) == 1
                 assert rows[0]["dl_reason"] == "broker-entry-vanished"
                 assert rows[0]["dl_original_id"] == entry_id
@@ -185,6 +187,7 @@ def test_a_pel_row_moved_to_another_consumer_is_not_a_vanished_entry(
                     [entry_id],
                 )
                 await asyncio.sleep(h.config.delivery_lease_heartbeat_s + 0.05)
+                await asyncio.gather(*list(consumer._lease_loss_tasks))
                 rows = await _vanished_rows(
                     h.async_redis, h.config.dead_letter_stream_name(), entry_id
                 )

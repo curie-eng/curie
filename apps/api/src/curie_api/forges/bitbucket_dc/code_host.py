@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -76,6 +77,7 @@ CAPABILITIES: Mapping[Operation, Support] = {
 # A feedback listing re-reads this far behind its cursor and drops what it
 # already returned, so a comment stamped late is still listed once (decision 10.5).
 OVERLAP = timedelta(seconds=120)
+_COMMIT_SHA = re.compile(r"[0-9a-f]{40,64}")
 _OVERLAP_MS = round(OVERLAP.total_seconds() * 1000)
 
 _PULL_STATES = {
@@ -363,6 +365,28 @@ class BitbucketDcCodeHost:
             ),
             message=_text(payload.get("message")),
         )
+
+    async def is_ancestor(self, repository: RepositoryRef, ancestor: str, descendant: str) -> bool:
+        if ancestor == descendant:
+            return True
+        await self.ensure_version(Operation.IS_ANCESTOR)
+        repo = self.repo_path(repository)
+        try:
+            response = await self._http.request(
+                "GET",
+                f"{repo}/commits/{quote(ancestor, safe='')}/merge-base",
+                what="merge_base",
+                params={"otherCommitId": descendant},
+            )
+        except NotFound:
+            raise Unavailable("merge_base") from None
+        # 204: the forge answered that the two commits share no ancestor.
+        if response.status_code == 204:
+            return False
+        found = object_of(response, "merge_base").get("id")
+        if not isinstance(found, str) or _COMMIT_SHA.fullmatch(found) is None:
+            raise Unavailable("merge_base")
+        return found == ancestor
 
     # Pull requests -----------------------------------------------------------
 

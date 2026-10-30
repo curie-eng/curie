@@ -24,6 +24,34 @@ WORKER_PROBE = (
     ".then(response => process.exit(response.ok ? 0 : 1))"
     ".catch(() => process.exit(1))"
 )
+FAILURE_CAUSES = (
+    ("image-pull", (
+        "pull access denied",
+        "manifest unknown",
+        "toomanyrequests",
+        "error pulling",
+        "failed to resolve reference",
+    )),
+    ("port-conflict", (
+        "port is already allocated",
+        "address already in use",
+    )),
+    ("name-conflict", (
+        "is already in use by container",
+    )),
+    ("dependency-failed", (
+        "dependency failed to start",
+        "is unhealthy",
+    )),
+    ("network", (
+        "failed to create network",
+        "could not find an available",
+        "non-overlapping",
+    )),
+    ("disk", (
+        "no space left on device",
+    )),
+)
 
 
 class Readiness:
@@ -46,6 +74,7 @@ class Readiness:
             if not path.is_absolute() or not path.is_file():
                 raise ValueError("COMPOSE_FILE must contain existing absolute paths")
             self.compose.extend(("-f", str(path)))
+        self.services = self._compose_services()
         public_key = os.environ.get("LANGFUSE_PUBLIC_KEY", "pk-lf-curie-dev")
         secret_key = os.environ.get("LANGFUSE_SECRET_KEY", "sk-lf-curie-dev")
         self.authorization = "Basic " + base64.b64encode(
@@ -58,6 +87,26 @@ class Readiness:
             raise TimeoutError("Langfuse readiness deadline expired")
         return remaining
 
+    def _compose_services(self) -> list[str]:
+        try:
+            result = subprocess.run(
+                [*self.compose, "config", "--services"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=self.remaining(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return []
+        if result.returncode != 0:
+            return []
+        services: list[str] = []
+        for line in result.stdout.splitlines():
+            name = line.strip()
+            if name and name not in services:
+                services.append(name)
+        return services
+
     def run(self, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         phase = {
             "up": "startup",
@@ -67,7 +116,8 @@ class Readiness:
             "exec": "worker probe",
         }.get(arguments[0], "unknown operation")
         # Compose output can include deployment details or credentials. Publish
-        # only these fixed phase names and numeric exit codes; withhold raw output.
+        # only these fixed phase names, numeric exit codes, the fixed cause
+        # category, and the compose-file service name; withhold raw output.
         try:
             result = subprocess.run(
                 [*self.compose, *arguments],
@@ -82,9 +132,18 @@ class Readiness:
                 f"(phase={phase}, exit code unavailable)"
             ) from None
         if check and result.returncode != 0:
+            combined = (result.stdout + result.stderr).lower()
+            cause = "unclassified"
+            for category, patterns in FAILURE_CAUSES:
+                if any(pattern in combined for pattern in patterns):
+                    cause = category
+                    break
+            detail = f"phase={phase}, exit code={result.returncode}, cause={cause}"
+            matched = [name for name in self.services if name.lower() in combined]
+            if len(matched) == 1:
+                detail = f"{detail}, service={matched[0]}"
             raise RuntimeError(
-                "Langfuse readiness Compose command failed "
-                f"(phase={phase}, exit code={result.returncode})"
+                f"Langfuse readiness Compose command failed ({detail})"
             )
         return result
 

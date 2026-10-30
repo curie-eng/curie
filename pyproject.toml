@@ -584,6 +584,7 @@ testpaths = [
     "tools/factory-e2e/tests",
     "tools/github-stub/tests",
     "tools/model-script/tests",
+    "tools/sandbox-admission-observer/tests",
     "tools/runtime-assertion-gate/tests",
     # @spec NAMESPACE-CLEANUP-EVIDENCE-4
     "tools/released-upgrade/tests",

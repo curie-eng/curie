@@ -138,7 +138,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0106 | [An approver is an authenticated principal, never a caller-asserted string](0106-an-approver-is-an-authenticated-principal.md) | Accepted |
 | 0107 | [An agent reads its own runs through a first-party surface, scoped by structured identity](0107-an-agent-reads-its-own-runs-through-a-first-party-scoped-surface.md) | Draft |
 | 0108 | [A deploy target carries its environment's values](0108-a-deploy-target-carries-its-environments-values.md) | Draft |
-| 0109 | [Retention, capacity, and back pressure are one policy: a claim is admitted, not discovered](0109-retention-capacity-and-back-pressure-are-one-policy.md) | Draft |
+| 0109 | [Retention, capacity, and back pressure are one policy: a claim is admitted, not discovered](0109-retention-capacity-and-back-pressure-are-one-policy.md) | Accepted |
 | 0110 | [Deterministic security posture classification distinguishes manifest declarations from operator gates](0110-deterministic-security-posture-classification.md) | Draft |
 | 0111 | [The default memory compaction algorithm](0111-the-default-memory-compaction-algorithm.md) | Draft |
 | 0112 | [A turn source names what caused the turn, not the channel it arrived on](0112-a-turn-source-names-what-caused-the-turn.md) | Draft |
@@ -269,8 +269,10 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0246 | [Common admission resolves an optional HTTP identity before authorized enqueue](0246-common-admission-resolves-an-optional-http-identity-before-authorized-enqueue.md) | Accepted |
 | 0247 | [A tree-identical parent or a schema window registration reuses checks](0247-a-tree-identical-parent-or-a-schema-window-registration-reuses-checks.md) | Accepted |
 | 0249 | [A factory run may take twelve hours](0249-a-factory-run-may-take-twelve-hours.md) | Accepted |
+| 0250 | [Verbatim Slack answers render as rich text sections with literal links](0250-verbatim-slack-answers-render-as-rich-text-sections-with-literal-links.md) | Accepted |
 | 0251 | [A failed factory run keeps a private recovery checkpoint that only explicit restoration reads](0251-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md) | Accepted |
 | 0252 | [HTTP identity resolves Enterprise Grid senders in their organisation](0252-http-identity-resolves-enterprise-grid-senders-in-their-organisation.md) | Accepted |
 | 0253 | [Factory base labels resolve at claim and follow relabels](0253-factory-base-labels-resolve-at-claim-and-follow-relabels.md) | Accepted |
 | 0254 | [HTTP identity applies to the channel identities an operator registers](0254-http-identity-applies-to-the-channel-identities-an-operator-registers.md) | Accepted |
+| 0255 | [Claim-backed sandbox scratch is bounded by its storage request](0255-claim-backed-sandbox-scratch-is-bounded-by-its-storage-request.md) | Draft |
 <!-- END GENERATED: adr-index -->

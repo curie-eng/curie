@@ -54,8 +54,11 @@ One script handles every hook event the bundle registers:
     to ``false``. The call is refused out of order: no diff review before the
     plan review completed, and no second plan review in the run (a diff
     rejection returns to implement, not to plan). Before a diff review, a changed or untracked root
-    ``.github`` path stops the run; an unreadable git status lets review proceed.
-    The hook numbers the round itself and writes the
+    ``.github`` path stops the run. An unreadable git status does not emit
+    ``github_path_refused`` and does not by itself stop the run. The same
+    invocation then fingerprints the checkout. A fingerprint that cannot be
+    taken denies that diff review without spending a round and without stopping
+    the run. The hook numbers the round itself and writes the
     ``plan_review`` or ``review_diff`` phase line to the pod log. It appends
     the bundle's verification contract to the prompt, the same bytes for both
     reviewers, followed by the bundle's ``verification/checks.json`` when the
@@ -71,7 +74,10 @@ One script handles every hook event the bundle registers:
     A diff ``VERDICT: CHANGES`` on round ``MAX_ROUNDS`` caps the diff loop.
     Either plan verdict is refused, and the run stops, when the checkout
     fingerprint differs from the one taken at the prompt or cannot be
-    computed. After a real verdict the reviewer's
+    computed. A diff ``APPROVE`` or ``CHANGES`` is not recorded when the
+    checkout fingerprint differs from the one taken at the start of that
+    review or cannot be computed. That refusal does not stop the run or
+    change the round. When a verdict is recorded, the reviewer's
     ``VERIFICATION:`` block is written as one ``curie_gate:
     verification_classified`` line (stage, round, verdict and each
     criterion's route); a reply without the block is recorded as absent. A
@@ -87,7 +93,11 @@ One script handles every hook event the bundle registers:
 
 ``PreToolUse`` on ``publish_changes``
     Allowed only after the diff reviewer approved, and never after a failed or
-    capped review.
+    capped review. The approval is bound to the checkout fingerprint from the
+    diff review that approved. A changed or unreadable checkout clears that
+    verdict and requires a fresh diff review. The round counter is kept. This
+    hook decision is not atomic with the later publication snapshot. A write
+    after the hook allows publish can still reach that snapshot.
 
 ``PreToolUse`` on ``report_progress``
     Never decided. Writes a ``curie_reported`` line with the reported phase,
@@ -404,11 +414,14 @@ def _github_path(path: str, workspace: str) -> str | None:
     return None
 
 
-def _github_changed_path(workspace: str) -> str | None:
-    """The first refused status path; unreadable or late status permits review."""
+def _github_changed_path(workspace: str, deadline: float) -> str | None:
+    """The first refused status path.
+
+    Unreadable, late, or empty status returns ``None``. This does not emit
+    ``github_path_refused``. The caller owns the deadline.
+    """
     if not workspace:
         return None
-    deadline = time.monotonic() + GIT_BUDGET_SECONDS
     try:
         status = _git(
             workspace, deadline, "status", "--porcelain=v1", "-z", "--untracked-files=all"
@@ -447,8 +460,10 @@ def _github_changed_path(workspace: str) -> str | None:
 def fingerprint(workspace: str, deadline: float) -> str | None:
     """A sha256 over the checkout's HEAD, status, diff and untracked files.
 
-    ``None`` when any part cannot be read in time: the caller treats that as an
-    unverifiable checkout, never as an unchanged one.
+    Each untracked path is a length-prefixed name, one type byte (``l`` for a
+    symlink, ``f`` for a regular file), one mode byte (``x`` when any execute
+    bit is set and ``-`` otherwise), then a length-prefixed body. ``None``
+    means unverifiable rather than unchanged.
     """
     if not workspace:
         return None
@@ -464,17 +479,43 @@ def fingerprint(workspace: str, deadline: float) -> str | None:
         untracked = _git(root, deadline, "ls-files", "--others", "--exclude-standard", "-z")
         for name in filter(None, untracked.split(b"\0")):
             path = Path(root) / os.fsdecode(name)
-            digest.update(name + b"\0")
+            digest.update(len(name).to_bytes(8, "big") + name)
             if time.monotonic() >= deadline:
                 return None
-            if path.is_symlink():
-                digest.update(os.fsencode(os.readlink(path)))
-            elif path.is_file():
+            try:
+                info = path.lstat()
+            except OSError:
+                return None
+            mode = info.st_mode
+            if stat.S_ISLNK(mode):
+                kind = b"l"
+            elif stat.S_ISREG(mode):
+                kind = b"f"
+            else:
+                # A fifo or any other type is unverifiable. Do not read it.
+                return None
+            # Any execute bit is how git records 100755.
+            digest.update(kind)
+            digest.update(b"x" if mode & 0o111 else b"-")
+            if kind == b"l":
+                body = os.fsencode(os.readlink(path))
+                digest.update(len(body).to_bytes(8, "big"))
+                digest.update(body)
+            else:
+                size = info.st_size
+                digest.update(size.to_bytes(8, "big"))
+                seen = 0
                 with path.open("rb") as handle:
                     for chunk in iter(lambda: handle.read(1 << 20), b""):
+                        want = min(1 << 20, size - seen)
+                        if len(chunk) != want:
+                            return None
                         digest.update(chunk)
+                        seen += len(chunk)
                         if time.monotonic() >= deadline:
                             return None
+                if seen != size:
+                    return None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     return digest.hexdigest() if time.monotonic() < deadline else None
@@ -558,13 +599,34 @@ def _text(value: Any) -> str:
     return ""
 
 
+def _reply_text(response: Any) -> str:
+    """The reviewer sub-agent's own reply, never the prompt it was sent.
+
+    A synchronous Agent tool response can echo the caller's ``prompt`` ahead
+    of the reviewer's ``content`` (observed on Claude Code 2.1.286). That
+    prompt is the implementing agent's text, not the reviewer's, so a
+    ``VERDICT:`` or ``VERIFICATION:`` line in it must never be read as the
+    reviewer's. From a dict response, read ``content`` alone: a dict without
+    it yields no reply, so the gate stops rather than read its other fields.
+    """
+    if isinstance(response, dict):
+        return _text(response.get("content"))
+    return _text(response)
+
+
 def parse_verdict(kind: str, response: Any) -> str | None:
-    """``APPROVE`` or ``CHANGES`` from a real reviewer reply, else ``None``."""
-    text = _text(response)
+    """``APPROVE`` or ``CHANGES`` from a real reviewer reply, else ``None``.
+
+    The verdict is the first ``VERDICT:`` line after the ``REVIEWER:`` header,
+    in the reviewer's reply only, so a verdict in the echoed prompt or in
+    text ahead of the header is never taken for the reviewer's own.
+    """
+    text = _reply_text(response)
     name = kind.split(":", 1)[1]
-    if not re.search(rf"^\s*REVIEWER:\s*{re.escape(name)}\s*$", text, re.MULTILINE):
+    header = re.search(rf"^\s*REVIEWER:\s*{re.escape(name)}\s*$", text, re.MULTILINE)
+    if header is None:
         return None
-    match = _VERDICT.search(text)
+    match = _VERDICT.search(text, header.end())
     return match.group(1) if match else None
 
 
@@ -792,7 +854,7 @@ def parse_verification(response: Any, declared: dict[str, str]) -> list[dict[str
     exactly equals a key of ``declared``, otherwise ``null``. An unknown
     refusal reason is kept as ``unrecognized``.
     """
-    lines = _text(response).splitlines()
+    lines = _reply_text(response).splitlines()
     start = next((i for i, line in enumerate(lines) if _VERIFICATION_HEAD.match(line)), None)
     if start is None:
         return None
@@ -856,7 +918,11 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
         )
     if state["stopped"]:
         return _deny(_stop_text(state["stopped"]))
-    if kind == DIFF and (path := _github_changed_path(state["workspace"])) is not None:
+    # One budget covers the status check and the checkout fingerprint below.
+    diff_deadline = time.monotonic() + GIT_BUDGET_SECONDS if kind == DIFF else None
+    if diff_deadline is not None and (
+        (path := _github_changed_path(state["workspace"], diff_deadline)) is not None
+    ):
         return _deny(_stop_for_github_path(state, path))
     plan, diff = state["plan"], state["diff"]
     if kind == DIFF and not plan_reviewed(state):
@@ -883,6 +949,11 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
             state["stopped"], gate = CHECKS_UNREADABLE, "checks_unavailable"
         emit_gate(state, gate, stage=PHASE[kind])
         return _deny(_stop_text(state["stopped"]))
+    if kind == DIFF and diff_deadline is not None:
+        digest = fingerprint(state["workspace"], diff_deadline)
+        if digest is None:
+            return _deny("Diff checkout is unverifiable; restore it before review.")
+        state["diff_review_fingerprint"] = digest
     loop = state[LOOP[kind]]
     round_ = loop["round"] + 1
     if round_ > ROUND_CAP[kind]:
@@ -1021,6 +1092,16 @@ def post_agent(
             f"The {PHASE[kind]} call failed on round {round_}: no reviewer verdict came back."
         )
         return _context(event, _stop_text(state["stopped"]))
+    if kind == DIFF:
+        digest = fingerprint(state["workspace"], time.monotonic() + GIT_BUDGET_SECONDS)
+        reviewed = state.get("diff_review_fingerprint")
+        if digest is None or reviewed is None or digest != reviewed:
+            emit_gate(state, "diff_approval_refused", cause="checkout_changed_or_unverifiable")
+            return _context(
+                event, "Fresh diff review required: checkout changed or is unverifiable."
+            )
+        if verdict == "APPROVE":
+            state["diff_approved_fingerprint"] = digest
     record_verification(state, kind, round_, verdict, response)
     if kind == PLAN and verdict in ADVISORY_PLAN_VERDICTS:
         cause = refuse_approval(state)
@@ -1061,6 +1142,13 @@ def pre_publish(state: dict[str, Any]) -> dict[str, Any]:
         return _deny(_stop_text(state["stopped"]))
     if state["diff"]["verdict"] != "APPROVE":
         return _deny("Nothing is published without a diff reviewer VERDICT: APPROVE.")
+    digest = fingerprint(state["workspace"], time.monotonic() + GIT_BUDGET_SECONDS)
+    approved = state.get("diff_approved_fingerprint")
+    if digest is None or approved is None or digest != approved:
+        state["diff"]["verdict"] = None
+        state.pop("diff_approved_fingerprint", None)
+        emit_gate(state, "diff_approval_refused", cause="checkout_changed_or_unverifiable")
+        return _deny("Fresh diff review required: checkout changed or is unverifiable.")
     return _allow("diff review approved")
 
 
