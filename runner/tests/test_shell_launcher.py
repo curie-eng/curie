@@ -217,6 +217,7 @@ def test_executable_but_unusable_shell_fails_closed_before_sdk_spawn(
     )
     launcher.chmod(0o755)
     monkeypatch.setattr(subprocess_env, "BASH_SHELL_LAUNCHER", launcher)
+    monkeypatch.setattr(subprocess_env, "_SHELL_LAUNCH_TIMEOUT_SECONDS", 2.0)
     calls: list[bool] = []
 
     async def connect(client: ClaudeSDKClient) -> None:

@@ -39,7 +39,11 @@ from .sdk_auth import (
 # sandbox this runner does not ship, and Bash then fails closed.
 BASH_CREDENTIAL_PRELUDE = Path(__file__).with_name("bash_credential_prelude.sh")
 BASH_SHELL_LAUNCHER = Path(__file__).with_name("curie_bash.sh")
-_SHELL_LAUNCH_TIMEOUT_SECONDS = 5.0
+# The launcher imports the runner package, so its --version check costs a full
+# cold Python start. Sandboxes that start together on one CPU-throttled node
+# have needed more than 5 s. A longer bound, not a retry, because a retry
+# discards the start already in progress. A hung shell still fails closed.
+_SHELL_LAUNCH_TIMEOUT_SECONDS = 30.0
 
 
 def sdk_shell_env() -> dict[str, str]:
