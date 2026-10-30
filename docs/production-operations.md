@@ -1,6 +1,6 @@
 # Production operator journey
 
-Use this page to plan, install, verify, and operate a Curie cluster deployment. It orders the existing procedures; the linked runbooks hold the commands and detailed limits. This guide was assembled from `main` at commit `7777d74f0f58f312f1e2c0686e2fc6b265031c40` on 2026-10-30. Check the [release notes](https://github.com/curie-eng/curie/releases) and the documentation matching your installed CLI and chart before changing a production installation. The sequence below has not been verified as a complete production walkthrough on a named release.
+Use this page to plan, install, verify, and operate a Curie cluster deployment. It orders the existing procedures; the linked runbooks hold the commands and detailed limits. Check the [release notes](https://github.com/curie-eng/curie/releases) and the documentation matching your installed CLI and chart before changing a production installation.
 
 This page answers what to do and verify at each production stage. Use the [administrator controls guide](administering-co-workers.md) to decide access, approvals, models, budgets, memory, and stop policy. Consult the [capability reference](capabilities.md) for released behavior and limits and the [security policy](../SECURITY.md) for the trust boundary. Curie runs platform and sandbox workloads in your Kubernetes installation. Configured model providers and workspace services receive the data needed for their selected workflows.
 
