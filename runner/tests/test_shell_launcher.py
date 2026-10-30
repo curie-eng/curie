@@ -40,6 +40,28 @@ def test_sdk_shell_env_rejects_missing_or_nonexecutable_launcher(
         subprocess_env.sdk_shell_env()
 
 
+def test_sdk_shell_env_tolerates_a_contended_cold_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The launcher imports the runner package under Python -I. Several sandboxes
+    # cold starting on one throttled node have taken longer than 5 s to answer
+    # --version; a slow but healthy launcher must still pass the check.
+    cold_start_seconds = 15.0
+    real_run = subprocess.run
+
+    def slow_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        if args[-1:] != ["--version"]:
+            return real_run(args, **kwargs)  # type: ignore[call-overload,no-any-return]
+        timeout = kwargs.get("timeout")
+        if isinstance(timeout, (int, float)) and timeout < cold_start_seconds:
+            raise subprocess.TimeoutExpired(args, timeout)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(subprocess_env.subprocess, "run", slow_run)
+    values = subprocess_env.sdk_shell_env()
+    assert values["CLAUDE_CODE_SHELL"] == str(subprocess_env.BASH_SHELL_LAUNCHER)
+
+
 def test_cli_parent_cannot_take_shell_authority_from_input_env() -> None:
     parent = subprocess_env.cli_parent_env(
         {
