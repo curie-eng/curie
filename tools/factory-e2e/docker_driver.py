@@ -600,6 +600,7 @@ class DockerScenario(dl.Lifecycle):
             since, until = str(math.floor(t0) - WINDOW_PAD), str(math.ceil(t1) + WINDOW_PAD)
             self.runs[run]["daemon"] = ds.collect(
                 context=self.args.context, namespace=self.dns, pod=self.runs[run]["daemon_pod"],
+                runner_namespace=self.ns, runner_pod=runners[run],
                 nonce=self.nonce, since=since, until=until,
             )  # fmt: skip
         started = time.monotonic()

@@ -243,6 +243,7 @@
       "properties": {
         "enabled": {"type": "boolean"},
         "intake": {"type": "string", "enum": ["poll", "webhook"]},
+        "baseLabelSettleSeconds": {"type": "integer", "minimum": 0},
         "cardBaseUrl": {"type": "string"},
         "ciWaitSeconds": {"type": "integer", "minimum": 1, "maximum": 10800},
         "codeHosts": {"type": "array", "items": {"$ref": "#/definitions/forge"}},
@@ -314,6 +315,21 @@
           "type": "number",
           "exclusiveMinimum": 0,
           "description": "Positive cadence in seconds for reconciling accepted GitHub review feedback."
+        },
+        "factoryPublicationLabels": {
+          "type": "object",
+          "propertyNames": {
+            "allOf": [
+              {"pattern": "^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*/[A-Za-z0-9._-]+$"},
+              {"pattern": "^[^/]{1,39}/[^/]{1,100}$"},
+              {"not": {"pattern": "/\\.{1,2}$"}}
+            ]
+          },
+          "additionalProperties": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {"type": "string", "minLength": 1, "maxLength": 50}
+          }
         },
         "githubRepoAllowlist": {
           "type": "array",
@@ -461,7 +477,14 @@
             "maxMembers": {"type": "integer", "minimum": 1, "maximum": 100000},
             "maxCompressionRatio": {"type": "number", "minimum": 1, "maximum": 1000},
             "referenceTtlSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
-            "bucket": {"type": "string", "minLength": 3}
+            "bucket": {"type": "string", "minLength": 3},
+            "recovery": {
+              "type": "object",
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "maxBytes": {"type": ["integer", "null"], "minimum": 1}
+              }
+            }
           }
         },
         "attachments": {
@@ -521,6 +544,22 @@
                 "sizeLimit": {"type": ["string", "null"], "minLength": 2},
                 "fetchTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 150},
                 "extractTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 150}
+              }
+            }
+          }
+        },
+        "resourceProfiles": {
+          "additionalProperties": {
+            "properties": {
+              "scratchVolume": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "description": "emptyDir (default) or ephemeral. Any other value fails the sandbox template render, which names this key."
+                  },
+                  "storageClassName": {"type": "string"}
+                }
               }
             }
           }

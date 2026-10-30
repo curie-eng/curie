@@ -30,6 +30,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -334,35 +335,32 @@ def _observe_termination(client: Any, request_id: uuid.UUID) -> None:
     assert recorded.status_code == 200, recorded.text
 
 
-def _start_running(request_id: uuid.UUID) -> int:
+def _start_running(client: Any, request_id: uuid.UUID) -> int:
     async def go() -> int:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with AsyncSession(engine) as session:
-                acquired = await acquire(
-                    session,
-                    request_id,
-                    owner="factory-owner",
-                    generation=1,
-                    wake=await factory_wake(session, request_id),
-                    context=None,
-                )
-                assert not isinstance(acquired, DispatchConflict), acquired
-                started = await start(
-                    session,
-                    request_id,
-                    owner="factory-owner",
-                    generation=1,
-                    claim_name="claim-factory",
-                    sandbox_name="sbx-factory",
-                    context=acquired.context,
-                )
-                assert not isinstance(started, DispatchConflict), started
-                return int(started.runtime_epoch)
-        finally:
-            await engine.dispose()
+        async with client.app.state.sessionmaker() as session:
+            acquired = await acquire(
+                session,
+                request_id,
+                owner="factory-owner",
+                generation=1,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=client.app.state.http_client,
+            )
+            assert not isinstance(acquired, DispatchConflict), acquired
+            started = await start(
+                session,
+                request_id,
+                owner="factory-owner",
+                generation=1,
+                claim_name="claim-factory",
+                sandbox_name="sbx-factory",
+                context=acquired.context,
+            )
+            assert not isinstance(started, DispatchConflict), started
+            return int(started.runtime_epoch)
 
-    return asyncio.run(go())
+    return int(client.portal.call(go))
 
 
 def test_capacity_wait_expiry_posts_one_comment(admitted: Any) -> None:
@@ -411,7 +409,7 @@ def test_runner_escalation_posts_one_comment_and_completed_needs_a_pull_request(
     number = 9203
     _label(client, github, number)
     row = _request(number)
-    epoch = _start_running(row["id"])
+    epoch = _start_running(client, row["id"])
     headers = {"X-Curie-Worker-Token": "factory-terminus-worker"}
     refused = client.post(
         f"/v1/internal/work-items/requests/{row['id']}/finish",
@@ -541,7 +539,7 @@ def test_an_unadopted_pr_notice_names_the_database_selected_conversation_pr(
     number = 9300
     _label(client, github, number)
     row = _request(number)
-    epoch = _start_running(row["id"])
+    epoch = _start_running(client, row["id"])
     # The comments fixture configures this HTTP server as the forge API. Its
     # canonical HTML origin is that same configured origin, as required by
     # #3562, rather than public github.com.
@@ -613,7 +611,7 @@ def test_approval_create_failure_posts_terminal_issue_notice_and_clears_running_
     number = 9294
     _label(client, github, number)
     row = _request(number)
-    epoch = _start_running(row["id"])
+    epoch = _start_running(client, row["id"])
     sink.issue_labels.setdefault(number, set()).add("curie:running")
 
     failed = client.post(
@@ -642,7 +640,7 @@ def test_approval_create_failure_after_first_publication_ends_ci_fix_round(
     number = 9295
     _label(client, github, number)
     row = _request(number)
-    epoch = _start_running(row["id"])
+    epoch = _start_running(client, row["id"])
     _attach_publication(row["work_item_id"], status="succeeded", pr=4295)
     sink.issue_labels.setdefault(number, set()).add("curie:running")
 
@@ -670,7 +668,7 @@ def test_credit_exhausted_finish_comments_the_redacted_provider_message(
     number = 9213
     _label(client, github, number)
     row = _request(number)
-    epoch = _start_running(row["id"])
+    epoch = _start_running(client, row["id"])
     key = "sk-or-v1-" + "0123456789abcdef" * 4
     failed = client.post(
         f"/v1/internal/work-items/requests/{row['id']}/finish",
@@ -706,7 +704,7 @@ def test_an_unpublished_finish_comments_the_agents_redacted_last_message(
     client, github, sink = admitted
     _label(client, github, number)
     row = _request(number)
-    epoch = _start_running(row["id"])
+    epoch = _start_running(client, row["id"])
     key = "sk-or-v1-" + "0123456789abcdef" * 4
     detail = f"I read the issue and stopped. <!-- curie-status:final --> @octocat {key}"
     finished = client.post(
@@ -744,7 +742,7 @@ def test_an_early_stop_finish_defers_to_an_in_flight_publication(admitted: Any, 
     number = 9293
     _label(client, github, number)
     row = _request(number)
-    epoch = _start_running(row["id"])
+    epoch = _start_running(client, row["id"])
     _attach_publication(row["work_item_id"], status="pending", pr=None)
 
     finished = client.post(
@@ -781,7 +779,7 @@ def _relabelled_after_publication(
 
     _label(client, github, number)
     first = _request(number)
-    _start_running(first["id"])
+    _start_running(client, first["id"])
     if published:
         _attach_publication(first["work_item_id"], status="succeeded", pr=number)
     github.labels = []
@@ -793,7 +791,7 @@ def _relabelled_after_publication(
     first_row, second = _requests(number)
     assert first_row["id"] == first["id"]
     assert (first_row["status"], first_row["terminal_cause"]) == ("cancelled", "issue_cancelled")
-    _start_running(second["id"])
+    _start_running(client, second["id"])
     return second
 
 
@@ -913,7 +911,7 @@ def test_a_request_whose_own_publication_succeeded_defers_an_unpublished_finish(
     number = 9298
     _label(client, github, number)
     row = _request(number)
-    _start_running(row["id"])
+    _start_running(client, row["id"])
     _attach_publication(row["work_item_id"], status="succeeded", pr=number)
 
     finished = _finish_unpublished(
@@ -979,7 +977,7 @@ def test_a_running_cancellation_comments_only_after_the_runtime_is_observed(
     number = 9207
     _label(client, github, number)
     row = _request(number)
-    _start_running(row["id"])
+    _start_running(client, row["id"])
     github.labels = []
     removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
     assert removed.json()["status"] == "factory_cancellation_requested"
@@ -1016,7 +1014,7 @@ def test_execution_deadline_posts_one_comment(admitted: Any) -> None:
     number = 9210
     _label(client, github, number)
     row = _request(number)
-    _start_running(row["id"])
+    _start_running(client, row["id"])
     _reconcile_later(1900)
     requested = _request(number)
     assert (requested["status"], requested["terminal_cause"]) == (
@@ -1044,7 +1042,7 @@ def test_owner_lost_posts_one_comment(admitted: Any) -> None:
     number = 9211
     _label(client, github, number)
     row = _request(number)
-    _start_running(row["id"])
+    _start_running(client, row["id"])
 
     async def lapse_heartbeat() -> None:
         engine = create_async_engine(get_settings().database_url)
@@ -1094,7 +1092,7 @@ def test_runner_failure_posts_one_comment(admitted: Any) -> None:
     number = 9212
     _label(client, github, number)
     row = _request(number)
-    epoch = _start_running(row["id"])
+    epoch = _start_running(client, row["id"])
     failed = client.post(
         f"/v1/internal/work-items/requests/{row['id']}/finish",
         headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
@@ -1115,7 +1113,7 @@ def test_publication_expiry_and_failure_each_post_one_comment(admitted: Any) -> 
     for number, status, _cause in cases:
         _label(client, github, number)
         row = _request(number)
-        _start_running(row["id"])
+        _start_running(client, row["id"])
         _attach_publication(row["work_item_id"], status=status, pr=None)
     _reconcile()
     assert sink.posts == 2
@@ -1140,8 +1138,8 @@ def test_failure_and_opened_pull_request_each_post_one_final_comment(
     _label(client, github, opened_number)
     denied = _request(denied_number)
     opened = _request(opened_number)
-    _start_running(denied["id"])
-    _start_running(opened["id"])
+    _start_running(client, denied["id"])
+    _start_running(client, opened["id"])
     _attach_publication(denied["work_item_id"], status="denied", pr=None)
     _attach_publication(opened["work_item_id"], status="succeeded", pr=77)
     _reconcile()
@@ -1174,7 +1172,9 @@ def _attach_publication(
                     (
                         await conn.execute(
                             text(
-                                "SELECT agent_id, conversation_id, repository_path, version "
+                                "SELECT agent_id, conversation_id, repository_path, version, "
+                                "base_branch, base_commit, code_host_kind, code_host_host, "
+                                "repository_project_id, code_host_installation_id "
                                 "FROM curie.work_items WHERE id = :id"
                             ),
                             {"id": work_item_id},
@@ -1232,9 +1232,11 @@ def _attach_publication(
                         "INSERT INTO curie.thread_publication_lineages "
                         "(id, agent_id, deployment_id, conversation_id, repo_full_name, "
                         "base_sha, branch, pr_number, pr_url, head_sha, status, version, "
-                        "latest_revision) VALUES "
+                        "latest_revision, code_host_kind, code_host_host, repository_project_id, "
+                        "code_host_installation_id, code_host_pr_id, base_ref) VALUES "
                         "(:id, :agent, :deployment, :conversation, :repo, :base, "
-                        ":branch, :pr, :url, :head, 'open', 1, 1)"
+                        ":branch, :pr, :url, :head, 'open', 1, 1, :kind, :host, :project, "
+                        ":installation, :node_id, :base_ref)"
                     ),
                     {
                         "id": lineage_id,
@@ -1242,11 +1244,19 @@ def _attach_publication(
                         "deployment": deployment_id,
                         "conversation": item["conversation_id"],
                         "repo": item["repository_path"],
-                        "base": "0123456789abcdef0123456789abcdef01234567",
+                        "base": item["base_commit"],
                         "branch": f"curie/publication-{lineage_id.hex}",
                         "pr": pr,
                         "url": pr_url,
                         "head": head_sha if pr is not None else None,
+                        "kind": item["code_host_kind"] if pr is not None else None,
+                        "host": item["code_host_host"] if pr is not None else None,
+                        "project": item["repository_project_id"] if pr is not None else None,
+                        "installation": (
+                            item["code_host_installation_id"] if pr is not None else None
+                        ),
+                        "node_id": f"PR_fixture_{work_item_id.hex}" if pr is not None else None,
+                        "base_ref": item["base_branch"] if pr is not None else None,
                     },
                 )
                 await conn.execute(
@@ -1288,24 +1298,25 @@ def _attach_publication(
                         "request_id": request["id"],
                         "repo": item["repository_path"],
                         "status": status,
-                        "base": "0123456789abcdef0123456789abcdef01234567",
+                        "base": item["base_commit"],
                         "channel": item["repository_path"],
                         "result": pr_url,
                     },
                 )
-                changed = await conn.execute(
-                    text(
-                        "UPDATE curie.work_items SET publication_lineage_id = :lineage, "
-                        "version = version + 1 WHERE id = :id AND version = :version"
-                    ),
-                    {
-                        "lineage": lineage_id,
-                        "id": work_item_id,
-                        "version": item["version"],
-                    },
-                )
-                if changed.rowcount != 1:
-                    raise AssertionError(f"work item {work_item_id} was not linked")
+                if pr is not None:
+                    changed = await conn.execute(
+                        text(
+                            "UPDATE curie.work_items SET publication_lineage_id = :lineage, "
+                            "version = version + 1 WHERE id = :id AND version = :version"
+                        ),
+                        {
+                            "lineage": lineage_id,
+                            "id": work_item_id,
+                            "version": item["version"],
+                        },
+                    )
+                    if changed.rowcount != 1:
+                        raise AssertionError(f"work item {work_item_id} was not linked")
                 if request["id"] is None:
                     raise AssertionError("running request is missing")
         finally:
@@ -1558,6 +1569,54 @@ def _attach_revision_publication(
     asyncio.run(go())
 
 
+def _acknowledge_publication_history(client: Any, published: dict[str, Any]) -> None:
+    from curie_worker.publication_clients import PublicationTranscriptClient
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    publication = _rows(
+        "SELECT id FROM curie.publications WHERE execution_request_id = :id",
+        {"id": published["id"]},
+    )[0]
+
+    async def acknowledge() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        store = PostgresPublicationStore(
+            engine, schema="curie", lease_owner="factory-ci-history"
+        )
+        try:
+            cleanup = await store.claim_pending_cleanup()
+            assert cleanup is not None and cleanup.publication_id == publication["id"]
+            await store.mark_cleanup_completed(cleanup.publication_id)
+            result = await store.pending_result(publication["id"])
+            assert result is not None
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=client.app), base_url="http://api.example.com"
+            ) as state_client:
+                transcript = PublicationTranscriptClient(
+                    api_base_url="http://api.example.com",
+                    api_key=get_settings().api_key,
+                    client=state_client,
+                )
+                await transcript.record_result(
+                    result.agent_id,
+                    result.workspace_conversation_id,
+                    result.publication_id,
+                    f"Published the approved changes: {result.pr_url}",
+                )
+            await store.mark_outcome_history_ready(result.publication_id)
+        finally:
+            await engine.dispose()
+
+    client.portal.call(acknowledge)
+    acknowledged = _rows(
+        "SELECT status, outcome_history_ready_at FROM curie.publications WHERE id = :id",
+        {"id": publication["id"]},
+    )[0]
+    assert acknowledged["status"] == "succeeded"
+    assert acknowledged["outcome_history_ready_at"] is not None
+
+
+
 def _published_issue(client: Any, github: GitHubAPI, sink: _CommentServer) -> tuple[int, int, Any]:
     """An issue whose first run opened a PR and posted its one final comment."""
 
@@ -1565,7 +1624,7 @@ def _published_issue(client: Any, github: GitHubAPI, sink: _CommentServer) -> tu
     pr = next(_REVISION_PR)
     _label(client, github, number)
     first = _request(number)
-    _start_running(first["id"])
+    _start_running(client, first["id"])
     _attach_publication(first["work_item_id"], status="succeeded", pr=pr)
     _reconcile()
     done = _request(number)
@@ -1595,7 +1654,7 @@ def _complete_revision(
         _revision_objective(pr, fragment),
         _revision_reply(pr, fragment),
     )
-    _start_running(revision)
+    _start_running(client, revision)
     _attach_revision_publication(first["work_item_id"], revision)
     _reconcile()
     status = _rows(
@@ -1643,7 +1702,7 @@ def test_a_mention_with_no_changes_completes_naming_the_open_pull_request(
     sink.ci_observations.clear()
     objective = _follow_up_objective(number, 88120)
     revision = _insert_revision(first["work_item_id"], number, objective, ISSUE_REPLY)
-    _start_running(revision)
+    _start_running(client, revision)
     detail = f"{padding}No changes needed: the existing tests already cover this request."
 
     finished = _finish_unpublished(client, revision, cause=cause, detail=detail)
@@ -1701,7 +1760,7 @@ def test_a_review_revision_with_no_changes_completes_in_its_thread(
     revision = _insert_revision(
         first["work_item_id"], number, objective, _revision_reply(pr, "discussion_r88121")
     )
-    _start_running(revision)
+    _start_running(client, revision)
     detail = "No changes needed: this helper already has the requested name."
 
     finished = _finish_unpublished(client, revision, cause=cause, detail=detail)
@@ -1770,7 +1829,7 @@ def test_a_no_change_reply_outside_an_open_follow_up_still_fails(
             if case == "mismatched_pr"
             else ISSUE_REPLY,
         )
-    _start_running(request_id)
+    _start_running(client, request_id)
     sink.requests.clear()
     if case == "could_not_complete":
         detail = "Could not complete: the requested change needs a design decision."
@@ -1790,7 +1849,12 @@ def test_a_no_change_reply_outside_an_open_follow_up_still_fails(
                     assignment = {
                         "merged": "status = 'merged'",
                         "closed": "status = 'closed'",
-                        "missing_pr_url": "pr_number = NULL, pr_url = NULL",
+                        "missing_pr_url": (
+                            "pr_number = NULL, pr_url = NULL, code_host_kind = NULL, "
+                            "code_host_host = NULL, repository_project_id = NULL, "
+                            "code_host_installation_id = NULL, code_host_pr_id = NULL, "
+                            "base_ref = NULL"
+                        ),
                         "empty_pr_url": "pr_url = '   '",
                     }[case]
                     changed = await conn.execute(
@@ -1898,7 +1962,9 @@ def test_a_relabel_outside_an_adopted_pull_request_still_fails(admitted: Any, ca
             "(SELECT publication_lineage_id FROM curie.work_items WHERE id = :id)"
         ),
         "missing_pr_url": (
-            "UPDATE curie.thread_publication_lineages SET pr_number = NULL, pr_url = NULL "
+            "UPDATE curie.thread_publication_lineages SET pr_number = NULL, pr_url = NULL, "
+            "code_host_kind = NULL, code_host_host = NULL, repository_project_id = NULL, "
+            "code_host_installation_id = NULL, code_host_pr_id = NULL, base_ref = NULL "
             "WHERE id = (SELECT publication_lineage_id FROM curie.work_items WHERE id = :id)"
         ),
         "earlier_publication_failed": (
@@ -1969,7 +2035,8 @@ def test_a_relabel_revision_on_an_adopted_pull_request_settles_through_the_ci_ga
     assert settled is not None
     assert settled.request_id == second["id"]
     assert settled.cause == "completed"
-    assert settled.publication_id == publication_id
+    assert isinstance(settled.subject, workitems.PublicationCISubject)
+    assert settled.subject.id == publication_id
     assert {row["id"]: row for row in _requests(number)}[second["id"]]["status"] == "running"
 
 
@@ -1984,7 +2051,7 @@ def test_a_no_change_follow_up_defers_to_its_in_flight_publication(
     number, _pr, first = _published_issue(client, github, sink)
     objective = _follow_up_objective(number, 88123)
     revision = _insert_revision(first["work_item_id"], number, objective, ISSUE_REPLY)
-    _start_running(revision)
+    _start_running(client, revision)
     _attach_revision_publication(first["work_item_id"], revision, status="pending")
 
     finished = _finish_unpublished(
@@ -2058,7 +2125,7 @@ def test_a_no_change_follow_up_preserves_stale_version_fencing(
     number, _pr, first = _published_issue(client, github, sink)
     objective = _follow_up_objective(number, 88125)
     revision = _insert_revision(first["work_item_id"], number, objective, ISSUE_REPLY)
-    _start_running(revision)
+    _start_running(client, revision)
     versions = _rows(
         "SELECT w.version AS work_version, r.version AS request_version "
         "FROM curie.work_items w JOIN curie.execution_requests r "
@@ -2203,7 +2270,7 @@ def test_a_marker_already_on_the_pull_request_is_not_posted_again(
             + f"\n{marker_for(revision)}\n",
         }
     ]
-    _start_running(revision)
+    _start_running(client, revision)
     _attach_revision_publication(first["work_item_id"], revision)
     _reconcile()
     assert _posts(sink) == []
@@ -2245,7 +2312,7 @@ def test_a_lost_thread_reply_response_rescans_every_list(admitted: Any) -> None:
     ]
     reply_path = f"/repos/{REPO}/pulls/{pr}/comments/88109/replies"
     sink.lost_response_paths.add(reply_path)
-    _start_running(revision)
+    _start_running(client, revision)
     _attach_revision_publication(first["work_item_id"], revision)
 
     _reconcile()
@@ -2286,7 +2353,7 @@ def test_factory_notices_publication_unrecorded_finish_comments_its_details_once
     number = 9216
     _label(client, github, number)
     row = _request(number)
-    epoch = _start_running(row["id"])
+    epoch = _start_running(client, row["id"])
     detail = "The publication record did not match the requested repository."
     finished = client.post(
         f"/v1/internal/work-items/requests/{row['id']}/finish",
@@ -2327,7 +2394,7 @@ def test_factory_notices_usage_limited_finish_posts_the_reset_remedy_once(
     number = 9214
     _label(client, github, number)
     row = _request(number)
-    epoch = _start_running(row["id"])
+    epoch = _start_running(client, row["id"])
     finished = client.post(
         f"/v1/internal/work-items/requests/{row['id']}/finish",
         headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
@@ -2358,7 +2425,7 @@ def test_factory_notices_model_unreachable_finish_comments_the_network_remedy(
     number = 9215
     _label(client, github, number)
     row = _request(number)
-    epoch = _start_running(row["id"])
+    epoch = _start_running(client, row["id"])
     finished = client.post(
         f"/v1/internal/work-items/requests/{row['id']}/finish",
         headers={"X-Curie-Worker-Token": "factory-terminus-worker"},

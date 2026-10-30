@@ -23,6 +23,8 @@ SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
 REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 ADMITTED_AGENT_RUNTIME = "tools/factory-e2e/tests/test_c4_admitted_agent.py"
+DYNAMIC_BASE_RUNTIME = "tools/factory-e2e/tests/test_c4_dynamic_base.py"
+ADMITTED_AGENT_RUNTIMES = (ADMITTED_AGENT_RUNTIME, DYNAMIC_BASE_RUNTIME)
 SCRIPTED_FACTORY_JOB = "e2e-scripted-factory"
 ADMITTED_AGENT_JOB = "factory-admitted-agent"
 ADMITTED_AGENT_SHARDS = [1, 2, 3, 4, 5]
@@ -625,7 +627,7 @@ def _without_runtime_exclusion(arguments: list[str], runtime: str) -> list[str]:
 
 def _without_owned_runtime_exclusions(arguments: list[str]) -> list[str]:
     expected = {
-        ("--deselect", ADMITTED_AGENT_RUNTIME),
+        *(("--deselect", runtime) for runtime in ADMITTED_AGENT_RUNTIMES),
         *(("--ignore", runtime) for runtime in (*CONTAINER_FILES, DRY_RUN_FILE)),
     }
     remaining = []
@@ -984,19 +986,19 @@ def test_aggregate_rejects_dry_run_skipped_while_selected_or_run_while_deselecte
     assert healthy.returncode == 0, healthy.stdout + healthy.stderr
 
 
-def _admitted_agent_runtime_owner() -> tuple[dict[str, Any], dict[str, Any]]:
+def _admitted_agent_runtime_owner(runtime: str) -> tuple[dict[str, Any], dict[str, Any]]:
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
     owners = []
     for job_id, job in jobs.items():
         for step in job.get("steps", []):
             script = _string(step, "run")
-            if ADMITTED_AGENT_RUNTIME not in script:
+            if runtime not in script:
                 continue
             arguments = shlex.split(script)
             if "pytest" not in arguments:
                 continue
             for index, argument in enumerate(arguments):
-                if argument.split("::", 1)[0] != ADMITTED_AGENT_RUNTIME:
+                if argument.split("::", 1)[0] != runtime:
                     continue
                 if index and arguments[index - 1] in {"--ignore", "--deselect"}:
                     continue
@@ -1005,8 +1007,9 @@ def _admitted_agent_runtime_owner() -> tuple[dict[str, Any], dict[str, Any]]:
     return jobs[ADMITTED_AGENT_JOB], owners[0][1]
 
 
-def test_admitted_agent_runtime_has_one_required_provisioned_factory_owner() -> None:
-    job, step = _admitted_agent_runtime_owner()
+@pytest.mark.parametrize("runtime", ADMITTED_AGENT_RUNTIMES)
+def test_admitted_agent_runtime_has_one_required_provisioned_factory_owner(runtime: str) -> None:
+    job, step = _admitted_agent_runtime_owner(runtime)
     assert job["if"] == "${{ needs.changes.outputs.factory == 'true' }}"
     assert "changes" in set(_needs(job))
     assert not job.get("continue-on-error", False)
@@ -1031,28 +1034,35 @@ def test_admitted_agent_runtime_has_one_required_provisioned_factory_owner() -> 
 def test_admitted_agent_factory_step_runs_whole_module_and_propagates_failure(
     tmp_path: Path, exit_code: int
 ) -> None:
-    _, step = _admitted_agent_runtime_owner()
+    _, step = _admitted_agent_runtime_owner(ADMITTED_AGENT_RUNTIME)
     completed, arguments = _record_uv_step(
         tmp_path, step, environment={"CASE_SHARD": "3/5"}, exit_code=exit_code
     )
     assert arguments[:2] == ["run", "pytest"]
-    assert arguments.count(ADMITTED_AGENT_RUNTIME) == 1
+    for runtime in ADMITTED_AGENT_RUNTIMES:
+        assert arguments.count(runtime) == 1
     assert arguments[arguments.index("--case-shard") + 1] == "3/5"
     assert arguments[arguments.index("-n") + 1] == "0"
     assert all(
         argument in {
             "run", "pytest", "-q", "-v", "-vv", "-n", "0", "--case-shard", "3/5",
-            ADMITTED_AGENT_RUNTIME,
+            *ADMITTED_AGENT_RUNTIMES,
         }
         for argument in arguments
     ), arguments
     assert completed.returncode == exit_code, completed.stdout + completed.stderr
 
 
-def test_admitted_agent_shards_partition_the_module_in_collection_order() -> None:
+def test_admitted_agent_shards_partition_the_module_in_collection_order(tmp_path: Path) -> None:
+    _, step = _admitted_agent_runtime_owner(ADMITTED_AGENT_RUNTIME)
+    completed, arguments = _record_uv_step(tmp_path, step, environment={"CASE_SHARD": "1/5"})
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    modules = [argument for argument in arguments if argument in ADMITTED_AGENT_RUNTIMES]
+    assert modules == list(ADMITTED_AGENT_RUNTIMES)
+
     def collect(*extra: str) -> list[str]:
         completed = subprocess.run(
-            [sys.executable, "-m", "pytest", "--collect-only", "-q", ADMITTED_AGENT_RUNTIME,
+            [sys.executable, "-m", "pytest", "--collect-only", "-q", *modules,
              *extra],
             cwd=REPO_ROOT, capture_output=True, text=True, check=False,
         )
@@ -1078,7 +1088,7 @@ def test_admitted_agent_shards_partition_the_module_in_collection_order() -> Non
 
 @pytest.mark.parametrize("shard", range(1, SHARD_COUNT + 1))
 @pytest.mark.parametrize("scope", ["full", "cli"])
-@pytest.mark.parametrize("runtime", [ADMITTED_AGENT_RUNTIME, *CONTAINER_FILES, DRY_RUN_FILE])
+@pytest.mark.parametrize("runtime", [*ADMITTED_AGENT_RUNTIMES, *CONTAINER_FILES, DRY_RUN_FILE])
 def test_dedicated_runtime_is_excluded_from_every_generic_shard(
     tmp_path: Path, shard: int, scope: str, runtime: str
 ) -> None:
@@ -1162,6 +1172,14 @@ def _assert_owned_kind_modules_excluded(argv: list[str]) -> None:
         argument.split("=", 1)[1] for argument in argv if argument.startswith("--ignore=")
     ]
     ignored += [argv[index] for index in separate]
+    deselected = [
+        argument.split("=", 1)[1] for argument in argv if argument.startswith("--deselect=")
+    ]
+    deselected += [
+        argv[index + 1] for index, argument in enumerate(argv) if argument == "--deselect"
+    ]
+    for module in ADMITTED_AGENT_RUNTIMES:
+        assert deselected.count(module) == 1, module
     for module in (
         "tools/factory-e2e/tests/test_c4_initial_binding.py",
         "tools/factory-e2e/tests/test_c4_static_token_rotation.py",

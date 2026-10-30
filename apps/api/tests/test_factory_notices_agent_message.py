@@ -93,7 +93,7 @@ def _settled_handoff(fixture: Any, detail: str) -> tuple[str, str]:
     client, github, sink = fixture
     number = 94698
     _label(client, github, number)
-    _start_running(_request(number)["id"])
+    _start_running(client, _request(number)["id"])
     row = _request(number)
 
     async def settle() -> None:

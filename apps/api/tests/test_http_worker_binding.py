@@ -547,3 +547,105 @@ def test_binding_value_refuses_coerced_or_out_of_range_classification(
     }
     with pytest.raises((TypeError, ValueError)):
         module.HttpIdentityBinding(**fields)
+
+
+class _Classifier:
+    """@spec HTTP-INVOCATION-EXECUTION-22: a synthetic API classification boundary."""
+
+    def __init__(self, required: bool | Exception, *, echo: dict[str, Any] | None = None) -> None:
+        self.required = required
+        self.echo = echo or {}
+        self.requests: list[Any] = []
+
+    async def classify_binding(self, request: Any) -> Any:
+        """@spec HTTP-INVOCATION-EXECUTION-22: answer through the shared response model."""
+        from curie_internal.identity_authority import BindingClassificationResponseV1
+
+        self.requests.append(request)
+        if isinstance(self.required, Exception):
+            raise self.required
+        return BindingClassificationResponseV1(
+            schema_version=1,
+            request_id=request.request_id,
+            scope=request.scope.model_copy(update=self.echo),
+            http_identity_required=self.required,
+        )
+
+
+async def _classifying_resolver(
+    factory: async_sessionmaker[AsyncSession], scope: dict[str, Any], classifier: Any,
+) -> Any:
+    """@spec HTTP-INVOCATION-EXECUTION-22: the resolver with an injected classifier."""
+    from curie_worker.binding import BindingResolver
+
+    async with factory() as session:
+        engine = session.bind
+    assert isinstance(engine, AsyncEngine)
+    return BindingResolver(
+        engine,
+        WorkerConfig(db_schema=get_settings().db_schema),
+        tenant_id=scope["tenant"],
+        identity_classifier=classifier,
+    )
+
+
+@pytest.mark.parametrize("required", [True, False])
+def test_selected_tenant_asks_the_api_for_each_binding_identity(
+    clean_db: None, required: bool,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-22: the registration, not the tenant, decides."""
+    module = api()
+
+    async def check(factory: async_sessionmaker[AsyncSession]) -> None:
+        scope = await _seed_scope(factory, "http")
+        classifier = _Classifier(required)
+        resolver = await _classifying_resolver(factory, scope, classifier)
+        value = await resolver.identity_binding("slack", scope["adapter"], scope["address"])
+        _assert_binding(module, value, scope, required)
+        assert len(classifier.requests) == 1
+        asked = classifier.requests[0]
+        assert asked.schema_version == 1
+        assert asked.scope.model_dump() == {
+            "tenant_id": str(scope["tenant"]),
+            "agent_id": str(scope["agent"]),
+            "binding_id": str(scope["binding"]),
+            "binding_generation": scope["generation"],
+        }
+
+    run(check)
+
+
+def test_unselected_tenant_never_asks_the_api(clean_db: None) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-22: SQL NULL selection makes no classification call."""
+    module = api()
+
+    async def check(factory: async_sessionmaker[AsyncSession]) -> None:
+        scope = await _seed_scope(factory, "absent")
+        classifier = _Classifier(True)
+        resolver = await _classifying_resolver(factory, scope, classifier)
+        value = await resolver.identity_binding("slack", scope["adapter"], scope["address"])
+        _assert_binding(module, value, scope, False)
+        assert classifier.requests == []
+
+    run(check)
+
+
+@pytest.mark.parametrize("fault", ["raise", "scope_echo"])
+def test_classifier_failure_propagates_instead_of_becoming_legacy(
+    clean_db: None, fault: str,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-22: unanswered is unavailable, never legacy."""
+
+    async def check(factory: async_sessionmaker[AsyncSession]) -> None:
+        scope = await _seed_scope(factory, "http")
+        classifier = (
+            _Classifier(RuntimeError("synthetic unavailable"))
+            if fault == "raise"
+            else _Classifier(False, echo={"binding_generation": scope["generation"] + 1})
+        )
+        resolver = await _classifying_resolver(factory, scope, classifier)
+        with pytest.raises(Exception) as caught:
+            await resolver.identity_binding("slack", scope["adapter"], scope["address"])
+        assert not isinstance(caught.value, AssertionError)
+
+    run(check)

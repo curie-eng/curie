@@ -393,6 +393,8 @@ _HTTP_OPERATIONS = [
     "/v1/internal/identity/approvals",
     # @spec HTTP-APPROVAL-CONTINUITY-12
     "/v1/internal/identity/approval-grant/check",
+    # @spec HTTP-INVOCATION-EXECUTION-22
+    "/v1/internal/identity/binding-classification/check",
     "/channel-read",
     "/channels/admission",
     "/channels/token",
@@ -476,6 +478,8 @@ _HTTP_OPERATIONS = [
     "/v1/internal/publications/{publication_id}/pull-request/metadata",
     "/v1/internal/publications/{publication_id}/branch-head",
     "/v1/internal/publications/{publication_id}/revision-commit",
+    "/v1/internal/workspace-recovery/context",
+    "/v1/internal/workspace-recovery/outcome",
     "/v1/internal/workspace-recovery/reserve",
     "/v1/internal/workspace-recovery/complete",
     "/v1/internal/workspace-recovery/fail",
@@ -637,6 +641,7 @@ _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES = {
         "poll_trackers",
         "sync_status_comments",
         "redispatch_lapsed_acquisitions",
+        "reconcile_base_transitions",
         "publish_execute_wakes",
     ],
 }

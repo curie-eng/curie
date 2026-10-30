@@ -1326,7 +1326,11 @@ def test_connector_secrets_are_never_written_to_the_claim() -> None:
     # Non-secret boot env is still written.
     assert {"name": "CURIE_BUDGET", "value": "{}"} in entries
     body = _claim_body(api)
-    assert "additionalPodMetadata" not in body["spec"]
+    # The pinned controller permits additional labels in the sandbox.users.io domain.
+    # https://github.com/kubernetes-sigs/agent-sandbox/blob/v0.5.0/extensions/controllers/sandboxclaim_controller.go
+    assert body["spec"]["additionalPodMetadata"] == {
+        "labels": {"sandbox.users.io/curie-admission-claim": "claim-1"}
+    }
     assert body["spec"]["warmPoolRef"]["name"] == "pool"
 
 
@@ -1344,7 +1348,9 @@ def test_claim_metadata_agent_label_is_not_additional_pod_metadata() -> None:
     )
     body = _claim_body(api)
     assert body["metadata"]["labels"]["curietech.ai/agent"] == "acme-a"
-    assert "additionalPodMetadata" not in body["spec"]
+    assert body["spec"]["additionalPodMetadata"] == {
+        "labels": {"sandbox.users.io/curie-admission-claim": "claim-1"}
+    }
     assert body["spec"]["warmPoolRef"]["name"] == "curie-agent-acme-a-runner-pool"
 
 
@@ -1756,6 +1762,220 @@ def test_eviction_event_with_an_unstructured_message_has_no_detail() -> None:
 
     termination = _client(api).pod_termination(
         "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.detail is None
+
+
+_SCRATCH_SIZE_KEYS = "curie.ai/sandbox-scratch-size-keys"
+_FACTORY_HOME_KEY = "agentSandbox.resourceProfiles.factory.homeSizeLimit"
+_HARDENING_HOME_KEY = "agentSandbox.runner.hardening.writablePathSizeLimit"
+_FACTORY_TMP_KEY = "agentSandbox.resourceProfiles.factory.tmpSizeLimit"
+_HOME_SCRATCH_DETAIL = (
+    "sandbox scratch /home/runner (writable-1) exceeded 15Gi; "
+    f"raise {_FACTORY_HOME_KEY} or set scratchVolume.type=ephemeral"
+)
+_ALLOWLISTED_WRITABLE_1 = 'Usage of EmptyDir volume "writable-1" exceeds the limit "15Gi"'
+_EVICTED_WRITABLE_1_MESSAGE = (
+    'Usage of EmptyDir volume "writable-1" exceeds the limit "15Gi". '
+    "token=exampleSecretValue123456 untrusted tail"
+)
+
+
+def _scratch_stamp(volume: str, key: str, ephemeral: object) -> str:
+    return json.dumps({volume: {"key": key, "ephemeral": ephemeral}})
+
+
+def _mounted_scratch_pod(
+    *,
+    message: str | None,
+    volume: str,
+    mount_path: str,
+    stamp: str | None,
+    phase: str = "Failed",
+    reason: str | None = "Evicted",
+) -> SimpleNamespace:
+    annotations: dict[str, str] = {}
+    if stamp is not None:
+        annotations[_SCRATCH_SIZE_KEYS] = stamp
+    return SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current", annotations=annotations),
+        spec=SimpleNamespace(
+            volumes=[SimpleNamespace(name=volume)],
+            containers=[
+                SimpleNamespace(
+                    name="runner",
+                    volume_mounts=[SimpleNamespace(name=volume, mount_path=mount_path)],
+                )
+            ],
+        ),
+        status=SimpleNamespace(
+            phase=phase,
+            reason=reason,
+            message=message,
+            container_statuses=[],
+        ),
+    )
+
+
+def _diagnosed(pod: SimpleNamespace, events: list[object] | None = None) -> Any:
+    api = _FakeApi()
+    api.pod = pod
+    if events is not None:
+        api.events = events
+    return _client(api).pod_termination(
+        "sbx-1",
+        request_timeout_seconds=0.5,
+        since=datetime.now(UTC) - timedelta(seconds=5),
+    )
+
+
+def test_evicted_scratch_volume_names_its_mount_path_and_value() -> None:
+    termination = _diagnosed(
+        _mounted_scratch_pod(
+            message=_EVICTED_WRITABLE_1_MESSAGE,
+            volume="writable-1",
+            mount_path="/home/runner",
+            stamp=_scratch_stamp("writable-1", _FACTORY_HOME_KEY, True),
+        )
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.detail == _HOME_SCRATCH_DETAIL
+    assert "exampleSecretValue123456" not in termination.detail
+    assert "untrusted tail" not in termination.detail
+    assert "token=" not in termination.detail
+
+
+def test_evicted_home_mount_names_an_underscored_profile_key() -> None:
+    key = "agentSandbox.resourceProfiles.factory_large.homeSizeLimit"
+    termination = _diagnosed(
+        _mounted_scratch_pod(
+            message=_EVICTED_WRITABLE_1_MESSAGE,
+            volume="writable-1",
+            mount_path="/home/runner",
+            stamp=_scratch_stamp("writable-1", key, True),
+        )
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.detail == (
+        "sandbox scratch /home/runner (writable-1) exceeded 15Gi; "
+        f"raise {key} or set scratchVolume.type=ephemeral"
+    )
+    assert "untrusted tail" not in termination.detail
+
+
+def test_evicted_home_mount_names_the_hardening_writable_path_key() -> None:
+    termination = _diagnosed(
+        _mounted_scratch_pod(
+            message=_EVICTED_WRITABLE_1_MESSAGE,
+            volume="writable-1",
+            mount_path="/home/runner",
+            stamp=_scratch_stamp("writable-1", _HARDENING_HOME_KEY, True),
+        )
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.detail == (
+        "sandbox scratch /home/runner (writable-1) exceeded 15Gi; "
+        f"raise {_HARDENING_HOME_KEY} or set scratchVolume.type=ephemeral"
+    )
+    assert termination.detail.endswith("or set scratchVolume.type=ephemeral")
+
+
+def test_evicted_tmp_mount_names_its_stamped_key_without_ephemeral_type() -> None:
+    termination = _diagnosed(
+        _mounted_scratch_pod(
+            message=(
+                'Usage of EmptyDir volume "writable-0" exceeds the limit "4Gi". '
+                "token=exampleSecretValue123456 untrusted tail"
+            ),
+            volume="writable-0",
+            mount_path="/tmp",
+            stamp=_scratch_stamp("writable-0", _FACTORY_TMP_KEY, False),
+        )
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.detail == (
+        f"sandbox scratch /tmp (writable-0) exceeded 4Gi; raise {_FACTORY_TMP_KEY}"
+    )
+    assert "scratchVolume.type" not in termination.detail
+    assert "untrusted tail" not in termination.detail
+
+
+@pytest.mark.parametrize(
+    ("stamp", "rejected"),
+    [
+        (None, None),
+        (_scratch_stamp("writable-1", "not-an-envelope-key", True), "not-an-envelope-key"),
+        (_scratch_stamp("writable-1", _FACTORY_HOME_KEY, "true"), _FACTORY_HOME_KEY),
+    ],
+    ids=["no-annotation", "unknown-key", "ephemeral-string"],
+)
+def test_unusable_scratch_stamp_keeps_the_allowlisted_sentence(
+    stamp: str | None, rejected: str | None
+) -> None:
+    termination = _diagnosed(
+        _mounted_scratch_pod(
+            message=_EVICTED_WRITABLE_1_MESSAGE,
+            volume="writable-1",
+            mount_path="/home/runner",
+            stamp=stamp,
+        )
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.detail == _ALLOWLISTED_WRITABLE_1
+    assert "scratchVolume.type" not in termination.detail
+    assert "untrusted tail" not in termination.detail
+    if rejected is not None:
+        assert rejected not in termination.detail
+
+
+def test_running_pod_eviction_event_names_the_stamped_scratch_volume() -> None:
+    termination = _diagnosed(
+        _mounted_scratch_pod(
+            message=None,
+            volume="writable-1",
+            mount_path="/home/runner",
+            stamp=_scratch_stamp("writable-1", _FACTORY_HOME_KEY, True),
+            phase="Running",
+            reason=None,
+        ),
+        events=[
+            SimpleNamespace(
+                reason="Evicted",
+                message=_EVICTED_WRITABLE_1_MESSAGE,
+                involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-current"),
+                last_timestamp=datetime.now(UTC),
+            )
+        ],
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.detail == _HOME_SCRATCH_DETAIL
+    assert "exampleSecretValue123456" not in termination.detail
+    assert "untrusted tail" not in termination.detail
+
+
+def test_stamped_pod_with_an_unstructured_eviction_message_has_no_detail() -> None:
+    termination = _diagnosed(
+        _mounted_scratch_pod(
+            message="The node needed the pod gone. token=exampleSecretValue123456",
+            volume="writable-1",
+            mount_path="/home/runner",
+            stamp=_scratch_stamp("writable-1", _FACTORY_HOME_KEY, True),
+        )
     )
 
     assert termination is not None

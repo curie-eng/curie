@@ -210,3 +210,6 @@ existing tracker and configured label intake, not a validated handoff API. Do no
 emit `validated-ready` or claim a reservation. Later connected validation must use
 the factory-owned evaluator for the exact final input and selected deployment;
 editing an input invalidates any earlier report for that input.
+
+After a Curie CLI upgrade, rerun `curie factory skills install --agent <client>`
+to update an exact shipped copy; review local edits before replacing them.

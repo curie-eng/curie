@@ -1,0 +1,1 @@
+error during connect: Get "https://7bd5b54461f4.fd-proof-d-e8ce1a8c.svc:2376/v1.56/info": tls: failed to verify certificate: x509: certificate signed by unknown authority (possibly because of "x509: ECDSA verification failure" while trying to verify candidate authority certificate "curie-docker-ca 7bd5b54461f4")

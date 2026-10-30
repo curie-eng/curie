@@ -47,7 +47,9 @@ result object containing one receipt per skill. This installs `prepare-factory-t
 `review-pr`, `factory-environment-setup`, and `factory-environment-maintenance`.
 All destinations are checked before any writes; a conflict
 in any skill refuses the operation. Identical copies are retained and unrelated
-skills are preserved. Review and move a conflicting copy aside before upgrading.
+skills are preserved. An exact, unmodified copy of a previously shipped skill
+is upgraded when the embedded skill changes. Locally edited or extended skill
+folders still conflict; review and move those aside before upgrading.
 
 Installation uses the CLI's embedded files and needs no network, Python, Docker
 or Curie deployment. The result prints invocation and refresh instructions;
@@ -55,12 +57,12 @@ client settings and activation consent still apply. See the
 [preparation guide](../docs/guides/factory-preparation.md) for client paths,
 manual installation, specification review, publication and factory selection.
 
-To upgrade, install the desired Curie CLI release, review your existing skill
-for local edits, and move its folder to a backup location outside the client's
-skill directories. Run the install command again and reapply any customizations
-after reviewing the new instructions. Keep the backup until you have verified
-the new skill in your coding agent. Automatic updates and repository version
-pins are deferred.
+To upgrade, install the desired Curie CLI release and rerun the install command.
+The CLI upgrades only exact previously shipped skill trees. If you edited a
+skill or added files inside its folder, move that folder to a backup location
+outside the client's skill directories, rerun the command, then review and
+reapply your customizations. Keep the backup until you have verified the new
+skill in your coding agent. Repository version pins remain deferred.
 
 The skills remain separate workflows after installation: use
 `$prepare-factory-ticket <issue-url>`, `$review-pr <pr-url>`,

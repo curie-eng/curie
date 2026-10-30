@@ -692,7 +692,7 @@ def _review_reaches(factory: LabelFactory, intake: str, number: int) -> None:
     (first, *_rest) = _work(number)
     pull = factory.github.plant_pull()
     _own_pull_request(first["work_item_id"], pull)
-    _complete(first["id"])
+    _complete(factory.client, first["id"])
     before = _requests(number)
     review = factory.github.add_review(pull, next(_REVIEW_IDS), f"@{MENTION} please rename it")
     if intake == "webhook":

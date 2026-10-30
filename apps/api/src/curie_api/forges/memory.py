@@ -14,6 +14,7 @@ Every port call that changes forge state counts one write in a shared
 from __future__ import annotations
 
 import itertools
+import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -29,6 +30,7 @@ from curie_api.forges.capabilities import (
 )
 from curie_api.forges.errors import Ambiguous, NotFound, Unavailable, Unsupported
 from curie_api.forges.ports import CodeHost, MarkedComments, Tracker
+from curie_api.forges.retarget import require_retargetable
 from curie_api.forges.types import (
     Actor,
     CheckState,
@@ -66,6 +68,7 @@ from curie_api.forges.types import (
 from curie_api.publication_policy import is_publication_branch
 
 BOT = Actor(id="1000", login="curie-bot")
+_COMMIT_SHA = re.compile(r"[0-9a-f]{40,64}")
 
 
 def all_supported(operations: frozenset[Operation]) -> dict[Operation, Support]:
@@ -733,6 +736,31 @@ class InMemoryCodeHost(_Declared):
             raise NotFound("commit")
         return found
 
+    async def is_ancestor(self, repository: RepositoryRef, ancestor: str, descendant: str) -> bool:
+        self._gate(Operation.IS_ANCESTOR)
+        self._repository(repository)
+        if ancestor == descendant:
+            return True
+        # Every parent, not only the first: "not reachable" is proved only over a
+        # whole, well-formed graph.
+        seen: set[str] = set()
+        pending = [descendant]
+        while pending:
+            sha = pending.pop()
+            if sha in seen:
+                continue
+            seen.add(sha)
+            found = self._commits.get(sha)
+            if found is None or found.sha != sha:
+                raise Unavailable("commit")
+            for parent in found.parents:
+                if _COMMIT_SHA.fullmatch(parent) is None:
+                    raise Unavailable("commit")
+                if parent == ancestor:
+                    return True
+                pending.append(parent)
+        return False
+
     async def find_pull_request(
         self, repository: RepositoryRef, *, head_ref: str
     ) -> PullRequest | None:
@@ -813,6 +841,37 @@ class InMemoryCodeHost(_Declared):
         pull.updated_at = datetime.now(UTC)
         self.ledger.record()
         return self._view(pull)
+
+    async def retarget_pull_request(
+        self,
+        pull_request: PullRequestRef,
+        *,
+        base_ref: str,
+        expected_head_sha: str,
+    ) -> PullRequest:
+        self._gate(Operation.RETARGET_PULL_REQUEST)
+        self._repository(pull_request.repository)
+        pull = self._pull(pull_request)
+        before = self._view(pull)
+        require_retargetable(
+            before, pull_request, expected_head_sha=expected_head_sha, base_ref=base_ref
+        )
+        if (pull_request.repository, base_ref) not in self._branches:
+            raise NotFound("branch")
+        if before.base_ref == base_ref:
+            return before
+        pull.base_ref = base_ref
+        pull.updated_at = datetime.now(UTC)
+        self.ledger.record()
+        after = self._view(pull)
+        require_retargetable(
+            after,
+            pull_request,
+            expected_head_sha=expected_head_sha,
+            base_ref=base_ref,
+            previous=before,
+        )
+        return after
 
     async def read_pull_request(self, pull_request: PullRequestRef) -> PullRequest:
         self._gate(Operation.READ_PULL_REQUEST)

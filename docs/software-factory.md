@@ -115,8 +115,9 @@ deployment, and periodically classify failed work for targeted repairs.
 
 The [preparation guide](guides/factory-preparation.md) has the installation and
 invocation table for Codex, Claude Code, Copilot, Gemini and Cursor, global
-installation, manual upgrades, and a source build option until the installer is
-released. Installation needs no Python or running Curie service. Starting work
+installation, safe upgrades, manual handling for customized skills, and a
+source build option until the installer is released. Installation needs no
+Python or running Curie service. Starting work
 still needs a configured factory, tracker access and the start authority described
 below. The skill does not deploy a factory or guarantee that a task can finish.
 
@@ -135,7 +136,14 @@ provide the equivalent provider-specific steps.
    platform tool; it holds no GitHub publication credential.
 2. **Add the configured label.** The default is `curie-factory`. A permitted
    user adding it admits work. Polling is the quickstart default, with a
-   45-second interval; production can also use authenticated webhooks.
+   45-second interval; production can also use authenticated webhooks. By
+   default, the factory waits 60 seconds after factory marking before acquiring a
+   sandbox and reads the current `base:<branch>` label then. With no base label
+   it uses the deployment default. Later base changes restart unpublished work
+   or rebase and retarget its PR. Observation continues after a successful run
+   while its PR stays open and its current head and base retain acknowledged
+   successful publication or settled base-move authority; see the
+   [base selection rules](operations.md#admitting-a-labelled-github-issue).
 3. **Follow the issue status comment.** It shows planning, implementation,
    review, publication, and CI phases. State labels distinguish queued,
    running, PR open, and needs human. Queueing for capacity is distinct from

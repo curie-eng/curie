@@ -443,7 +443,7 @@ def test_closure_requests_termination_until_the_runtime_confirms_it(
         == "factory_admitted"
     )
     request_id = uuid.UUID(str(_requests(number)[0]["id"]))
-    _mark_running(request_id)
+    _mark_running(client, request_id)
     api.issue_state = "closed"
     closed = _post(client, "issues", _issue_event("closed", number))
 
@@ -773,34 +773,31 @@ def test_concurrent_label_deliveries_leave_one_active_execution(
     assert len({row["id"] for row in rows}) == 1
 
 
-def _mark_running(request_id: uuid.UUID) -> None:
+def _mark_running(client: TestClient, request_id: uuid.UUID) -> None:
     async def go() -> None:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with AsyncSession(engine) as session:
-                acquired = await acquire(
-                    session,
-                    request_id,
-                    owner="factory-owner",
-                    generation=1,
-                    wake=await factory_wake(session, request_id),
-                    context=None,
-                )
-                assert not isinstance(acquired, DispatchConflict), acquired
-                started = await start(
-                    session,
-                    request_id,
-                    owner="factory-owner",
-                    generation=1,
-                    claim_name="claim-factory",
-                    sandbox_name="sbx-factory",
-                    context=acquired.context,
-                )
-                assert not isinstance(started, DispatchConflict), started
-        finally:
-            await engine.dispose()
+        async with client.app.state.sessionmaker() as session:
+            acquired = await acquire(
+                session,
+                request_id,
+                owner="factory-owner",
+                generation=1,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=client.app.state.http_client,
+            )
+            assert not isinstance(acquired, DispatchConflict), acquired
+            started = await start(
+                session,
+                request_id,
+                owner="factory-owner",
+                generation=1,
+                claim_name="claim-factory",
+                sandbox_name="sbx-factory",
+                context=acquired.context,
+            )
+            assert not isinstance(started, DispatchConflict), started
 
-    asyncio.run(go())
+    client.portal.call(go)
 
 
 def _assert_publication_refused(work_item_id: uuid.UUID) -> None:

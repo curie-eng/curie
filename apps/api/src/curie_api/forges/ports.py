@@ -203,6 +203,14 @@ class CodeHost(Protocol):
 
     async def read_commit(self, repository: RepositoryRef, sha: str) -> Commit: ...
 
+    async def is_ancestor(self, repository: RepositoryRef, ancestor: str, descendant: str) -> bool:
+        """Whether ``ancestor`` is reachable from ``descendant`` through any parent.
+
+        Equal shas are true. False only when the forge answers that it is not;
+        `Unavailable` when the forge cannot answer, including a missing commit.
+        """
+        ...
+
     async def find_pull_request(
         self, repository: RepositoryRef, *, head_ref: str
     ) -> PullRequest | None:
@@ -227,6 +235,21 @@ class CodeHost(Protocol):
     async def update_pull_request(
         self, pull_request: PullRequestRef, *, title: str | None, body: str | None
     ) -> PullRequest: ...
+
+    async def retarget_pull_request(
+        self,
+        pull_request: PullRequestRef,
+        *,
+        base_ref: str,
+        expected_head_sha: str,
+    ) -> PullRequest:
+        """Change only an open pull request's target at the expected head.
+
+        Verify identity, source branch and head before and after the update.
+        An already matching target makes no write. Provider reads are optimistic
+        checks; the caller fences branch updates with Git's exact head lease.
+        """
+        ...
 
     async def list_factory_publications(
         self, repository: RepositoryRef
@@ -257,7 +280,7 @@ class CodeHost(Protocol):
         """Optional: check names the code host requires on ``branch`` before merge.
 
         GitHub unions ruleset contexts and branch protection contexts. Other
-        code hosts declare this unsupported. The factory does not apply labels
+        code hosts declare this unsupported. This read does not apply labels
         or start workflows to make a required check run.
         """
         ...

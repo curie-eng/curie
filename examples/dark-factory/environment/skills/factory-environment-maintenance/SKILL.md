@@ -51,3 +51,6 @@ If work-item outcomes omit the command or sandbox evidence needed to classify
 a failure, report that observability gap instead of guessing. An image update
 does not automatically make an old failed issue eligible for retry; follow the
 configured tracker's explicit retry or selection policy.
+
+After a Curie CLI upgrade, rerun `curie factory skills install --agent <client>`
+to update an exact shipped copy; review local edits before replacing them.

@@ -1296,6 +1296,7 @@ codeHostTrust:
 factory:
   enabled: false
   intake: poll  # or webhook
+  baseLabelSettleSeconds: 60
   cardBaseUrl: ""
   ciWaitSeconds: 3600
   codeHosts: []
@@ -1500,6 +1501,12 @@ api:
   # reach. Each entry is owner/repository or owner/*; an empty list allows no
   # opening-message repository selections.
   githubRepoAllowlist: []
+  # Operator-controlled GitHub labels by exact owner/repository; agents cannot
+  # choose labels. No wildcards; at most 10 label names of 1 to 50 characters.
+  # Repository keys match case-insensitively.
+  # Applied once per publication revision using a 30-day Valkey success marker.
+  # Best effort: forge or Valkey errors preserve the publication.
+  factoryPublicationLabels: {}
   # BYO secret (issue #1759, the same idiom githubAppExistingSecret below
   # uses). Wins over githubToken when set. A plain `curie cluster up`
   # preserves the reference and key; an explicit inline replacement or
@@ -2146,6 +2153,14 @@ worker:
     bucket: curie-workspaces
     cloneVolumeSize: 4Gi
     mountPath: /var/lib/curie/workspaces
+    # Workspace recovery capture (ADR 0251). Off by default. Enabling it keeps
+    # a checkpoint of a terminated turn's workspace for 24 hours and requires
+    # maxBytes, a positive installation-wide cap that counts every recovery
+    # byte; the render fails without it. The API also receives
+    # maxArchiveBytes above so its ledger matches the worker's limit.
+    recovery:
+      enabled: false
+      maxBytes: null
   # Inbound channel attachments (#2567). The worker downloads a referenced file
   # with the channel bot token (Slack) or from the adapter that sent it, with
   # that adapter's adapterCredentials secret (any other kind, ADR-0153), parks
@@ -2775,6 +2790,12 @@ agentSandbox:
   # `standard`. The factory 2Gi is a headroom choice, not a measured need:
   # after #4895 the factory publication listing over 231 pages peaked near
   # 170 MB under both 512Mi and 2Gi limits.
+  #
+  # scratchVolume.type is emptyDir (the default) or ephemeral. emptyDir keeps
+  # today's sizeLimit. ephemeral uses that same size as requests.storage on
+  # workspace and the home writable volume only. /tmp and every other writable
+  # path stay emptyDir. Leave storageClassName unset so the cluster default
+  # class is used; an empty class is omitted rather than rendered as "".
   resourceProfiles:
     standard:
       resources:
@@ -2784,6 +2805,8 @@ agentSandbox:
       homeSizeLimit: 512Mi
       tmpSizeLimit: 512Mi
       writablePathSizeLimit: 512Mi
+      scratchVolume:
+        type: emptyDir
       apiMemoryLimit: 512Mi
     factory:
       resources:
@@ -2793,6 +2816,8 @@ agentSandbox:
       homeSizeLimit: 15Gi
       tmpSizeLimit: 4Gi
       writablePathSizeLimit: 512Mi
+      scratchVolume:
+        type: emptyDir
       apiMemoryLimit: 2Gi
   # Agents that get a labeled sandbox template and warm pool so connector
   # ingress can select curietech.ai/agent=<name>. A list of agent name strings.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import time
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -85,7 +86,7 @@ def _sql(statement: str, **params: Any) -> list[dict[str, Any]]:
 
 def _seed(
     *, agent_id: str | None = None, item_id: str | None = None, start_failed: bool = False,
-    lineage_closed: bool = False
+    lineage_closed: bool = False, deadline_passed: bool = False
 ) -> dict[str, Any]:
     agent_id = agent_id or str(uuid.uuid4())
     item_id = item_id or str(uuid.uuid4())
@@ -129,6 +130,7 @@ def _seed(
         "CASE WHEN :start_failed OR :lineage_closed THEN NULL "
         "ELSE clock_timestamp() - interval '1 minute' END, "
         "CASE WHEN :start_failed OR :lineage_closed THEN NULL "
+        "WHEN :deadline_passed THEN clock_timestamp() - interval '1 second' "
         "ELSE clock_timestamp() + interval '1 hour' END, "
         "clock_timestamp() - interval '1 second', "
         "CASE WHEN :lineage_closed THEN 'lineage_closed' "
@@ -141,6 +143,7 @@ def _seed(
         sequence=sequence,
         start_failed=start_failed,
         lineage_closed=lineage_closed,
+        deadline_passed=deadline_passed,
     )
     _sql(
         "UPDATE curie.work_items SET next_sequence = :sequence WHERE id = :id",
@@ -197,8 +200,9 @@ def _reserved(client: Any, source: dict[str, Any], **kwargs: Any) -> dict[str, A
     body = _reserve_body(source, **kwargs)
     result = _ok(_post(client, "reserve", body))
     assert set(result) == {
-        "checkpoint_id", "objects", "capture_deadline", "staging_expires_at"
+        "checkpoint_id", "objects", "capture_deadline", "staging_expires_at", "replayed"
     }
+    assert isinstance(result["replayed"], bool)
     uuid.UUID(result["checkpoint_id"])
     assert len(result["objects"]) == len(body["objects"])
     expected = {obj["kind"]: obj for obj in body["objects"]}
@@ -404,7 +408,8 @@ def test_recovery_http_authority(recovery: None, client: Any, auth_headers: Any)
 
     reservation = _ok(_post(client, "reserve", body))
     reserved_state = _snapshot()
-    assert _ok(_post(client, "reserve", body)) == reservation
+    replay = _ok(_post(client, "reserve", body))
+    assert replay == {**reservation, "replayed": True}
     assert _snapshot() == reserved_state
     conflict = copy.deepcopy(body)
     conflict["objects"][1]["sha256"] = "f" * 64
@@ -1151,3 +1156,683 @@ def test_recovery_candidate_cannot_serve_schema_before_0141(
     with pytest.raises(RuntimeError, match="schema"):
         with TestClient(create_app()):
             pytest.fail("the API started against a schema without the recovery ledger")
+
+
+# --- terminal capture: context, outcome, budget and lease-loss cleanup (#5143) ------
+
+CAPTURE_REASONS = (
+    "torn_capture",
+    "capture_timeout",
+    "capture_failed",
+    "runner_unavailable",
+    "patch_too_large",
+    "manifest_too_large",
+    "base_mismatch",
+)
+
+
+def _no_capability(text: str) -> None:
+    """A metadata answer names no URL, signature or object bytes."""
+
+    assert "://" not in text
+    assert "X-Amz" not in text and "Signature" not in text
+    assert "base64" not in text
+
+
+def _outcome_body(source: dict[str, Any], reason: str) -> dict[str, Any]:
+    return {**_authority(source), "reason": reason}
+
+
+def _last_good(source: dict[str, Any]) -> str | None:
+    rows = _sql(
+        "SELECT last_good_checkpoint_id FROM curie.workspace_recovery_groups "
+        "WHERE work_item_id = :id",
+        id=uuid.UUID(source["work_item_id"]),
+    )
+    value = rows[0]["last_good_checkpoint_id"] if rows else None
+    return str(value) if value is not None else None
+
+
+def _checkpoint_status(reservation: dict[str, Any]) -> str:
+    return str(
+        _sql(
+            "SELECT status FROM curie.workspace_recovery_checkpoints WHERE id = :id",
+            id=uuid.UUID(reservation["checkpoint_id"]),
+        )[0]["status"]
+    )
+
+
+def _lease_lost(
+    client: Any, source: dict[str, Any], reservation: dict[str, Any], *, retract: bool = False
+) -> Any:
+    """``retract`` is sent only by a writer whose own completion returned this invocation."""
+
+    body: dict[str, Any] = {
+        **_authority(source),
+        "checkpoint_id": reservation["checkpoint_id"],
+        "reason": "lease_lost",
+    }
+    if retract:
+        body["retract"] = True
+    return _post(client, "fail", body)
+
+
+def _terminal_now(source: dict[str, Any]) -> None:
+    """Move the source's terminus to now, after any outcome already written."""
+
+    _sql(
+        "UPDATE curie.execution_requests SET terminal_at = clock_timestamp() WHERE id = :id",
+        id=uuid.UUID(source["source_request_id"]),
+    )
+
+
+def test_capture_context_and_outcome_require_the_worker_token(
+    recovery: None, client: Any, auth_headers: Any
+) -> None:
+    _routes_exist(client)
+    source = _seed()
+    before = _snapshot()
+    for operation, body in (
+        ("context", _authority(source)),
+        ("outcome", _outcome_body(source, "capture_failed")),
+    ):
+        for headers in (
+            {}, {"X-Curie-Worker-Token": "wrong-token"}, auth_headers,
+            {"X-Curie-Worker-Token": get_settings().api_key},
+        ):
+            response = client.post(f"{ROOT}/{operation}", json=body, headers=headers)
+            assert response.status_code == 401, response.text
+            assert _snapshot() == before
+    # Liveness: the worker token opens both.
+    _ok(_post(client, "context", _authority(source)))
+    _ok(_post(client, "outcome", _outcome_body(source, "capture_failed")))
+
+
+def test_capture_context_names_the_work_item_repository_and_writes_nothing(
+    recovery: None, client: Any
+) -> None:
+    _routes_exist(client)
+    source = _seed()
+    before = _snapshot()
+    response = _post(client, "context", _authority(source))
+    body = _ok(response)
+    assert body == {
+        "repository": dict(REPOSITORY),
+        "base_commit": BASE,
+        "target_branch": "main",
+    }
+    _no_capability(response.text)
+    assert _snapshot() == before
+
+
+@pytest.mark.parametrize(
+    "state",
+    ("disabled", "unknown_item", "unknown_source", "other_epoch", "other_generation",
+     "successor", "running", "start_failed", "cancelled_item", "expired_heartbeat",
+     "expired_deadline", "null_base"),
+)
+def test_capture_context_refuses_a_source_that_cannot_start_a_capture(
+    recovery: None, client: Any, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    _routes_exist(client)
+    # Execution deadlines are write once, so an expired one is seeded expired.
+    source = _seed(
+        start_failed=state == "start_failed", deadline_passed=state == "expired_deadline"
+    )
+    body = _authority(source)
+    request = {"id": uuid.UUID(source["source_request_id"])}
+    status, code = 409, None
+    if state == "disabled":
+        monkeypatch.setenv("CURIE_WORKSPACE_RECOVERY_ENABLED", "false")
+        get_settings.cache_clear()
+        status, code = 503, "workspace_recovery.disabled"
+    elif state == "unknown_item":
+        body["work_item_id"] = str(uuid.uuid4())
+        code = "workspace_recovery.source_identity"
+    elif state == "unknown_source":
+        body["source_request_id"] = str(uuid.uuid4())
+        code = "workspace_recovery.source_identity"
+    elif state == "other_epoch":
+        body["runtime_epoch"] = 4
+        code = "workspace_recovery.source_identity"
+    elif state == "other_generation":
+        body["dispatch_generation"] = 3
+        code = "workspace_recovery.source_identity"
+    elif state == "successor":
+        _seed(agent_id=source["agent_id"], item_id=source["work_item_id"])
+        code = "workspace_recovery.source_identity"
+    elif state == "running":
+        _sql(
+            "UPDATE curie.execution_requests SET status = 'running', terminal_at = NULL, "
+            "terminal_cause = NULL WHERE id = :id", **request,
+        )
+        code = "workspace_recovery.ineligible_source"
+    elif state == "start_failed":
+        code = "workspace_recovery.ineligible_source"
+    elif state == "cancelled_item":
+        _sql("UPDATE curie.work_items SET cancelled_at = clock_timestamp() WHERE id = :id",
+             id=uuid.UUID(source["work_item_id"]))
+        code = "workspace_recovery.ineligible_source"
+    elif state == "expired_heartbeat":
+        _sql(
+            "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
+            "clock_timestamp() - interval '1 second' WHERE id = :id", **request,
+        )
+        code = "workspace_recovery.expired_source"
+    elif state == "expired_deadline":
+        code = "workspace_recovery.expired_source"
+    else:
+        _sql(
+            "UPDATE curie.work_items SET base_commit = NULL, base_branch = NULL, "
+            "base_source = NULL WHERE id = :id", id=uuid.UUID(source["work_item_id"]),
+        )
+        code = "workspace_recovery.source_identity"
+    before = _snapshot()
+    response = _post(client, "context", body)
+    _refused(response, status)
+    assert response.json()["detail"]["code"] == code
+    _no_capability(response.text)
+    assert _snapshot() == before
+
+
+@pytest.mark.parametrize("reason", CAPTURE_REASONS)
+def test_capture_outcome_records_each_pre_reservation_reason_and_nothing_else(
+    recovery: None, client: Any, reason: str
+) -> None:
+    _routes_exist(client)
+    source = _seed()
+    before = _snapshot(omit_outcomes=True)
+    response = _post(client, "outcome", _outcome_body(source, reason))
+    _ok(response)
+    _no_capability(response.text)
+    recorded = _outcome(source)
+    assert recorded["workspace_recovery_outcome"] == reason
+    assert recorded["workspace_recovery_outcome_at"] is not None
+    # Only the WorkItem outcome moved: no checkpoint, object, approval or publication.
+    assert _snapshot(omit_outcomes=True) == before
+    assert recorded["version"] == 7
+
+
+@pytest.mark.parametrize(
+    "reason", ("reserved", "complete", "lease_lost", "upload_failed", "anything"),
+)
+def test_capture_outcome_refuses_a_reason_outside_its_closed_set(
+    recovery: None, client: Any, reason: str
+) -> None:
+    _routes_exist(client)
+    source = _seed()
+    before = _snapshot()
+    response = _post(client, "outcome", _outcome_body(source, reason))
+    assert response.status_code == 422, response.text
+    assert _snapshot() == before
+
+
+def test_capture_outcome_survives_an_expired_heartbeat_and_deadline(
+    recovery: None, client: Any
+) -> None:
+    """A capture that spent its whole budget still records why, after the lease lapsed."""
+
+    _routes_exist(client)
+    source = _seed(deadline_passed=True)
+    _sql(
+        "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
+        "clock_timestamp() - interval '1 second' WHERE id = :id",
+        id=uuid.UUID(source["source_request_id"]),
+    )
+    # The same expiry refuses a new capture: the asymmetry is the point.
+    _refused(_post(client, "context", _authority(source)))
+    _ok(_post(client, "outcome", _outcome_body(source, "capture_timeout")))
+    assert _outcome(source)["workspace_recovery_outcome"] == "capture_timeout"
+
+
+@pytest.mark.parametrize(
+    "state", ("successor", "running", "start_failed", "other_epoch", "cancelled_item"),
+)
+def test_capture_outcome_refuses_a_source_that_is_not_the_latest_failed_run(
+    recovery: None, client: Any, state: str
+) -> None:
+    _routes_exist(client)
+    source = _seed(start_failed=state == "start_failed")
+    body = _outcome_body(source, "capture_failed")
+    if state == "successor":
+        _seed(agent_id=source["agent_id"], item_id=source["work_item_id"])
+    elif state == "running":
+        _sql(
+            "UPDATE curie.execution_requests SET status = 'running', terminal_at = NULL, "
+            "terminal_cause = NULL WHERE id = :id",
+            id=uuid.UUID(source["source_request_id"]),
+        )
+    elif state == "other_epoch":
+        body["runtime_epoch"] = 4
+    elif state == "cancelled_item":
+        _sql("UPDATE curie.work_items SET cancelled_at = clock_timestamp() WHERE id = :id",
+             id=uuid.UUID(source["work_item_id"]))
+    before = _snapshot()
+    _refused(_post(client, "outcome", body))
+    assert _snapshot() == before
+
+
+def test_capture_outcome_overwrites_only_an_outcome_older_than_its_source_terminus(
+    recovery: None, client: Any
+) -> None:
+    """Structural rule on real ``clock_timestamp()`` ordering, no clock arithmetic."""
+
+    _routes_exist(client)
+    previous = _seed()
+    _ok(_post(client, "outcome", _outcome_body(previous, "runner_unavailable")))
+    older = _outcome(previous)
+    source = _seed(agent_id=previous["agent_id"], item_id=previous["work_item_id"])
+    _terminal_now(source)
+    # The previous run's outcome predates this source's terminus: overwritten.
+    _ok(_post(client, "outcome", _outcome_body(source, "torn_capture")))
+    written = _outcome(source)
+    assert written["workspace_recovery_outcome"] == "torn_capture"
+    assert written["workspace_recovery_outcome_at"] > older["workspace_recovery_outcome_at"]
+
+    # A reservation by this same source writes a later outcome; a pre-reservation
+    # reason arriving after it does not displace it.
+    reservation = _reserved(client, source)
+    assert _outcome(source)["workspace_recovery_outcome"] == "reserved"
+    _ok(_post(client, "outcome", _outcome_body(source, "capture_failed")))
+    assert _outcome(source)["workspace_recovery_outcome"] == "reserved"
+    _fail(client, source, reservation)
+
+
+@pytest.mark.parametrize("budget", (0, -1, 0.0, 60.001, 61))
+def test_reserve_refuses_a_capture_budget_outside_zero_to_sixty(
+    recovery: None, client: Any, budget: Any
+) -> None:
+    _routes_exist(client)
+    source = _seed()
+    before = _snapshot()
+    body = {**_reserve_body(source), "capture_budget_seconds": budget}
+    response = _post(client, "reserve", body)
+    assert response.status_code == 422, response.text
+    assert _snapshot() == before
+
+
+@pytest.mark.parametrize("budget", (None, 60, 0.5, 17.25))
+def test_reserve_sets_the_capture_deadline_from_the_remaining_budget(
+    recovery: None, client: Any, budget: float | None
+) -> None:
+    _routes_exist(client)
+    source = _seed()
+    body = _reserve_body(source)
+    if budget is not None:
+        body["capture_budget_seconds"] = budget
+    reservation = _ok(_post(client, "reserve", body))
+    expected = timedelta(seconds=60 if budget is None else budget)
+    # reserve stamps one database ``now`` for both deadlines.
+    reserved_at = _date(reservation["staging_expires_at"]) - timedelta(seconds=600)
+    assert _date(reservation["capture_deadline"]) - reserved_at == expected
+    row = _sql(
+        "SELECT capture_deadline, staging_expires_at FROM curie.workspace_recovery_checkpoints "
+        "WHERE id = :id", id=uuid.UUID(reservation["checkpoint_id"]),
+    )[0]
+    assert row["capture_deadline"] - (row["staging_expires_at"] - timedelta(seconds=600)) == (
+        expected
+    )
+    assert row["capture_deadline"] == _date(reservation["capture_deadline"])
+
+
+def test_reserve_replays_with_a_smaller_remaining_budget_and_keeps_its_deadline(
+    recovery: None, client: Any
+) -> None:
+    _routes_exist(client)
+    source = _seed()
+    body = {**_reserve_body(source, key="replayed-capture"), "capture_budget_seconds": 40}
+    first = _ok(_post(client, "reserve", body))
+    state = _snapshot()
+    replay = _ok(_post(client, "reserve", {**body, "capture_budget_seconds": 12.5}))
+    assert {**replay, "replayed": False} == first
+    assert _snapshot() == state
+    # The budget is excluded from the content digest; the content is not.
+    changed = copy.deepcopy(body)
+    changed["objects"][-1]["sha256"] = "f" * 64
+    _refused(_post(client, "reserve", changed))
+    assert _snapshot() == state
+
+
+def test_reserve_answers_replayed_only_when_the_idempotency_key_matched(
+    recovery: None, client: Any
+) -> None:
+    """``replayed`` is the writer's proof that this invocation did not create the checkpoint."""
+
+    _routes_exist(client)
+    source = _seed()
+    body = _reserve_body(source, key="replay-proof")
+    first = _ok(_post(client, "reserve", body))
+    assert first["replayed"] is False
+    replay = _ok(_post(client, "reserve", body))
+    assert replay["replayed"] is True
+    assert replay["checkpoint_id"] == first["checkpoint_id"]
+    _completed(client, source, first)
+    # A replay of a complete checkpoint still says so.
+    after = _ok(_post(client, "reserve", body))
+    assert after["replayed"] is True
+    assert after["checkpoint_id"] == first["checkpoint_id"]
+    fresh = _ok(_post(client, "reserve", _reserve_body(source, reuse=True)))
+    assert fresh["replayed"] is False
+    assert fresh["checkpoint_id"] != first["checkpoint_id"]
+
+
+def test_a_completion_after_the_budgeted_deadline_is_refused_and_publishes_nothing(
+    recovery: None, client: Any
+) -> None:
+    _routes_exist(client)
+    source = _seed()
+    reservation = _ok(_post(client, "reserve", {
+        **_reserve_body(source), "capture_budget_seconds": 0.5,
+    }))
+    # Wait out the budget on the database clock, not by arithmetic.
+    for _ in range(100):
+        if _sql(
+            "SELECT capture_deadline <= clock_timestamp() AS passed "
+            "FROM curie.workspace_recovery_checkpoints WHERE id = :id",
+            id=uuid.UUID(reservation["checkpoint_id"]),
+        )[0]["passed"]:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("capture deadline never passed")
+    _refused(_post(client, "complete", _completion(source, reservation)))
+    assert _last_good(source) is None
+    assert _checkpoint_status(reservation) == "staging"
+    _fail(client, source, reservation)
+    # Liveness: the same shape with the default budget completes.
+    fresh = _seed()
+    accepted = _reserved(client, fresh)
+    _completed(client, fresh, accepted)
+    assert _last_good(fresh) == accepted["checkpoint_id"]
+
+
+def test_lease_lost_cleanup_tombstones_a_superseded_source_staging(
+    recovery: None, client: Any
+) -> None:
+    """A predecessor whose lease was lost cleans up even after a successor was admitted."""
+
+    _routes_exist(client)
+    source = _seed()
+    reservation = _reserved(client, source)
+    assert _outcome(source)["workspace_recovery_outcome"] == "reserved"
+    successor = _seed(agent_id=source["agent_id"], item_id=source["work_item_id"])
+    # The successor's admission alone bars the predecessor from new captures.
+    _refused(_post(client, "context", _authority(source)))
+    _refused(_post(client, "reserve", _reserve_body(source, reuse=True)))
+    _refused(_post(client, "complete", _completion(source, reservation)))
+
+    response = _lease_lost(client, source, reservation)
+    body = _ok(response)
+    assert body == {"checkpoint_id": reservation["checkpoint_id"], "status": "tombstoned"}
+    _no_capability(response.text)
+    assert _checkpoint_status(reservation) == "tombstoned"
+    assert _last_good(source) is None
+    # The successor never captured, so the predecessor's own reservation outcome
+    # is replaced by the cleanup reason.
+    assert _outcome(source)["workspace_recovery_outcome"] == "lease_lost"
+    # The successor's own capture is unaffected.
+    _terminal_now(successor)
+    assert _ok(_post(client, "context", _authority(successor)))["base_commit"] == BASE
+
+
+@pytest.mark.parametrize("stage", ("staging", "complete"))
+def test_predecessor_cleanup_survives_a_successor_readmitted_on_a_new_base(
+    recovery: None, client: Any, stage: str
+) -> None:
+    """Cleanup is fenced by the retained checkpoint's identity, not the WorkItem's base.
+
+    Ordinary readmission moves the WorkItem to a new base commit; the predecessor
+    whose lease was lost still withdraws its own staging or completion.
+    """
+
+    _routes_exist(client)
+    source = _seed()
+    reservation = _reserved(client, source)
+    if stage == "complete":
+        _completed(client, source, reservation)
+    _seed(agent_id=source["agent_id"], item_id=source["work_item_id"])
+    _sql(
+        "UPDATE curie.work_items SET base_commit = :base WHERE id = :id",
+        id=uuid.UUID(source["work_item_id"]),
+        base="b" * 40,
+    )
+    response = _lease_lost(client, source, reservation, retract=stage == "complete")
+    expected = "retracted" if stage == "complete" else "tombstoned"
+    assert _ok(response) == {"checkpoint_id": reservation["checkpoint_id"], "status": expected}
+    _no_capability(response.text)
+    assert _checkpoint_status(reservation) == "tombstoned"
+    assert _last_good(source) is None
+    assert _outcome(source)["workspace_recovery_outcome"] == "lease_lost"
+
+
+@pytest.mark.parametrize("change", ("other_epoch", "other_generation", "running_source"))
+def test_superseded_cleanup_still_requires_the_exact_failed_source(
+    recovery: None, client: Any, change: str
+) -> None:
+    _routes_exist(client)
+    source = _seed()
+    reservation = _reserved(client, source)
+    _seed(agent_id=source["agent_id"], item_id=source["work_item_id"])
+    body = {
+        **_authority(source),
+        "checkpoint_id": reservation["checkpoint_id"],
+        "reason": "lease_lost",
+    }
+    if change == "other_epoch":
+        body["runtime_epoch"] = 4
+    elif change == "other_generation":
+        body["dispatch_generation"] = 3
+    else:
+        _sql(
+            "UPDATE curie.execution_requests SET status = 'running', terminal_at = NULL, "
+            "terminal_cause = NULL WHERE id = :id",
+            id=uuid.UUID(source["source_request_id"]),
+        )
+    before = _snapshot()
+    _refused(_post(client, "fail", body))
+    assert _snapshot() == before
+    assert _checkpoint_status(reservation) == "staging"
+
+
+def test_lease_lost_cleanup_keeps_a_successors_newer_outcome(
+    recovery: None, client: Any
+) -> None:
+    _routes_exist(client)
+    source = _seed()
+    reservation = _reserved(client, source)
+    successor = _seed(agent_id=source["agent_id"], item_id=source["work_item_id"])
+    _terminal_now(successor)
+    _ok(_post(client, "outcome", _outcome_body(successor, "runner_unavailable")))
+    newer = _outcome(successor)
+    assert newer["workspace_recovery_outcome"] == "runner_unavailable"
+
+    _ok(_lease_lost(client, source, reservation))
+
+    assert _checkpoint_status(reservation) == "tombstoned"
+    assert _outcome(source)["workspace_recovery_outcome"] == "runner_unavailable"
+    assert (
+        _outcome(source)["workspace_recovery_outcome_at"]
+        == newer["workspace_recovery_outcome_at"]
+    )
+
+
+def test_lease_lost_retracts_the_just_completed_checkpoint_to_the_previous_one(
+    recovery: None, client: Any
+) -> None:
+    _routes_exist(client)
+    source = _seed()
+    first = _reserved(client, source)
+    _completed(client, source, first)
+    second = _reserved(client, source, reuse=True)
+    _completed(client, source, second)
+    assert _last_good(source) == second["checkpoint_id"]
+
+    response = _lease_lost(client, source, second, retract=True)
+    body = _ok(response)
+    assert body == {"checkpoint_id": second["checkpoint_id"], "status": "retracted"}
+    _no_capability(response.text)
+    assert _checkpoint_status(second) == "tombstoned"
+    assert _checkpoint_status(first) == "complete"
+    assert _last_good(source) == first["checkpoint_id"]
+    assert _outcome(source)["workspace_recovery_outcome"] == "lease_lost"
+    # New selection of the retracted checkpoint is refused; the previous one reads.
+    _refused(_post(client, "acquire-reader", _reader_body(source, second)))
+    _release(client, _reader(client, source, first))
+    # A repeated retraction is not a second state change.
+    state = _snapshot()
+    repeated = _post(client, "fail", {
+        **_authority(source), "checkpoint_id": second["checkpoint_id"], "reason": "lease_lost",
+        "retract": True,
+    })
+    assert repeated.status_code in {200, 409}, repeated.text
+    assert _snapshot() == state
+
+
+def test_lease_lost_retraction_of_the_only_checkpoint_clears_the_pointer(
+    recovery: None, client: Any
+) -> None:
+    _routes_exist(client)
+    source = _seed()
+    only = _reserved(client, source)
+    _completed(client, source, only)
+    # Superseded while the completion committed: the retraction still applies.
+    _seed(agent_id=source["agent_id"], item_id=source["work_item_id"])
+    assert _ok(_lease_lost(client, source, only, retract=True))["status"] == "retracted"
+    assert _last_good(source) is None
+    assert _checkpoint_status(only) == "tombstoned"
+
+
+@pytest.mark.parametrize("case", ("other_reason", "other_source"))
+def test_a_complete_checkpoint_is_retracted_only_by_its_own_lease_loss(
+    recovery: None, client: Any, case: str
+) -> None:
+    _routes_exist(client)
+    source = _seed()
+    first = _reserved(client, source)
+    _completed(client, source, first)
+    second = _reserved(client, source, reuse=True)
+    _completed(client, source, second)
+    target, authority, reason = second, _authority(source), "lease_lost"
+    if case == "other_reason":
+        reason = "upload_failed"
+    else:
+        authority = {**authority, "runtime_epoch": 4}
+    before = _snapshot()
+    _refused(_post(client, "fail", {
+        **authority, "checkpoint_id": target["checkpoint_id"], "reason": reason,
+        "retract": True,
+    }))
+    assert _snapshot() == before
+    assert _last_good(source) == second["checkpoint_id"]
+
+
+def test_retraction_withdraws_its_own_checkpoint_and_keeps_a_successors_pointer(
+    recovery: None, client: Any
+) -> None:
+    """A successor's newer checkpoint stays the answer; the predecessor's still goes."""
+
+    _routes_exist(client)
+    source = _seed()
+    own = _reserved(client, source)
+    _completed(client, source, own)
+    successor = _seed(agent_id=source["agent_id"], item_id=source["work_item_id"])
+    _terminal_now(successor)
+    newer = _reserved(client, successor, reuse=True)
+    _completed(client, successor, newer)
+    assert _last_good(source) == newer["checkpoint_id"]
+
+    response = _lease_lost(client, source, own, retract=True)
+    assert _ok(response) == {"checkpoint_id": own["checkpoint_id"], "status": "retracted"}
+    _no_capability(response.text)
+    assert _checkpoint_status(own) == "tombstoned"
+    assert _checkpoint_status(newer) == "complete"
+    assert _last_good(source) == newer["checkpoint_id"]
+    _refused(_post(client, "acquire-reader", _reader_body(source, own)))
+    _release(client, _reader(client, source, newer))
+
+
+@pytest.mark.parametrize("stage", ("complete", "staging"))
+def test_cleanup_after_the_work_item_was_cancelled(
+    recovery: None, client: Any, stage: str
+) -> None:
+    """A cancellation committing after the capture does not strand its checkpoint."""
+
+    _routes_exist(client)
+    source = _seed()
+    reservation = _reserved(client, source)
+    if stage == "complete":
+        _completed(client, source, reservation)
+    # As the lifecycle's cancel does: the WorkItem is marked cancelled.
+    _sql(
+        "UPDATE curie.work_items SET cancelled_at = clock_timestamp() WHERE id = :id",
+        id=uuid.UUID(source["work_item_id"]),
+    )
+    if stage == "complete":
+        response = _lease_lost(client, source, reservation, retract=True)
+        expected = "retracted"
+    else:
+        response = _post(client, "fail", {
+            **_authority(source),
+            "checkpoint_id": reservation["checkpoint_id"],
+            "reason": "upload_failed",
+        })
+        expected = "tombstoned"
+    assert _ok(response) == {"checkpoint_id": reservation["checkpoint_id"], "status": expected}
+    assert _checkpoint_status(reservation) == "tombstoned"
+    assert _last_good(source) is None
+    _refused(_post(client, "acquire-reader", _reader_body(source, reservation)))
+
+
+def test_lease_lost_without_retract_never_withdraws_a_complete_checkpoint(
+    recovery: None, client: Any
+) -> None:
+    """A replay that lost its lease before its own completion cannot retract.
+
+    Its reserve answered an already complete checkpoint, so only ``retract: true``
+    (sent after the writer's own ``complete`` returned) may withdraw it.
+    """
+
+    _routes_exist(client)
+    source = _seed()
+    first = _reserved(client, source)
+    _completed(client, source, first)
+    second = _reserved(client, source, reuse=True)
+    _completed(client, source, second)
+    before = _snapshot()
+    response = _lease_lost(client, source, second)
+    _refused(response)
+    assert response.json()["detail"]["code"] == "workspace_recovery.checkpoint_state"
+    assert _snapshot() == before
+    assert _checkpoint_status(second) == "complete"
+    assert _last_good(source) == second["checkpoint_id"]
+    _release(client, _reader(client, source, second))
+
+
+@pytest.mark.parametrize("repeat", ("retract", "lease_lost", "upload_failed"))
+def test_a_repeated_fail_after_retraction_answers_retracted_never_tombstoned(
+    recovery: None, client: Any, repeat: str
+) -> None:
+    """``tombstoned`` tells the writer to discard; a once-complete checkpoint never is."""
+
+    _routes_exist(client)
+    source = _seed()
+    first = _reserved(client, source)
+    _completed(client, source, first)
+    second = _reserved(client, source, reuse=True)
+    _completed(client, source, second)
+    reader = _reader(client, source, second)
+    assert _ok(_lease_lost(client, source, second, retract=True))["status"] == "retracted"
+    state = _snapshot()
+    body: dict[str, Any] = {
+        **_authority(source),
+        "checkpoint_id": second["checkpoint_id"],
+        "reason": "upload_failed" if repeat == "upload_failed" else "lease_lost",
+    }
+    if repeat == "retract":
+        body["retract"] = True
+    response = _post(client, "fail", body)
+    assert _ok(response) == {"checkpoint_id": second["checkpoint_id"], "status": "retracted"}
+    _no_capability(response.text)
+    assert _snapshot() == state
+    assert _last_good(source) == first["checkpoint_id"]
+    _release(client, reader)

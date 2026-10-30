@@ -187,6 +187,9 @@ class MailState:
         # evidence the sender cannot write (ADR 0228 decision 3). Only the
         # verifying test provider reads it; AgentMail's provider ignores it.
         self.verdicts: dict[str, dict[str, str]] = {}
+        self.list_gate = threading.Event()
+        self.list_gate.set()
+        self.list_entered = threading.Event()
         self.reply_gate = threading.Event()
         self.reply_gate.set()
         self.reply_entered = threading.Event()
@@ -291,6 +294,14 @@ class MailState:
             page["next_page_token"] = self.next_page_token_override_once
             self.next_page_token_override_once = None
         return page
+
+    def hold_lists(self) -> None:
+        """Make list requests block inside the provider until `release_lists`."""
+        self.list_entered.clear()
+        self.list_gate.clear()
+
+    def release_lists(self) -> None:
+        self.list_gate.set()
 
     def hold_replies(self) -> None:
         """Make the next reply block inside the provider until `release_replies`."""
@@ -416,6 +427,9 @@ class MailHandler(_JsonHandler):
             state.list_times.append(time.monotonic())
             state.list_queries.append(query)
             state.list_authorization.append(self.headers.get("Authorization") or "")
+            if not state.list_gate.is_set():
+                state.list_entered.set()
+                state.list_gate.wait()
             if state.drop_next_lists > 0:
                 state.drop_next_lists -= 1
                 # `list_times` was appended above, so this is that call's index.

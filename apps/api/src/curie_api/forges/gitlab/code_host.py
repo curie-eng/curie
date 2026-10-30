@@ -16,6 +16,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from typing import Any
+from urllib.parse import urlencode
 
 from curie_api.forges import types
 from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Operation, Support
@@ -37,6 +38,7 @@ from curie_api.forges.gitlab.transport import (
     encode_segment,
     parse_time,
 )
+from curie_api.forges.retarget import retarget_checked
 from curie_api.forges.types import (
     Actor,
     CiReport,
@@ -72,6 +74,7 @@ _STATES = {
     "locked": PullRequestState.CLOSED,
 }
 # The title prefixes GitLab reads as a draft; the factory writes ``Draft: ``.
+_COMMIT_SHA = re.compile(r"[0-9a-f]{40,64}")
 _DRAFT_PREFIX = re.compile(r"^\s*(?:draft:|\[draft\]|\(draft\))\s*", re.IGNORECASE)
 DRAFT_PREFIX = "Draft: "
 # GitLab can refuse a merge request for a branch pushed a moment ago with a 400
@@ -213,6 +216,23 @@ class GitLabCodeHost:
             parents=tuple(p for p in (parents if isinstance(parents, list) else []) if p),
             message=_text(commit.get("message")),
         )
+
+    async def is_ancestor(self, repository: RepositoryRef, ancestor: str, descendant: str) -> bool:
+        if ancestor == descendant:
+            return True
+        # Compare carries no ahead/behind status, so ask for the merge base. A 404
+        # does not say whether a ref is missing or the commits share no ancestor.
+        query = urlencode([("refs[]", ancestor), ("refs[]", descendant)])
+        try:
+            base = await self._transport.get_object(
+                f"{self._project(repository)}/repository/merge_base?{query}"
+            )
+        except NotFound:
+            raise Unavailable("ancestry_unknown") from None
+        found = base.get("id")
+        if not isinstance(found, str) or _COMMIT_SHA.fullmatch(found) is None:
+            raise Unavailable("malformed")
+        return found == ancestor
 
     # Merge requests ----------------------------------------------------------------
 
@@ -376,6 +396,38 @@ class GitLabCodeHost:
             change["description"] = body
         updated = await self._transport.write("PUT", path, json=change)
         return self._pull(pull_request.repository, updated)
+
+    async def retarget_pull_request(
+        self,
+        pull_request: PullRequestRef,
+        *,
+        base_ref: str,
+        expected_head_sha: str,
+    ) -> PullRequest:
+        repository = pull_request.repository
+        path = self._merge_request(pull_request)
+
+        def parse(payload: Mapping[str, Any]) -> PullRequest:
+            if any(
+                type(payload.get(field)) is not int or str(payload[field]) != repository.project_id
+                for field in ("project_id", "source_project_id", "target_project_id")
+            ):
+                raise Unavailable("pull_request_mismatch")
+            return self._pull(repository, payload)
+
+        async def read() -> PullRequest:
+            return parse(await self._transport.get_object(path))
+
+        async def update() -> PullRequest:
+            return parse(await self._transport.write("PUT", path, json={"target_branch": base_ref}))
+
+        return await retarget_checked(
+            pull_request,
+            base_ref=base_ref,
+            expected_head_sha=expected_head_sha,
+            read=read,
+            update=update,
+        )
 
     async def read_pull_request(self, pull_request: PullRequestRef) -> PullRequest:
         payload = await self._transport.get_object(self._merge_request(pull_request))

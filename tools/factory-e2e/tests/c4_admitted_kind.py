@@ -557,7 +557,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
             "curie",
             "--locked",
             "-j",
-            "2",
+            self.env.get("CARGO_BUILD_JOBS", "2"),
             timeout=1800,
         )
         for name in ("api", "worker", "ui"):
@@ -581,6 +581,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         values = original(**kwargs)
         host = urlsplit(self.stub.base_url).netloc
         factory = values["factory"]
+        factory["baseLabelSettleSeconds"] = 0
         for component in ("api", "worker", "ui"):
             repository, tag = self.images[component].rsplit(":", 1)
             values[component]["image"].update(repository=repository, tag=tag, pullPolicy="Never")

@@ -71,7 +71,7 @@ from curie_api.workitem_outcomes import derive_outcome
 from curie_api.workitems import lifecycle as workitems
 from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
-from forge_fakes import factory_wake
+from forge_fakes import factory_wake, no_external_calls
 from forge_fakes.github import (
     ci_view,
     forges_document,
@@ -299,7 +299,7 @@ def _admit_revision(facts: SimpleNamespace) -> SimpleNamespace:
     return with_session(body)
 
 
-def _start(request_id: uuid.UUID, *, generation: int = 1) -> int:
+def _start(client: TestClient, request_id: uuid.UUID, *, generation: int = 1) -> int:
     async def body(session: AsyncSession) -> int:
         acquired = await acquire(
             session,
@@ -308,6 +308,7 @@ def _start(request_id: uuid.UUID, *, generation: int = 1) -> int:
             generation=generation,
             wake=await factory_wake(session, request_id),
             context=None,
+            client=client.app.state.http_client,
         )
         assert isinstance(acquired, AcquireGrant), acquired
         started = await start(
@@ -383,10 +384,9 @@ def _cancel(work_item_id: uuid.UUID, request_id: uuid.UUID) -> None:
 def _completed(client: TestClient, agent: dict[str, Any], **overrides: Any) -> SimpleNamespace:
     """Admit and start. Completion waits until a pull request is open."""
 
-    del client
     facts = _facts(agent["agent_id"], **overrides)
     seeded = _admit(facts)
-    seeded.runtime_epoch = _start(facts.request_id)
+    seeded.runtime_epoch = _start(client, facts.request_id)
     return seeded
 
 
@@ -551,6 +551,16 @@ async def _first_parent_proof(
             assert sha == publication.base_sha
             return Commit(sha=sha, parents=(), message="Approved base")
 
+        async def is_ancestor(
+            self, repository: RepositoryRef, ancestor: str, descendant: str
+        ) -> bool:
+            assert repository.path == REPO
+            # The graph is base <- (moved parent) <- head; the branch tip is the parent.
+            reachable = {descendant}
+            if descendant in (head_sha, parent):
+                reachable |= {parent, publication.base_sha}
+            return ancestor in reachable
+
     code_host = cast(Any, CodeHostGraph())
     repository = RepositoryRef("github", "github.com", "101", REPO, default_branch="main")
     base_branch = await publication_base_ref(session, code_host, publication, repository)
@@ -626,14 +636,16 @@ def test_capacity_deferral_is_waiting_and_names_capacity(
     seeded = _admit(facts)
 
     async def body(session: AsyncSession) -> None:
-        acquired = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=1,
-            wake=await factory_wake(session, facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            acquired = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert isinstance(acquired, AcquireGrant), acquired
         await defer(
             session,
@@ -696,7 +708,7 @@ def test_started_request_is_running(stack: TestClient, auth_headers: dict[str, s
     agent = _agent(stack, auth_headers)
     facts = _facts(agent["agent_id"])
     seeded = _admit(facts)
-    _start(facts.request_id)
+    _start(stack, facts.request_id)
 
     body = _detail(stack, auth_headers, seeded.work_item_id)
 
@@ -713,7 +725,7 @@ def test_cancel_while_running_is_cancellation_requested_naming_issue_cancelled(
     agent = _agent(stack, auth_headers)
     facts = _facts(agent["agent_id"])
     seeded = _admit(facts)
-    _start(facts.request_id)
+    _start(stack, facts.request_id)
     _cancel(seeded.work_item_id, facts.request_id)
 
     body = _detail(stack, auth_headers, seeded.work_item_id)
@@ -743,7 +755,7 @@ def test_cancelled_after_termination_is_recorded(
     agent = _agent(stack, auth_headers)
     facts = _facts(agent["agent_id"])
     seeded = _admit(facts)
-    _start(facts.request_id)
+    _start(stack, facts.request_id)
     _cancel(seeded.work_item_id, facts.request_id)
 
     async def terminate(session: AsyncSession) -> None:
@@ -770,7 +782,7 @@ def test_failed_names_terminal_cause_and_delivery_budget(
     agent = _agent(stack, auth_headers)
     facts = _facts(agent["agent_id"])
     seeded = _admit(facts)
-    epoch = _start(facts.request_id)
+    epoch = _start(stack, facts.request_id)
     _finish(facts.request_id, epoch, "failed", "deadline_halted")
 
     body = _detail(stack, auth_headers, seeded.work_item_id)
@@ -797,14 +809,16 @@ def test_failed_start_failed_names_the_attempts_and_last_reason(
                 text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
                 {"id": facts.request_id},
             )
-            granted = await acquire(
-                session,
-                facts.request_id,
-                owner=OWNER,
-                generation=generation,
-                wake=await factory_wake(session, facts.request_id),
-                context=None,
-            )
+            async with no_external_calls() as http_client:
+                granted = await acquire(
+                    session,
+                    facts.request_id,
+                    owner=OWNER,
+                    generation=generation,
+                    wake=await factory_wake(session, facts.request_id),
+                    context=None,
+                    client=http_client,
+                )
             assert getattr(granted, "code", None) is None, granted
             deferred = await defer(
                 session,
@@ -842,14 +856,16 @@ def _defer_once(request_id: uuid.UUID, *, reason: str, capacity: bool, detail: s
             text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
             {"id": request_id},
         )
-        granted = await acquire(
-            session,
-            request_id,
-            owner=OWNER,
-            generation=generation,
-            wake=await factory_wake(session, request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            granted = await acquire(
+                session,
+                request_id,
+                owner=OWNER,
+                generation=generation,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=http_client,
+            )
         assert getattr(granted, "code", None) is None, granted
         deferred = await defer(
             session,
@@ -1029,7 +1045,7 @@ def test_running_and_completed_requests_report_no_start_failure(
     waiting = _detail(stack, auth_headers, seeded.work_item_id)
     assert PREVIOUS_START_FAILURE in waiting["actionable_cause"]
 
-    epoch = _start(facts.request_id, generation=_current_generation(facts.request_id))
+    epoch = _start(stack, facts.request_id, generation=_current_generation(facts.request_id))
     running = _detail(stack, auth_headers, seeded.work_item_id)
     assert running["state"] == "running"
     assert "previous start failure" not in running["actionable_cause"]
@@ -1276,7 +1292,7 @@ def test_opened_pr_binds_only_the_publication_request(
     publication = _publish(stack, agent["deployment_id"])
     other_facts = _facts(agent["agent_id"], issue_number=2578)
     other = _admit(other_facts)
-    _start(other_facts.request_id)
+    _start(stack, other_facts.request_id)
     assert _bound_lineage(owner.work_item_id) is None
     assert _bound_lineage(other.work_item_id) is None
 
@@ -1293,7 +1309,7 @@ def test_verified_repository_identity_must_match_work_item_to_bind(
     agent = _agent(stack, auth_headers)
     facts = _facts(agent["agent_id"], repository_id=102)
     seeded = _admit(facts)
-    _start(facts.request_id)
+    _start(stack, facts.request_id)
     publication = _publish(stack, agent["deployment_id"])
     _resolve(stack, auth_headers, publication["approval_id"])
     lease_owner = "outcomes-test-worker"
@@ -1383,7 +1399,7 @@ def test_readmitted_item_running_again_reports_running_and_keeps_the_pr(
     _complete(seeded)
     second = _facts(agent["agent_id"])
     _admit(second)
-    _start(second.request_id)
+    _start(stack, second.request_id)
 
     body = _detail(stack, auth_headers, seeded.work_item_id)
 
@@ -1595,7 +1611,7 @@ def test_linked_lineage_id_is_used_when_set(
     agent = _agent(stack, auth_headers)
     facts = _facts(agent["agent_id"])
     seeded = _admit(facts)
-    epoch = _start(facts.request_id)
+    epoch = _start(stack, facts.request_id)
     publication = _publish(
         stack,
         agent["deployment_id"],
@@ -1634,7 +1650,7 @@ def test_no_runtime_owner_or_secret_material_reaches_list_or_detail(
     agent = _agent(stack, auth_headers)
     running = _facts(agent["agent_id"], issue_number=1)
     running_item = _admit(running)
-    _start(running.request_id)
+    _start(stack, running.request_id)
     published = _completed(stack, agent, issue_number=2, reply_conversation_id="1700000000.000200")
     publication = _publish(stack, agent["deployment_id"], conversation_id="1700000000.000200")
     _execute(
@@ -2046,7 +2062,7 @@ def test_cancel_termination_does_not_leak_the_observer_owner(
     agent = _agent(stack, auth_headers)
     facts = _facts(agent["agent_id"])
     seeded = _admit(facts)
-    _start(facts.request_id)
+    _start(stack, facts.request_id)
     _cancel(seeded.work_item_id, facts.request_id)
     _terminate(facts.request_id)
 
@@ -2059,7 +2075,7 @@ def test_deadline_termination_does_not_leak_the_observer_owner(
     agent = _agent(stack, auth_headers)
     facts = _facts(agent["agent_id"])
     seeded = _admit(facts)
-    _start(facts.request_id)
+    _start(stack, facts.request_id)
 
     async def elapse_deadline() -> None:
         # The deadline is write-once (trigger) and fixed at 1800 s; move it into
@@ -2308,7 +2324,7 @@ def _deadline_90_then_elapse(
     assert patched.status_code == 200, patched.text
     facts = _facts(agent["agent_id"])
     seeded = _admit(facts)
-    _start(facts.request_id)
+    _start(stack, facts.request_id)
 
     async def elapse_deadline() -> None:
         # Keep the configured 90 s span but move it into the past, triggers

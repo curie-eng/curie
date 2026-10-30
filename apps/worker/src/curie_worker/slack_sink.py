@@ -65,7 +65,7 @@ from .blocks import (
     resolved_approval_card,
     to_blocks,
 )
-from .slack_text import split_answer, split_verbatim_answer
+from .slack_text import split_answer, split_verbatim_answer, verbatim_rich_text
 from .slack_tokens import token_identity
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle: reply_sink builds this adapter
@@ -76,6 +76,14 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 _reply_sleep = asyncio.sleep
+
+# Resend budget for a part Slack refused with msg_too_long. The stored form can
+# grow past the bytes sent (`&` stored as `&amp;` is 5 bytes for 1), and 5 x 800 = 4,000.
+_MSG_TOO_LONG_RESEND_BYTES = 800
+# Sent in place of a smaller part Slack also refused, so the reply still completes.
+MSG_TOO_LONG_NOTICE = (
+    "Slack refused part of this reply as too long (msg_too_long), so that part is not shown here."
+)
 
 
 async def _rate_limited_call[T](call: Callable[[], Awaitable[T]], operation: str) -> T:
@@ -121,20 +129,29 @@ def _record_reply_retry(operation: str, retry_class: str) -> None:
     )
 
 
+def _slack_error_code(exc: SlackApiError) -> object | None:
+    """The ``error`` field Slack answered with, or None when it named none."""
+
+    response = getattr(exc, "response", None)
+    if isinstance(response, Mapping):
+        return response.get("error")
+    if response is not None:
+        try:
+            error: object | None = response.get("error")
+        except (AttributeError, TypeError):
+            return None
+        return error
+    return None
+
+
 def _slack_retry_class(exc: SlackApiError) -> str:
     """Classify the one retry this adapter actually performs after rejection."""
 
     response = getattr(exc, "response", None)
     status_code = getattr(response, "status_code", None)
-    error: object | None = None
     if isinstance(response, Mapping):
         status_code = response.get("status_code", status_code)
-        error = response.get("error")
-    elif response is not None:
-        try:
-            error = response.get("error")
-        except (AttributeError, TypeError):
-            pass
+    error = _slack_error_code(exc)
     return (
         "rate-limit"
         if status_code == 429 or error in {"ratelimited", "rate_limited"}
@@ -682,25 +699,73 @@ class SlackReplyAdapter:
         # A wire 1.0 placeholder-less create retains its historical unkeyed
         # behavior. Wire 1.1 uses the event's stable turn delivery identity.
         seed = event.delivery_id or ref
+        posted_any = False
+
+        def create_key(
+            index: int, sub_index: int | None = None, *, notice: bool = False
+        ) -> str | None:
+            if seed is None:
+                return None
+            name = f"curie-answer:{identity}:{target.address}:{seed}:{digest}:{index}"
+            if sub_index is not None:
+                name += f":{sub_index}"
+            if notice:
+                name += ":notice"
+            return str(uuid.uuid5(uuid.NAMESPACE_URL, name))
+
+        async def send(
+            payload: tuple[str, list[dict[str, Any]] | None],
+            *,
+            index: int,
+            key: str | None,
+            slot: bool,
+        ) -> bool:
+            """Edit the placeholder or create one message; False is the best-effort swallow."""
+            nonlocal ref, thread, posted_any
+            if slot and index == 0 and target.reply_ref is not None:
+                await self._update(
+                    channel=target.address,
+                    ts=target.reply_ref,
+                    text="",
+                    payload=payload,
+                    endpoint=endpoint,
+                    identity=identity,
+                    best_effort_unreachable=best_effort_unreachable,
+                    allow_block_fallback=not verbatim,
+                )
+                return True
+            if posted_any:
+                # Slack generally admits one message per second per channel.
+                await _reply_sleep(1.0)
+            posted_any = True
+            posted = await self._post_text(
+                channel=target.address,
+                thread_ts=thread,
+                text="",
+                payload=payload,
+                endpoint=endpoint,
+                identity=identity,
+                best_effort_unreachable=best_effort_unreachable,
+                client_msg_id=key,
+                allow_block_fallback=not verbatim,
+            )
+            if posted is None:
+                return False
+            if slot and index == 0:
+                ref = posted
+                if thread is None:
+                    thread = posted
+            return True
+
+        def text_payload(text: str) -> tuple[str, list[dict[str, Any]] | None]:
+            return (text, [verbatim_rich_text(text)]) if verbatim else (text, None)
+
         for index, part in enumerate(parts):
             payload = (part.text, blocks if len(parts) == 1 else None)
             if verbatim:
-                # A plain_text section shows line breaks as spaces in the client;
-                # preformatted rich text shows every character and line break.
-                payload = (
-                    part.content,
-                    [
-                        {
-                            "type": "rich_text",
-                            "elements": [
-                                {
-                                    "type": "rich_text_preformatted",
-                                    "elements": [{"type": "text", "text": part.content}],
-                                }
-                            ],
-                        }
-                    ],
-                )
+                # ADR 0250: an ordinary rich text section keeps every character
+                # and line break without drawing the answer as a code box.
+                payload = (part.content, [verbatim_rich_text(part.content)])
             if structured is not None and len(parts) > 1:
                 last = index == len(parts) - 1
                 payload = (
@@ -720,52 +785,61 @@ class SlackReplyAdapter:
                         _nav_pack(event.nav) if last else None,
                     ),
                 )
-            if index == 0 and ref is not None:
-                await self._update(
-                    channel=target.address,
-                    ts=ref,
-                    text="",
-                    payload=payload,
-                    endpoint=endpoint,
-                    identity=identity,
-                    best_effort_unreachable=best_effort_unreachable,
-                    allow_block_fallback=not verbatim,
-                )
+            key = event.delivery_id if index == 0 else create_key(index)
+            try:
+                if not await send(payload, index=index, key=key, slot=True):
+                    return ref  # The existing approval-resume best-effort exception.
                 continue
-            key = (
-                event.delivery_id
-                if index == 0
-                else (
-                    str(
-                        uuid.uuid5(
-                            uuid.NAMESPACE_URL,
-                            f"curie-answer:{identity}:{target.address}:{seed}:{digest}:{index}",
-                        )
-                    )
-                    if seed is not None
-                    else None
+            except SlackApiError as exc:
+                if _slack_error_code(exc) != "msg_too_long":
+                    raise
+            # Slack documents msg_too_long for both chat.update and
+            # chat.postMessage. Resend this part losslessly as smaller parts:
+            # the first keeps the refused part's slot, the rest are keyed creates.
+            smaller = (
+                split_verbatim_answer(part.content, max_bytes=_MSG_TOO_LONG_RESEND_BYTES)
+                if verbatim
+                else split_answer(part.text, max_bytes=_MSG_TOO_LONG_RESEND_BYTES)
+            )
+            placeholder_update = index == 0 and target.reply_ref is not None
+            for sub_index, sub in enumerate(smaller):
+                # Every smaller post, piece 0 included, gets its own key. Slack
+                # dedupes chat.postMessage on client_msg_id and answers ok with the
+                # first message's ts even when the text differs, so reusing the
+                # refused part's key would let a retry's full-part post dedupe onto
+                # an already accepted piece 0 and skip the remaining pieces.
+                sub_key = (
+                    key if placeholder_update and sub_index == 0 else create_key(index, sub_index)
                 )
-            )
-            if index > 1 or (index == 1 and target.reply_ref is None):
-                # Slack generally admits one message per second per channel.
-                await _reply_sleep(1.0)
-            posted = await self._post_text(
-                channel=target.address,
-                thread_ts=thread,
-                text="",
-                payload=payload,
-                endpoint=endpoint,
-                identity=identity,
-                best_effort_unreachable=best_effort_unreachable,
-                client_msg_id=key,
-                allow_block_fallback=not verbatim,
-            )
-            if posted is None:
-                return ref  # The existing approval-resume best-effort exception.
-            if index == 0:
-                ref = posted
-                if thread is None:
-                    thread = posted
+                sub_slot = sub_index == 0
+                try:
+                    delivered = await send(
+                        text_payload(sub.content if verbatim else sub.text),
+                        index=index,
+                        key=sub_key,
+                        slot=sub_slot,
+                    )
+                except SlackApiError as exc:
+                    if _slack_error_code(exc) != "msg_too_long":
+                        raise
+                    logger.warning(
+                        "Slack refused a smaller part of answer part %d as msg_too_long "
+                        "for delivery %s; sending a notice in its place",
+                        index,
+                        event.delivery_id,
+                    )
+                    if not await send(
+                        text_payload(MSG_TOO_LONG_NOTICE),
+                        index=index,
+                        # Own key: on retry the piece is refused again and its post
+                        # must not dedupe onto a stored notice and look delivered.
+                        key=create_key(index, sub_index, notice=True),
+                        slot=sub_slot,
+                    ):
+                        return ref
+                    break
+                if not delivered:
+                    return ref
         return ref
 
     async def _update(

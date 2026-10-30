@@ -75,6 +75,7 @@ worker:
   CURIE_RUNNER_IMAGE: agentSandbox.runner.image
   CURIE_RUNNER_PORT: agentSandbox.runner.port
   CURIE_RUNNER_TOTAL_TIMEOUT_S: worker.runnerTotalTimeoutSeconds
+  CURIE_SANDBOX_ADMISSION: resourceQuota
   CURIE_SEALING_PREVIOUS_PRIVATE_KEY: sealing.previousPrivateKeyExistingSecret
   CURIE_SEALING_PRIVATE_KEY: sealing.privateKeyExistingSecret
   CURIE_SHIMMER: worker.shimmer
@@ -99,6 +100,7 @@ worker:
   CURIE_WORKSPACE_MAX_COMPRESSION_RATIO: worker.workspace.maxCompressionRatio
   CURIE_WORKSPACE_MAX_CONCURRENT_CLONES: worker.workspace.maxConcurrentClones
   CURIE_WORKSPACE_MAX_MEMBERS: worker.workspace.maxMembers
+  CURIE_WORKSPACE_RECOVERY_ENABLED: worker.workspace.recovery.enabled
   CURIE_WORKSPACE_REFERENCE_TTL_SECONDS: worker.workspace.referenceTtlSeconds
   CURIE_WORKSPACE_SCRATCH_ROOT: worker.workspace.mountPath
   CURIE_WORKSPACE_TOTAL_TIMEOUT_SECONDS: worker.workspace.totalTimeoutSeconds
@@ -155,6 +157,7 @@ api:
   CURIE_E2E_SOURCE_HOSTS: e2eConnector.sourceHosts
   CURIE_E2E_TTL_SECONDS: e2eConnector.ttlSeconds
   CURIE_E2E_WORKER_CLUSTER_ROLE: e2eConnector.workerClusterRole
+  CURIE_FACTORY_PUBLICATION_LABELS: api.factoryPublicationLabels
   CURIE_FORGES: factory.codeHosts / factory.trackers / factory.bindings
   CURIE_HTTP_IDENTITY_DIR: api.httpIdentity.existingSecret
   CURIE_INSTALLATION_ID: the release-managed installation identity (remove this override)
@@ -163,6 +166,9 @@ api:
   CURIE_PUBLICATION_RETENTION_SECONDS: worker.publication.retentionSeconds
   CURIE_REMEDIATION_AUTHORITY_KEY: api.remediationAuthorityKey
   CURIE_REMEDIATION_ENABLED: remediation.enabled
+  CURIE_WORKSPACE_MAX_ARCHIVE_BYTES: worker.workspace.maxArchiveBytes
+  CURIE_WORKSPACE_RECOVERY_ENABLED: worker.workspace.recovery.enabled
+  CURIE_WORKSPACE_RECOVERY_MAX_BYTES: worker.workspace.recovery.maxBytes
   CURIE_SANDBOX_QUOTA_LIMITS_CPU: resourceQuota.hard.limitsCpu
   CURIE_SANDBOX_QUOTA_LIMITS_MEMORY: resourceQuota.hard.limitsMemory
   CURIE_SANDBOX_QUOTA_REQUESTS_CPU: resourceQuota.hard.requestsCpu
@@ -176,6 +182,7 @@ api:
   FACTORY_CI_WAIT_S: factory.ciWaitSeconds
   FACTORY_ENABLED: factory.enabled
   FACTORY_INTAKE: factory.intake
+  FACTORY_BASE_LABEL_SETTLE_S: factory.baseLabelSettleSeconds
   GITHUB_API_URL: api.githubApiUrl
   GITHUB_APP_ID: api.githubAppId
   GITHUB_APP_PRIVATE_KEY: api.githubAppExistingSecret

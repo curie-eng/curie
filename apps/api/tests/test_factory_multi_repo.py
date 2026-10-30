@@ -125,13 +125,16 @@ class _Forge:
         self.seen.append(path)
         for repo, fake in self.fakes.items():
             root = f"/repos/{repo}"
-            if path != root and not path.startswith(f"{root}/"):
+            by_id = path == f"/repositories/{_REPO_IDS[repo]}"
+            if not by_id and path != root and not path.startswith(f"{root}/"):
                 continue
             if repo == REPO:
                 return fake.handle(request)
             inner = httpx.Request(
                 request.method,
-                request.url.copy_with(path=f"/repos/{REPO}{path[len(root) :]}"),
+                request.url.copy_with(
+                    path=f"/repos/{REPO}" if by_id else f"/repos/{REPO}{path[len(root) :]}"
+                ),
                 headers=request.headers,
                 content=request.content,
             )
@@ -533,7 +536,7 @@ def test_multi_repo_review_feedback_routes_for_each_repository(
         pr = next(_PULL_NUMBERS)
         fake.open_pull(pr)
         _own_pull_request_in(repo, first["work_item_id"], pr)
-        _complete(first["id"])
+        _complete(client, first["id"])
         payload, fid = _feedback_event(fake, event, pr, _mention())
 
         response = _post(client, event, _rename(payload, repo))

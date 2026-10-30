@@ -3494,6 +3494,61 @@
         "title": "BehaviorPacksConfig",
         "type": "object"
       },
+      "BindingClassificationRequestV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-INVOCATION-EXECUTION-22.",
+        "properties": {
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/TurnAuthorityScopeV1"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "scope"
+        ],
+        "title": "BindingClassificationRequestV1",
+        "type": "object"
+      },
+      "BindingClassificationResponseV1": {
+        "additionalProperties": false,
+        "description": "Classification, not permission. @spec HTTP-INVOCATION-EXECUTION-22.",
+        "properties": {
+          "http_identity_required": {
+            "title": "Http Identity Required",
+            "type": "boolean"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/TurnAuthorityScopeV1"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "scope",
+          "http_identity_required"
+        ],
+        "title": "BindingClassificationResponseV1",
+        "type": "object"
+      },
       "Body_confirm_connection_identity_connect__token__confirm_post": {
         "properties": {
           "csrf": {
@@ -10666,6 +10721,64 @@
         "title": "RecoveryAcquireReader",
         "type": "object"
       },
+      "RecoveryCaptureAuthority": {
+        "additionalProperties": false,
+        "properties": {
+          "dispatch_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Dispatch Generation",
+            "type": "integer"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "source_request_id": {
+            "format": "uuid",
+            "title": "Source Request Id",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "source_request_id",
+          "runtime_epoch",
+          "dispatch_generation"
+        ],
+        "title": "RecoveryCaptureAuthority",
+        "type": "object"
+      },
+      "RecoveryCaptureContext": {
+        "additionalProperties": false,
+        "properties": {
+          "base_commit": {
+            "title": "Base Commit",
+            "type": "string"
+          },
+          "repository": {
+            "$ref": "#/components/schemas/RecoveryRepository"
+          },
+          "target_branch": {
+            "title": "Target Branch",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "base_commit",
+          "target_branch"
+        ],
+        "title": "RecoveryCaptureContext",
+        "type": "object"
+      },
       "RecoveryCaptureFailure": {
         "additionalProperties": false,
         "properties": {
@@ -10675,8 +10788,11 @@
             "type": "string"
           },
           "status": {
-            "const": "tombstoned",
             "default": "tombstoned",
+            "enum": [
+              "tombstoned",
+              "retracted"
+            ],
             "title": "Status",
             "type": "string"
           }
@@ -10874,6 +10990,11 @@
             "title": "Reason",
             "type": "string"
           },
+          "retract": {
+            "default": false,
+            "title": "Retract",
+            "type": "boolean"
+          },
           "runtime_epoch": {
             "maximum": 9.223372036854776e+18,
             "minimum": 1.0,
@@ -11019,6 +11140,69 @@
           "key"
         ],
         "title": "RecoveryObjectReceipt",
+        "type": "object"
+      },
+      "RecoveryOutcome": {
+        "additionalProperties": false,
+        "properties": {
+          "dispatch_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Dispatch Generation",
+            "type": "integer"
+          },
+          "reason": {
+            "enum": [
+              "torn_capture",
+              "capture_timeout",
+              "capture_failed",
+              "runner_unavailable",
+              "patch_too_large",
+              "manifest_too_large",
+              "base_mismatch"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "source_request_id": {
+            "format": "uuid",
+            "title": "Source Request Id",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "source_request_id",
+          "runtime_epoch",
+          "dispatch_generation",
+          "reason"
+        ],
+        "title": "RecoveryOutcome",
+        "type": "object"
+      },
+      "RecoveryOutcomeRecorded": {
+        "additionalProperties": false,
+        "properties": {
+          "recorded": {
+            "title": "Recorded",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "recorded"
+        ],
+        "title": "RecoveryOutcomeRecorded",
         "type": "object"
       },
       "RecoveryPublicCheckpoint": {
@@ -11355,6 +11539,10 @@
             "title": "Objects",
             "type": "array"
           },
+          "replayed": {
+            "title": "Replayed",
+            "type": "boolean"
+          },
           "staging_expires_at": {
             "format": "date-time",
             "title": "Staging Expires At",
@@ -11365,7 +11553,8 @@
           "checkpoint_id",
           "objects",
           "capture_deadline",
-          "staging_expires_at"
+          "staging_expires_at",
+          "replayed"
         ],
         "title": "RecoveryReservation",
         "type": "object"
@@ -11383,6 +11572,13 @@
             "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
             "title": "Base Commit",
             "type": "string"
+          },
+          "capture_budget_seconds": {
+            "default": 60.0,
+            "exclusiveMinimum": 0.0,
+            "maximum": 60.0,
+            "title": "Capture Budget Seconds",
+            "type": "number"
           },
           "dispatch_generation": {
             "maximum": 9.223372036854776e+18,
@@ -29355,6 +29551,66 @@
         ]
       }
     },
+    "/v1/internal/identity/binding-classification/check": {
+      "post": {
+        "description": "The worker's per-identity question. Writes and grants nothing.\n\n@spec HTTP-INVOCATION-EXECUTION-22.",
+        "operationId": "check_binding_classification_v1_internal_identity_binding_classification_check_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BindingClassificationRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BindingClassificationResponseV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check Binding Classification",
+        "tags": [
+          "internal-identity-authority"
+        ]
+      }
+    },
     "/v1/internal/identity/turn-authority/check": {
       "post": {
         "description": "@spec HTTP-INVOCATION-EXECUTION-8/16.",
@@ -31744,6 +32000,65 @@
         ]
       }
     },
+    "/v1/internal/workspace-recovery/context": {
+      "post": {
+        "operationId": "context_v1_internal_workspace_recovery_context_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryCaptureAuthority"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryCaptureContext"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Context",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
     "/v1/internal/workspace-recovery/fail": {
       "post": {
         "operationId": "fail_v1_internal_workspace_recovery_fail_post",
@@ -31857,6 +32172,65 @@
           }
         },
         "summary": "Finalize Collection",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
+    "/v1/internal/workspace-recovery/outcome": {
+      "post": {
+        "operationId": "outcome_v1_internal_workspace_recovery_outcome_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryOutcome"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryOutcomeRecorded"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Outcome",
         "tags": [
           "internal-workspace-recovery"
         ]

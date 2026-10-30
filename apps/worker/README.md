@@ -1093,9 +1093,29 @@ substrate.reap_orphans()              # periodic tick: claims with no live route
 
 Contract notes the kernel must know:
 
-Quota pressure reclamation runs only after a real ResourceQuota refusal and
-only when the remaining delivery budget is at least 70 seconds plus
-`claim_timeout_seconds`. A lower budget skips the scan. An interactive Slack
+With sandbox quotas enabled, the chart supplies `CURIE_SANDBOX_ADMISSION` with
+the quota name, sandbox PriorityClass, computed ceiling and complete resource
+hard map. Before a fresh claim can mint credentials or create a SandboxClaim,
+the substrate atomically reserves its selected Pod footprint in a shared
+Valkey ledger for its namespace and quota. Every admission accounts for occupied
+claims, unmatched chargeable Pods and outstanding reservations across Pod count,
+CPU and memory requests and limits, including init containers and RuntimeClass
+overhead. The nominal ceiling uses the chart's existing capacity calculation;
+the actual resource vector determines admission. An enabled zero ceiling refuses
+claims. Disabling the quota omits the admission contract.
+
+Reservations survive worker restart and remain charged through uncertain
+creation or deletion. Route expiry and reservation age do not free capacity.
+Reconciliation releases a reservation only after fresh inventory confirms its
+claim, all owned Sandboxes and all owned chargeable Pods are absent. A suspended
+Sandbox occupies zero only after its Pods are confirmed gone. Inventory or
+configured quota read failures fail closed, and an underreported quota usage
+cannot authorize a reservation beyond the shared budget.
+
+Capacity pressure reclamation runs after a real ResourceQuota refusal or a
+typed refusal from shared admission, and only when the remaining delivery budget
+is at least 70 seconds plus `claim_timeout_seconds`. A lower budget skips the
+scan. An interactive Slack
 turn waits durably for capacity under its original event identity, with a
 fixed deadline set by `CURIE_CAPACITY_WAIT_BUDGET_S` (24 hours by default).
 The worker acknowledges a parked stream delivery, then wakes the turn through
@@ -1107,7 +1127,7 @@ grant outcome is not unknown. A failed notice stays queued for another try.
 A confirmed or unknown grant keeps the existing notice retry. Waiting does not use a runner attempt or
 hold a conversation lock. Its placeholder says queued while waiting and
 receives an expiry message if the deadline passes. An approval resume does not
-wait. It runs the same reclamation pass after its own quota refusal, and when
+wait. It runs the same reclamation pass after its own capacity refusal, and when
 the pass frees nothing, or the one retry after it is refused again, the attempt
 fails under `sandbox-capacity` instead (#3693, #3700). The failure retries, and
 each retry that is refused again may run the pass once more, so a resume that
@@ -1118,23 +1138,28 @@ earlier attempt's confirmed pod termination is carried onto that notice. Other t
 retain their capacity response. Operators can inspect the persisted wait state and
 `curie.capacity.wait` metrics for waiting, active, and expired turns.
 
-The rejection retains every exceeded resource and its requested, used, and
-hard quantity. Before scanning, the worker validates the complete map with
+Quota rejection evidence retains every exceeded resource and its requested,
+used, and hard quantity. Admission evidence identifies the shared resource
+budget and refused footprint without presenting computed usage as a Kubernetes
+quota rejection. Before scanning, the worker validates the complete map with
 Kubernetes quantity semantics, including CPU DecimalSI, memory BinarySI, pod
 counts, and combined rejections. Invalid or incomplete evidence skips
 pressure reclamation with `outcome=refused-invalid-quota` and performs no
 pressure Redis call or deletion.
 
-After one exact idle route is detached and deleted, the worker polls the exact
-named ResourceQuota in its configured namespace within the existing 20 second
-cleanup window. It retries only when live spec and status hard limits agree and
-every rejected resource has enough current headroom. A transient claim or
-sandbox disappearance read supplies no observation and is polled again within
-that same window. Both resources must be confirmed absent before quota
-headroom can authorize the retry. The worker Role grants
-only namespaced `get` on core `resourcequotas`. A missing permission, malformed
-quantity, mismatched spec and status limits, or timeout fails closed. The
-rejected claim or another quota can consume the freed capacity before the full
+After one exact idle route is detached and deleted, the worker polls within the
+existing 20 second cleanup window until the victim's claim, all owned Sandboxes
+and all owned chargeable Pods are absent and its reservation is released. It
+then verifies shared admission headroom and the exact named ResourceQuota in
+its configured namespace. It retries only when live spec and status hard limits
+agree and every refused resource has enough current headroom. A transient
+inventory read supplies no observation and is polled again within that same
+window. With sandbox quotas enabled, a dedicated namespaced `worker-admission`
+Role grants only `list` on Sandboxes and Pods. The main worker Role retains
+`get` on core `resourcequotas`. A separate cluster grant permits only `get` on
+the selected RuntimeClass when required for overhead. A missing permission,
+malformed quantity, mismatched spec and status limits, or timeout fails closed.
+The rejected claim or another quota can consume the freed capacity before the full
 retry. That bounded race records `reclaimed-retry-refused`; it does not delete
 another victim or schedule work.
 
@@ -1228,7 +1253,8 @@ Recovery is off by default; enabling `CURIE_WORKSPACE_RECOVERY_ENABLED` on the
 API requires a positive installation cap in `CURIE_WORKSPACE_RECOVERY_MAX_BYTES`.
 The API and worker must share the `CURIE_WORKSPACE_MAX_ARCHIVE_BYTES` base ceiling.
 `reserve`, `complete` and `fail` manage bounded checkpoint metadata; reservations
-have a 60-second completion deadline and 600-second staging lifetime.
+have a completion deadline of at most 60 seconds (the capture's remaining budget)
+and a 600-second staging lifetime.
 `acquire-reader` and `release-reader` manage at most eight readers per WorkItem,
 each bounded to 300 seconds. Two-phase metadata collection uses `claim-collection`
 to fence eligible objects against readers, then `finalize-collection` after deletion.
@@ -1250,8 +1276,29 @@ on the worker and the internal worker token is present, the worker supervises th
 `CURIE_WORKSPACE_RECOVERY_COLLECT_INTERVAL_S` seconds (default 30): it claims
 eligible objects, deletes them outside any lock, and finalizes each claim, so a
 collector interrupted between deletion and finalization repeats both after
-restart. Logs carry ids, kinds, sizes and typed codes only. Capture call sites in
-the run path and restoration are not wired yet.
+restart. Logs carry ids, kinds, sizes and typed codes only.
+
+Capture is wired on ordinary failure (#5143). A run whose failed finish is known
+to have committed is marked recovery eligible; cancellation, execution deadline,
+termination, owner loss and a `work_item_cancelled` finish refusal never are, and
+keep the plain release. Before releasing an eligible run's claim, the kernel holds
+a renewable lease on the thread lock and, only while the thread's route still
+names the run's claim, `curie_worker.workspace_recovery_capture.WorkspaceRecoveryCapture`
+reads the WorkItem's repository and base through the ledger's `context`
+operation, asks the runner's `POST /v1/checkpoint` for a patch and manifest against
+the claim's trusted base, and writes the checkpoint. One 60-second aggregate
+deadline covers all of it, and `reserve` carries the budget still left, so the
+ledger's completion deadline never outlives it. A capture that ends before any
+reservation (torn capture, oversized patch or manifest, runner unavailable,
+timeout, base mismatch) records its reason through the `outcome` operation within
+the five-second cleanup allowance. The lease is checked before every completion
+attempt and once after it commits; a lease lost first tombstones the staging, and
+a lease lost after commit retracts the just-completed checkpoint back to the
+previous one, leaving its objects to the collector. When the lease is lost before
+the release, the lock is reacquired and the plain release runs with the recorded
+claim. A capture failure never changes the WorkItem's terminal outcome. Enabling
+recovery on the worker requires `CURIE_INTERNAL_WORKER_TOKEN` and
+`CURIE_WORKSPACE_ENABLED`. Restoration is not wired yet.
 
 ### Retained thread attachments
 

@@ -356,8 +356,8 @@ def _own_pull_request(
     return asyncio.run(go())
 
 
-def _complete(request_id: uuid.UUID) -> None:
-    _mark_running(request_id)
+def _complete(client: TestClient, request_id: uuid.UUID) -> None:
+    _mark_running(client, request_id)
     _execute(
         "UPDATE curie.execution_requests SET status = 'completed', "
         "terminal_at = clock_timestamp(), terminal_cause = 'completed', "
@@ -393,7 +393,7 @@ def _owned(client: TestClient, api: ReviewGitHubAPI) -> tuple[int, int, dict[str
     pr = next(_PULLS)
     api.open_pull(pr)
     _own_pull_request(first["work_item_id"], pr)
-    _complete(first["id"])
+    _complete(client, first["id"])
     return number, pr, first
 
 
@@ -665,7 +665,7 @@ def test_closed_lineage_is_refused(factory: tuple[TestClient, ReviewGitHubAPI]) 
     pr = next(_PULLS)
     api.open_pull(pr)
     _own_pull_request(first["work_item_id"], pr, lineage_status="closed")
-    _complete(first["id"])
+    _complete(client, first["id"])
     payload, _ = _feedback_event(api, "issue_comment", pr, _mention())
     _refused(client, number, "issue_comment", payload, "lineage_closed")
 
@@ -734,7 +734,7 @@ def test_review_mention_during_live_run_waits_then_becomes_next_request(
     pr = next(_PULLS)
     api.open_pull(pr)
     _own_pull_request(first["work_item_id"], pr)
-    _mark_running(first["id"])
+    _mark_running(client, first["id"])
     payload, fid = _feedback_event(api, event, pr, _mention())
     delivery = str(uuid.uuid4())
 
@@ -791,7 +791,7 @@ def test_distinct_review_mentions_wait_in_order_until_each_live_run_ends(
     pr = next(_PULLS)
     api.open_pull(pr)
     _own_pull_request(first["work_item_id"], pr)
-    _mark_running(first["id"])
+    _mark_running(client, first["id"])
     first_payload, first_fid = _feedback_event(
         api, "issue_comment", pr, f"@{MENTION} please change the first helper"
     )
@@ -823,7 +823,7 @@ def test_distinct_review_mentions_wait_in_order_until_each_live_run_ends(
     assert [row["status"] for row in rows] == ["completed", "waiting", "queued"]
     assert [row["id"] for row in rows[1:]] == [first_revision_id, second_revision_id]
 
-    _mark_running(first_revision_id)
+    _mark_running(client, first_revision_id)
     _reconcile_queued_revisions(monkeypatch)
     assert [row["status"] for row in _requests(number)] == ["completed", "running", "queued"]
     _execute(
@@ -848,7 +848,7 @@ def test_review_admission_survives_work_item_version_change_during_verification(
     pr = next(_PULLS)
     api.open_pull(pr)
     _own_pull_request(first["work_item_id"], pr)
-    _mark_running(first["id"])
+    _mark_running(client, first["id"])
     payload, fid = _feedback_event(api, "issue_comment", pr, _mention())
     verify = github_factory_review.verify_feedback_truth
     bumped = False
@@ -908,7 +908,7 @@ def test_unlabel_cancels_queued_review_revision_before_it_can_run(
     pr = next(_PULLS)
     api.open_pull(pr)
     _own_pull_request(first["work_item_id"], pr)
-    _mark_running(first["id"])
+    _mark_running(client, first["id"])
     payload, _ = _feedback_event(api, "issue_comment", pr, _mention())
     queued = _post(client, "issue_comment", payload)
     assert queued.json()["status"] == "factory_queued", queued.text
@@ -936,7 +936,7 @@ def test_closed_lineage_cancels_queued_review_revision_after_live_run_ends(
     pr = next(_PULLS)
     api.open_pull(pr)
     lineage_id = _own_pull_request(first["work_item_id"], pr)
-    _mark_running(first["id"])
+    _mark_running(client, first["id"])
     payload, _ = _feedback_event(api, "pull_request_review_comment", pr, _mention())
     queued = _post(client, "pull_request_review_comment", payload)
     assert queued.json()["status"] == "factory_queued", queued.text

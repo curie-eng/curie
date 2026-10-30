@@ -102,6 +102,7 @@ from .sandbox import (
     SubstrateConfig,
     SuspendedThreadError,
 )
+from .sandbox.quota import parse_admission_config
 from .schema_startup import assert_worker_schema
 from .sibling_turns import build_sibling_limit
 from .slack_tokens import slack_bot_tokens
@@ -121,7 +122,9 @@ from .workspace import (
     WorkspacePreparer,
 )
 from .workspace_recovery import WorkspaceRecoveryClient
+from .workspace_recovery_capture import WorkspaceRecoveryCapture
 from .workspace_recovery_storage import (
+    RecoveryCheckpointWriter,
     RecoveryCollector,
     RecoveryObjectStore,
     build_recovery_s3_client,
@@ -277,6 +280,9 @@ def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
     # authoritative default lives in SubstrateConfig. Keep any override below the
     # per-thread lock TTL (WorkerConfig.lock_ttl_ms) -- see that comment.
     overrides: dict[str, Any] = {}
+    admission = parse_admission_config(env.get("CURIE_SANDBOX_ADMISSION"))
+    if admission is not None and env.get("CURIE_SANDBOX_SUBSTRATE") == "docker":
+        raise ValueError("Docker substrate cannot use Kubernetes quota admission")
     claim_timeout = _bounded_seconds(env, "CURIE_CLAIM_TIMEOUT_SECONDS", float)
     if claim_timeout is not None:
         overrides["claim_timeout_seconds"] = claim_timeout
@@ -296,6 +302,7 @@ def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
     return SubstrateConfig(
         namespace=env.get("CURIE_NAMESPACE", "default"),
         warm_pool=env.get("CURIE_WARM_POOL", "curie-runner-pool"),
+        admission=admission,
         agent_pools=_agent_names(env, "CURIE_AGENT_SANDBOX_POOLS"),
         connector_secret_pools=_agent_names(env, "CURIE_AGENT_CONNECTOR_SECRET_POOLS"),
         # ADR 0216: malformed input fails worker startup rather than routing a
@@ -533,7 +540,6 @@ def build(
         snapshot_patch_max_bytes=config.publication_patch_max_bytes,
     )
     owner.register_close("runner", runner.close, order=10)
-    binding = BindingResolver(engine, config)
     workspace_s3 = build_s3_client(
         endpoint_url=config.s3_endpoint_url,
         access_key=config.s3_access_key,
@@ -604,7 +610,18 @@ def build(
     # eval-lane reporters below; httpx.AsyncClient is task-safe.
     eval_http = httpx.AsyncClient(timeout=30.0)
     owner.register_close("eval-http", eval_http.aclose, order=30)
+    # @spec HTTP-INVOCATION-EXECUTION-18/22: one client answers the kernel's
+    # current checks and the binding owner's per-identity classification.
+    identity_authority = (
+        HttpTurnAuthorityClient(
+            api_base_url=config.api_base_url, worker_token=config.internal_worker_token,
+            client=eval_http,
+        )
+        if config.internal_worker_token else None
+    )
+    binding = BindingResolver(engine, config, identity_classifier=identity_authority)
     recovery_gc: RecoveryCollector | None = None
+    recovery_capture: WorkspaceRecoveryCapture | None = None
     if config.workspace_recovery_enabled and config.internal_worker_token:
         recovery_s3 = build_recovery_s3_client(
             endpoint_url=config.s3_endpoint_url,
@@ -615,15 +632,31 @@ def build(
         owner.register_close(
             "workspace-recovery-s3", lambda: _close_sync(recovery_s3.close), order=70
         )
+        recovery_ledger = WorkspaceRecoveryClient(
+            api_base_url=config.api_base_url,
+            worker_token=config.internal_worker_token,
+            client=eval_http,
+        )
+        recovery_store = RecoveryObjectStore(client=recovery_s3, bucket=config.workspace_bucket)
         recovery_gc = RecoveryCollector(
-            ledger=WorkspaceRecoveryClient(
-                api_base_url=config.api_base_url,
-                worker_token=config.internal_worker_token,
-                client=eval_http,
-            ),
-            store=RecoveryObjectStore(client=recovery_s3, bucket=config.workspace_bucket),
+            ledger=recovery_ledger,
+            store=recovery_store,
             collector_id=config.consumer_name,
         )
+        # The terminal capture (#5143). The config refuses recovery without
+        # managed workspaces, so the coordinator is always built here.
+        if workspace is not None:
+            recovery_capture = WorkspaceRecoveryCapture(
+                ledger=recovery_ledger,
+                writer=RecoveryCheckpointWriter(
+                    ledger=recovery_ledger,
+                    store=recovery_store,
+                    scratch_root=Path(config.workspace_scratch_root) / "recovery",
+                    base_archive_limit_bytes=config.workspace_max_archive_bytes,
+                ),
+                runner=runner,
+                coordinator=workspace,
+            )
     attachment_access_client = None
     broker_server = None
     if config.attachment_enabled and config.attachment_mode == "lazy":
@@ -731,14 +764,9 @@ def build(
         markers=Markers(async_redis, config),
         config=config,
         binding=binding,
-        identity_authority=(
-            HttpTurnAuthorityClient(
-                api_base_url=config.api_base_url, worker_token=config.internal_worker_token,
-                client=eval_http,
-            )
-            if config.internal_worker_token else None
-        ),
+        identity_authority=identity_authority,
         workspace=workspace,
+        recovery=recovery_capture,
         attachments=attachments,
         attachment_access=attachment_access_client,
         # ADR 0205: the thread attachment ledger, behind the internal worker

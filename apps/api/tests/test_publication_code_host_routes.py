@@ -10,18 +10,25 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import time
+import json
+import logging
+import re
+import socket
 import uuid
+from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
+import redis
+import redis.asyncio as async_redis
 from curie_api.config import get_settings
 from curie_api.factory_rediscovery import issue_marker
-from curie_api.forges.config import ForgesConfig
 from curie_api.forges.errors import Ambiguous, NotFound, Unavailable
-from curie_api.forges.registry import build_registry
+from curie_api.forges.registry import forges_registry
 from curie_api.forges.types import (
     Commit,
     FactoryPublication,
@@ -32,8 +39,16 @@ from curie_api.forges.types import (
 )
 from curie_api.models import ExecutionRequest, Publication, WorkItem
 from curie_api.routers import publication_code_host
+from curie_test_support.valkey import NO_RETRY
 from fastapi.testclient import TestClient
-from forge_fakes.github import forges_document
+from forge_fakes.github import (
+    GitHubAPI,
+    _Credentials,
+    fake_installation_tokens,
+    forges_document,
+    forges_env_json,
+    github_repository_binding,
+)
 from sqlalchemy import select, text
 
 from apps.api.tests.test_workitem_outcomes import (  # noqa: F401 - the stack fixture
@@ -65,6 +80,7 @@ ROUTES = (
     ("POST", "pull-request/metadata", None),
 )
 UPDATED_AT = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+_COMMIT_SHA = re.compile(r"[0-9a-f]{40,64}")
 
 
 class _CodeHost:
@@ -74,13 +90,19 @@ class _CodeHost:
         self.head: str | None = HEAD_SHA
         self.existing: PullRequest | None = None
         self.opened: list[dict[str, Any]] = []
+        self.label_calls: list[tuple[PullRequestRef, list[str]]] = []
+        self.label_fail: Exception | None = None
         self.calls: list[str] = []
         self.publications: tuple[FactoryPublication, ...] = ()
         self.commit = Commit(sha=HEAD_SHA, parents=("0" * 40,), message="unmarked")
         self.commits: dict[str, Commit] = {}
         self.base_head: str | None = BASE_SHA
         self.default_branch = "main"
+        self.kind = "github"
+        self.host = "github.com"
         self.reads: list[str] = []
+        self.ancestry_calls: list[tuple[str, str]] = []
+        self.ancestry_fail: Exception | None = None
         self.branch_reads: list[str] = []
         self.read_delay = 0.0
         self.on_read: Any = None
@@ -121,6 +143,13 @@ class _CodeHost:
             pull_request.repository, title=self.title, body=self.body, updated_at=UPDATED_AT
         )
 
+    async def add_pull_request_labels(
+        self, pull_request: PullRequestRef, labels: list[str]
+    ) -> None:
+        self.label_calls.append((pull_request, list(labels)))
+        if self.label_fail is not None:
+            raise self.label_fail
+
     async def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:
         self.calls.append("branch_head")
         self._maybe_fail()
@@ -139,10 +168,36 @@ class _CodeHost:
             raise NotFound("commit_not_found")
         return self.commits[sha]
 
+    async def is_ancestor(self, repository: RepositoryRef, ancestor: str, descendant: str) -> bool:
+        # One forge call, like a compare or merge-base request, answered from the whole graph.
+        self.ancestry_calls.append((ancestor, descendant))
+        self._maybe_fail()
+        if self.ancestry_fail is not None:
+            raise self.ancestry_fail
+        if ancestor == descendant:
+            return True
+        pending = [descendant]
+        visited: set[str] = set()
+        while pending:
+            sha = pending.pop()
+            if sha in visited:
+                continue
+            visited.add(sha)
+            commit = self.commits.get(sha)
+            if commit is None or commit.sha != sha:
+                raise Unavailable("commit_unreadable")
+            for parent in commit.parents:
+                if not _COMMIT_SHA.fullmatch(parent):
+                    raise Unavailable("commit_unreadable")
+                if parent == ancestor:
+                    return True
+                pending.append(parent)
+        return False
+
     async def resolve_repository(self, project_id: str) -> RepositoryRef:
-        assert project_id == f"path:{REPO}"
+        assert project_id == (f"path:{REPO}" if self.kind == "github" else "101")
         return RepositoryRef(
-            "github", "github.com", "101", REPO, default_branch=self.default_branch
+            self.kind, self.host, "101", REPO, default_branch=self.default_branch
         )
 
     async def find_pull_request(
@@ -235,10 +290,48 @@ def factory_approved(
     stack: TestClient,  # noqa: F811
     auth_headers: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
-) -> Seeded:
-    config = ForgesConfig.model_validate(forges_document(api_url=get_settings().github_api_url))
-    stack.app.state.forges = build_registry(config)
-    return _seed(stack, auth_headers, monkeypatch, open_pr=False, trigger_label="curie:implement")
+    tmp_path: Path,
+) -> Iterator[Seeded]:
+    label = "curie:implement"
+    document = forges_document(
+        api_url=get_settings().github_api_url,
+        label=label,
+        bindings=[
+            github_repository_binding(repo=REPO, repo_id=101, bases=["main"], default_base="main")
+        ],
+    )
+    monkeypatch.setenv("FACTORY_BASE_LABEL_SETTLE_S", "0")
+    monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, tmp_path))
+    get_settings.cache_clear()
+    stack.app.state.forges = forges_registry(get_settings())
+
+    class PublicationCredentials(_Credentials):
+        def token_for_verified_installation(self, repo: str, installation_id: int) -> str:
+            assert installation_id == 202
+            return self.token_for(repo)
+
+    fake_installation_tokens(monkeypatch, PublicationCredentials())
+    github = GitHubAPI()
+    github.repository_id = 101
+    github.labels = [label]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        response = github.handle(request)
+        if request.url.path == f"/repos/{REPO}/git/ref/heads/main":
+            # https://docs.github.com/en/rest/git/refs#get-a-reference
+            payload = response.json()
+            payload["object"]["sha"] = BASE_SHA
+            return httpx.Response(response.status_code, json=payload)
+        return response
+
+    original = stack.app.state.http_client
+    external = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    stack.app.state.http_client = external
+    try:
+        yield _seed(stack, auth_headers, monkeypatch, open_pr=False, trigger_label=label)
+    finally:
+        stack.app.state.http_client = original
+        stack.portal.call(external.aclose)
 
 
 def _matching_pull(publication: dict[str, Any], code_host: _CodeHost) -> PullRequest:
@@ -253,6 +346,225 @@ def _matching_pull(publication: dict[str, Any], code_host: _CodeHost) -> PullReq
 
 def _url(publication_id: object, suffix: str) -> str:
     return f"/v1/internal/publications/{publication_id}/{suffix}"
+
+
+Labelled = tuple[TestClient, dict[str, Any], _CodeHost, redis.Redis]
+
+
+@pytest.fixture
+def publication_labels(
+    approved: Seeded, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Labelled]:
+    client, publication, code_host = approved
+    monkeypatch.setenv(
+        "CURIE_FACTORY_PUBLICATION_LABELS", json.dumps({REPO.upper(): ["SMOKE", "ready"]})
+    )
+    get_settings.cache_clear()
+    valkey = redis.Redis.from_url(get_settings().valkey_dsn(), decode_responses=True)
+    valkey.ping()
+    try:
+        yield client, publication, code_host, valkey
+    finally:
+        ids = with_session(
+            lambda session: session.scalars(
+                select(Publication.id).where(
+                    Publication.lineage_id == uuid.UUID(publication["lineage_id"])
+                )
+            )
+        )
+        for publication_id in ids:
+            valkey.delete(f"curie:publication-labels:{publication_id}")
+        valkey.close()
+        get_settings.cache_clear()
+
+
+def _recover_labels(client: TestClient, publication: dict[str, Any], **fields: Any) -> Any:
+    return client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": False, **fields},
+        headers=WORKER_HEADERS,
+    )
+
+
+def test_publication_labels_apply_once_per_revision_and_keep_a_bounded_marker(
+    publication_labels: Labelled, auth_headers: dict[str, str]
+) -> None:
+    client, publication, code_host, valkey = publication_labels
+    first = _recover_labels(client, publication)
+
+    assert first.status_code == 200, first.text
+    assert code_host.label_calls == [
+        (
+            PullRequestRef(RepositoryRef("github", "github.com", "101", REPO), str(PR_NUMBER)),
+            ["SMOKE", "ready"],
+        )
+    ]
+    key = f"curie:publication-labels:{publication['id']}"
+    assert valkey.exists(key) == 1
+    assert 0 < valkey.ttl(key) <= 30 * 24 * 60 * 60
+    code_host.existing = _matching_pull(publication, code_host)
+
+    repeat = _recover_labels(client, publication)
+
+    assert repeat.status_code == 200, repeat.text
+    assert len(code_host.label_calls) == 1
+    _open_pr(client, publication["id"])
+    _execute(
+        "UPDATE curie.publications SET outcome_history_ready_at = now() WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    )
+    deployment_id = with_session(
+        lambda session: session.scalar(
+            select(Publication.deployment_id).where(Publication.id == uuid.UUID(publication["id"]))
+        )
+    )
+    second = _publish(client, str(deployment_id), base_sha=HEAD_SHA)
+    _resolve(client, auth_headers, second["approval_id"])
+    assert second["lineage_id"] == publication["lineage_id"]
+    assert second["id"] != publication["id"]
+    code_host.existing = _matching_pull(second, code_host)
+
+    revised = _recover_labels(client, second)
+
+    assert revised.status_code == 200, revised.text
+    assert len(code_host.label_calls) == 2
+    assert valkey.exists(f"curie:publication-labels:{second['id']}") == 1
+
+
+def test_publication_labels_apply_when_adopting_an_existing_open_pull_request(
+    publication_labels: Labelled,
+) -> None:
+    client, publication, code_host, _valkey = publication_labels
+    code_host.existing = _matching_pull(publication, code_host)
+
+    response = _recover_labels(client, publication, adopt_only=True)
+
+    assert response.status_code == 200, response.text
+    assert len(code_host.label_calls) == 1
+    assert code_host.opened == []
+
+
+@pytest.mark.parametrize(
+    "excluded",
+    ["draft", "closed", "merged", "adopt-miss", "unconfigured", "empty", "non-github"],
+)
+def test_publication_labels_exclude_ineligible_pull_requests_and_repositories(
+    publication_labels: Labelled, monkeypatch: pytest.MonkeyPatch, excluded: str
+) -> None:
+    client, publication, code_host, valkey = publication_labels
+    if excluded in {"draft", "closed", "merged"}:
+        code_host.existing = replace(
+            _matching_pull(publication, code_host),
+            draft=excluded == "draft",
+            state={"closed": PullRequestState.CLOSED, "merged": PullRequestState.MERGED}.get(
+                excluded, PullRequestState.OPEN
+            ),
+        )
+    elif excluded in {"unconfigured", "empty"}:
+        monkeypatch.setenv(
+            "CURIE_FACTORY_PUBLICATION_LABELS",
+            json.dumps({REPO: []} if excluded == "empty" else {}),
+        )
+        get_settings.cache_clear()
+    elif excluded == "non-github":
+        code_host.kind = "gitlab"
+        code_host.host = "gitlab.example.com"
+        _execute(
+            "UPDATE curie.thread_publication_lineages SET code_host_kind = 'gitlab', "
+            "code_host_host = 'gitlab.example.com', repository_project_id = '101', "
+            "code_host_pr_id = 'merge-request-example', base_ref = 'main', "
+            "pr_number = :number, pr_url = :url, head_sha = :head "
+            "WHERE id = :id",
+            {
+                "id": uuid.UUID(publication["lineage_id"]),
+                "number": PR_NUMBER,
+                "url": "https://gitlab.example.com/acme-corp/acme-bot/-/merge_requests/123",
+                "head": HEAD_SHA,
+            },
+        )
+        code_host.existing = replace(
+            _matching_pull(publication, code_host),
+            ref=PullRequestRef(
+                RepositoryRef("gitlab", "gitlab.example.com", "101", REPO), str(PR_NUMBER)
+            ),
+        )
+
+    response = _recover_labels(client, publication, adopt_only=excluded == "adopt-miss")
+
+    assert response.status_code == (204 if excluded == "adopt-miss" else 200), response.text
+    assert code_host.label_calls == []
+    assert valkey.exists(f"curie:publication-labels:{publication['id']}") == 0
+
+
+def test_publication_labels_failure_is_warned_without_a_marker_and_retries(
+    publication_labels: Labelled, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, publication, code_host, valkey = publication_labels
+    code_host.label_fail = Unavailable("private-provider-payload")
+
+    with caplog.at_level(logging.WARNING, logger=publication_code_host.__name__):
+        failed = _recover_labels(client, publication)
+
+    assert failed.status_code == 200, failed.text
+    assert failed.json()["number"] == PR_NUMBER
+    warnings = [
+        record for record in caplog.records if record.name == publication_code_host.__name__
+    ]
+    assert len(warnings) == 1
+    assert publication["id"] in warnings[0].getMessage()
+    assert REPO in warnings[0].getMessage()
+    assert "Unavailable" in warnings[0].getMessage()
+    assert "private-provider-payload" not in caplog.text
+    assert valkey.exists(f"curie:publication-labels:{publication['id']}") == 0
+    code_host.label_fail = None
+    code_host.existing = _matching_pull(publication, code_host)
+
+    retried = _recover_labels(client, publication)
+
+    assert retried.status_code == 200, retried.text
+    assert len(code_host.label_calls) == 2
+    assert valkey.exists(f"curie:publication-labels:{publication['id']}") == 1
+
+
+def test_publication_labels_failure_when_valkey_is_unreachable_keeps_the_pull_request(
+    publication_labels: Labelled, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, publication, code_host, valkey = publication_labels
+    original = client.app.state.valkey
+    with socket.socket() as unavailable:
+        unavailable.bind(("127.0.0.1", 0))
+        broken = async_redis.Redis(
+            host="127.0.0.1",
+            port=unavailable.getsockname()[1],
+            socket_connect_timeout=0.1,
+            socket_timeout=0.1,
+            retry=NO_RETRY,
+        )
+        client.app.state.valkey = broken
+        try:
+            with caplog.at_level(logging.WARNING, logger=publication_code_host.__name__):
+                response = _recover_labels(client, publication)
+        finally:
+            client.app.state.valkey = original
+            client.portal.call(broken.aclose)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["number"] == PR_NUMBER
+    assert code_host.label_calls == []
+    assert valkey.exists(f"curie:publication-labels:{publication['id']}") == 0
+    warnings = [
+        record for record in caplog.records if record.name == publication_code_host.__name__
+    ]
+    assert len(warnings) == 1
+    assert publication["id"] in warnings[0].getMessage()
+    assert "ConnectionError" in warnings[0].getMessage()
+    code_host.existing = _matching_pull(publication, code_host)
+
+    recovered = _recover_labels(client, publication)
+
+    assert recovered.status_code == 200, recovered.text
+    assert len(code_host.label_calls) == 1
+    assert valkey.exists(f"curie:publication-labels:{publication['id']}") == 1
 
 
 @pytest.mark.parametrize(("method", "suffix", "body"), ROUTES)
@@ -962,7 +1274,7 @@ def test_branch_context_preserves_verified_lineage_base(seeded: Seeded) -> None:
     ("branch", "source", "commit"),
     [
         ("", "default", BASE_SHA),
-        ("refs/heads/main", "default", BASE_SHA),
+        ("refs/heads//main", "default", BASE_SHA),
         ("bad..branch", "default", BASE_SHA),
         ("x" * 1025, "default", BASE_SHA),
         ("main", "default", "not-a-sha"),
@@ -1302,14 +1614,17 @@ def test_ancestry_read_budget_is_shared_by_both_proofs(approved: Seeded) -> None
         cursor = _graph_commit(code_host, _sha(10000 + index), cursor)
         if index == 599:
             _published_parent(publication, code_host, cursor)
+            parent = cursor
     code_host.base_head = cursor
     before = _stored_state(publication)
 
     response = _verify(client, publication)
 
-    assert response.status_code == 503, response.text
-    assert "publication_ancestry_unproved" in response.json()["detail"]["message"]
-    assert len(code_host.reads) - code_host.reads.count(HEAD_SHA) <= 1024
+    # Depth costs nothing: both relations are one forge question each (#5094).
+    assert response.status_code == 200, response.text
+    assert response.json() == {"commit_sha": HEAD_SHA, "parent_sha": parent}
+    assert code_host.reads == [HEAD_SHA]
+    assert code_host.ancestry_calls == [(BASE_SHA, parent), (parent, cursor)]
     assert _stored_state(publication) == before
     assert code_host.opened == []
     code_host.base_head = BASE_SHA
@@ -1323,17 +1638,18 @@ def test_ancestry_has_a_whole_operation_deadline_and_can_retry(approved: Seeded)
     parent = _graph_commit(code_host, _sha(60), intermediate)
     code_host.base_head = parent
     _published_parent(publication, code_host, parent)
-    code_host.read_delay = 6.0
+    # The HTTP client timeout is the bound; it surfaces from the forge as Unavailable.
+    code_host.ancestry_fail = Unavailable("github_timeout")
     before = _stored_state(publication)
-    started = time.monotonic()
 
     response = _verify(client, publication)
 
     assert response.status_code == 503, response.text
-    assert time.monotonic() - started < 11.5
+    assert response.json()["detail"]["code"] == "publication.code_host_unavailable"
     assert "publication_ancestry_unproved" in response.json()["detail"]["message"]
     assert _stored_state(publication) == before
-    code_host.read_delay = 0
+    assert code_host.opened == []
+    code_host.ancestry_fail = None
     assert _verify(client, publication).status_code == 200
 
 
@@ -1343,15 +1659,14 @@ def test_paced_ancestry_obeys_wallclock_limit_below_read_cap_and_same_graph_retr
 ) -> None:
     client, publication, code_host = approved
     cursor = BASE_SHA
-    graph: set[str] = set()
     parent = BASE_SHA
     for index in range(120):
         cursor = _graph_commit(code_host, _sha(20000 + index), cursor)
-        graph.add(cursor)
         if index == 59:
             parent = cursor
     code_host.base_head = cursor
     _published_parent(publication, code_host, parent)
+    # Slow commit reads no longer matter: only the publication commit is read.
     code_host.read_delay = 0.1
     before = _stored_state(publication)
     body = (
@@ -1359,26 +1674,29 @@ def test_paced_ancestry_obeys_wallclock_limit_below_read_cap_and_same_graph_retr
         if operation == "revision-commit"
         else {"expected_head_sha": HEAD_SHA, "adopt_only": False}
     )
-    started = time.monotonic()
 
     response = client.post(_url(publication["id"], operation), json=body, headers=WORKER_HEADERS)
 
-    elapsed = time.monotonic() - started
-    assert response.status_code == 503, response.text
-    assert elapsed <= 11.5, elapsed
-    assert response.json()["detail"]["code"] == "publication.code_host_unavailable"
-    assert "publication_ancestry_unproved" in response.json()["detail"]["message"]
-    assert len(code_host.reads) - code_host.reads.count(HEAD_SHA) <= 1024
-    assert code_host.opened == []
+    assert response.status_code == 200, response.text
+    assert code_host.reads == [HEAD_SHA]
+    assert len(code_host.ancestry_calls) == 2
+    if operation == "revision-commit":
+        assert response.json() == {"commit_sha": HEAD_SHA, "parent_sha": parent}
+        assert code_host.opened == []
+    else:
+        assert len(code_host.opened) == 1
     assert _stored_state(publication) == before
 
     code_host.base_head = _graph_commit(code_host, _sha(21000), BASE_SHA)
     _published_parent(publication, code_host, code_host.base_head)
     code_host.reads.clear()
+    code_host.ancestry_calls.clear()
+    code_host.opened.clear()
     paced = client.post(_url(publication["id"], operation), json=body, headers=WORKER_HEADERS)
 
     assert paced.status_code == 200, paced.text
-    assert code_host.reads == [HEAD_SHA, code_host.base_head]
+    assert code_host.reads == [HEAD_SHA]
+    assert len(code_host.ancestry_calls) == 2
     if operation == "revision-commit":
         assert paced.json() == {"commit_sha": HEAD_SHA, "parent_sha": code_host.base_head}
     else:
@@ -1389,17 +1707,59 @@ def test_paced_ancestry_obeys_wallclock_limit_below_read_cap_and_same_graph_retr
     _published_parent(publication, code_host, parent)
     code_host.read_delay = 0
     code_host.reads.clear()
+    code_host.ancestry_calls.clear()
     code_host.opened.clear()
     healthy = client.post(_url(publication["id"], operation), json=body, headers=WORKER_HEADERS)
 
     assert healthy.status_code == 200, healthy.text
-    assert set(code_host.reads) == graph | {HEAD_SHA}
+    assert code_host.reads == [HEAD_SHA]
+    assert len(code_host.ancestry_calls) == 2
     if operation == "revision-commit":
         assert healthy.json() == {"commit_sha": HEAD_SHA, "parent_sha": parent}
         assert code_host.opened == []
     else:
         assert len(code_host.opened) == 1
         assert code_host.opened[0]["base_ref"] == "main"
+    assert _stored_state(publication) == before
+
+
+def test_first_publication_ancestry_is_constant_forge_calls_when_the_base_is_100_commits_ahead(
+    approved: Seeded,
+) -> None:
+    # Fix pin for #5094: a base that moved while the agent worked cost one commit read per
+    # commit, ran past the deadline on a healthy forge, and answered 503.
+    client, publication, code_host = approved
+    parent = _graph_commit(code_host, _sha(30000), BASE_SHA)
+    tip = parent
+    for index in range(1, 121):
+        side = _graph_commit(code_host, _sha(31000 + index), tip)
+        tip = _graph_commit(code_host, _sha(30000 + index), tip, side) if index % 10 == 0 else side
+    code_host.base_head = tip
+    _published_parent(publication, code_host, parent)
+    before = _stored_state(publication)
+
+    for operation in ("revision-commit", "pull-request"):
+        code_host.reads.clear()
+        code_host.ancestry_calls.clear()
+        body = (
+            {"commit_sha": HEAD_SHA, "revision_id": publication["id"], "expected_parent": BASE_SHA}
+            if operation == "revision-commit"
+            else {"expected_head_sha": HEAD_SHA, "adopt_only": False}
+        )
+
+        response = client.post(
+            _url(publication["id"], operation), json=body, headers=WORKER_HEADERS
+        )
+
+        assert response.status_code == 200, (operation, response.text)
+        assert code_host.reads == [HEAD_SHA], operation
+        assert code_host.ancestry_calls == [(BASE_SHA, parent), (parent, tip)], operation
+        if operation == "revision-commit":
+            assert response.json() == {"commit_sha": HEAD_SHA, "parent_sha": parent}
+            assert code_host.opened == []
+        else:
+            assert len(code_host.opened) == 1
+            assert code_host.opened[0]["base_ref"] == "main"
     assert _stored_state(publication) == before
 
 

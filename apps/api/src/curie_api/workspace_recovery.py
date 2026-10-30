@@ -6,7 +6,7 @@ import hashlib
 import json
 import uuid
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,6 +34,8 @@ from .models import (
 from .schemas import workspace_recovery as wire
 from .workitems.lifecycle import database_now, lock_request, lock_work_item
 
+STAGING_EXPIRY_SECONDS = 600
+
 
 class RecoveryRefusal(Exception):
     def __init__(self, code: str, status: int = 409, *, recorded: bool = False) -> None:
@@ -48,12 +50,9 @@ def _enabled(settings: Settings) -> None:
         raise RecoveryRefusal("disabled", 503)
 
 
-def _live_authority(
-    item: WorkItem, source: ExecutionRequest, now: datetime, *, starting: bool
-) -> None:
+def _failed_source(source: ExecutionRequest) -> None:
     if (
-        item.cancelled_at is not None
-        or source.status != "failed"
+        source.status != "failed"
         or source.started_at is None
         or source.terminal_at is None
         or source.termination_observation is not None
@@ -68,6 +67,14 @@ def _live_authority(
         }
     ):
         raise RecoveryRefusal("ineligible_source")
+
+
+def _live_authority(
+    item: WorkItem, source: ExecutionRequest, now: datetime, *, starting: bool
+) -> None:
+    if item.cancelled_at is not None:
+        raise RecoveryRefusal("ineligible_source")
+    _failed_source(source)
     if starting and (
         source.runtime_heartbeat_expires_at is None
         or source.runtime_heartbeat_expires_at <= now
@@ -163,15 +170,29 @@ def _capture_identity(checkpoint: Checkpoint, body: wire.RecoveryCaptureAuthorit
         raise RecoveryRefusal("checkpoint_source_identity")
 
 
-async def _outcome(session: AsyncSession, item: WorkItem, code: str) -> None:
+def _outcome(item: WorkItem, code: str, at: datetime) -> None:
     item.workspace_recovery_outcome = code
-    item.workspace_recovery_outcome_at = await database_now(session)
+    item.workspace_recovery_outcome_at = at
+
+
+def _outcome_if_not_later(item: WorkItem, code: str, at: datetime, bound: datetime) -> bool:
+    """Write ``code`` unless the WorkItem holds an outcome written after ``bound``.
+
+    ``bound`` is the latest moment the caller's own capture wrote anything, so an
+    outcome a newer capture recorded is never displaced by an older one.
+    """
+
+    current = item.workspace_recovery_outcome_at
+    if current is not None and current > bound:
+        return False
+    _outcome(item, code, at)
+    return True
 
 
 async def _record_refusal(
     session: AsyncSession, item: WorkItem, code: str, status: int = 409
 ) -> None:
-    await _outcome(session, item, code)
+    _outcome(item, code, await database_now(session))
     raise RecoveryRefusal(code, status, recorded=True)
 
 
@@ -196,7 +217,9 @@ def _receipt(obj: RecoveryObject) -> wire.RecoveryObjectReceipt:
     )
 
 
-async def _reservation(session: AsyncSession, cp: Checkpoint) -> wire.RecoveryReservation:
+async def _reservation(
+    session: AsyncSession, cp: Checkpoint, *, replayed: bool
+) -> wire.RecoveryReservation:
     objects = [
         obj
         for obj in await _objects(session, cp.work_item_id)
@@ -209,7 +232,48 @@ async def _reservation(session: AsyncSession, cp: Checkpoint) -> wire.RecoveryRe
         objects=[_receipt(obj) for obj in objects],
         capture_deadline=cp.capture_deadline,
         staging_expires_at=cp.staging_expires_at,
+        replayed=replayed,
     )
+
+
+async def context(
+    session: AsyncSession, settings: Settings, body: wire.RecoveryCaptureAuthority
+) -> wire.RecoveryCaptureContext:
+    """The WorkItem's repository identity and trusted base, for a capture about to start."""
+
+    _enabled(settings)
+    item, _ = await _authority(session, body, starting=True)
+    assert item.base_commit is not None and item.base_branch is not None
+    return wire.RecoveryCaptureContext(
+        repository=wire.RecoveryRepository(
+            provider=item.code_host_kind,
+            host=item.code_host_host,
+            project_id=item.repository_project_id,
+            path=item.repository_path,
+        ),
+        base_commit=item.base_commit,
+        target_branch=item.base_branch,
+    )
+
+
+async def outcome(
+    session: AsyncSession, settings: Settings, body: wire.RecoveryOutcome
+) -> wire.RecoveryOutcomeRecorded:
+    """Record a capture that ended before any reservation (ADR 0251 section 3).
+
+    The source must be the latest failed request, but an expired heartbeat or
+    deadline does not block it. An outcome written after the source's terminus
+    (its own reservation, or a newer capture) is kept.
+    """
+
+    _enabled(settings)
+    item, source = await _authority(session, body, starting=False)
+    assert source.terminal_at is not None
+    recorded = _outcome_if_not_later(
+        item, body.reason, await database_now(session), source.terminal_at
+    )
+    await session.flush()
+    return wire.RecoveryOutcomeRecorded(recorded=recorded)
 
 
 async def reserve(
@@ -233,7 +297,7 @@ async def reserve(
     group = await _group(session, item.id)
     now = await database_now(session)
     _live_authority(item, source, now, starting=True)
-    contents = body.model_dump(mode="json")
+    contents = body.model_dump(mode="json", exclude={"capture_budget_seconds"})
     contents["objects"] = sorted(contents["objects"], key=lambda value: value["kind"])
     digest = hashlib.sha256(json.dumps(contents, sort_keys=True).encode()).hexdigest()
     replay = await session.scalar(
@@ -247,7 +311,7 @@ async def reserve(
     if replay is not None:
         if replay.content_sha256 != digest:
             raise RecoveryRefusal("idempotency_conflict")
-        return await _reservation(session, replay)
+        return await _reservation(session, replay, replayed=True)
     caps = {"base": settings.workspace_max_archive_bytes, "patch": 900000, "manifest": 1048576}
     for obj in body.objects:
         if obj.size_bytes > caps[obj.kind]:
@@ -303,8 +367,8 @@ async def reserve(
         idempotency_key=body.idempotency_key,
         content_sha256=digest,
         includes_base=includes_base,
-        capture_deadline=now + timedelta(seconds=60),
-        staging_expires_at=now + timedelta(seconds=600),
+        capture_deadline=now + timedelta(seconds=body.capture_budget_seconds),
+        staging_expires_at=now + timedelta(seconds=STAGING_EXPIRY_SECONDS),
     )
     session.add(cp)
     await session.flush()
@@ -327,9 +391,9 @@ async def reserve(
                 staging_expires_at=cp.staging_expires_at,
             )
         )
-    await _outcome(session, item, "reserved")
+    _outcome(item, "reserved", now)
     await session.flush()
-    return await _reservation(session, cp)
+    return await _reservation(session, cp, replayed=False)
 
 
 async def _transition(
@@ -386,7 +450,7 @@ def _completion(cp: Checkpoint) -> wire.RecoveryCompletion:
 
 
 async def _capture_context(
-    session: AsyncSession, body: wire.RecoveryComplete | wire.RecoveryFail
+    session: AsyncSession, body: wire.RecoveryComplete
 ) -> tuple[WorkItem, Group, Checkpoint, datetime]:
     item, source = await _authority(session, body, starting=False)
     await _installation(session)
@@ -402,7 +466,7 @@ async def _capture_context(
 
 async def complete(session: AsyncSession, body: wire.RecoveryComplete) -> wire.RecoveryCompletion:
     item, group, cp, now = await _capture_context(session, body)
-    reservation = await _reservation(session, cp)
+    reservation = await _reservation(session, cp, replayed=True)
     expected = sorted(obj.model_dump_json() for obj in reservation.objects)
     actual = sorted(obj.model_dump_json() for obj in body.receipts)
     if expected != actual:
@@ -438,15 +502,89 @@ async def complete(session: AsyncSession, body: wire.RecoveryComplete) -> wire.R
     for old in completed[2:]:
         await _tombstone(session, group, old)
     group.last_good_checkpoint_id = cp.id
-    await _outcome(session, item, "complete")
+    _outcome(item, "complete", now)
     await session.flush()
     return _completion(cp)
 
 
+async def _cleanup_context(
+    session: AsyncSession, body: wire.RecoveryFail
+) -> tuple[WorkItem, Group, Checkpoint, datetime]:
+    """Authority for cleaning up a capture's own checkpoint.
+
+    Unlike ``_capture_context`` the source need not be the WorkItem's latest
+    request, nor unexpired, nor its WorkItem uncancelled: a predecessor whose
+    lease was lost after a successor was admitted, or whose WorkItem was
+    cancelled after its capture, still tombstones its own checkpoint. Nor is the
+    retained group
+    compared with the WorkItem's current base: ordinary readmission replaces that
+    base, and the predecessor still withdraws its own checkpoint. The retained
+    group must exist, and the checkpoint's exact source (request, epoch, dispatch
+    generation) and its eligible failure are still required.
+    """
+
+    item = await lock_work_item(session, body.work_item_id)
+    if item is None:
+        raise RecoveryRefusal("source_identity")
+    source = await lock_request(session, work_item_id=item.id, request_id=body.source_request_id)
+    if (
+        source is None
+        or source.runtime_epoch != body.runtime_epoch
+        or source.dispatch_generation != body.dispatch_generation
+    ):
+        raise RecoveryRefusal("source_identity")
+    await _installation(session)
+    group = await _group(session, item.id)
+    if group is None:
+        raise RecoveryRefusal("retained_identity")
+    cp = await _checkpoint(session, item.id, body.checkpoint_id)
+    now = await database_now(session)
+    _failed_source(source)
+    _capture_identity(cp, body)
+    return item, group, cp, now
+
+
+async def _retract(
+    session: AsyncSession, item: WorkItem, group: Group, cp: Checkpoint, now: datetime
+) -> wire.RecoveryCaptureFailure:
+    """Withdraw a just-completed checkpoint whose capture lost its lease after commit.
+
+    Its objects are left for the collector, whose reader-pinning rule keeps a
+    reader that already leased it working until its lease expires. The group's
+    pointer moves only when it named this checkpoint; a successor's newer
+    checkpoint stays the answer.
+    """
+
+    assert cp.completed_at is not None
+    was_last_good = group.last_good_checkpoint_id == cp.id
+    await _tombstone(session, group, cp)
+    if was_last_good:
+        group.last_good_checkpoint_id = await session.scalar(
+            select(Checkpoint.id)
+            .where(
+                Checkpoint.work_item_id == item.id,
+                Checkpoint.status == "complete",
+                Checkpoint.id != cp.id,
+            )
+            .order_by(Checkpoint.completed_at.desc(), Checkpoint.id.desc())
+            .limit(1)
+        )
+    _outcome_if_not_later(item, "lease_lost", now, cp.completed_at)
+    await session.flush()
+    return wire.RecoveryCaptureFailure(checkpoint_id=cp.id, status="retracted")
+
+
 async def fail(session: AsyncSession, body: wire.RecoveryFail) -> wire.RecoveryCaptureFailure:
-    item, group, cp, _ = await _capture_context(session, body)
+    item, group, cp, now = await _cleanup_context(session, body)
     if cp.status == "tombstoned":
-        return wire.RecoveryCaptureFailure(checkpoint_id=cp.id)
+        # A checkpoint that was ever complete may still be held by a reader, so a
+        # repeated fail answers ``retracted`` and the writer leaves its objects.
+        status: Literal["tombstoned", "retracted"] = (
+            "retracted" if cp.completed_at is not None else "tombstoned"
+        )
+        return wire.RecoveryCaptureFailure(checkpoint_id=cp.id, status=status)
+    if cp.status == "complete" and body.retract and body.reason == "lease_lost":
+        return await _retract(session, item, group, cp, now)
     if cp.status != "staging":
         raise RecoveryRefusal("checkpoint_state")
     await _tombstone(session, group, cp)
@@ -462,7 +600,8 @@ async def fail(session: AsyncSession, body: wire.RecoveryFail) -> wire.RecoveryC
         )
         .values(status="tombstoned")
     )
-    await _outcome(session, item, body.reason)
+    reserved_at = cp.staging_expires_at - timedelta(seconds=STAGING_EXPIRY_SECONDS)
+    _outcome_if_not_later(item, body.reason, now, reserved_at)
     return wire.RecoveryCaptureFailure(checkpoint_id=cp.id)
 
 

@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::ui::{CliOutput, DryRunPlan, Ui};
 
@@ -72,7 +73,12 @@ impl CliOutput for AgentSkillInstallOutput {
     }
 }
 
-pub type SkillFiles<'a> = (&'a str, Vec<(&'a str, &'a [u8])>);
+pub struct SkillFiles<'a> {
+    pub name: &'a str,
+    pub files: Vec<(&'a str, &'a [u8])>,
+    /// SHA-256 of exact previously shipped directory trees, including paths.
+    pub previous_versions: &'a [&'a str],
+}
 
 struct AgentSkillsInstallOutput {
     skills: Vec<Box<dyn CliOutput>>,
@@ -92,8 +98,7 @@ impl CliOutput for AgentSkillsInstallOutput {
 
 /// Check every destination before installing any skill. Existing customized
 /// skills are never overwritten; unrelated skills remain outside this operation.
-/// Each new folder is published atomically. I/O failures can leave earlier
-/// folders installed, so rerunning accepts those identical copies.
+/// I/O failures can leave earlier folders installed, so rerunning accepts them.
 pub fn install_set(
     skills: &[SkillFiles<'_>],
     options: InstallOptions,
@@ -101,8 +106,8 @@ pub fn install_set(
     let mut preview = options.clone();
     preview.dry_run = true;
     let mut lines = Vec::new();
-    for (name, files) in skills {
-        let plan = install(name, files, preview.clone())?;
+    for skill in skills {
+        let plan = install(skill, preview.clone())?;
         let value = plan.to_json();
         lines.extend(
             value["plan"]
@@ -117,7 +122,7 @@ pub fn install_set(
     }
     let installed = skills
         .iter()
-        .map(|(name, files)| install(name, files, options.clone()))
+        .map(|skill| install(skill, options.clone()))
         .collect::<Result<Vec<_>>>()?;
     Ok(Box::new(AgentSkillsInstallOutput { skills: installed }))
 }
@@ -183,13 +188,14 @@ pub(crate) fn selected_root(options: &InstallOptions) -> Result<PathBuf> {
     Ok(root)
 }
 
-/// Publish a complete embedded skill, or accept an identical existing copy.
-/// A changed or incomplete existing skill is refused, including on dry runs.
-pub fn install(
-    name: &str,
-    files: &[(&str, &[u8])],
-    options: InstallOptions,
-) -> Result<Box<dyn CliOutput>> {
+/// Publish a complete embedded skill, accept an identical existing copy, or
+/// replace a tree whose digest is in the trusted previous-version catalog.
+pub fn install(skill: &SkillFiles<'_>, options: InstallOptions) -> Result<Box<dyn CliOutput>> {
+    let SkillFiles {
+        name,
+        files,
+        previous_versions,
+    } = skill;
     if Path::new(name).components().count() != 1 || name.is_empty() {
         return Err(crate::exit::usage("skill name must be one path component"));
     }
@@ -203,22 +209,34 @@ pub fn install(
     if existing && !directory.is_dir() {
         return Err(refusal(&directory));
     }
+    let mut identical = existing;
     for (file, bytes) in files {
         if file.is_empty() {
             return Err(crate::exit::usage("skill asset path must not be empty"));
         }
         check_path(&root, &relative.join(file))?;
         if existing && fs::read(directory.join(file)).as_deref().ok() != Some(*bytes) {
-            return Err(refusal(&directory.join(file)));
+            identical = false;
         }
     }
+    let upgrade = if existing && !identical {
+        let digest = directory_digest(&directory)?;
+        if !previous_versions.contains(&digest.as_str()) {
+            return Err(refusal(&directory));
+        }
+        true
+    } else {
+        false
+    };
     let guidance = options.agent.guidance(name);
     if options.dry_run {
         return Ok(Box::new(DryRunPlan {
             lines: vec![
                 format!(
                     "{} {}",
-                    if existing {
+                    if upgrade {
+                        "Upgrade unmodified skill at"
+                    } else if existing {
                         "Keep identical skill at"
                     } else {
                         "Install embedded skill at"
@@ -229,7 +247,7 @@ pub fn install(
             ],
         }));
     }
-    if !existing {
+    if !existing || upgrade {
         let parent = directory.parent().expect("skill has a parent");
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         check_path(&root, &relative)?;
@@ -244,17 +262,207 @@ pub fn install(
         // Do not merge into a destination another installation created while
         // staging. Rename publishes all assets together on the same filesystem.
         check_path(&root, &relative)?;
-        if directory.try_exists()? {
-            return Err(refusal(&directory));
+        if upgrade {
+            // Recheck immediately before moving the old tree so intervening
+            // edits detected before the move prevent replacement.
+            let digest = directory_digest(&directory)?;
+            if !previous_versions.contains(&digest.as_str()) {
+                return Err(refusal(&directory));
+            }
+            let backup = tempfile::Builder::new()
+                .prefix(".curie-skill-backup-")
+                .tempdir_in(parent)?;
+            let old = backup.path().join("previous");
+            fs::rename(&directory, &old).context("stage previous skill")?;
+            if let Err(error) = fs::rename(staging.path(), &directory) {
+                if let Err(restore_error) = fs::rename(&old, &directory) {
+                    let retained = backup.keep();
+                    return Err(anyhow::anyhow!(
+                        "publish upgraded skill failed: {error}; restore failed: {restore_error}; previous skill retained at {}",
+                        retained.display()
+                    ));
+                }
+                return Err(error).context("publish upgraded skill");
+            }
+        } else {
+            if directory.try_exists()? {
+                return Err(refusal(&directory));
+            }
+            fs::rename(staging.path(), &directory).context("publish staged skill")?;
         }
-        fs::rename(staging.path(), &directory).context("publish staged skill")?;
     }
     Ok(Box::new(AgentSkillInstallOutput {
         agent: options.agent,
-        skill: name.to_owned(),
+        skill: (*name).to_owned(),
         scope: if options.global { "user" } else { "repository" },
         directory,
-        status: if existing { "unchanged" } else { "installed" },
+        status: if upgrade {
+            "upgraded"
+        } else if existing {
+            "unchanged"
+        } else {
+            "installed"
+        },
         guidance,
     }))
+}
+
+/// Digest an exact tree. File names, directory names, file bytes, and types
+/// all contribute; symlinks and non-file entries fail closed.
+fn directory_digest(root: &Path) -> Result<String> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        entries: &mut Vec<(String, bool, Vec<u8>)>,
+    ) -> Result<()> {
+        for entry in
+            fs::read_dir(directory).with_context(|| format!("read {}", directory.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)?
+                .to_str()
+                .ok_or_else(|| refusal(&path))?
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                entries.push((relative, true, Vec::new()));
+                visit(root, &path, entries)?;
+            } else if kind.is_file() {
+                entries.push((relative, false, fs::read(&path)?));
+            } else {
+                return Err(refusal(&path));
+            }
+        }
+        Ok(())
+    }
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries)?;
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hash = Sha256::new();
+    for (path, directory, bytes) in entries {
+        hash.update(if directory { b"D" } else { b"F" });
+        hash.update((path.len() as u64).to_be_bytes());
+        hash.update(path.as_bytes());
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
+    Ok(hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(root: &Path, dry_run: bool) -> InstallOptions {
+        InstallOptions {
+            agent: AgentClient::Codex,
+            global: false,
+            dir: Some(root.to_path_buf()),
+            dry_run,
+        }
+    }
+
+    #[test]
+    fn known_previous_tree_upgrades_and_then_is_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join(".agents/skills/example-skill");
+        fs::create_dir_all(directory.join("references")).unwrap();
+        fs::write(directory.join("SKILL.md"), b"old").unwrap();
+        fs::write(directory.join("references/help.md"), b"help").unwrap();
+        let digest = directory_digest(&directory).unwrap();
+        let versions = [digest.as_str()];
+        let skill = SkillFiles {
+            name: "example-skill",
+            files: vec![("SKILL.md", b"new"), ("references/help.md", b"help")],
+            previous_versions: &versions,
+        };
+        assert!(install(&skill, options(root.path(), true))
+            .unwrap()
+            .to_json()["plan"][0]
+            .as_str()
+            .unwrap()
+            .contains("Upgrade"));
+        assert_eq!(fs::read(directory.join("SKILL.md")).unwrap(), b"old");
+        assert_eq!(
+            install(&skill, options(root.path(), false))
+                .unwrap()
+                .to_json()["status"],
+            "upgraded"
+        );
+        assert_eq!(fs::read(directory.join("SKILL.md")).unwrap(), b"new");
+        assert_eq!(
+            install(&skill, options(root.path(), false))
+                .unwrap()
+                .to_json()["status"],
+            "unchanged"
+        );
+    }
+
+    #[test]
+    fn changed_or_extra_previous_tree_is_never_upgraded() {
+        for change in ["edit", "extra-file", "extra-directory", "missing-file"] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join(".agents/skills/example-skill");
+            fs::create_dir_all(directory.join("references")).unwrap();
+            fs::write(directory.join("SKILL.md"), b"old").unwrap();
+            fs::write(directory.join("references/help.md"), b"help").unwrap();
+            let digest = directory_digest(&directory).unwrap();
+            match change {
+                "edit" => fs::write(directory.join("SKILL.md"), b"local edit").unwrap(),
+                "extra-file" => fs::write(directory.join("notes.md"), b"local note").unwrap(),
+                "extra-directory" => fs::create_dir(directory.join("local")).unwrap(),
+                "missing-file" => fs::remove_file(directory.join("references/help.md")).unwrap(),
+                _ => unreachable!(),
+            }
+            let versions = [digest.as_str()];
+            let skill = SkillFiles {
+                name: "example-skill",
+                files: vec![("SKILL.md", b"new"), ("references/help.md", b"help")],
+                previous_versions: &versions,
+            };
+            assert!(
+                install(&skill, options(root.path(), true)).is_err(),
+                "{change}"
+            );
+            assert!(
+                install(&skill, options(root.path(), false)).is_err(),
+                "{change}"
+            );
+            assert_ne!(fs::read(directory.join("SKILL.md")).unwrap(), b"new");
+        }
+    }
+
+    #[test]
+    fn set_conflict_prevents_a_known_upgrade() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join(".agents/skills/first");
+        let second = root.path().join(".agents/skills/second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("SKILL.md"), b"old first").unwrap();
+        fs::write(second.join("SKILL.md"), b"local second").unwrap();
+        let first_digest = directory_digest(&first).unwrap();
+        let versions = [first_digest.as_str()];
+        let skills = [
+            SkillFiles {
+                name: "first",
+                files: vec![("SKILL.md", b"new first")],
+                previous_versions: &versions,
+            },
+            SkillFiles {
+                name: "second",
+                files: vec![("SKILL.md", b"new second")],
+                previous_versions: &[],
+            },
+        ];
+        assert!(install_set(&skills, options(root.path(), false)).is_err());
+        assert_eq!(fs::read(first.join("SKILL.md")).unwrap(), b"old first");
+        assert_eq!(fs::read(second.join("SKILL.md")).unwrap(), b"local second");
+    }
 }

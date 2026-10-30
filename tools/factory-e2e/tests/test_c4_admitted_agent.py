@@ -423,6 +423,40 @@ def await_admission_status(run: AdmittedKind, ticket: Ticket, request_id: str) -
     )
 
 
+def await_base_pin_status(
+    run: AdmittedKind,
+    ticket: Ticket,
+    row: dict[str, Any],
+    notice_before: dict[str, Any],
+) -> None:
+    with run.stub.provider_lock:
+        branch = run.stub._repository_row()["default_branch"]
+        commit = run.stub._ref(branch)
+    assert branch and commit
+    assert run.sql(
+        "SELECT json_build_object('branch',base_branch,'source',base_source,"
+        "'commit',base_commit,'request_id',base_resolved_request_id) FROM curie.work_items "
+        f"WHERE id='{uuid.UUID(row['work_item_id'])}'"
+    ) == {"branch": branch, "source": "default", "commit": commit, "request_id": row["id"]}
+    assert notice_before["rendered_digest"] is not None
+    notice = observe_until(
+        lambda: n if (n := notice_state(run, row["id"]))
+        and n["comment_id"] == notice_before["comment_id"]
+        and n["posted_at"] == notice_before["posted_at"]
+        and n["rendered_digest"] is not None
+        and n["rendered_digest"] != notice_before["rendered_digest"]
+        and n["sync_owner"] is None
+        and not n["sync_invalidated"] else None
+    )
+    if notice is None:
+        failure = RuntimeError("base pin status outbox did not finish updating the fixture comment")
+        run.record_failure("base pin status readiness", failure)
+        raise failure
+    assert_status_on_original_tracker(run, ticket, row["id"])
+    assert len(run.comments(ticket)) == 1
+    no_execution_effects(run, ticket, row)
+
+
 def waiting_ticket(
     run: AdmittedKind, kind: str = "github"
 ) -> tuple[Ticket, dict[str, Any], dict[str, Any]]:
@@ -467,7 +501,8 @@ def factory_deferral(
     run: AdmittedKind, ticket: Ticket, before: dict[str, Any], reason: str
 ) -> dict[str, Any]:
     row = observe_until(
-        lambda: r if (r := run.request(ticket)) and r["last_deferral_reason"] else None
+        lambda: r if (r := run.request(ticket))
+        and r["start_deferrals"] != before["start_deferrals"] else None
     )
     assert row is not None, "request has no correlated factory authority refusal"
     assert row["last_deferral_reason"] == "not_started:" + reason
@@ -561,6 +596,39 @@ def test_execute_revalidates_current_authority(
 ) -> None:
     run = paused_factory
     ticket, before, wake = waiting_ticket(run)
+    if change == "deployment_missing":
+        notice_before = notice_state(run, before["id"])
+        body = acquire_body(before, wake)
+        path = f"/v1/internal/work-items/requests/{before['id']}"
+        grant = run.api("POST", path + "/acquire", body, internal=True)
+        assert grant["generation"] == before["dispatch_generation"]
+        assert grant["context"]["agent_id"] == ticket.agent.id
+        deferred = run.api(
+            "POST", path + "/defer",
+            {
+                "owner": body["owner"], "generation": grant["generation"],
+                "reason": "fixture_ready", "capacity": False,
+            }, internal=True,
+        )
+        current = run.request(ticket)
+        assert current is not None
+        assert current["status"] == "waiting"
+        assert current["dispatch_generation"] == before["dispatch_generation"] + 1
+        assert deferred["dispatch_generation"] == current["dispatch_generation"]
+        assert deferred["terminal_cause"] is None
+        assert datetime.fromisoformat(deferred["not_before"]) == datetime.fromisoformat(
+            current["dispatch_not_before"]
+        )
+        assert current["last_deferral_reason"] == "fixture_ready"
+        assert current["start_deferrals"] == before["start_deferrals"]
+        assert current["capacity_deferrals"] == before["capacity_deferrals"]
+        assert current["acquire_owner"] is None
+        assert current["acquired_generation"] is None
+        assert current["acquire_expires_at"] is None
+        wake = run.take_execute_wake(current)
+        before = run.request(ticket)
+        assert before is not None
+        await_base_pin_status(run, ticket, before, notice_before)
     comments = run.comments(ticket)
     agent_id = uuid.UUID(ticket.agent.id)
     binding = f"agent_id='{agent_id}' AND kind='github'"
@@ -667,6 +735,7 @@ def test_existing_acquire_fences_remain_read_only(
             f"WHERE id='{uuid.UUID(row['id'])}'"
         )
     else:
+        notice_before = notice_state(run, row["id"])
         run.api(
             "POST", f"/v1/internal/work-items/requests/{row['id']}/acquire",
             acquire_body(row, wake, owner="acme-other-worker"), internal=True,
@@ -675,6 +744,8 @@ def test_existing_acquire_fences_remain_read_only(
             "UPDATE curie.execution_requests SET acquire_expires_at=now()+interval '1 hour' "
             f"WHERE id='{uuid.UUID(row['id'])}'"
         )
+        await_base_pin_status(run, ticket, row, notice_before)
+        comments = run.comments(ticket)
     frozen = request_state(run, row["id"])
     run.enqueue(wake)
     run.worker_replicas(1)
@@ -1480,6 +1551,20 @@ def test_renewal_and_late_start_revalidate_granted_binding(
     assert grant["repository_path"] == REPOSITORY
     assert datetime.fromisoformat(grant["wait_deadline"]) == datetime.fromisoformat(
         before["wait_deadline"]
+    )
+    settle_seconds = run.kubectl(
+        "-n",
+        run.namespace,
+        "exec",
+        "deployment/curie-api",
+        "--",
+        "python",
+        "-c",
+        "from curie_api.config import get_settings; "
+        "print(get_settings().factory_base_label_settle_s)",
+    )
+    assert int(settle_seconds.strip()) == 0, (
+        "the admitted-agent fixture API did not consume a zero base-label settle interval"
     )
     run.api(
         "DELETE", query_path(

@@ -240,10 +240,23 @@ spec:
         {{- if $agent }}
         curietech.ai/agent: {{ $agent | quote }}
         {{- end }}
-      {{- with (include "curie.placement.annotations" (dict "root" . "class" "sandbox")) }}
-      annotations:
-        {{- . | nindent 8 }}
+      {{- /* Winning size key per scratch volume, and whether that volume may
+             use scratchVolume.type=ephemeral. Eligibility, not the current type:
+             workspace and the home writable volume are true on every profile. */}}
+      {{- $scratchStamp := dict }}
+      {{- if $wf.enabled }}
+      {{- $_ := set $scratchStamp "workspace" (dict "key" $env.workspaceSizeKey "ephemeral" true) }}
       {{- end }}
+      {{- if $runner.hardening.enabled }}
+      {{- range $i, $p := $runner.hardening.writablePaths }}
+      {{- $_ := set $scratchStamp (printf "writable-%d" (int $i)) (dict "key" (index $env.writableKeys $i) "ephemeral" (index $env.writableEphemeral $i)) }}
+      {{- end }}
+      {{- end }}
+      annotations:
+        curie.ai/sandbox-scratch-size-keys: {{ $scratchStamp | toJson | quote }}
+        {{- with (include "curie.placement.annotations" (dict "root" . "class" "sandbox")) }}
+        {{- . | nindent 8 }}
+        {{- end }}
     spec:
       {{- with (include "curie.placement.spec" (dict "root" . "class" "sandbox")) }}
       {{- . | nindent 6 }}
@@ -312,11 +325,28 @@ spec:
             sizeLimit: {{ $bf.awsConfigSizeLimit | quote }}
         {{- end }}
         {{- if $wf.enabled }}
+        {{- if eq $env.scratchVolume.type "ephemeral" }}
+        {{- /* ADR 0255: workspace is a generic ephemeral volume. requests.storage
+               is the envelope size. The claim dies with the pod. */}}
+        - name: workspace
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                {{- if $env.scratchVolume.storageClassName }}
+                storageClassName: {{ $env.scratchVolume.storageClassName | quote }}
+                {{- end }}
+                resources:
+                  requests:
+                    storage: {{ $wf.sizeLimit | quote }}
+        {{- else }}
         # One claim-scoped managed checkout. It is separate from writablePaths
         # so the workspace has one explicit size and lifetime boundary.
         - name: workspace
           emptyDir:
             sizeLimit: {{ $wf.sizeLimit | quote }}
+        {{- end }}
         {{- end }}
         {{- if $af.enabled }}
         # One turn's inbound attachments. A SIBLING of the workspace volume, not
@@ -331,12 +361,29 @@ spec:
         {{- end }}
         {{- if $runner.hardening.enabled }}
         {{- range $i, $p := $runner.hardening.writablePaths }}
+        {{- if and (eq $env.scratchVolume.type "ephemeral") (eq (toString $p) (toString $runner.hardening.home)) }}
+        {{- /* ADR 0255: only the home writable volume is claim-backed. /tmp and
+               every other writable path stay emptyDir with sizeLimit. */}}
+        - name: writable-{{ $i }}
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                {{- if $env.scratchVolume.storageClassName }}
+                storageClassName: {{ $env.scratchVolume.storageClassName | quote }}
+                {{- end }}
+                resources:
+                  requests:
+                    storage: {{ index $env.writable $i | quote }}
+        {{- else }}
         # sizeLimit is ADR-0059 decision 2 (see hardening.writablePathSizeLimit
         # in values.yaml for the periodic-measurement caveat); the envelope
         # resolves it per path from the resource profile (#4889).
         - name: writable-{{ $i }}
           emptyDir:
             sizeLimit: {{ index $env.writable $i | quote }}
+        {{- end }}
         {{- end }}
         {{- end }}
       {{- end }}

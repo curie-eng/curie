@@ -83,6 +83,19 @@ fn success(output: &Output) -> Value {
     value
 }
 fn receipts(value: &Value, agent: &str, scope: &str, root: &Path, directory: &str) {
+    let set_schema: Value = serde_json::from_slice(
+        &fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("schema/agent-skills-install.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        jsonschema::validator_for(&set_schema)
+            .unwrap()
+            .is_valid(value),
+        "set receipt schema: {value}"
+    );
     let values = value["skills"]
         .as_array()
         .expect("set receipt contains skills array");
@@ -184,6 +197,73 @@ fn repeated_set_install_reports_all_unchanged_without_mutating_assets() {
         .iter()
         .all(|v| v["status"] == "unchanged"));
     assert_eq!(files_under(&f.project), before);
+}
+
+fn seed_previous_install(f: &Fixture) -> PathBuf {
+    let root = f.project.join(".agents/skills");
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/vectors/factory-skills-v1");
+    for (skill, files) in SKILLS {
+        for (name, current_bytes) in files {
+            let previous = fs::read(fixtures.join(skill).join(name)).unwrap();
+            if *name == "SKILL.md" {
+                assert_ne!(previous, *current_bytes, "{skill} needs a newer asset");
+            }
+            let path = root.join(skill).join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, previous).unwrap();
+        }
+    }
+    root
+}
+
+#[test]
+fn previously_shipped_skills_upgrade_through_offline_cli() {
+    let f = Fixture::new();
+    seed_previous_install(&f);
+    let before = files_under(&f.project);
+    let plan = success(&f.run(&["--agent", "codex", "--dry-run"]));
+    assert_eq!(
+        plan["plan"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|line| line.as_str().unwrap().contains("Upgrade unmodified skill"))
+            .count(),
+        SKILLS.len()
+    );
+    assert_eq!(files_under(&f.project), before, "dry run is read only");
+
+    let result = success(&f.run(&["--agent", "codex"]));
+    receipts(&result, "codex", "repository", &f.project, ".agents/skills");
+    assert!(result["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|receipt| receipt["status"] == "upgraded"));
+    installed(&f.project, ".agents/skills");
+
+    let repeated = success(&f.run(&["--agent", "codex"]));
+    assert!(repeated["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|receipt| receipt["status"] == "unchanged"));
+}
+
+#[test]
+fn edited_previously_shipped_skill_refuses_the_whole_set() {
+    let f = Fixture::new();
+    let root = seed_previous_install(&f);
+    fs::write(root.join("review-pr/SKILL.md"), b"local customization\n").unwrap();
+    let before = files_under(&f.project);
+    for args in [
+        vec!["--agent", "codex"],
+        vec!["--agent", "codex", "--dry-run"],
+    ] {
+        let result = f.run(&args);
+        assert!(!result.status.success(), "edited skill must conflict");
+        assert_eq!(files_under(&f.project), before);
+    }
 }
 
 #[test]

@@ -254,6 +254,16 @@ spec:
             # renders the same value from the same helper.
             - name: CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES
               value: {{ include "curie.actionExecutorMaxConcurrentSandboxes" . | quote }}
+            {{- if eq (include "curie.workspaceRecoveryEnabled" .) "true" }}
+            # Workspace recovery (ADR 0251). The ledger compares the worker's
+            # archive limit with its own, so both render from the same value.
+            - name: CURIE_WORKSPACE_RECOVERY_ENABLED
+              value: "true"
+            - name: CURIE_WORKSPACE_RECOVERY_MAX_BYTES
+              value: {{ include "curie.workspaceRecoveryMaxBytes" . | quote }}
+            - name: CURIE_WORKSPACE_MAX_ARCHIVE_BYTES
+              value: {{ .Values.worker.workspace.maxArchiveBytes | int64 | quote }}
+            {{- end }}
             # The automated remediation switch (AUTOMATED-REMEDIATION-1). The
             # worker renders the same value from the same helper, which fails
             # the render when it is on and the executor is off.
@@ -360,6 +370,8 @@ spec:
               value: {{ get (.Values.factory | default dict) "enabled" | default false | quote }}
             - name: FACTORY_INTAKE
               value: {{ get (.Values.factory | default dict) "intake" | default "poll" | quote }}
+            - name: FACTORY_BASE_LABEL_SETTLE_S
+              value: {{ dig "baseLabelSettleSeconds" 60 (.Values.factory | default dict) | quote }}
             - name: FACTORY_CI_WAIT_S
               value: {{ include "curie.factory.str" (get (.Values.factory | default dict) "ciWaitSeconds" | default 3600) | quote }}
             - name: CURIE_FORGES
@@ -378,6 +390,10 @@ spec:
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.api.githubTokenExistingSecret "existingSecretKey" .Values.api.githubTokenExistingSecretKey "defaultKey" "githubToken") | nindent 18 }}
             - name: GITHUB_REPO_ALLOWLIST
               value: {{ .Values.api.githubRepoAllowlist | toJson | quote }}
+            {{- with (get (.Values.api | default dict) "factoryPublicationLabels") }}
+            - name: CURIE_FACTORY_PUBLICATION_LABELS
+              value: {{ . | toJson | quote }}
+            {{- end }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" .Values.api.extraEnv) | nindent 12 }}
             # GitHub App identity (ADR-0092). When both are set the platform
             # mints a one-hour token scoped to the single repository it is
