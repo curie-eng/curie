@@ -34,4 +34,19 @@ RUN set -eu; \
     echo "${sha256}  /tmp/cargo-nextest.tar.gz" | sha256sum -c -; \
     tar -xzf /tmp/cargo-nextest.tar.gz -C /usr/local/cargo/bin cargo-nextest; \
     rm /tmp/cargo-nextest.tar.gz
+# Official Helm archives, the same v3.16.4 pin as the CLI chart-consumer CI.
+# Checksums are the published .sha256sum values, verified against the bytes.
+RUN set -eu; \
+    version=3.16.4; \
+    arch="$(dpkg --print-architecture)"; \
+    case "${arch}" in \
+        amd64) sha256=fc307327959aa38ed8f9f7e66d45492bb022a66c3e5da6063958254b9767d179 ;; \
+        arm64) sha256=d3f8f15b3d9ec8c8678fbf3280c3e5902efabe5912e2f9fcf29107efbc8ead69 ;; \
+        *) echo "unsupported helm architecture: ${arch}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://get.helm.sh/helm-v${version}-linux-${arch}.tar.gz" -o /tmp/helm.tar.gz; \
+    echo "${sha256}  /tmp/helm.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/helm.tar.gz -C /tmp "linux-${arch}/helm"; \
+    install -m 0755 "/tmp/linux-${arch}/helm" /usr/local/bin/helm; \
+    rm -rf /tmp/helm.tar.gz "/tmp/linux-${arch}"
 USER 1000:1000
