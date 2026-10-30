@@ -43,7 +43,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -53,7 +53,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Test reconciliation decisions and Kubernetes transport
@@ -69,7 +69,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Back off before retrying Install uv
         if: steps.install_uv.outcome == 'failure'
         run: |
@@ -77,7 +77,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Require third party action SHA pins and version comments
         run: |
           uv run --no-project --with pyyaml==6.0.3 python3 - <<'PY'
@@ -152,7 +152,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -162,7 +162,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Sync workspace
@@ -227,7 +227,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -237,7 +237,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Sync workspace
@@ -416,7 +416,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -426,7 +426,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Sync workspace
@@ -530,7 +530,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -540,7 +540,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Sync workspace
@@ -623,7 +623,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -633,7 +633,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       # Fail fast if uv.lock has drifted from the pyproject.toml files (a
@@ -915,7 +915,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -925,7 +925,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Schema window gate
@@ -1013,7 +1013,7 @@ jobs:
           workspaces: cli
           shared-key: rust-test
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-nextest@0.9.146
       - name: Build and archive the tests
@@ -1065,7 +1065,7 @@ jobs:
       - name: Toolchain
         run: rustc --version
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-nextest@0.9.146
       # write_allowlist_bundle_passes_the_real_bundle_validator (AC3) shells out
@@ -1078,7 +1078,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -1088,7 +1088,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Install Helm for CLI consumer render tests
@@ -1146,7 +1146,7 @@ jobs:
         working-directory: cli
         run: rustc --version
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-nextest@0.9.146
       - name: Install Helm
@@ -2351,7 +2351,7 @@ jobs:
         if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: "Toolchain: Back off before retrying Install uv"
@@ -2361,7 +2361,7 @@ jobs:
           sleep 15
       - name: "Toolchain: Install uv (retry)"
         if: ${{ !cancelled() && needs.changes.outputs.images == 'true' && steps.install_uv.outcome == 'failure' }}
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: "Toolchain: Sync workspace"
@@ -2805,7 +2805,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Back off before retrying Install uv
         if: steps.install_uv.outcome == 'failure'
         run: |
@@ -2813,7 +2813,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       # Pushes to both release train branches omit kind. Pull requests into
       # either train select kind tiers by changed paths, because a regression
       # merged into next with kind omitted was first seen by the nightly run
@@ -3006,7 +3006,7 @@ jobs:
       - name: Install uv for publication proof
         id: install_uv_for_publication_proof
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv for publication proof
@@ -3016,7 +3016,7 @@ jobs:
           sleep 15
       - name: Install uv for publication proof (retry)
         if: steps.install_uv_for_publication_proof.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Prove publication Job adoption and failure reporting
@@ -3210,7 +3210,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -3220,7 +3220,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Pull Docker Hub images through the mirror
@@ -3344,7 +3344,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -3354,7 +3354,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Install Helm
@@ -3446,7 +3446,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -3456,7 +3456,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Install Helm
@@ -3709,7 +3709,7 @@ jobs:
       - name: Install uv for the connector readiness render
         id: install_uv_for_the_connector_readiness_render
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv for the connector readiness render
@@ -3719,7 +3719,7 @@ jobs:
           sleep 15
       - name: Install uv for the connector readiness render (retry)
         if: steps.install_uv_for_the_connector_readiness_render.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       # Connector readiness (#3338). The script defaults to k8scratch; this
@@ -4407,7 +4407,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -4417,7 +4417,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Sync workspace
@@ -5304,7 +5304,7 @@ jobs:
       - name: Install uv for the runtime assertion gate
         id: install_uv_for_the_runtime_assertion_gate
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Back off before retrying Install uv for the runtime assertion gate
         if: steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure'
         run: |
@@ -5312,7 +5312,7 @@ jobs:
           sleep 15
       - name: Install uv for the runtime assertion gate (retry)
         if: steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       # #3391: an added or changed charts/curie/ci/runtime assertion counts only
       # when a Calico cluster job this verdict needs runs it through the
       # receipt runner, and that exact blob left a pass receipt. The negative
@@ -5514,7 +5514,7 @@ jobs:
         id: install_uv_for_the_runtime_assertion_gate
         continue-on-error: true
         if: ${{ !cancelled() }}
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       # #3391: an added or changed charts/curie/ci/runtime assertion counts only
       # when a Calico cluster job this verdict needs runs it through the
       # receipt runner, and that exact blob left a pass receipt. Registration
@@ -5526,7 +5526,7 @@ jobs:
           sleep 15
       - name: Install uv for the runtime assertion gate (retry)
         if: ${{ !cancelled() && steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure' }}
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Download runtime assertion receipts
         if: ${{ !cancelled() && needs.changes.outputs.runtime_assertions != '[]' }}
         uses: actions/download-artifact@v8
@@ -5557,7 +5557,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -5567,7 +5567,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - run: uv sync --frozen

@@ -73,7 +73,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -83,7 +83,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       # Export the fully-resolved third-party dependency set from the frozen
