@@ -69,12 +69,32 @@ def _transport_harness() -> ModuleType:
     return module
 
 
+def joined(body: Any) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-12: run blocking work on a thread joined before return."""
+    failures: list[BaseException] = []
+
+    def target() -> None:
+        """@spec HTTP-INVOCATION-EXECUTION-12: relay the owned thread's failure."""
+        try:
+            body()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread.
+            failures.append(exc)
+
+    thread = threading.Thread(target=target, name="synthetic-concurrent-writer")
+    thread.start()
+    thread.join()
+    if failures:
+        raise failures[0]
+
+
 @pytest.fixture
 def synthetic_provider(tmp_path: Path) -> Iterator[SimpleNamespace]:
     """@spec HTTP-INVOCATION-EXECUTION-12/15: own TLS, thread, tasks and certificates."""
     harness = _transport_harness()
     stop, ready = threading.Event(), threading.Event()
-    provider = SimpleNamespace(member=True, requests=[], responses=[], errors=[])
+    provider = SimpleNamespace(
+        member=True, requests=[], responses=[], errors=[], during_lookup=None,
+    )
 
     async def serve() -> None:
         """@spec HTTP-INVOCATION-EXECUTION-12: all external observations are synthetic."""
@@ -87,6 +107,9 @@ def synthetic_provider(tmp_path: Path) -> Iterator[SimpleNamespace]:
                 """@spec HTTP-INVOCATION-EXECUTION-4/15: echo actual request scope/version."""
                 first, headers, raw = listener.requests[-1]
                 request = json.loads(raw)
+                if provider.during_lookup is not None:
+                    # Lookups run outside SQL, where another writer may commit meanwhile.
+                    joined(provider.during_lookup)
                 assert first == b"POST /lookup HTTP/1.1"
                 assert headers["authorization"] == "Bearer " + BEARER
                 assert "cookie" not in headers

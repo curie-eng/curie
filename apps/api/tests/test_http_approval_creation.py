@@ -394,7 +394,11 @@ def test_creation_repeats_fresh_provider_membership_instead_of_using_queued_perm
 def test_committed_change_during_actual_lookup_discards_captured_authority(
     creation_case: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, changed: str,
 ) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-9: same response bytes cannot be salvaged by recapture."""
+    """@spec HTTP-APPROVAL-CONTINUITY-9 HTTP-INVOCATION-EXECUTION-4: never salvaged.
+
+    Each bounded restart discards its bytes and looks up afresh; a change on
+    every attempt exhausts the bound.
+    """
     case = creation_case
     original = HttpIdentityClient.lookup
     observations = []
@@ -429,7 +433,7 @@ def test_committed_change_during_actual_lookup_discards_captured_authority(
 
     monkeypatch.setattr(HttpIdentityClient, "lookup", lookup)
     refused(post(case), 503, "authority_unavailable")
-    assert len(observations) == 1 and len(case.provider.requests) == 2
+    assert len(observations) == 3 and len(case.provider.requests) == 1 + 3
     assert rows(case.request["approval"]["dedupe_key"]) == []
 
 
