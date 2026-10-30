@@ -2094,6 +2094,19 @@ class SandboxSubstrate:
             # A 409 means the name is someone else's claim: never retire it.
             if created and not isinstance(exc, ClaimNameConflict):
                 self._retire_claim_quietly(name, env=env, daemon=False)
+            # Nothing was submitted under this name, so this attempt's own
+            # reservation is released now rather than after the reconcile grace.
+            if not created and reservation is not None and config.admission is not None:
+                try:
+                    self._affinity.admission_update(
+                        config.namespace, config.admission.quota_name, name, reservation, None
+                    )
+                except Exception as cleanup:  # noqa: BLE001 - the primary error wins
+                    logger.warning(
+                        "sandbox admission reservation of %s not released (%s)",
+                        name,
+                        type(cleanup).__name__,
+                    )
             # Only what this attempt created goes: its objects by uid, and the
             # marker and credential only if this attempt wrote them.
             try:
