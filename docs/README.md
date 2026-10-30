@@ -61,10 +61,10 @@ they are not substitutes for a supported quickstart.
 
 ## Administer Curie
 
-- [Administrator guide](administering-co-workers.md): access, approvals, model
-  configuration, budgets, memory, inspection, and stopping work.
-- [Production operator journey](production-operations.md): readiness, install,
-  verification, upgrades, recovery, and state protection.
+- [Administrator controls](administering-co-workers.md): decide access,
+  approvals, model settings, budgets, memory, inspection, and stop policy.
+- [Production operator journey](production-operations.md): follow the sequence
+  from cluster readiness through install, verification, upgrade, and recovery.
 - [Approvals](approvals.md): route binding, approver authority, and resumed turns.
 - [Operations](operations.md): cluster installation, credentials, egress, factory
   operation, upgrades, and operational limits.
