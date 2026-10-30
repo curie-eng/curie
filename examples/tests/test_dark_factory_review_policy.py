@@ -1802,3 +1802,25 @@ def test_protected_path_combined_symlinks_never_escape_the_github_check(
     out = s.edit_with("Edit", gate.edit_input("Edit", str(base / ".github" / "calc.py")))
 
     _assert_github_stop(s, gate.deny_reason(out))
+
+
+def test_protected_path_a_link_inside_github_cannot_hide_a_path_that_lands_in_it(
+    tmp_path: Path,
+) -> None:
+    s = _prompted(tmp_path)
+    _plan_approved(s)
+    github = s.cwd / ".github"
+    (github / "nested" / "deep").mkdir(parents=True)
+    (github / "workflows").mkdir()
+    # Lexically ``workflows/ci.yaml``; resolved through the link, ``.github/workflows/ci.yaml``.
+    os.symlink("nested/deep", github / "jump")
+
+    # The same link leading out of .github to an ordinary file stays allowed.
+    outward = github / "jump" / ".." / ".." / ".." / SOURCE
+    assert gate.allowed(s.edit_with("Edit", gate.edit_input("Edit", str(outward))))
+    assert _gates(s, "github_path_refused") == []
+
+    inward = github / "jump" / ".." / ".." / "workflows" / "ci.yaml"
+    out = s.edit_with("Edit", gate.edit_input("Edit", str(inward)))
+
+    _assert_github_stop(s, gate.deny_reason(out))

@@ -67,10 +67,11 @@ One script handles every hook event the bundle registers:
     every phase. The path is resolved one component at a time, following
     every symlink, and refused when a step is ``.github`` (matched
     case-insensitively) directly under the real workspace that the rest of
-    the path does not leave again, so neither a
-    ``.github`` symlink, a workspace alias, a link back to the root nor
-    ``..`` escapes it; its lexically normalized form is checked the same
-    way. No repository edit before the workflow is loaded and
+    the path does not leave again, or when the path lands under the real
+    workspace's ``.github``, so neither a ``.github`` symlink, a workspace
+    alias, a link back to the root, a link inside ``.github`` nor ``..``
+    escapes it; its lexically normalized form is checked the same way. No
+    repository edit before the workflow is loaded and
     the plan review completed (either verdict), and none the timing refuses
     (that refusal writes ``timing_refused``, not ``edit_refused``). Right
     after the plan review (phase ``failing_test``) only test edits may
@@ -616,10 +617,12 @@ def _github_path(path: str, workspace: str) -> str | None:
     The path, joined to the real workspace, is resolved one component at a
     time as the kernel does, following every symlink, and refused when a step
     is ``.github`` directly under the real workspace and the rest of the path
-    does not leave it again (``.github/../pkg`` is ``pkg``). That holds through a
-    workspace alias, a link back to the root and ``..``, and whether
-    ``.github`` itself is a directory or a symlink. Its lexically normalized
-    form, which an editor may write instead, is walked the same way.
+    does not leave it again (``.github/../pkg`` is ``pkg``), or when the path
+    lands under the real workspace's ``.github``. That holds through a
+    workspace alias, a link back to the root, a link inside ``.github`` and
+    ``..``, and whether ``.github`` itself is a directory or a symlink. Its
+    lexically normalized form, which an editor may write instead, is walked
+    the same way.
     """
     if not path or not workspace:
         return None
@@ -633,7 +636,8 @@ def _github_path(path: str, workspace: str) -> str | None:
 
 def _github_step(path: str, root: str) -> str | None:
     """The rest of ``path``, normalized, from a ``.github`` step under ``root``
-    that the rest does not leave again."""
+    that the rest does not leave again, else where it lands under
+    ``root/.github``."""
     pending = list(reversed(Path(path).parts))
     current, hops = os.sep, 0
     while pending:
@@ -657,6 +661,14 @@ def _github_step(path: str, root: str) -> str | None:
             else:
                 hops += 1
                 pending.extend(reversed(Path(target).parts))
+    # Where the path lands, which a link inside ``.github`` can make differ
+    # from what its lexical rest says.
+    try:
+        landed = Path(current).relative_to(root)
+    except ValueError:
+        return None
+    if landed.parts and landed.parts[0].casefold() == ".github":
+        return landed.as_posix()
     return None
 
 
