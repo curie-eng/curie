@@ -87,8 +87,8 @@ def test_the_dark_factory_bundle_declares_nine_phases_and_three_loops() -> None:
     assert declared is not None
     assert [phase["id"] for phase in declared["phases"]] == BUNDLE_PHASES
     assert [(loop["start"], loop["review"], loop["cap"]) for loop in declared["loops"]] == [
-        ("plan", "plan_review", 3),
-        ("implement", "review_diff", 3),
+        ("plan", "plan_review", 1),
+        ("implement", "review_diff", 5),
         ("implement", "wait_ci", 3),
     ]
     assert [(stage["id"], stage["phases"]) for stage in declared["stages"]] == [
@@ -222,18 +222,20 @@ def test_a_valid_report_posts_the_wire_body_with_the_token_header() -> None:
     async def go() -> dict[str, Any]:
         async with TestServer(recorder.app()) as server:
             tool = _tool(str(server.make_url("/v1/work-item-progress/example-request")), activity)
-            return await tool.handler({"phase": "plan", "note": "Drafting the plan", "round": 2})
+            return await tool.handler(
+                {"phase": "review_diff", "note": "Reviewing the diff", "round": 2}
+            )
 
     result = anyio.run(go)
     assert result.get("is_error") is not True
-    assert _text(result) == "recorded plan"
+    assert _text(result) == "recorded review_diff"
     assert len(recorder.received) == 1
     body, key = recorder.received[0]
     assert key == TOKEN
     declared = load_phase_declaration(BUNDLE)
     assert body == {
-        "phase": "plan",
-        "note": "Drafting the plan",
+        "phase": "review_diff",
+        "note": "Reviewing the diff",
         "round": 2,
         "declaration": declared,
         "activity": {

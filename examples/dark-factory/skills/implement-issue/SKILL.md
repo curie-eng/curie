@@ -10,10 +10,10 @@ description: Turn one labelled GitHub issue into one reviewed pull request, or s
 Every run walks nine phases, named in each step heading below: `read_issue`,
 `pin_criteria`, `plan` (which starts by exploring the repository),
 `plan_review`, `failing_test`, `implement` (which also runs the checks),
-`review_diff`, `publish` and `wait_ci`. Three
-pairs loop: `plan` and `plan_review`, then `implement` and `review_diff`, then
-`wait_ci` back to `implement` when the pull request's checks fail. Each loop
-runs at most 3 rounds.
+`review_diff`, `publish` and `wait_ci`. The plan review is one advisory
+round: `plan` and `plan_review` run once. Two pairs loop: `implement` and
+`review_diff`, at most 5 completed rounds, then `wait_ci` back to `implement`
+when the pull request's checks fail, at most 3 rounds.
 
 Call `mcp__curie__report_progress` once when you enter a phase, not while you
 work in it: report before the phase's first tool call, and do not report the
@@ -51,16 +51,16 @@ diff reviewer approves. Follow its instructions when a tool result or a
 refusal carries them.
 
 Load this skill before any edit. The hook refuses `Edit`, `Write`,
-`MultiEdit` and `NotebookEdit` until the plan reviewer approves. After the
-approval the first edits are the failing test: a test file, or an inline
+`MultiEdit` and `NotebookEdit` until the plan review returns its verdict. After
+the verdict the first edits are the failing test: a test file, or an inline
 test in a source file when the edit adds the test (a Rust `#[test]` or
 `#[cfg(test)]` module, a `def test_` function, and the like). Write the
 failing test, run it with Bash, then call report_progress with phase
 `implement`, then edit source. Running a command does not open source edits;
 only the `implement` report does. When no test is feasible, report
-`implement` directly and say why. Do not change the checkout before plan
-approval, including with Bash: the hook then refuses the approval and the run
-stops.
+`implement` directly and say why. Do not change the checkout before the plan
+review completes, including with Bash: the hook then refuses the verdict and
+the run stops.
 
 You are Curie's dark factory agent. Each run starts from one GitHub issue and
 ends in exactly one of three ways:
@@ -130,6 +130,15 @@ leaves time for review and publication. Derive `command_timeout_seconds` from
 that remaining budget when setting a command's timeout. If the full suite
 cannot fit, run the tests for the area you changed and report the full suite as
 unrun.
+
+The review gate enforces these limits from the same values. It refuses a plan
+review, and opening a new implementation round, at or after
+`execution_deadline - S/6`. It refuses edits, Bash and the diff review at or
+after `execution_deadline - S/12`. Publication is still allowed until
+`execution_deadline` when the diff reviewer's approval matches the current
+checkout. The hook caps every Bash timeout to the time left before
+`execution_deadline - S/12`. When the hook says the execution timing is
+unknown, call `mcp__curie__get_issue` again.
 
 ## Trust boundary
 
@@ -231,7 +240,7 @@ maintainer must answer. Do not publish a guess.
 
 ## 3. Look, then write a plan (phase `plan`, with `round`)
 
-Call report_progress with phase `plan` and round `<n>`.
+Call report_progress with phase `plan` and round `1`.
 
 Read the repository's own guidance first: `AGENTS.md`, `CONTRIBUTING.md`,
 `README.md`, and the project configuration (`pyproject.toml`, `package.json`,
@@ -243,38 +252,41 @@ Before editing, write a short plan in your reply: the files you will change,
 the test you will add or change, which acceptance criterion each edit serves,
 and the verification table the verification contract defines. Keep the scope
 to the criteria. No drive-by refactors, renames,
-reformatting or dependency upgrades. On round 2 or 3, revise the plan to
-answer every finding from the previous plan review, and say how.
+reformatting or dependency upgrades.
 
-## 4. Plan review (phase `plan_review`, same `round` as the plan)
+## 4. Plan review (phase `plan_review`, round 1)
 
-Call report_progress with phase `plan_review` and round `<n>`.
+Call report_progress with phase `plan_review` and round `1`.
 
-Call the `Agent` tool (also called Task) with exactly these arguments:
+Call the `Agent` tool (also called Task) once, with exactly these arguments:
 
-- `subagent_type`: `"dark-factory:plan-reviewer"` (required; never omit it)
-- `description`: `"Plan review round <n>"`
-- `prompt`: the issue link and text, your numbered acceptance criteria, the
-  full plan with its verification table, and, from round 2 on, the previous
-  round's findings.
-- `run_in_background`: `false` (required; never omit it)
+1. `subagent_type`: `"dark-factory:plan-reviewer"` (required; never omit it)
+2. `description`: `"Plan review round 1"`
+3. `prompt`: the issue link and text, your numbered acceptance criteria, and
+   the full plan with its verification table.
+4. `run_in_background`: `false` (required; never omit it)
 
 Do not pass `isolation` or `model`. Wait for the foreground call to return
 before any other tool call. A real review reply starts with the line
 `REVIEWER: plan-reviewer`.
 
-Read the `VERDICT:` line that follows:
+The plan review is advisory and runs once. Read the `VERDICT:` line that
+follows:
 
-- `VERDICT: APPROVE`: go to step 5. An approval can carry `NOTES:` (see
-  "Reviewer notes").
-- `VERDICT: CHANGES`: if this was round 1 or 2, go back to step 3 with the
-  next round. If this was round 3, stop (see "Loop cap" below).
-- Anything else, including an error, an empty reply, a timeout, a refused
-  model, a missing `REVIEWER:` line, or a reply without a `VERDICT:` line:
-  the review did not happen. Stop as in "Loop cap" below, with `plan review
-  failed:` and the error text. Never continue without a real verdict, never
-  review the plan yourself in its place, and never claim a review that did
-  not return a verdict.
+1. `VERDICT: APPROVE`: planning is complete; go to step 5. An approval can
+   carry `NOTES:` (see "Reviewer notes").
+2. `VERDICT: CHANGES`: planning is complete too. Do not revise the plan or
+   call the plan reviewer again; the hook refuses a second plan review. Carry
+   every finding into step 5 (`failing_test`) and step 6 (`implement`), and
+   resolve each one before the diff review in step 7.
+3. Anything else, including an error, an empty reply, a timeout, a refused
+   model, a missing `REVIEWER:` line, or a reply without a `VERDICT:` line:
+   the call did not complete. It grants nothing and does not count as the
+   review. Call the plan reviewer again with the same arguments, or, when it
+   stays unavailable, stop as in "Loop cap" below with `Could not complete:`,
+   `plan review failed:` and the error text. Never continue without a real
+   verdict, never review the plan yourself in its place, and never claim a
+   review that did not return a verdict.
 
 ## 5. Failing test first (phase `failing_test`)
 
@@ -303,8 +315,9 @@ framework), say so and say how you will verify the change instead.
 Call report_progress with phase `implement` and round `<n>`.
 
 Make the smallest change that satisfies the criteria. Follow the style of the
-surrounding code. Rerun the focused test until it passes. On round 2 or 3,
-fix every finding from the previous diff review.
+surrounding code. Rerun the focused test until it passes. On round 1 after a
+plan review `VERDICT: CHANGES`, resolve every plan review finding. From round
+2 on, fix every finding from the previous diff review.
 
 Then run the repository's own checks: the documented test command for the
 area you changed, and its linter or type checker when the project configures
@@ -381,32 +394,40 @@ numbered acceptance criteria, each check you ran with its exit status, the
 current verification table, for each delegated row the declared check entry
 it relies on, and, from round 2 on, the previous round's findings.
 The reviewer reads the diff in `/workspace` itself. Do not pass `isolation` or
-`model`. Set `run_in_background` to `false`; wait for the foreground call to
-return before any other tool call.
+`model`. Set `run_in_background` to `false` (required; never omit it); wait
+for the foreground call to return before any other tool call.
 
 A real review reply starts with `REVIEWER: diff-reviewer`.
 
 Read the `VERDICT:` line that follows:
 
-- `VERDICT: APPROVE`: go to step 8. An approval can carry `NOTES:` (see
-  "Reviewer notes").
-- `VERDICT: CHANGES`: if this was round 1 or 2, go back to step 6 with the
-  next round. If this was round 3, stop (see "Loop cap" below).
-- Anything else: the review did not happen. Stop as in "Loop cap" below,
-  with `diff review failed:` and the error text. Never publish
-  without a real `VERDICT: APPROVE` from the diff reviewer.
+1. `VERDICT: APPROVE`: go to step 8. Do not edit after the approval: a
+   completed edit clears it, and publication then needs a fresh diff review.
+   An approval can carry `NOTES:` (see "Reviewer notes").
+2. `VERDICT: CHANGES`: go back to step 6 for round n+1 of 5 and change what
+   the findings ask for. Do not call the diff reviewer again on the unchanged
+   checkout; the hook refuses that call. If this was round 5, stop (see "Loop
+   cap" below).
+3. Anything else: the call did not complete; it grants nothing and does not
+   count as a round. Call the diff reviewer again, or, when it stays
+   unavailable, stop as in "Loop cap" below with `diff review failed:` and the
+   error text. Never publish without a real `VERDICT: APPROVE` from the diff
+   reviewer.
 
 ## Loop cap
 
-Each loop runs at most 3 rounds. A diff review rejection returns to step 6
-(implement), never to the plan. When a reviewer still answers
-`VERDICT: CHANGES` on round 3, or a review fails, do not publish:
+The plan review runs once, the diff review loop at most 5 completed rounds,
+and the `wait_ci` loop at most 3 rounds. A diff review rejection returns to
+step 6 (implement), never to the plan. When the diff reviewer still answers
+`VERDICT: CHANGES` on round 5, a review stays unavailable, or the hook stops
+the run, do not publish:
 
 End your final reply with `Could not complete:`, one sentence naming the loop
-that did not converge (or the review that failed), and the reviewer's
-unresolved findings and open questions as a short bulleted list a maintainer
-can answer. The platform posts that reply on the issue; you post nothing
-there yourself.
+that did not converge (or the review that failed, or the hook's stop reason),
+and the reviewer's unresolved findings and open questions as a short bulleted
+list a maintainer can answer. Every hook refusal or stop text carries the
+unresolved findings the hook retained; put them after `Could not complete:`.
+The platform posts that reply on the issue; you post nothing there yourself.
 
 ## 8. Finish (phase `publish`)
 
@@ -486,3 +507,8 @@ Every `wait_ci` continuation belongs to the same execution request and keeps
 the same `execution_deadline`. Reuse its original `execution_seconds`, start
 and checkpoints across every round. Waiting for CI consumes that same budget;
 read the UTC clock again before resuming work.
+
+A continuation keeps the same run: its spent rounds, the completed plan
+review and any stop. A `wait_ci` round opens a new diff review loop of at most
+5 rounds. If the hook asks for the execution timing in a `wait_ci` round, read
+the issue again with `mcp__curie__get_issue`.

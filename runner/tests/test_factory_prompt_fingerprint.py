@@ -79,7 +79,9 @@ class CaptureRun:
         return str(self.helpers.context_of(outs[0]))
 
     def state(self) -> dict[str, Any]:
-        path = Path(self.session.env["DARK_FACTORY_STATE_DIR"]) / "sess-fresh.json"
+        # The hook keys its state on the Curie session when the runner sets one.
+        key = self.run.env.get("CURIE_SESSION_ID") or "sess-fresh"
+        path = Path(self.session.env["DARK_FACTORY_STATE_DIR"]) / f"{key}.json"
         state: dict[str, Any] = json.loads(path.read_text())
         return state
 
@@ -159,6 +161,7 @@ def test_transient_capture_failure_recovers_before_review(
     assert c.calls(captures_only=True) == 2
     assert c.state()["fingerprint"] is not None
     assert c.state()["plan"]["round"] == 0
+    c.run.read_issue()
 
     decision = c.plan()
     assert decision["permissionDecision"] == "allow"
@@ -200,9 +203,13 @@ def test_capture_interruption_saves_reset_and_cannot_capture_later(
 ) -> None:
     c = capture_run
     c.prompt()
+    c.run.read_issue()
     assert "APPROVED" in c.run.review(c.helpers.PLAN, "APPROVE")
     assert "APPROVED" in c.run.review(c.helpers.DIFF, "APPROVE")
     c.case(case)
+    # A prompt in the same session continues that run and takes no new
+    # fingerprint, so the next run is a new Curie session's first prompt.
+    c.run.env["CURIE_SESSION_ID"] = "curie-next-run"
     with pytest.raises(subprocess.CalledProcessError):
         c.prompt()
 
@@ -232,11 +239,13 @@ def test_a_fresh_prompt_recovers_round_one_and_still_checks_for_changes(
     c.case("healthy")
     assert c.helpers.contract() in c.prompt()
     assert c.state()["plan"] == {"round": 0, "verdict": None}
+    c.run.read_issue()
     if mutate:
         assert c.run.bash("printf '\nLATER = True\n' >> pkg/calc.py") == 0
 
     context = c.run.review(c.helpers.PLAN, "APPROVE")
-    assert c.state()["plan"]["round"] == 1
+    # The recovered run reaches plan review round 1.
+    assert c.session.phases() == [("plan_review", 1)]
     if mutate:
         assert context.startswith("STOP.")
         assert "checkout_changed_before_plan_approval" in context
@@ -244,7 +253,7 @@ def test_a_fresh_prompt_recovers_round_one_and_still_checks_for_changes(
         assert c.run.decision(c.helpers.PUBLISH) == "deny"
     else:
         assert "APPROVED" in context
-        assert c.state()["plan"]["verdict"] == "APPROVE"
+        assert c.state()["plan"] == {"round": 1, "verdict": "APPROVE"}
 
 
 def test_task_notification_preserves_the_baseline_without_recapturing(
@@ -252,6 +261,7 @@ def test_task_notification_preserves_the_baseline_without_recapturing(
 ) -> None:
     c = capture_run
     c.prompt()
+    c.run.read_issue()
     assert "APPROVED" in c.run.review(c.helpers.PLAN, "APPROVE")
     before, calls = c.state(), c.calls()
     c.case("fail")
@@ -283,6 +293,7 @@ def test_ci_fix_round_needs_no_initial_fingerprint(capture_run: CaptureRun) -> N
     assert c.calls() == 0
     assert c.state()["stage"] == "implement"
     assert c.state()["fingerprint"] is None
+    c.run.read_issue()
     assert c.plan()["permissionDecision"] == "deny"
     denied = c.run.pre(
         "Agent",
