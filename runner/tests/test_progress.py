@@ -87,8 +87,8 @@ def test_the_dark_factory_bundle_declares_nine_phases_and_three_loops() -> None:
     assert declared is not None
     assert [phase["id"] for phase in declared["phases"]] == BUNDLE_PHASES
     assert [(loop["start"], loop["review"], loop["cap"]) for loop in declared["loops"]] == [
-        ("plan", "plan_review", 3),
-        ("implement", "review_diff", 3),
+        ("plan", "plan_review", 1),
+        ("implement", "review_diff", 5),
         ("implement", "wait_ci", 3),
     ]
     assert [(stage["id"], stage["phases"]) for stage in declared["stages"]] == [

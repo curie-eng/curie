@@ -103,8 +103,8 @@ def test_progress_declaration_defines_ordered_phases_labels_loops_and_stages() -
     for phase in declared["phases"]:
         assert 1 <= len(phase["label"]) <= 40, phase
     assert declared["loops"] == [
-        {"start": "plan", "review": "plan_review", "cap": 3},
-        {"start": "implement", "review": "review_diff", "cap": 3},
+        {"start": "plan", "review": "plan_review", "cap": 1},
+        {"start": "implement", "review": "review_diff", "cap": 5},
         {"start": "implement", "review": "wait_ci", "cap": 3},
     ]
     assert declared["stages"] == [

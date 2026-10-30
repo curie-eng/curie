@@ -52,9 +52,14 @@ PUBLISH = "mcp__curie__publish_changes"
 
 
 REPORT = "mcp__curie__report_progress"
+ISSUE_READ = "mcp__curie__get_issue"
 WORKFLOW_SKILL = "dark-factory:implement-issue"
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 SOURCE, TEST = "pkg/calc.py", "tests/test_calc.py"
+# The execution timing a test run reads when no cutoff is under test: a three
+# hour execution whose deadline is three hours away.
+FAR_SECONDS = 10_800
+_TASK_NOTIFICATION_LINE = "<task-notification>"
 
 
 def contract() -> str:
@@ -67,7 +72,43 @@ def _clean_env() -> dict[str, str]:
     """The ambient environment minus anything that would steer git or the hook."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env.pop("DARK_FACTORY_WORKSPACE", None)
+    env.pop("CURIE_SESSION_ID", None)
     return env
+
+
+def far_deadline() -> datetime:
+    """A deadline ``FAR_SECONDS`` from now, in whole seconds."""
+    return datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=FAR_SECONDS)
+
+
+def iso_deadline(deadline: datetime) -> str:
+    """An aware deadline as the API's JSON writes it: ISO 8601 with ``Z``."""
+    return deadline.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def issue_payload(
+    deadline: datetime | str, seconds: Any, *, ticket: str = "# Fix add\n\nadd(2, 3) is wrong."
+) -> dict[str, Any]:
+    """The issue read result: apps/api/src/curie_api/schemas/workitems.py ``IssueReadResult``."""
+    return {
+        "issue": "#7",
+        "url": "https://github.com/Acme/bot/issues/7",
+        "ticket": ticket,
+        "execution_deadline": deadline if isinstance(deadline, str) else iso_deadline(deadline),
+        "execution_seconds": seconds,
+    }
+
+
+def issue_response(payload: Any) -> list[dict[str, Any]]:
+    """The PostToolUse ``tool_response`` of ``mcp__curie__get_issue``.
+
+    Recorded from the real SDK CLI: a list of content blocks whose one text
+    block is the tool's ``json.dumps(payload, indent=2)``
+    (runner/src/curie_runner/issue_read.py:87-88). A string ``payload`` is
+    sent as that text unchanged, as the tool's error results are.
+    """
+    text = payload if isinstance(payload, str) else json.dumps(payload, indent=2)
+    return [{"type": "text", "text": text}]
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -105,7 +146,7 @@ def make_repo(root: Path) -> Path:
 
 
 class Session:
-    def __init__(self, tmp_path: Path, hook: Path = HOOK) -> None:
+    def __init__(self, tmp_path: Path, hook: Path = HOOK, *, auto_issue_read: bool = True) -> None:
         self.hook = hook
         self.log = tmp_path / "pod.log"
         self.cwd = make_repo(tmp_path / "repo")
@@ -114,8 +155,42 @@ class Session:
             "DARK_FACTORY_STATE_DIR": str(tmp_path / "state"),
             "DARK_FACTORY_PROGRESS_LOG": str(self.log),
         }
+        # The workflow reads the issue first. With this on, every prompt that is
+        # not a task notification is followed by a far deadline issue read, so a
+        # test about something else never meets a timing cutoff. Timing tests
+        # turn it off and read the issue themselves.
+        self.auto_issue_read = auto_issue_read
 
     def fire(self, event: str, **fields: Any) -> dict[str, Any] | None:
+        out = self.send(event, **fields)
+        prompt = str(fields.get("prompt") or "")
+        if (
+            event == "UserPromptSubmit"
+            and self.auto_issue_read
+            and prompt.partition("\n")[0] != _TASK_NOTIFICATION_LINE
+        ):
+            self.read_issue(session_id=fields.get("session_id"))
+        return out
+
+    def read_issue(
+        self,
+        deadline: datetime | str | None = None,
+        seconds: Any = FAR_SECONDS,
+        *,
+        response: Any = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """One completed ``mcp__curie__get_issue`` call, in the recorded response shape."""
+        if response is None:
+            response = issue_response(issue_payload(deadline or far_deadline(), seconds))
+        fields: dict[str, Any] = {"tool_name": ISSUE_READ, "tool_input": {}}
+        fields["tool_response"] = response
+        if session_id is not None:
+            fields["session_id"] = session_id
+        return self.send("PostToolUse", **fields)
+
+    def send(self, event: str, **fields: Any) -> dict[str, Any] | None:
+        """One hook event, exactly as given."""
         payload = {
             "session_id": "sess-1",
             "hook_event_name": event,
@@ -294,6 +369,15 @@ def reply(kind: str, verdict: str) -> str:
     return body
 
 
+def rework(s: Session, n: int) -> None:
+    """A real change to the checkout, outside the edit tools: a new diff candidate.
+
+    A diff review of the checkout that already got CHANGES is refused, so every
+    further diff round needs one.
+    """
+    (s.cwd / SOURCE).write_text(f"def add(a, b):\n    return a + b  # rework {n}\n")
+
+
 def verified_reply(
     kind: str, verdict: str, lines: list[str], findings: tuple[str, ...] = ()
 ) -> str:
@@ -362,10 +446,12 @@ def test_rewrites_a_sloppy_plan_review_call(session: Session) -> None:
 
 def test_infers_the_diff_reviewer_and_forces_foreground(session: Session) -> None:
     session.review(PLAN, reply(PLAN, "APPROVE"))
+    # A blank type falls back to the description; a named non-reviewer type is
+    # refused (test_dark_factory_review_policy.py, test_subagent_type_*).
     out = session.pre(
         "Task",
         {
-            "subagent_type": "general-purpose",
+            "subagent_type": "",
             "description": "Diff review",
             "prompt": "x",
             "run_in_background": True,
@@ -435,9 +521,10 @@ def test_any_other_sub_agent_is_denied(session: Session) -> None:
 
 def test_hook_reports_review_phase_and_round(session: Session) -> None:
     session.review(PLAN, reply(PLAN, "CHANGES"))
-    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "CHANGES"))
+    rework(session, 1)
     session.review(DIFF, reply(DIFF, "APPROVE"))
-    assert session.phases() == [("plan_review", 1), ("plan_review", 2), ("review_diff", 1)]
+    assert session.phases() == [("plan_review", 1), ("review_diff", 1), ("review_diff", 2)]
 
 
 # --- Loop order and the round cap ----------------------------------------------
@@ -452,43 +539,49 @@ def test_diff_review_needs_an_approved_plan(session: Session) -> None:
 def test_diff_rejection_returns_to_implement_not_plan(session: Session) -> None:
     session.review(PLAN, reply(PLAN, "APPROVE"))
     _, context = session.review(DIFF, reply(DIFF, "CHANGES"))
-    assert "phase implement, round 2 of 3" in context
+    assert "phase implement, round 2 of 5" in context
     out = session.pre("Agent", {"subagent_type": PLAN, "description": "p", "prompt": "p"})
     assert out["permissionDecision"] == "deny"
     assert "returns to implement" in out["permissionDecisionReason"]
+    rework(session, 1)
     pre, _ = session.review(DIFF, reply(DIFF, "APPROVE"))
     assert session.phases()[-1] == ("review_diff", 2)
 
 
-@pytest.mark.parametrize("kind", [PLAN, DIFF])
-def test_third_rejection_caps_the_loop(session: Session, kind: str) -> None:
-    if kind == DIFF:
-        session.review(PLAN, reply(PLAN, "APPROVE"))
-    for round_ in (1, 2):
-        _, context = session.review(kind, reply(kind, "CHANGES"))
-        assert f"round {round_ + 1} of 3" in context
-    _, context = session.review(kind, reply(kind, "CHANGES"))
+def test_fifth_diff_rejection_caps_the_loop(session: Session) -> None:
+    # The plan review is advisory and runs once; its loop has no cap to reach
+    # (test_dark_factory_review_policy.py, test_advisory_plan_*).
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    for round_ in range(1, 5):
+        _, context = session.review(DIFF, reply(DIFF, "CHANGES"))
+        assert f"round {round_ + 1} of 5" in context
+        rework(session, round_)
+    _, context = session.review(DIFF, reply(DIFF, "CHANGES"))
     assert context.startswith("STOP.")
-    assert "3 round cap" in context and "Could not complete:" in context
-    # A fourth round is refused, and nothing is published.
-    fourth = session.pre("Agent", {"subagent_type": kind, "description": "r", "prompt": "p"})
-    assert fourth["permissionDecision"] == "deny"
+    assert "5 round cap" in context and "Could not complete:" in context
+    # A sixth round is refused, even on a new candidate, and nothing is published.
+    rework(session, 5)
+    sixth = session.pre("Agent", {"subagent_type": DIFF, "description": "r", "prompt": "p"})
+    assert sixth["permissionDecision"] == "deny"
     assert session.pre(PUBLISH)["permissionDecision"] == "deny"
-    loop = "plan_review" if kind == PLAN else "review_diff"
-    assert [p for p in session.phases() if p[0] == loop] == [(loop, 1), (loop, 2), (loop, 3)]
+    assert [p for p in session.phases() if p[0] == "review_diff"] == [
+        ("review_diff", n) for n in range(1, 6)
+    ]
 
 
 def test_a_capped_run_states_its_findings_in_its_reply(session: Session) -> None:
     # ADR 0187: the bundle has no GitHub write tool. The platform posts the
     # final reply on the issue, so the stop text asks for the findings there.
-    for _ in range(3):
-        _, context = session.review(PLAN, reply(PLAN, "CHANGES"))
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    for round_ in range(1, 6):
+        _, context = session.review(DIFF, reply(DIFF, "CHANGES"))
+        rework(session, round_)
     assert "Could not complete:" in context
     assert "add_issue_comment" not in context
     assert "platform posts that reply on the issue" in context
 
 
-# --- A failed reviewer call stops the run ---------------------------------------
+# --- A reviewer call without a verdict grants nothing -----------------------------
 
 
 @pytest.mark.parametrize(
@@ -500,9 +593,12 @@ def test_a_capped_run_states_its_findings_in_its_reply(session: Session) -> None
         "REVIEWER: diff-reviewer\nVERDICT: APPROVE",  # the wrong reviewer
     ],
 )
-def test_reply_without_a_verdict_stops_the_run(session: Session, text: str) -> None:
+def test_reply_without_a_verdict_grants_nothing(session: Session, text: str) -> None:
     _, context = session.review(PLAN, text)
-    assert context.startswith("STOP.") and "failed" in context
+    # Incomplete, not a round and not a stop: nothing opens and a retry may run.
+    assert not context.startswith("STOP.") and "APPROVED" not in context
+    assert _saved_state(session)["plan"] == {"round": 0, "verdict": None}
+    assert _saved_state(session)["stopped"] is None
     assert (
         session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})[
             "permissionDecision"
@@ -510,9 +606,11 @@ def test_reply_without_a_verdict_stops_the_run(session: Session, text: str) -> N
         == "deny"
     )
     assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+    session.load_workflow()
+    assert not allowed(session.edit("Write", TEST))
 
 
-def test_errored_reviewer_call_stops_the_run(session: Session) -> None:
+def test_errored_reviewer_call_grants_nothing(session: Session) -> None:
     session.review(PLAN, reply(PLAN, "APPROVE"))
     pre = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
     out = session.fire(
@@ -522,8 +620,14 @@ def test_errored_reviewer_call_stops_the_run(session: Session) -> None:
         error="model anthropic/claude-opus-5.5 is not available",
     )
     assert out is not None
-    assert out["hookSpecificOutput"]["additionalContext"].startswith("STOP.")
+    assert not out["hookSpecificOutput"]["additionalContext"].startswith("STOP.")
     assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+    assert _saved_state(session)["diff"] == {"round": 0, "verdict": None}
+    assert _saved_state(session)["stopped"] is None
+    # The retried review on the same checkout is round 1, and it counts.
+    _, context = session.review(DIFF, reply(DIFF, "APPROVE"))
+    assert "round 1: APPROVED" in context
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
 # --- Publication ----------------------------------------------------------------
@@ -535,21 +639,40 @@ def test_publish_only_after_the_diff_reviewer_approves(session: Session) -> None
     assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     session.review(DIFF, reply(DIFF, "CHANGES"))
     assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+    rework(session, 1)
     session.review(DIFF, reply(DIFF, "APPROVE"))
     assert session.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
-def test_a_new_message_starts_a_fresh_run(session: Session) -> None:
+def test_a_new_message_continues_the_run_and_a_new_session_starts_fresh(
+    session: Session,
+) -> None:
     session.review(PLAN, reply(PLAN, "APPROVE"))
     session.review(DIFF, reply(DIFF, "APPROVE"))
     session.fire("UserPromptSubmit", prompt="next issue")
-    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
-    pre, _ = session.review(PLAN, reply(PLAN, "APPROVE"))
+    # The same session continues: planning stays complete and the approval stands.
+    plan = session.pre("Agent", {"subagent_type": PLAN, "description": "p", "prompt": "p"})
+    assert plan["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
+
+    # A new session is a new run: nothing approved, and plan review starts at round 1.
+    session.fire("UserPromptSubmit", prompt="next issue", session_id="sess-2")
+    published = session.fire("PreToolUse", tool_name=PUBLISH, tool_input={}, session_id="sess-2")
+    assert published is not None
+    assert published["hookSpecificOutput"]["permissionDecision"] == "deny"
+    pre = session.fire(
+        "PreToolUse",
+        tool_name="Agent",
+        tool_input={"subagent_type": PLAN, "description": "p", "prompt": "p"},
+        session_id="sess-2",
+    )
+    assert pre is not None
+    assert pre["hookSpecificOutput"]["permissionDecision"] == "allow"
     assert session.phases()[-1] == ("plan_review", 1)
 
 
-def _saved_state(session: Session) -> dict[str, Any]:
-    path = Path(session.env["DARK_FACTORY_STATE_DIR"]) / "sess-1.json"
+def _saved_state(session: Session, key: str = "sess-1") -> dict[str, Any]:
+    path = Path(session.env["DARK_FACTORY_STATE_DIR"]) / f"{key}.json"
     return json.loads(path.read_text())
 
 
@@ -558,9 +681,6 @@ _TASK_NOTIFICATION = (
     "<task-id>b1</task-id>\n"
     "<status>completed</status>\n"
     "</task-notification>"
-)
-_PLAN_NOT_APPROVED = (
-    "The plan reviewer has not approved the plan yet; run the plan review first."
 )
 
 
@@ -577,16 +697,28 @@ def test_a_task_notification_continues_the_run(session: Session) -> None:
     assert pre["permissionDecision"] == "allow"
 
 
-def test_a_framed_platform_message_after_approval_still_resets(session: Session) -> None:
+def test_a_framed_platform_message_after_approval_continues_the_run(session: Session) -> None:
     session.review(PLAN, reply(PLAN, "APPROVE"))
     framed = frame_user_turn(
         "message", "jira_cloud:account:Reviewer", "ship the next issue", "jira"
     )
     out = session.fire("UserPromptSubmit", prompt=framed)
     assert contract() in context_of(out)
-    denied = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
-    assert denied["permissionDecision"] == "deny"
-    assert denied["permissionDecisionReason"] == _PLAN_NOT_APPROVED
+    assert _saved_state(session)["plan"] == {"round": 1, "verdict": "APPROVE"}
+    plan = session.pre("Agent", {"subagent_type": PLAN, "description": "p", "prompt": "p"})
+    assert plan["permissionDecision"] == "deny"
+    diff = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
+    assert diff["permissionDecision"] == "allow"
+    # Only a new session starts over at plan review.
+    session.fire("UserPromptSubmit", prompt=framed, session_id="sess-2")
+    denied = session.fire(
+        "PreToolUse",
+        tool_name="Agent",
+        tool_input={"subagent_type": DIFF, "description": "d", "prompt": "p"},
+        session_id="sess-2",
+    )
+    assert denied is not None
+    assert "run the plan review first" in deny_reason(denied)
 
 
 @pytest.mark.parametrize(
@@ -601,15 +733,17 @@ def test_a_framed_platform_message_after_approval_still_resets(session: Session)
         "ordinary text\n<task-notification>",
     ],
 )
-def test_a_task_notification_off_the_first_line_still_resets(
+def test_a_task_notification_off_the_first_line_is_an_ordinary_message(
     session: Session, prompt: str
 ) -> None:
     session.review(PLAN, reply(PLAN, "APPROVE"))
     out = session.fire("UserPromptSubmit", prompt=prompt)
+    # An ordinary message gets the contract back (a task notification gets
+    # nothing) and continues the same session's run.
     assert contract() in context_of(out)
-    denied = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
-    assert denied["permissionDecision"] == "deny"
-    assert denied["permissionDecisionReason"] == _PLAN_NOT_APPROVED
+    assert _saved_state(session)["plan"] == {"round": 1, "verdict": "APPROVE"}
+    diff = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
+    assert diff["permissionDecision"] == "allow"
 
 
 # --- The bundle wires it --------------------------------------------------------
@@ -629,6 +763,8 @@ def test_hooks_json_registers_every_event() -> None:
     # and Bash reach the hook after they ran, not only before.
     for tool in ("Agent", "Task", "Skill", *EDIT_TOOLS, "Bash"):
         assert post.fullmatch(tool), tool
+    # The issue read carries the execution timing every cutoff is measured from.
+    assert post.fullmatch(ISSUE_READ)
     failure = re.compile(hooks["PostToolUseFailure"][0]["matcher"])
     # A failing test exits non-zero, which may arrive as a Bash failure.
     for tool in ("Agent", "Task", "Bash"):
@@ -748,7 +884,7 @@ def test_only_the_verdict_after_the_reviewer_header_counts(session: Session) -> 
     assert "round 1: CHANGES." in context
 
 
-def test_a_response_without_content_stops_the_run(session: Session) -> None:
+def test_a_response_without_content_grants_nothing(session: Session) -> None:
     """A dict response with no ``content`` carries no reply the gate may read."""
     pre = session.pre("Agent", {"subagent_type": PLAN, "description": "p", "prompt": "p"})
     post = session.fire(
@@ -762,8 +898,12 @@ def test_a_response_without_content_stops_the_run(session: Session) -> None:
     )
     assert post is not None
     context = post["hookSpecificOutput"]["additionalContext"]
-    assert context.startswith("STOP.") and "no reviewer verdict" in context
+    assert "no reviewer verdict" in context
+    assert "APPROVED" not in context and not context.startswith("STOP.")
+    assert _saved_state(session)["plan"] == {"round": 0, "verdict": None}
     assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+    session.load_workflow()
+    assert not allowed(session.edit("Write", TEST))
 
 
 def test_a_verification_block_in_the_echoed_prompt_is_not_the_reviewers(
@@ -856,7 +996,7 @@ def test_ci_round_three_reports_its_round(tmp_path: Path) -> None:
 def test_ci_round_diff_rejection_still_loops_and_blocks_publish(tmp_path: Path) -> None:
     s, _ = _ci_session(tmp_path, _ci_prompt(2))
     _, context = s.review(DIFF, reply(DIFF, "CHANGES"))
-    assert "phase implement, round 2 of 3" in context
+    assert "phase implement, round 2 of 5" in context
     assert s.pre(PUBLISH)["permissionDecision"] == "deny"
 
 
@@ -882,13 +1022,24 @@ def test_a_marker_inside_the_json_report_has_no_effect(tmp_path: Path) -> None:
     assert diff["permissionDecision"] == "deny"
 
 
-def test_a_new_ordinary_message_after_a_ci_round_needs_plan_review_again(
+def test_an_ordinary_message_after_a_ci_round_continues_it_and_a_new_session_does_not(
     tmp_path: Path,
 ) -> None:
     s, _ = _ci_session(tmp_path, _ci_prompt(2))
     s.fire("UserPromptSubmit", prompt=ISSUE)
+    # The same session keeps the CI round: straight to the diff review.
     diff = s.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
-    assert diff["permissionDecision"] == "deny"
+    assert diff["permissionDecision"] == "allow"
+    # A new session is a new run, which needs plan review again.
+    s.fire("UserPromptSubmit", prompt=ISSUE, session_id="sess-2")
+    denied = s.fire(
+        "PreToolUse",
+        tool_name="Agent",
+        tool_input={"subagent_type": DIFF, "description": "d", "prompt": "p"},
+        session_id="sess-2",
+    )
+    assert denied is not None
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 def test_the_bundle_ci_marker_follows_the_platform_round_bound(
@@ -1061,10 +1212,11 @@ def test_service_backed_diff_is_published_not_stalled_at_the_cap(session: Sessio
 
 
 def test_service_evidence_demands_still_stall_at_the_cap(session: Session) -> None:
-    """The failure mode #3755 removes: three CHANGES rounds deny publication."""
+    """The failure mode #3755 removes: five CHANGES rounds deny publication."""
     session.review(PLAN, reply(PLAN, "APPROVE"))
-    for _ in range(3):
+    for round_ in range(1, 6):
         session.review(DIFF, reply(DIFF, "CHANGES"))
+        rework(session, round_)
     assert session.pre(PUBLISH, {"title": "t", "body": "b"})["permissionDecision"] == "deny"
 
 
@@ -1101,7 +1253,9 @@ def test_loading_the_workflow_skill_is_recorded(session: Session) -> None:
     # Past the workflow gate: the next refusal is about the plan, not the skill.
     reason = deny_reason(session.edit("Edit", SOURCE))
     assert WORKFLOW_SKILL not in reason
-    assert [e["curie_gate"] for e in session.gate_events()][0] == "workflow_loaded"
+    # The issue read's timing line comes first; the skill is the first workflow event.
+    gates = [e["curie_gate"] for e in session.gate_events()]
+    assert [g for g in gates if not g.startswith("timing_")][0] == "workflow_loaded"
 
 
 def test_the_bare_implement_issue_skill_does_not_load_the_workflow(session: Session) -> None:
@@ -1134,9 +1288,10 @@ def test_edits_are_refused_after_the_workflow_loads_until_the_plan_is_approved(
     assert not allowed(session.edit("Edit", SOURCE))
     assert not allowed(session.edit("Write", TEST))
 
-    # A plan rejection keeps the gate shut.
+    # A plan CHANGES completes planning, but source edits still wait for the
+    # failing test: the self-reported implement above opened nothing.
     session.review(PLAN, reply(PLAN, "CHANGES"))
-    assert not allowed(session.edit("Edit", SOURCE))
+    assert "failing_test" in deny_reason(session.edit("Edit", SOURCE))
     refused = [e for e in session.gate_events() if e["curie_gate"] == "edit_refused"]
     assert len(refused) == 4
 
@@ -1617,6 +1772,7 @@ def _load_hook(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str) -> An
     for key in [k for k in os.environ if k.startswith("GIT_")]:
         monkeypatch.delenv(key)
     monkeypatch.delenv("DARK_FACTORY_WORKSPACE", raising=False)
+    monkeypatch.delenv("CURIE_SESSION_ID", raising=False)
     monkeypatch.setenv("DARK_FACTORY_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("DARK_FACTORY_PROGRESS_LOG", str(tmp_path / "pod.log"))
     spec = importlib.util.spec_from_file_location(name, HOOK)
@@ -1705,37 +1861,53 @@ def test_an_unchanged_checkout_whose_prompt_fingerprint_timed_out_is_unverifiabl
     assert state["fingerprint"] is None
 
 
-def test_a_new_prompt_resets_the_state_before_fingerprinting(
+def test_a_new_session_saves_its_fresh_state_before_fingerprinting(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A native hook timeout mid-fingerprint must not leave the last run approved."""
+    """A native hook timeout mid-fingerprint must not leave a new run approved.
+
+    A prompt in a session with saved state continues that run and never
+    retakes the fingerprint; a fresh run needs a new session.
+    """
     module = _load_hook(monkeypatch, tmp_path, "dark_factory_review_gate_reset")
     repo = make_repo(tmp_path / "repo")
-    path = module.state_path("sess-r")
+    old = module.state_path("sess-old")
     approved = module._fresh()
     approved.update(
         plan={"round": 1, "verdict": "APPROVE"},
         diff={"round": 1, "verdict": "APPROVE"},
         workflow=True,
         stage="implement",
-        workspace=str(repo),
+        workspace=os.path.realpath(repo),
         fingerprint="0" * 64,
     )
-    module.save(path, approved)
+    module.save(old, approved)
 
     def killed(workspace: str, deadline: float) -> str | None:
         raise SystemExit(1)
 
     monkeypatch.setattr(module, "fingerprint", killed)
-    with pytest.raises(SystemExit):
-        module.handle(
+
+    def prompt(session_id: str) -> dict[str, Any] | None:
+        out: dict[str, Any] | None = module.handle(
             {
-                "session_id": "sess-r",
+                "session_id": session_id,
                 "hook_event_name": "UserPromptSubmit",
                 "cwd": str(repo),
                 "prompt": ISSUE,
             }
         )
+        return out
+
+    # The approved session continues: no fingerprint is taken, nothing is reset.
+    assert contract() in context_of(prompt("sess-old"))
+    kept = json.loads(old.read_text())
+    assert kept["plan"] == {"round": 1, "verdict": "APPROVE"}
+    assert kept["fingerprint"] == "0" * 64
+
+    path = module.state_path("sess-r")
+    with pytest.raises(SystemExit):
+        prompt("sess-r")
 
     state = json.loads(path.read_text())
     assert state["plan"]["verdict"] is None
@@ -1880,6 +2052,13 @@ class HooksJsonRuntime:
         outs = self.dispatch(event, tool, **fields)
         assert len(outs) == 1, (event, tool, self.hooks.get(event))
 
+    def read_issue(
+        self, deadline: datetime | str | None = None, seconds: Any = FAR_SECONDS
+    ) -> None:
+        """One completed ``mcp__curie__get_issue`` call, in the recorded response shape."""
+        payload = issue_payload(deadline or far_deadline(), seconds)
+        self.post("PostToolUse", ISSUE_READ, tool_input={}, tool_response=issue_response(payload))
+
     def edit(self, tool: str, tool_input: dict[str, Any]) -> dict[str, Any] | None:
         """One edit tool call. Applied, then reported, only when the hook allows it."""
         out = self.pre(tool, tool_input)
@@ -1995,6 +2174,7 @@ def test_a_fresh_execution_through_hooks_json_gates_edits_in_phase_order(
 
     (prompt_out,) = run.dispatch("UserPromptSubmit", prompt=ISSUE)
     assert contract() in context_of(prompt_out)
+    run.read_issue()
 
     # A read-only tool never reaches the hook.
     assert run.dispatch("PreToolUse", "Read", tool_input={"file_path": str(source)}) == []
@@ -2298,8 +2478,10 @@ def _flat(text: str) -> str:
 
 
 def _start(run: HooksJsonRuntime) -> str:
-    """A fresh prompt, the workflow skill and the plan report; the prompt's context."""
+    """A fresh prompt, the issue read, the workflow skill and the plan report; the
+    prompt's context."""
     (out,) = run.dispatch("UserPromptSubmit", prompt=ISSUE)
+    run.read_issue()
     run.post("PostToolUse", "Skill", tool_input={"skill": WORKFLOW_SKILL}, tool_response="ok")
     assert run.pre(REPORT, {"phase": "plan", "round": 1}) is None
     return context_of(out)
@@ -2549,23 +2731,21 @@ def test_an_incorrect_test_or_missing_ci_route_is_refused_at_both_reviews(
 ) -> None:
     reason, why = REFUSALS[case]
     run, s, port = _refusal_setup(tmp_path, case, monkeypatch)
-    refused = [f"- AC1: refused {reason}"]
+    # Each review refuses AC1 and names a delegated route for AC2. The hook
+    # records what it was told and never overrides a verdict.
+    refused = [f"- AC1: refused {reason}", "- AC2: delegated integration-tests"]
     finding = (f"AC1: {why}",)
     queue = {"file_path": s.abspath("pkg/queue.py"), "content": _queue_source(s)}
 
     _start(run)
+    # The plan review is advisory: its CHANGES completes planning and carries
+    # the finding into the failing test, and source still waits for that test.
     _, context = run.review_with(PLAN, verified_reply(PLAN, "CHANGES", refused, finding))
-    assert "Go back to phase plan, round 2 of 3" in context
-    assert "plan review" in deny_reason(run.edit("Write", queue)).lower()
+    assert "round 1: CHANGES" in context and why in context
+    assert "failing_test" in deny_reason(run.edit("Write", queue))
     assert "return 0" in (s.cwd / "pkg" / "queue.py").read_text()
     assert run.decision(PUBLISH, {"title": "t", "body": "b"}) == "deny"
 
-    # The plan reviewer accepts the revised plan's delegated row. The hook
-    # records what it was told and never overrides a verdict.
-    _, context = run.review_with(
-        PLAN, verified_reply(PLAN, "APPROVE", ["- AC1: delegated integration-tests"])
-    )
-    assert "APPROVED" in context
     if case == "invalid_test":
         # The test replaces the function it claims to verify: green on the base code.
         content = MOCKED_QUEUE_TEST
@@ -2584,34 +2764,28 @@ def test_an_incorrect_test_or_missing_ci_route_is_refused_at_both_reviews(
     assert allowed(run.edit("Write", queue))
 
     _, context = run.review_with(DIFF, verified_reply(DIFF, "CHANGES", refused, finding))
-    assert "phase implement, round 2 of 3" in context
+    assert "phase implement, round 2 of 5" in context
     assert run.decision(PUBLISH, {"title": "t", "body": "b"}) == "deny"
     plan_again = run.pre("Agent", {"subagent_type": PLAN, "description": "p", "prompt": "p"})
     assert "returns to implement" in deny_reason(plan_again)
 
-    assert stages(s) == [
-        ("plan_review", 1, "CHANGES"),
-        ("plan_review", 2, "APPROVE"),
-        ("review_diff", 1, "CHANGES"),
-    ]
-    records = classified(s)
-    expected = [{"ac": 1, "route": "refused", "reason": reason}]
-    assert records[0]["classifications"] == expected
-    assert records[2]["classifications"] == expected
-    # Only the resolved declaration makes a label a route: the plan's row is
+    assert stages(s) == [("plan_review", 1, "CHANGES"), ("review_diff", 1, "CHANGES")]
+    # Only the resolved declaration makes a label a route: the AC2 row is
     # recorded as declared in the declared case alone, its label nowhere else.
     declared = case == "invalid_test"
-    assert records[1]["classifications"] == [
+    expected = [
+        {"ac": 1, "route": "refused", "reason": reason},
         {
-            "ac": 1,
+            "ac": 2,
             "route": "delegated",
             "declared": declared,
             "check_id": "queue" if declared else None,
-        }
+        },
     ]
+    for record in classified(s):
+        assert record["classifications"] == expected
     assert s.phases() == [
         ("plan_review", 1),
-        ("plan_review", 2),
         ("failing_test", 1),
         ("implement", 1),
         ("review_diff", 1),
@@ -2646,7 +2820,7 @@ def test_an_available_failing_check_returns_to_implement_and_a_failing_ci_run_re
     failing = ["- AC1: refused failing_check"]
     finding = ("AC1: tests/test_add.py still fails: add(2, 3) returns 6",)
     _, context = run.review_with(DIFF, verified_reply(DIFF, "CHANGES", failing, finding))
-    assert "phase implement, round 2 of 3" in context
+    assert "phase implement, round 2 of 5" in context
     assert run.decision(PUBLISH, {"title": "t", "body": "b"}) == "deny"
 
     assert allowed(
@@ -2708,15 +2882,16 @@ def test_a_reply_without_a_verification_block_still_approves(session: Session) -
 
 
 def test_the_verification_block_never_changes_the_verdict(session: Session) -> None:
-    # A CHANGES whose block holds no refusal still returns to plan.
-    _, context = session.review(
-        PLAN, verified_reply(PLAN, "CHANGES", ["- AC1: sandbox x"], ("AC1: no",))
-    )
-    assert "Go back to phase plan, round 2 of 3" in context
     # An APPROVE carrying a refused row is still an approval: nothing is overridden.
     refused = ["- AC1: refused invalid_test"]
     _, context = session.review(PLAN, verified_reply(PLAN, "APPROVE", refused))
     assert "APPROVED" in context
+    # A CHANGES whose block holds no refusal still returns to implement.
+    _, context = session.review(
+        DIFF, verified_reply(DIFF, "CHANGES", ["- AC1: sandbox x"], ("AC1: no",))
+    )
+    assert "phase implement, round 2 of 5" in context
+    rework(session, 1)
     # Only the first run of criterion lines is the block; prose ends it.
     lines = [
         "- AC1: refused made_up_reason",
@@ -2730,14 +2905,14 @@ def test_the_verification_block_never_changes_the_verdict(session: Session) -> N
 
     records = classified(session)
     assert stages(session) == [
-        ("plan_review", 1, "CHANGES"),
-        ("plan_review", 2, "APPROVE"),
-        ("review_diff", 1, "APPROVE"),
+        ("plan_review", 1, "APPROVE"),
+        ("review_diff", 1, "CHANGES"),
+        ("review_diff", 2, "APPROVE"),
     ]
-    assert records[0]["classifications"] == [{"ac": 1, "route": "sandbox"}]
-    assert records[1]["classifications"] == [
+    assert records[0]["classifications"] == [
         {"ac": 1, "route": "refused", "reason": "invalid_test"}
     ]
+    assert records[1]["classifications"] == [{"ac": 1, "route": "sandbox"}]
     assert records[2]["classifications"] == [
         {"ac": 1, "route": "refused", "reason": "unrecognized"},
         {"ac": 2, "route": "delegated", "declared": False, "check_id": None},
@@ -2776,7 +2951,8 @@ def test_only_a_label_the_resolved_declaration_names_reaches_the_pod_log(
     _, context = s.review(PLAN, verified_reply(PLAN, "APPROVE", lines))
     assert "APPROVED" in context
     _, context = s.review(DIFF, verified_reply(DIFF, "CHANGES", lines, ("AC1: no route",)))
-    assert "phase implement, round 2 of 3" in context
+    assert "phase implement, round 2 of 5" in context
+    rework(s, 1)
     _, context = s.review(DIFF, verified_reply(DIFF, "APPROVE", lines))
     assert "APPROVED" in context
     assert s.pre(PUBLISH, {"title": "t", "body": "b"})["permissionDecision"] == "allow"
@@ -2822,7 +2998,7 @@ def test_a_malformed_repository_declaration_routes_nothing_and_logs_no_label(
     _, context = s.review(PLAN, verified_reply(PLAN, "APPROVE", lines))
     assert "APPROVED" in context
     _, context = s.review(DIFF, verified_reply(DIFF, "CHANGES", lines, ("AC1: no route",)))
-    assert "phase implement, round 2 of 3" in context
+    assert "phase implement, round 2 of 5" in context
 
     log = s.log.read_text()
     assert SECRET not in log and "TOKEN=" not in log
@@ -2850,7 +3026,7 @@ def test_a_valid_declaration_with_a_credential_label_logs_only_its_check_id(
     _, context = s.review(PLAN, verified_reply(PLAN, "APPROVE", lines))
     assert "APPROVED" in context
     _, context = s.review(DIFF, verified_reply(DIFF, "CHANGES", lines, ("AC1: no route",)))
-    assert "phase implement, round 2 of 3" in context
+    assert "phase implement, round 2 of 5" in context
 
     log = s.log.read_text()
     assert "TOKEN=" not in log and "ghp_" not in log
@@ -3335,13 +3511,15 @@ def test_before_review_unreadable_refused_without_spending_round(session: Sessio
 
 
 def test_untracked_mode_changes_real_fingerprint(session: Session) -> None:
+    # A later prompt in one session continues its run without a new
+    # fingerprint, so each baseline is a new session's first prompt.
     path = session.cwd / "new.py"
     path.write_bytes(_UNTRACKED_BYTES)
-    session.fire("UserPromptSubmit", prompt="mode-off")
-    first = _saved_state(session)["fingerprint"]
+    session.fire("UserPromptSubmit", prompt="mode-off", session_id="sess-mode-off")
+    first = _saved_state(session, "sess-mode-off")["fingerprint"]
     path.chmod(0o755)
-    session.fire("UserPromptSubmit", prompt="mode-on")
-    second = _saved_state(session)["fingerprint"]
+    session.fire("UserPromptSubmit", prompt="mode-on", session_id="sess-mode-on")
+    second = _saved_state(session, "sess-mode-on")["fingerprint"]
     assert first is not None
     assert second is not None
     assert first != second
@@ -3363,16 +3541,17 @@ def test_unreadable_before_review_can_resume_without_round_reset(session: Sessio
 
 def test_stale_at_cap_does_not_get_more_rounds(session: Session) -> None:
     session.review(PLAN, reply(PLAN, "APPROVE"))
-    session.review(DIFF, reply(DIFF, "CHANGES"))
-    session.review(DIFF, reply(DIFF, "CHANGES"))
+    for round_ in range(1, 5):
+        session.review(DIFF, reply(DIFF, "CHANGES"))
+        rework(session, round_)
     session.review(DIFF, reply(DIFF, "APPROVE"))
     (session.cwd / SOURCE).write_text(_TRACKED_TEXT)
     assert session.pre(PUBLISH)["permissionDecision"] == "deny"
-    assert _saved_state(session)["diff"]["round"] == 3
+    assert _saved_state(session)["diff"]["round"] == 5
     assert _saved_state(session)["diff"]["verdict"] is None
     denied = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
     assert denied["permissionDecision"] == "deny"
-    assert _saved_state(session)["diff"]["round"] == 3
+    assert _saved_state(session)["diff"]["round"] == 5
     assert _saved_state(session)["stopped"] is not None
 
 
