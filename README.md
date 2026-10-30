@@ -25,6 +25,25 @@ agent's instructions and tools to the same platform.
 | [SRE co-worker](#sre-co-worker-on-your-laptop) | Ask about your local cluster in Slack; approve configured mutations. |
 | [Bring your existing agent](#make-your-existing-agent-a-co-worker) | Reuse its instructions and tools, then connect it to a workspace. |
 
+## Platform capabilities
+
+Curie connects agents to supported external workspaces and work systems.
+Four capabilities let a team delegate work, share appropriate context, and
+control what happens:
+
+| Capability | What it provides |
+| --- | --- |
+| Workspace adaptors | Connect supported conversation channels, issue trackers, and code hosts to Curie. |
+| Authentication, authorization, and synchronization | Verify incoming authority, connect workspace accounts to people where supported, and sync identity and team data from an enterprise IdP. |
+| Memory and context | Supply scoped agent and channel facts alongside the work state an agent needs. |
+| Controls | Set tool permissions, approvals, model choices, execution bounds, and inspectable results. |
+
+This is a capability map. Each integration has its own supported path and
+limits. Read [platform capabilities and boundaries](docs/platform-capabilities.md)
+for how these capabilities interact, and
+[capabilities and release status](docs/capabilities.md) for what is
+available in a supported deployment.
+
 ### See the Software Factory
 
 <a href="https://vimeo.com/1231115133/eadc6eb936">

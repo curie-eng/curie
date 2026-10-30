@@ -321,7 +321,7 @@ sequenceDiagram
     R->>A: model call (streaming)
     opt the model calls mcp__curie__progress on a turn holding a capability
         R->>P: POST /v1/turn-progress/{progress_id} (turn.progress token + generation)
-        P->>V: validate active generation; XADD inbox + SADD pending index atomically
+        P->>V: validate generation and atomically XADD inbox and SADD pending index
         W->>V: live pump or maintenance drainer applies inbox (rendering off, no outbox enqueue)
     end
     R-->>W: NDJSON: text_delta*, tool notes*, final
