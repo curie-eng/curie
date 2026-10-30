@@ -63,6 +63,8 @@ they are not substitutes for a supported quickstart.
 
 - [Administrator guide](administering-co-workers.md): access, approvals, model
   configuration, budgets, memory, inspection, and stopping work.
+- [Production operator journey](production-operations.md): readiness, install,
+  verification, upgrades, recovery, and state protection.
 - [Approvals](approvals.md): route binding, approver authority, and resumed turns.
 - [Operations](operations.md): cluster installation, credentials, egress, factory
   operation, upgrades, and operational limits.
