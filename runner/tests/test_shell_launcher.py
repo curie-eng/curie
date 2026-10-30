@@ -57,7 +57,7 @@ def test_sdk_shell_env_tolerates_a_contended_cold_start(
             raise subprocess.TimeoutExpired(args, timeout)
         return subprocess.CompletedProcess(args, 0)
 
-    monkeypatch.setattr(subprocess_env.subprocess, "run", slow_run)
+    monkeypatch.setattr(subprocess, "run", slow_run)
     values = subprocess_env.sdk_shell_env()
     assert values["CLAUDE_CODE_SHELL"] == str(subprocess_env.BASH_SHELL_LAUNCHER)
 
