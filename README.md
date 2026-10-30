@@ -105,6 +105,19 @@ Choose where your issues and code live:
 Create a GitHub repository with an initial commit, or use a small existing
 repository. Write a bounded issue with clear acceptance criteria.
 
+Before starting, check that you have a supported released CLI, Docker and kind,
+`kubectl`, Helm, a model credential with available credit, and permission to
+create and install a GitHub App on the repository. For the default local kind
+trial, plan for **at least 16 GiB allocated to Docker Desktop**: the factory
+work pod requests 8 GiB on its own, and Curie's services also need memory. A
+7.75 GiB Docker VM left the work pod Pending with `Insufficient memory` in a
+released-version trial. The 16 GiB figure is a planning allowance, not a
+measured minimum for every host. See the [capacity and recovery details](docs/guides/dark-factory-quickstart.md#local-kind-capacity-and-recovery).
+Expect a reviewable PR or a stated failure reason, then inspect the final
+issue status after CI handling. Allow variable setup time plus about 190
+minutes of configured waiting windows; this is not a measured completion
+time. Provider credit and actual spend are separate from that time allowance.
+
 **1. Start the local factory setup.** A dedicated kubeconfig keeps this trial
 separate from your other clusters.
 
@@ -156,25 +169,33 @@ KUBECONFIG="$CURIE_FACTORY_KUBECONFIG" curie factory quickstart \
 **3. Delegate the issue.** Add the `curie-factory` label in GitHub. The person
 adding it needs write or admin access to the repository.
 
-The issue status comment shows progress through planning, implementation, review,
-publication, and CI. Inspect the resulting PR and its verification information.
-A failed or ambiguous task reports its reason. Mention the configured App in a
-new comment to request a revision.
+| Checkpoint | What you should see | If it stops here |
+| --- | --- | --- |
+| First command | `Kubernetes context:` names the trial cluster, then a prefilled App registration link. | Check the [install and context steps](docs/guides/dark-factory-quickstart.md#choose-the-target-and-run-the-command). |
+| App setup and second command | `Factory quickstart ready` names the same context, repository, intake label, and deployed runner. | Check [App setup and troubleshooting](docs/guides/dark-factory-quickstart.md#rerun-with-the-app). |
+| Issue admission | The App posts a status comment; `curie-factory:queued` then `curie-factory:running` mark progress. | Check [label authority and sandbox capacity](docs/guides/dark-factory-quickstart.md#troubleshooting). |
+| PR and final result | A PR opens under the App identity. Read its diff and verification, then check whether the issue says `Completed:` or `Could not complete:` after CI handling. | Follow the [status-comment reason](docs/guides/dark-factory-quickstart.md#what-a-repository-with-no-ci-sees); an open PR alone is not a completed run. |
+
+Mention the configured App in a new comment to request a revision. The
+[complete factory quickstart](docs/guides/dark-factory-quickstart.md) has the
+canonical commands, recovery steps, and cleanup.
 
 The trial enables automatic initial PR publication. Curie does not merge the PR;
 your team accepts the result. Production agents default to human publication
 approval. Configure implementation and reviewer models explicitly, then use
 usage estimates and your accepted outcomes to evaluate costs.
 
-See the [complete factory quickstart](docs/guides/dark-factory-quickstart.md)
-for checkpoints, troubleshooting, timing and cost guidance, and cleanup.
 The [factory overview](docs/software-factory.md) explains review and CI limits.
 
 When finished with the trial, delete its local cluster:
 
 ```bash
 kind delete cluster --name "$CURIE_FACTORY_CLUSTER"
+rm -f -- "$CURIE_FACTORY_KUBECONFIG"
 ```
+
+If you created an App only for this trial, remove it and its downloaded key
+when finished; keep an App and key that other repositories or runs still use.
 
 ### SRE co-worker on your laptop
 
