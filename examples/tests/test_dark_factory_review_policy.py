@@ -11,7 +11,8 @@ The name prefixes select the acceptance criteria: ``test_advisory_plan_*``
 (AC1), ``test_diff_round_*`` (AC2), ``test_subagent_type_*`` (AC3),
 ``test_timing_*`` (AC4), ``test_unchanged_candidate_*`` (AC5),
 ``test_continuation_*``, ``test_retained_findings_*`` and
-``test_approval_after_edit_*`` (AC6).
+``test_approval_after_edit_*`` (AC6). ``test_protected_path_*`` keeps the root
+``.github`` refused through symlinks.
 """
 
 from __future__ import annotations
@@ -1433,7 +1434,8 @@ def test_continuation_follows_the_curie_session_across_a_rotated_sdk_session(
     for key in ("plan", "diff", "stopped", "findings", "fingerprint"):
         assert after[key] == before[key], key
     state_dir = Path(s.env["DARK_FACTORY_STATE_DIR"])
-    assert sorted(p.name for p in state_dir.glob("*.json")) == ["curie-run-1.json"]
+    for sdk_session in (STATE_KEY, "sdk-rotated"):
+        assert not (state_dir / f"{sdk_session}.json").exists(), sdk_session
     refused = s.fire("PreToolUse", tool_name="Agent", tool_input=PLAN_INPUT, session_id="sdk-r2")
     assert refused is not None
     _deny(refused["hookSpecificOutput"])
@@ -1447,7 +1449,8 @@ def test_continuation_a_blank_curie_session_keys_on_the_hook_session(tmp_path: P
     assert gate.contract() in gate.context_of(s.fire("UserPromptSubmit", prompt=ISSUE))
 
     state_dir = Path(s.env["DARK_FACTORY_STATE_DIR"])
-    assert sorted(p.name for p in state_dir.glob("*.json")) == [f"{STATE_KEY}.json"]
+    assert _state(s)["workspace"] == os.path.realpath(s.cwd)
+    assert not (state_dir / "___.json").exists()
 
 
 def test_continuation_a_new_curie_session_starts_fresh(tmp_path: Path) -> None:
@@ -1532,6 +1535,80 @@ def test_continuation_recovers_a_missing_fingerprint_before_planning(tmp_path: P
     assert "round 1: APPROVED" in context
 
 
+def test_continuation_each_workspace_keeps_its_own_run_in_one_session(tmp_path: Path) -> None:
+    s = _prompted(tmp_path)
+    repo_a = s.cwd
+    repo_b = gate.make_repo(tmp_path / "other")
+    _plan_approved(s)
+    assert _capped(s, FINDING).startswith("STOP.")
+
+    # Workspace B in the same session: a fresh run of its own.
+    context = gate.context_of(s.fire("UserPromptSubmit", prompt=ISSUE, cwd=str(repo_b)))
+    assert gate.contract() in context and not context.startswith("STOP.")
+    state = _state(s)
+    assert state["workspace"] == os.path.realpath(repo_b)
+    assert state["stopped"] is None
+    assert state["plan"] == {"round": 0, "verdict": None}
+    s.load_workflow()
+    _, context = s.review(PLAN, gate.reply(PLAN, "APPROVE"))
+    assert "round 1: APPROVED" in context
+
+    # Back to A: its stop, its spent rounds and its findings are restored.
+    context = gate.context_of(s.fire("UserPromptSubmit", prompt="back to A", cwd=str(repo_a)))
+    assert context.startswith("STOP.") and FINDING in context
+    state = _state(s)
+    assert state["workspace"] == os.path.realpath(repo_a)
+    assert state["stopped"]
+    assert state["diff"]["round"] == 5
+    assert FINDING in state["findings"]["text"]
+    (repo_a / SOURCE).write_text("def add(a, b):\n    return b + a\n")
+    diff = _deny(s.pre("Agent", DIFF_INPUT))
+    assert diff.startswith("STOP.") and FINDING in diff
+    edit = gate.deny_reason(s.edit("Edit", SOURCE))
+    assert edit.startswith("STOP.") and FINDING in edit
+
+    # Back to B: its completed plan review is restored, and nothing of A's stop.
+    context = gate.context_of(s.fire("UserPromptSubmit", prompt="back to B", cwd=str(repo_b)))
+    assert gate.contract() in context and not context.startswith("STOP.")
+    state = _state(s)
+    assert state["workspace"] == os.path.realpath(repo_b)
+    assert state["plan"] == {"round": 1, "verdict": "APPROVE"}
+    assert state["stopped"] is None
+    _deny(s.pre("Agent", PLAN_INPUT))
+    assert ("planning_complete", "plan_review") in _review_refusals(s)
+
+
+def test_continuation_returning_to_a_workspace_restores_its_spent_rounds(tmp_path: Path) -> None:
+    s = _prompted(tmp_path)
+    repo_a = s.cwd
+    repo_b = gate.make_repo(tmp_path / "other")
+    s.review(PLAN, changes(PLAN, "the plan skips criterion 3"))
+    s.report("implement", 1)
+    _edit_source(s, "fix")
+    _diff_changes(s, FINDING)
+
+    s.fire("UserPromptSubmit", prompt=ISSUE, cwd=str(repo_b))
+    assert _state(s)["plan"] == {"round": 0, "verdict": None}
+    context = gate.context_of(s.fire("UserPromptSubmit", prompt="back to A", cwd=str(repo_a)))
+
+    assert gate.contract() in context and not context.startswith("STOP.")
+    state = _state(s)
+    assert state["workspace"] == os.path.realpath(repo_a)
+    assert state["plan"] == {"round": 1, "verdict": "CHANGES"}
+    assert state["diff"] == {"round": 1, "verdict": "CHANGES"}
+    assert state["stopped"] is None
+    assert FINDING in state["findings"]["text"]
+    # Planning stays complete and the rejected candidate stays rejected.
+    _deny(s.pre("Agent", PLAN_INPUT))
+    assert FINDING in _deny(s.pre("Agent", DIFF_INPUT))
+    assert _review_refusals(s)[-2:] == [
+        ("planning_complete", "plan_review"),
+        ("no_progress", "review_diff"),
+    ]
+    _edit_source(s, "rework")
+    assert "round 3 of 5" in _diff_changes(s, "second finding")
+
+
 # --- AC6: an accepted edit after approval clears it -----------------------------
 
 
@@ -1566,3 +1643,85 @@ def test_approval_after_edit_requested_but_never_run_keeps_it(tmp_path: Path) ->
     assert _gates(s, "diff_approval_cleared") == []
     assert _state(s)["diff"] == {"round": 1, "verdict": "APPROVE"}
     assert s.pre(PUBLISH)["permissionDecision"] == "allow"
+
+
+# --- The root .github stays protected through symlinks --------------------------
+# A path is refused when its lexical form (relative to the stored workspace) or
+# its resolved form (relative to the resolved workspace) starts at ``.github``.
+
+
+def _assert_github_stop(s: Any, reason: str) -> None:
+    assert reason.startswith("STOP.") and "Could not complete:" in reason, reason
+    assert len(_gates(s, "github_path_refused")) == 1
+    assert _state(s)["stopped"]
+    assert [p for p in s.phases() if p[0] == "review_diff"] == []
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize("symlink", ["untracked", "retargeted"])
+def test_protected_path_a_github_symlink_stops_the_diff_review(
+    tmp_path: Path, symlink: str
+) -> None:
+    s = _session(tmp_path)
+    github = s.cwd / ".github"
+    if symlink == "retargeted":
+        # The base commits a .github symlink into pkg; the run then retargets it.
+        os.symlink("pkg", github)
+        gate._git(s.cwd, "add", ".github")
+        gate._git(s.cwd, "commit", "-q", "-m", "metadata symlink")
+    assert gate.contract() in gate.context_of(s.fire("UserPromptSubmit", prompt=ISSUE))
+    s.load_workflow()
+    _plan_approved(s)
+    if symlink == "retargeted":
+        github.unlink()
+        os.symlink("tests", github)
+    else:
+        os.symlink("pkg", github)
+
+    reason = _deny(s.pre("Agent", DIFF_INPUT))
+
+    _assert_github_stop(s, reason)
+
+
+@pytest.mark.parametrize("tool", ["Edit", "Write"])
+@pytest.mark.parametrize("stage", ["failing_test", "implement"])
+def test_protected_path_an_edit_through_a_github_symlink_is_refused(
+    tmp_path: Path, tool: str, stage: str
+) -> None:
+    s = _prompted(tmp_path)
+    _, context = s.review(PLAN, gate.reply(PLAN, "APPROVE"))
+    assert "APPROVED" in context
+    allowed_path = TEST
+    if stage == "implement":
+        s.report("implement", 1)
+        allowed_path = SOURCE
+    # The same edit by its real path is allowed in this stage.
+    assert gate.allowed(s.edit_with(tool, gate.edit_input(tool, s.abspath(allowed_path))))
+    os.symlink("pkg", s.cwd / ".github")
+
+    out = s.edit_with(tool, gate.edit_input(tool, str(s.cwd / ".github" / "calc.py")))
+
+    _assert_github_stop(s, gate.deny_reason(out))
+
+
+def test_protected_path_a_symlinked_workspace_prefix_still_guards_github(tmp_path: Path) -> None:
+    s = _session(tmp_path)
+    repo = s.cwd
+    link = tmp_path / "link"
+    link.symlink_to(repo, target_is_directory=True)
+    # The run is started from the symlinked path; the hook stores the real one.
+    s.cwd = link
+    assert gate.contract() in gate.context_of(s.fire("UserPromptSubmit", prompt=ISSUE))
+    s.load_workflow()
+    _plan_approved(s)
+    assert _state(s)["workspace"] == os.path.realpath(repo)
+
+    # Ordinary source edits are allowed through the link and directly.
+    for path in (link / SOURCE, repo / SOURCE):
+        assert gate.allowed(s.edit_with("Edit", gate.edit_input("Edit", str(path))))
+    assert _gates(s, "github_path_refused") == []
+
+    workflow = link / ".github" / "workflows" / "ci.yaml"
+    out = s.edit_with("Edit", gate.edit_input("Edit", str(workflow)))
+
+    _assert_github_stop(s, gate.deny_reason(out))
