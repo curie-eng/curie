@@ -385,12 +385,79 @@ def test_missing_job_recovery_reads_the_exact_lineage_branch_head() -> None:
 
 
 def test_an_absent_branch_has_no_head() -> None:
-    head = _with_host(
-        lambda _request: httpx.Response(404, json={"message": "Not Found"}),
-        lambda host: host.branch_head(_repository(), BRANCH),
-    )
+    # Contents read is required by this endpoint, which returns matching refs:
+    # https://docs.github.com/en/rest/git/refs#list-matching-references
+    # https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens#repository-permissions-for-contents
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if "/git/matching-refs/heads/" in request.url.path:
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    head = _with_host(handler, lambda host: host.branch_head(_repository(), BRANCH))
 
     assert head is None
+    assert len(requests) == 2
+    assert requests[1].url.raw_path.decode() == (
+        f"/repos/{REPO}/git/matching-refs/heads/curie%2Fthread-lineage-example"
+    )
+    assert all(request.headers["Authorization"] == GIT_HEADER for request in requests)
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 409, 503])
+def test_ref_404_requires_contents_access(status: int) -> None:
+    # GitHub hides inaccessible resources behind the same 404 as missing refs:
+    # https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/git/matching-refs/heads/" in request.url.path:
+            return httpx.Response(status, json={"message": "Not Found"})
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    error = Unauthorized if status in (401, 403) else NotFound if status == 404 else Unavailable
+    with pytest.raises(error):
+        _with_host(handler, lambda host: host.branch_head(_repository(), BRANCH))
+
+
+@pytest.mark.parametrize("exact", [False, True])
+def test_ref_404_matching_references_distinguishes_exact_branch(exact: bool) -> None:
+    # Matching refs also returns names that merely share the requested prefix:
+    # https://docs.github.com/en/rest/git/refs#list-matching-references
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/git/matching-refs/heads/" in request.url.path:
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "ref": f"refs/heads/{BRANCH}" + ("" if exact else "-other"),
+                        "object": {"type": "commit", "sha": REVISION_HEAD},
+                    }
+                ],
+            )
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    head = _with_host(handler, lambda host: host.branch_head(_repository(), BRANCH))
+    assert head == (REVISION_HEAD if exact else None)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        [None],
+        [{"ref": f"refs/heads/{BRANCH}"}],
+        [{"ref": f"refs/heads/{BRANCH}", "object": {"sha": "invalid"}}],
+    ],
+)
+def test_ref_404_malformed_contents_response_is_unavailable(payload: Any) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/git/matching-refs/heads/" in request.url.path:
+            return httpx.Response(200, json=payload)
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    with pytest.raises(Unavailable, match="malformed_response"):
+        _with_host(handler, lambda host: host.branch_head(_repository(), BRANCH))
 
 
 @pytest.mark.parametrize(

@@ -4342,8 +4342,75 @@ def _readmit_lineage_row(lineage_id: uuid.UUID) -> dict[str, Any]:
 def _absent_branch(request: httpx.Request) -> httpx.Response:
     """The code host's answer when the lineage branch was never pushed."""
 
+    if "/git/matching-refs/heads/" in request.url.path:
+        return httpx.Response(200, json=[])
     assert "/git/ref/heads/" in request.url.path, request.url.path
     return httpx.Response(404, json={"message": "Branch not found"})
+
+
+@pytest.mark.parametrize("contents_status", [404, 401, 403, 503])
+def test_readmit_masked_ref_404_preserves_pushed_lineage(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    contents_status: int,
+) -> None:
+    # GitHub masks inaccessible resources as 404, including existing refs:
+    # https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api
+    # Repository metadata permission does not grant Contents read permission:
+    # https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens#repository-permissions-for-contents
+    from forge_fakes.github import GitHubRepositoryFake
+
+    client, _ = publication_stack
+    conversation_id = "thread-readmit-masked-ref"
+    seed = _seed_readmit_stale_lineage(client, auth_headers, conversation_id=conversation_id)
+    original = _readmit_lineage_row(seed["lineage_id"])
+    forge = GitHubRepositoryFake()
+    forge.branches[original["branch"]] = SECOND_REVISION_SHA
+    requests: list[httpx.Request] = []
+
+    def inaccessible_contents(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if "/git/ref/heads/" in request.url.path:
+            assert forge.handle(request).status_code == 200
+            return httpx.Response(404, json={"message": "Not Found"})
+        if "/git/matching-refs/heads/" in request.url.path:
+            return httpx.Response(contents_status, json={"message": "Not Found"})
+        return forge.handle(request)
+
+    kept = _get_lineage_with_http(
+        client,
+        deployment_id=seed["deployment"]["id"],
+        conversation_id=conversation_id,
+        handler=inaccessible_contents,
+    )
+    assert kept.status_code == 200, kept.text
+    assert uuid.UUID(kept.json()["id"]) == seed["lineage_id"]
+    assert _readmit_lineage_row(seed["lineage_id"]) == original
+    assert len(requests) == 2
+    assert requests[0].headers["Authorization"] == requests[1].headers["Authorization"]
+    _execute(
+        "UPDATE curie.work_items SET base_commit = :base WHERE id = :id",
+        {"id": seed["item_id"], "base": SECOND_REVISION_SHA},
+    )
+    status_code, revision = _create_publication(
+        client,
+        _publication_payload(
+            seed["deployment"]["id"],
+            conversation_id=conversation_id,
+            dedupe_key="readmit-masked-ref-two",
+        ),
+    )
+    assert status_code == 201
+    assert uuid.UUID(revision["lineage_id"]) == seed["lineage_id"]
+    assert revision["revision_number"] == 2
+    assert revision["base_sha"] == original["base_sha"]
+    after = _readmit_lineage_row(seed["lineage_id"])
+    assert after["status"] == "open"
+    assert after["version"] == original["version"]
+    assert after["branch"] == original["branch"]
+    assert after["head_sha"] is None
+    assert after["pr_number"] is None
 
 
 def test_readmitted_never_pushed_lineage_prepares_current_base(
@@ -4645,6 +4712,8 @@ def test_readmit_creates_new_lineage_after_never_pushed_failure(
     close_landed = threading.Event()
 
     def probe_then_close(request: httpx.Request) -> httpx.Response:
+        if "/git/matching-refs/heads/" in request.url.path:
+            return httpx.Response(200, json=[])
         assert "/git/ref/heads/" in request.url.path, request.url.path
         probe_started.set()
         assert close_landed.wait(timeout=30), "closing reader never landed during the probe"
@@ -4868,6 +4937,8 @@ def test_readmit_lineage_retirement_fails_closed(
     writer_landed = threading.Event()
 
     def probe_then_wait(request: httpx.Request) -> httpx.Response:
+        if "/git/matching-refs/heads/" in request.url.path:
+            return httpx.Response(200, json=[])
         assert "/git/ref/heads/" in request.url.path, request.url.path
         probe_started.set()
         assert writer_landed.wait(timeout=30), "writer never landed during the probe"
@@ -4920,6 +4991,8 @@ def test_readmit_lineage_retirement_fails_closed(
     bump_done = threading.Event()
 
     def probe_then_bump(request: httpx.Request) -> httpx.Response:
+        if "/git/matching-refs/heads/" in request.url.path:
+            return httpx.Response(200, json=[])
         assert "/git/ref/heads/" in request.url.path, request.url.path
         bump_seen.set()
         assert bump_done.wait(timeout=30), "version bump never landed during the probe"

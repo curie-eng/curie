@@ -94,6 +94,18 @@ class BaseGitHubAPI(GitHubAPI):
             if sha is None:
                 return httpx.Response(404, json={"message": "Not Found"})
             return httpx.Response(200, json={"ref": f"refs/heads/{name}", "object": {"sha": sha}})
+        matching_prefix = f"/repos/{REPO}/git/matching-refs/heads/"
+        if path.startswith(matching_prefix):
+            # https://docs.github.com/en/rest/git/refs#list-matching-references
+            name = path.removeprefix(matching_prefix)
+            return httpx.Response(
+                200,
+                json=[
+                    {"ref": f"refs/heads/{branch}", "object": {"sha": sha, "type": "commit"}}
+                    for branch, sha in self.branches.items()
+                    if branch.startswith(name)
+                ],
+            )
         parts = path.split("/")
         # /repos/{owner}/{name}/issues/{number}/comments
         if len(parts) == 7 and parts[4] == "issues" and parts[6] == "comments":
