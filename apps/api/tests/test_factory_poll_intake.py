@@ -371,6 +371,18 @@ class PollGitHub:
             if sha is None:
                 return httpx.Response(404, json={"message": "Not Found"})
             return httpx.Response(200, json={"ref": f"refs/heads/{branch}", "object": {"sha": sha}})
+        matching_prefix = f"{root}/git/matching-refs/heads/"
+        if path.startswith(matching_prefix):
+            # https://docs.github.com/en/rest/git/refs#list-matching-references
+            prefix = path.removeprefix(matching_prefix)
+            return httpx.Response(
+                200,
+                json=[
+                    {"ref": f"refs/heads/{branch}", "object": {"type": "commit", "sha": sha}}
+                    for branch, sha in self.branches.items()
+                    if branch.startswith(prefix)
+                ],
+            )
         if path == f"{root}/issues":
             wanted = request.url.params.get("labels")
             listed = [

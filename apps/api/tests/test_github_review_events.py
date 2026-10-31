@@ -359,7 +359,11 @@ class GitHubTruth:
             )
         authorizations = {"Bearer fixture-app-token-private-sentinel"}
         if path == f"/repos/{REPO}" or path.startswith(
-            (f"/repos/{REPO}/git/ref/heads/", f"/repos/{REPO}/git/commits/")
+            (
+                f"/repos/{REPO}/git/ref/heads/",
+                f"/repos/{REPO}/git/matching-refs/heads/",
+                f"/repos/{REPO}/git/commits/",
+            )
         ):
             authorizations.add(
                 "Basic "
@@ -376,6 +380,18 @@ class GitHubTruth:
             if branch not in self.branches:
                 return httpx.Response(404, json={"message": "Not Found"})
             return httpx.Response(200, json={"object": {"sha": self.branches[branch]}})
+        matching_prefix = f"/repos/{REPO}/git/matching-refs/heads/"
+        if path.startswith(matching_prefix):
+            # https://docs.github.com/en/rest/git/refs#list-matching-references
+            prefix = path.removeprefix(matching_prefix)
+            return httpx.Response(
+                200,
+                json=[
+                    {"ref": f"refs/heads/{branch}", "object": {"type": "commit", "sha": sha}}
+                    for branch, sha in self.branches.items()
+                    if branch.startswith(prefix)
+                ],
+            )
         # https://docs.github.com/en/rest/git/commits#get-a-commit-object
         if path.startswith(f"/repos/{REPO}/git/commits/"):
             sha = path.removeprefix(f"/repos/{REPO}/git/commits/")

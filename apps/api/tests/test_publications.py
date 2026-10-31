@@ -4388,6 +4388,7 @@ def test_readmit_masked_ref_404_preserves_pushed_lineage(
     assert uuid.UUID(kept.json()["id"]) == seed["lineage_id"]
     assert _readmit_lineage_row(seed["lineage_id"]) == original
     assert len(requests) == 2
+    assert "/git/matching-refs/heads/" in requests[1].url.path
     assert requests[0].headers["Authorization"] == requests[1].headers["Authorization"]
     _execute(
         "UPDATE curie.work_items SET base_commit = :base WHERE id = :id",

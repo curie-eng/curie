@@ -585,6 +585,23 @@ class GithubStub:
                 "ref": f"refs/heads/{branch}",
                 "object": {"sha": sha, "type": "commit"},
             }
+        if method == "GET" and tail.startswith("git/matching-refs/heads/"):
+            # https://docs.github.com/en/rest/git/refs#list-matching-references
+            branch_prefix = tail.removeprefix("git/matching-refs/heads/")
+            refs = self._run(
+                "git",
+                "--git-dir",
+                str(self._repository),
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads/",
+            ).decode()
+            matches = []
+            for line in refs.splitlines():
+                ref, sha = line.split(" ", 1)
+                if ref.startswith(f"refs/heads/{branch_prefix}"):
+                    matches.append({"ref": ref, "object": {"sha": sha, "type": "commit"}})
+            return 200, matches
         if method == "GET" and tail.startswith("git/commits/"):
             commit = self._commit(tail.removeprefix("git/commits/"))
             if commit is None:

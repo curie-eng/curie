@@ -191,6 +191,18 @@ def review_lineage_app(
             return httpx.Response(
                 200, json={"ref": f"refs/heads/{branch}", "object": {"type": "commit", "sha": sha}}
             )
+        matching_prefix = f"/repos/{REPO}/git/matching-refs/heads/"
+        if request.url.path.startswith(matching_prefix):
+            # https://docs.github.com/en/rest/git/refs#list-matching-references
+            prefix = request.url.path.removeprefix(matching_prefix)
+            return httpx.Response(
+                200,
+                json=[
+                    {"ref": f"refs/heads/{branch}", "object": {"type": "commit", "sha": sha}}
+                    for branch, sha in truth["branches"].items()
+                    if branch.startswith(prefix)
+                ],
+            )
         # https://docs.github.com/en/rest/git/commits#get-a-commit-object
         if request.url.path.startswith(f"/repos/{REPO}/git/commits/"):
             commit = truth["commits"].get(request.url.path.rsplit("/", 1)[-1])
