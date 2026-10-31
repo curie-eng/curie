@@ -12,8 +12,8 @@ hook subprocess, one process per event, against a real git checkout, through
 the shared fixture in ``test_dark_factory_review_gate.py``. A local commit must
 not redefine the base or keep a stale approval alive, and committing the
 approved files must not by itself be refused. Neither an index flag, a git stat
-cache, a clean filter nor a diff driver may make the reviewed candidate differ
-from the published one.
+cache nor a diff driver may make the reviewed candidate differ from the published
+one, and a changed path under a filter attribute is refused rather than built.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -68,6 +69,9 @@ reply, contract, candidate_block = gate.reply, gate.contract, gate.candidate_blo
 DIFF_INPUT = {"subagent_type": DIFF, "description": "diff-reviewer", "prompt": "p"}
 FRESH_REVIEW = "Fresh diff review required: checkout changed or is unverifiable."
 UNVERIFIABLE = "Diff checkout is unverifiable; restore it before review."
+FRESH_REVIEW_PREFIX = "Fresh diff review required:"
+PATCH_CHANGED = "candidate patch is missing or changed"
+FILTER_REFUSAL = "has a filter attribute"
 CAPTURE_REPO = "acme-corp/acme-calc"
 GITHUB = "https://github.com"
 
@@ -156,11 +160,15 @@ def _admitted(prompt: str) -> _Admitted:
     return _Admitted(prompt, path.read_bytes())
 
 
-def _review_diff(s: Any, verdict: str) -> _Admitted:
-    """One full diff reviewer call that returns ``verdict``."""
+def _admit_diff(s: Any) -> tuple[dict[str, Any], _Admitted]:
+    """An admitted diff reviewer call: its PreToolUse decision and what it was sent."""
     pre = _diff_review(s)
     assert pre["permissionDecision"] == "allow", pre
-    admitted = _admitted(str(pre["updatedInput"]["prompt"]))
+    return pre, _admitted(str(pre["updatedInput"]["prompt"]))
+
+
+def _deliver_diff(s: Any, pre: dict[str, Any], verdict: str) -> str:
+    """The admitted reviewer returns ``verdict``; the PostToolUse context the agent gets."""
     post = s.fire(
         "PostToolUse",
         tool_name="Agent",
@@ -168,7 +176,13 @@ def _review_diff(s: Any, verdict: str) -> _Admitted:
         tool_response={"content": [{"type": "text", "text": reply(DIFF, verdict)}]},
     )
     assert post is not None
-    context = post["hookSpecificOutput"]["additionalContext"]
+    return str(post["hookSpecificOutput"]["additionalContext"])
+
+
+def _review_diff(s: Any, verdict: str) -> _Admitted:
+    """One full diff reviewer call that returns ``verdict``."""
+    pre, admitted = _admit_diff(s)
+    context = _deliver_diff(s, pre, verdict)
     assert ("APPROVED" if verdict == "APPROVE" else verdict) in context, context
     return admitted
 
@@ -766,9 +780,13 @@ def _capture(s: Any, base: str) -> Any:
     )
 
 
-def _strip_hidden_lines(s: Any, path: str) -> None:
-    """A checkout-local clean filter on ``path`` that drops every HIDDEN line from git's view."""
-    _git(s, "config", "filter.strip.clean", "grep -v HIDDEN || true")
+def _strip_hidden_lines(s: Any, path: str, marker: Path) -> None:
+    """A checkout-local clean filter on ``path`` that drops every HIDDEN line from git's view.
+
+    The filter program creates ``marker`` whenever git runs it.
+    """
+    program = f"touch {shlex.quote(str(marker))}; grep -v HIDDEN || true"
+    _git(s, "config", "filter.strip.clean", program)
     _git(s, "config", "filter.strip.smudge", "cat")
     attributes = s.cwd / ".git" / "info" / "attributes"
     attributes.parent.mkdir(exist_ok=True)
@@ -802,28 +820,109 @@ def _rewrite_keeping_stat(s: Any, path: str, old: bytes, new: bytes, mtime_ns: i
     os.utime(target, ns=(mtime_ns, mtime_ns))
 
 
-def test_a_line_a_clean_filter_hides_after_approval_is_neither_reviewed_nor_published(
+def _unsupported_filter() -> type[Exception]:
+    """The runner's refusal of a changed path under a filter attribute."""
+    from curie_runner.workspace_snapshot import UnsupportedFilterError
+
+    assert issubclass(UnsupportedFilterError, workspace_snapshot.WorkspaceSnapshotError)
+    return UnsupportedFilterError
+
+
+def test_a_clean_filter_added_after_approval_denies_the_publish_and_refuses_the_capture(
     tmp_path: Path,
 ) -> None:
     s, base = _planned(tmp_path)
     _publishable(s)
     _change_source(s, "fix")
-    reviewed = _reviewed_patch(s, base, _approve_diff(s))
-    _strip_hidden_lines(s, SOURCE)
+    _reviewed_patch(s, base, _approve_diff(s))
+    marker = tmp_path / "filter-ran"
+    _strip_hidden_lines(s, SOURCE, marker)
     with (s.cwd / SOURCE).open("a") as handle:
         handle.write(HIDDEN_LINE)
-    assert HIDDEN_LINE in (s.cwd / SOURCE).read_text()
+    # The checkout's own git diff runs the filter and hides the line.
+    assert "HIDDEN" not in _git(s, "diff", base)
+    assert marker.exists(), "git diff did not run the configured filter"
+    marker.unlink()
 
     decision = _publish(s)
-    published = _capture(s, base)
 
-    # The candidate is git's clean form of the final bytes: the approved one.
-    assert decision["permissionDecision"] == "allow", decision
-    assert published.base_sha == base
-    assert published.changed_paths == (SOURCE,)
-    assert published.patch == reviewed
-    assert b"+    return a + b  # fix\n" in published.patch
-    assert b"HIDDEN" not in published.patch
+    # The approved candidate can no longer be built: neither published nor reviewed.
+    assert decision["permissionDecision"] == "deny", decision
+    assert decision["permissionDecisionReason"].startswith(FRESH_REVIEW_PREFIX), decision
+    with pytest.raises(_unsupported_filter(), match=FILTER_REFUSAL) as refused:
+        _capture(s, base)
+    assert SOURCE in str(refused.value)
+    assert not marker.exists(), "the gate or the capture ran a filter program"
+
+
+@pytest.mark.parametrize(
+    "filtered", [SOURCE, TEST], ids=["edited_filtered_path", "control_unchanged_filtered_path"]
+)
+def test_a_diff_review_of_an_edited_path_under_a_filter_is_denied_naming_the_path(
+    tmp_path: Path, filtered: str
+) -> None:
+    s, _ = _planned(tmp_path)
+    marker = tmp_path / "filter-ran"
+    _strip_hidden_lines(s, filtered, marker)
+    _change_source(s, "fix")
+
+    decision = _diff_review(s)
+
+    assert not marker.exists(), "the gate ran a filter program"
+    if filtered != SOURCE:
+        # Control: a filter attribute on a path the candidate does not change refuses nothing.
+        assert decision["permissionDecision"] == "allow", decision
+        return
+    assert decision["permissionDecision"] == "deny", decision
+    reason = decision["permissionDecisionReason"]
+    assert SOURCE in reason and FILTER_REFUSAL in reason, reason
+    assert reason != UNVERIFIABLE
+    assert ("review_diff", 1) not in s.phases()
+    assert json.loads(_state_file(s).read_text())["diff"]["round"] == 0
+
+
+@pytest.mark.parametrize("patch_file", ["deleted", "overwritten", "control_unchanged"])
+def test_a_diff_verdict_on_a_candidate_patch_that_went_missing_or_changed_is_not_counted(
+    tmp_path: Path, patch_file: str
+) -> None:
+    """The verdict counts only while the patch file still holds the admitted bytes.
+
+    The gate records the patch's sha256 at admission and checks it when the
+    verdict arrives. That catches a patch file deleted or left changed during
+    the review. It does not defeat a process that replaces the file and puts the
+    admitted bytes back before the verdict, nor one that forges the gate's own
+    state: both run as the same user as the gate, inside its trust boundary.
+    """
+    s, _ = _planned(tmp_path)
+    _change_source(s, "fix")
+    pre, admitted = _admit_diff(s)
+    path = Path(_block_line(admitted.prompt, "candidate patch"))
+    assert path.read_bytes() == admitted.patch
+    if patch_file == "deleted":
+        path.unlink()
+    elif patch_file == "overwritten":
+        changed = admitted.patch.replace(b"# fix", b"# not the reviewed fix")
+        assert changed != admitted.patch
+        path.write_bytes(changed)
+
+    context = _deliver_diff(s, pre, "APPROVE")
+
+    if patch_file == "control_unchanged":
+        assert "APPROVED" in context, context
+        # Publication reads the candidate, not the patch file, after approval.
+        path.unlink()
+        assert _publish(s)["permissionDecision"] == "allow"
+        return
+    assert context.startswith(FRESH_REVIEW_PREFIX), context
+    assert PATCH_CHANGED in context, context
+    assert "APPROVED" not in context, context
+    state = json.loads(_state_file(s).read_text())
+    assert state["diff"]["verdict"] != "APPROVE"
+    assert state["diff"]["round"] == 0
+    assert _publish(s)["permissionDecision"] == "deny"
+    # Fresh review, not a stop: the unchanged checkout is reviewed again and publishes.
+    _approve_diff(s)
+    assert _publish(s)["permissionDecision"] == "allow"
 
 
 def test_a_stale_stat_rewrite_of_an_unedited_file_after_approval_needs_a_fresh_review(

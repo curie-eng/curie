@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import stat
 import subprocess
 import tarfile
@@ -30,7 +31,12 @@ from curie_worker.publication_validation import (
     publication_git_environment,
     validate_snapshot_against_base,
 )
-from curie_worker.runner_client import RunnerClient, RunnerWorkspaceSnapshot
+from curie_worker.runner_client import (
+    RunnerClient,
+    RunnerError,
+    RunnerSnapshotReadError,
+    RunnerWorkspaceSnapshot,
+)
 from curie_worker.workspace import (
     SubprocessCommands,
     WorkspaceLimits,
@@ -485,30 +491,38 @@ def test_a_change_committed_then_reverted_validates_as_an_empty_publication(
     assert tree == _tree_of(repo, prepared)
 
 
-def test_a_line_a_clean_filter_hides_is_not_published_beside_a_visible_edit(
+def test_an_edit_under_a_clean_filter_is_refused_by_the_route_and_never_validated(
     tmp_path: Path,
 ) -> None:
     repo, prepared = _prepared(tmp_path)
-    archive = _archive(repo, prepared)
-    # A checkout-local clean filter drops every HIDDEN line from git's view of src/app.py.
-    _git(repo, "config", "filter.strip.clean", "grep -v HIDDEN || true")
-    _git(repo, "config", "filter.strip.smudge", "cat")
+    # A checkout-local clean filter that would drop every HIDDEN line from git's
+    # view of src/app.py, and leave a marker behind whenever it runs.
+    marker = tmp_path / "filter-ran"
+    _git(
+        repo,
+        "config",
+        "filter.strip.clean",
+        f"touch {shlex.quote(str(marker))}; grep -v HIDDEN || true",
+    )
     attributes = repo / ".git" / "info" / "attributes"
     attributes.parent.mkdir(exist_ok=True)
     attributes.write_text("src/app.py filter=strip\n")
     _write(repo, "src/app.py", b"x = 2\n# HIDDEN: never shown by git diff\n")
     assert "HIDDEN" not in _git(repo, "diff", "HEAD")
+    assert marker.exists(), "git diff did not run the configured filter"
+    marker.unlink()
 
-    snapshot = _snapshot_over_http(repo, prepared)
+    # The runner answers a 422 refusal naming the path: no snapshot reaches the
+    # worker, so nothing is validated or published.
+    with pytest.raises(RunnerError) as refused:
+        _snapshot_over_http(repo, prepared)
 
-    # The publication is git's view of the file: the visible edit, not the hidden line.
-    assert snapshot.base_sha == prepared
-    assert snapshot.changed_paths == ("src/app.py",)
-    assert b"+x = 2" in snapshot.patch
-    assert b"HIDDEN" not in snapshot.patch
-    _validate(_coordinator(prepared, archive), snapshot, tmp_path / "validation")
-    _, checkout = _result(tmp_path / "result", archive, snapshot.patch)
-    assert (checkout / "src" / "app.py").read_bytes() == b"x = 2\n"
+    assert not isinstance(refused.value, RunnerSnapshotReadError)
+    message = str(refused.value)
+    assert message.startswith("/v1/snapshot -> 422: "), message
+    assert "src/app.py" in message
+    assert "has a filter attribute" in message
+    assert not marker.exists(), "the runner capture ran a filter program"
 
 
 def test_an_untouched_crlf_checkout_validates_to_an_empty_publication(tmp_path: Path) -> None:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import os
+import shlex
 import stat
 import subprocess
 from collections import Counter
@@ -721,50 +722,190 @@ def test_an_untracked_crlf_file_under_an_eol_attribute_is_published_byte_for_byt
     assert b"+@echo off\r\n+echo new\r\n" in _sections(captured.patch)["new.bat"]
 
 
+# --- candidate construction never runs a filter program ---------------------------
+
+FILTER_REFUSAL = "has a filter attribute"
+
+
+def _unsupported_filter() -> type[workspace_snapshot.WorkspaceSnapshotError]:
+    """The runner's filter refusal: a snapshot refusal, never a history refusal."""
+
+    from curie_runner.workspace_snapshot import UnsupportedFilterError
+
+    assert issubclass(UnsupportedFilterError, workspace_snapshot.WorkspaceSnapshotError)
+    assert not issubclass(UnsupportedFilterError, workspace_snapshot.WorkspaceHistoryError)
+    return UnsupportedFilterError
+
+
+def _marking_filter(repo: Path, marker: Path, name: str = "strip") -> None:
+    """Configure driver ``name`` whose clean program creates ``marker`` whenever git runs it.
+
+    The program also drops every HIDDEN line, so a line it would hide from git
+    never reaches a publication by way of the filter either.
+    """
+
+    program = f"touch {shlex.quote(str(marker))}; grep -v HIDDEN || true"
+    _git(repo, "config", f"filter.{name}.clean", program)
+
+
+def _info_attributes(repo: Path, line: bytes) -> None:
+    attributes = repo / ".git" / "info" / "attributes"
+    attributes.parent.mkdir(exist_ok=True)
+    attributes.write_bytes(line + b"\n")
+
+
+def _assert_filter_is_live(repo: Path, marker: Path) -> None:
+    """The checkout's own git diff runs the filter, so an absent marker later means something."""
+
+    assert "HIDDEN" not in _git(repo, "diff", "HEAD")
+    assert marker.exists(), "git diff did not run the configured filter"
+    marker.unlink()
+
+
+def _assert_filter_refused(repo: Path, prepared: str, path: str, marker: Path | None) -> None:
+    """The capture refuses ``path`` by name, publishes nothing, and runs no filter program."""
+
+    with pytest.raises(_unsupported_filter(), match=FILTER_REFUSAL) as refused:
+        _capture(repo, prepared)
+    assert path in str(refused.value)
+    if marker is not None:
+        assert not marker.exists(), "candidate construction ran a filter program"
+
+
 @pytest.mark.parametrize("visible", [False, True], ids=["hidden_line_alone", "beside_an_edit"])
-def test_a_line_a_checkout_clean_filter_hides_from_git_diff_is_not_published(
+def test_an_edit_under_a_checkout_clean_filter_is_refused_without_running_it(
     tmp_path: Path, visible: bool
 ) -> None:
     repo, prepared = _prepared(tmp_path)
-    _git(repo, "config", "filter.strip.clean", "grep -v HIDDEN || true")
-    _git(repo, "config", "filter.strip.smudge", "cat")
-    attributes = repo / ".git" / "info" / "attributes"
-    attributes.parent.mkdir(exist_ok=True)
-    attributes.write_bytes(b"src/app.py filter=strip\n")
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _info_attributes(repo, b"src/app.py filter=strip")
     _write(repo, "src/app.py", (b"x = 2\n" if visible else b"x = 1\n") + _HIDDEN)
-    assert "HIDDEN" not in _git(repo, "diff", "HEAD")
+    _assert_filter_is_live(repo, marker)
 
-    captured = _capture(repo, prepared)
-
-    assert b"HIDDEN" not in captured.patch
-    if not visible:
-        # git sees no change, so nothing publishes.
-        assert captured.patch == b""
-        assert captured.changed_paths == ()
-        return
-    assert captured.changed_paths == ("src/app.py",)
-    assert _changed_lines(_sections(captured.patch)["src/app.py"]) == [b"-x = 1", b"+x = 2"]
+    # No silent fallback to the raw bytes and no git clean form: a refusal by name.
+    _assert_filter_refused(repo, prepared, "src/app.py", marker)
 
 
-def test_a_staged_visible_edit_publishes_without_a_line_the_clean_filter_hides(
+def test_a_staged_edit_under_a_clean_filter_is_refused_without_running_it(
     tmp_path: Path,
 ) -> None:
     repo, prepared = _prepared(tmp_path)
-    _git(repo, "config", "filter.strip.clean", "grep -v HIDDEN || true")
-    _git(repo, "config", "filter.strip.smudge", "cat")
-    attributes = repo / ".git" / "info" / "attributes"
-    attributes.parent.mkdir(exist_ok=True)
-    attributes.write_bytes(b"src/app.py filter=strip\n")
     _write(repo, "src/app.py", b"x = 2\n")
     _git(repo, "add", "src/app.py")
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _info_attributes(repo, b"src/app.py filter=strip")
     with (repo / "src" / "app.py").open("ab") as handle:
         handle.write(_HIDDEN)
 
+    _assert_filter_refused(repo, prepared, "src/app.py", marker)
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    [b"filter=strip", b"filter", b"-filter", b"filter=unspecified"],
+    ids=["named_driver", "bare_set", "unset", "driver_named_unspecified"],
+)
+def test_every_form_of_a_filter_attribute_on_an_edited_file_is_refused(
+    tmp_path: Path, attribute: bytes
+) -> None:
+    repo, prepared = _prepared(tmp_path)
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker, "strip")
+    # git check-attr reports this driver's value as the word "unspecified".
+    _marking_filter(repo, marker, "unspecified")
+    _info_attributes(repo, b"src/app.py " + attribute)
+    _write(repo, "src/app.py", b"x = 2\n")
+
+    _assert_filter_refused(repo, prepared, "src/app.py", marker)
+
+
+def test_a_filter_attribute_from_a_nested_gitattributes_is_refused(tmp_path: Path) -> None:
+    repo, _ = _prepared(tmp_path)
+    _write(repo, "sub/data.txt", b"data = base\n")
+    _write(repo, "sub/.gitattributes", b"data.txt filter=strip\n")
+    _git(repo, "add", "-A")
+    prepared = _commit(repo, "Prepared base with a nested filter attribute")
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _write(repo, "sub/data.txt", b"data = edited\n")
+
+    _assert_filter_refused(repo, prepared, "sub/data.txt", marker)
+
+
+def test_a_process_filter_driver_is_refused_without_starting_it(tmp_path: Path) -> None:
+    repo, prepared = _prepared(tmp_path)
+    marker = tmp_path / "filter-ran"
+    _git(repo, "config", "filter.x.process", f"touch {shlex.quote(str(marker))}; cat")
+    _info_attributes(repo, b"src/app.py filter=x")
+    _write(repo, "src/app.py", b"x = 2\n")
+
+    _assert_filter_refused(repo, prepared, "src/app.py", marker)
+
+
+_REPOSITORY_CLEAN_SCRIPT = b"""import pathlib
+import sys
+
+pathlib.Path(sys.argv[1]).touch()
+sys.stdout.buffer.write(b"".join(line for line in sys.stdin.buffer if b"HIDDEN" not in line))
+"""
+
+
+@pytest.mark.parametrize("clean", ["failing_program", "repository_script"])
+def test_an_optional_filter_git_would_skip_is_refused_not_published_as_raw_bytes(
+    tmp_path: Path, clean: str
+) -> None:
+    """Neither filter is ``required``, so git falls back to the raw bytes when it fails.
+
+    ``false`` always fails. The repository-relative script is tracked and
+    unchanged, so it works in the checkout but is absent from any scratch copy
+    of the edited paths. Either way the capture refuses rather than publishing
+    the raw bytes, HIDDEN line included.
+    """
+
+    repo, _ = _prepared(tmp_path)
+    _write(repo, "tools/clean.py", _REPOSITORY_CLEAN_SCRIPT)
+    _git(repo, "add", "tools/clean.py")
+    prepared = _commit(repo, "Prepared base with a repository clean script")
+    marker = tmp_path / "filter-ran"
+    if clean == "failing_program":
+        _git(repo, "config", "filter.strip.clean", "false")
+    else:
+        _git(
+            repo,
+            "config",
+            "filter.strip.clean",
+            f"python3 tools/clean.py {shlex.quote(str(marker))}",
+        )
+    _info_attributes(repo, b"src/app.py filter=strip")
+    _write(repo, "src/app.py", b"x = 2\n" + _HIDDEN)
+    if clean == "repository_script":
+        _assert_filter_is_live(repo, marker)
+
+    _assert_filter_refused(repo, prepared, "src/app.py", marker)
+
+
+def test_an_unchanged_file_under_a_filter_attribute_does_not_refuse_an_unfiltered_edit(
+    tmp_path: Path,
+) -> None:
+    # Liveness for the refusals above: only a path whose bytes or mode differ
+    # from the base asks git about attributes.
+    repo, prepared = _prepared(tmp_path)
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _info_attributes(repo, b"README.md filter=strip")
+    # Same bytes as the base, rewritten so git's stat cache no longer matches.
+    _write(repo, "README.md", _PREPARED_FILES["README.md"])
+    _write(repo, "src/app.py", b"x = 2\n")
+
     captured = _capture(repo, prepared)
 
+    assert captured.base_sha == prepared
     assert captured.changed_paths == ("src/app.py",)
+    assert _header_paths(captured.patch) == ["src/app.py"]
     assert _changed_lines(_sections(captured.patch)["src/app.py"]) == [b"-x = 1", b"+x = 2"]
-    assert b"HIDDEN" not in captured.patch
+    assert not marker.exists(), "candidate construction ran a filter program"
 
 
 def _trust_stat(repo: Path, path: str) -> int:
@@ -844,7 +985,7 @@ def test_a_stale_stat_rewrite_after_the_edit_was_recorded_publishes_the_rewrite(
     assert b"x = 2" not in captured.patch
 
 
-# --- attributes git finds only in the index still convert the final bytes ---------
+# --- attributes git finds only in the index still apply to the final bytes --------
 
 
 def test_a_deleted_gitattributes_kept_in_the_index_still_normalizes_an_edited_crlf_file(
@@ -865,26 +1006,21 @@ def test_a_deleted_gitattributes_kept_in_the_index_still_normalizes_an_edited_cr
     assert b"\r" not in sections["run.bat"]
 
 
-def test_a_deleted_gitattributes_kept_in_the_index_still_applies_the_clean_filter(
+def test_a_filter_attribute_from_a_gitattributes_kept_only_in_the_index_is_refused(
     tmp_path: Path,
 ) -> None:
     repo, _ = _prepared(tmp_path)
-    _git(repo, "config", "filter.strip.clean", "grep -v HIDDEN || true")
-    _git(repo, "config", "filter.strip.smudge", "cat")
     _write(repo, ".gitattributes", b"src/app.py filter=strip\n")
     _git(repo, "add", ".gitattributes")
     prepared = _commit(repo, "Prepared base with a clean filter attribute")
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
     (repo / ".gitattributes").unlink()
     assert _git(repo, "ls-files", "--", ".gitattributes") == ".gitattributes"
     _write(repo, "src/app.py", b"x = 2\n" + _HIDDEN)
 
-    captured = _capture(repo, prepared)
-
-    sections = _sections(captured.patch)
-    assert captured.changed_paths == (".gitattributes", "src/app.py")
-    assert b"deleted file mode 100644" in sections[".gitattributes"]
-    assert _changed_lines(sections["src/app.py"]) == [b"-x = 1", b"+x = 2"]
-    assert b"HIDDEN" not in captured.patch
+    # git's attribute lookup falls back to the index copy, so the attribute still applies.
+    _assert_filter_refused(repo, prepared, "src/app.py", marker)
 
 
 # --- one builder: the capture publishes the rendered candidate --------------------
