@@ -1,28 +1,84 @@
 """Bounded, credential-free snapshots of the managed repository workspace.
 
-The runner exposes the result only to its per-sandbox bearer-token holder.  It
-does not publish anything: the worker validates and durably stores the patch
-before the sandbox is suspended, and a separate platform Job applies it after
-approval.
+The worker names the prepared commit P it retained for the thread. The runner
+proves the checkout's HEAD is P or a bounded local descendant of P, then
+captures the net change from P to the final working tree files: committed,
+staged, unstaged and untracked (not ignored) changes together. Local commits
+never move the base.
+
+Files are read without following symlinks and hashed without git filters into
+a scratch index and object directory, so the real index, refs, HEAD and object
+store are only read. The workspace is observed before and after the patch is
+built, and a difference refuses the capture.
+
+The runner exposes the result only to its per-sandbox bearer-token holder. It
+does not publish anything: the worker validates the patch against its own copy
+of P and durably stores it before the sandbox is suspended, and a separate
+platform Job applies it after approval.
 """
 
 from __future__ import annotations
 
 import base64
+import errno
+import hashlib
 import os
 import re
 import shlex
+import shutil
 import stat
 import subprocess
+import tempfile
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import IO
 from urllib.parse import urlsplit, urlunsplit
 
 from .subprocess_env import shell_and_hook_env
 
 MAX_PATCH_BYTES = 900_000
+# Bounds on the local history between the prepared base and HEAD.
+MAX_ANCESTRY_COMMITS = 256
+MAX_ANCESTRY_BYTES = 1_048_576
 _GIT_TIMEOUT_SECONDS = 30
-_SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
+# A full lowercase sha1 or sha256 object id.
+_OID_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+_OID_LENGTH = {"sha1": 40, "sha256": 64}
+_SYMLINK_MODE = "120000"
+_GITLINK_MODE = "160000"
+_READ_CHUNK = 1024 * 1024
+_CHANGED = "the workspace changed during snapshot capture; retry once writes stop"
+_BASE_UNAVAILABLE = "the prepared base commit is not available in the workspace"
+_NOT_DESCENDANT = (
+    "the workspace HEAD is not the prepared base commit or a local commit on top of it"
+)
+_UNREADABLE_HISTORY = "a local commit on top of the prepared base is missing or unreadable"
+# Every git call: no workspace-configured hook or monitor runs and nothing
+# optional is written back to the real repository. A split index would put its
+# shared index in the real git directory even for the scratch index.
+_GIT_CONFIG = (
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+    "-c",
+    "core.splitIndex=false",
+    # Unescaped UTF-8 paths in patch headers.
+    "-c",
+    "core.quotePath=false",
+    "-c",
+    "gc.auto=0",
+)
+_GIT_ENV = {
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_NO_LAZY_FETCH": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+}
 # One segment of a declared repository path (ADR 0197): GitLab nests groups, so
 # a code host other than GitHub has any number of these. Dot segments are
 # refused separately, since a URL would resolve them away.
@@ -31,6 +87,10 @@ _PATH_SEGMENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._~-]*")
 
 class WorkspaceSnapshotError(RuntimeError):
     """The workspace cannot be represented as a safe publication patch."""
+
+
+class WorkspaceHistoryError(WorkspaceSnapshotError):
+    """HEAD is not P or a verified local descendant of P, or P is unavailable."""
 
 
 @dataclass(frozen=True)
@@ -148,19 +208,27 @@ def validate_patch(patch: bytes) -> bytes:
     return patch
 
 
-def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+def _git(
+    repo: Path,
+    *args: str,
+    check: bool = True,
+    stdin: bytes | None = None,
+    env: Mapping[str, str] | None = None,
+    stdout: IO[bytes] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    # An inherited GIT_* variable could point git at another index, object
+    # store or config; only this module's own settings apply.
+    inherited = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     try:
         return subprocess.run(
-            ["git", *args],
+            ["git", *_GIT_CONFIG, *args],
             cwd=repo,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
+            input=b"" if stdin is None else stdin,
+            stdout=subprocess.PIPE if stdout is None else stdout,
+            stderr=subprocess.PIPE,
             timeout=_GIT_TIMEOUT_SECONDS,
             check=check,
-            env=shell_and_hook_env(
-                os.environ,
-                extra={"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"},
-            ),
+            env=shell_and_hook_env(inherited, extra={**_GIT_ENV, **(env or {})}),
         )
     except FileNotFoundError as exc:
         raise WorkspaceSnapshotError(
@@ -244,68 +312,452 @@ def _canonical_repo(
     return repo
 
 
-def _changed_paths(repo: Path) -> tuple[str, ...]:
-    # Keep path enumeration identical to patch capture. Explicitly disabling
-    # rename detection represents a rename as one deletion plus one addition,
-    # so both paths are validated and disclosed to the approver.
-    tracked = _git(repo, "diff", "--no-renames", "--name-only", "-z", "HEAD", "--").stdout
-    untracked = _git(repo, "ls-files", "--others", "--exclude-standard", "-z").stdout
-    paths: set[str] = set()
-    for item in (tracked + untracked).split(b"\0"):
+def _display(raw: bytes) -> str:
+    return raw.decode("utf-8", errors="backslashreplace")
+
+
+def _object_id(object_format: str, kind: bytes, data: bytes) -> str:
+    header = b"%s %d\0" % (kind, len(data))
+    return hashlib.new(object_format, header + data, usedforsecurity=False).hexdigest()
+
+
+def _verify_base(repo: Path, base_sha: str) -> str:
+    """Return the object format once ``base_sha`` names a commit in the workspace."""
+
+    if not isinstance(base_sha, str) or not _OID_RE.fullmatch(base_sha):
+        raise WorkspaceSnapshotError("the prepared base commit is not a full lowercase object id")
+    object_format = _git(repo, "rev-parse", "--show-object-format").stdout.decode(
+        "ascii", errors="replace"
+    ).strip()
+    if object_format not in _OID_LENGTH:
+        raise WorkspaceSnapshotError("the workspace object format is not supported")
+    if len(base_sha) != _OID_LENGTH[object_format]:
+        raise WorkspaceHistoryError(_BASE_UNAVAILABLE)
+    resolved = _git(
+        repo,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "--end-of-options",
+        f"{base_sha}^{{commit}}",
+        check=False,
+    )
+    if resolved.returncode != 0 or resolved.stdout.decode("ascii", errors="replace").strip() != (
+        base_sha
+    ):
+        raise WorkspaceHistoryError(_BASE_UNAVAILABLE)
+    return object_format
+
+
+def _head(repo: Path, length: int) -> str | None:
+    result = _git(repo, "rev-parse", "--verify", "--quiet", "HEAD", check=False)
+    head = result.stdout.decode("ascii", errors="replace").strip()
+    if result.returncode != 0 or len(head) != length or not _OID_RE.fullmatch(head):
+        return None
+    return head
+
+
+def _commit_parents(body: bytes, length: int) -> list[str]:
+    """Parse parents as git does: the lines directly after the tree line."""
+
+    lines = body.split(b"\n")
+    if not lines[0].startswith(b"tree "):
+        raise WorkspaceHistoryError(_UNREADABLE_HISTORY)
+    parents: list[str] = []
+    for line in lines[1:]:
+        if not line.startswith(b"parent "):
+            break
+        parent = line.removeprefix(b"parent ").decode("ascii", errors="replace")
+        if len(parent) != length or not _OID_RE.fullmatch(parent):
+            raise WorkspaceHistoryError(_UNREADABLE_HISTORY)
+        parents.append(parent)
+    return parents
+
+
+def _prove_descendant(repo: Path, head: str, base_sha: str, object_format: str) -> None:
+    """Refuse unless ``head`` is ``base_sha`` or a bounded local descendant of it.
+
+    rev-list only proposes the commits. Their sizes, bodies and object ids are
+    checked here and their parents parsed here, so a graft, shallow file or
+    commit-graph cannot decide the answer. Nothing is fetched.
+    """
+
+    if head == base_sha:
+        return
+    listed = _git(
+        repo,
+        "rev-list",
+        f"--max-count={MAX_ANCESTRY_COMMITS + 1}",
+        head,
+        f"^{base_sha}",
+        "--",
+        check=False,
+    )
+    if listed.returncode != 0:
+        raise WorkspaceHistoryError(_NOT_DESCENDANT)
+    commits = listed.stdout.decode("ascii", errors="replace").split()
+    if len(commits) > MAX_ANCESTRY_COMMITS:
+        raise WorkspaceHistoryError(
+            "the local history on top of the prepared base exceeds "
+            f"{MAX_ANCESTRY_COMMITS} commits"
+        )
+    if (
+        head not in commits
+        or len(set(commits)) != len(commits)
+        or any(len(commit) != len(base_sha) or not _OID_RE.fullmatch(commit) for commit in commits)
+    ):
+        raise WorkspaceHistoryError(_NOT_DESCENDANT)
+
+    request = "".join(f"{commit}\n" for commit in commits).encode("ascii")
+    checked = _git(repo, "cat-file", "--batch-check", stdin=request).stdout.splitlines()
+    if len(checked) != len(commits):
+        raise WorkspaceHistoryError(_UNREADABLE_HISTORY)
+    sizes: list[int] = []
+    for commit, line in zip(commits, checked, strict=True):
+        fields = line.decode("ascii", errors="replace").split(" ")
+        if (
+            len(fields) != 3
+            or fields[0] != commit
+            or fields[1] != "commit"
+            or not fields[2].isdigit()
+        ):
+            raise WorkspaceHistoryError(_UNREADABLE_HISTORY)
+        sizes.append(int(fields[2]))
+        if sum(sizes) > MAX_ANCESTRY_BYTES:
+            raise WorkspaceHistoryError(
+                "the local history on top of the prepared base exceeds 1 MiB of commit objects"
+            )
+
+    bodies = _git(repo, "cat-file", "--batch", stdin=request).stdout
+    known = set(commits)
+    offset = 0
+    for commit, size in zip(commits, sizes, strict=True):
+        header = f"{commit} commit {size}\n".encode("ascii")
+        start = offset + len(header)
+        if bodies[offset:start] != header or bodies[start + size : start + size + 1] != b"\n":
+            raise WorkspaceHistoryError(_UNREADABLE_HISTORY)
+        body = bodies[start : start + size]
+        offset = start + size + 1
+        if _object_id(object_format, b"commit", body) != commit:
+            raise WorkspaceHistoryError(
+                "a local commit on top of the prepared base does not match its object id"
+            )
+        parents = _commit_parents(body, len(base_sha))
+        # A root commit or a parent outside the listed set is history that
+        # does not end at the prepared base.
+        if not parents or any(parent != base_sha and parent not in known for parent in parents):
+            raise WorkspaceHistoryError(_NOT_DESCENDANT)
+
+
+def _tree_entries(repo: Path, base_sha: str) -> dict[bytes, tuple[str, str]]:
+    """Every path of the prepared base's tree, as (mode, object id)."""
+
+    entries: dict[bytes, tuple[str, str]] = {}
+    for item in _git(repo, "ls-tree", "-r", "-z", "--full-tree", base_sha).stdout.split(b"\0"):
         if not item:
             continue
-        try:
-            raw = item.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise WorkspaceSnapshotError("workspace contains a non-UTF-8 path") from exc
-        safe = _safe_repository_path(raw)
-        candidate = repo / safe
-        try:
-            mode = candidate.lstat().st_mode
-        except FileNotFoundError:
-            # Deleted tracked paths are represented by their patch and have no
-            # filesystem object to validate.
-            paths.add(safe)
-            continue
-        if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
-            raise WorkspaceSnapshotError(f"workspace path {safe!r} is not a regular file")
-        paths.add(safe)
-    return tuple(sorted(paths))
+        meta, separator, path = item.partition(b"\t")
+        fields = meta.decode("ascii", errors="replace").split(" ")
+        if not separator or len(fields) != 3:
+            raise WorkspaceSnapshotError("git listed a malformed tree entry")
+        entries[path] = (fields[0], fields[2])
+    return entries
 
 
-def _untracked_patch(repo: Path, paths: tuple[str, ...]) -> bytes:
-    chunks: list[bytes] = []
-    for path in paths:
-        tracked = _git(repo, "ls-files", "--error-unmatch", "--", path, check=False)
-        if tracked.returncode == 0:
-            continue
-        result = _git(
-            repo,
-            "diff",
-            "--no-index",
-            "--binary",
-            "--",
-            "/dev/null",
-            path,
-            check=False,
+# One path as read from the filesystem: ("absent",), ("directory",),
+# ("gitlink", oid), ("symlink", oid) or ("file", mode, oid).
+_Record = tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _Observation:
+    """One read of the index listing, the untracked listing and every candidate path."""
+
+    index: Mapping[bytes, tuple[str, str]]
+    untracked: tuple[bytes, ...]
+    records: Mapping[bytes, _Record]
+
+
+def _require_readable(path: bytes) -> None:
+    # Checked before any read, so a crafted index entry cannot reach outside
+    # the workspace or into git metadata.
+    if any(part in (b"", b".", b"..") or part.lower() == b".git" for part in path.split(b"/")):
+        raise WorkspaceSnapshotError(f"unsafe patch path {_display(path)!r}")
+
+
+def _open_parent(root_fd: int, parts: list[bytes]) -> int | None:
+    """Open the parent directory without following symlinks, or None if absent."""
+
+    fd = os.dup(root_fd)
+    for part in parts:
+        try:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+                return None
+            raise
+        finally:
+            os.close(fd)
+        fd = child
+    return fd
+
+
+def _hash_file(parent_fd: int, name: bytes, object_format: str) -> _Record:
+    try:
+        fd = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY, dir_fd=parent_fd
         )
-        if result.returncode not in (0, 1):
-            diagnostic = result.stderr.decode("utf-8", errors="replace").strip()
-            raise WorkspaceSnapshotError(f"git could not capture untracked path: {diagnostic}")
-        chunks.append(result.stdout)
-    return b"".join(chunks)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ELOOP):
+            raise WorkspaceSnapshotError(_CHANGED) from exc
+        raise
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise WorkspaceSnapshotError(_CHANGED)
+        digest = hashlib.new(object_format, usedforsecurity=False)
+        digest.update(b"blob %d\0" % info.st_size)
+        read = 0
+        while chunk := os.read(fd, _READ_CHUNK):
+            read += len(chunk)
+            digest.update(chunk)
+        if read != info.st_size:
+            raise WorkspaceSnapshotError(_CHANGED)
+        mode = "100755" if info.st_mode & stat.S_IXUSR else "100644"
+        return ("file", mode, digest.hexdigest())
+    finally:
+        os.close(fd)
+
+
+def _record(root_fd: int, path: bytes, gitlink: str | None, object_format: str) -> _Record:
+    parts = path.split(b"/")
+    try:
+        parent = _open_parent(root_fd, parts[:-1])
+    except OSError as exc:
+        raise WorkspaceSnapshotError(
+            f"workspace path {_display(path)!r} could not be read"
+        ) from exc
+    if parent is None:
+        return ("absent",)
+    name = parts[-1]
+    try:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if gitlink is not None and stat.S_ISDIR(info.st_mode):
+            # A submodule directory is identified by its recorded commit and
+            # never descended into.
+            return ("gitlink", gitlink)
+        if stat.S_ISLNK(info.st_mode):
+            target = os.readlink(name, dir_fd=parent)
+            return ("symlink", _object_id(object_format, b"blob", target))
+        if stat.S_ISDIR(info.st_mode):
+            # Its untracked contents are listed as paths of their own.
+            return ("directory",)
+        if stat.S_ISREG(info.st_mode):
+            return _hash_file(parent, name, object_format)
+        raise WorkspaceSnapshotError(f"workspace path {_display(path)!r} is not a regular file")
+    except FileNotFoundError:
+        return ("absent",)
+    except OSError as exc:
+        raise WorkspaceSnapshotError(
+            f"workspace path {_display(path)!r} could not be read"
+        ) from exc
+    finally:
+        os.close(parent)
+
+
+def _gitlink(
+    path: bytes,
+    index: Mapping[bytes, tuple[str, str]],
+    base: Mapping[bytes, tuple[str, str]],
+) -> str | None:
+    for entry in (index.get(path), base.get(path)):
+        if entry is not None and entry[0] == _GITLINK_MODE:
+            return entry[1]
+    return None
+
+
+def _observe(
+    repo: Path, base: Mapping[bytes, tuple[str, str]], object_format: str
+) -> _Observation:
+    """Read every path of P's tree, the index and the untracked listing."""
+
+    index: dict[bytes, tuple[str, str]] = {}
+    for item in _git(repo, "ls-files", "-s", "-z").stdout.split(b"\0"):
+        if not item:
+            continue
+        meta, separator, path = item.partition(b"\t")
+        fields = meta.decode("ascii", errors="replace").split(" ")
+        if not separator or len(fields) != 3:
+            raise WorkspaceSnapshotError("git listed a malformed index entry")
+        if fields[2] != "0":
+            raise WorkspaceSnapshotError(
+                f"workspace path {_display(path)!r} has an unmerged index entry"
+            )
+        index[path] = (fields[0], fields[1])
+    untracked: list[bytes] = []
+    for item in _git(repo, "ls-files", "-z", "--others", "--exclude-standard").stdout.split(
+        b"\0"
+    ):
+        if not item:
+            continue
+        if item.endswith(b"/"):
+            raise WorkspaceSnapshotError(
+                f"workspace path {_display(item.rstrip(b'/'))!r} is an untracked nested "
+                "repository"
+            )
+        untracked.append(item)
+
+    candidates = sorted({*base, *index, *untracked})
+    for path in candidates:
+        _require_readable(path)
+    try:
+        root_fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        raise WorkspaceSnapshotError("managed workspace directory is missing") from exc
+    try:
+        records = {
+            path: _record(root_fd, path, _gitlink(path, index, base), object_format)
+            for path in candidates
+        }
+    finally:
+        os.close(root_fd)
+    return _Observation(index=index, untracked=tuple(untracked), records=records)
+
+
+def _desired_entries(records: Mapping[bytes, _Record]) -> dict[bytes, tuple[str, str]]:
+    """The tree the observed files describe: path to (mode, object id)."""
+
+    desired: dict[bytes, tuple[str, str]] = {}
+    for path, record in records.items():
+        if record[0] == "file":
+            desired[path] = (record[1], record[2])
+        elif record[0] == "symlink":
+            desired[path] = (_SYMLINK_MODE, record[1])
+        elif record[0] == "gitlink":
+            desired[path] = (_GITLINK_MODE, record[1])
+    return desired
+
+
+def _publishable_path(
+    raw: bytes, entries: tuple[tuple[str, str] | None, tuple[str, str] | None]
+) -> str:
+    try:
+        path = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WorkspaceSnapshotError("workspace contains a non-UTF-8 path") from exc
+    if _safe_repository_path(path) != path or "\n" in path:
+        raise WorkspaceSnapshotError(f"unsafe patch path {path!r}")
+    if any(entry is not None and entry[0] in (_SYMLINK_MODE, _GITLINK_MODE) for entry in entries):
+        raise WorkspaceSnapshotError(f"workspace path {path!r} is not a regular file")
+    return path
+
+
+def _stdin_path(path: bytes) -> bytes:
+    """A path as ``hash-object --stdin-paths`` reads it: a leading quote means C quoting."""
+
+    if not path.startswith(b'"'):
+        return path
+    return b'"' + path.replace(b"\\", b"\\\\").replace(b'"', b'\\"') + b'"'
+
+
+def _build_patch(
+    repo: Path,
+    base_sha: str,
+    desired: Mapping[bytes, tuple[str, str]],
+    blobs: list[bytes],
+    changed: list[bytes],
+) -> bytes:
+    """Build tree C in a scratch index and object directory and diff it against P."""
+
+    objects_path = _git(repo, "rev-parse", "--git-path", "objects").stdout.decode(
+        "utf-8", errors="surrogateescape"
+    ).strip()
+    real_objects = (repo / objects_path).absolute()
+    scratch = Path(tempfile.mkdtemp(prefix="curie-snapshot-"))
+    try:
+        (scratch / "objects").mkdir()
+        # Building C never consults the real store; only the diff reads it.
+        isolated = {
+            "GIT_INDEX_FILE": str(scratch / "index"),
+            "GIT_OBJECT_DIRECTORY": str(scratch / "objects"),
+        }
+        if blobs:
+            printed = _git(
+                repo,
+                "hash-object",
+                "-w",
+                "--no-filters",
+                "--stdin-paths",
+                stdin=b"".join(_stdin_path(path) + b"\n" for path in blobs),
+                env=isolated,
+            ).stdout
+            if printed.split() != [desired[path][1].encode("ascii") for path in blobs]:
+                raise WorkspaceSnapshotError(_CHANGED)
+        _git(
+            repo,
+            "update-index",
+            "-z",
+            "--index-info",
+            stdin=b"".join(
+                b"%s %s\t%s\0" % (mode.encode("ascii"), oid.encode("ascii"), path)
+                for path, (mode, oid) in sorted(desired.items())
+            ),
+            env=isolated,
+        )
+        tree = _git(repo, "write-tree", "--missing-ok", env=isolated).stdout.decode(
+            "ascii", errors="replace"
+        ).strip()
+        if len(tree) != len(base_sha) or not _OID_RE.fullmatch(tree):
+            raise WorkspaceSnapshotError("git wrote an invalid snapshot tree id")
+        with_base = {**isolated, "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(real_objects)}
+        names = _git(
+            repo, "diff", "--no-renames", "--name-only", "-z", base_sha, tree, "--", env=with_base
+        ).stdout
+        if sorted(name for name in names.split(b"\0") if name) != changed:
+            raise WorkspaceSnapshotError("the snapshot tree does not match the observed workspace")
+        patch_file = scratch / "patch"
+        with patch_file.open("wb") as handle:
+            # Explicitly disabling rename detection represents a rename as one
+            # deletion plus one addition, so both paths are disclosed.
+            _git(
+                repo,
+                "diff",
+                "--binary",
+                "--full-index",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                base_sha,
+                tree,
+                "--",
+                env=with_base,
+                stdout=handle,
+            )
+        with patch_file.open("rb") as handle:
+            return enforce_patch_cap(handle.read(MAX_PATCH_BYTES + 1))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def capture_workspace_snapshot(
     workspace: str | Path = "/workspace",
     *,
+    base_sha: str,
     expected_repo: str | None = None,
     trusted_origin: str | None = None,
     repository_path: str | None = None,
     publication_title: str | None = None,
     publication_body: str | None = None,
 ) -> WorkspaceSnapshot:
-    """Capture the workspace as a publication patch, refusing an untrusted origin.
+    """Capture the net change from ``base_sha`` to the final working tree files.
+
+    ``base_sha`` is the prepared commit P the worker retained for the thread;
+    the result is always anchored there. HEAD must be P or a local descendant
+    proven within ``MAX_ANCESTRY_COMMITS`` and ``MAX_ANCESTRY_BYTES``, else
+    ``WorkspaceHistoryError``.
 
     ``trusted_origin`` and ``repository_path`` are the boot env's
     ``CURIE_REPO_ORIGIN`` and ``CURIE_REPO_PATH`` (ADR 0197), which the worker
@@ -332,36 +784,31 @@ def capture_workspace_snapshot(
             f"workspace repository {actual_repo!r} does not match configured repository"
         )
 
-    base_sha = _git(repo, "rev-parse", "HEAD").stdout.decode().strip().lower()
-    if not _SHA_RE.fullmatch(base_sha):
-        raise WorkspaceSnapshotError("workspace base commit is not a valid object id")
+    object_format = _verify_base(repo, base_sha)
+    head = _head(repo, len(base_sha))
+    if head is None:
+        raise WorkspaceHistoryError(_NOT_DESCENDANT)
+    _prove_descendant(repo, head, base_sha, object_format)
 
-    changed_paths = _changed_paths(repo)
-    patch = _git(
-        repo,
-        "diff",
-        "--no-renames",
-        "--binary",
-        "--full-index",
-        "HEAD",
-        "--",
-    ).stdout
-    patch += _untracked_patch(repo, changed_paths)
-    # Capture is several git calls with no isolation between them. A write
-    # landing between them can patch a path the disclosed list omits, or add
-    # one the patch never reads, so re-enumerate and refuse a moved tree.
-    if (
-        _git(repo, "rev-parse", "HEAD").stdout.decode().strip().lower() != base_sha
-        or _changed_paths(repo) != changed_paths
-    ):
-        raise WorkspaceSnapshotError(
-            "the workspace changed during snapshot capture; retry once writes stop"
-        )
+    base = _tree_entries(repo, base_sha)
+    first = _observe(repo, base, object_format)
+    desired = _desired_entries(first.records)
+    changed = sorted(path for path in {*base, *desired} if base.get(path) != desired.get(path))
+    changed_paths = tuple(
+        _publishable_path(path, (base.get(path), desired.get(path))) for path in changed
+    )
+    blobs = [path for path in changed if first.records[path][0] == "file"]
+    patch = _build_patch(repo, base_sha, desired, blobs, changed)
+    # Capture is several reads with no isolation between them. A write landing
+    # in between can patch content the disclosed list omits, so observe again
+    # and refuse a moved workspace.
+    if _head(repo, len(base_sha)) != head or _observe(repo, base, object_format) != first:
+        raise WorkspaceSnapshotError(_CHANGED)
     validate_patch(patch)
     return WorkspaceSnapshot(
         repo_full_name=actual_repo,
         base_sha=base_sha,
-        patch=enforce_patch_cap(patch),
+        patch=patch,
         changed_paths=changed_paths,
         contains_workflow_files=any(
             path.startswith(".github/workflows/") for path in changed_paths
@@ -369,3 +816,30 @@ def capture_workspace_snapshot(
         publication_title=publication_title,
         publication_body=publication_body,
     )
+
+
+def workspace_snapshotter(
+    workspace: Path,
+    *,
+    trusted_origin: str | None,
+    repository_path: str | None,
+    proposal: Callable[[], tuple[str | None, str | None]],
+) -> Callable[[str], WorkspaceSnapshot]:
+    """The ``/v1/snapshot`` capture of the mounted workspace.
+
+    The route supplies the worker's prepared base. ``proposal`` returns the
+    approval gate's publication title and body at capture time.
+    """
+
+    def capture(base_sha: str) -> WorkspaceSnapshot:
+        title, body = proposal()
+        return capture_workspace_snapshot(
+            workspace,
+            base_sha=base_sha,
+            trusted_origin=trusted_origin,
+            repository_path=repository_path,
+            publication_title=title,
+            publication_body=body,
+        )
+
+    return capture

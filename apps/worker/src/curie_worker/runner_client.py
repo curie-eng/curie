@@ -721,9 +721,13 @@ class RunnerClient:
         base_url: str,
         token: str | None = None,
         *,
+        base_sha: str,
         remaining_s: float | None = None,
     ) -> RunnerWorkspaceSnapshot:
         """Capture a bounded patch before a publication approval suspends.
+
+        ``base_sha`` is the prepared commit the worker retained for the
+        thread; the runner anchors the patch there, never at the agent's HEAD.
 
         This call is always runner-token authenticated. A missing token is a
         worker invariant violation, not a request to try the unauthenticated
@@ -735,6 +739,7 @@ class RunnerClient:
             raise RunnerError("publication snapshot requires a runner token")
         async with self._session.post(
             f"{base_url}/v1/snapshot",
+            json={"base_sha": base_sha},
             headers=_auth_headers(token),
             timeout=self._request_timeout(remaining_s),
         ) as resp:
