@@ -22,9 +22,14 @@ base commit to the final working tree files, with committed, staged, unstaged
 and untracked changes together. The implementer may have committed some or
 all of it, so a plain `git diff` against HEAD can miss part of the change.
 Run `git diff <base>` with the base commit from the `CANDIDATE:` block, and
-`git status` to list the untracked files, then read each untracked file. Do
-this yourself; do not trust a pasted diff. Local commits are flattened into
-one publication, so judge the net change, not the commit history. Check:
+`git status` to list the untracked files, then read each untracked file. When
+the `CANDIDATE:` block also lists paths that git diff does not show (a base
+file the index no longer lists, or an index entry git is told not to read
+from disk), read every listed file directly: each is published with its
+current file contents, and a listed file missing from disk is published as a
+deletion. Do this yourself; do not trust a pasted diff. Local
+commits are flattened into one publication, so judge the net change, not the
+commit history. Check:
 
 - Every acceptance criterion is met, with the evidence its row in the
   verification table requires under the verification contract.

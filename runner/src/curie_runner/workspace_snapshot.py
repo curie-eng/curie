@@ -464,9 +464,14 @@ def _tree_entries(repo: Path, base_sha: str) -> dict[bytes, tuple[str, str]]:
     return entries
 
 
-# One path as read from the filesystem: ("absent",), ("directory",),
-# ("gitlink", oid), ("symlink", oid) or ("file", mode, oid).
+# One path as observed: ("absent",), ("directory",), ("gitlink", oid),
+# ("symlink", oid) or ("file", mode, oid) from the filesystem, or ("kept", mode,
+# oid) for P's own entry left in place (see ``_observe``).
 _Record = tuple[str, ...]
+_ABSENT: _Record = ("absent",)
+# Index flag tags (``git ls-files -v``) of a skip-worktree entry; the lowercase
+# form also has assume-unchanged set.
+_SKIP_WORKTREE_TAGS = frozenset({"S", "s"})
 
 
 @dataclass(frozen=True)
@@ -579,21 +584,32 @@ def _gitlink(
 def _observe(
     repo: Path, base: Mapping[bytes, tuple[str, str]], object_format: str
 ) -> _Observation:
-    """Read every path of P's tree, the index and the untracked listing."""
+    """Read every path of P's tree, the index and the untracked listing.
+
+    The filesystem decides every path, with one exception: a skip-worktree index
+    entry equal to P's entry whose path is absent keeps P's entry. That is the
+    state worker preparation leaves when it unlinks a committed symlink that
+    escapes the checkout, so it is not a deletion the agent made. Because the
+    kept entry is part of the records, the second observation compares it too.
+    """
 
     index: dict[bytes, tuple[str, str]] = {}
-    for item in _git(repo, "ls-files", "-s", "-z").stdout.split(b"\0"):
+    skip_worktree: set[bytes] = set()
+    for item in _git(repo, "ls-files", "-s", "-v", "-z").stdout.split(b"\0"):
         if not item:
             continue
         meta, separator, path = item.partition(b"\t")
         fields = meta.decode("ascii", errors="replace").split(" ")
-        if not separator or len(fields) != 3:
+        if not separator or len(fields) != 4 or len(fields[0]) != 1:
             raise WorkspaceSnapshotError("git listed a malformed index entry")
-        if fields[2] != "0":
+        tag, mode, oid, stage = fields
+        if stage != "0":
             raise WorkspaceSnapshotError(
                 f"workspace path {_display(path)!r} has an unmerged index entry"
             )
-        index[path] = (fields[0], fields[1])
+        index[path] = (mode, oid)
+        if tag in _SKIP_WORKTREE_TAGS:
+            skip_worktree.add(path)
     untracked: list[bytes] = []
     for item in _git(repo, "ls-files", "-z", "--others", "--exclude-standard").stdout.split(
         b"\0"
@@ -615,10 +631,18 @@ def _observe(
     except OSError as exc:
         raise WorkspaceSnapshotError("managed workspace directory is missing") from exc
     try:
-        records = {
-            path: _record(root_fd, path, _gitlink(path, index, base), object_format)
-            for path in candidates
-        }
+        records: dict[bytes, _Record] = {}
+        for path in candidates:
+            record = _record(root_fd, path, _gitlink(path, index, base), object_format)
+            kept = base.get(path)
+            if (
+                record == _ABSENT
+                and path in skip_worktree
+                and kept is not None
+                and index.get(path) == kept
+            ):
+                record = ("kept", *kept)
+            records[path] = record
     finally:
         os.close(root_fd)
     return _Observation(index=index, untracked=tuple(untracked), records=records)
@@ -629,7 +653,7 @@ def _desired_entries(records: Mapping[bytes, _Record]) -> dict[bytes, tuple[str,
 
     desired: dict[bytes, tuple[str, str]] = {}
     for path, record in records.items():
-        if record[0] == "file":
+        if record[0] in ("file", "kept"):
             desired[path] = (record[1], record[2])
         elif record[0] == "symlink":
             desired[path] = (_SYMLINK_MODE, record[1])
