@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from curie_runner import workspace_snapshot
 
 
 def _load_gate_helpers() -> Any:
@@ -662,17 +663,31 @@ def test_a_flagged_github_edit_hidden_from_git_diff_stops_the_diff_review(
     assert not [e for e in s.gate_events() if e["curie_gate"] == "github_path_refused"]
 
 
-# --- Freshness and the reviewer's input bind to the bytes on disk --------------------
+# --- The reviewed candidate is the published one, as git sees the checkout ---------
 
+CAPTURE_REPO = "acme-corp/acme-calc"
 # A comment in both Python and YAML, so it changes no behavior where it lands.
-HIDDEN_LINE = "# HIDDEN: published, but never shown by git diff\n"
+HIDDEN_LINE = "# HIDDEN: never shown by git diff\n"
+
+
+def _publishable(s: Any) -> None:
+    """Give the checkout the credential-free origin the runner capture requires."""
+    _git(s, "remote", "add", "origin", f"https://github.com/{CAPTURE_REPO}.git")
+
+
+def _capture(s: Any, base: str) -> Any:
+    """The real runner capture of the session's checkout against the run's base."""
+    return workspace_snapshot.capture_workspace_snapshot(
+        s.cwd,
+        base_sha=base,
+        expected_repo=CAPTURE_REPO,
+        trusted_origin="https://github.com",
+        repository_path=CAPTURE_REPO,
+    )
 
 
 def _strip_hidden_lines(s: Any, path: str) -> None:
-    """A checkout-local clean filter on ``path`` that drops every HIDDEN line from git's view.
-
-    The snapshot hashes files without filters, so it still publishes those lines.
-    """
+    """A checkout-local clean filter on ``path`` that drops every HIDDEN line from git's view."""
     _git(s, "config", "filter.strip.clean", "grep -v HIDDEN || true")
     _git(s, "config", "filter.strip.smudge", "cat")
     attributes = s.cwd / ".git" / "info" / "attributes"
@@ -680,17 +695,13 @@ def _strip_hidden_lines(s: Any, path: str) -> None:
     attributes.write_text(f"{path} filter=strip\n")
 
 
-def _append_hidden_line(s: Any, path: str) -> None:
-    with (s.cwd / path).open("a") as handle:
-        handle.write(HIDDEN_LINE)
-
-
 def _trust_stat(s: Any, path: str) -> int:
     """Make git trust ``path``'s cached stat; the mtime it caches, in nanoseconds.
 
     ``core.checkStat=minimal`` and ``core.trustctime=false`` leave whole-second
     mtime and size as git's only checks, and the index is refreshed after an
-    mtime a minute in the past, so the entry is not racy.
+    mtime a minute in the past, so the entry is not racy. Every tracked file
+    must equal its index entry when this runs.
     """
     _git(s, "config", "core.checkStat", "minimal")
     _git(s, "config", "core.trustctime", "false")
@@ -701,142 +712,86 @@ def _trust_stat(s: Any, path: str) -> int:
     return past
 
 
-def _rewrite_keeping_stat(s: Any, path: str, mtime_ns: int) -> None:
-    """Rewrite ``path`` with new bytes of the same size and put its mtime back."""
+def _rewrite_keeping_stat(s: Any, path: str, old: bytes, new: bytes, mtime_ns: int) -> None:
+    """Rewrite ``path`` with ``old`` replaced by ``new``, same size, and put its mtime back."""
     target = s.cwd / path
     data = target.read_bytes()
-    changed = data.replace(b"== 3", b"== 4")
+    changed = data.replace(old, new)
     assert changed != data and len(changed) == len(data)
     target.write_bytes(changed)
     os.utime(target, ns=(mtime_ns, mtime_ns))
 
 
-@pytest.mark.parametrize("hidden", [True, False], ids=["hidden_line_after_approval", "control"])
-def test_a_line_a_clean_filter_hides_from_git_after_approval_needs_a_fresh_review(
-    tmp_path: Path, hidden: bool
+def test_a_line_a_clean_filter_hides_after_approval_is_neither_reviewed_nor_published(
+    tmp_path: Path,
 ) -> None:
-    s, _ = _planned(tmp_path)
-    _strip_hidden_lines(s, SOURCE)
+    s, base = _planned(tmp_path)
+    _publishable(s)
     _change_source(s, "fix")
     _approve_diff(s)
-    shown = _git(s, "diff", "HEAD")
-    assert SOURCE in shown
-
-    if hidden:
-        _append_hidden_line(s, SOURCE)
-        # git's view of the checkout is still the one the reviewer approved.
-        assert _git(s, "diff", "HEAD") == shown
-        assert HIDDEN_LINE in (s.cwd / SOURCE).read_text()
+    reviewed = _capture(s, base)
+    _strip_hidden_lines(s, SOURCE)
+    with (s.cwd / SOURCE).open("a") as handle:
+        handle.write(HIDDEN_LINE)
+    assert HIDDEN_LINE in (s.cwd / SOURCE).read_text()
 
     decision = _publish(s)
+    published = _capture(s, base)
 
-    if not hidden:
-        assert decision["permissionDecision"] == "allow", decision
-        return
-    _assert_denied(decision, FRESH_REVIEW)
+    # git's view, which the reviewer read, did not change, and it is what publishes.
+    assert decision["permissionDecision"] == "allow", decision
+    assert published.base_sha == base
+    assert published.changed_paths == (SOURCE,)
+    assert published.patch == reviewed.patch
+    assert b"+    return a + b  # fix\n" in published.patch
+    assert b"HIDDEN" not in published.patch
 
 
-@pytest.mark.parametrize("rewritten", [True, False], ids=["rewrite_after_approval", "control"])
-def test_a_same_size_rewrite_the_stat_cache_hides_after_approval_needs_a_fresh_review(
-    tmp_path: Path, rewritten: bool
+def test_a_stale_stat_rewrite_of_an_unedited_file_is_neither_reviewed_nor_published(
+    tmp_path: Path,
 ) -> None:
-    s, _ = _planned(tmp_path)
+    s, base = _planned(tmp_path)
+    _publishable(s)
     past = _trust_stat(s, TEST)
     _change_source(s, "fix")
     _approve_diff(s)
-
-    if rewritten:
-        status = _git(s, "status", "--porcelain=v1", "--untracked-files=all")
-        _rewrite_keeping_stat(s, TEST, past)
-        # git trusts the cached stat: it neither rereads nor reports the file.
-        assert _git(s, "status", "--porcelain=v1", "--untracked-files=all") == status
-        assert _git(s, "diff", "HEAD", "--", TEST) == ""
+    reviewed = _capture(s, base)
+    _rewrite_keeping_stat(s, TEST, b"== 3", b"== 4", past)
+    # The index entry still equals the base and its stat looks clean: git diff
+    # <base> does not list the file, so the reviewer never saw the rewrite.
+    assert _git(s, "diff", "--name-only", base) == f"{SOURCE}\n"
 
     decision = _publish(s)
+    published = _capture(s, base)
 
-    if not rewritten:
-        assert decision["permissionDecision"] == "allow", decision
-        return
-    _assert_denied(decision, FRESH_REVIEW)
+    assert decision["permissionDecision"] == "allow", decision
+    assert published.base_sha == base
+    assert published.changed_paths == (SOURCE,)
+    assert published.patch == reviewed.patch
+    assert b"== 4" not in published.patch
 
 
-@pytest.mark.parametrize(
-    "scenario",
-    [
-        "filter_hidden_line",
-        "filter_hidden_line_beside_a_visible_edit",
-        "same_size_rewrite_under_a_trusted_stat",
-        "control_ordinary_edit",
-        "control_filter_with_the_index_equal",
-    ],
-)
-def test_bytes_git_does_not_show_as_they_are_on_disk_are_named_after_the_candidate_block(
-    tmp_path: Path, scenario: str
+def test_a_stale_stat_rewrite_of_a_committed_file_after_approval_needs_a_fresh_review(
+    tmp_path: Path,
 ) -> None:
     s, base = _planned(tmp_path)
-    hidden: list[str] = []
-    if scenario.startswith("filter_hidden_line"):
-        _strip_hidden_lines(s, SOURCE)
-        if scenario.endswith("visible_edit"):
-            # git diff lists the file, but its view of the contents lacks the line.
-            _change_source(s, "fix")
-        _append_hidden_line(s, SOURCE)
-        assert "HIDDEN" not in _git(s, "diff", "HEAD")
-        hidden = [SOURCE]
-    elif scenario == "same_size_rewrite_under_a_trusted_stat":
-        past = _trust_stat(s, TEST)
-        _rewrite_keeping_stat(s, TEST, past)
-        assert _clean(s)
-        hidden = [TEST]
-    elif scenario == "control_ordinary_edit":
-        # Control: git shows this edit as it is, so nothing is named.
-        _change_source(s, "fix")
-    else:
-        # Control: a filter is configured, but every tracked file equals its index entry.
-        _strip_hidden_lines(s, SOURCE)
-        _change_source(s, "fix")
-        _git(s, "add", SOURCE)
+    _publishable(s)
+    _change_source(s, "fix")
+    _commit(s, "Fix add")
+    past = _trust_stat(s, SOURCE)
+    _approve_diff(s)
+    _rewrite_keeping_stat(s, SOURCE, b"a + b", b"a - b", past)
+    # git diff HEAD misses the rewrite; git diff <base>, the reviewer's view, shows it.
+    assert _git(s, "diff", "HEAD") == ""
+    assert "+    return a - b  # fix" in _git(s, "diff", base)
 
-    prompt = _approve_diff(s)
+    decision = _publish(s)
+    published = _capture(s, base)
 
-    expected = contract() + candidate_block(base)
-    if hidden:
-        expected += hidden_paths_line(hidden)
-    else:
-        assert "git diff does not show them" not in prompt
-    assert prompt.endswith(expected), prompt[-800:]
-    assert prompt.count("CANDIDATE:") == 1
-
-
-@pytest.mark.parametrize(
-    "path",
-    [".github/workflows/ci.yml", "pkg/.github/workflows/ci.yml"],
-    ids=["root_github", "control_nested"],
-)
-def test_a_github_line_a_clean_filter_hides_from_git_diff_stops_the_diff_review(
-    tmp_path: Path, path: str
-) -> None:
-    s = Session(tmp_path)
-    target = s.cwd / path
-    target.parent.mkdir(parents=True)
-    target.write_text("on: push\n")
-    _commit(s, "Workflow fixture")
-    base = _plan_run(s)
-    s.report("implement", 1)
-    _strip_hidden_lines(s, path)
-    _append_hidden_line(s, path)
-    assert _clean(s)
-
-    out = s.fire("PreToolUse", tool_name="Agent", tool_input=dict(DIFF_INPUT))
-
-    if path.startswith(".github/"):
-        # The same stop a visible .github change gets (#4435).
-        gate._assert_github_path_stops_run(s, out, path)
-        return
-    # Control: outside the root .github the diff review is admitted, naming the path.
-    assert out is not None
-    decision = out["hookSpecificOutput"]
-    assert decision["permissionDecision"] == "allow", decision
-    prompt = decision["updatedInput"]["prompt"]
-    assert prompt.endswith(contract() + candidate_block(base) + hidden_paths_line([path]))
-    assert not [e for e in s.gate_events() if e["curie_gate"] == "github_path_refused"]
+    _assert_denied(decision, FRESH_REVIEW)
+    # The deny is needed: the publication carries the rewrite.
+    assert published.changed_paths == (SOURCE,)
+    assert b"+    return a - b  # fix\n" in published.patch
+    # Fresh review, not a stop: the rewritten checkout is reviewed again and publishes.
+    _approve_diff(s)
+    assert _publish(s)["permissionDecision"] == "allow"

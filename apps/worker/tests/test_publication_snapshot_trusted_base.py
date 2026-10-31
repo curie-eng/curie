@@ -485,7 +485,7 @@ def test_a_change_committed_then_reverted_validates_as_an_empty_publication(
     assert tree == _tree_of(repo, prepared)
 
 
-def test_a_line_a_checkout_clean_filter_hides_from_git_diff_is_published_and_validated(
+def test_a_line_a_clean_filter_hides_is_not_published_beside_a_visible_edit(
     tmp_path: Path,
 ) -> None:
     repo, prepared = _prepared(tmp_path)
@@ -496,16 +496,39 @@ def test_a_line_a_checkout_clean_filter_hides_from_git_diff_is_published_and_val
     attributes = repo / ".git" / "info" / "attributes"
     attributes.parent.mkdir(exist_ok=True)
     attributes.write_text("src/app.py filter=strip\n")
-    final = b"x = 1\n# HIDDEN: published, but never shown by git diff\n"
-    _write(repo, "src/app.py", final)
-    assert _git(repo, "diff", "HEAD") == ""
+    _write(repo, "src/app.py", b"x = 2\n# HIDDEN: never shown by git diff\n")
+    assert "HIDDEN" not in _git(repo, "diff", "HEAD")
 
     snapshot = _snapshot_over_http(repo, prepared)
 
-    # The snapshot publishes the raw bytes, not git's filtered view of them.
+    # The publication is git's view of the file: the visible edit, not the hidden line.
     assert snapshot.base_sha == prepared
     assert snapshot.changed_paths == ("src/app.py",)
-    assert b"+# HIDDEN: published, but never shown by git diff" in snapshot.patch
+    assert b"+x = 2" in snapshot.patch
+    assert b"HIDDEN" not in snapshot.patch
     _validate(_coordinator(prepared, archive), snapshot, tmp_path / "validation")
     _, checkout = _result(tmp_path / "result", archive, snapshot.patch)
-    assert (checkout / "src" / "app.py").read_bytes() == final
+    assert (checkout / "src" / "app.py").read_bytes() == b"x = 2\n"
+
+
+def test_an_untouched_crlf_checkout_validates_to_an_empty_publication(tmp_path: Path) -> None:
+    repo, _ = _prepared(tmp_path)
+    # P stores LF content under an attribute that checks it out with CRLF.
+    _write(repo, ".gitattributes", b"*.bat text eol=crlf\n")
+    _write(repo, "run.bat", b"@echo off\necho acme\n")
+    _git(repo, "add", "-A")
+    prepared = _commit(repo, "Prepared base with a CRLF script")
+    (repo / "run.bat").unlink()
+    _git(repo, "checkout", "--", "run.bat")
+    assert (repo / "run.bat").read_bytes() == b"@echo off\r\necho acme\r\n"
+    assert _git(repo, "status", "--porcelain") == ""
+    archive = _archive(repo, prepared)
+
+    snapshot = _snapshot_over_http(repo, prepared)
+
+    assert snapshot.base_sha == prepared
+    assert snapshot.patch == b""
+    assert snapshot.changed_paths == ()
+    _validate(_coordinator(prepared, archive), snapshot, tmp_path / "validation")
+    tree, _ = _result(tmp_path / "result", archive, snapshot.patch)
+    assert tree == _tree_of(repo, prepared)

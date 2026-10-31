@@ -651,6 +651,213 @@ def test_an_absent_skip_worktree_entry_the_agent_restaged_is_a_deletion_of_the_b
     assert not (fresh / "kept.cfg").exists()
 
 
+# --- tracked files publish git's view of them --------------------------------------
+
+_HIDDEN = b"# HIDDEN: never shown by git diff\n"
+
+
+def _crlf_checkout(root: Path) -> tuple[Path, str]:
+    """P stores LF content under ``*.bat text eol=crlf``; checkout writes it as CRLF."""
+
+    repo, _ = _prepared(root)
+    _write(repo, ".gitattributes", b"*.bat text eol=crlf\n")
+    _write(repo, "run.bat", b"@echo off\necho one\necho two\n")
+    _git(repo, "add", "-A")
+    prepared = _commit(repo, "Prepared base with a CRLF script")
+    (repo / "run.bat").unlink()
+    _git(repo, "checkout", "--", "run.bat")
+    assert (repo / "run.bat").read_bytes() == b"@echo off\r\necho one\r\necho two\r\n"
+    assert _git(repo, "status", "--porcelain") == ""
+    return repo, prepared
+
+
+def _changed_lines(section: bytes) -> list[bytes]:
+    return [
+        line
+        for line in section.splitlines()
+        if line.startswith((b"+", b"-")) and not line.startswith((b"+++", b"---"))
+    ]
+
+
+def test_an_untouched_crlf_checkout_is_an_empty_capture(tmp_path: Path) -> None:
+    repo, prepared = _crlf_checkout(tmp_path)
+
+    captured = _capture(repo, prepared)
+
+    assert captured.base_sha == prepared
+    assert captured.patch == b""
+    assert captured.changed_paths == ()
+
+
+def test_an_edit_to_one_line_of_a_crlf_file_publishes_that_line_in_git_normal_form(
+    tmp_path: Path,
+) -> None:
+    repo, prepared = _crlf_checkout(tmp_path)
+    _write(repo, "run.bat", b"@echo off\r\necho one\r\necho changed\r\n")
+
+    captured = _capture(repo, prepared)
+
+    assert captured.changed_paths == ("run.bat",)
+    assert _changed_lines(_sections(captured.patch)["run.bat"]) == [
+        b"-echo two",
+        b"+echo changed",
+    ]
+    assert b"\r" not in captured.patch
+
+
+def test_an_untracked_crlf_file_under_an_eol_attribute_is_published_byte_for_byte(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _prepared(tmp_path)
+    _write(repo, ".gitattributes", b"*.bat text eol=crlf\n")
+    _git(repo, "add", ".gitattributes")
+    prepared = _commit(repo, "Prepared base with an eol attribute")
+    _write(repo, "new.bat", b"@echo off\r\necho new\r\n")
+
+    captured = _capture(repo, prepared)
+
+    # git does not read an untracked file, so its bytes publish unconverted.
+    assert captured.changed_paths == ("new.bat",)
+    assert b"+@echo off\r\n+echo new\r\n" in _sections(captured.patch)["new.bat"]
+
+
+@pytest.mark.parametrize("visible", [False, True], ids=["hidden_line_alone", "beside_an_edit"])
+def test_a_line_a_checkout_clean_filter_hides_from_git_diff_is_not_published(
+    tmp_path: Path, visible: bool
+) -> None:
+    repo, prepared = _prepared(tmp_path)
+    _git(repo, "config", "filter.strip.clean", "grep -v HIDDEN || true")
+    _git(repo, "config", "filter.strip.smudge", "cat")
+    attributes = repo / ".git" / "info" / "attributes"
+    attributes.parent.mkdir(exist_ok=True)
+    attributes.write_bytes(b"src/app.py filter=strip\n")
+    _write(repo, "src/app.py", (b"x = 2\n" if visible else b"x = 1\n") + _HIDDEN)
+    assert "HIDDEN" not in _git(repo, "diff", "HEAD")
+
+    captured = _capture(repo, prepared)
+
+    assert b"HIDDEN" not in captured.patch
+    if not visible:
+        # git sees no change, so nothing publishes.
+        assert captured.patch == b""
+        assert captured.changed_paths == ()
+        return
+    assert captured.changed_paths == ("src/app.py",)
+    assert _changed_lines(_sections(captured.patch)["src/app.py"]) == [b"-x = 1", b"+x = 2"]
+
+
+def test_a_staged_visible_edit_publishes_without_a_line_the_clean_filter_hides(
+    tmp_path: Path,
+) -> None:
+    repo, prepared = _prepared(tmp_path)
+    _git(repo, "config", "filter.strip.clean", "grep -v HIDDEN || true")
+    _git(repo, "config", "filter.strip.smudge", "cat")
+    attributes = repo / ".git" / "info" / "attributes"
+    attributes.parent.mkdir(exist_ok=True)
+    attributes.write_bytes(b"src/app.py filter=strip\n")
+    _write(repo, "src/app.py", b"x = 2\n")
+    _git(repo, "add", "src/app.py")
+    with (repo / "src" / "app.py").open("ab") as handle:
+        handle.write(_HIDDEN)
+
+    captured = _capture(repo, prepared)
+
+    assert captured.changed_paths == ("src/app.py",)
+    assert _changed_lines(_sections(captured.patch)["src/app.py"]) == [b"-x = 1", b"+x = 2"]
+    assert b"HIDDEN" not in captured.patch
+
+
+def _trust_stat(repo: Path, path: str) -> int:
+    """Make git trust ``path``'s cached stat; the mtime it caches, in nanoseconds.
+
+    Whole-second mtime and size become git's only checks, and the index is
+    refreshed after an mtime a minute in the past, so the entry is not racy.
+    Every tracked file must equal its index entry when this runs.
+    """
+
+    _git(repo, "config", "core.checkStat", "minimal")
+    _git(repo, "config", "core.trustctime", "false")
+    target = repo / path
+    past = target.stat().st_mtime_ns - 60 * 1_000_000_000
+    os.utime(target, ns=(past, past))
+    _git(repo, "update-index", "--refresh")
+    return past
+
+
+def _rewrite_keeping_stat(repo: Path, path: str, data: bytes, mtime_ns: int) -> None:
+    """Rewrite ``path`` with same-size bytes and put its mtime back."""
+
+    target = repo / path
+    assert len(data) == target.stat().st_size and data != target.read_bytes()
+    target.write_bytes(data)
+    os.utime(target, ns=(mtime_ns, mtime_ns))
+
+
+def test_a_stale_stat_rewrite_of_a_file_whose_index_entry_is_the_base_is_not_published(
+    tmp_path: Path,
+) -> None:
+    repo, prepared = _prepared(tmp_path)
+    past = _trust_stat(repo, "src/app.py")
+    _rewrite_keeping_stat(repo, "src/app.py", b"x = 3\n", past)
+    # git diff <P> does not list it, so the candidate keeps P's entry.
+    assert _git(repo, "diff", "--name-only", prepared) == ""
+
+    captured = _capture(repo, prepared)
+
+    assert captured.base_sha == prepared
+    assert captured.patch == b""
+    assert captured.changed_paths == ()
+
+
+@pytest.mark.parametrize("recorded", ["staged", "committed"])
+def test_a_stale_stat_rewrite_after_the_edit_was_recorded_publishes_the_rewrite(
+    tmp_path: Path, recorded: str
+) -> None:
+    repo, prepared = _prepared(tmp_path)
+    _write(repo, "src/app.py", b"x = 2\n")
+    _git(repo, "add", "src/app.py")
+    if recorded == "committed":
+        _commit(repo, "Change src/app.py")
+    past = _trust_stat(repo, "src/app.py")
+    _rewrite_keeping_stat(repo, "src/app.py", b"x = 3\n", past)
+    # The index entry differs from P, so git diff <P> lists it with the bytes on disk.
+    assert "+x = 3" in _git(repo, "diff", prepared)
+
+    captured = _capture(repo, prepared)
+
+    assert captured.base_sha == prepared
+    assert captured.changed_paths == ("src/app.py",)
+    assert _changed_lines(_sections(captured.patch)["src/app.py"]) == [b"-x = 1", b"+x = 3"]
+    assert b"x = 2" not in captured.patch
+
+
+def test_a_mode_only_chmod_publishes_when_the_checkout_sets_core_filemode_false(
+    tmp_path: Path,
+) -> None:
+    repo, prepared = _prepared(tmp_path)
+    _git(repo, "config", "core.fileMode", "false")
+    (repo / "script.sh").chmod(0o755)
+    assert _git(repo, "status", "--porcelain") == ""
+
+    captured = _capture(repo, prepared)
+
+    assert captured.changed_paths == ("script.sh",)
+    assert b"old mode 100644\nnew mode 100755\n" in _sections(captured.patch)["script.sh"]
+
+
+def test_an_assume_unchanged_file_publishes_its_bytes_on_disk(tmp_path: Path) -> None:
+    repo, prepared = _prepared(tmp_path)
+    _git(repo, "update-index", "--assume-unchanged", "--", "README.md")
+    _write(repo, "README.md", b"edited behind an index flag\n")
+    assert _git(repo, "status", "--porcelain") == ""
+
+    captured = _capture(repo, prepared)
+
+    # git no longer reads a flagged file, so its bytes on disk publish.
+    assert captured.changed_paths == ("README.md",)
+    assert b"+edited behind an index flag" in _sections(captured.patch)["README.md"]
+
+
 # --- the /v1/snapshot route -------------------------------------------------------
 
 
