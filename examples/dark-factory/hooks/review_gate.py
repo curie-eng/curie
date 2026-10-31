@@ -28,11 +28,16 @@ reads as unset.
 Candidate. A run records its base commit, the checkout's HEAD when the run
 starts, before the agent acts. The candidate under review is the net change
 from that base to the final working tree files, so a local commit never
-redefines the base. The checkout fingerprint is a sha256 over the base, HEAD,
-``git status``, ``git diff HEAD``, the untracked files, the index entries with
-their skip-worktree and assume-unchanged flags, and the bytes on disk of every
-path the base tracks that the index does not list and of every flagged index
-entry, whose file git no longer reads (an absent one hashes as absent). Every
+redefines the base. The publication publishes index entries git reads as git
+shows them in ``git diff <base>``, and paths git does not read (untracked,
+flagged, base paths missing from the index) as their bytes on disk. The
+checkout fingerprint is a sha256 over the base, HEAD, ``git status``, ``git
+diff HEAD``, ``git diff <base>`` (the reviewer's exact view, so a stale index
+stat cannot hide a rewrite of a file committed after the base), the untracked
+files, the index entries with their skip-worktree and assume-unchanged flags,
+and the bytes on disk of every path the base tracks that the index does not
+list and of every flagged index entry, whose file git no longer reads (an
+absent one hashes as absent). Every
 git call sets ``core.fileMode=true``, so an executable bit always counts, and
 every git diff passes ``--no-ext-diff --no-textconv``. A run without a base has
 no fingerprint: every check that needs one treats the checkout as
@@ -910,8 +915,9 @@ def hidden_paths(workspace: str, deadline: float, base: str | None) -> list[str]
 
 
 def fingerprint(workspace: str, deadline: float, base: str | None) -> str | None:
-    """A sha256 over the base commit, the checkout's HEAD, status, diff and
-    untracked files, then the index entries with their flags, then every path
+    """A sha256 over the base commit, the checkout's HEAD, status, ``git diff
+    HEAD``, ``git diff <base>`` (length-prefixed; the reviewer's exact view)
+    and untracked files, then the index entries with their flags, then every path
     ``base`` tracks that the index does not, then every index entry flagged
     skip-worktree or assume-unchanged.
 
@@ -936,6 +942,10 @@ def fingerprint(workspace: str, deadline: float, base: str | None) -> str | None
         digest.update(
             _git(root, deadline, "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD")
         )
+        # The reviewer's exact view: a stale stat can hide a rewrite of a file
+        # committed after the base from the HEAD diff, but not from this one.
+        reviewed = _git(root, deadline, "diff", "--no-ext-diff", "--no-textconv", "--binary", base)
+        digest.update(len(reviewed).to_bytes(8, "big") + reviewed)
         untracked = _git(root, deadline, "ls-files", "--others", "--exclude-standard", "-z")
         for name in filter(None, untracked.split(b"\0")):
             if not _hash_path(digest, root, name, deadline, may_be_absent=False):

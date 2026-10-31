@@ -6,10 +6,16 @@ captures the net change from P to the final working tree files: committed,
 staged, unstaged and untracked (not ignored) changes together. Local commits
 never move the base.
 
-Files are read without following symlinks and hashed without git filters into
-a scratch index and object directory, so the real index, refs, HEAD and object
-store are only read. The workspace is observed before and after the patch is
-built, and a difference refuses the capture.
+Index entries git reads are published as git shows them in ``git diff <P>``:
+an entry that listing does not name keeps P's entry, and a listed file is
+git's clean conversion of its bytes on disk (attributes, line endings and clean
+filters, as ``git diff`` applies them). Paths git does not read (untracked
+files, index entries flagged skip-worktree or assume-unchanged, and P's paths
+missing from the index) are published as their bytes on disk, unconverted.
+Files are read without following symlinks, and every object is written to a
+scratch index and object directory, so the real refs, HEAD and object store
+are only read. The workspace is observed before and after the patch is built,
+and a difference refuses the capture.
 
 The runner exposes the result only to its per-sandbox bearer-token holder. It
 does not publish anything: the worker validates the patch against its own copy
@@ -212,15 +218,19 @@ def _git(
     repo: Path,
     *args: str,
     check: bool = True,
-    stdin: bytes | None = None,
+    stdin: bytes | IO[bytes] | None = None,
     env: Mapping[str, str] | None = None,
     stdout: IO[bytes] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
+    # Bytes are sent as git's input; an open file becomes its stdin directly.
+    data = stdin if isinstance(stdin, bytes) else None
+    handle = None if stdin is None or isinstance(stdin, bytes) else stdin
     try:
         return subprocess.run(
             ["git", *_GIT_CONFIG, *args],
             cwd=repo,
-            input=b"" if stdin is None else stdin,
+            input=None if handle is not None else (data or b""),
+            stdin=handle,
             stdout=subprocess.PIPE if stdout is None else stdout,
             stderr=subprocess.PIPE,
             timeout=_GIT_TIMEOUT_SECONDS,
@@ -462,10 +472,13 @@ def _tree_entries(repo: Path, base_sha: str) -> dict[bytes, tuple[str, str]]:
 
 
 # One path as observed: ("absent",), ("directory",), ("gitlink", oid),
-# ("symlink", oid) or ("file", mode, oid) from the filesystem, or ("kept", mode,
+# ("symlink", oid) or ("file", mode, oid) from the filesystem; ("clean", mode,
+# oid) for a file git reads and ``git diff <P>`` lists, whose raw bytes hash to
+# oid and which publishes as git's clean conversion of them; or ("kept", mode,
 # oid) for P's own entry left in place (see ``_observe``).
 _Record = tuple[str, ...]
 _ABSENT: _Record = ("absent",)
+_DIRECTORY: _Record = ("directory",)
 # Index flag tags (``git ls-files -v``) of a skip-worktree entry; the lowercase
 # form also has assume-unchanged set.
 _SKIP_WORKTREE_TAGS = frozenset({"S", "s"})
@@ -473,10 +486,12 @@ _SKIP_WORKTREE_TAGS = frozenset({"S", "s"})
 
 @dataclass(frozen=True)
 class _Observation:
-    """One read of the index listing, the untracked listing and every candidate path."""
+    """One read of the index, the untracked listing, ``git diff <P>``'s listing
+    and every candidate path."""
 
     index: Mapping[bytes, tuple[str, str]]
     untracked: tuple[bytes, ...]
+    listed: frozenset[bytes]
     records: Mapping[bytes, _Record]
 
 
@@ -579,19 +594,33 @@ def _gitlink(
 
 
 def _observe(
-    repo: Path, base: Mapping[bytes, tuple[str, str]], object_format: str
+    repo: Path, base_sha: str, base: Mapping[bytes, tuple[str, str]], object_format: str
 ) -> _Observation:
-    """Read every path of P's tree, the index and the untracked listing.
+    """Read every path of P's tree, the index, the untracked listing and the
+    listing of ``git diff <P>``.
 
-    The filesystem decides every path, with one exception: a skip-worktree index
-    entry equal to P's entry whose path is absent keeps P's entry. That is the
-    state worker preparation leaves when it unlinks a committed symlink that
-    escapes the checkout, so it is not a deletion the agent made. Because the
-    kept entry is part of the records, the second observation compares it too.
+    An index entry git reads (not flagged skip-worktree or assume-unchanged,
+    not a gitlink) follows ``git diff <P>``. When that listing does not name
+    it, git shows P's content there, so the record is P's own entry and the
+    file is not read. When it does, the file on disk decides, and a regular
+    file is recorded as ``clean``: it publishes as git's clean conversion of
+    its bytes. An unnamed entry P lacks must be absent on disk (git shows no
+    file there), else git's listing disagrees with the index and the capture
+    is refused.
+
+    Every other path is read from the filesystem, with one exception: a
+    skip-worktree index entry equal to P's entry whose path is absent keeps
+    P's entry. That is the state worker preparation leaves when it unlinks a
+    committed symlink that escapes the checkout, so it is not a deletion the
+    agent made. Because kept entries and the listing are part of the
+    observation, the second observation compares them too.
     """
 
     index: dict[bytes, tuple[str, str]] = {}
     skip_worktree: set[bytes] = set()
+    # git does not read the file of a flagged entry: skip-worktree (S or s)
+    # or assume-unchanged (any lowercase tag).
+    flagged: set[bytes] = set()
     for item in _git(repo, "ls-files", "-s", "-v", "-z").stdout.split(b"\0"):
         if not item:
             continue
@@ -607,6 +636,24 @@ def _observe(
         index[path] = (mode, oid)
         if tag in _SKIP_WORKTREE_TAGS:
             skip_worktree.add(path)
+        if tag in _SKIP_WORKTREE_TAGS or tag.islower():
+            flagged.add(path)
+    # The reviewer's view of the candidate. The checkout's own core.fileMode
+    # must not hide an executable bit.
+    diffed = _git(
+        repo,
+        "-c",
+        "core.fileMode=true",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--name-only",
+        "-z",
+        base_sha,
+        "--",
+    ).stdout
+    listed = frozenset(item for item in diffed.split(b"\0") if item)
     untracked: list[bytes] = []
     for item in _git(repo, "ls-files", "-z", "--others", "--exclude-standard").stdout.split(
         b"\0"
@@ -630,27 +677,39 @@ def _observe(
     try:
         records: dict[bytes, _Record] = {}
         for path in candidates:
-            record = _record(root_fd, path, _gitlink(path, index, base), object_format)
+            entry = index.get(path)
             kept = base.get(path)
-            if (
-                record == _ABSENT
-                and path in skip_worktree
-                and kept is not None
-                and index.get(path) == kept
-            ):
+            read_by_git = entry is not None and entry[0] != _GITLINK_MODE and path not in flagged
+            if read_by_git and path not in listed and kept is not None:
+                records[path] = ("kept", *kept)
+                continue
+            record = _record(root_fd, path, _gitlink(path, index, base), object_format)
+            if read_by_git and path not in listed:
+                if record not in (_ABSENT, _DIRECTORY):
+                    raise WorkspaceSnapshotError(
+                        f"git diff does not list workspace path {_display(path)!r}, which the "
+                        "prepared base lacks"
+                    )
+            elif record == _ABSENT and path in skip_worktree and kept is not None and entry == kept:
                 record = ("kept", *kept)
+            elif read_by_git and record[0] == "file":
+                record = ("clean", *record[1:])
             records[path] = record
     finally:
         os.close(root_fd)
-    return _Observation(index=index, untracked=tuple(untracked), records=records)
+    return _Observation(index=index, untracked=tuple(untracked), listed=listed, records=records)
 
 
 def _desired_entries(records: Mapping[bytes, _Record]) -> dict[bytes, tuple[str, str]]:
-    """The tree the observed files describe: path to (mode, object id)."""
+    """The tree the observed files describe: path to (mode, object id).
+
+    A ``clean`` record still carries its raw blob id here; the capture replaces
+    it with git's clean conversion before deciding what changed.
+    """
 
     desired: dict[bytes, tuple[str, str]] = {}
     for path, record in records.items():
-        if record[0] in ("file", "kept"):
+        if record[0] in ("file", "clean", "kept"):
             desired[path] = (record[1], record[2])
         elif record[0] == "symlink":
             desired[path] = (_SYMLINK_MODE, record[1])
@@ -681,86 +740,171 @@ def _stdin_path(path: bytes) -> bytes:
     return b'"' + path.replace(b"\\", b"\\\\").replace(b'"', b'\\"') + b'"'
 
 
+def _scratch_env(scratch: Path) -> dict[str, str]:
+    """git's environment for the scratch index and object directory."""
+
+    return {
+        "GIT_INDEX_FILE": str(scratch / "index"),
+        "GIT_OBJECT_DIRECTORY": str(scratch / "objects"),
+    }
+
+
+def _clean_blob(repo: Path, path: bytes, record: _Record, object_format: str, scratch: Path) -> str:
+    """Write git's clean conversion of a ``clean`` record's file; its blob id.
+
+    The file is read again without following symlinks and must still hash to
+    the record's raw blob id. ``git hash-object --stdin --path`` then applies
+    the conversion ``git diff`` applies to it (attributes, line endings and
+    clean filters) and writes the result to the scratch object directory. The
+    bytes are copied into the scratch directory while they are hashed, so git
+    converts exactly the bytes checked and no file is held in memory.
+    """
+
+    parts = path.split(b"/")
+    try:
+        root_fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        raise WorkspaceSnapshotError("managed workspace directory is missing") from exc
+    try:
+        parent = _open_parent(root_fd, parts[:-1])
+        if parent is None:
+            raise WorkspaceSnapshotError(_CHANGED)
+        try:
+            fd = os.open(
+                parts[-1],
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY,
+                dir_fd=parent,
+            )
+        finally:
+            os.close(parent)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+            raise WorkspaceSnapshotError(_CHANGED) from exc
+        raise WorkspaceSnapshotError(
+            f"workspace path {_display(path)!r} could not be read"
+        ) from exc
+    finally:
+        os.close(root_fd)
+    copy = scratch / "clean-input"
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise WorkspaceSnapshotError(_CHANGED)
+        digest = hashlib.new(object_format, usedforsecurity=False)
+        digest.update(b"blob %d\0" % info.st_size)
+        read = 0
+        out = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        try:
+            while chunk := os.read(fd, _READ_CHUNK):
+                read += len(chunk)
+                digest.update(chunk)
+                os.write(out, chunk)
+        finally:
+            os.close(out)
+    except OSError as exc:
+        raise WorkspaceSnapshotError(
+            f"workspace path {_display(path)!r} could not be read"
+        ) from exc
+    finally:
+        os.close(fd)
+    if read != info.st_size or digest.hexdigest() != record[2]:
+        raise WorkspaceSnapshotError(_CHANGED)
+    with copy.open("rb") as checked:
+        printed = (
+            _git(
+                repo,
+                "hash-object",
+                "-w",
+                "--stdin",
+                f"--path={os.fsdecode(path)}",
+                stdin=checked,
+                env=_scratch_env(scratch),
+            )
+            .stdout.decode("ascii", errors="replace")
+            .strip()
+        )
+    if len(printed) != _OID_LENGTH[object_format] or not _OID_RE.fullmatch(printed):
+        raise WorkspaceSnapshotError("git wrote an invalid blob id")
+    return printed
+
+
 def _build_patch(
     repo: Path,
     base_sha: str,
     desired: Mapping[bytes, tuple[str, str]],
     blobs: list[bytes],
     changed: list[bytes],
+    scratch: Path,
 ) -> bytes:
-    """Build tree C in a scratch index and object directory and diff it against P."""
+    """Build tree C in the scratch index and object directory and diff it against P.
+
+    ``blobs`` are the changed files published as their raw bytes; every
+    ``clean`` conversion is already in the scratch object directory.
+    """
 
     objects_path = _git(repo, "rev-parse", "--git-path", "objects").stdout.decode(
         "utf-8", errors="surrogateescape"
     ).strip()
     real_objects = (repo / objects_path).absolute()
-    scratch = Path(tempfile.mkdtemp(prefix="curie-snapshot-"))
-    try:
-        (scratch / "objects").mkdir()
-        # Building C never consults the real store; only the diff reads it.
-        isolated = {
-            "GIT_INDEX_FILE": str(scratch / "index"),
-            "GIT_OBJECT_DIRECTORY": str(scratch / "objects"),
-        }
-        if blobs:
-            printed = _git(
-                repo,
-                "hash-object",
-                "-w",
-                "--no-filters",
-                "--stdin-paths",
-                stdin=b"".join(_stdin_path(path) + b"\n" for path in blobs),
-                env=isolated,
-            ).stdout
-            if printed.split() != [desired[path][1].encode("ascii") for path in blobs]:
-                raise WorkspaceSnapshotError(_CHANGED)
+    # Building C never consults the real store; only the diff reads it.
+    isolated = _scratch_env(scratch)
+    if blobs:
+        printed = _git(
+            repo,
+            "hash-object",
+            "-w",
+            "--no-filters",
+            "--stdin-paths",
+            stdin=b"".join(_stdin_path(path) + b"\n" for path in blobs),
+            env=isolated,
+        ).stdout
+        if printed.split() != [desired[path][1].encode("ascii") for path in blobs]:
+            raise WorkspaceSnapshotError(_CHANGED)
+    _git(
+        repo,
+        "update-index",
+        "-z",
+        "--index-info",
+        stdin=b"".join(
+            b"%s %s\t%s\0" % (mode.encode("ascii"), oid.encode("ascii"), path)
+            for path, (mode, oid) in sorted(desired.items())
+        ),
+        env=isolated,
+    )
+    tree = _git(repo, "write-tree", "--missing-ok", env=isolated).stdout.decode(
+        "ascii", errors="replace"
+    ).strip()
+    if len(tree) != len(base_sha) or not _OID_RE.fullmatch(tree):
+        raise WorkspaceSnapshotError("git wrote an invalid snapshot tree id")
+    with_base = {**isolated, "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(real_objects)}
+    names = _git(
+        repo, "diff", "--no-renames", "--name-only", "-z", base_sha, tree, "--", env=with_base
+    ).stdout
+    if sorted(name for name in names.split(b"\0") if name) != changed:
+        raise WorkspaceSnapshotError("the snapshot tree does not match the observed workspace")
+    patch_file = scratch / "patch"
+    with patch_file.open("wb") as handle:
+        # Explicitly disabling rename detection represents a rename as one
+        # deletion plus one addition, so both paths are disclosed.
         _git(
             repo,
-            "update-index",
-            "-z",
-            "--index-info",
-            stdin=b"".join(
-                b"%s %s\t%s\0" % (mode.encode("ascii"), oid.encode("ascii"), path)
-                for path, (mode, oid) in sorted(desired.items())
-            ),
-            env=isolated,
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            base_sha,
+            tree,
+            "--",
+            env=with_base,
+            stdout=handle,
         )
-        tree = _git(repo, "write-tree", "--missing-ok", env=isolated).stdout.decode(
-            "ascii", errors="replace"
-        ).strip()
-        if len(tree) != len(base_sha) or not _OID_RE.fullmatch(tree):
-            raise WorkspaceSnapshotError("git wrote an invalid snapshot tree id")
-        with_base = {**isolated, "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(real_objects)}
-        names = _git(
-            repo, "diff", "--no-renames", "--name-only", "-z", base_sha, tree, "--", env=with_base
-        ).stdout
-        if sorted(name for name in names.split(b"\0") if name) != changed:
-            raise WorkspaceSnapshotError("the snapshot tree does not match the observed workspace")
-        patch_file = scratch / "patch"
-        with patch_file.open("wb") as handle:
-            # Explicitly disabling rename detection represents a rename as one
-            # deletion plus one addition, so both paths are disclosed.
-            _git(
-                repo,
-                "diff",
-                "--binary",
-                "--full-index",
-                "--no-renames",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-color",
-                "--src-prefix=a/",
-                "--dst-prefix=b/",
-                base_sha,
-                tree,
-                "--",
-                env=with_base,
-                stdout=handle,
-            )
-        with patch_file.open("rb") as handle:
-            return enforce_patch_cap(handle.read(MAX_PATCH_BYTES + 1))
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+    with patch_file.open("rb") as handle:
+        return enforce_patch_cap(handle.read(MAX_PATCH_BYTES + 1))
 
 
 def capture_workspace_snapshot(
@@ -812,18 +956,30 @@ def capture_workspace_snapshot(
     _prove_descendant(repo, head, base_sha, object_format)
 
     base = _tree_entries(repo, base_sha)
-    first = _observe(repo, base, object_format)
-    desired = _desired_entries(first.records)
-    changed = sorted(path for path in {*base, *desired} if base.get(path) != desired.get(path))
-    changed_paths = tuple(
-        _publishable_path(path, (base.get(path), desired.get(path))) for path in changed
-    )
-    blobs = [path for path in changed if first.records[path][0] == "file"]
-    patch = _build_patch(repo, base_sha, desired, blobs, changed)
+    first = _observe(repo, base_sha, base, object_format)
+    scratch = Path(tempfile.mkdtemp(prefix="curie-snapshot-"))
+    try:
+        (scratch / "objects").mkdir()
+        desired = _desired_entries(first.records)
+        for path, record in first.records.items():
+            if record[0] == "clean":
+                desired[path] = (
+                    record[1],
+                    _clean_blob(repo, path, record, object_format, scratch),
+                )
+        # After the conversion, so a file whose clean form is P's is unchanged.
+        changed = sorted(path for path in {*base, *desired} if base.get(path) != desired.get(path))
+        changed_paths = tuple(
+            _publishable_path(path, (base.get(path), desired.get(path))) for path in changed
+        )
+        blobs = [path for path in changed if first.records[path][0] == "file"]
+        patch = _build_patch(repo, base_sha, desired, blobs, changed, scratch)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
     # Capture is several reads with no isolation between them. A write landing
     # in between can patch content the disclosed list omits, so observe again
     # and refuse a moved workspace.
-    if _head(repo, len(base_sha)) != head or _observe(repo, base, object_format) != first:
+    if _head(repo, len(base_sha)) != head or _observe(repo, base_sha, base, object_format) != first:
         raise WorkspaceSnapshotError(_CHANGED)
     validate_patch(patch)
     return WorkspaceSnapshot(
