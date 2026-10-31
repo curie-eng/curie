@@ -84,6 +84,27 @@ def candidate_block(base: str) -> str:
     )
 
 
+HIDDEN_PATHS_SHOWN = 50
+
+
+def hidden_paths_line(paths: list[str]) -> str:
+    """The line the CANDIDATE block ends with when git diff hides candidate paths (#5230).
+
+    ``paths`` are base paths missing from the index and index entries flagged
+    skip-worktree or assume-unchanged, each existing on disk. They are named
+    sorted, at most ``HIDDEN_PATHS_SHOWN`` of them, then a count of the rest.
+    With no such path the block gains nothing and stays ``candidate_block(base)``.
+    """
+    ordered = sorted(paths)
+    rest = len(ordered) - HIDDEN_PATHS_SHOWN
+    return (
+        "\nThese paths are in the candidate with their current file contents, but git diff "
+        "does not show them; read each file directly: "
+        + ", ".join(ordered[:HIDDEN_PATHS_SHOWN])
+        + (f" and {rest} more" if rest > 0 else "")
+    )
+
+
 def _clean_env() -> dict[str, str]:
     """The ambient environment minus anything that would steer git or the hook."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}

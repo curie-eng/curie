@@ -519,6 +519,112 @@ def test_a_symlink_change_is_refused_while_an_unchanged_symlink_is_kept(
     assert not isinstance(refused.value, workspace_snapshot.WorkspaceHistoryError)
 
 
+# --- skip-worktree entries the worker's preparation leaves behind -----------------
+
+
+def _drop_from_worktree(repo: Path, path: str) -> None:
+    """What preparation does to a committed link that escapes the checkout.
+
+    ``workspace.py::_drop_escaping_links`` unlinks it and marks it skip-worktree,
+    so the file is gone while the index keeps P's entry and git status is clean.
+    """
+
+    (repo / path).unlink()
+    _git(repo, "update-index", "--skip-worktree", "--", path)
+    assert _git(repo, "ls-files", "-v", "--", path).startswith("S ")
+
+
+def _prepared_with_escaping_link(root: Path) -> tuple[Path, str]:
+    """P commits ``out -> ../outside``; the agent's checkout is P after preparation."""
+
+    repo, _ = _prepared(root)
+    os.symlink("../outside", repo / "out")
+    _git(repo, "add", "out")
+    prepared = _commit(repo, "Prepared base with an escaping link")
+    _drop_from_worktree(repo, "out")
+    return repo, prepared
+
+
+@pytest.mark.parametrize("committed", [False, True], ids=["uncommitted", "committed"])
+def test_a_dropped_escaping_link_stays_the_prepared_entry_beside_an_ordinary_edit(
+    tmp_path: Path, committed: bool
+) -> None:
+    repo, prepared = _prepared_with_escaping_link(tmp_path)
+    if committed:
+        _commit_change(repo)
+    else:
+        _write(repo, "src/app.py", b"x = 2\n")
+
+    captured = _capture(repo, prepared)
+
+    assert captured.base_sha == prepared
+    # The link preparation removed is P's entry, not a deletion to publish.
+    assert captured.changed_paths == ("src/app.py",)
+    assert _header_paths(captured.patch) == ["src/app.py"]
+    fresh = _checkout_of(repo, prepared, tmp_path / "fresh")
+    _apply(fresh, captured.patch)
+    assert (fresh / "src" / "app.py").read_bytes() == b"x = 2\n"
+    assert os.readlink(fresh / "out") == "../outside"
+
+
+def test_a_skip_worktree_file_recreated_with_new_bytes_publishes_them(tmp_path: Path) -> None:
+    repo, prepared = _prepared(tmp_path)
+    _drop_from_worktree(repo, "kept.cfg")
+    _write(repo, "kept.cfg", b"kept = recreated\n")
+    # git status does not show it; the final file still decides the candidate.
+    assert _git(repo, "status", "--porcelain") == ""
+
+    captured = _capture(repo, prepared)
+
+    assert captured.base_sha == prepared
+    assert captured.changed_paths == ("kept.cfg",)
+    section = _sections(captured.patch)["kept.cfg"]
+    assert b"-kept = base" in section
+    assert b"+kept = recreated" in section
+    fresh = _checkout_of(repo, prepared, tmp_path / "fresh")
+    _apply(fresh, captured.patch)
+    assert (fresh / "kept.cfg").read_bytes() == b"kept = recreated\n"
+
+
+@pytest.mark.parametrize("path", ["out", "kept.cfg"])
+def test_a_symlink_recreated_at_a_skip_worktree_path_is_refused(tmp_path: Path, path: str) -> None:
+    repo, prepared = _prepared_with_escaping_link(tmp_path)
+    if path != "out":
+        _drop_from_worktree(repo, path)
+    os.symlink("README.md", repo / path)
+
+    with pytest.raises(workspace_snapshot.WorkspaceSnapshotError) as refused:
+        _capture(repo, prepared)
+
+    assert f"workspace path {path!r} is not a regular file" in str(refused.value)
+    assert not isinstance(refused.value, workspace_snapshot.WorkspaceHistoryError)
+
+
+def test_an_absent_skip_worktree_entry_the_agent_restaged_is_a_deletion_of_the_base_entry(
+    tmp_path: Path,
+) -> None:
+    repo, prepared = _prepared(tmp_path)
+    staged_only = b"index only bytes never written to disk\n"
+    blob = _git(repo, "hash-object", "-w", "--stdin", stdin=staged_only)
+    (repo / "kept.cfg").unlink()
+    _git(repo, "update-index", "--cacheinfo", f"100644,{blob},kept.cfg")
+    _git(repo, "update-index", "--skip-worktree", "--", "kept.cfg")
+    listed = _git(repo, "ls-files", "-s", "-v", "--", "kept.cfg").split()
+    assert listed[0] == "S"
+    assert listed[2] == blob
+
+    captured = _capture(repo, prepared)
+
+    # The index entry differs from P, so the filesystem decides: the file is gone.
+    assert captured.changed_paths == ("kept.cfg",)
+    assert b"deleted file mode 100644" in _sections(captured.patch)["kept.cfg"]
+    assert staged_only not in captured.patch
+    assert blob.encode() not in captured.patch
+    fresh = _checkout_of(repo, prepared, tmp_path / "fresh")
+    _apply(fresh, captured.patch)
+    assert not (fresh / "kept.cfg").exists()
+
+
 # --- the /v1/snapshot route -------------------------------------------------------
 
 

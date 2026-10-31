@@ -6,13 +6,17 @@ the run started, to the final working tree files. Every case drives
 process per event, against a real git checkout, through the shared fixture in
 ``test_dark_factory_review_gate.py``. A local commit must not redefine the base,
 hide a change from the diff reviewer or the ``.github`` stop, or keep a stale
-approval alive, and committing locally must not by itself be refused.
+approval alive, and committing locally must not by itself be refused. An index
+flag (skip-worktree, assume-unchanged) must not hide an edit from the approval or
+from the ``.github`` stop either, and the diff reviewer is told which candidate
+paths git diff does not show.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -39,7 +43,9 @@ def _load_gate_helpers() -> Any:
 gate = _load_gate_helpers()
 Session = gate.Session
 PLAN, DIFF, PUBLISH, SOURCE, ISSUE = gate.PLAN, gate.DIFF, gate.PUBLISH, gate.SOURCE, gate.ISSUE
+TEST = gate.TEST
 reply, contract, candidate_block = gate.reply, gate.contract, gate.candidate_block
+hidden_paths_line = gate.hidden_paths_line
 
 DIFF_INPUT = {"subagent_type": DIFF, "description": "diff-reviewer", "prompt": "p"}
 FRESH_REVIEW = "Fresh diff review required: checkout changed or is unverifiable."
@@ -137,6 +143,39 @@ def _drop_base(s: Any, base: str) -> None:
     assert state["base"] == base, state.get("base")
     del state["base"]
     path.write_text(json.dumps(state))
+
+
+def _plan_run(s: Any) -> str:
+    """Start the run on the session's current checkout and approve its plan; the base."""
+    assert contract() in gate.context_of(s.fire("UserPromptSubmit", prompt=ISSUE))
+    base = _head(s)
+    s.approve_plan()
+    return base
+
+
+def _flag(s: Any, flag: str, *paths: str) -> None:
+    """Mark index entries ``assume-unchanged`` or ``skip-worktree``: git stops reading them."""
+    _git(s, "update-index", f"--{flag}", "--", *paths)
+    expected = "S" if flag == "skip-worktree" else "h"
+    for path in paths:
+        tag = _git(s, "ls-files", "-v", "--", path)[:1]
+        assert tag == expected, (path, tag)
+
+
+def _with_dropped_escaping_link(tmp_path: Path) -> Any:
+    """A session whose checkout is prepared the way the worker prepares one.
+
+    The base commits ``out -> ../outside``; preparation unlinks that escaping
+    link and marks it skip-worktree, so the file stays absent and git status is
+    clean.
+    """
+    s = Session(tmp_path)
+    os.symlink("../outside", s.cwd / "out")
+    _commit(s, "Escaping link fixture")
+    (s.cwd / "out").unlink()
+    _flag(s, "skip-worktree", "out")
+    assert _clean(s)
+    return s
 
 
 # --- A commit after approval invalidates it; a commit before review does not -------
@@ -394,3 +433,132 @@ def test_a_run_state_that_lost_its_base_after_approval_cannot_publish(
         _assert_denied(decision, FRESH_REVIEW)
     else:
         assert decision["permissionDecision"] == "allow", decision
+
+
+# --- An index flag does not hide an edit from the approval ---------------------------
+
+
+@pytest.mark.parametrize("flag", ["assume-unchanged", "skip-worktree"])
+@pytest.mark.parametrize("order", ["flag_after_approval", "flag_before_review"])
+def test_an_edit_to_a_flagged_base_file_after_diff_approval_needs_a_fresh_review(
+    tmp_path: Path, flag: str, order: str
+) -> None:
+    s, _ = _planned(tmp_path)
+    _change_source(s, "fix")
+    if order == "flag_before_review":
+        _flag(s, flag, TEST)
+    _approve_diff(s)
+    if order == "flag_after_approval":
+        _flag(s, flag, TEST)
+
+    (s.cwd / TEST).write_text("def test_add():\n    assert True\n")
+    # git reads the index entry, not the file: neither status nor diff shows the edit.
+    assert TEST not in _git(s, "status", "--porcelain=v1", "--untracked-files=all")
+    assert _git(s, "diff", "HEAD", "--", TEST) == ""
+
+    _assert_denied(_publish(s), FRESH_REVIEW)
+    refused = [e for e in s.gate_events() if e["curie_gate"] == "diff_approval_refused"]
+    assert [e["cause"] for e in refused] == ["checkout_changed_or_unverifiable"]
+    # Fresh review, not a stop: the edited checkout is reviewed again and publishes.
+    _approve_diff(s)
+    assert _publish(s)["permissionDecision"] == "allow"
+
+
+def test_a_prepared_escaping_link_that_stays_absent_keeps_the_approval(tmp_path: Path) -> None:
+    # Liveness control for the flag refusals above: the skip-worktree entry
+    # preparation leaves behind is hashed as absent, consistently.
+    s = _with_dropped_escaping_link(tmp_path)
+    base = _plan_run(s)
+    _change_source(s, "fix")
+
+    prompt = _approve_diff(s)
+
+    # Admitted, and nothing hidden is on disk: the block is exactly the plain one.
+    assert prompt.endswith(contract() + candidate_block(base)), prompt[-600:]
+    assert "git diff does not show them" not in prompt
+    assert not (s.cwd / "out").exists() and not (s.cwd / "out").is_symlink()
+    assert _publish(s)["permissionDecision"] == "allow"
+
+
+# --- The diff reviewer is told which candidate paths git diff hides ------------------
+
+
+@pytest.mark.parametrize("flag", ["assume-unchanged", "skip-worktree"])
+@pytest.mark.parametrize("on_disk", [True, False], ids=["on_disk", "control_absent"])
+def test_candidate_paths_git_diff_hides_are_named_after_the_candidate_block(
+    tmp_path: Path, flag: str, on_disk: bool
+) -> None:
+    s, base = _planned(tmp_path)
+    # A base file leaves the index and is ignored; a base file is flagged.
+    _git(s, "rm", "-q", "--cached", SOURCE)
+    gitignore = s.cwd / ".gitignore"
+    gitignore.write_text(gitignore.read_text() + f"{SOURCE}\n")
+    _flag(s, flag, TEST)
+    if on_disk:
+        (s.cwd / TEST).write_text("def test_add():\n    assert True\n")
+    else:
+        (s.cwd / SOURCE).unlink()
+        (s.cwd / TEST).unlink()
+
+    prompt = _approve_diff(s)
+
+    expected = contract() + candidate_block(base)
+    if on_disk:
+        expected += hidden_paths_line([TEST, SOURCE])
+    else:
+        # Control: an absent path is a deletion git diff shows, so the block is unchanged.
+        assert "git diff does not show them" not in prompt
+    assert prompt.endswith(expected), prompt[-800:]
+    assert prompt.count("CANDIDATE:") == 1
+
+
+def test_the_hidden_paths_line_names_fifty_paths_then_counts_the_rest(tmp_path: Path) -> None:
+    s = Session(tmp_path)
+    notes = [f"docs/note-{n:02d}.txt" for n in range(53)]
+    for note in notes:
+        target = s.cwd / note
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"{note}\n")
+    _commit(s, "Notes fixture")
+    base = _plan_run(s)
+    _flag(s, "assume-unchanged", *notes)
+
+    prompt = _approve_diff(s)
+
+    assert prompt.endswith(contract() + candidate_block(base) + hidden_paths_line(notes))
+    assert prompt.endswith(", docs/note-49.txt and 3 more"), prompt[-200:]
+    assert "docs/note-50.txt" not in prompt
+
+
+@pytest.mark.parametrize(
+    "path",
+    [".github/workflows/ci.yml", "pkg/.github/workflows/ci.yml"],
+    ids=["root_github", "control_nested"],
+)
+def test_a_flagged_github_edit_hidden_from_git_diff_stops_the_diff_review(
+    tmp_path: Path, path: str
+) -> None:
+    s = Session(tmp_path)
+    target = s.cwd / path
+    target.parent.mkdir(parents=True)
+    target.write_text("on: push\n")
+    _commit(s, "Workflow fixture")
+    base = _plan_run(s)
+    s.report("implement", 1)
+    _flag(s, "assume-unchanged", path)
+    target.write_text("on: [push, pull_request]\n")
+    assert _clean(s)
+
+    out = s.fire("PreToolUse", tool_name="Agent", tool_input=dict(DIFF_INPUT))
+
+    if path.startswith(".github/"):
+        # The same stop a visible .github change gets (#4435).
+        gate._assert_github_path_stops_run(s, out, path)
+        return
+    # Control: outside the root .github the diff review is admitted, naming the path.
+    assert out is not None
+    decision = out["hookSpecificOutput"]
+    assert decision["permissionDecision"] == "allow", decision
+    prompt = decision["updatedInput"]["prompt"]
+    assert prompt.endswith(contract() + candidate_block(base) + hidden_paths_line([path]))
+    assert not [e for e in s.gate_events() if e["curie_gate"] == "github_path_refused"]

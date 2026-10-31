@@ -4,7 +4,8 @@ The real runner route (the production ``workspace_snapshotter`` over a real git
 checkout) answers the real worker ``RunnerClient``, and the real
 ``validate_snapshot_against_base`` rebuilds the candidate on the trusted base
 archive. Only the coordinator's retained facts are a stand-in: they name the
-prepared commit P and stream ``git archive`` of P's tree.
+prepared commit P and stream an archive of P, either ``git archive`` of P's tree
+or the normalized checkout archive preparation itself builds.
 """
 
 from __future__ import annotations
@@ -30,7 +31,13 @@ from curie_worker.publication_validation import (
     validate_snapshot_against_base,
 )
 from curie_worker.runner_client import RunnerClient, RunnerWorkspaceSnapshot
-from curie_worker.workspace import WorkspacePreparationError
+from curie_worker.workspace import (
+    SubprocessCommands,
+    WorkspaceLimits,
+    WorkspacePreparationError,
+    WorkspacePreparer,
+    validate_workspace_archive,
+)
 
 REPO = "acme-corp/acme-bot"
 GITHUB = "https://github.com"
@@ -214,6 +221,66 @@ def _files(root: Path, *, skip: frozenset[str] = frozenset()) -> dict[str, tuple
         elif path.is_file():
             found[relative] = (path.read_bytes(), bool(path.stat().st_mode & stat.S_IXUSR))
     return found
+
+
+def _normalized_with_escaping_link(root: Path) -> tuple[Path, str, bytes]:
+    """The agent's workspace, P and P's archive, for a P that commits an escaping link.
+
+    Preparation's own steps run on the checkout: ``_drop_escaping_links`` unlinks
+    ``out -> ../outside`` and marks it skip-worktree, ``archive_checkout`` writes
+    the normalized checkout (its ``.git`` included) as the private base archive,
+    and ``validate_workspace_archive`` admits it. The sandbox workspace is that
+    archive extracted.
+    """
+
+    source, _ = _prepared(root / "preparation")
+    os.symlink("../outside", source / "out")
+    _git(source, "add", "out")
+    prepared = _commit(source, "Prepared base with an escaping link")
+    scratch = root / "preparation-scratch"
+    scratch.mkdir()
+    limits = WorkspaceLimits()
+    preparer = WorkspacePreparer(
+        credentials=None,
+        commands=SubprocessCommands(),
+        objects=None,
+        scratch_root=scratch,
+        limits=limits,
+    )
+    preparer._drop_escaping_links(source)
+    archive = b"".join(preparer.archive_checkout(source, archive_path=scratch / "base.tar.gz"))
+    validate_workspace_archive([archive], limits=limits, scratch_root=scratch)
+
+    workspace = root / "sandbox" / "workspace"
+    workspace.mkdir(parents=True)
+    with tarfile.open(fileobj=BytesIO(archive), mode="r:gz") as extracted:
+        names = extracted.getnames()
+        extracted.extractall(workspace, filter="data")
+    assert "out" not in names
+    assert ".git/index" in names
+    assert not (workspace / "out").exists() and not (workspace / "out").is_symlink()
+    assert _git(workspace, "ls-files", "-v", "--", "out").startswith("S ")
+    return workspace, prepared, archive
+
+
+def test_a_dropped_escaping_link_beside_a_committed_edit_publishes_only_the_edit(
+    tmp_path: Path,
+) -> None:
+    workspace, prepared, archive = _normalized_with_escaping_link(tmp_path)
+    head = _commit_change(workspace, "src/app.py", b"x = 2\n")
+    # The agent sees a clean checkout: the dropped link is hidden from git status.
+    assert _git(workspace, "status", "--porcelain") == ""
+
+    snapshot = _snapshot_over_http(workspace, prepared)
+
+    assert snapshot.base_sha == prepared
+    assert snapshot.changed_paths == ("src/app.py",)
+    assert snapshot.patch.count(b"diff --git ") == 1
+    assert b"diff --git a/out " not in snapshot.patch
+    _validate(_coordinator(prepared, archive), snapshot, tmp_path / "validation")
+    tree, checkout = _result(tmp_path / "result", archive, snapshot.patch)
+    assert (checkout / "src" / "app.py").read_bytes() == b"x = 2\n"
+    assert tree == _tree_of(workspace, head)
 
 
 def test_committed_only_change_publishes_against_the_prepared_base(tmp_path: Path) -> None:
