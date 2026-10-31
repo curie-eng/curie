@@ -3365,9 +3365,11 @@ def test_a_change_outside_root_github_still_reaches_the_diff_reviewer(
 
 
 @pytest.mark.parametrize("git_outcome", ["failure", "timeout"])
-def test_an_unreadable_git_status_does_not_stop_diff_review(
+def test_an_unreadable_git_status_does_not_hide_an_untracked_github_file(
     tmp_path: Path, git_outcome: str
 ) -> None:
+    # The .github stop reads the canonical candidate, never git status, so a
+    # broken status neither hides the untracked file nor is ever consulted.
     s = _github_gate_session(tmp_path, "implement")
     target = s.cwd / ".github" / "e2e-selection.yaml"
     target.parent.mkdir()
@@ -3396,15 +3398,13 @@ def test_an_unreadable_git_status_does_not_stop_diff_review(
 
     decision = s.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
 
-    assert not [e for e in s.gate_events() if e["curie_gate"] == "github_path_refused"]
+    refused = [e for e in s.gate_events() if e["curie_gate"] == "github_path_refused"]
+    assert [e["path"] for e in refused] == [".github/e2e-selection.yaml"]
     assert decision["permissionDecision"] == "deny"
     assert s.pre(PUBLISH)["permissionDecision"] == "deny"
-    assert _saved_state(s)["stopped"] is None
+    assert _saved_state(s)["stopped"] is not None
     assert _saved_state(s)["diff"]["round"] == 0
-    argv = json.loads(invocation.read_text())
-    assert "--porcelain=v1" in argv
-    assert "-z" in argv
-    assert "--untracked-files=all" in argv
+    assert not invocation.exists()
 
 
 # --- Fresh diff review after the checkout changes (#5122) -------------------

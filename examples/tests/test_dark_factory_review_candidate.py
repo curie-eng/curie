@@ -888,7 +888,7 @@ def test_external_diff_and_textconv_drivers_change_neither_the_reviewed_nor_the_
     external.write_text("#!/bin/sh\necho ACME EXTERNAL DIFF\n")
     external.chmod(0o755)
     textconv = tmp_path / "acme-textconv"
-    textconv.write_text("#!/bin/sh\necho ACME TEXTCONV\n")
+    textconv.write_text('#!/bin/sh\necho ACME TEXTCONV\ncat "$1"\n')
     textconv.chmod(0o755)
     _git(s, "config", "diff.external", str(external))
     _git(s, "config", "diff.acme.textconv", str(textconv))
