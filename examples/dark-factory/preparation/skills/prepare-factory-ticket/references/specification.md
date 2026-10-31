@@ -123,6 +123,27 @@ implementation, and external qualification. Turn testable behavior into explicit
 acceptance requiring the missing tests as part of the PR. Do not ask the user to
 implement coverage before the factory can start.
 
+Also inspect when each check can run. A scripted integration or end-to-end check
+may require a cluster, image build, privileged runner or other resource absent
+from the factory workspace, yet be available to a person or a named PR check
+after publication. Do not call it sandbox-verifiable on the strength of a host
+run, or CI-verifiable merely because a workflow exists. First identify focused
+tests the factory can run against the changed production path and the failures
+they would catch. Then ask the developer whether the broader check should be a
+post-publication human evaluation before merge. Offer this choice only when the
+focused tests give meaningful coverage of the agreed implementation. If they do
+not, retain the core verification blocker and propose a feasible test route.
+
+When the developer approves human evaluation, record it visibly in the issue's
+Out of scope or equivalent deferred-qualification section: the exact command or
+named PR check and required environment, the human owner, what focused tests do
+and do not prove, the evidence to capture against the PR head, and what to do if
+the check fails. State that merge waits for successful evidence or an explicit
+decision under the repository's waiver policy. Keep the original outcome in the
+coverage map. The factory may publish a PR after its focused acceptance tests;
+neither ticket preparation nor PR publication counts as completing the human
+evaluation. Repository-required PR checks and merge rules still apply.
+
 For example, delivery code may be accepted through automated tests of request
 construction, authentication/error handling and retries at its production entry
 point using an HTTP fixture. Delivery to a real Slack workspace remains unproved.
