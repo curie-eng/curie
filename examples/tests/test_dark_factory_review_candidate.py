@@ -484,7 +484,7 @@ def test_a_prepared_escaping_link_that_stays_absent_keeps_the_approval(tmp_path:
 
 
 @pytest.mark.parametrize("flag", ["assume-unchanged", "skip-worktree"])
-@pytest.mark.parametrize("on_disk", [True, False], ids=["on_disk", "control_absent"])
+@pytest.mark.parametrize("on_disk", [True, False], ids=["on_disk", "absent"])
 def test_candidate_paths_git_diff_hides_are_named_after_the_candidate_block(
     tmp_path: Path, flag: str, on_disk: bool
 ) -> None:
@@ -505,8 +505,13 @@ def test_candidate_paths_git_diff_hides_are_named_after_the_candidate_block(
     expected = contract() + candidate_block(base)
     if on_disk:
         expected += hidden_paths_line([TEST, SOURCE])
+    elif flag == "assume-unchanged":
+        # git diff shows the deletion of a path missing from the index (SOURCE), but
+        # not of an absent assume-unchanged entry, which the snapshot still deletes.
+        expected += hidden_paths_line([TEST])
     else:
-        # Control: an absent path is a deletion git diff shows, so the block is unchanged.
+        # An absent skip-worktree entry equal to the base entry is the prepared
+        # escaping-link case: the snapshot keeps it, so nothing is hidden.
         assert "git diff does not show them" not in prompt
     assert prompt.endswith(expected), prompt[-800:]
     assert prompt.count("CANDIDATE:") == 1
