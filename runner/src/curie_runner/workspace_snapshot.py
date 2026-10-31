@@ -34,6 +34,7 @@ import base64
 import errno
 import hashlib
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -911,7 +912,9 @@ def _clean_blobs(
     Each file is copied into ``<scratch>/worktree`` without following symlinks
     and must still be the bytes observed. Every ``.gitattributes`` that is a
     regular file on disk in the root or an ancestor directory of those paths is
-    copied too; git skips any other kind. One ``git add --renormalize`` then
+    copied too; git skips any other kind. A relative ``core.attributesFile``,
+    which git resolves against the work tree root, is copied the same way, and
+    one that leaves the workspace is refused. One ``git add --renormalize`` then
     runs against the real git directory with the scratch copy as its work tree
     and a scratch copy of the real index as its index, so git applies the
     attributes and built-in conversions (text, eol, ident,
@@ -933,6 +936,31 @@ def _clean_blobs(
         parts = path.split(b"/")
         for depth in range(len(parts)):
             attributes[b"/".join([*parts[:depth], b".gitattributes"])] = None
+    # git resolves a relative core.attributesFile against the work tree root,
+    # so in the scratch work tree it is absent unless copied to the same
+    # relative path, and a filter it sets would be missed. An absolute value
+    # (``--path`` has already expanded ``~``) or the unset default resolves
+    # identically from the scratch work tree.
+    configured = _git(
+        repo, "config", "--path", "--get", "core.attributesFile", check=False, deadline=deadline
+    )
+    if configured.returncode == 0:
+        attributes_file = configured.stdout.removesuffix(b"\n")
+    elif configured.returncode == 1 and not configured.stdout:
+        attributes_file = b""
+    else:
+        raise WorkspaceSnapshotError("the workspace git config could not be read")
+    relative: bytes | None = None
+    if attributes_file and not os.path.isabs(os.fsdecode(attributes_file)):
+        # A .. segment is refused before normalizing: git resolves it through
+        # any symlink on the way, which a lexical normpath cannot reproduce.
+        relative = posixpath.normpath(attributes_file)
+        if b".." in attributes_file.split(b"/") or relative == b".":
+            raise WorkspaceSnapshotError(
+                f"core.attributesFile {_display(attributes_file)!r} is a relative path with a "
+                ".. segment or outside the workspace; the candidate cannot resolve its attributes"
+            )
+        attributes[relative] = None
     converted = set(paths)
     try:
         root_fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY)
@@ -945,6 +973,14 @@ def _clean_blobs(
             if fd is None:
                 if path in converted:
                     raise WorkspaceSnapshotError(_CHANGED)
+                # git follows symlinks to the attributes file; the copy does
+                # not, so one present by any other route is refused.
+                if path == relative and os.path.lexists(os.path.join(repo, os.fsdecode(path))):
+                    raise WorkspaceSnapshotError(
+                        f"core.attributesFile {_display(attributes_file)!r} is not a regular "
+                        "file reachable without symlinks; the candidate cannot resolve its "
+                        "attributes"
+                    )
                 continue
             try:
                 copied = _copy_file(fd, worktree / os.fsdecode(path), object_format, deadline)
