@@ -1200,10 +1200,38 @@ def test_a_relative_git_configuration_path_in_the_environment_is_refused(
         _write(repo, "src/app.py", b"x = 2\n")
         # Set only now, so every helper above ran git with the real environment.
         monkeypatch.setenv(name, "relative-config")
+    # GIT_CONFIG is refused whatever its value, so its refusal does not say relative.
+    state = "is set" if name == "GIT_CONFIG" else "is relative"
 
     with pytest.raises(
         workspace_snapshot.WorkspaceSnapshotError,
-        match=f"git configuration path {name} is relative",
+        match=f"git configuration path {name} {state}",
+    ) as refused:
+        _capture(repo, prepared)
+
+    assert not isinstance(refused.value, workspace_snapshot.WorkspaceHistoryError)
+    assert not marker.exists(), "candidate construction ran a filter program"
+
+
+def test_any_git_config_environment_override_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GIT_CONFIG makes ``git config`` read only that file; conversion reads the repository's.
+
+    So an absolute GIT_CONFIG would hide the repository's relative
+    core.attributesFile from discovery while the checkout's git still applies it.
+    """
+
+    repo, prepared = _prepared_with_attributes_file(tmp_path, b"src/app.py filter=strip\n")
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _write(repo, "src/app.py", b"x = 2\n" + _HIDDEN)
+    _assert_filter_is_live(repo, marker)
+    monkeypatch.setenv("GIT_CONFIG", os.devnull)
+
+    with pytest.raises(
+        workspace_snapshot.WorkspaceSnapshotError,
+        match="git configuration path GIT_CONFIG is set",
     ) as refused:
         _capture(repo, prepared)
 
