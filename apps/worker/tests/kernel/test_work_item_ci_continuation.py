@@ -164,6 +164,10 @@ class _Workspace:
     def release(self, _thread_key: str) -> None:
         return None
 
+    def current(self, _thread_key: str) -> object:
+        # The retained prepared base the publication snapshot is anchored at.
+        return SimpleNamespace(repo_full_name=WORK_ITEM_REPO, base_sha=HEAD)
+
 
 class _WorkItems:
     """Dispatch double. ``running_for_conversation`` names the running request."""

@@ -1347,6 +1347,10 @@ async def _publication_run(
         def touch(self, _thread_identity: str, *, ttl_seconds: int) -> None:
             del ttl_seconds
 
+        def current(self, _thread_identity: str) -> object:
+            # The retained prepared base the publication snapshot is anchored at.
+            return SimpleNamespace(repo_full_name="acme-corp/acme-private", base_sha="a" * 40)
+
     publication_api = PublicationApi() if publication_creator is None else publication_creator
     workspace = Workspace()
     binding = Binding(grant_event_id="unused", grant_tool="unused")
@@ -2428,6 +2432,10 @@ class _FactoryWorkspace:
 
     def release(self, _thread_key: str) -> None:
         return None
+
+    def current(self, _thread_key: str) -> object:
+        # The retained prepared base the publication snapshot is anchored at.
+        return SimpleNamespace(repo_full_name="acme-corp/widgets", base_sha="a1" * 20)
 
 
 class _FactoryWorkItems:
@@ -3776,7 +3784,18 @@ def test_publication_snapshot_inherits_the_attempts_remaining_delivery_budget(
                     approval_granted_tool="mcp__curie__publish_changes",
                 )
             ]
+            # The publication snapshot is requested only at a retained prepared
+            # base (#5230); this generic turn selects no repository otherwise.
+            h.kernel._workspace = SimpleNamespace(  # type: ignore[assignment]
+                current=lambda _thread_key: SimpleNamespace(
+                    repo_full_name="acme-corp/acme-bot", base_sha="a" * 40
+                ),
+                touch=lambda _thread_key, *, ttl_seconds: True,
+                release=lambda _thread_key: None,
+                enumerate_expired=lambda: [],
+            )
             observed_remaining: list[float] = []
+            observed_bases: list[str] = []
             consumed_turns = 0
             real_consume = h.kernel._consume
 
@@ -3791,9 +3810,11 @@ def test_publication_snapshot_inherits_the_attempts_remaining_delivery_budget(
                 _base_url: str,
                 token: str | None = None,
                 *,
+                base_sha: str,
                 remaining_s: float,
             ) -> None:
                 observed_remaining.append(remaining_s)
+                observed_bases.append(base_sha)
                 # Stop after capturing the boundary; _attempt deliberately
                 # converts runner snapshot failures into a publication error.
                 raise RunnerError("captured snapshot deadline")
@@ -3813,6 +3834,7 @@ def test_publication_snapshot_inherits_the_attempts_remaining_delivery_budget(
             assert consumed_turns == 1
             assert clock_s == 1000.25
             assert observed_remaining == [17.0]
+            assert observed_bases == ["a" * 40]
 
     asyncio.run(go())
 

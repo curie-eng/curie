@@ -68,6 +68,22 @@ def contract() -> str:
     return CONTRACT_FILE.read_bytes().decode("utf-8")
 
 
+def candidate_block(base: str) -> str:
+    """What the gate appends to the diff reviewer's prompt after everything else (#5230).
+
+    ``base`` is the checkout's HEAD when the run started. The plan reviewer never
+    gets this block, and an agent commit never redefines the base.
+    """
+    return (
+        "\n\nCANDIDATE:\n"
+        f"base commit {base}\n"
+        "The publication candidate is the net change from that base commit to the final "
+        "working tree files, with committed, staged, unstaged and untracked changes together. "
+        f"Review git diff {base} and every untracked file git status lists. "
+        "Local commits are flattened into one publication."
+    )
+
+
 def _clean_env() -> dict[str, str]:
     """The ambient environment minus anything that would steer git or the hook."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
@@ -1821,12 +1837,19 @@ def test_the_fingerprint_deadline_covers_hashing_untracked_files(
 ) -> None:
     module = _load_hook(monkeypatch, tmp_path, "dark_factory_review_gate_deadline")
     repo = _repo_with_untracked_files(tmp_path)
+    base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        env=_clean_env(),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
     # Control: in budget, the same checkout fingerprints.
-    assert module.fingerprint(str(repo), module.time.monotonic() + 7.0) is not None
+    assert module.fingerprint(str(repo), module.time.monotonic() + 7.0, base) is not None
 
     _expire_after_listing_untracked(monkeypatch, module)
 
-    assert module.fingerprint(str(repo), module.time.monotonic() + 7.0) is None
+    assert module.fingerprint(str(repo), module.time.monotonic() + 7.0, base) is None
 
 
 def test_an_unchanged_checkout_whose_prompt_fingerprint_timed_out_is_unverifiable(
@@ -1883,7 +1906,7 @@ def test_a_new_session_saves_its_fresh_state_before_fingerprinting(
     )
     module.save(old, approved)
 
-    def killed(workspace: str, deadline: float) -> str | None:
+    def killed(workspace: str, deadline: float, base: str | None) -> str | None:
         raise SystemExit(1)
 
     monkeypatch.setattr(module, "fingerprint", killed)
@@ -2493,6 +2516,7 @@ def test_the_implementer_and_both_reviewers_get_the_same_contract_bytes(tmp_path
     text = contract()
 
     fresh = _start(run)
+    base = _head(s)
     plan_prompt = "Plan for issue 7: change pkg/calc.py, add tests/test_add.py"
     plan_input, plan_context = run.review_with(PLAN, reply(PLAN, "APPROVE"), prompt=plan_prompt)
     assert "APPROVED" in plan_context
@@ -2504,6 +2528,9 @@ def test_the_implementer_and_both_reviewers_get_the_same_contract_bytes(tmp_path
     assert diff_input["prompt"].startswith(diff_prompt)
     plan_suffix = plan_input["prompt"][len(plan_prompt) :]
     diff_suffix = diff_input["prompt"][len(diff_prompt) :]
+    # The diff reviewer alone also gets the CANDIDATE block, after the contract (#5230).
+    assert diff_suffix.endswith(candidate_block(base))
+    diff_suffix = diff_suffix.removesuffix(candidate_block(base))
     assert plan_suffix.endswith(text) and diff_suffix.endswith(text)
     # Both reviewers get identical appended text, and it is what the implementer got.
     assert plan_suffix == diff_suffix
@@ -2592,6 +2619,7 @@ def test_a_valid_delegated_service_test_publishes_and_waits_for_its_named_check(
     run = HooksJsonRuntime(s)
     lines = [f"- AC1: delegated {delegated}", CALC_CHECK]
     _start(run)
+    base = _head(s)
     plan_prompt = f"Plan for issue 7: fix enqueue's job id. Startup check:\n{startup}\n"
     plan_input, context = run.review_with(
         PLAN, verified_reply(PLAN, "APPROVE", lines), prompt=plan_prompt
@@ -2621,7 +2649,7 @@ def test_a_valid_delegated_service_test_publishes_and_waits_for_its_named_check(
     )
     assert "APPROVED" in context
     assert diff_input["prompt"].startswith(diff_prompt)
-    assert diff_input["prompt"].endswith(contract())
+    assert diff_input["prompt"].endswith(contract() + candidate_block(base))
     assert run.decision(PUBLISH, {"title": "t", "body": "b"}) == "allow"
 
     # The platform then holds the run on the named check at the published head.
@@ -3094,6 +3122,7 @@ def test_a_bundle_declaration_reaches_both_reviewers_after_the_contract(tmp_path
     text = contract()
 
     fresh = _start(run)
+    base = _head(s)
     plan_input, _ = run.review_with(PLAN, reply(PLAN, "APPROVE"), prompt="plan")
     diff_input, _ = run.review_with(DIFF, reply(DIFF, "APPROVE"), prompt="diff")
 
@@ -3102,7 +3131,8 @@ def test_a_bundle_declaration_reaches_both_reviewers_after_the_contract(tmp_path
     assert checks not in fresh
     plan_suffix = plan_input["prompt"][len("plan") :]
     diff_suffix = diff_input["prompt"][len("diff") :]
-    assert plan_suffix == diff_suffix
+    # The diff reviewer also gets the CANDIDATE block, after the declaration (#5230).
+    assert diff_suffix == plan_suffix + candidate_block(base)
     # The declaration's exact bytes follow the contract, fenced as declared data.
     assert checks in plan_suffix
     contract_end = plan_suffix.index(text) + len(text)
