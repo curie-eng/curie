@@ -50,6 +50,10 @@ hidden_paths_line = gate.hidden_paths_line
 DIFF_INPUT = {"subagent_type": DIFF, "description": "diff-reviewer", "prompt": "p"}
 FRESH_REVIEW = "Fresh diff review required: checkout changed or is unverifiable."
 UNVERIFIABLE = "Diff checkout is unverifiable; restore it before review."
+TOO_MANY_HIDDEN = (
+    "Diff review refused: more than 50 candidate paths are hidden from git diff; clear the "
+    "assume-unchanged and skip-worktree flags or restore the index before review."
+)
 
 
 def _git(s: Any, *args: str) -> str:
@@ -153,13 +157,21 @@ def _plan_run(s: Any) -> str:
     return base
 
 
-def _flag(s: Any, flag: str, *paths: str) -> None:
-    """Mark index entries ``assume-unchanged`` or ``skip-worktree``: git stops reading them."""
+# ``git ls-files -v`` tags: skip-worktree is ``S``, assume-unchanged lowercases the tag.
+_FLAG_TAGS = {"assume-unchanged": "h", "skip-worktree": "S"}
+
+
+def _flag(s: Any, flag: str, *paths: str, tag: str | None = None) -> None:
+    """Set an index flag (``assume-unchanged``, ``skip-worktree``) or clear one (``no-...``).
+
+    git stops reading a flagged entry's file. ``tag`` is the ``ls-files -v`` tag
+    each path must carry afterwards; by default the tag ``flag`` alone gives.
+    """
     _git(s, "update-index", f"--{flag}", "--", *paths)
-    expected = "S" if flag == "skip-worktree" else "h"
+    expected = tag or _FLAG_TAGS[flag]
     for path in paths:
-        tag = _git(s, "ls-files", "-v", "--", path)[:1]
-        assert tag == expected, (path, tag)
+        found = _git(s, "ls-files", "-v", "--", path)[:1]
+        assert found == expected, (path, found)
 
 
 def _with_dropped_escaping_link(tmp_path: Path) -> Any:
@@ -464,6 +476,58 @@ def test_an_edit_to_a_flagged_base_file_after_diff_approval_needs_a_fresh_review
     assert _publish(s)["permissionDecision"] == "allow"
 
 
+@pytest.mark.parametrize("cleared", [True, False], ids=["skip_worktree_cleared", "control_reset"])
+def test_changing_only_an_index_flag_after_diff_approval_needs_a_fresh_review(
+    tmp_path: Path, cleared: bool
+) -> None:
+    s, _ = _planned(tmp_path)
+    # A base file is absent on disk with both flags set: git shows nothing for it.
+    (s.cwd / TEST).unlink()
+    _flag(s, "assume-unchanged", TEST)
+    _flag(s, "skip-worktree", TEST, tag="s")
+    _change_source(s, "fix")
+    _approve_diff(s)
+
+    if cleared:
+        # Still assume-unchanged, so status and diff stay silent; only the flag set changed.
+        _flag(s, "no-skip-worktree", TEST, tag="h")
+    else:
+        # Control: setting the flag it already has changes nothing.
+        _flag(s, "skip-worktree", TEST, tag="s")
+    assert TEST not in _git(s, "status", "--porcelain=v1", "--untracked-files=all")
+
+    decision = _publish(s)
+
+    if not cleared:
+        assert decision["permissionDecision"] == "allow", decision
+        return
+    _assert_denied(decision, FRESH_REVIEW)
+
+
+@pytest.mark.parametrize("chmod", [True, False], ids=["chmod_after_approval", "control"])
+def test_an_executable_bit_change_after_approval_needs_a_fresh_review_despite_core_filemode(
+    tmp_path: Path, chmod: bool
+) -> None:
+    s, _ = _planned(tmp_path)
+    # The checkout's own config tells git to ignore executable bits.
+    _git(s, "config", "core.fileMode", "false")
+    _change_source(s, "fix")
+    _approve_diff(s)
+
+    if chmod:
+        target = s.cwd / TEST
+        target.chmod(target.stat().st_mode | 0o111)
+        assert TEST not in _git(s, "status", "--porcelain=v1", "--untracked-files=all")
+        assert _git(s, "diff", "HEAD", "--", TEST) == ""
+
+    decision = _publish(s)
+
+    if not chmod:
+        assert decision["permissionDecision"] == "allow", decision
+        return
+    _assert_denied(decision, FRESH_REVIEW)
+
+
 def test_a_prepared_escaping_link_that_stays_absent_keeps_the_approval(tmp_path: Path) -> None:
     # Liveness control for the flag refusals above: the skip-worktree entry
     # preparation leaves behind is hashed as absent, consistently.
@@ -517,9 +581,10 @@ def test_candidate_paths_git_diff_hides_are_named_after_the_candidate_block(
     assert prompt.count("CANDIDATE:") == 1
 
 
-def test_the_hidden_paths_line_names_fifty_paths_then_counts_the_rest(tmp_path: Path) -> None:
+def _flagged_notes(tmp_path: Path, count: int) -> tuple[Any, str, list[str]]:
+    """A planned run whose base tracks ``count`` notes, every one flagged assume-unchanged."""
     s = Session(tmp_path)
-    notes = [f"docs/note-{n:02d}.txt" for n in range(53)]
+    notes = [f"docs/note-{n:02d}.txt" for n in range(count)]
     for note in notes:
         target = s.cwd / note
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -527,12 +592,40 @@ def test_the_hidden_paths_line_names_fifty_paths_then_counts_the_rest(tmp_path: 
     _commit(s, "Notes fixture")
     base = _plan_run(s)
     _flag(s, "assume-unchanged", *notes)
+    return s, base, notes
+
+
+def _named_hidden_paths(prompt: str) -> list[str]:
+    return prompt.rpartition("read each file directly: ")[2].split(", ")
+
+
+def test_fifty_hidden_paths_are_all_named(tmp_path: Path) -> None:
+    s, base, notes = _flagged_notes(tmp_path, gate.HIDDEN_PATHS_SHOWN)
 
     prompt = _approve_diff(s)
 
     assert prompt.endswith(contract() + candidate_block(base) + hidden_paths_line(notes))
-    assert prompt.endswith(", docs/note-49.txt and 3 more"), prompt[-200:]
-    assert "docs/note-50.txt" not in prompt
+    # Every path is named and nothing is summarized as "and <n> more".
+    assert _named_hidden_paths(prompt) == notes
+    assert prompt.endswith(", docs/note-49.txt"), prompt[-200:]
+
+
+def test_more_than_fifty_hidden_paths_refuse_the_diff_review_without_stopping_the_run(
+    tmp_path: Path,
+) -> None:
+    s, base, notes = _flagged_notes(tmp_path, gate.HIDDEN_PATHS_SHOWN + 1)
+
+    _assert_denied(_diff_review(s), TOO_MANY_HIDDEN)
+
+    state = json.loads(_state_file(s).read_text())
+    assert state["stopped"] is None
+    assert state["diff"]["round"] == 0
+    assert ("review_diff", 1) not in s.phases()
+    # Liveness: with one flag cleared, fifty paths remain and the review is admitted.
+    _flag(s, "no-assume-unchanged", notes[0], tag="H")
+    prompt = _approve_diff(s)
+    assert prompt.endswith(contract() + candidate_block(base) + hidden_paths_line(notes[1:]))
+    assert _named_hidden_paths(prompt) == notes[1:]
 
 
 @pytest.mark.parametrize(

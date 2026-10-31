@@ -84,24 +84,23 @@ def candidate_block(base: str) -> str:
     )
 
 
+# The most hidden paths a diff review names; more refuses the review (#5230).
 HIDDEN_PATHS_SHOWN = 50
 
 
 def hidden_paths_line(paths: list[str]) -> str:
     """The line the CANDIDATE block ends with when git diff hides candidate paths (#5230).
 
-    ``paths`` are base paths missing from the index and index entries flagged
-    skip-worktree or assume-unchanged, each existing on disk. They are named
-    sorted, at most ``HIDDEN_PATHS_SHOWN`` of them, then a count of the rest.
-    With no such path the block gains nothing and stays ``candidate_block(base)``.
+    ``paths`` is every hidden path: base paths missing from the index that exist
+    on disk, and flagged (skip-worktree or assume-unchanged) index entries the
+    gate counts as hidden. Each is named, sorted, with nothing truncated; more
+    than ``HIDDEN_PATHS_SHOWN`` refuses the review instead. With no hidden path
+    the block gains nothing and stays ``candidate_block(base)``.
     """
-    ordered = sorted(paths)
-    rest = len(ordered) - HIDDEN_PATHS_SHOWN
+    assert len(paths) <= HIDDEN_PATHS_SHOWN, len(paths)
     return (
         "\nThese paths are in the candidate with their current file contents, but git diff "
-        "does not show them; read each file directly: "
-        + ", ".join(ordered[:HIDDEN_PATHS_SHOWN])
-        + (f" and {rest} more" if rest > 0 else "")
+        "does not show them; read each file directly: " + ", ".join(sorted(paths))
     )
 
 
