@@ -2810,8 +2810,22 @@ class Preflight:
                     input_text=labelled,
                 )
         # Helm skips existing CRDs and applies their custom resources at once,
-        # so each one must be served before the install starts.
+        # so each one must be served before the install starts. A fresh CRD is
+        # served with status.conditions: null until the naming controller
+        # writes status.acceptedNames and NamesAccepted in one status update,
+        # and kubectl --for=condition exits on that null instead of waiting
+        # (#5128). acceptedNames.plural is "" until that same update, so a
+        # jsonpath wait on it keeps waiting through the null state: await the
+        # accepted plural first, then the Established condition. The plural is
+        # the CRD name up to its first dot, the same correction as the chart
+        # CI script (#5125).
         for crd in self.created_crds:
+            self.kubectl(
+                "wait",
+                f"--for=jsonpath={{.status.acceptedNames.plural}}={crd.split('.', 1)[0]}",
+                f"crd/{crd}",
+                "--timeout=120s",
+            )
             self.kubectl("wait", "--for=condition=Established", f"crd/{crd}", "--timeout=120s")
         if self.uses_github_app:
             key_file = str(self.config.private_key_file)
