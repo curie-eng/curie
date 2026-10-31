@@ -141,8 +141,9 @@ class _FakeCommands:
 
 
 class _FakeCredentialClient:
-    def __init__(self, workspace: Any) -> None:
+    def __init__(self, workspace: Any, *, base_commit: str | None = None) -> None:
         self._workspace = workspace
+        self._base_commit = base_commit
         self.requested: list[uuid.UUID] = []
 
     def redeem(self, deployment_id: uuid.UUID, conversation_id: str) -> Any:
@@ -154,6 +155,7 @@ class _FakeCredentialClient:
             authorization_header=GIT_CREDENTIAL,
             origin="https://github.com",
             header_form="authorization_basic",
+            base_commit=self._base_commit,
         )
 
 
@@ -236,11 +238,12 @@ def _preparer(
     objects: _StreamingObjectStore | None = None,
     limits: Any | None = None,
     clock: Any | None = None,
+    credentials: _FakeCredentialClient | None = None,
 ) -> tuple[Any, _FakeCommands, _StreamingObjectStore]:
     command_port = commands or _FakeCommands()
     object_port = objects or _StreamingObjectStore()
     preparer = workspace.WorkspacePreparer(
-        credentials=_FakeCredentialClient(workspace),
+        credentials=credentials or _FakeCredentialClient(workspace),
         commands=command_port,
         objects=object_port,
         scratch_root=tmp_path / "clone-scratch",
@@ -1713,6 +1716,55 @@ def test_headless_lineage_claim_owns_original_base_for_later_publication(
     assert observed[0]["workspace_materialized_head"] == expected_base
     assert observed[0]["publication_visible_outcome_revision"] == 1
     assert "clone" in commands.events
+
+
+def test_lineage_absent_readmit_claim_pins_credential_base(
+    workspace: Any, tmp_path: Path
+) -> None:
+    """#4948: a re-admitted run whose failed lineage reads absent claims at the
+    WorkItem's re-admit base -- the credential pin, with no lineage pin above it."""
+
+    readmit_base = "b" * 40
+    commands = _FakeCommands()
+    commands.head_sha = "d" * 40
+    preparer, _, _objects = _preparer(
+        workspace,
+        tmp_path,
+        commands=commands,
+        credentials=_FakeCredentialClient(workspace, base_commit=readmit_base),
+    )
+    observed: list[dict[str, object]] = []
+
+    class Substrate(_RecordingSubstrate):
+        def claim(self, thread_key: str, **kwargs: object) -> object:
+            observed.append({"thread_key": thread_key, **kwargs})
+            return super().claim(thread_key, **kwargs)
+
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=Substrate(),
+    )
+
+    result = coordinator.claim_or_resume_with_handle(
+        thread_key="1700000000.000100",
+        deployment_id=DEPLOYMENT_ID,
+        repo_full_name="acme-corp/acme-bot",
+        publication_visible_outcome_revision=0,
+    )
+
+    assert result.prepared.base_sha == readmit_base
+    assert result.prepared.materialized_head == readmit_base
+    fetch_pins = [
+        call["argv"][-1] for call in commands.calls if "fetch" in call.get("argv", [])
+    ]
+    assert fetch_pins == [readmit_base]
+    checkout_pins = [
+        call["argv"][-1]
+        for call in commands.calls
+        if "checkout" in call.get("argv", []) and "--detach" in call["argv"]
+    ]
+    assert checkout_pins == [readmit_base]
+    assert observed[0]["workspace_materialized_head"] == readmit_base
 
 
 def test_late_handoff_revalidation_refusal_restores_ownership_and_old_route(
