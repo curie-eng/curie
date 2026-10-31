@@ -25,6 +25,19 @@ other workspaces are parked under ``others``, keyed by workspace. Tool events
 read and write the active run only. A key missing from an older state file
 reads as unset.
 
+Candidate. A run records its base commit, the checkout's HEAD when the run
+starts, before the agent acts. The candidate under review is the net change
+from that base to the final working tree files, so a local commit never
+redefines the base. The checkout fingerprint is a sha256 over the base, HEAD,
+``git status``, ``git diff HEAD``, the untracked files, the index entries with
+their skip-worktree and assume-unchanged flags, and the bytes on disk of every
+path the base tracks that the index does not list and of every flagged index
+entry, whose file git no longer reads (an absent one hashes as absent). Every
+git call sets ``core.fileMode=true``, so an executable bit always counts, and
+every git diff passes ``--no-ext-diff --no-textconv``. A run without a base has
+no fingerprint: every check that needs one treats the checkout as
+unverifiable. There is no fallback.
+
 Timing. ``execution_deadline`` (D) and ``execution_seconds`` (S) come only from
 a completed ``mcp__curie__get_issue`` call. The round cutoff is ``D - S // 6``
 and wrap up starts at ``D - S // 12``, both in whole UTC epoch seconds;
@@ -130,12 +143,16 @@ One script handles every hook event the bundle registers:
     returns to implement, not to plan. A missing prompt fingerprint stops the
     run before the review. Then the timing check.
 
-    Diff review: a changed or untracked root ``.github`` path, matched the
-    same way as for edits, stops the run (an unreadable git status does not
-    emit ``github_path_refused`` and does not by itself stop the run). No diff
-    review before the plan review completes. The same invocation then
-    fingerprints the checkout; a fingerprint that cannot be taken refuses the
-    review without a stop. A
+    Diff review: a root ``.github`` path that is a hidden candidate path
+    (below), that git status lists as changed or untracked, or that
+    ``git diff <base>`` lists (so a committed change counts too), matched the
+    same way as for edits, stops the run (an unreadable git status or diff
+    does not emit ``github_path_refused`` and does not by itself stop the
+    run). No diff review before the plan review completes. The same
+    invocation then fingerprints the checkout; a fingerprint or hidden path
+    list that cannot be taken, a missing base included, refuses the review
+    without a stop. More than ``HIDDEN_PATHS_LIMIT`` (50) hidden candidate
+    paths refuse the review without a stop, a round or a gate line. A
     checkout the diff reviewer already approved is refused (cause
     ``already_approved``): go to publish. An approval of another checkout is
     cleared. Then the timing check. A checkout identical to the last one that
@@ -146,13 +163,22 @@ One script handles every hook event the bundle registers:
     refuses writes the same line again. Plan reviews on a stopped run write
     none, and no finding text is logged.
 
-    Both reviewers get the bundle's verification contract appended to the
-    prompt, the same bytes for both, followed by the bundle's
-    ``verification/checks.json`` when the bundle declares one, fenced as
-    declared data. When either cannot be read the call is denied and the run
-    stops. An admitted call writes the ``plan_review`` or ``review_diff``
-    phase line with the round it would complete. Admission never spends a
-    round.
+    Both reviewers get the same appended text: the bundle's verification
+    contract, followed by the bundle's ``verification/checks.json`` when the
+    bundle declares one, fenced as declared data. The diff reviewer's prompt
+    then gets a ``CANDIDATE:`` block last, naming the run's base commit and
+    asking for a review of ``git diff <base>`` plus the untracked files; the
+    plan reviewer's gets none. The hidden candidate paths, which git diff does
+    not show, are the base paths the index does not list that exist on disk,
+    the flagged index entries that exist on disk, and the flagged entries the
+    base has that are absent (a deletion), except a skip-worktree entry equal
+    to the base's, which the publication keeps. When there are any, the
+    block ends with a line naming every one of them, sorted, to read
+    directly; with none the block is unchanged. When the contract or the
+    checks cannot be read
+    the call is denied and the run stops. An admitted call writes the
+    ``plan_review`` or ``review_diff`` phase line with the round it would
+    complete. Admission never spends a round.
 
 ``PostToolUse`` / ``PostToolUseFailure`` on ``Agent``/``Task``
     Reads the reviewer's ``REVIEWER:`` and ``VERDICT:`` lines from its reply,
@@ -227,18 +253,20 @@ One script handles every hook event the bundle registers:
     continuation, if there is one.
     Otherwise, and with no readable saved state for the session key, it
     starts a new run there, keeping the parked runs: the reset state is
-    saved with them, then the checkout fingerprint is taken with at most two
-    attempts sharing a seven-second deadline that also bounds hashing
-    untracked files. If
-    neither succeeds, the run stops with the prerequisite failure. A CI fix
-    round starts at ``implement`` with planning complete and takes no
+    saved with them, then the checkout's HEAD is recorded as the base and the
+    checkout fingerprint is taken, with at most two attempts sharing a
+    seven-second deadline that also bounds reading the base and hashing
+    files. If neither succeeds, the run stops with the prerequisite failure.
+    A CI fix round starts at ``implement`` with planning complete, records
+    its base the same way (its fresh checkout's HEAD) and takes no
     fingerprint.
 
     A prompt from the active run's checkout continues that run: rounds,
-    planning, the fingerprint, timing, findings and any stop are kept. A stop
-    is never cleared, with one exception: a run stopped for a missing prompt
-    fingerprint before planning completed retakes the fingerprint the same
-    way, and a success clears that stop. A
+    planning, the base, the fingerprint, timing, findings and any stop are
+    kept. A stop is never cleared, with one exception: a run stopped for a
+    missing prompt fingerprint before planning completed retakes the
+    fingerprint the same way, a missing base first, and a success clears
+    that stop. A
     genuine CI marker on a run that is not stopped opens one repair round:
     planning complete, stage ``implement``, a new diff loop at round 0, every
     approval and the rejected checkout cleared, and the CI findings kept.
@@ -279,7 +307,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 PLAN_REVIEWS = 1
 DIFF_ROUNDS = 5
@@ -315,6 +343,13 @@ GIT_BUDGET_SECONDS = 7.0
 GIT_CALL_SECONDS = 3.0
 # Linux's own limit on symlinks followed in one path lookup.
 SYMLINK_HOPS = 40
+# The most hidden candidate paths the CANDIDATE block names; more refuses the diff review.
+HIDDEN_PATHS_LIMIT = 50
+TOO_MANY_HIDDEN = (
+    f"Diff review refused: more than {HIDDEN_PATHS_LIMIT} candidate paths are hidden from "
+    "git diff; clear the assume-unchanged and skip-worktree flags or restore the index "
+    "before review."
+)
 FINGERPRINT_MISSING = (
     "The initial checkout fingerprint could not be captured (checkout_unverifiable). "
     "Ensure the checkout is readable by Git within the seven-second budget, "
@@ -372,6 +407,8 @@ NO_PROGRESS = (
 ROUND_CAP_STOP = f"The review_diff loop hit its {DIFF_ROUNDS} round cap without approval."
 NO_FINDINGS = "No reviewer findings were recorded; state the reason above as the finding."
 
+# A full commit id, sha1 or sha256: the only form a base commit takes.
+_COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 _VERDICT = re.compile(r"^\s*VERDICT:\s*(APPROVE|CHANGES)\b", re.MULTILINE)
 _CI_ROUND = re.compile(r"^Curie wait_ci round ([23]) of 3: ")
 # The runner's platform sender frame (curie_runner.sender_frame): five header
@@ -512,6 +549,8 @@ def _fresh(prompt: str = "") -> dict[str, Any]:
         "observed": None,
         "seq": 0,
         "workspace": "",
+        # The checkout's HEAD when the run started: the candidate's base commit.
+        "base": None,
         "fingerprint": None,
         # {"deadline": epoch seconds, "seconds": execution seconds} from get_issue.
         "timing": None,
@@ -615,7 +654,8 @@ def _git(top: str, deadline: float, *args: str) -> bytes:
     if timeout <= 0:
         raise subprocess.TimeoutExpired(["git", *args], 0)
     done = subprocess.run(
-        ["git", "--no-optional-locks", "-C", top, *args],
+        # The checkout's own core.fileMode must not hide an executable bit.
+        ["git", "--no-optional-locks", "-C", top, "-c", "core.fileMode=true", *args],
         capture_output=True,
         timeout=timeout,
         check=True,
@@ -694,14 +734,28 @@ def _github_step(path: str, root: str) -> str | None:
     return None
 
 
-def _github_changed_path(workspace: str, deadline: float) -> str | None:
-    """The first refused status path.
+def _github_changed_path(
+    workspace: str, deadline: float, base: str | None, hidden: list[str]
+) -> str | None:
+    """The first refused path among ``hidden``, then that git status lists or
+    that differs from ``base``.
 
-    Unreadable, late, or empty status returns ``None``. This does not emit
+    ``hidden`` are the candidate paths git diff does not show
+    (``hidden_paths``). The paths of ``git diff <base>`` catch a committed
+    change. Unreadable, late, or empty status or diff returns ``None``, and so
+    does a missing base after the status walk. This does not emit
     ``github_path_refused``. The caller owns the deadline.
     """
     if not workspace:
         return None
+    for name in hidden:
+        if time.monotonic() >= deadline:
+            return None
+        path = _github_path(name, workspace)
+        if time.monotonic() >= deadline:
+            return None
+        if path is not None:
+            return path
     try:
         status = _git(
             workspace, deadline, "status", "--porcelain=v1", "-z", "--untracked-files=all"
@@ -732,73 +786,230 @@ def _github_changed_path(workspace: str, deadline: float) -> str | None:
                     return None
                 if path is not None:
                     return path
+        if not _is_commit(base):
+            return None
+        changed = _git(
+            workspace,
+            deadline,
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            base,
+            "--",
+        )
+        for raw_path in filter(None, changed.split(b"\0")):
+            if time.monotonic() >= deadline:
+                return None
+            path = _github_path(os.fsdecode(raw_path), workspace)
+            if time.monotonic() >= deadline:
+                return None
+            if path is not None:
+                return path
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     return None
 
 
-def fingerprint(workspace: str, deadline: float) -> str | None:
-    """A sha256 over the checkout's HEAD, status, diff and untracked files.
+def _is_commit(value: object) -> TypeGuard[str]:
+    return isinstance(value, str) and _COMMIT.fullmatch(value) is not None
 
-    Each untracked path is a length-prefixed name, one type byte (``l`` for a
-    symlink, ``f`` for a regular file), one mode byte (``x`` when any execute
-    bit is set and ``-`` otherwise), then a length-prefixed body. ``None``
-    means unverifiable rather than unchanged.
-    """
+
+def base_commit(workspace: str, deadline: float) -> str | None:
+    """The checkout's HEAD commit id, or ``None`` when it cannot be read in time."""
     if not workspace:
+        return None
+    try:
+        head = _git(workspace, deadline, "rev-parse", "--verify", "HEAD").decode().strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return head if _is_commit(head) else None
+
+
+def _paths_git_hides(
+    root: str, deadline: float, base: str
+) -> tuple[bytes, list[bytes], dict[bytes, bool]]:
+    """The exact ``git ls-files -s -v -z`` bytes (every index entry with its
+    flags), the paths ``base`` tracks that the index does not list, then the
+    index entries flagged skip-worktree or assume-unchanged, each mapped to
+    whether its absence on disk deletes a base file from the candidate.
+
+    git status and git diff never show the bytes on disk of either, yet both
+    are in the candidate with those bytes, and an absent flagged file is a
+    deletion neither shows. The one exception is the publication snapshot's:
+    an absent skip-worktree entry whose (mode, oid) equals the base's keeps
+    the base entry. A ``git ls-files -s -v`` record is ``<tag> <mode> <oid>
+    <stage>\\t<path>``: tag ``S`` or ``s`` is skip-worktree, and any lowercase
+    tag is assume-unchanged. A ``git ls-tree`` record is ``<mode> <type>
+    <oid>\\t<path>``. A record of another shape raises ``ValueError``.
+    """
+    index: dict[bytes, tuple[bytes, bytes] | None] = {}
+    skip_worktree: set[bytes] = set()
+    flagged: dict[bytes, None] = {}
+    entries = _git(root, deadline, "ls-files", "-s", "-v", "-z")
+    for record in filter(None, entries.split(b"\0")):
+        meta, tab, name = record.partition(b"\t")
+        fields = meta.split(b" ")
+        if not tab or not name or len(fields) != 4:
+            raise ValueError("unreadable index entry")
+        tag, mode, oid, _stage = fields
+        entry: tuple[bytes, bytes] | None = (mode, oid)
+        # An unmerged path has several entries, so no one of them is its entry.
+        if name in index and index[name] != entry:
+            entry = None
+        index[name] = entry
+        if tag in (b"S", b"s"):
+            skip_worktree.add(name)
+        if tag in (b"S", b"s") or tag.islower():
+            flagged[name] = None
+    based: dict[bytes, tuple[bytes, bytes]] = {}
+    listed = _git(root, deadline, "ls-tree", "-r", "-z", "--full-tree", base)
+    for record in filter(None, listed.split(b"\0")):
+        meta, tab, name = record.partition(b"\t")
+        fields = meta.split(b" ")
+        if not tab or not name or len(fields) != 3:
+            raise ValueError("unreadable base entry")
+        based[name] = (fields[0], fields[2])
+    outside = [name for name in based if name not in index]
+    deletes = {
+        name: name in based and not (name in skip_worktree and index[name] == based[name])
+        for name in flagged
+    }
+    return entries, outside, deletes
+
+
+def hidden_paths(workspace: str, deadline: float, base: str | None) -> list[str] | None:
+    """The candidate paths git diff does not show, sorted, or ``None``.
+
+    Each path ``_paths_git_hides`` names that exists on disk, and each flagged
+    one whose absence deletes a base file. ``None`` means unreadable or late,
+    and so does a missing base.
+    """
+    if not workspace or not _is_commit(base):
+        return None
+    hidden: set[str] = set()
+    try:
+        root = os.fsdecode(_git(workspace, deadline, "rev-parse", "--show-toplevel").rstrip(b"\n"))
+        _, outside, flagged = _paths_git_hides(root, deadline, base)
+        for name in (*outside, *flagged):
+            if time.monotonic() >= deadline:
+                return None
+            try:
+                (Path(root) / os.fsdecode(name)).lstat()
+            except (FileNotFoundError, NotADirectoryError):
+                # Absent: git diff shows a base path's deletion, but not a
+                # flagged entry's. ``outside`` names no flagged entry.
+                if not flagged.get(name):
+                    continue
+            hidden.add(os.fsdecode(name))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return sorted(hidden) if time.monotonic() < deadline else None
+
+
+def fingerprint(workspace: str, deadline: float, base: str | None) -> str | None:
+    """A sha256 over the base commit, the checkout's HEAD, status, diff and
+    untracked files, then the index entries with their flags, then every path
+    ``base`` tracks that the index does not, then every index entry flagged
+    skip-worktree or assume-unchanged.
+
+    Untracked, base and flagged paths are hashed by ``_hash_path``; only a
+    base or flagged path may be absent. A zero length ends the untracked list
+    and the base list, and the index entries are length-prefixed, so changing
+    only a flag changes the digest and setting one already set does not.
+    ``None`` means unverifiable rather than unchanged, and so does a missing
+    or unreadable base.
+    """
+    if not workspace or not _is_commit(base):
         return None
     digest = hashlib.sha256()
     try:
         top, head = _git(workspace, deadline, "rev-parse", "--show-toplevel", "HEAD").split()
         root = top.decode()
+        digest.update(base.encode())
         digest.update(head)
         digest.update(
             _git(root, deadline, "status", "--porcelain=v1", "-z", "--untracked-files=all")
         )
-        digest.update(_git(root, deadline, "diff", "HEAD", "--binary"))
+        digest.update(
+            _git(root, deadline, "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD")
+        )
         untracked = _git(root, deadline, "ls-files", "--others", "--exclude-standard", "-z")
         for name in filter(None, untracked.split(b"\0")):
-            path = Path(root) / os.fsdecode(name)
-            digest.update(len(name).to_bytes(8, "big") + name)
-            if time.monotonic() >= deadline:
+            if not _hash_path(digest, root, name, deadline, may_be_absent=False):
                 return None
-            try:
-                info = path.lstat()
-            except OSError:
+        digest.update((0).to_bytes(8, "big"))
+        # A base file outside the index (removed from it, maybe ignored) and a
+        # flagged index entry, whose file git no longer reads, are still part
+        # of the candidate: their bytes on disk count. The flags themselves
+        # count too: they decide what the publication snapshot keeps.
+        entries, outside, flagged = _paths_git_hides(root, deadline, base)
+        digest.update(len(entries).to_bytes(8, "big") + entries)
+        for name in outside:
+            if not _hash_path(digest, root, name, deadline, may_be_absent=True):
                 return None
-            mode = info.st_mode
-            if stat.S_ISLNK(mode):
-                kind = b"l"
-            elif stat.S_ISREG(mode):
-                kind = b"f"
-            else:
-                # A fifo or any other type is unverifiable. Do not read it.
+        digest.update((0).to_bytes(8, "big"))
+        for name in flagged:
+            if not _hash_path(digest, root, name, deadline, may_be_absent=True):
                 return None
-            # Any execute bit is how git records 100755.
-            digest.update(kind)
-            digest.update(b"x" if mode & 0o111 else b"-")
-            if kind == b"l":
-                body = os.fsencode(os.readlink(path))
-                digest.update(len(body).to_bytes(8, "big"))
-                digest.update(body)
-            else:
-                size = info.st_size
-                digest.update(size.to_bytes(8, "big"))
-                seen = 0
-                with path.open("rb") as handle:
-                    for chunk in iter(lambda: handle.read(1 << 20), b""):
-                        want = min(1 << 20, size - seen)
-                        if len(chunk) != want:
-                            return None
-                        digest.update(chunk)
-                        seen += len(chunk)
-                        if time.monotonic() >= deadline:
-                            return None
-                if seen != size:
-                    return None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     return digest.hexdigest() if time.monotonic() < deadline else None
+
+
+def _hash_path(
+    digest: Any, root: str, name: bytes, deadline: float, *, may_be_absent: bool
+) -> bool:
+    """Add one checkout path to ``digest``; ``False`` means unverifiable.
+
+    A length-prefixed name, then ``a`` when the path is absent and
+    ``may_be_absent``, else one type byte (``l`` for a symlink, ``f`` for a
+    regular file), one mode byte (``x`` when any execute bit is set and ``-``
+    otherwise), then a length-prefixed body.
+    """
+    path = Path(root) / os.fsdecode(name)
+    digest.update(len(name).to_bytes(8, "big") + name)
+    if time.monotonic() >= deadline:
+        return False
+    try:
+        info = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        if may_be_absent:
+            digest.update(b"a")
+        return may_be_absent
+    except OSError:
+        return False
+    mode = info.st_mode
+    if stat.S_ISLNK(mode):
+        kind = b"l"
+    elif stat.S_ISREG(mode):
+        kind = b"f"
+    else:
+        # A fifo or any other type is unverifiable. Do not read it.
+        return False
+    # Any execute bit is how git records 100755.
+    digest.update(kind)
+    digest.update(b"x" if mode & 0o111 else b"-")
+    if kind == b"l":
+        body = os.fsencode(os.readlink(path))
+        digest.update(len(body).to_bytes(8, "big"))
+        digest.update(body)
+        return True
+    size = info.st_size
+    digest.update(size.to_bytes(8, "big"))
+    seen = 0
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            want = min(1 << 20, size - seen)
+            if len(chunk) != want:
+                return False
+            digest.update(chunk)
+            seen += len(chunk)
+            if time.monotonic() >= deadline:
+                return False
+    return seen == size
 
 
 def is_test_path(path: str, workspace: str) -> bool:
@@ -966,6 +1177,30 @@ def contract_text() -> str | None:
 def contract_block(text: str) -> str:
     """The contract as every reader gets it: one header, then the file's bytes."""
     return f"{CONTRACT_HEADER}\n\n{text}"
+
+
+def candidate_block(base: str, hidden: list[str]) -> str:
+    """What the diff reviewer reviews, appended after everything else in its prompt.
+
+    ``hidden`` are the candidate paths git diff does not show, sorted
+    (``hidden_paths``), at most ``HIDDEN_PATHS_LIMIT`` of them because the
+    admission refuses more. When there are any, a last line names every one;
+    with none the block ends at its fixed text.
+    """
+    block = (
+        "\n\nCANDIDATE:\n"
+        f"base commit {base}\n"
+        "The publication candidate is the net change from that base commit to the final "
+        "working tree files, with committed, staged, unstaged and untracked changes together. "
+        f"Review git diff {base} and every untracked file git status lists. "
+        "Local commits are flattened into one publication."
+    )
+    if not hidden:
+        return block
+    return (
+        f"{block}\nThese paths are in the candidate with their current file contents, but git "
+        "diff does not show them; read each file directly: " + ", ".join(hidden)
+    )
 
 
 def declared_checks() -> str | None:
@@ -1390,6 +1625,7 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
         return _deny(_stop_text(state["stopped"], state))
     diff = state["diff"]
     digest: str | None = None
+    candidate = ""
     if kind == PLAN:
         if planned(state):
             emit_gate(state, "review_refused", cause="planning_complete", stage="plan_review")
@@ -1405,15 +1641,25 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
         if (refused := _timing_check(state, "plan_review")) is not None:
             return _deny(refused)
     else:
-        # One budget covers the status check and the checkout fingerprint below.
+        # One budget covers the hidden paths, the status check and the
+        # checkout fingerprint below.
         deadline = time.monotonic() + GIT_BUDGET_SECONDS
-        if (path := _github_changed_path(state["workspace"], deadline)) is not None:
+        base = state.get("base")
+        hidden = hidden_paths(state["workspace"], deadline, base)
+        if (
+            path := _github_changed_path(state["workspace"], deadline, base, hidden or [])
+        ) is not None:
             return _deny(_stop_for_github_path(state, path))
         if not planned(state):
             return _deny("The plan review has not completed yet; run the plan review first.")
-        digest = fingerprint(state["workspace"], deadline)
-        if digest is None:
+        digest = fingerprint(state["workspace"], deadline, base)
+        if digest is None or hidden is None:
             return _deny("Diff checkout is unverifiable; restore it before review.")
+        if len(hidden) > HIDDEN_PATHS_LIMIT:
+            # No stop and no round: clearing the flags lets the review run.
+            return _deny(TOO_MANY_HIDDEN)
+        # The fingerprint was taken, so the base is a commit id.
+        candidate = candidate_block(state["base"], hidden)
         if diff["verdict"] == "APPROVE":
             if digest == state.get("diff_approved_fingerprint"):
                 emit_gate(state, "review_refused", cause="already_approved", stage="review_diff")
@@ -1446,7 +1692,8 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
     updated = dict(tool_input)
     updated["subagent_type"] = kind
     appended = contract_block(contract) + (f"\n\n{checks}" if checks else "")
-    updated["prompt"] = f"{tool_input.get('prompt') or ''}\n\n{appended}"
+    # Only the diff reviewer gets the CANDIDATE block, last.
+    updated["prompt"] = f"{tool_input.get('prompt') or ''}\n\n{appended}{candidate}"
     updated.pop("isolation", None)
     updated.pop("model", None)
     # An omitted run_in_background launches the agent async and the main loop
@@ -1570,7 +1817,7 @@ def post_skill(state: dict[str, Any], tool_input: dict[str, Any]) -> None:
 def refuse_approval(state: dict[str, Any]) -> str | None:
     """The stop cause when the checkout moved before plan approval, else ``None``."""
     now = (
-        fingerprint(state["workspace"], time.monotonic() + GIT_BUDGET_SECONDS)
+        fingerprint(state["workspace"], time.monotonic() + GIT_BUDGET_SECONDS, state.get("base"))
         if state["fingerprint"] is not None
         else None
     )
@@ -1643,7 +1890,9 @@ def _post_diff(
     state: dict[str, Any], event: str, round_: int, verdict: str, response: Any
 ) -> dict[str, Any]:
     """A verdict on the checkout the review started from counts the round."""
-    digest = fingerprint(state["workspace"], time.monotonic() + GIT_BUDGET_SECONDS)
+    digest = fingerprint(
+        state["workspace"], time.monotonic() + GIT_BUDGET_SECONDS, state.get("base")
+    )
     reviewed = state.get("diff_review_fingerprint")
     if digest is None or reviewed is None or digest != reviewed:
         emit_gate(state, "diff_approval_refused", cause="checkout_changed_or_unverifiable")
@@ -1679,7 +1928,9 @@ def pre_publish(state: dict[str, Any]) -> dict[str, Any]:
         return _deny(refused)
     if state["diff"]["verdict"] != "APPROVE":
         return _deny("Nothing is published without a diff reviewer VERDICT: APPROVE.")
-    digest = fingerprint(state["workspace"], time.monotonic() + GIT_BUDGET_SECONDS)
+    digest = fingerprint(
+        state["workspace"], time.monotonic() + GIT_BUDGET_SECONDS, state.get("base")
+    )
     approved = state.get("diff_approved_fingerprint")
     if digest is None or approved is None or digest != approved:
         state["diff"]["verdict"] = None
@@ -1723,13 +1974,16 @@ def _same_checkout(state: dict[str, Any], workspace: str) -> bool:
     return not workspace or workspace == str(state.get("workspace") or "")
 
 
-def _prompt_fingerprint(workspace: str) -> str | None:
-    """At most two attempts sharing one seven-second deadline."""
+def _prompt_fingerprint(state: dict[str, Any]) -> str | None:
+    """At most two attempts sharing one seven-second deadline. Each first
+    records a missing base as the checkout's HEAD."""
     deadline = time.monotonic() + GIT_BUDGET_SECONDS
     for _ in range(2):
         if time.monotonic() >= deadline:
             break
-        digest = fingerprint(workspace, deadline)
+        if state.get("base") is None:
+            state["base"] = base_commit(state["workspace"], deadline)
+        digest = fingerprint(state["workspace"], deadline, state["base"])
         if digest is not None:
             return digest
     return None
@@ -1764,12 +2018,14 @@ def _start_run(path: Path, prompt: str, workspace: str, others: dict[str, Any]) 
         state["others"] = others
     ci_round = state["ci_round"]
     if ci_round:
+        # A fix round in a new sandbox: its fresh checkout's HEAD is the base.
+        state["base"] = base_commit(workspace, time.monotonic() + GIT_BUDGET_SECONDS)
         _begin_ci_round(state, prompt, ci_round)
     else:
         # Saved first: a hook killed mid-fingerprint must not leave the last
-        # run's approvals in place.
+        # run's approvals in place. The base is read before the fingerprint.
         save(path, state)
-        state["fingerprint"] = _prompt_fingerprint(workspace)
+        state["fingerprint"] = _prompt_fingerprint(state)
         if state["fingerprint"] is None:
             state["stopped"] = FINGERPRINT_MISSING
             emit_gate(state, "fingerprint_unavailable", stage="prompt")
@@ -1780,8 +2036,8 @@ def _continue_run(path: Path, state: dict[str, Any], prompt: str) -> dict[str, A
     """Another prompt of the same run: nothing spent or decided is reset."""
     if state["stopped"] == FINGERPRINT_MISSING and not planned(state):
         # The one stop a later prompt may clear: the baseline the plan review
-        # needs was never taken.
-        digest = _prompt_fingerprint(state["workspace"])
+        # needs was never taken. A missing base is retaken with it.
+        digest = _prompt_fingerprint(state)
         if digest is None:
             emit_gate(state, "fingerprint_unavailable", stage="prompt")
         else:

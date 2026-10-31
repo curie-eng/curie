@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -290,7 +291,9 @@ def test_ci_fix_round_needs_no_initial_fingerprint(capture_run: CaptureRun) -> N
     context = c.run.dispatch("UserPromptSubmit", prompt=c.helpers._ci_prompt(2))
 
     assert c.helpers.contract() in c.helpers.context_of(context[0])
-    assert c.calls() == 0
+    # The CI round records its base commit (#5230) but takes no initial fingerprint.
+    assert c.calls(captures_only=True) == 0
+    assert re.fullmatch(r"[0-9a-f]{40}", c.state()["base"] or "")
     assert c.state()["stage"] == "implement"
     assert c.state()["fingerprint"] is None
     c.run.read_issue()

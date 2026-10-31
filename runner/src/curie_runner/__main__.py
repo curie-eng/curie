@@ -165,7 +165,7 @@ from .verification import (
     blocked_checks,
     preflight_workspace_verification,
 )
-from .workspace_snapshot import WorkspaceSnapshot, capture_workspace_snapshot
+from .workspace_snapshot import workspace_snapshotter
 
 logger = logging.getLogger("curie_runner")
 
@@ -1907,22 +1907,24 @@ def _serve() -> None:
         memory_guidance=fetches.memory_guidance,
     )
 
-    def capture_mounted_workspace() -> WorkspaceSnapshot:
-        # The sanitized, credential-free origin in /workspace/.git/config is
-        # the repository fact. The proposal is runner-held state from the
-        # permission-gated tool input; neither needs another claim env.
-        if workspace_path is None:
-            raise RuntimeError("managed workspace disappeared before snapshot wiring")
+    def publication_proposal() -> tuple[str | None, str | None]:
+        # Runner-held state from the permission-gated tool input. The prepared
+        # base comes from the worker's snapshot request, never from the checkout.
         gate = runner._approval_gate  # noqa: SLF001 - same package wiring
-        return capture_workspace_snapshot(
+        if gate is None:
+            return None, None
+        return gate.publication_title, gate.publication_body
+
+    snapshot_callback = (
+        workspace_snapshotter(
             workspace_path,
             trusted_origin=config.repo_origin,
             repository_path=config.repo_path,
-            publication_title=gate.publication_title if gate is not None else None,
-            publication_body=gate.publication_body if gate is not None else None,
+            proposal=publication_proposal,
         )
-
-    snapshot_callback = capture_mounted_workspace if workspace_path is not None else None
+        if workspace_path is not None
+        else None
+    )
 
     # create_app schedules the runner's start on startup without awaiting it.
     app = create_app(runner, token=serving_token, snapshotter=snapshot_callback)

@@ -138,6 +138,10 @@ class _Workspace:
     def release(self, _thread_key: str) -> None:
         return None
 
+    def current(self, _thread_key: str) -> object:
+        # The retained prepared base; matches the base _patch_snapshot returns.
+        return SimpleNamespace(repo_full_name=WORK_ITEM_REPO, base_sha="a1" * 20)
+
 
 class _WorkItems:
     """Dispatch double: records every finish the worker posts."""
