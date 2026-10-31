@@ -1165,6 +1165,65 @@ def test_a_relative_attributes_file_still_applies_built_in_conversion(tmp_path: 
     assert b"\r" not in captured.patch
 
 
+# --- relative git configuration paths in the environment --------------------------
+
+
+def _prepared_with_repository_config(root: Path, marker: Path) -> tuple[Path, str]:
+    """P tracks ``cfg``, which names the tracked relative attributes file ``attrs``.
+
+    ``attrs`` gives src/app.py the marking filter, and the checkout edits
+    src/app.py with a HIDDEN line. Neither ``cfg`` nor ``attrs`` changes.
+    """
+
+    repo, _ = _prepared(root)
+    _write(repo, "cfg", b"[core]\n\tattributesFile = attrs\n")
+    _write(repo, "attrs", b"src/app.py filter=strip\n")
+    _git(repo, "add", "cfg", "attrs")
+    prepared = _commit(repo, "Prepared base with a repository git config file")
+    _marking_filter(repo, marker)
+    _write(repo, "src/app.py", b"x = 2\n" + _HIDDEN)
+    return repo, prepared
+
+
+@pytest.mark.parametrize("name", ["GIT_CONFIG_GLOBAL", "GIT_CONFIG", "XDG_CONFIG_HOME", "HOME"])
+def test_a_relative_git_configuration_path_in_the_environment_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    marker = tmp_path / "filter-ran"
+    if name == "GIT_CONFIG_GLOBAL":
+        repo, prepared = _prepared_with_repository_config(tmp_path, marker)
+        monkeypatch.setenv(name, "cfg")
+        # The checkout's git reads cfg from the work tree, so its attributes file applies.
+        _assert_filter_is_live(repo, marker)
+    else:
+        repo, prepared = _prepared(tmp_path)
+        _write(repo, "src/app.py", b"x = 2\n")
+        # Set only now, so every helper above ran git with the real environment.
+        monkeypatch.setenv(name, "relative-config")
+
+    with pytest.raises(
+        workspace_snapshot.WorkspaceSnapshotError,
+        match=f"git configuration path {name} is relative",
+    ) as refused:
+        _capture(repo, prepared)
+
+    assert not isinstance(refused.value, workspace_snapshot.WorkspaceHistoryError)
+    assert not marker.exists(), "candidate construction ran a filter program"
+
+
+def test_an_absolute_git_config_global_still_resolves_its_relative_attributes_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Liveness for the refusal above: the same cfg named by an absolute path is
+    # read, so its attributes file reaches the candidate and the filter is refused.
+    marker = tmp_path / "filter-ran"
+    repo, prepared = _prepared_with_repository_config(tmp_path, marker)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(repo / "cfg"))
+    _assert_filter_is_live(repo, marker)
+
+    _assert_filter_refused(repo, prepared, "src/app.py", marker)
+
+
 # --- one builder: the capture publishes the rendered candidate --------------------
 
 
