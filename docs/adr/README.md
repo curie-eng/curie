@@ -264,4 +264,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0249 | [A factory run may take twelve hours](0249-a-factory-run-may-take-twelve-hours.md) | Accepted |
 | 0250 | [Verbatim Slack answers render as rich text sections with literal links](0250-verbatim-slack-answers-render-as-rich-text-sections-with-literal-links.md) | Accepted |
 | 0251 | [Claim-backed sandbox scratch is bounded by its storage request](0251-claim-backed-sandbox-scratch-is-bounded-by-its-storage-request.md) | Draft |
+| 0252 | [Publication validates and pushes a Git object overlay](0252-publication-validates-and-pushes-a-git-object-overlay.md) | Draft |
 <!-- END GENERATED: adr-index -->
