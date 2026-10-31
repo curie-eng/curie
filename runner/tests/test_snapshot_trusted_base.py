@@ -793,42 +793,119 @@ def _rewrite_keeping_stat(repo: Path, path: str, data: bytes, mtime_ns: int) -> 
     os.utime(target, ns=(mtime_ns, mtime_ns))
 
 
-def test_a_stale_stat_rewrite_of_a_file_whose_index_entry_is_the_base_is_not_published(
-    tmp_path: Path,
+def _prepared_with_attributes(root: Path, attributes: bytes | None) -> tuple[Path, str]:
+    """P, optionally with a committed ``.gitattributes``, so tracked files convert at check-in."""
+
+    repo, prepared = _prepared(root)
+    if attributes is None:
+        return repo, prepared
+    _write(repo, ".gitattributes", attributes)
+    _git(repo, "add", ".gitattributes")
+    return repo, _commit(repo, "Prepared base with attributes")
+
+
+@pytest.mark.parametrize("attributes", [None, b"*.py text\n"], ids=["raw", "text_attribute"])
+def test_a_stale_stat_rewrite_of_a_file_whose_index_entry_is_the_base_is_published(
+    tmp_path: Path, attributes: bytes | None
 ) -> None:
-    repo, prepared = _prepared(tmp_path)
+    repo, prepared = _prepared_with_attributes(tmp_path, attributes)
     past = _trust_stat(repo, "src/app.py")
     _rewrite_keeping_stat(repo, "src/app.py", b"x = 3\n", past)
-    # git diff <P> does not list it, so the candidate keeps P's entry.
+    # git trusts the cached stat: git diff <P> does not list the file.
     assert _git(repo, "diff", "--name-only", prepared) == ""
 
     captured = _capture(repo, prepared)
 
+    # Final disk bytes win over the stat cache.
     assert captured.base_sha == prepared
-    assert captured.patch == b""
-    assert captured.changed_paths == ()
+    assert captured.changed_paths == ("src/app.py",)
+    assert _changed_lines(_sections(captured.patch)["src/app.py"]) == [b"-x = 1", b"+x = 3"]
 
 
+@pytest.mark.parametrize("attributes", [None, b"*.py text\n"], ids=["raw", "text_attribute"])
 @pytest.mark.parametrize("recorded", ["staged", "committed"])
 def test_a_stale_stat_rewrite_after_the_edit_was_recorded_publishes_the_rewrite(
-    tmp_path: Path, recorded: str
+    tmp_path: Path, recorded: str, attributes: bytes | None
 ) -> None:
-    repo, prepared = _prepared(tmp_path)
+    repo, prepared = _prepared_with_attributes(tmp_path, attributes)
     _write(repo, "src/app.py", b"x = 2\n")
     _git(repo, "add", "src/app.py")
     if recorded == "committed":
         _commit(repo, "Change src/app.py")
     past = _trust_stat(repo, "src/app.py")
     _rewrite_keeping_stat(repo, "src/app.py", b"x = 3\n", past)
-    # The index entry differs from P, so git diff <P> lists it with the bytes on disk.
-    assert "+x = 3" in _git(repo, "diff", prepared)
 
     captured = _capture(repo, prepared)
 
+    # Final disk bytes win over staging, commits and the stat cache.
     assert captured.base_sha == prepared
     assert captured.changed_paths == ("src/app.py",)
     assert _changed_lines(_sections(captured.patch)["src/app.py"]) == [b"-x = 1", b"+x = 3"]
     assert b"x = 2" not in captured.patch
+
+
+# --- attributes git finds only in the index still convert the final bytes ---------
+
+
+def test_a_deleted_gitattributes_kept_in_the_index_still_normalizes_an_edited_crlf_file(
+    tmp_path: Path,
+) -> None:
+    repo, prepared = _crlf_checkout(tmp_path)
+    (repo / ".gitattributes").unlink()
+    assert _git(repo, "ls-files", "--", ".gitattributes") == ".gitattributes"
+    _write(repo, "run.bat", b"@echo off\r\necho one\r\necho changed\r\n")
+
+    captured = _capture(repo, prepared)
+
+    sections = _sections(captured.patch)
+    assert captured.changed_paths == (".gitattributes", "run.bat")
+    assert b"deleted file mode 100644" in sections[".gitattributes"]
+    # git's attribute lookup falls back to the index copy: the edit is normalized to LF.
+    assert _changed_lines(sections["run.bat"]) == [b"-echo two", b"+echo changed"]
+    assert b"\r" not in sections["run.bat"]
+
+
+def test_a_deleted_gitattributes_kept_in_the_index_still_applies_the_clean_filter(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _prepared(tmp_path)
+    _git(repo, "config", "filter.strip.clean", "grep -v HIDDEN || true")
+    _git(repo, "config", "filter.strip.smudge", "cat")
+    _write(repo, ".gitattributes", b"src/app.py filter=strip\n")
+    _git(repo, "add", ".gitattributes")
+    prepared = _commit(repo, "Prepared base with a clean filter attribute")
+    (repo / ".gitattributes").unlink()
+    assert _git(repo, "ls-files", "--", ".gitattributes") == ".gitattributes"
+    _write(repo, "src/app.py", b"x = 2\n" + _HIDDEN)
+
+    captured = _capture(repo, prepared)
+
+    sections = _sections(captured.patch)
+    assert captured.changed_paths == (".gitattributes", "src/app.py")
+    assert b"deleted file mode 100644" in sections[".gitattributes"]
+    assert _changed_lines(sections["src/app.py"]) == [b"-x = 1", b"+x = 2"]
+    assert b"HIDDEN" not in captured.patch
+
+
+# --- one builder: the capture publishes the rendered candidate --------------------
+
+
+def test_the_capture_patch_is_the_rendered_shared_candidate(tmp_path: Path) -> None:
+    repo, prepared, expected = _mixed_workspace(tmp_path)
+
+    built = workspace_snapshot.build_candidate(repo, prepared, render_patch=True)
+    captured = _capture(repo, prepared)
+
+    assert built.base_sha == prepared
+    assert set(built.changed_paths) == expected
+    assert tuple(built.changed_paths) == captured.changed_paths
+    assert built.patch == captured.patch
+    # The tree is the one the patch describes: P with the patch applied.
+    fresh = _checkout_of(repo, prepared, tmp_path / "fresh")
+    patch_file = tmp_path / "candidate.patch"
+    patch_file.write_bytes(built.patch)
+    _git(fresh, "apply", "--binary", "--index", str(patch_file))
+    assert _git(fresh, "write-tree") == built.tree
 
 
 def test_a_mode_only_chmod_publishes_when_the_checkout_sets_core_filemode_false(

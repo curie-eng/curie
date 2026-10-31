@@ -1,29 +1,47 @@
 """The review gate binds review and publication to the run's candidate (#5230).
 
-The candidate is the net change from the base commit, the checkout's HEAD when
-the run started, to the final working tree files. Every case drives
-``examples/dark-factory/hooks/review_gate.py`` as the real hook subprocess, one
-process per event, against a real git checkout, through the shared fixture in
-``test_dark_factory_review_gate.py``. A local commit must not redefine the base,
-hide a change from the diff reviewer or the ``.github`` stop, or keep a stale
-approval alive, and committing locally must not by itself be refused. An index
-flag (skip-worktree, assume-unchanged) must not hide an edit from the approval or
-from the ``.github`` stop either, and the diff reviewer is told which candidate
-paths git diff does not show.
+The candidate is the final publishable contents: the net change from the base
+commit, the checkout's HEAD when the run started, to the final working tree
+files. One shared builder (``curie_runner.workspace_snapshot.build_candidate``)
+computes it for both the runner capture and the gate. The gate fingerprints its
+tree and, at diff review admission, writes its rendered patch to a file the
+CANDIDATE block names, so the reviewer reads exactly what will publish.
+
+Every case drives ``examples/dark-factory/hooks/review_gate.py`` as the real
+hook subprocess, one process per event, against a real git checkout, through
+the shared fixture in ``test_dark_factory_review_gate.py``. A local commit must
+not redefine the base or keep a stale approval alive, and committing the
+approved files must not by itself be refused. Neither an index flag, a git stat
+cache, a clean filter nor a diff driver may make the reviewed candidate differ
+from the published one.
 """
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import os
+import stat
 import subprocess
 import sys
+import tarfile
+from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from curie_runner import workspace_snapshot
+from aiohttp.test_utils import TestServer
+from curie_runner import RunTracer, SideEffectClassifier, create_app, workspace_snapshot
+from curie_runner.fake import FakeModelSession
+from curie_runner.session import SessionRunner
+from curie_worker.publication_validation import (
+    publication_git_environment,
+    validate_snapshot_against_base,
+)
+from curie_worker.runner_client import RunnerClient
 
 
 def _load_gate_helpers() -> Any:
@@ -46,19 +64,20 @@ Session = gate.Session
 PLAN, DIFF, PUBLISH, SOURCE, ISSUE = gate.PLAN, gate.DIFF, gate.PUBLISH, gate.SOURCE, gate.ISSUE
 TEST = gate.TEST
 reply, contract, candidate_block = gate.reply, gate.contract, gate.candidate_block
-hidden_paths_line = gate.hidden_paths_line
 
 DIFF_INPUT = {"subagent_type": DIFF, "description": "diff-reviewer", "prompt": "p"}
 FRESH_REVIEW = "Fresh diff review required: checkout changed or is unverifiable."
 UNVERIFIABLE = "Diff checkout is unverifiable; restore it before review."
-TOO_MANY_HIDDEN = (
-    "Diff review refused: more than 50 candidate paths are hidden from git diff; clear the "
-    "assume-unchanged and skip-worktree flags or restore the index before review."
-)
+CAPTURE_REPO = "acme-corp/acme-calc"
+GITHUB = "https://github.com"
 
 
 def _git(s: Any, *args: str) -> str:
     """One git command in the session's checkout, with a placeholder identity; its stdout."""
+    return _git_bytes(s, *args).decode("utf-8")
+
+
+def _git_bytes(s: Any, *args: str) -> bytes:
     done = subprocess.run(
         [
             "git",
@@ -73,7 +92,6 @@ def _git(s: Any, *args: str) -> str:
         cwd=s.cwd,
         env=gate._clean_env(),
         capture_output=True,
-        text=True,
         check=True,
     )
     return done.stdout
@@ -120,11 +138,44 @@ def _diff_review(s: Any) -> dict[str, Any]:
     return decision
 
 
-def _approve_diff(s: Any) -> str:
-    """One admitted diff review that approves; the prompt the reviewer was sent."""
-    pre, context = s.review(DIFF, reply(DIFF, "APPROVE"))
-    assert "APPROVED" in context, context
-    return str(pre["updatedInput"]["prompt"])
+@dataclass(frozen=True)
+class _Admitted:
+    """One admitted diff review: the prompt and its patch file's bytes at admission."""
+
+    prompt: str
+    patch: bytes
+
+
+def _admitted(prompt: str) -> _Admitted:
+    """Read the patch file an admitted diff reviewer prompt names, while the review runs.
+
+    The file must be readable by the run alone.
+    """
+    path = Path(_block_line(prompt, "candidate patch"))
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600, oct(path.stat().st_mode)
+    return _Admitted(prompt, path.read_bytes())
+
+
+def _review_diff(s: Any, verdict: str) -> _Admitted:
+    """One full diff reviewer call that returns ``verdict``."""
+    pre = _diff_review(s)
+    assert pre["permissionDecision"] == "allow", pre
+    admitted = _admitted(str(pre["updatedInput"]["prompt"]))
+    post = s.fire(
+        "PostToolUse",
+        tool_name="Agent",
+        tool_input=pre["updatedInput"],
+        tool_response={"content": [{"type": "text", "text": reply(DIFF, verdict)}]},
+    )
+    assert post is not None
+    context = post["hookSpecificOutput"]["additionalContext"]
+    assert ("APPROVED" if verdict == "APPROVE" else verdict) in context, context
+    return admitted
+
+
+def _approve_diff(s: Any) -> _Admitted:
+    """One admitted diff review that approves."""
+    return _review_diff(s, "APPROVE")
 
 
 def _publish(s: Any) -> dict[str, Any]:
@@ -156,6 +207,37 @@ def _plan_run(s: Any) -> str:
     base = _head(s)
     s.approve_plan()
     return base
+
+
+def _block_line(prompt: str, label: str) -> str:
+    """The value of one ``<label> <value>`` line of the prompt's CANDIDATE block."""
+    block = prompt.rpartition("\n\nCANDIDATE:\n")[2]
+    (line,) = [line for line in block.splitlines() if line.startswith(f"{label} ")]
+    return line.removeprefix(f"{label} ")
+
+
+def _reviewed_patch(s: Any, base: str, reviewed: _Admitted) -> bytes:
+    """Check the diff reviewer got the checkout's candidate; the patch file it was sent.
+
+    The prompt ends with the CANDIDATE block for the candidate the shared
+    builder computes for the unchanged checkout, after the contract, and the
+    file it named held that candidate's rendered patch.
+    """
+    built = gate.build_candidate(s.cwd, base)
+    path = gate.candidate_patch_path(s.env["DARK_FACTORY_STATE_DIR"], built.tree)
+    prompt = reviewed.prompt
+    assert prompt.endswith(contract() + candidate_block(base, built.tree, path)), prompt[-900:]
+    assert prompt.count("CANDIDATE:") == 1
+    assert reviewed.patch == built.patch
+    return reviewed.patch
+
+
+def _section(patch: bytes, path: str) -> bytes:
+    """The part of a rendered patch that changes ``path``."""
+    header = f"diff --git a/{path} b/{path}\n".encode()
+    start = patch.index(header)
+    end = patch.find(b"\ndiff --git ", start + len(header))
+    return patch[start:] if end < 0 else patch[start : end + 1]
 
 
 # ``git ls-files -v`` tags: skip-worktree is ``S``, assume-unchanged lowercases the tag.
@@ -191,25 +273,26 @@ def _with_dropped_escaping_link(tmp_path: Path) -> Any:
     return s
 
 
-# --- A commit after approval invalidates it; a commit before review does not -------
+# --- A commit keeps the approval only when the final files are the approved ones ---
 
 
-@pytest.mark.parametrize("committed", [True, False], ids=["commit_after_approval", "control"])
-def test_a_commit_after_diff_approval_requires_a_fresh_review(
-    tmp_path: Path, committed: bool
+@pytest.mark.parametrize("edited", [False, True], ids=["commit_only", "edit_then_commit"])
+def test_a_commit_after_diff_approval_keeps_it_only_when_the_files_are_unchanged(
+    tmp_path: Path, edited: bool
 ) -> None:
     s, _ = _planned(tmp_path)
     _change_source(s, "fix")
     _approve_diff(s)
-
-    if committed:
-        _commit(s, "Fix add")
-        # The committed change no longer shows in git diff HEAD.
-        assert _clean(s)
+    if edited:
+        _change_source(s, "edited after approval")
+    _commit(s, "Fix add")
+    # The committed change no longer shows in git diff HEAD.
+    assert _clean(s)
 
     decision = _publish(s)
 
-    if not committed:
+    if not edited:
+        # The final files are the approved candidate, so committing them changes nothing.
         assert decision["permissionDecision"] == "allow", decision
         return
     _assert_denied(decision, FRESH_REVIEW)
@@ -228,8 +311,11 @@ def test_a_change_committed_before_the_diff_review_is_reviewed_and_published(
     _commit(s, "Fix add")
     assert _head(s) != base and _clean(s)
 
-    _approve_diff(s)
+    reviewed = _approve_diff(s)
 
+    # The committed change is in the patch the reviewer reads.
+    patch = _reviewed_patch(s, base, reviewed)
+    assert b"+    return a + b  # fix\n" in _section(patch, SOURCE)
     assert _publish(s)["permissionDecision"] == "allow"
     assert not [e for e in s.gate_events() if e["curie_gate"] == "diff_approval_refused"]
 
@@ -252,7 +338,9 @@ def test_an_edit_to_a_base_file_removed_from_the_index_and_ignored_needs_a_fresh
     assert _git(s, "ls-files", "--", SOURCE) == ""
     assert _git(s, "ls-files", "--others", "--exclude-standard") == ""
     assert (s.cwd / SOURCE).is_file()
-    _approve_diff(s)
+    reviewed = _approve_diff(s)
+    # Kept with its bytes on disk, which equal the base: not a deletion.
+    assert f"diff --git a/{SOURCE} ".encode() not in _reviewed_patch(s, base, reviewed)
 
     (s.cwd / SOURCE).write_text("def add(a, b):\n    return a - b\n")
 
@@ -334,7 +422,7 @@ def test_a_committed_change_outside_root_github_reaches_the_diff_reviewer(
     assert not [e for e in s.gate_events() if e["curie_gate"] == "github_path_refused"]
 
 
-# --- The diff reviewer's prompt names the base recorded when the run started --------
+# --- The diff reviewer's prompt names the base and the candidate's patch file -------
 
 
 def test_the_diff_reviewer_prompt_names_the_base_recorded_when_the_run_started(
@@ -353,20 +441,25 @@ def test_the_diff_reviewer_prompt_names_the_base_recorded_when_the_run_started(
     _commit(s, "First try")
     first_head = _head(s)
     assert first_head != base
-    pre, context = s.review(DIFF, reply(DIFF, "CHANGES"))
-    assert "CHANGES" in context
-    first = pre["updatedInput"]["prompt"]
+    first = _review_diff(s, "CHANGES")
+    first_patch = _reviewed_patch(s, base, first)
     _change_source(s, "second try")
     _commit(s, "Second try")
     second_head = _head(s)
     second = _approve_diff(s)
+    second_patch = _reviewed_patch(s, base, second)
 
     # Agent commits never redefine the base: both rounds name the run's first HEAD.
-    for prompt in (first, second):
+    for prompt in (first.prompt, second.prompt):
         assert prompt.startswith("p\n\n"), prompt[:40]
-        assert prompt.endswith(contract() + candidate_block(base)), prompt[-600:]
-        assert prompt.count("CANDIDATE:") == 1
+        assert _block_line(prompt, "base commit") == base
         assert first_head not in prompt and second_head not in prompt
+    # Each round's patch file is that round's candidate, measured from the base.
+    assert b"+    return a + b  # first try\n" in first_patch
+    assert b"+    return a + b  # second try\n" in second_patch
+    assert _block_line(first.prompt, "candidate patch") != _block_line(
+        second.prompt, "candidate patch"
+    )
     assert _publish(s)["permissionDecision"] == "allow"
 
 
@@ -384,7 +477,7 @@ def test_a_ci_fix_round_in_a_fresh_state_directory_records_its_base(tmp_path: Pa
     # Admitted, not unverifiable: the CI round start recorded the base.
     assert decision["permissionDecision"] == "allow", decision
     prompt = decision["updatedInput"]["prompt"]
-    assert prompt.endswith(contract() + candidate_block(base)), prompt[-600:]
+    assert b"+    return a + b  # ci fix\n" in _reviewed_patch(s, base, _admitted(prompt))
     assert _head(s) not in prompt
 
 
@@ -403,7 +496,10 @@ def test_a_change_reverted_to_the_base_content_is_still_reviewed_and_published(
     assert _head(s) != base and _clean(s)
     assert _git(s, "diff", "--name-only", base) == ""
 
-    assert _diff_review(s)["permissionDecision"] == "allow"
+    decision = _diff_review(s)
+
+    assert decision["permissionDecision"] == "allow", decision
+    assert _reviewed_patch(s, base, _admitted(decision["updatedInput"]["prompt"])) == b""
 
 
 # --- A run state without a base fails closed -----------------------------------------
@@ -482,7 +578,8 @@ def test_changing_only_an_index_flag_after_diff_approval_needs_a_fresh_review(
     tmp_path: Path, cleared: bool
 ) -> None:
     s, _ = _planned(tmp_path)
-    # A base file is absent on disk with both flags set: git shows nothing for it.
+    # A base file is absent on disk with both flags set: git shows nothing for it,
+    # and the candidate keeps the base entry of an absent skip-worktree path.
     (s.cwd / TEST).unlink()
     _flag(s, "assume-unchanged", TEST)
     _flag(s, "skip-worktree", TEST, tag="s")
@@ -490,7 +587,8 @@ def test_changing_only_an_index_flag_after_diff_approval_needs_a_fresh_review(
     _approve_diff(s)
 
     if cleared:
-        # Still assume-unchanged, so status and diff stay silent; only the flag set changed.
+        # Still assume-unchanged, so status and diff stay silent, but the absent file
+        # is now a deletion in the candidate.
         _flag(s, "no-skip-worktree", TEST, tag="h")
     else:
         # Control: setting the flag it already has changes nothing.
@@ -531,61 +629,68 @@ def test_an_executable_bit_change_after_approval_needs_a_fresh_review_despite_co
 
 def test_a_prepared_escaping_link_that_stays_absent_keeps_the_approval(tmp_path: Path) -> None:
     # Liveness control for the flag refusals above: the skip-worktree entry
-    # preparation leaves behind is hashed as absent, consistently.
+    # preparation leaves behind stays the base entry, consistently.
     s = _with_dropped_escaping_link(tmp_path)
     base = _plan_run(s)
     _change_source(s, "fix")
 
-    prompt = _approve_diff(s)
+    reviewed = _approve_diff(s)
 
-    # Admitted, and nothing hidden is on disk: the block is exactly the plain one.
-    assert prompt.endswith(contract() + candidate_block(base)), prompt[-600:]
-    assert "git diff does not show them" not in prompt
+    patch = _reviewed_patch(s, base, reviewed)
+    assert b"diff --git a/out " not in patch
+    assert b"+    return a + b  # fix\n" in _section(patch, SOURCE)
     assert not (s.cwd / "out").exists() and not (s.cwd / "out").is_symlink()
     assert _publish(s)["permissionDecision"] == "allow"
 
 
-# --- The diff reviewer is told which candidate paths git diff hides ------------------
+# --- The reviewed patch file carries what git diff does not show ---------------------
 
 
-@pytest.mark.parametrize("flag", ["assume-unchanged", "skip-worktree"])
-@pytest.mark.parametrize("on_disk", [True, False], ids=["on_disk", "absent"])
-def test_candidate_paths_git_diff_hides_are_named_after_the_candidate_block(
-    tmp_path: Path, flag: str, on_disk: bool
+@pytest.mark.parametrize(
+    "change",
+    ["flagged_edit", "index_removed_ignored_edit", "untracked_file", "deleted_assume_unchanged"],
+)
+def test_the_reviewed_patch_file_carries_changes_git_diff_does_not_show(
+    tmp_path: Path, change: str
 ) -> None:
     s, base = _planned(tmp_path)
-    # A base file leaves the index and is ignored; a base file is flagged.
-    _git(s, "rm", "-q", "--cached", SOURCE)
-    gitignore = s.cwd / ".gitignore"
-    gitignore.write_text(gitignore.read_text() + f"{SOURCE}\n")
-    _flag(s, flag, TEST)
-    if on_disk:
+    if change == "flagged_edit":
+        _flag(s, "assume-unchanged", TEST)
         (s.cwd / TEST).write_text("def test_add():\n    assert True\n")
+        path, expected = TEST, b"+    assert True\n"
+    elif change == "index_removed_ignored_edit":
+        _git(s, "rm", "-q", "--cached", SOURCE)
+        gitignore = s.cwd / ".gitignore"
+        gitignore.write_text(gitignore.read_text() + f"{SOURCE}\n")
+        (s.cwd / SOURCE).write_text("def add(a, b):\n    return a - b\n")
+        path, expected = SOURCE, b"+    return a - b\n"
+        # git diff shows a deletion; the candidate is the edited file.
+        assert "deleted file mode" in _git(s, "diff", base, "--", SOURCE)
+    elif change == "untracked_file":
+        target = s.cwd / "notes" / "todo.txt"
+        target.parent.mkdir()
+        target.write_text("remember the acme release\n")
+        path, expected = "notes/todo.txt", b"+remember the acme release\n"
     else:
-        (s.cwd / SOURCE).unlink()
+        _flag(s, "assume-unchanged", TEST)
         (s.cwd / TEST).unlink()
+        path, expected = TEST, b"deleted file mode 100644\n"
+    if change != "index_removed_ignored_edit":
+        assert path not in _git(s, "diff", "--name-only", base)
 
-    prompt = _approve_diff(s)
+    reviewed = _approve_diff(s)
 
-    expected = contract() + candidate_block(base)
-    if on_disk:
-        expected += hidden_paths_line([TEST, SOURCE])
-    elif flag == "assume-unchanged":
-        # git diff shows the deletion of a path missing from the index (SOURCE), but
-        # not of an absent assume-unchanged entry, which the snapshot still deletes.
-        expected += hidden_paths_line([TEST])
-    else:
-        # An absent skip-worktree entry equal to the base entry is the prepared
-        # escaping-link case: the snapshot keeps it, so nothing is hidden.
-        assert "git diff does not show them" not in prompt
-    assert prompt.endswith(expected), prompt[-800:]
-    assert prompt.count("CANDIDATE:") == 1
+    section = _section(_reviewed_patch(s, base, reviewed), path)
+    assert expected in section
+    if change == "index_removed_ignored_edit":
+        assert b"deleted file mode" not in section
 
 
-def _flagged_notes(tmp_path: Path, count: int) -> tuple[Any, str, list[str]]:
-    """A planned run whose base tracks ``count`` notes, every one flagged assume-unchanged."""
+def test_many_flagged_edits_are_admitted_and_every_one_is_in_the_patch_file(
+    tmp_path: Path,
+) -> None:
     s = Session(tmp_path)
-    notes = [f"docs/note-{n:02d}.txt" for n in range(count)]
+    notes = [f"docs/note-{n:02d}.txt" for n in range(51)]
     for note in notes:
         target = s.cwd / note
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -593,40 +698,16 @@ def _flagged_notes(tmp_path: Path, count: int) -> tuple[Any, str, list[str]]:
     _commit(s, "Notes fixture")
     base = _plan_run(s)
     _flag(s, "assume-unchanged", *notes)
-    return s, base, notes
+    for note in notes:
+        (s.cwd / note).write_text(f"{note} edited\n")
 
+    # Admitted: there is no cap on changes git diff does not show.
+    reviewed = _approve_diff(s)
 
-def _named_hidden_paths(prompt: str) -> list[str]:
-    return prompt.rpartition("read each file directly: ")[2].split(", ")
-
-
-def test_fifty_hidden_paths_are_all_named(tmp_path: Path) -> None:
-    s, base, notes = _flagged_notes(tmp_path, gate.HIDDEN_PATHS_SHOWN)
-
-    prompt = _approve_diff(s)
-
-    assert prompt.endswith(contract() + candidate_block(base) + hidden_paths_line(notes))
-    # Every path is named and nothing is summarized as "and <n> more".
-    assert _named_hidden_paths(prompt) == notes
-    assert prompt.endswith(", docs/note-49.txt"), prompt[-200:]
-
-
-def test_more_than_fifty_hidden_paths_refuse_the_diff_review_without_stopping_the_run(
-    tmp_path: Path,
-) -> None:
-    s, base, notes = _flagged_notes(tmp_path, gate.HIDDEN_PATHS_SHOWN + 1)
-
-    _assert_denied(_diff_review(s), TOO_MANY_HIDDEN)
-
-    state = json.loads(_state_file(s).read_text())
-    assert state["stopped"] is None
-    assert state["diff"]["round"] == 0
-    assert ("review_diff", 1) not in s.phases()
-    # Liveness: with one flag cleared, fifty paths remain and the review is admitted.
-    _flag(s, "no-assume-unchanged", notes[0], tag="H")
-    prompt = _approve_diff(s)
-    assert prompt.endswith(contract() + candidate_block(base) + hidden_paths_line(notes[1:]))
-    assert _named_hidden_paths(prompt) == notes[1:]
+    patch = _reviewed_patch(s, base, reviewed)
+    for note in notes:
+        assert f"+{note} edited\n".encode() in _section(patch, note)
+    assert json.loads(_state_file(s).read_text())["stopped"] is None
 
 
 @pytest.mark.parametrize(
@@ -654,25 +735,24 @@ def test_a_flagged_github_edit_hidden_from_git_diff_stops_the_diff_review(
         # The same stop a visible .github change gets (#4435).
         gate._assert_github_path_stops_run(s, out, path)
         return
-    # Control: outside the root .github the diff review is admitted, naming the path.
+    # Control: outside the root .github the diff review is admitted and reviews the edit.
     assert out is not None
     decision = out["hookSpecificOutput"]
     assert decision["permissionDecision"] == "allow", decision
-    prompt = decision["updatedInput"]["prompt"]
-    assert prompt.endswith(contract() + candidate_block(base) + hidden_paths_line([path]))
+    patch = _reviewed_patch(s, base, _admitted(decision["updatedInput"]["prompt"]))
+    assert b"+on: [push, pull_request]\n" in _section(patch, path)
     assert not [e for e in s.gate_events() if e["curie_gate"] == "github_path_refused"]
 
 
-# --- The reviewed candidate is the published one, as git sees the checkout ---------
+# --- The reviewed candidate is the published one -------------------------------------
 
-CAPTURE_REPO = "acme-corp/acme-calc"
 # A comment in both Python and YAML, so it changes no behavior where it lands.
 HIDDEN_LINE = "# HIDDEN: never shown by git diff\n"
 
 
 def _publishable(s: Any) -> None:
     """Give the checkout the credential-free origin the runner capture requires."""
-    _git(s, "remote", "add", "origin", f"https://github.com/{CAPTURE_REPO}.git")
+    _git(s, "remote", "add", "origin", f"{GITHUB}/{CAPTURE_REPO}.git")
 
 
 def _capture(s: Any, base: str) -> Any:
@@ -681,7 +761,7 @@ def _capture(s: Any, base: str) -> Any:
         s.cwd,
         base_sha=base,
         expected_repo=CAPTURE_REPO,
-        trusted_origin="https://github.com",
+        trusted_origin=GITHUB,
         repository_path=CAPTURE_REPO,
     )
 
@@ -728,8 +808,7 @@ def test_a_line_a_clean_filter_hides_after_approval_is_neither_reviewed_nor_publ
     s, base = _planned(tmp_path)
     _publishable(s)
     _change_source(s, "fix")
-    _approve_diff(s)
-    reviewed = _capture(s, base)
+    reviewed = _reviewed_patch(s, base, _approve_diff(s))
     _strip_hidden_lines(s, SOURCE)
     with (s.cwd / SOURCE).open("a") as handle:
         handle.write(HIDDEN_LINE)
@@ -738,16 +817,16 @@ def test_a_line_a_clean_filter_hides_after_approval_is_neither_reviewed_nor_publ
     decision = _publish(s)
     published = _capture(s, base)
 
-    # git's view, which the reviewer read, did not change, and it is what publishes.
+    # The candidate is git's clean form of the final bytes: the approved one.
     assert decision["permissionDecision"] == "allow", decision
     assert published.base_sha == base
     assert published.changed_paths == (SOURCE,)
-    assert published.patch == reviewed.patch
+    assert published.patch == reviewed
     assert b"+    return a + b  # fix\n" in published.patch
     assert b"HIDDEN" not in published.patch
 
 
-def test_a_stale_stat_rewrite_of_an_unedited_file_is_neither_reviewed_nor_published(
+def test_a_stale_stat_rewrite_of_an_unedited_file_after_approval_needs_a_fresh_review(
     tmp_path: Path,
 ) -> None:
     s, base = _planned(tmp_path)
@@ -755,20 +834,21 @@ def test_a_stale_stat_rewrite_of_an_unedited_file_is_neither_reviewed_nor_publis
     past = _trust_stat(s, TEST)
     _change_source(s, "fix")
     _approve_diff(s)
-    reviewed = _capture(s, base)
     _rewrite_keeping_stat(s, TEST, b"== 3", b"== 4", past)
-    # The index entry still equals the base and its stat looks clean: git diff
-    # <base> does not list the file, so the reviewer never saw the rewrite.
+    # git trusts the cached stat: git diff <base> does not list the rewritten file.
     assert _git(s, "diff", "--name-only", base) == f"{SOURCE}\n"
 
     decision = _publish(s)
     published = _capture(s, base)
 
-    assert decision["permissionDecision"] == "allow", decision
-    assert published.base_sha == base
-    assert published.changed_paths == (SOURCE,)
-    assert published.patch == reviewed.patch
-    assert b"== 4" not in published.patch
+    _assert_denied(decision, FRESH_REVIEW)
+    # Final bytes win over the stat cache: the publication carries the rewrite.
+    assert published.changed_paths == (SOURCE, TEST)
+    assert b"+    assert add(1, 2) == 4\n" in _section(published.patch, TEST)
+    # A fresh review reads the rewrite in its patch file, then publishes.
+    reviewed = _reviewed_patch(s, base, _approve_diff(s))
+    assert reviewed == published.patch
+    assert _publish(s)["permissionDecision"] == "allow"
 
 
 def test_a_stale_stat_rewrite_of_a_committed_file_after_approval_needs_a_fresh_review(
@@ -781,9 +861,8 @@ def test_a_stale_stat_rewrite_of_a_committed_file_after_approval_needs_a_fresh_r
     past = _trust_stat(s, SOURCE)
     _approve_diff(s)
     _rewrite_keeping_stat(s, SOURCE, b"a + b", b"a - b", past)
-    # git diff HEAD misses the rewrite; git diff <base>, the reviewer's view, shows it.
+    # git diff HEAD misses the rewrite.
     assert _git(s, "diff", "HEAD") == ""
-    assert "+    return a - b  # fix" in _git(s, "diff", base)
 
     decision = _publish(s)
     published = _capture(s, base)
@@ -792,6 +871,184 @@ def test_a_stale_stat_rewrite_of_a_committed_file_after_approval_needs_a_fresh_r
     # The deny is needed: the publication carries the rewrite.
     assert published.changed_paths == (SOURCE,)
     assert b"+    return a - b  # fix\n" in published.patch
-    # Fresh review, not a stop: the rewritten checkout is reviewed again and publishes.
-    _approve_diff(s)
+    # A fresh review reads the rewrite in its patch file, then publishes.
+    reviewed = _reviewed_patch(s, base, _approve_diff(s))
+    assert reviewed == published.patch
     assert _publish(s)["permissionDecision"] == "allow"
+
+
+def test_external_diff_and_textconv_drivers_change_neither_the_reviewed_nor_the_published_patch(
+    tmp_path: Path,
+) -> None:
+    s, base = _planned(tmp_path)
+    _publishable(s)
+    _change_source(s, "fix")
+    plain = _capture(s, base).patch
+    external = tmp_path / "acme-external-diff"
+    external.write_text("#!/bin/sh\necho ACME EXTERNAL DIFF\n")
+    external.chmod(0o755)
+    textconv = tmp_path / "acme-textconv"
+    textconv.write_text("#!/bin/sh\necho ACME TEXTCONV\n")
+    textconv.chmod(0o755)
+    _git(s, "config", "diff.external", str(external))
+    _git(s, "config", "diff.acme.textconv", str(textconv))
+    attributes = s.cwd / ".git" / "info" / "attributes"
+    attributes.parent.mkdir(exist_ok=True)
+    attributes.write_text(f"{SOURCE} diff=acme\n")
+    # The checkout's own git diff now runs both drivers.
+    assert "ACME EXTERNAL DIFF" in _git(s, "diff")
+    assert "ACME TEXTCONV" in _git(s, "diff", "--no-ext-diff")
+
+    reviewed = _reviewed_patch(s, base, _approve_diff(s))
+    published = _capture(s, base).patch
+
+    assert reviewed == published == plain
+    assert b"ACME" not in published
+    assert b"+    return a + b  # fix\n" in published
+
+
+def test_the_reviewed_patch_file_is_byte_identical_to_the_runner_capture(tmp_path: Path) -> None:
+    s, base = _planned(tmp_path)
+    _publishable(s)
+    # Committed, staged, deleted, mode, binary and untracked changes together.
+    _change_source(s, "committed")
+    _commit(s, "Commit the source change")
+    (s.cwd / "pkg" / "staged.py").write_text("STAGED = True\n")
+    _git(s, "add", "pkg/staged.py")
+    (s.cwd / TEST).unlink()
+    (s.cwd / ".gitignore").chmod(0o755)
+    (s.cwd / "asset.bin").write_bytes(b"\x00acme asset\xff")
+    (s.cwd / "notes.md").write_text("untracked note\n")
+
+    reviewed = _reviewed_patch(s, base, _approve_diff(s))
+    published = _capture(s, base)
+
+    assert published.base_sha == base
+    assert published.patch == reviewed
+    assert set(published.changed_paths) == {
+        ".gitignore",
+        "asset.bin",
+        "notes.md",
+        "pkg/staged.py",
+        SOURCE,
+        TEST,
+    }
+
+
+# --- End to end: the reviewed patch is what the worker validates and publishes -------
+
+TOKEN = "runner-token-value"
+THREAD = "1700000000.000100"
+
+
+def _runner() -> SessionRunner:
+    fake = FakeModelSession()
+    return SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
+        session_factory=lambda: fake,
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="dark-factory-review-candidate",
+    )
+
+
+def _snapshot_over_http(workspace: Path, base_sha: str) -> Any:
+    """Ask the real runner route for a snapshot through the real worker client."""
+
+    async def go() -> Any:
+        runner = _runner()
+        await runner.start()
+        app = create_app(
+            runner,
+            token=TOKEN,
+            snapshotter=workspace_snapshot.workspace_snapshotter(
+                workspace,
+                trusted_origin=GITHUB,
+                repository_path=CAPTURE_REPO,
+                proposal=lambda: ("Fix add", "Publish the reviewed candidate."),
+            ),
+        )
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=30.0)
+        try:
+            return await client.snapshot(
+                f"http://127.0.0.1:{server.port}", token=TOKEN, base_sha=base_sha
+            )
+        finally:
+            await client.close()
+            await server.close()
+
+    return asyncio.run(go())
+
+
+def _coordinator(base_sha: str, archive: bytes) -> SimpleNamespace:
+    """The retained facts the worker holds for this thread: P and P's archive."""
+    return SimpleNamespace(
+        preparer=SimpleNamespace(limits=SimpleNamespace(max_archive_bytes=len(archive) + 1)),
+        current=lambda _thread: SimpleNamespace(repo_full_name=CAPTURE_REPO, base_sha=base_sha),
+        stream_current_base=lambda _thread: [archive],
+    )
+
+
+def _published_tree(root: Path, archive: bytes, patch: bytes) -> tuple[str, Path]:
+    """The published result: P's archive with the patch applied, as a tree id."""
+    root.mkdir(parents=True)
+    checkout = root / "checkout"
+    checkout.mkdir()
+    with tarfile.open(fileobj=BytesIO(archive), mode="r:gz") as source:
+        source.extractall(checkout, filter="data")
+    env = publication_git_environment(root)
+
+    def git(*args: str) -> bytes:
+        return subprocess.run(
+            ["git", *args], cwd=checkout, env=env, check=True, capture_output=True
+        ).stdout
+
+    git("init", "--quiet")
+    git("add", "-A")
+    patch_file = root / "candidate.patch"
+    patch_file.write_bytes(patch)
+    git("apply", "--binary", "--index", str(patch_file))
+    return git("write-tree").decode("ascii").strip(), checkout
+
+
+def test_a_reviewed_candidate_publishes_through_the_runner_route_and_worker_validation(
+    tmp_path: Path,
+) -> None:
+    s, base = _planned(tmp_path)
+    _publishable(s)
+    archive = _git_bytes(s, "archive", "--format=tar.gz", base)
+    _change_source(s, "fix")
+    _commit(s, "Fix add")
+    (s.cwd / TEST).write_text(
+        "from pkg.calc import add\n\n\ndef test_add():\n    assert add(2, 3) == 5\n"
+    )
+    _git(s, "add", TEST)
+    (s.cwd / "docs").mkdir()
+    (s.cwd / "docs" / "notes.md").write_text("untracked note\n")
+    approved = _approve_diff(s)
+    reviewed = _reviewed_patch(s, base, approved)
+    assert _publish(s)["permissionDecision"] == "allow"
+
+    snapshot = _snapshot_over_http(s.cwd, base)
+
+    assert snapshot.base_sha == base
+    assert snapshot.patch == reviewed
+    scratch = tmp_path / "validation"
+    scratch.mkdir()
+    validate_snapshot_against_base(
+        _coordinator(base, archive),
+        thread_key=THREAD,
+        snapshot=snapshot,
+        scratch_root=scratch,
+        protected_paths=(),
+        allow_dependency_additions=False,
+    )
+    tree, checkout = _published_tree(tmp_path / "result", archive, snapshot.patch)
+    # The published tree is the candidate tree the reviewer was told about.
+    assert tree == _block_line(approved.prompt, "candidate tree")
+    for path in (SOURCE, TEST, "docs/notes.md"):
+        assert (checkout / path).read_bytes() == (s.cwd / path).read_bytes(), path
