@@ -941,6 +941,16 @@ def _clean_blobs(
     # relative path, and a filter it sets would be missed. An absolute value
     # (``--path`` has already expanded ``~``) or the unset default resolves
     # identically from the scratch work tree.
+    # git resolves these against its working directory, which differs in the
+    # scratch work tree; the subprocess env comes from os.environ through
+    # shell_and_hook_env.
+    for variable in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG", "XDG_CONFIG_HOME", "HOME"):
+        value = os.environ.get(variable)
+        if value and not os.path.isabs(value):
+            raise WorkspaceSnapshotError(
+                f"the git configuration path {variable} is relative; the candidate cannot resolve "
+                "its attributes the same way in a scratch work tree"
+            )
     configured = _git(
         repo, "config", "--path", "--get", "core.attributesFile", check=False, deadline=deadline
     )
