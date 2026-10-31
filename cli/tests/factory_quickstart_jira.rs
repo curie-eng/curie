@@ -978,6 +978,7 @@ fn action_names(actions: &[Action]) -> Vec<&'static str> {
         .iter()
         .map(|action| match action {
             Action::External { .. } => "external",
+            Action::KindCluster { .. } => "kind",
             Action::Cluster { .. } => "cluster",
             Action::Register { .. } => "register",
             Action::Intake(_) => "intake",
