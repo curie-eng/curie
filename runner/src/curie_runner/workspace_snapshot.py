@@ -13,8 +13,9 @@ untracked listing is read from disk without following symlinks; git's stat
 cache and git diff listings are never trusted. A file git reads (an index
 entry not flagged skip-worktree or assume-unchanged) whose bytes differ from
 P's entry is published as git's canonical clean form of those bytes, with the
-attributes, line endings and clean filters git applies; one equal to P's entry
-is unchanged. Paths git does not read (flagged index entries, P's paths
+attributes and line endings git applies; no clean or process filter program
+runs, so such a path with a ``filter`` attribute is refused. One equal to P's
+entry is unchanged. Paths git does not read (flagged index entries, P's paths
 missing from the index, and untracked files) are published as their bytes on
 disk, unconverted. Every object is written to a scratch index and object
 directory, so the real index, refs, HEAD and object store are only read. The
@@ -109,6 +110,14 @@ _PATH_SEGMENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._~-]*")
 
 class WorkspaceSnapshotError(RuntimeError):
     """The workspace cannot be represented as a safe publication patch."""
+
+
+class UnsupportedFilterError(WorkspaceSnapshotError):
+    """A changed path git would convert has a ``filter`` attribute.
+
+    The candidate is built without running repository- or user-configured
+    filter programs, so the change to that path cannot be published.
+    """
 
 
 class WorkspaceHistoryError(WorkspaceSnapshotError):
@@ -845,6 +854,48 @@ def _copy_file(fd: int, target: Path, object_format: str, deadline: float | None
     return digest.hexdigest()
 
 
+def _refuse_filters(
+    worktree: Path, paths: list[bytes], env: Mapping[str, str], deadline: float | None
+) -> None:
+    """Raise ``UnsupportedFilterError`` for a path with any ``filter`` attribute.
+
+    This is git's own attribute lookup with the index and work tree ``git
+    add`` uses, so the work tree and index-retained ``.gitattributes``, nested
+    files, ``info/attributes`` and ``core.attributesFile`` all apply.
+    """
+
+    listed = _git(
+        worktree,
+        "check-attr",
+        "--all",
+        "-z",
+        "--stdin",
+        stdin=b"".join(path + b"\0" for path in paths),
+        env=env,
+        deadline=deadline,
+    ).stdout
+    fields = listed.split(b"\0")
+    if fields[-1] != b"" or (len(fields) - 1) % 3:
+        raise WorkspaceSnapshotError("git listed malformed path attributes")
+    requested = set(paths)
+    for index in range(0, len(fields) - 1, 3):
+        path, attribute = fields[index], fields[index + 1]
+        if path not in requested:
+            raise WorkspaceSnapshotError("git listed malformed path attributes")
+        # Any listed form refuses. git check-attr prints a driver literally
+        # named unspecified, set or unset exactly like those states, and
+        # --all omits only attributes no line mentions, so refusing every
+        # listed filter is the sound boundary. An explicit -filter is refused
+        # too, a conservative limitation.
+        if attribute == b"filter":
+            raise UnsupportedFilterError(
+                f"workspace path {_display(path)!r} has a filter attribute; the candidate "
+                "is built without running filter programs, so a change to this path "
+                "cannot be published. Remove the filter attribute for this path, or "
+                "leave the file as it is in the prepared base"
+            )
+
+
 def _clean_blobs(
     repo: Path,
     git_dir: str,
@@ -863,11 +914,16 @@ def _clean_blobs(
     copied too; git skips any other kind. One ``git add --renormalize`` then
     runs against the real git directory with the scratch copy as its work tree
     and a scratch copy of the real index as its index, so git applies the
-    attributes, line endings and clean filters it applies in ``git diff``,
-    including its fallback to a ``.gitattributes`` kept in the index (``git
-    hash-object`` never reads the index, so it would miss that fallback).
-    Objects are written to the scratch object directory; the real index and
-    objects are only read.
+    attributes and built-in conversions (text, eol, ident,
+    working-tree-encoding) it applies in ``git diff``, including its fallback
+    to a ``.gitattributes`` kept in the index (``git hash-object`` never reads
+    the index, so it would miss that fallback). Objects are written to the
+    scratch object directory; the real index and objects are only read.
+
+    No clean or process filter program runs. Before the add, ``git
+    check-attr`` resolves every path's attributes with that same index and
+    work tree, and a path with any ``filter`` attribute raises
+    ``UnsupportedFilterError``.
     """
 
     worktree = scratch / "worktree"
@@ -919,6 +975,7 @@ def _clean_blobs(
         "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(real_objects),
         "GIT_LITERAL_PATHSPECS": "1",
     }
+    _refuse_filters(worktree, paths, env, deadline)
     # core.safecrlf only decides whether git refuses a conversion it would make;
     # git diff never refuses, so the candidate must not either.
     _git(
@@ -1082,7 +1139,9 @@ def build_candidate(
     assume-unchanged, not a gitlink) whose file differs from P's entry
     publishes git's canonical clean form of the final bytes on disk; flagged
     entries, P's paths missing from the index and untracked paths publish their
-    bytes on disk, unconverted. ``tree`` is C's tree id, ``changed_paths`` the
+    bytes on disk, unconverted. No clean or process filter program runs: a
+    converted path with a ``filter`` attribute raises
+    ``UnsupportedFilterError``. ``tree`` is C's tree id, ``changed_paths`` the
     paths that differ from P, and ``patch`` the rendered binary patch when
     ``render_patch`` is true, else ``None``.
 

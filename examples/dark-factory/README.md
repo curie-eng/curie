@@ -27,7 +27,16 @@ reviewer subagents check it on a stronger model. The skill walks nine phases:
    the rendered candidate patch, the net change from the run's base commit
    exactly as it will be published (committed, staged, unstaged and untracked
    changes together), against every criterion, and approves it or sends it back
-   to `implement` (never to `plan`), for at most 5 completed rounds.
+   to `implement` (never to `plan`), for at most 5 completed rounds. The
+   candidate is built without running clean or process filter programs, so a
+   change to a path with a `filter` attribute is refused with a reason naming
+   that path. The gate records the patch file's sha256 when the review starts
+   and refuses the verdict when that file is missing or changed. The gate's
+   state file and the patch file are owned by the agent's user, so the gate is
+   not an OS isolation or authentication boundary: mode 0600 and the tree id
+   in the file name do not protect against that owner, and the digest check
+   catches a missing or persistently changed patch at verdict time but does
+   not defeat a transient replace and restore, or forged gate state.
 8. `publish`: publish one pull request, or end with `Could not complete:` and
    the reason.
 9. `wait_ci`: the pull request's checks run and the platform waits on them

@@ -152,6 +152,9 @@ One script handles every hook event the bundle registers:
     base included, does not emit ``github_path_refused`` and does not by
     itself stop the run. No diff review before the plan review completes.
     An unbuildable candidate then refuses the review without a stop. A
+    changed path git would convert that has a ``filter`` attribute makes C
+    unbuildable, because no filter program runs: that refusal names the
+    path and the reason (``review_refused``, cause ``unsupported_filter``). A
     checkout the diff reviewer already approved is refused (cause
     ``already_approved``): go to publish. An approval of another checkout is
     cleared. Then the timing check. A checkout identical to the last one that
@@ -170,7 +173,8 @@ One script handles every hook event the bundle registers:
     ``candidate-<tree>.patch`` in the state directory, and asking for a
     review of that whole patch, not of git diff of the working tree; the
     plan reviewer's gets none. A patch that cannot be written refuses the
-    review without a stop. When the contract or the checks cannot be read
+    review without a stop. The admission records the patch's path and sha256
+    with the reviewed fingerprint. When the contract or the checks cannot be read
     the call is denied and the run stops. An admitted call writes the
     ``plan_review`` or ``review_diff`` phase line with the round it would
     complete. Admission never spends a round.
@@ -190,9 +194,17 @@ One script handles every hook event the bundle registers:
     before the diff review.
 
     A diff verdict is not recorded when the checkout fingerprint differs from
-    the one taken at the start of that review or cannot be computed. That
-    refusal does not stop the run or count a round. A recorded verdict counts
-    the round. ``APPROVE`` binds the approval to that fingerprint.
+    the one taken at the start of that review or cannot be computed, nor when
+    the reviewed patch file is missing or its sha256 differs from the one
+    recorded at admission (cause ``candidate_patch_missing_or_changed``).
+    Either refusal does not stop the run or count a round. The state file and
+    the patch file are owned by the agent's user, so this gate is not an OS
+    isolation or authentication boundary: mode 0600 and the tree id in the
+    file name do not protect against that owner, and the digest check
+    catches a missing or persistently changed patch at verdict time but does
+    not defeat a transient replace and restore, or forged gate state. A
+    recorded verdict counts the round and drops the patch record;
+    publication never needs the patch file. ``APPROVE`` binds the approval to that fingerprint.
     ``CHANGES`` marks the checkout rejected, and on round ``DIFF_ROUNDS`` it
     stops the run and writes the ``round_cap`` line (``curie_gate:
     review_refused``, with ``stage``, ``round`` and ``cap``).
@@ -306,7 +318,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeGuard
 
 try:
-    from curie_runner.workspace_snapshot import WorkspaceSnapshotError, build_candidate
+    from curie_runner.workspace_snapshot import (
+        UnsupportedFilterError,
+        WorkspaceSnapshotError,
+        build_candidate,
+    )
 except ImportError:  # pragma: no cover - the runner image always provides it
     # Exit 2 blocks the gated call; any other failure would let it through.
     print(
@@ -760,6 +776,25 @@ def base_commit(workspace: str, deadline: float) -> str | None:
     return head if _is_commit(head) else None
 
 
+def _build_candidate(
+    workspace: str, deadline: float, base: str | None, *, render_patch: bool = False
+) -> tuple[WorkspaceCandidate | None, str | None]:
+    """C, or ``None`` with the runner's refusal text when a filter attribute refused it.
+
+    The refusal text is set only for ``UnsupportedFilterError``; every other
+    failure reads as ``(None, None)``.
+    """
+    if not workspace or not _is_commit(base):
+        return None, None
+    try:
+        built = build_candidate(workspace, base, render_patch=render_patch, deadline=deadline)
+    except UnsupportedFilterError as exc:
+        return None, str(exc)
+    except (WorkspaceSnapshotError, OSError, ValueError):
+        return None, None
+    return built, None
+
+
 def _candidate(
     workspace: str, deadline: float, base: str | None, *, render_patch: bool = False
 ) -> WorkspaceCandidate | None:
@@ -767,14 +802,10 @@ def _candidate(
 
     The runner's ``build_candidate``, the one construction path the
     publication capture also uses, within ``deadline``. A missing or malformed
-    base, an unbuildable checkout and a late build all read as ``None``.
+    base, an unbuildable checkout, a changed path with a filter attribute and
+    a late build all read as ``None``.
     """
-    if not workspace or not _is_commit(base):
-        return None
-    try:
-        return build_candidate(workspace, base, render_patch=render_patch, deadline=deadline)
-    except (WorkspaceSnapshotError, OSError, ValueError):
-        return None
+    return _build_candidate(workspace, deadline, base, render_patch=render_patch)[0]
 
 
 def candidate_digest(base: str, tree: str) -> str:
@@ -810,6 +841,9 @@ def write_candidate_patch(tree: str, patch: bytes) -> Path:
     """Write C's patch for the diff reviewer, atomically and with mode 0600.
 
     The file is ``candidate-<tree>.patch`` beside the session state files.
+    It and the state file are owned by the agent's user, so mode 0600 and the
+    tree id in the name do not protect it from that owner: this is not an OS
+    isolation or authentication boundary.
     """
     directory = state_dir()
     directory.mkdir(parents=True, exist_ok=True)
@@ -1435,6 +1469,7 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
         return _deny(_stop_text(state["stopped"], state))
     diff = state["diff"]
     digest: str | None = None
+    patch_record: dict[str, str] | None = None
     candidate = ""
     if kind == PLAN:
         if planned(state):
@@ -1454,7 +1489,7 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
         # One budget covers building C with its patch.
         deadline = time.monotonic() + GIT_BUDGET_SECONDS
         base = state.get("base")
-        built = _candidate(state["workspace"], deadline, base, render_patch=True)
+        built, refusal = _build_candidate(state["workspace"], deadline, base, render_patch=True)
         if (
             built is not None
             and (path := _github_candidate_path(built.changed_paths, state["workspace"]))
@@ -1463,6 +1498,9 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
             return _deny(_stop_for_github_path(state, path))
         if not planned(state):
             return _deny("The plan review has not completed yet; run the plan review first.")
+        if built is None and refusal is not None:
+            emit_gate(state, "review_refused", cause="unsupported_filter", stage="review_diff")
+            return _deny(f"Diff review refused: {refusal}")
         # C is only built against a commit id, so the base is one here.
         if built is None or built.patch is None or not _is_commit(base):
             return _deny(UNVERIFIABLE)
@@ -1471,6 +1509,11 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
             patch_path = write_candidate_patch(built.tree, built.patch)
         except OSError:
             return _deny(UNVERIFIABLE)
+        patch_record = {
+            "fingerprint": digest,
+            "path": str(patch_path),
+            "sha256": hashlib.sha256(built.patch).hexdigest(),
+        }
         candidate = candidate_block(base, built.tree, patch_path)
         if diff["verdict"] == "APPROVE":
             if digest == state.get("diff_approved_fingerprint"):
@@ -1498,6 +1541,7 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
         if diff["round"] >= DIFF_ROUNDS:
             return _deny(_cap_stop(state))
         state["diff_review_fingerprint"] = digest
+        state["diff_review_patch"] = patch_record
         round_ = diff["round"] + 1
     # The round this call completes; only its verdict, at PostToolUse, counts it.
     emit_phase(state, PHASE[kind], round_, f"{kind.split(':', 1)[1]} round {round_}")
@@ -1698,6 +1742,26 @@ def _post_plan(state: dict[str, Any], event: str, verdict: str, response: Any) -
     )
 
 
+def _patch_intact(record: Any, reviewed: str) -> bool:
+    """Whether the reviewed patch file is still the bytes the review admitted.
+
+    The record names the fingerprint, the file and its sha256. The file and
+    the state are owned by the agent's user, so this catches a missing or
+    persistently changed patch at verdict time; it does not defeat a
+    transient replace and restore, or forged gate state.
+    """
+    if not isinstance(record, dict) or record.get("fingerprint") != reviewed:
+        return False
+    path, expected = record.get("path"), record.get("sha256")
+    if not isinstance(path, str) or not isinstance(expected, str):
+        return False
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return False
+    return hashlib.sha256(data).hexdigest() == expected
+
+
 def _post_diff(
     state: dict[str, Any], event: str, round_: int, verdict: str, response: Any
 ) -> dict[str, Any]:
@@ -1709,9 +1773,16 @@ def _post_diff(
     if digest is None or reviewed is None or digest != reviewed:
         emit_gate(state, "diff_approval_refused", cause="checkout_changed_or_unverifiable")
         return _context(event, "Fresh diff review required: checkout changed or is unverifiable.")
+    if not _patch_intact(state.get("diff_review_patch"), reviewed):
+        emit_gate(state, "diff_approval_refused", cause="candidate_patch_missing_or_changed")
+        return _context(
+            event, "Fresh diff review required: the candidate patch is missing or changed."
+        )
     diff = state["diff"]
     diff["round"] = round_
     record_verification(state, DIFF, round_, verdict, response)
+    # The patch is not needed after review.
+    state.pop("diff_review_patch", None)
     if verdict == "APPROVE":
         diff["verdict"] = "APPROVE"
         state["diff_approved_fingerprint"] = digest
@@ -1864,6 +1935,7 @@ def _continue_run(path: Path, state: dict[str, Any], prompt: str) -> dict[str, A
         )
         state.pop("diff_approved_fingerprint", None)
         state.pop("diff_review_fingerprint", None)
+        state.pop("diff_review_patch", None)
         state["ci_round"] = ci_round
         _begin_ci_round(state, prompt, ci_round)
     return _prompt_reply(path, state, bool(ci_round))
