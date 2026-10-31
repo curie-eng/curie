@@ -29,12 +29,14 @@ Candidate. A run records its base commit, the checkout's HEAD when the run
 starts, before the agent acts. The candidate under review is the net change
 from that base to the final working tree files, so a local commit never
 redefines the base. The checkout fingerprint is a sha256 over the base, HEAD,
-``git status``, ``git diff HEAD``, the untracked files, and the bytes on disk
-of every path the base tracks that the index does not list and of every index
-entry flagged skip-worktree or assume-unchanged, whose file git no longer
-reads (an absent one hashes as absent). A run without a base has no
-fingerprint: every check that needs one treats the checkout as unverifiable.
-There is no fallback.
+``git status``, ``git diff HEAD``, the untracked files, the index entries with
+their skip-worktree and assume-unchanged flags, and the bytes on disk of every
+path the base tracks that the index does not list and of every flagged index
+entry, whose file git no longer reads (an absent one hashes as absent). Every
+git call sets ``core.fileMode=true``, so an executable bit always counts, and
+every git diff passes ``--no-ext-diff --no-textconv``. A run without a base has
+no fingerprint: every check that needs one treats the checkout as
+unverifiable. There is no fallback.
 
 Timing. ``execution_deadline`` (D) and ``execution_seconds`` (S) come only from
 a completed ``mcp__curie__get_issue`` call. The round cutoff is ``D - S // 6``
@@ -149,7 +151,8 @@ One script handles every hook event the bundle registers:
     run). No diff review before the plan review completes. The same
     invocation then fingerprints the checkout; a fingerprint or hidden path
     list that cannot be taken, a missing base included, refuses the review
-    without a stop. A
+    without a stop. More than ``HIDDEN_PATHS_LIMIT`` (50) hidden candidate
+    paths refuse the review without a stop, a round or a gate line. A
     checkout the diff reviewer already approved is refused (cause
     ``already_approved``): go to publish. An approval of another checkout is
     cleared. Then the timing check. A checkout identical to the last one that
@@ -170,9 +173,9 @@ One script handles every hook event the bundle registers:
     the flagged index entries that exist on disk, and the flagged entries the
     base has that are absent (a deletion), except a skip-worktree entry equal
     to the base's, which the publication keeps. When there are any, the
-    block ends with a line naming them to read directly, sorted, at most
-    ``HIDDEN_PATHS_SHOWN`` (50), then a count of the rest; with none the block
-    is unchanged. When the contract or the checks cannot be read
+    block ends with a line naming every one of them, sorted, to read
+    directly; with none the block is unchanged. When the contract or the
+    checks cannot be read
     the call is denied and the run stops. An admitted call writes the
     ``plan_review`` or ``review_diff`` phase line with the round it would
     complete. Admission never spends a round.
@@ -340,8 +343,13 @@ GIT_BUDGET_SECONDS = 7.0
 GIT_CALL_SECONDS = 3.0
 # Linux's own limit on symlinks followed in one path lookup.
 SYMLINK_HOPS = 40
-# Hidden candidate paths the diff reviewer's CANDIDATE block names; the rest are counted.
-HIDDEN_PATHS_SHOWN = 50
+# The most hidden candidate paths the CANDIDATE block names; more refuses the diff review.
+HIDDEN_PATHS_LIMIT = 50
+TOO_MANY_HIDDEN = (
+    f"Diff review refused: more than {HIDDEN_PATHS_LIMIT} candidate paths are hidden from "
+    "git diff; clear the assume-unchanged and skip-worktree flags or restore the index "
+    "before review."
+)
 FINGERPRINT_MISSING = (
     "The initial checkout fingerprint could not be captured (checkout_unverifiable). "
     "Ensure the checkout is readable by Git within the seven-second budget, "
@@ -646,7 +654,8 @@ def _git(top: str, deadline: float, *args: str) -> bytes:
     if timeout <= 0:
         raise subprocess.TimeoutExpired(["git", *args], 0)
     done = subprocess.run(
-        ["git", "--no-optional-locks", "-C", top, *args],
+        # The checkout's own core.fileMode must not hide an executable bit.
+        ["git", "--no-optional-locks", "-C", top, "-c", "core.fileMode=true", *args],
         capture_output=True,
         timeout=timeout,
         check=True,
@@ -779,7 +788,18 @@ def _github_changed_path(
                     return path
         if not _is_commit(base):
             return None
-        changed = _git(workspace, deadline, "diff", "--no-renames", "--name-only", "-z", base, "--")
+        changed = _git(
+            workspace,
+            deadline,
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            base,
+            "--",
+        )
         for raw_path in filter(None, changed.split(b"\0")):
             if time.monotonic() >= deadline:
                 return None
@@ -810,10 +830,11 @@ def base_commit(workspace: str, deadline: float) -> str | None:
 
 def _paths_git_hides(
     root: str, deadline: float, base: str
-) -> tuple[list[bytes], dict[bytes, bool]]:
-    """The paths ``base`` tracks that the index does not list, then the index
-    entries flagged skip-worktree or assume-unchanged, each mapped to whether
-    its absence on disk deletes a base file from the candidate.
+) -> tuple[bytes, list[bytes], dict[bytes, bool]]:
+    """The exact ``git ls-files -s -v -z`` bytes (every index entry with its
+    flags), the paths ``base`` tracks that the index does not list, then the
+    index entries flagged skip-worktree or assume-unchanged, each mapped to
+    whether its absence on disk deletes a base file from the candidate.
 
     git status and git diff never show the bytes on disk of either, yet both
     are in the candidate with those bytes, and an absent flagged file is a
@@ -856,7 +877,7 @@ def _paths_git_hides(
         name: name in based and not (name in skip_worktree and index[name] == based[name])
         for name in flagged
     }
-    return outside, deletes
+    return entries, outside, deletes
 
 
 def hidden_paths(workspace: str, deadline: float, base: str | None) -> list[str] | None:
@@ -871,7 +892,7 @@ def hidden_paths(workspace: str, deadline: float, base: str | None) -> list[str]
     hidden: set[str] = set()
     try:
         root = os.fsdecode(_git(workspace, deadline, "rev-parse", "--show-toplevel").rstrip(b"\n"))
-        outside, flagged = _paths_git_hides(root, deadline, base)
+        _, outside, flagged = _paths_git_hides(root, deadline, base)
         for name in (*outside, *flagged):
             if time.monotonic() >= deadline:
                 return None
@@ -890,13 +911,16 @@ def hidden_paths(workspace: str, deadline: float, base: str | None) -> list[str]
 
 def fingerprint(workspace: str, deadline: float, base: str | None) -> str | None:
     """A sha256 over the base commit, the checkout's HEAD, status, diff and
-    untracked files, then every path ``base`` tracks that the index does not,
-    then every index entry flagged skip-worktree or assume-unchanged.
+    untracked files, then the index entries with their flags, then every path
+    ``base`` tracks that the index does not, then every index entry flagged
+    skip-worktree or assume-unchanged.
 
     Untracked, base and flagged paths are hashed by ``_hash_path``; only a
     base or flagged path may be absent. A zero length ends the untracked list
-    and the base list. ``None`` means unverifiable rather than unchanged, and
-    so does a missing or unreadable base.
+    and the base list, and the index entries are length-prefixed, so changing
+    only a flag changes the digest and setting one already set does not.
+    ``None`` means unverifiable rather than unchanged, and so does a missing
+    or unreadable base.
     """
     if not workspace or not _is_commit(base):
         return None
@@ -909,7 +933,9 @@ def fingerprint(workspace: str, deadline: float, base: str | None) -> str | None
         digest.update(
             _git(root, deadline, "status", "--porcelain=v1", "-z", "--untracked-files=all")
         )
-        digest.update(_git(root, deadline, "diff", "HEAD", "--binary"))
+        digest.update(
+            _git(root, deadline, "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD")
+        )
         untracked = _git(root, deadline, "ls-files", "--others", "--exclude-standard", "-z")
         for name in filter(None, untracked.split(b"\0")):
             if not _hash_path(digest, root, name, deadline, may_be_absent=False):
@@ -917,8 +943,10 @@ def fingerprint(workspace: str, deadline: float, base: str | None) -> str | None
         digest.update((0).to_bytes(8, "big"))
         # A base file outside the index (removed from it, maybe ignored) and a
         # flagged index entry, whose file git no longer reads, are still part
-        # of the candidate: their bytes on disk count.
-        outside, flagged = _paths_git_hides(root, deadline, base)
+        # of the candidate: their bytes on disk count. The flags themselves
+        # count too: they decide what the publication snapshot keeps.
+        entries, outside, flagged = _paths_git_hides(root, deadline, base)
+        digest.update(len(entries).to_bytes(8, "big") + entries)
         for name in outside:
             if not _hash_path(digest, root, name, deadline, may_be_absent=True):
                 return None
@@ -1155,9 +1183,9 @@ def candidate_block(base: str, hidden: list[str]) -> str:
     """What the diff reviewer reviews, appended after everything else in its prompt.
 
     ``hidden`` are the candidate paths git diff does not show, sorted
-    (``hidden_paths``). When there are any, a last line names at most
-    ``HIDDEN_PATHS_SHOWN`` of them and counts the rest; with none the block
-    ends at its fixed text.
+    (``hidden_paths``), at most ``HIDDEN_PATHS_LIMIT`` of them because the
+    admission refuses more. When there are any, a last line names every one;
+    with none the block ends at its fixed text.
     """
     block = (
         "\n\nCANDIDATE:\n"
@@ -1169,12 +1197,9 @@ def candidate_block(base: str, hidden: list[str]) -> str:
     )
     if not hidden:
         return block
-    rest = len(hidden) - HIDDEN_PATHS_SHOWN
     return (
         f"{block}\nThese paths are in the candidate with their current file contents, but git "
-        "diff does not show them; read each file directly: "
-        + ", ".join(hidden[:HIDDEN_PATHS_SHOWN])
-        + (f" and {rest} more" if rest > 0 else "")
+        "diff does not show them; read each file directly: " + ", ".join(hidden)
     )
 
 
@@ -1630,6 +1655,9 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
         digest = fingerprint(state["workspace"], deadline, base)
         if digest is None or hidden is None:
             return _deny("Diff checkout is unverifiable; restore it before review.")
+        if len(hidden) > HIDDEN_PATHS_LIMIT:
+            # No stop and no round: clearing the flags lets the review run.
+            return _deny(TOO_MANY_HIDDEN)
         # The fingerprint was taken, so the base is a commit id.
         candidate = candidate_block(state["base"], hidden)
         if diff["verdict"] == "APPROVE":
