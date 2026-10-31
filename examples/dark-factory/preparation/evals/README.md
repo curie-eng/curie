@@ -53,6 +53,9 @@ receive no intake label, including after explicit start consent. A supported san
 and a supported observable CI route are positive controls. Host-only success,
 secret-dependent CI with no factory observation path, a new test that fails only
 for the missing feature, and changed environment evidence exercise the boundaries.
+The post-PR cases check that a scripted environment-heavy scenario prompts an
+explicit developer choice, while focused factory tests remain required and
+approved human evaluation remains a merge gate with PR-head evidence.
 Publish-only must remain available without pretending gaps are resolved. Do not
 count these fixtures as observed runs; record fresh host results separately.
 
