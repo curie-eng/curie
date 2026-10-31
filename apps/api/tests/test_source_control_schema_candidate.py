@@ -69,6 +69,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.1") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.3") == {"schema_min": "0140", "schema_head": "0140"}
+    assert data["windows"].get("0.14.4") == {"schema_min": "0140", "schema_head": "0140"}
     assert data["revisions"][-16:] == [
         "0096",
         "0097",
@@ -112,7 +113,7 @@ def test_every_prior_registered_window_is_exactly_preserved() -> None:
     assert actual["0.12.1"] == {"schema_min": "0076", "schema_head": "0076"}
     assert set(actual) - set(expected) <= {
         "0.12.1", "0.12.2", "0.12.3", "0.12.4", "0.12.5", "0.13.0", "0.13.1", "0.13.2",
-        "0.14.0", "0.14.1", "0.14.2", "0.14.3"
+        "0.14.0", "0.14.1", "0.14.2", "0.14.3", "0.14.4"
     }
 
 
