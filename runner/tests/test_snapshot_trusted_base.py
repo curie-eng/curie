@@ -1023,6 +1023,148 @@ def test_a_filter_attribute_from_a_gitattributes_kept_only_in_the_index_is_refus
     _assert_filter_refused(repo, prepared, "src/app.py", marker)
 
 
+# --- a relative core.attributesFile resolves against the checkout ------------------
+
+
+def _prepared_with_attributes_file(
+    root: Path, attributes: bytes, files: dict[str, bytes] | None = None
+) -> tuple[Path, str]:
+    """P tracks ``attrs``, and the checkout names it as a relative core.attributesFile.
+
+    git resolves a relative value against the work tree root, so the
+    checkout's own git reads the tracked, unchanged ``attrs`` although no
+    .gitattributes file mentions it.
+    """
+
+    repo, _ = _prepared(root)
+    _git(repo, "config", "core.attributesFile", "attrs")
+    _write(repo, "attrs", attributes)
+    for path, data in (files or {}).items():
+        _write(repo, path, data)
+    _git(repo, "add", "-A")
+    return repo, _commit(repo, "Prepared base with a relative attributes file")
+
+
+def test_a_filter_attribute_from_a_relative_attributes_file_is_refused(tmp_path: Path) -> None:
+    repo, prepared = _prepared_with_attributes_file(tmp_path, b"src/app.py filter=strip\n")
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _write(repo, "src/app.py", b"x = 2\n" + _HIDDEN)
+    # attrs itself is unchanged, so it is not one of the converted paths.
+    assert _git(repo, "status", "--porcelain") == "M src/app.py"
+    _assert_filter_is_live(repo, marker)
+
+    _assert_filter_refused(repo, prepared, "src/app.py", marker)
+
+
+def _assert_attributes_file_refused(repo: Path, prepared: str, marker: Path) -> None:
+    """The capture refuses the attributes file setting itself and runs no filter program."""
+
+    with pytest.raises(
+        workspace_snapshot.WorkspaceSnapshotError, match="core.attributesFile"
+    ) as refused:
+        _capture(repo, prepared)
+    assert not isinstance(refused.value, workspace_snapshot.WorkspaceHistoryError)
+    assert not marker.exists(), "candidate construction ran a filter program"
+
+
+def _prepared_with_links(
+    root: Path, links: dict[str, str], files: dict[str, bytes] | None = None
+) -> tuple[Path, str]:
+    """P commits each ``links`` path as a symlink to its target, beside ``files``."""
+
+    repo, _ = _prepared(root)
+    for path, target in links.items():
+        os.symlink(target, repo / path)
+    for path, data in (files or {}).items():
+        _write(repo, path, data)
+    _git(repo, "add", "-A")
+    return repo, _commit(repo, "Prepared base with linked attributes")
+
+
+def test_a_relative_attributes_file_outside_the_workspace_is_refused(tmp_path: Path) -> None:
+    repo, prepared = _prepared(tmp_path)
+    (tmp_path / "attrs").write_bytes(b"src/app.py filter=strip\n")
+    _git(repo, "config", "core.attributesFile", "../attrs")
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _write(repo, "src/app.py", b"x = 2\n" + _HIDDEN)
+    # The checkout's git reads the file beside the work tree, so the attribute is real.
+    _assert_filter_is_live(repo, marker)
+
+    _assert_attributes_file_refused(repo, prepared, marker)
+
+
+def test_a_relative_attributes_file_with_a_dotdot_segment_is_refused(tmp_path: Path) -> None:
+    """``sub/../attrs`` names the tracked ``attrs`` as text, but git follows ``sub`` first.
+
+    ``sub`` links to a directory outside the workspace, so the file git reads
+    is the filter line beside that directory, not the harmless ``attrs`` a
+    text-only normalization of the value would pick.
+    """
+
+    outside = tmp_path / "linked"
+    (outside / "inner").mkdir(parents=True)
+    (outside / "attrs").write_bytes(b"src/app.py filter=strip\n")
+    repo, prepared = _prepared_with_links(
+        tmp_path, {"sub": "../linked/inner"}, {"attrs": b"# no filter here\n"}
+    )
+    _git(repo, "config", "core.attributesFile", "sub/../attrs")
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _write(repo, "src/app.py", b"x = 2\n" + _HIDDEN)
+    _assert_filter_is_live(repo, marker)
+
+    _assert_attributes_file_refused(repo, prepared, marker)
+
+
+@pytest.mark.parametrize("linked", ["file", "parent_directory"])
+def test_a_symlinked_relative_attributes_file_is_refused(tmp_path: Path, linked: str) -> None:
+    # Both links are tracked and unchanged in P, so neither is a converted
+    # path or a symlink change; only the attributes file setting reaches them.
+    outside = tmp_path / "linked"
+    outside.mkdir()
+    (outside / "attrs").write_bytes(b"src/app.py filter=strip\n")
+    if linked == "file":
+        repo, prepared = _prepared_with_links(tmp_path, {"attrs": "../linked/attrs"})
+        _git(repo, "config", "core.attributesFile", "attrs")
+    else:
+        repo, prepared = _prepared_with_links(tmp_path, {"conf": "../linked"})
+        _git(repo, "config", "core.attributesFile", "conf/attrs")
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _write(repo, "src/app.py", b"x = 2\n" + _HIDDEN)
+    assert _git(repo, "status", "--porcelain") == "M src/app.py"
+    _assert_filter_is_live(repo, marker)
+
+    _assert_attributes_file_refused(repo, prepared, marker)
+
+
+def test_a_relative_attributes_file_still_applies_built_in_conversion(tmp_path: Path) -> None:
+    # Liveness for the refusals above: a relative attributes file without a
+    # filter publishes, and its eol attribute normalizes the edit as git would.
+    repo, prepared = _prepared_with_attributes_file(
+        tmp_path,
+        b"*.bat text eol=crlf\n",
+        {"run.bat": b"@echo off\necho one\necho two\n"},
+    )
+    (repo / "run.bat").unlink()
+    _git(repo, "checkout", "--", "run.bat")
+    assert (repo / "run.bat").read_bytes() == b"@echo off\r\necho one\r\necho two\r\n"
+    assert _git(repo, "status", "--porcelain") == ""
+    _write(repo, "run.bat", b"@echo off\r\necho one\r\necho changed\r\n")
+
+    captured = _capture(repo, prepared)
+
+    assert captured.base_sha == prepared
+    assert captured.changed_paths == ("run.bat",)
+    assert _changed_lines(_sections(captured.patch)["run.bat"]) == [
+        b"-echo two",
+        b"+echo changed",
+    ]
+    assert b"\r" not in captured.patch
+
+
 # --- one builder: the capture publishes the rendered candidate --------------------
 
 
