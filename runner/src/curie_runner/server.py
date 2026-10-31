@@ -31,6 +31,7 @@ import contextlib
 import hmac
 import inspect
 import json
+import re
 import secrets
 from collections.abc import Awaitable, Callable, Mapping
 from types import MappingProxyType
@@ -83,8 +84,11 @@ _GATED_PATHS = frozenset(
 
 # Typed app key so aiohttp resolves the runner without the string-key warning.
 RUNNER: web.AppKey[SessionRunner] = web.AppKey("runner", SessionRunner)
-Snapshotter = Callable[[], WorkspaceSnapshot | Awaitable[WorkspaceSnapshot]]
+# Called with the prepared base commit the worker named in the request.
+Snapshotter = Callable[[str], WorkspaceSnapshot | Awaitable[WorkspaceSnapshot]]
 SNAPSHOTTER: web.AppKey[object] = web.AppKey("snapshotter", object)
+_SNAPSHOT_BASE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+_SNAPSHOT_REQUEST_REFUSAL = "snapshot request must name the prepared base_sha"
 STATUS_ATTESTATION: web.AppKey[object] = web.AppKey("status_attestation", object)
 
 
@@ -343,12 +347,30 @@ async def _snapshot(request: web.Request) -> web.Response:
             },
             status=409,
         )
+    base_sha = _snapshot_base(await request.read())
+    if base_sha is None:
+        return web.json_response({"error": _SNAPSHOT_REQUEST_REFUSAL}, status=400)
     try:
-        result = snapshotter()
+        result = snapshotter(base_sha)
         captured = await result if inspect.isawaitable(result) else result
     except WorkspaceSnapshotError as exc:
         return web.json_response({"error": str(exc)}, status=422)
     return web.json_response(captured.to_json())
+
+
+def _snapshot_base(raw: bytes) -> str | None:
+    """The prepared base from a body of exactly ``{"base_sha": <full object id>}``."""
+
+    try:
+        body = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(body, dict) or set(body) != {"base_sha"}:
+        return None
+    base_sha = body["base_sha"]
+    if not isinstance(base_sha, str) or not _SNAPSHOT_BASE.fullmatch(base_sha):
+        return None
+    return base_sha
 
 
 def _parse(body: object) -> Event | Interrupt:

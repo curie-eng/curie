@@ -553,16 +553,21 @@ def test_docker_runner_snapshot_checks_the_claims_code_host_origin(
         check=True,
         capture_output=True,
     )
+    prepared = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
     (tmp_path / "README.md").write_text("Code host change\n")
 
     captured = capture_workspace_snapshot(
         tmp_path,
+        base_sha=prepared,
         expected_repo=repo_name,
         trusted_origin=forwarded["CURIE_REPO_ORIGIN"],
         repository_path=forwarded["CURIE_REPO_PATH"],
     )
 
     assert captured.repo_full_name == repo_name
+    assert captured.base_sha == prepared
     assert captured.changed_paths == ("README.md",)
     assert b"Code host change" in captured.patch
 

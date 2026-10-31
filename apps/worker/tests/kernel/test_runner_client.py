@@ -295,7 +295,9 @@ def test_snapshot_refuses_an_oversized_body_before_json_decoding() -> None:
         client = RunnerClient(total_timeout_s=30.0, snapshot_patch_max_bytes=16)
         try:
             with pytest.raises(RunnerError, match="invalid bounded payload"):
-                await client.snapshot(f"http://127.0.0.1:{server.port}", token="runner-token")
+                await client.snapshot(
+                    f"http://127.0.0.1:{server.port}", token="runner-token", base_sha="a" * 40
+                )
         finally:
             await client.close()
             await server.close()
@@ -323,7 +325,10 @@ def test_snapshot_reads_the_whole_chunked_400kb_body() -> None:
         assert len(body) >= 400_000
         app = web.Application()
 
+        requested: list[object] = []
+
         async def chunked(request: web.Request) -> web.StreamResponse:
+            requested.append(await request.json())
             response = web.StreamResponse(headers={"Content-Type": "application/json"})
             response.enable_chunked_encoding()
             await response.prepare(request)
@@ -343,8 +348,10 @@ def test_snapshot_reads_the_whole_chunked_400kb_body() -> None:
         client = RunnerClient(total_timeout_s=30.0)
         try:
             snapshot = await client.snapshot(
-                f"http://127.0.0.1:{server.port}", token="runner-token"
+                f"http://127.0.0.1:{server.port}", token="runner-token", base_sha="a1" * 20
             )
+            # The worker names the prepared base and nothing else (#5230).
+            assert requested == [{"base_sha": "a1" * 20}]
             assert isinstance(snapshot, RunnerWorkspaceSnapshot)
             assert snapshot.patch == patch
             assert snapshot.changed_paths == ("src/widget.py",)
@@ -378,7 +385,9 @@ def test_snapshot_short_content_length_raises_a_client_error() -> None:
             # ClientPayloadError, a ClientError subclass, when read to EOF:
             # https://docs.aiohttp.org/en/stable/client_reference.html#client-exceptions
             with pytest.raises(ClientError):
-                await client.snapshot(f"http://127.0.0.1:{server.port}", token="runner-token")
+                await client.snapshot(
+                    f"http://127.0.0.1:{server.port}", token="runner-token", base_sha="a" * 40
+                )
         finally:
             await client.close()
             await server.close()
@@ -402,7 +411,9 @@ def test_snapshot_malformed_json_names_the_inner_error_and_byte_count() -> None:
         client = RunnerClient(total_timeout_s=5.0)
         try:
             with pytest.raises(RunnerSnapshotReadError) as caught:
-                await client.snapshot(f"http://127.0.0.1:{server.port}", token="runner-token")
+                await client.snapshot(
+                    f"http://127.0.0.1:{server.port}", token="runner-token", base_sha="a" * 40
+                )
             assert str(caught.value).startswith(
                 f"/v1/snapshot returned an invalid bounded payload after {len(body)} bytes: "
                 "JSONDecodeError: "
@@ -433,7 +444,9 @@ def test_snapshot_oversized_body_keeps_the_byte_cap_and_named_validation_error()
         client = RunnerClient(total_timeout_s=5.0, snapshot_patch_max_bytes=patch_limit)
         try:
             with pytest.raises(RunnerSnapshotReadError) as caught:
-                await client.snapshot(f"http://127.0.0.1:{server.port}", token="runner-token")
+                await client.snapshot(
+                    f"http://127.0.0.1:{server.port}", token="runner-token", base_sha="a" * 40
+                )
             assert str(caught.value) == (
                 f"/v1/snapshot returned an invalid bounded payload after {len(body)} bytes: "
                 "ValueError: snapshot response exceeds its encoded byte limit"
@@ -462,7 +475,9 @@ def test_snapshot_http_status_distinguishes_retryable_reads_from_refusals(status
         client = RunnerClient(total_timeout_s=5.0)
         try:
             with pytest.raises(RunnerError, match=f"/v1/snapshot -> {status}") as caught:
-                await client.snapshot(f"http://127.0.0.1:{server.port}", token="runner-token")
+                await client.snapshot(
+                    f"http://127.0.0.1:{server.port}", token="runner-token", base_sha="a" * 40
+                )
             if status == 503:
                 assert isinstance(caught.value, RunnerSnapshotReadError)
             else:

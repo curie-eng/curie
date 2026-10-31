@@ -788,13 +788,31 @@ async def _attempt_turn(
             outcome.approval_granted_tool,
         ):
             snapshot = None
+            # The worker names the base the snapshot is anchored at: the
+            # prepared commit retained for this thread, never the agent's HEAD.
+            snapshot_base: str | None = None
+            snapshot_base_error: str | None = None
+            try:
+                if self._workspace is None:
+                    raise WorkspacePreparationError(
+                        "publication-validation",
+                        "managed workspace coordinator is unavailable",
+                    )
+                prepared = await asyncio.to_thread(self._workspace.current, thread_key)
+                if prepared is None:
+                    raise WorkspacePreparationError(
+                        "publication-validation", "thread has no retained sanitized base"
+                    )
+                snapshot_base = prepared.base_sha
+            except WorkspacePreparationError as exc:
+                snapshot_base_error = f"publication snapshot failed: {exc}"
             snapshot_started = clock.time.monotonic()
             snapshot_budget_s = (
                 None if remaining_s is None else remaining_s - (snapshot_started - attempt_started)
             )
             snapshot_attempts = 0
             snapshot_failure_text = "remaining budget is 5 s or less"
-            while snapshot_attempts < 3:
+            while snapshot_base is not None and snapshot_attempts < 3:
                 snapshot_remaining_s = (
                     None
                     if snapshot_budget_s is None
@@ -810,6 +828,7 @@ async def _attempt_turn(
                     snapshot = await self._runner.snapshot(
                         routed.handle.base_url,
                         token=routed.handle.token or None,
+                        base_sha=snapshot_base,
                         remaining_s=snapshot_remaining_s,
                     )
                 except (RunnerError, aiohttp.ClientError, TimeoutError) as exc:
@@ -842,7 +861,9 @@ async def _attempt_turn(
                     await asyncio.sleep(float(snapshot_attempts))
                 else:
                     break
-            if snapshot is None:
+            if snapshot_base_error is not None:
+                outcome.publication_snapshot_error = snapshot_base_error
+            elif snapshot is None:
                 # A trusted publication request never falls through into an
                 # ordinary approval when snapshotting fails. The pause path
                 # reports this error and creates neither durable row.

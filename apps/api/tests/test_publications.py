@@ -2826,8 +2826,9 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
                     runner_app=create_runner_app(
                         runner,
                         token=runner_token,
-                        snapshotter=lambda: capture_workspace_snapshot(
+                        snapshotter=lambda base_sha: capture_workspace_snapshot(
                             repo,
+                            base_sha=base_sha,
                             expected_repo=REPO,
                             # The boot env's CURIE_REPO_ORIGIN and CURIE_REPO_PATH.
                             trusted_origin="https://github.com",

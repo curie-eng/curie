@@ -179,6 +179,10 @@ class ReviewWorkspace:
     def release(self, thread_key: str) -> None:
         self.released.append(thread_key)
 
+    def current(self, _thread_key: str) -> object:
+        # The retained prepared head the review revision is anchored at.
+        return SimpleNamespace(repo_full_name=REPO, base_sha=HEAD)
+
 
 class ReviewPublicationApi:
     """Protocol double whose authority is one complete persisted queue row."""
