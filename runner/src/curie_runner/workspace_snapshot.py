@@ -216,9 +216,6 @@ def _git(
     env: Mapping[str, str] | None = None,
     stdout: IO[bytes] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    # An inherited GIT_* variable could point git at another index, object
-    # store or config; only this module's own settings apply.
-    inherited = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     try:
         return subprocess.run(
             ["git", *_GIT_CONFIG, *args],
@@ -228,7 +225,7 @@ def _git(
             stderr=subprocess.PIPE,
             timeout=_GIT_TIMEOUT_SECONDS,
             check=check,
-            env=shell_and_hook_env(inherited, extra={**_GIT_ENV, **(env or {})}),
+            env=shell_and_hook_env(os.environ, extra={**_GIT_ENV, **(env or {})}),
         )
     except FileNotFoundError as exc:
         raise WorkspaceSnapshotError(
