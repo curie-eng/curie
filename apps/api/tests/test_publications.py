@@ -764,8 +764,10 @@ def _open_lineage(
     *,
     conversation_id: str,
     pr_url: str = PR_URL,
+    deployment: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    deployment = _create_deployment(client, auth_headers)
+    if deployment is None:
+        deployment = _create_deployment(client, auth_headers)
     _, publication = _create_publication(
         client,
         _publication_payload(
@@ -4260,11 +4262,19 @@ def _seed_readmit_stale_lineage(
     execution_status: str = "failed",
     work_item_conversation: str | None = None,
     outcome_ready: bool = True,
+    deployment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Seed #4948's bug shape: an open headless lineage at ``base_sha`` whose
-    single publication is the failed prior execution of a live WorkItem."""
+    single publication is the failed prior execution of a live WorkItem.
 
-    deployment = _create_deployment(client, auth_headers)
+    Every scenario lives on its own conversation, so one caller-created
+    deployment (one agent bound to one Slack route) can host them all: the
+    ``agent_channels_route_key`` uniqueness makes a second agent on the same
+    route a 409, and a shared agent is the production shape anyway.
+    """
+
+    if deployment is None:
+        deployment = _create_deployment(client, auth_headers)
     _, publication = _create_publication(
         client,
         _publication_payload(
@@ -4459,6 +4469,7 @@ def test_readmit_preserves_published_or_pushed_lineage(
         client,
         auth_headers,
         conversation_id=pr_conversation,
+        deployment=control["deployment"],
     )
 
     def pull_request_reads(request: httpx.Request) -> httpx.Response:
@@ -4498,6 +4509,7 @@ def test_readmit_preserves_published_or_pushed_lineage(
         client,
         auth_headers,
         conversation_id=pushed_conversation,
+        deployment=control["deployment"],
     )
 
     def present_branch(request: httpx.Request) -> httpx.Response:
@@ -4544,6 +4556,7 @@ def test_readmit_preserves_published_or_pushed_lineage(
             client,
             auth_headers,
             conversation_id=conversation_id,
+            deployment=control["deployment"],
             **kwargs,
         )
         ineligible = _get_lineage_with_http(
@@ -4626,6 +4639,7 @@ def test_readmit_creates_new_lineage_after_never_pushed_failure(
         client,
         auth_headers,
         conversation_id=overlap_conversation,
+        deployment=seed["deployment"],
     )
     probe_started = threading.Event()
     close_landed = threading.Event()
@@ -4669,6 +4683,7 @@ def test_readmit_creates_new_lineage_after_never_pushed_failure(
         client,
         auth_headers,
         conversation_id=terminal_conversation,
+        deployment=seed["deployment"],
     )
     _, terminal_second = _create_publication(
         client,
@@ -4739,6 +4754,7 @@ def test_readmit_lineage_retirement_fails_closed(
         client,
         auth_headers,
         conversation_id=unavailable_conversation,
+        deployment=control["deployment"],
     )
 
     def unreachable(request: httpx.Request) -> httpx.Response:
@@ -4769,6 +4785,7 @@ def test_readmit_lineage_retirement_fails_closed(
         client,
         auth_headers,
         conversation_id=unauthorized_conversation,
+        deployment=control["deployment"],
     )
 
     def refused_credentials(request: httpx.Request) -> httpx.Response:
@@ -4789,6 +4806,7 @@ def test_readmit_lineage_retirement_fails_closed(
         client,
         auth_headers,
         conversation_id=inflight_conversation,
+        deployment=control["deployment"],
     )
     _, _pending = _create_publication(
         client,
@@ -4814,6 +4832,7 @@ def test_readmit_lineage_retirement_fails_closed(
         auth_headers,
         conversation_id=undurable_conversation,
         outcome_ready=False,
+        deployment=control["deployment"],
     )
     read = _get_lineage_with_http(
         client,
@@ -4843,6 +4862,7 @@ def test_readmit_lineage_retirement_fails_closed(
         client,
         auth_headers,
         conversation_id=writer_conversation,
+        deployment=control["deployment"],
     )
     probe_started = threading.Event()
     writer_landed = threading.Event()
@@ -4894,6 +4914,7 @@ def test_readmit_lineage_retirement_fails_closed(
         client,
         auth_headers,
         conversation_id=stale_conversation,
+        deployment=control["deployment"],
     )
     bump_seen = threading.Event()
     bump_done = threading.Event()
