@@ -90,6 +90,13 @@ that snapshot contract; it does not reimplement the fix.
    retrieves exact shallow commits without trees, then only ancestor trees
    along affected paths and the required old blobs. It performs no checkout,
    recursive tree listing, complete index construction or full-tree staging.
+   Set `GIT_NO_LAZY_FETCH=1` for every Git process in validation and the Job.
+   Object reads use only verified local objects; a missing object must go
+   through the bounded explicit fetcher before the read is retried. Every
+   object-fetch invocation requests an exact ID/type set with `--filter=tree:0`
+   and `fetch.negotiationAlgorithm=noop`, including explicit tree/blob fetches.
+   No Git read, promisor callback or negotiation side path may fetch objects
+   implicitly or bypass these settings and limits.
    Each fetch declares an exact expected object-ID/type set, of at most 256
    objects. The received pack's count must not exceed that set, and its final
    object set must equal the requested set. Each ID has a size allowance from
@@ -97,8 +104,8 @@ that snapshot contract; it does not reimplement the fix.
    workspace checkout-byte ceiling. Expanded bytes cannot exceed the remaining
    workspace checkout-byte budget; wire bytes cannot exceed the lower of the
    remaining configured archive-byte budget and 65,536 plus twice the sum of
-   those per-ID allowances. Enforce both limits while streaming, including each
-   lazy object fetch, terminate the transfer immediately on excess, and refuse
+   those per-ID allowances. Enforce both limits on every explicit fetch while
+   streaming, terminate the transfer immediately on excess, and refuse
    with `publication_object_fetch_limit`. Do not first spool an unbounded pack.
    Unexpected objects refuse with `publication_object_fetch_scope`. Thus a
    server or proxy that starts ignoring filters after qualification cannot
@@ -131,6 +138,13 @@ that snapshot contract; it does not reimplement the fix.
    objects. M1 exists even when the parent is unchanged. The immutable Job
    contract binds both manifests, and retry adoption verifies both. A new parent
    cannot mutate M0 or reuse an M1 from another approved revision.
+   M1 binds all rebuild inputs, including exact patch bytes, parent/source
+   objects, Git object format and commit metadata (author, committer, fixed
+   timestamps, message and revision trailer). The Job rebuilds blobs, trees
+   and the revision commit from those bound inputs. It refuses before push
+   with `publication_manifest_rebuild_mismatch` unless every generated object
+   ID, including the root tree and commit ID, equals M1's manifest. Matching
+   manifest digests without rebuilding the objects is insufficient.
 5. The work bound is affected old/new blob bytes plus affected ancestor-tree
    metadata, one sequential round trip per affected path depth level batched
    across paths at that level, and bounded transport/API overhead. Ancestor tree
@@ -180,25 +194,33 @@ that snapshot contract; it does not reimplement the fix.
 
 1. Drop none of ADR 0197's four CodeHost adapters: GitHub, GitLab, Bitbucket
    Cloud and Bitbucket Data Center. Global cutover waits for every row of this
-   finite initial qualification list to pass selective fetch and bounded push:
+   finite qualification matrix to pass selective fetch and bounded push:
 
    | Adapter | Named qualification target |
    | --- | --- |
    | GitHub | Hosted API 2022-11-28, GraphQL schema and Git protocol v2, qualification profile v1 |
-   | GitHub | Enterprise Server 3.19.0, Git protocol v2 |
+   | GitHub | Enterprise Server: oldest release with complete passing qualification and newest stable release, Git protocol v2 |
    | GitLab | Hosted API v4 and Git protocol v2, qualification profile v1 |
-   | GitLab | CE 19.4.1 and EE 19.4.1, Git protocol v2 |
+   | GitLab | CE and EE at the documented 17.0 floor (17.0.0) and newest stable release, Git protocol v2 |
    | Bitbucket Cloud | Hosted API 2.0 and Git protocol v2, qualification profile v1 |
-   | Bitbucket Data Center | 9.4.24, Git protocol v2 |
+   | Bitbucket Data Center | Documented 9.4.0 floor and newest stable release, Git protocol v2 |
 
    These are probe targets, not claims of qualified support. A hosted profile
    records the actual probe date, exposed service version/capabilities, client
    Git version and redacted evidence; it does not pretend SaaS builds are
-   caller-pinnable. A changed capability profile must requalify. Self-managed
-   versions outside the exact list refuse before admission with
-   `publication_forge_version_unqualified`, naming the version and list. A
-   required row that fails keeps the entire cutover blocked; it never removes
-   an adapter from support. List expansion requires explicit qualification.
+   caller-pinnable. A changed capability profile must requalify. Resolve newest
+   stable releases from official vendor sources at qualification time, then
+   pin and record exact versions and fixture/image identities for that run.
+   Keep the documented supported ranges: GitLab 17.0 or later and Bitbucket
+   Data Center 9.4.0 or later. Releases between the floor and newest tested
+   release are supported, not an exact-version allowlist; the newest tested
+   release is evidence, not an upper version gate. GHES has no documented
+   floor today: set its floor to the oldest release with complete passing
+   qualification and support the range from that floor. A self-managed version
+   below its floor refuses before admission with
+   `publication_forge_version_unqualified`, naming the version and required
+   minimum. A required endpoint that fails keeps the entire cutover blocked;
+   it never removes an adapter or narrows the existing documented ranges.
 2. Explicitly refused and silently ignored filters are named pre-admission
    refusals (`publication_partial_clone_unsupported`); streaming limits still
    apply to every actual fetch. There is no full-clone, archive-rehash or
@@ -235,13 +257,13 @@ that snapshot contract; it does not reimplement the fix.
 | Git path and tree validity | Git apply/add reject invalid paths and tree entries | Every generated/replayed tree passes Git path rules and fsck-strict checks, including nested `.git`, HFS/NTFS lookalikes, duplicates and ordering |
 | Dependency restrictions | Parse affected before/after manifests and locks | Retain the same complete-file policy checks |
 | Bundle review freshness | Not a platform property; the platform does not bind the bundle fingerprint to a publication | Unaffected; bundle review policy remains outside this ADR |
-| Integrity and provenance | Archive digest, private patch state and immutable Job resource contract | Verify each consumed object; bind approved M0 and post-approval M1 with exact versions and digests, including retry adoption |
+| Integrity and provenance | Archive digest, private patch state and immutable Job resource contract | Verify each consumed object; bind M0/M1 and retry adoption, and require the Job's rebuilt blob/tree/commit IDs to equal M1 |
 | Ancestry and revision identity | API revision marker, single parent and forge ancestry checks | Preserve approved base <= parent <= current tip for first publication and exact later parent |
 | Concurrent branch updates | Expected-head read and force-with-lease push | Retain both checks, including branch creation races |
 | Approval and runtime authority | Atomic approval/publication creation, replay and deadline/lease fences | Preserve all authority checks and refusal behavior |
 | Credential isolation and recovery | Trusted push-only Job, immutable resource adoption and owned cleanup | Preserve identity boundaries, exact adoption, deterministic recovery and cleanup |
 | Allowlist and validation access | Private archive permits offline validation; redemption rechecks repository authority | Read-scoped validation credential with an allowlist recheck at every redemption; named unavailable/unreachable refusals, without archive fallback |
-| Transfer bounds | Existing workspace and Git time/size envelopes | Per-fetch exact object sets, streaming wire/expanded-byte limits and named over-limit refusal even after qualification |
+| Transfer bounds | Existing workspace and Git time/size envelopes | Disable lazy fetch; explicit exact-set tree:0/noop fetches enforce streaming byte/object limits even after qualification |
 
 These are requirements for the future implementation, not claims that this
 documentation change has established runtime protection. API commit checks
@@ -257,6 +279,27 @@ reconstruction correctness. Engine plus validation is estimated at 900 to 1,400
 production lines; publisher plus cutover and qualification at 800 to 1,300,
 both plus tests. Correctness risk remains medium to high. These are design
 estimates, not measured delivery evidence.
+
+Qualification changes neither GitLab's documented 17.0+ range nor Bitbucket
+Data Center's 9.4.0+ range into a list of individually tested releases. Floor
+and newest-release tests qualify the endpoints, and the intervening releases
+remain supported. Newest releases must be resolved and pinned for each
+qualification run; that tested endpoint does not impose an upper support
+cutoff. GHES gains an explicit minimum only from the oldest release whose
+complete qualification passes. Before cutover, #5236 must publish that measured
+GHES floor and the below-floor refusal in `docs/capabilities.md` and
+`docs/guides/dark-factory-quickstart.md`, alongside the unchanged GitLab and
+Bitbucket ranges. This Draft does not invent an untested GHES minimum.
+
+Validation adds read-only credential provisioning and rotation work. The
+static-token GitLab, Bitbucket Cloud and Bitbucket Data Center adapters need a
+separate read-only repository credential alongside their publishing token.
+GitHub, including GHES, needs the same extra credential when using a static
+token. GitHub App installations may instead mint a repository-read-only
+installation token, but #5235 must implement and verify that attenuation;
+today's clone/push scope label alone does not attenuate the returned token.
+Provisioning and authenticated read-only checks are dispatch prerequisites;
+operators must not reuse a write token as validation authority.
 
 The realizing implementation belongs in workspace preparation and ownership,
 `publication_validation.py`, `publication_k8s.py`, `publication_loop.py`, their
