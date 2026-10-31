@@ -6,16 +6,20 @@ captures the net change from P to the final working tree files: committed,
 staged, unstaged and untracked (not ignored) changes together. Local commits
 never move the base.
 
-Index entries git reads are published as git shows them in ``git diff <P>``:
-an entry that listing does not name keeps P's entry, and a listed file is
-git's clean conversion of its bytes on disk (attributes, line endings and clean
-filters, as ``git diff`` applies them). Paths git does not read (untracked
-files, index entries flagged skip-worktree or assume-unchanged, and P's paths
-missing from the index) are published as their bytes on disk, unconverted.
-Files are read without following symlinks, and every object is written to a
-scratch index and object directory, so the real refs, HEAD and object store
-are only read. The workspace is observed before and after the patch is built,
-and a difference refuses the capture.
+The net change is the canonical candidate C: the final publishable contents,
+built by ``build_candidate``, the one construction path that both this capture
+and the dark factory review gate use. Every path of P's tree, the index and the
+untracked listing is read from disk without following symlinks; git's stat
+cache and git diff listings are never trusted. A file git reads (an index
+entry not flagged skip-worktree or assume-unchanged) whose bytes differ from
+P's entry is published as git's canonical clean form of those bytes, with the
+attributes, line endings and clean filters git applies; one equal to P's entry
+is unchanged. Paths git does not read (flagged index entries, P's paths
+missing from the index, and untracked files) are published as their bytes on
+disk, unconverted. Every object is written to a scratch index and object
+directory, so the real index, refs, HEAD and object store are only read. The
+workspace is observed before and after C is built, and a difference refuses
+it.
 
 The runner exposes the result only to its per-sandbox bearer-token holder. It
 does not publish anything: the worker validates the patch against its own copy
@@ -35,6 +39,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -55,6 +60,7 @@ _SYMLINK_MODE = "120000"
 _GITLINK_MODE = "160000"
 _READ_CHUNK = 1024 * 1024
 _CHANGED = "the workspace changed during snapshot capture; retry once writes stop"
+_BUDGET = "workspace candidate construction exceeded its time budget"
 _BASE_UNAVAILABLE = "the prepared base commit is not available in the workspace"
 _NOT_DESCENDANT = (
     "the workspace HEAD is not the prepared base commit or a local commit on top of it"
@@ -77,6 +83,16 @@ _GIT_CONFIG = (
     "core.quotePath=false",
     "-c",
     "gc.auto=0",
+)
+# Every diff between P and C: no workspace config moves the paths, drops the
+# a/ and b/ prefixes, or reads an order file.
+_DIFF_CONFIG = (
+    "-c",
+    "diff.relative=false",
+    "-c",
+    "diff.noprefix=false",
+    "-c",
+    "diff.orderFile=/dev/null",
 )
 _GIT_ENV = {
     "GIT_TERMINAL_PROMPT": "0",
@@ -221,10 +237,17 @@ def _git(
     stdin: bytes | IO[bytes] | None = None,
     env: Mapping[str, str] | None = None,
     stdout: IO[bytes] | None = None,
+    deadline: float | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     # Bytes are sent as git's input; an open file becomes its stdin directly.
     data = stdin if isinstance(stdin, bytes) else None
     handle = None if stdin is None or isinstance(stdin, bytes) else stdin
+    # ``deadline`` (a time.monotonic() value) caps the call below the 30 s limit.
+    timeout = float(_GIT_TIMEOUT_SECONDS)
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            raise WorkspaceSnapshotError(_BUDGET)
     try:
         return subprocess.run(
             ["git", *_GIT_CONFIG, *args],
@@ -233,7 +256,7 @@ def _git(
             stdin=handle,
             stdout=subprocess.PIPE if stdout is None else stdout,
             stderr=subprocess.PIPE,
-            timeout=_GIT_TIMEOUT_SECONDS,
+            timeout=timeout,
             check=check,
             env=shell_and_hook_env(os.environ, extra={**_GIT_ENV, **(env or {})}),
         )
@@ -242,6 +265,8 @@ def _git(
             "git is not installed in the runner image; repository publication is unavailable"
         ) from exc
     except subprocess.TimeoutExpired as exc:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise WorkspaceSnapshotError(_BUDGET) from exc
         raise WorkspaceSnapshotError("git snapshot stage exceeded 30 seconds") from exc
     except subprocess.CalledProcessError as exc:
         diagnostic = exc.stderr.decode("utf-8", errors="replace").strip()
@@ -328,14 +353,16 @@ def _object_id(object_format: str, kind: bytes, data: bytes) -> str:
     return hashlib.new(object_format, header + data, usedforsecurity=False).hexdigest()
 
 
-def _verify_base(repo: Path, base_sha: str) -> str:
+def _verify_base(repo: Path, base_sha: str, *, deadline: float | None = None) -> str:
     """Return the object format once ``base_sha`` names a commit in the workspace."""
 
     if not isinstance(base_sha, str) or not _OID_RE.fullmatch(base_sha):
         raise WorkspaceSnapshotError("the prepared base commit is not a full lowercase object id")
-    object_format = _git(repo, "rev-parse", "--show-object-format").stdout.decode(
-        "ascii", errors="replace"
-    ).strip()
+    object_format = (
+        _git(repo, "rev-parse", "--show-object-format", deadline=deadline)
+        .stdout.decode("ascii", errors="replace")
+        .strip()
+    )
     if object_format not in _OID_LENGTH:
         raise WorkspaceSnapshotError("the workspace object format is not supported")
     if len(base_sha) != _OID_LENGTH[object_format]:
@@ -348,6 +375,7 @@ def _verify_base(repo: Path, base_sha: str) -> str:
         "--end-of-options",
         f"{base_sha}^{{commit}}",
         check=False,
+        deadline=deadline,
     )
     if resolved.returncode != 0 or resolved.stdout.decode("ascii", errors="replace").strip() != (
         base_sha
@@ -456,11 +484,14 @@ def _prove_descendant(repo: Path, head: str, base_sha: str, object_format: str) 
             raise WorkspaceHistoryError(_NOT_DESCENDANT)
 
 
-def _tree_entries(repo: Path, base_sha: str) -> dict[bytes, tuple[str, str]]:
+def _tree_entries(
+    repo: Path, base_sha: str, deadline: float | None = None
+) -> dict[bytes, tuple[str, str]]:
     """Every path of the prepared base's tree, as (mode, object id)."""
 
     entries: dict[bytes, tuple[str, str]] = {}
-    for item in _git(repo, "ls-tree", "-r", "-z", "--full-tree", base_sha).stdout.split(b"\0"):
+    listed = _git(repo, "ls-tree", "-r", "-z", "--full-tree", base_sha, deadline=deadline)
+    for item in listed.stdout.split(b"\0"):
         if not item:
             continue
         meta, separator, path = item.partition(b"\t")
@@ -471,27 +502,34 @@ def _tree_entries(repo: Path, base_sha: str) -> dict[bytes, tuple[str, str]]:
     return entries
 
 
-# One path as observed: ("absent",), ("directory",), ("gitlink", oid),
-# ("symlink", oid) or ("file", mode, oid) from the filesystem; ("clean", mode,
-# oid) for a file git reads and ``git diff <P>`` lists, whose raw bytes hash to
-# oid and which publishes as git's clean conversion of them; or ("kept", mode,
-# oid) for P's own entry left in place (see ``_observe``).
+# One path as observed on disk: ("absent",), ("directory",), ("gitlink", oid),
+# ("symlink", oid) or ("file", mode, oid) with the raw bytes' blob id, or
+# ("kept", mode, oid) for P's own entry left in place (see ``_observe``).
 _Record = tuple[str, ...]
 _ABSENT: _Record = ("absent",)
-_DIRECTORY: _Record = ("directory",)
 # Index flag tags (``git ls-files -v``) of a skip-worktree entry; the lowercase
 # form also has assume-unchanged set.
 _SKIP_WORKTREE_TAGS = frozenset({"S", "s"})
 
 
+def _flagged(tag: str) -> bool:
+    """git does not read the file of an entry flagged skip-worktree or assume-unchanged."""
+
+    return tag in _SKIP_WORKTREE_TAGS or tag.islower()
+
+
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise WorkspaceSnapshotError(_BUDGET)
+
+
 @dataclass(frozen=True)
 class _Observation:
-    """One read of the index, the untracked listing, ``git diff <P>``'s listing
-    and every candidate path."""
+    """One read of the index with its flags, the untracked listing and every candidate path."""
 
     index: Mapping[bytes, tuple[str, str]]
+    tags: Mapping[bytes, str]
     untracked: tuple[bytes, ...]
-    listed: frozenset[bytes]
     records: Mapping[bytes, _Record]
 
 
@@ -519,7 +557,7 @@ def _open_parent(root_fd: int, parts: list[bytes]) -> int | None:
     return fd
 
 
-def _hash_file(parent_fd: int, name: bytes, object_format: str) -> _Record:
+def _hash_file(parent_fd: int, name: bytes, object_format: str, deadline: float | None) -> _Record:
     try:
         fd = os.open(
             name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY, dir_fd=parent_fd
@@ -536,6 +574,7 @@ def _hash_file(parent_fd: int, name: bytes, object_format: str) -> _Record:
         digest.update(b"blob %d\0" % info.st_size)
         read = 0
         while chunk := os.read(fd, _READ_CHUNK):
+            _check_deadline(deadline)
             read += len(chunk)
             digest.update(chunk)
         if read != info.st_size:
@@ -546,7 +585,9 @@ def _hash_file(parent_fd: int, name: bytes, object_format: str) -> _Record:
         os.close(fd)
 
 
-def _record(root_fd: int, path: bytes, gitlink: str | None, object_format: str) -> _Record:
+def _record(
+    root_fd: int, path: bytes, gitlink: str | None, object_format: str, deadline: float | None
+) -> _Record:
     parts = path.split(b"/")
     try:
         parent = _open_parent(root_fd, parts[:-1])
@@ -570,7 +611,7 @@ def _record(root_fd: int, path: bytes, gitlink: str | None, object_format: str) 
             # Its untracked contents are listed as paths of their own.
             return ("directory",)
         if stat.S_ISREG(info.st_mode):
-            return _hash_file(parent, name, object_format)
+            return _hash_file(parent, name, object_format, deadline)
         raise WorkspaceSnapshotError(f"workspace path {_display(path)!r} is not a regular file")
     except FileNotFoundError:
         return ("absent",)
@@ -594,34 +635,23 @@ def _gitlink(
 
 
 def _observe(
-    repo: Path, base_sha: str, base: Mapping[bytes, tuple[str, str]], object_format: str
+    repo: Path, base: Mapping[bytes, tuple[str, str]], object_format: str, deadline: float | None
 ) -> _Observation:
-    """Read every path of P's tree, the index, the untracked listing and the
-    listing of ``git diff <P>``.
+    """Read every path of P's tree, the index with its flags and the untracked listing.
 
-    An index entry git reads (not flagged skip-worktree or assume-unchanged,
-    not a gitlink) follows ``git diff <P>``. When that listing does not name
-    it, git shows P's content there, so the record is P's own entry and the
-    file is not read. When it does, the file on disk decides, and a regular
-    file is recorded as ``clean``: it publishes as git's clean conversion of
-    its bytes. An unnamed entry P lacks must be absent on disk (git shows no
-    file there), else git's listing disagrees with the index and the capture
-    is refused.
-
-    Every other path is read from the filesystem, with one exception: a
-    skip-worktree index entry equal to P's entry whose path is absent keeps
-    P's entry. That is the state worker preparation leaves when it unlinks a
-    committed symlink that escapes the checkout, so it is not a deletion the
-    agent made. Because kept entries and the listing are part of the
-    observation, the second observation compares them too.
+    Every candidate path is read from the filesystem, never from git's stat
+    cache or a git diff listing, with one exception: a skip-worktree index
+    entry equal to P's entry whose path is absent keeps P's entry. That is the
+    state worker preparation leaves when it unlinks a committed symlink that
+    escapes the checkout, so it is not a deletion the agent made. Because the
+    kept entry and the flags are part of the observation, the second
+    observation compares them too.
     """
 
     index: dict[bytes, tuple[str, str]] = {}
-    skip_worktree: set[bytes] = set()
-    # git does not read the file of a flagged entry: skip-worktree (S or s)
-    # or assume-unchanged (any lowercase tag).
-    flagged: set[bytes] = set()
-    for item in _git(repo, "ls-files", "-s", "-v", "-z").stdout.split(b"\0"):
+    tags: dict[bytes, str] = {}
+    listed = _git(repo, "ls-files", "-s", "-v", "-z", deadline=deadline).stdout
+    for item in listed.split(b"\0"):
         if not item:
             continue
         meta, separator, path = item.partition(b"\t")
@@ -634,36 +664,15 @@ def _observe(
                 f"workspace path {_display(path)!r} has an unmerged index entry"
             )
         index[path] = (mode, oid)
-        if tag in _SKIP_WORKTREE_TAGS:
-            skip_worktree.add(path)
-        if tag in _SKIP_WORKTREE_TAGS or tag.islower():
-            flagged.add(path)
-    # The reviewer's view of the candidate. The checkout's own core.fileMode
-    # must not hide an executable bit.
-    diffed = _git(
-        repo,
-        "-c",
-        "core.fileMode=true",
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-renames",
-        "--name-only",
-        "-z",
-        base_sha,
-        "--",
-    ).stdout
-    listed = frozenset(item for item in diffed.split(b"\0") if item)
+        tags[path] = tag
     untracked: list[bytes] = []
-    for item in _git(repo, "ls-files", "-z", "--others", "--exclude-standard").stdout.split(
-        b"\0"
-    ):
+    others = _git(repo, "ls-files", "-z", "--others", "--exclude-standard", deadline=deadline)
+    for item in others.stdout.split(b"\0"):
         if not item:
             continue
         if item.endswith(b"/"):
             raise WorkspaceSnapshotError(
-                f"workspace path {_display(item.rstrip(b'/'))!r} is an untracked nested "
-                "repository"
+                f"workspace path {_display(item.rstrip(b'/'))!r} is an untracked nested repository"
             )
         untracked.append(item)
 
@@ -677,39 +686,32 @@ def _observe(
     try:
         records: dict[bytes, _Record] = {}
         for path in candidates:
-            entry = index.get(path)
+            _check_deadline(deadline)
+            record = _record(root_fd, path, _gitlink(path, index, base), object_format, deadline)
             kept = base.get(path)
-            read_by_git = entry is not None and entry[0] != _GITLINK_MODE and path not in flagged
-            if read_by_git and path not in listed and kept is not None:
-                records[path] = ("kept", *kept)
-                continue
-            record = _record(root_fd, path, _gitlink(path, index, base), object_format)
-            if read_by_git and path not in listed:
-                if record not in (_ABSENT, _DIRECTORY):
-                    raise WorkspaceSnapshotError(
-                        f"git diff does not list workspace path {_display(path)!r}, which the "
-                        "prepared base lacks"
-                    )
-            elif record == _ABSENT and path in skip_worktree and kept is not None and entry == kept:
+            if (
+                record == _ABSENT
+                and tags.get(path) in _SKIP_WORKTREE_TAGS
+                and kept is not None
+                and index.get(path) == kept
+            ):
                 record = ("kept", *kept)
-            elif read_by_git and record[0] == "file":
-                record = ("clean", *record[1:])
             records[path] = record
     finally:
         os.close(root_fd)
-    return _Observation(index=index, untracked=tuple(untracked), listed=listed, records=records)
+    return _Observation(index=index, tags=tags, untracked=tuple(untracked), records=records)
 
 
 def _desired_entries(records: Mapping[bytes, _Record]) -> dict[bytes, tuple[str, str]]:
     """The tree the observed files describe: path to (mode, object id).
 
-    A ``clean`` record still carries its raw blob id here; the capture replaces
-    it with git's clean conversion before deciding what changed.
+    A regular file carries the blob id of its raw bytes here; ``build_candidate``
+    replaces it with git's clean form where git reads the file.
     """
 
     desired: dict[bytes, tuple[str, str]] = {}
     for path, record in records.items():
-        if record[0] in ("file", "clean", "kept"):
+        if record[0] in ("file", "kept"):
             desired[path] = (record[1], record[2])
         elif record[0] == "symlink":
             desired[path] = (_SYMLINK_MODE, record[1])
@@ -718,23 +720,69 @@ def _desired_entries(records: Mapping[bytes, _Record]) -> dict[bytes, tuple[str,
     return desired
 
 
-def _publishable_path(
-    raw: bytes, entries: tuple[tuple[str, str] | None, tuple[str, str] | None]
-) -> str:
+def _candidate_path(raw: bytes) -> str:
+    """A changed path as text, refused unless it is UTF-8 and a safe repository path."""
+
     try:
         path = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise WorkspaceSnapshotError("workspace contains a non-UTF-8 path") from exc
     if _safe_repository_path(path) != path or "\n" in path:
         raise WorkspaceSnapshotError(f"unsafe patch path {path!r}")
-    if any(entry is not None and entry[0] in (_SYMLINK_MODE, _GITLINK_MODE) for entry in entries):
-        raise WorkspaceSnapshotError(f"workspace path {path!r} is not a regular file")
     return path
+
+
+def _regular_change(entries: tuple[tuple[str, str] | None, tuple[str, str] | None]) -> bool:
+    """Whether a change at a path involves only regular files (or their absence)."""
+
+    return not any(
+        entry is not None and entry[0] in (_SYMLINK_MODE, _GITLINK_MODE) for entry in entries
+    )
+
+
+def _write_symlink_blob(
+    repo: Path, path: bytes, oid: str, object_format: str, scratch: Path, deadline: float | None
+) -> None:
+    """Write a changed symlink's target to the scratch store, so C's patch can show it."""
+
+    parts = path.split(b"/")
+    try:
+        root_fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        raise WorkspaceSnapshotError("managed workspace directory is missing") from exc
+    try:
+        parent = _open_parent(root_fd, parts[:-1])
+        if parent is None:
+            raise WorkspaceSnapshotError(_CHANGED)
+        try:
+            target = os.readlink(parts[-1], dir_fd=parent)
+        finally:
+            os.close(parent)
+    except OSError as exc:
+        raise WorkspaceSnapshotError(_CHANGED) from exc
+    finally:
+        os.close(root_fd)
+    if _object_id(object_format, b"blob", target) != oid:
+        raise WorkspaceSnapshotError(_CHANGED)
+    written = _git(
+        repo,
+        "hash-object",
+        "-w",
+        "--no-filters",
+        "--stdin",
+        stdin=target,
+        env=_scratch_env(scratch),
+        deadline=deadline,
+    )
+    if written.stdout.decode("ascii", errors="replace").strip() != oid:
+        raise WorkspaceSnapshotError(_CHANGED)
 
 
 def _stdin_path(path: bytes) -> bytes:
     """A path as ``hash-object --stdin-paths`` reads it: a leading quote means C quoting."""
 
+    if b"\n" in path:
+        raise WorkspaceSnapshotError(f"unsafe patch path {_display(path)!r}")
     if not path.startswith(b'"'):
         return path
     return b'"' + path.replace(b"\\", b"\\\\").replace(b'"', b'\\"') + b'"'
@@ -749,103 +797,175 @@ def _scratch_env(scratch: Path) -> dict[str, str]:
     }
 
 
-def _clean_blob(repo: Path, path: bytes, record: _Record, object_format: str, scratch: Path) -> str:
-    """Write git's clean conversion of a ``clean`` record's file; its blob id.
+def _open_file(root_fd: int, path: bytes) -> int | None:
+    """Open a workspace file without following symlinks.
 
-    The file is read again without following symlinks and must still hash to
-    the record's raw blob id. ``git hash-object --stdin --path`` then applies
-    the conversion ``git diff`` applies to it (attributes, line endings and
-    clean filters) and writes the result to the scratch object directory. The
-    bytes are copied into the scratch directory while they are hashed, so git
-    converts exactly the bytes checked and no file is held in memory.
+    ``None`` when the path is absent or is not a regular file.
     """
 
     parts = path.split(b"/")
+    try:
+        parent = _open_parent(root_fd, parts[:-1])
+        if parent is None:
+            return None
+        try:
+            fd = os.open(
+                parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY, dir_fd=parent
+            )
+        finally:
+            os.close(parent)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.ENXIO):
+            return None
+        raise WorkspaceSnapshotError(
+            f"workspace path {_display(path)!r} could not be read"
+        ) from exc
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return None
+    return fd
+
+
+def _copy_file(fd: int, target: Path, object_format: str, deadline: float | None) -> str:
+    """Copy an open workspace file to ``target``; the blob id of the bytes copied."""
+
+    size = os.fstat(fd).st_size
+    digest = hashlib.new(object_format, usedforsecurity=False)
+    digest.update(b"blob %d\0" % size)
+    copied = 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("xb") as out:
+        while chunk := os.read(fd, _READ_CHUNK):
+            _check_deadline(deadline)
+            copied += len(chunk)
+            digest.update(chunk)
+            out.write(chunk)
+    if copied != size:
+        raise WorkspaceSnapshotError(_CHANGED)
+    return digest.hexdigest()
+
+
+def _clean_blobs(
+    repo: Path,
+    git_dir: str,
+    real_objects: Path,
+    paths: list[bytes],
+    records: Mapping[bytes, _Record],
+    object_format: str,
+    scratch: Path,
+    deadline: float | None,
+) -> list[str]:
+    """git's canonical clean form of each path's final bytes on disk, written to scratch.
+
+    Each file is copied into ``<scratch>/worktree`` without following symlinks
+    and must still be the bytes observed. Every ``.gitattributes`` that is a
+    regular file on disk in the root or an ancestor directory of those paths is
+    copied too; git skips any other kind. One ``git add --renormalize`` then
+    runs against the real git directory with the scratch copy as its work tree
+    and a scratch copy of the real index as its index, so git applies the
+    attributes, line endings and clean filters it applies in ``git diff``,
+    including its fallback to a ``.gitattributes`` kept in the index (``git
+    hash-object`` never reads the index, so it would miss that fallback).
+    Objects are written to the scratch object directory; the real index and
+    objects are only read.
+    """
+
+    worktree = scratch / "worktree"
+    worktree.mkdir()
+    attributes: dict[bytes, None] = {}
+    for path in paths:
+        parts = path.split(b"/")
+        for depth in range(len(parts)):
+            attributes[b"/".join([*parts[:depth], b".gitattributes"])] = None
+    converted = set(paths)
     try:
         root_fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY)
     except OSError as exc:
         raise WorkspaceSnapshotError("managed workspace directory is missing") from exc
     try:
-        parent = _open_parent(root_fd, parts[:-1])
-        if parent is None:
-            raise WorkspaceSnapshotError(_CHANGED)
-        try:
-            fd = os.open(
-                parts[-1],
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY,
-                dir_fd=parent,
-            )
-        finally:
-            os.close(parent)
-    except OSError as exc:
-        if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
-            raise WorkspaceSnapshotError(_CHANGED) from exc
-        raise WorkspaceSnapshotError(
-            f"workspace path {_display(path)!r} could not be read"
-        ) from exc
+        for path in [*paths, *(name for name in attributes if name not in converted)]:
+            _check_deadline(deadline)
+            fd = _open_file(root_fd, path)
+            if fd is None:
+                if path in converted:
+                    raise WorkspaceSnapshotError(_CHANGED)
+                continue
+            try:
+                copied = _copy_file(fd, worktree / os.fsdecode(path), object_format, deadline)
+            except OSError as exc:
+                raise WorkspaceSnapshotError(
+                    f"workspace path {_display(path)!r} could not be read"
+                ) from exc
+            finally:
+                os.close(fd)
+            if path in converted and copied != records[path][2]:
+                raise WorkspaceSnapshotError(_CHANGED)
     finally:
         os.close(root_fd)
-    copy = scratch / "clean-input"
+    real_index = repo / os.fsdecode(
+        _git(repo, "rev-parse", "--git-path", "index", deadline=deadline).stdout.rstrip(b"\n")
+    )
+    clean_index = scratch / "clean-index"
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise WorkspaceSnapshotError(_CHANGED)
-        digest = hashlib.new(object_format, usedforsecurity=False)
-        digest.update(b"blob %d\0" % info.st_size)
-        read = 0
-        out = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-        try:
-            while chunk := os.read(fd, _READ_CHUNK):
-                read += len(chunk)
-                digest.update(chunk)
-                os.write(out, chunk)
-        finally:
-            os.close(out)
+        shutil.copyfile(real_index, clean_index)
     except OSError as exc:
-        raise WorkspaceSnapshotError(
-            f"workspace path {_display(path)!r} could not be read"
-        ) from exc
-    finally:
-        os.close(fd)
-    if read != info.st_size or digest.hexdigest() != record[2]:
-        raise WorkspaceSnapshotError(_CHANGED)
-    with copy.open("rb") as checked:
-        printed = (
-            _git(
-                repo,
-                "hash-object",
-                "-w",
-                "--stdin",
-                f"--path={os.fsdecode(path)}",
-                stdin=checked,
-                env=_scratch_env(scratch),
-            )
-            .stdout.decode("ascii", errors="replace")
-            .strip()
-        )
-    if len(printed) != _OID_LENGTH[object_format] or not _OID_RE.fullmatch(printed):
+        raise WorkspaceSnapshotError("the workspace index could not be read") from exc
+    env = {
+        "GIT_DIR": git_dir,
+        "GIT_WORK_TREE": str(worktree),
+        "GIT_INDEX_FILE": str(clean_index),
+        "GIT_OBJECT_DIRECTORY": str(scratch / "objects"),
+        # The index's .gitattributes blobs are read from the real store.
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(real_objects),
+        "GIT_LITERAL_PATHSPECS": "1",
+    }
+    # core.safecrlf only decides whether git refuses a conversion it would make;
+    # git diff never refuses, so the candidate must not either.
+    _git(
+        worktree,
+        "-c",
+        "core.safecrlf=false",
+        "add",
+        "--renormalize",
+        "--pathspec-from-file=-",
+        "--pathspec-file-nul",
+        stdin=b"".join(path + b"\0" for path in paths),
+        env=env,
+        deadline=deadline,
+    )
+    staged: dict[bytes, str] = {}
+    listed = _git(worktree, "ls-files", "-s", "-z", env=env, deadline=deadline).stdout
+    for item in filter(None, listed.split(b"\0")):
+        meta, separator, name = item.partition(b"\t")
+        fields = meta.decode("ascii", errors="replace").split(" ")
+        if not separator or len(fields) != 3:
+            raise WorkspaceSnapshotError("git listed a malformed index entry")
+        if name in converted:
+            staged[name] = fields[1]
+    blobs = [staged.get(path, "") for path in paths]
+    if any(
+        len(blob) != _OID_LENGTH[object_format] or not _OID_RE.fullmatch(blob) for blob in blobs
+    ):
         raise WorkspaceSnapshotError("git wrote an invalid blob id")
-    return printed
+    return blobs
 
 
-def _build_patch(
+def _write_tree(
     repo: Path,
     base_sha: str,
     desired: Mapping[bytes, tuple[str, str]],
     blobs: list[bytes],
     changed: list[bytes],
     scratch: Path,
-) -> bytes:
-    """Build tree C in the scratch index and object directory and diff it against P.
+    real_objects: Path,
+    deadline: float | None,
+) -> str:
+    """Build tree C in the scratch index and object directory; its id.
 
-    ``blobs`` are the changed files published as their raw bytes; every
-    ``clean`` conversion is already in the scratch object directory.
+    ``blobs`` are the changed files published as their raw bytes; every clean
+    form is already in the scratch object directory.
     """
 
-    objects_path = _git(repo, "rev-parse", "--git-path", "objects").stdout.decode(
-        "utf-8", errors="surrogateescape"
-    ).strip()
-    real_objects = (repo / objects_path).absolute()
     # Building C never consults the real store; only the diff reads it.
     isolated = _scratch_env(scratch)
     if blobs:
@@ -857,6 +977,7 @@ def _build_patch(
             "--stdin-paths",
             stdin=b"".join(_stdin_path(path) + b"\n" for path in blobs),
             env=isolated,
+            deadline=deadline,
         ).stdout
         if printed.split() != [desired[path][1].encode("ascii") for path in blobs]:
             raise WorkspaceSnapshotError(_CHANGED)
@@ -870,24 +991,47 @@ def _build_patch(
             for path, (mode, oid) in sorted(desired.items())
         ),
         env=isolated,
+        deadline=deadline,
     )
-    tree = _git(repo, "write-tree", "--missing-ok", env=isolated).stdout.decode(
-        "ascii", errors="replace"
-    ).strip()
+    tree = (
+        _git(repo, "write-tree", "--missing-ok", env=isolated, deadline=deadline)
+        .stdout.decode("ascii", errors="replace")
+        .strip()
+    )
     if len(tree) != len(base_sha) or not _OID_RE.fullmatch(tree):
         raise WorkspaceSnapshotError("git wrote an invalid snapshot tree id")
     with_base = {**isolated, "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(real_objects)}
     names = _git(
-        repo, "diff", "--no-renames", "--name-only", "-z", base_sha, tree, "--", env=with_base
+        repo,
+        *_DIFF_CONFIG,
+        "diff",
+        "--no-renames",
+        "--name-only",
+        "-z",
+        base_sha,
+        tree,
+        "--",
+        env=with_base,
+        deadline=deadline,
     ).stdout
     if sorted(name for name in names.split(b"\0") if name) != changed:
         raise WorkspaceSnapshotError("the snapshot tree does not match the observed workspace")
+    return tree
+
+
+def _render_patch(
+    repo: Path, base_sha: str, tree: str, scratch: Path, real_objects: Path, deadline: float | None
+) -> bytes:
+    """The binary patch from P to tree C, within ``MAX_PATCH_BYTES``."""
+
+    with_base = {**_scratch_env(scratch), "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(real_objects)}
     patch_file = scratch / "patch"
     with patch_file.open("wb") as handle:
         # Explicitly disabling rename detection represents a rename as one
         # deletion plus one addition, so both paths are disclosed.
         _git(
             repo,
+            *_DIFF_CONFIG,
             "diff",
             "--binary",
             "--full-index",
@@ -902,9 +1046,136 @@ def _build_patch(
             "--",
             env=with_base,
             stdout=handle,
+            deadline=deadline,
         )
     with patch_file.open("rb") as handle:
         return enforce_patch_cap(handle.read(MAX_PATCH_BYTES + 1))
+
+
+@dataclass(frozen=True)
+class WorkspaceCandidate:
+    """The canonical candidate C: the final publishable contents against P."""
+
+    base_sha: str
+    tree: str
+    changed_paths: tuple[str, ...]
+    patch: bytes | None
+    # Changed paths whose change involves a symlink or a gitlink; C shows them,
+    # and the publication capture refuses them.
+    unpublishable: tuple[str, ...] = ()
+
+
+def build_candidate(
+    workspace: str | Path,
+    base_sha: str,
+    *,
+    render_patch: bool = False,
+    deadline: float | None = None,
+) -> WorkspaceCandidate:
+    """Build the canonical candidate C for ``base_sha`` from the checkout's final files.
+
+    This is the one construction path: the runner capture publishes C and the
+    review gate binds review and approval to it. Every candidate path (P's
+    tree, the index and the untracked listing) is read from disk without
+    following symlinks; git's stat cache and git diff listings are never
+    trusted. An index entry git reads (not flagged skip-worktree or
+    assume-unchanged, not a gitlink) whose file differs from P's entry
+    publishes git's canonical clean form of the final bytes on disk; flagged
+    entries, P's paths missing from the index and untracked paths publish their
+    bytes on disk, unconverted. ``tree`` is C's tree id, ``changed_paths`` the
+    paths that differ from P, and ``patch`` the rendered binary patch when
+    ``render_patch`` is true, else ``None``.
+
+    ``deadline`` is a ``time.monotonic()`` value bounding every git call and
+    file read. Running out raises ``WorkspaceSnapshotError``, as does every
+    other failure; there is no partial result. No origin, ancestry or HEAD
+    check runs here.
+    """
+
+    repo = Path(workspace)
+    if not repo.is_dir():
+        raise WorkspaceSnapshotError("managed workspace directory is missing")
+    object_format = _verify_base(repo, base_sha, deadline=deadline)
+    located = _git(
+        repo, "rev-parse", "--show-toplevel", "--absolute-git-dir", deadline=deadline
+    ).stdout.split(b"\n")
+    if len(located) != 3 or located[2] or not located[0] or not located[1]:
+        raise WorkspaceSnapshotError("managed workspace is not a git checkout")
+    if os.path.realpath(os.fsdecode(located[0])) != os.path.realpath(repo):
+        raise WorkspaceSnapshotError("managed workspace is not the root of its git checkout")
+    git_dir = os.fsdecode(located[1])
+    objects_path = (
+        _git(repo, "rev-parse", "--git-path", "objects", deadline=deadline)
+        .stdout.decode("utf-8", errors="surrogateescape")
+        .strip()
+    )
+    real_objects = (repo / objects_path).absolute()
+
+    base = _tree_entries(repo, base_sha, deadline)
+    first = _observe(repo, base, object_format, deadline)
+    scratch = Path(tempfile.mkdtemp(prefix="curie-snapshot-"))
+    try:
+        (scratch / "objects").mkdir()
+        desired = _desired_entries(first.records)
+        # A file git reads whose raw bytes are not P's entry publishes git's
+        # clean form of them; one equal to P's entry is unchanged as it is.
+        convert = [
+            path
+            for path, record in first.records.items()
+            if record[0] == "file"
+            and path in first.index
+            and first.index[path][0] != _GITLINK_MODE
+            and not _flagged(first.tags[path])
+            and base.get(path) != desired[path]
+        ]
+        if convert:
+            clean = _clean_blobs(
+                repo,
+                git_dir,
+                real_objects,
+                convert,
+                first.records,
+                object_format,
+                scratch,
+                deadline,
+            )
+            for path, blob in zip(convert, clean, strict=True):
+                desired[path] = (desired[path][0], blob)
+        converted = set(convert)
+        changed = sorted(path for path in {*base, *desired} if base.get(path) != desired.get(path))
+        changed_paths = tuple(_candidate_path(path) for path in changed)
+        unpublishable = tuple(
+            text
+            for path, text in zip(changed, changed_paths, strict=True)
+            if not _regular_change((base.get(path), desired.get(path)))
+        )
+        for path in changed:
+            entry = desired.get(path)
+            if entry is not None and entry[0] == _SYMLINK_MODE:
+                _write_symlink_blob(repo, path, entry[1], object_format, scratch, deadline)
+        blobs = [
+            path for path in changed if first.records[path][0] == "file" and path not in converted
+        ]
+        tree = _write_tree(repo, base_sha, desired, blobs, changed, scratch, real_objects, deadline)
+        patch = (
+            _render_patch(repo, base_sha, tree, scratch, real_objects, deadline)
+            if render_patch
+            else None
+        )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    # Construction is several reads with no isolation between them. A write
+    # landing in between can change content the disclosed list omits, so
+    # observe again and refuse a moved workspace.
+    if _observe(repo, base, object_format, deadline) != first:
+        raise WorkspaceSnapshotError(_CHANGED)
+    return WorkspaceCandidate(
+        base_sha=base_sha,
+        tree=tree,
+        changed_paths=changed_paths,
+        patch=patch,
+        unpublishable=unpublishable,
+    )
 
 
 def capture_workspace_snapshot(
@@ -922,7 +1193,8 @@ def capture_workspace_snapshot(
     ``base_sha`` is the prepared commit P the worker retained for the thread;
     the result is always anchored there. HEAD must be P or a local descendant
     proven within ``MAX_ANCESTRY_COMMITS`` and ``MAX_ANCESTRY_BYTES``, else
-    ``WorkspaceHistoryError``.
+    ``WorkspaceHistoryError``. The patch is the canonical candidate C that
+    ``build_candidate`` renders.
 
     ``trusted_origin`` and ``repository_path`` are the boot env's
     ``CURIE_REPO_ORIGIN`` and ``CURIE_REPO_PATH`` (ADR 0197), which the worker
@@ -955,40 +1227,24 @@ def capture_workspace_snapshot(
         raise WorkspaceHistoryError(_NOT_DESCENDANT)
     _prove_descendant(repo, head, base_sha, object_format)
 
-    base = _tree_entries(repo, base_sha)
-    first = _observe(repo, base_sha, base, object_format)
-    scratch = Path(tempfile.mkdtemp(prefix="curie-snapshot-"))
-    try:
-        (scratch / "objects").mkdir()
-        desired = _desired_entries(first.records)
-        for path, record in first.records.items():
-            if record[0] == "clean":
-                desired[path] = (
-                    record[1],
-                    _clean_blob(repo, path, record, object_format, scratch),
-                )
-        # After the conversion, so a file whose clean form is P's is unchanged.
-        changed = sorted(path for path in {*base, *desired} if base.get(path) != desired.get(path))
-        changed_paths = tuple(
-            _publishable_path(path, (base.get(path), desired.get(path))) for path in changed
-        )
-        blobs = [path for path in changed if first.records[path][0] == "file"]
-        patch = _build_patch(repo, base_sha, desired, blobs, changed, scratch)
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-    # Capture is several reads with no isolation between them. A write landing
-    # in between can patch content the disclosed list omits, so observe again
-    # and refuse a moved workspace.
-    if _head(repo, len(base_sha)) != head or _observe(repo, base_sha, base, object_format) != first:
+    candidate = build_candidate(repo, base_sha, render_patch=True)
+    # HEAD must not have moved while C was built.
+    if _head(repo, len(base_sha)) != head:
         raise WorkspaceSnapshotError(_CHANGED)
-    validate_patch(patch)
+    if candidate.unpublishable:
+        raise WorkspaceSnapshotError(
+            f"workspace path {candidate.unpublishable[0]!r} is not a regular file"
+        )
+    if candidate.patch is None:
+        raise WorkspaceSnapshotError("the workspace candidate has no rendered patch")
+    patch = validate_patch(candidate.patch)
     return WorkspaceSnapshot(
         repo_full_name=actual_repo,
         base_sha=base_sha,
         patch=patch,
-        changed_paths=changed_paths,
+        changed_paths=candidate.changed_paths,
         contains_workflow_files=any(
-            path.startswith(".github/workflows/") for path in changed_paths
+            path.startswith(".github/workflows/") for path in candidate.changed_paths
         ),
         publication_title=publication_title,
         publication_body=publication_body,

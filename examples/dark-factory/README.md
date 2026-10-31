@@ -24,8 +24,9 @@ reviewer subagents check it on a stronger model. The skill walks nine phases:
 5. `failing_test`: write a failing test first where one is feasible.
 6. `implement`: make the smallest change and run the repository's own checks.
 7. `review_diff`: [`agents/diff-reviewer.md`](agents/diff-reviewer.md) reviews
-   the net change from the run's base commit against every criterion
-   (committed, staged, unstaged and untracked changes together), and approves it or sends it back
+   the rendered candidate patch, the net change from the run's base commit
+   exactly as it will be published (committed, staged, unstaged and untracked
+   changes together), against every criterion, and approves it or sends it back
    to `implement` (never to `plan`), for at most 5 completed rounds.
 8. `publish`: publish one pull request, or end with `Could not complete:` and
    the reason.
