@@ -4,7 +4,7 @@ import re
 import uuid
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, not_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -119,6 +119,17 @@ async def select_thread_publication_lineage(
             ThreadPublicationLineage.agent_id == agent_id,
             ThreadPublicationLineage.conversation_id == conversation_id,
             ThreadPublicationLineage.repo_full_name == repo_full_name,
+            # A retired never-pushed lineage is absent (#4948): its closed row
+            # pins nothing, so ordinary lookup and the next publication treat
+            # it as gone and open a fresh lineage at the re-admit base. A row
+            # that closed carrying a pull request is NOT filtered -- it stays
+            # terminal for every reader and writer.
+            not_(
+                and_(
+                    ThreadPublicationLineage.status == "closed",
+                    ThreadPublicationLineage.pr_number.is_(None),
+                )
+            ),
         )
         .order_by(ThreadPublicationLineage.created_at.desc())
         .limit(1)
@@ -127,6 +138,143 @@ async def select_thread_publication_lineage(
         statement = statement.with_for_update().execution_options(populate_existing=True)
     lineage: ThreadPublicationLineage | None = await session.scalar(statement)
     return lineage
+
+
+async def readmit_retirement_eligible(
+    session: AsyncSession,
+    lineage: ThreadPublicationLineage,
+) -> bool:
+    """Whether a re-admitted run may retire this never-pushed lineage (#4948).
+
+    True only when every fact that could still make the lineage matter is
+    absent: it is open and headless, it carried at least one publication, every
+    publication ended ``failed`` with its outcome already durable thread
+    history, and every one was the failed prior execution -- a terminal-failed
+    request of one specific live WorkItem on this thread's repository. A
+    pending or in-flight revision, an undurable outcome, an unknown or
+    non-failed execution, a cancelled WorkItem, a WorkItem of another thread,
+    or a mismatched repository each keeps the lineage in place.
+    """
+
+    if lineage.status != "open" or lineage.head_sha is not None or lineage.pr_number is not None:
+        return False
+    publications = (
+        await session.execute(
+            select(
+                Publication.status,
+                Publication.outcome_history_ready_at,
+                Publication.execution_request_id,
+            ).where(Publication.lineage_id == lineage.id)
+        )
+    ).all()
+    if not publications:
+        return False
+    request_ids: set[uuid.UUID] = set()
+    for status, outcome_ready_at, request_id in publications:
+        if status != "failed" or outcome_ready_at is None or request_id is None:
+            return False
+        request_ids.add(request_id)
+    executions = {
+        execution.id: execution
+        for execution in await session.scalars(
+            select(ExecutionRequest).where(ExecutionRequest.id.in_(request_ids))
+        )
+    }
+    if len(executions) != len(request_ids):
+        return False
+    item_ids: set[uuid.UUID] = set()
+    for execution in executions.values():
+        if execution.status != "failed" or execution.terminal_at is None:
+            return False
+        item_ids.add(execution.work_item_id)
+    if len(item_ids) != 1:
+        return False
+    item = await session.get(WorkItem, item_ids.pop())
+    if item is None or item.cancelled_at is not None:
+        return False
+    if item.agent_id != lineage.agent_id:
+        return False
+    if item.conversation_id not in await thread_key_forms(
+        session, lineage.agent_id, lineage.conversation_id
+    ):
+        return False
+    return item.repository_path.casefold() == lineage.repo_full_name.casefold()
+
+
+async def retire_abandoned_headless_lineage(
+    session: AsyncSession,
+    lineage: ThreadPublicationLineage,
+) -> ThreadPublicationLineage | None:
+    """Close one eligible never-pushed lineage under the writer's row lock (#4948).
+
+    The caller proves remote branch absence first. This re-proves eligibility
+    under the same ``FOR UPDATE`` lock `create_publication` takes, so a
+    publication writer admitted meanwhile serializes here and blocks the
+    close, and the close's compare-and-set refuses when the lineage version
+    moved at all during the remote read. Returns the row to answer with:
+    None when the lineage is now absent (the caller answers 404), otherwise
+    the current row, unchanged — or, when another reader retired the lineage
+    while we probed, whatever the filtered lookup answers with instead.
+    """
+
+    # Capture the version the caller read before the remote probe: the locked
+    # re-read below refreshes this very identity-mapped instance, so comparing
+    # against ``lineage.version`` after it would always match the fresh value
+    # and silently accept any concurrent bump.
+    expected_version = lineage.version
+    # Capture the lookup keys too: the rollback on a compare-and-set miss
+    # expires every persistent instance in this session, and touching an
+    # expired attribute afterwards would trigger implicit sync database I/O
+    # that the async session cannot run.
+    expected_agent_id = lineage.agent_id
+    expected_conversation_id = lineage.conversation_id
+    expected_repo_full_name = lineage.repo_full_name
+    locked = await session.scalar(
+        select(ThreadPublicationLineage)
+        .where(ThreadPublicationLineage.id == lineage.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if locked is None:
+        return None
+    if locked.status == "closed" and locked.pr_number is None:
+        # Another reader retired this never-pushed lineage while we probed.
+        # The retired row must read as absent (#4948), never as an answer, so
+        # the filtered lookup decides: a fresh replacement lineage, or None.
+        return await select_thread_publication_lineage(
+            session,
+            agent_id=expected_agent_id,
+            conversation_id=expected_conversation_id,
+            repo_full_name=expected_repo_full_name,
+        )
+    if not await readmit_retirement_eligible(session, locked):
+        return locked
+    changed = await session.execute(
+        update(ThreadPublicationLineage)
+        .where(
+            ThreadPublicationLineage.id == locked.id,
+            ThreadPublicationLineage.status == "open",
+            ThreadPublicationLineage.version == expected_version,
+            ThreadPublicationLineage.head_sha.is_(None),
+            ThreadPublicationLineage.pr_number.is_(None),
+        )
+        .values(
+            status="closed",
+            version=ThreadPublicationLineage.version + 1,
+            updated_at=func.now(),
+        )
+        .returning(ThreadPublicationLineage.id)
+    )
+    if changed.scalar_one_or_none() is None:
+        await session.rollback()
+        return await select_thread_publication_lineage(
+            session,
+            agent_id=expected_agent_id,
+            conversation_id=expected_conversation_id,
+            repo_full_name=expected_repo_full_name,
+        )
+    await session.commit()
+    return None
 
 
 async def get_thread_publication_lineage(
