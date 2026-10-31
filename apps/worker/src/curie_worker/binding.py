@@ -1292,8 +1292,7 @@ class BindingResolver:
         state_url = f"{base}/agents/{resolved.agent_id}/state"
         if not resolved.memory and kind is not None and address is not None:
             state_url = (
-                f"{base}/agents/{resolved.agent_id}/state/bindings/"
-                f"{quote(kind, safe='')}/{quote(address, safe='')}"
+                f"{base}/agents/{resolved.agent_id}/state/{binding_state_path(kind, address)}"
             )
         # Channel memory (#1461, ADR-0167): the agent's memory namespace scoped
         # to this turn's binding, on the same store. The boot-env memory token
@@ -1312,8 +1311,8 @@ class BindingResolver:
             and not (isolate_memory or is_eval_isolate_thread(thread_key))
         ):
             channel_memory_ref = (
-                f"{base}/agents/{resolved.agent_id}/state/bindings/"
-                f"{quote(kind, safe='')}/{quote(address, safe='')}/memory"
+                f"{base}/agents/{resolved.agent_id}/state/"
+                f"{binding_state_path(kind, address)}/memory"
             )
         # Mint scoped tokens (ADR-0033, #410) for this agent. Two scopes, because
         # the memory/history loaders and the bundle reach DIFFERENT namespaces:
@@ -1810,6 +1809,29 @@ def _channel_read_mint(payload: object) -> ChannelReadMint | None:
     return ChannelReadMint(
         token=token, generation=generation, expires_at=expires_at, turn_key=turn_key
     )
+
+
+def binding_address_text(address: str) -> str:
+    """A binding address with only ``%`` and ``/`` escaped, ``%`` first.
+
+    The API decodes the request path once before it routes and the address
+    segment once more (``routers/state.py`` ``_binding_address``). Escaping
+    ``/`` here keeps a GitHub ``owner/name`` in one segment through the first
+    decode; escaping ``%`` keeps a literal escape in an address from being
+    read by the second. Nothing else is escaped, so an address holding
+    neither character (a Slack channel, a mail address) is sent exactly as an
+    API that does not decode the segment again expects."""
+
+    return address.replace("%", "%25").replace("/", "%2F")
+
+
+def binding_state_path(kind: str, address: str) -> str:
+    """``bindings/<kind>/<address>`` under an agent's state API base, the
+    address as ``binding_address_text`` gives it, encoded as a path segment.
+    Encoded only once, an ``owner/name`` address had its ``%2F`` decoded
+    before routing and the path split at the slash."""
+
+    return f"bindings/{quote(kind, safe='')}/{quote(binding_address_text(address), safe='')}"
 
 
 def _binding_claim(kind: str | None, address: str | None) -> str | None:
