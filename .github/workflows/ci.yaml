@@ -4719,6 +4719,10 @@ jobs:
         run: |
           set -euo pipefail
           helm uninstall curie -n curie --wait --timeout 5m
+          # helm uninstall --wait returns while pods still terminate, and a
+          # worker may hold SIGTERM for its whole 1860 s grace. The namespace
+          # delete then waits on it. Nothing here asserts shutdown, so force.
+          kubectl delete pods --all -n curie --force --grace-period=0
           kubectl delete namespace curie --wait=true --timeout=300s
       # v0.8.4 deploys the dispatcher only when Slack tokens are set, and the
       # retained extraEnv timeout crash-loops the worker on this baseline
@@ -5033,6 +5037,10 @@ jobs:
           test -z "$negative_attester"
           echo "Released-upgrade assertion rejected the nil-unsafe mutant's blank attester as expected"
           helm uninstall curie-negative -n curie-negative --wait --timeout 5m
+          # helm uninstall --wait returns while pods still terminate, and a
+          # worker may hold SIGTERM for its whole 1860 s grace. The namespace
+          # delete then waits on it. Nothing here asserts shutdown, so force.
+          kubectl delete pods --all -n curie-negative --force --grace-period=0
           kubectl delete namespace curie-negative --wait=true --timeout=300s
       # #4889: a factory selected on the released-to-candidate upgrade gets the
       # full factory sandbox envelope on the live SandboxTemplate, keeps an
@@ -5079,6 +5087,10 @@ jobs:
             --context "$context" --namespace "$ns" --release "$release" \
             --agent acme-factory --workspace 18Gi
           helm uninstall "$release" -n "$ns" --wait --timeout 5m
+          # helm uninstall --wait returns while pods still terminate, and a
+          # worker may hold SIGTERM for its whole 1860 s grace. The namespace
+          # delete then waits on it. Nothing here asserts shutdown, so force.
+          kubectl delete pods --all -n "$ns" --force --grace-period=0
           kubectl delete namespace "$ns" --wait=true --timeout=300s
       - name: Dump negative control diagnostics on failure
         if: failure()
