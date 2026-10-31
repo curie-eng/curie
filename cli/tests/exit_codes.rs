@@ -25,7 +25,7 @@ const INVALID_API_URL: &str = "localhost:8000";
 const INVALID_RUNNER_URL: &str = "localhost:8787";
 const DOCKER_FAILURE_SENTINEL: &str = "curie-1655-docker-command-failure";
 
-const SNAPSHOT_DOCKER_FIXTURE: &str = r#"#!/usr/bin/python3
+const SNAPSHOT_DOCKER_FIXTURE: &str = r#"#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
@@ -289,7 +289,10 @@ fn run_demo(mode: &str, json: bool) -> Output {
     command
         .arg("try")
         .current_dir(scratch.path())
-        .env("PATH", &bin)
+        .env(
+            "PATH",
+            crate::support::executable::fixture_python_path(&bin),
+        )
         .env("TMPDIR", &demos)
         .env("CURIE_CONFIG_DIR", scratch.path().join("config"))
         .env("CURIE_TEST_DEMO_STATE", scratch.path())
@@ -582,7 +585,7 @@ fn run_invalid_runner_message(debug: bool) -> Output {
         .expect("run skill message with an invalid runner URL")
 }
 
-fn run_skill_up_with_path(debug: bool, path: &Path, name: &str) -> Output {
+fn run_skill_up_with_path(debug: bool, path: impl AsRef<std::ffi::OsStr>, name: &str) -> Output {
     let dir = tempfile::tempdir().expect("create plugin directory");
     curie::scaffold::scaffold(dir.path(), "acme-agent").expect("scaffold plugin");
     let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
@@ -1289,7 +1292,8 @@ fn skill_up_docker_command_failure_keeps_the_command_diagnosis() {
 fn skill_up_lost_name_race_keeps_the_specialized_replacement_remedy() {
     let container_name = "acme-1655-docker-name-race";
     let stub = executable_docker_lost_race_stub(container_name);
-    let human = run_skill_up_with_path(false, stub.path(), container_name);
+    let path = crate::support::executable::fixture_python_path(stub.path());
+    let human = run_skill_up_with_path(false, &path, container_name);
     let human_stderr = String::from_utf8_lossy(&human.stderr);
     assert_eq!(
         human.status.code(),

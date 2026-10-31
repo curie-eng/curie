@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """Recording helm/kubectl boundary for `curie cluster upgrade`.
 
 Installed under both names; dispatch is on ``sys.argv[0]``. Every invocation is

@@ -36,7 +36,46 @@ const FORBIDDEN_KIND_NAMES: &[&str] = &[
 // These tools substitute external processes and HTTP responses, never the
 // driver functions or parsers. Unknown API requests fail instead of reaching
 // another job's service at the driver's fixed ports.
-const TOOL_FIXTURE: &str = r#"#!/usr/bin/python3
+//
+// The launcher is named python3 and is first on PATH. An env shebang on that
+// file would resolve to itself. The shell skips its own directory, finds the
+// caller python, and runs the fixture for `python3 -`.
+const PYTHON_LAUNCHER: &str = r#"#!/bin/sh
+case $0 in
+  */*) here=$(CDPATH= cd -- "$(dirname "$0")" && pwd) || exit 126 ;;
+  *)
+    here=
+    IFS=:
+    for dir in $PATH; do
+      if [ -x "$dir/$0" ] && [ ! -d "$dir/$0" ]; then
+        here=$(CDPATH= cd -- "$dir" && pwd) || exit 126
+        break
+      fi
+    done
+    unset IFS
+    ;;
+esac
+real=
+IFS=:
+for dir in $PATH; do
+  [ "$dir" = "$here" ] && continue
+  if [ -x "$dir/python3" ] && [ ! -d "$dir/python3" ]; then
+    real=$dir/python3
+    break
+  fi
+done
+unset IFS
+if [ -z "$real" ]; then
+  echo "missing python3" >&2
+  exit 127
+fi
+if [ "${1-}" = "-" ]; then
+  exec "$real" "$here/py/python3" "$@"
+fi
+exec "$real" "$@"
+"#;
+
+const TOOL_FIXTURE: &str = r#"#!/usr/bin/env python3
 import io
 import json
 import os
@@ -88,7 +127,7 @@ def fixture_response(request, timeout):
 
 if tool == "python3":
     if not args or args[0] != "-":
-        os.execv("/usr/bin/python3", ["python3", *args])
+        os.execv(sys.executable, [sys.executable, *args])
     program = sys.stdin.read()
     if len(args) > 1 and args[1].startswith("http://"):
         urllib.request.urlopen = fixture_response
@@ -127,12 +166,21 @@ impl Driver {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("create driver fixture directory");
         fs::create_dir(dir.path().join("tmp")).expect("create private temporary directory");
-        for tool in ["kind", "kubectl", "helm", "curl", "python3"] {
+        fs::create_dir(dir.path().join("py")).expect("create off-path python fixture directory");
+        for tool in ["kind", "kubectl", "helm", "curl"] {
             let path = dir.path().join(tool);
             fs::write(&path, TOOL_FIXTURE).expect("write external tool fixture");
             fs::set_permissions(path, fs::Permissions::from_mode(0o755))
                 .expect("make external tool fixture executable");
         }
+        let interpreter = dir.path().join("py").join("python3");
+        fs::write(&interpreter, TOOL_FIXTURE).expect("write off-path python fixture");
+        fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o755))
+            .expect("make off-path python fixture executable");
+        let launcher = dir.path().join("python3");
+        fs::write(&launcher, PYTHON_LAUNCHER).expect("write python launcher");
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755))
+            .expect("make python launcher executable");
         Self { dir }
     }
 
