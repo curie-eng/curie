@@ -499,8 +499,9 @@ path, size, chunk = '$FILL_PATH', $FILL_BYTES, 1 << 20
 with open(path, 'wb') as handle:
     for _ in range(size // chunk):
         handle.write(os.urandom(chunk))
-    handle.flush()
-    os.fsync(handle.fileno())
+        handle.flush()
+        os.fsync(handle.fileno())
+        os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
 print(os.stat(path).st_size)
 "
 }

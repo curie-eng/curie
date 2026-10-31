@@ -76,6 +76,8 @@ mod connector_selection;
 mod connector_start_wait;
 mod connector_startup_events;
 mod console_login;
+#[cfg(target_os = "linux")]
+mod convergence_child_reaping;
 mod credential_resolution;
 mod cron_trigger_warning;
 mod curie_yaml_starter;
