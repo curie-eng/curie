@@ -943,8 +943,14 @@ def _clean_blobs(
     # identically from the scratch work tree.
     # git resolves these against its working directory, which differs in the
     # scratch work tree; the subprocess env comes from os.environ through
-    # shell_and_hook_env.
-    for variable in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG", "XDG_CONFIG_HOME", "HOME"):
+    # shell_and_hook_env. GIT_CONFIG affects only git config, so the discovery
+    # below would read a different config than check-attr and add.
+    if os.environ.get("GIT_CONFIG"):
+        raise WorkspaceSnapshotError(
+            "the git configuration path GIT_CONFIG is set; git config reads it but attribute "
+            "conversion does not, so the candidate cannot resolve its attributes the same way"
+        )
+    for variable in ("GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME", "HOME"):
         value = os.environ.get(variable)
         if value and not os.path.isabs(value):
             raise WorkspaceSnapshotError(
