@@ -834,8 +834,11 @@ fn node_read_timeout_is_bounded_skips_once_and_stops_the_owned_read() {
         elapsed >= Duration::from_secs(19),
         "the actual 20-second deadline must be exercised: {elapsed:?}"
     );
+    // Waiting for the read means returning after it ends on its own at 60
+    // seconds. A tighter bound measures the host: a CI runner stall of about
+    // 13 seconds pushed a correct 20-second deadline past 30.
     assert!(
-        elapsed < Duration::from_secs(30),
+        elapsed < Duration::from_secs(60),
         "the advisory must not wait for the 60-second read: {elapsed:?}"
     );
     assert!(

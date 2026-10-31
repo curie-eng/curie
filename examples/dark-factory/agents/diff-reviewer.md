@@ -31,6 +31,11 @@ Any changed path under `.github/` is a blocking finding, requested or not.
 This applies to any first path component that casefolds to `.github`,
 including `.GitHub/`. The factory cannot publish these changes.
 
+When your notes mention a branch, the base or the remote, name the local ref
+you read. A local ref is only as new as its last fetch, so never state what the
+remote holds. A claim about the remote in the verification table that rests
+only on a local ref is a blocking finding.
+
 Reply in exactly this shape and nothing else. The first line is always
 `REVIEWER: diff-reviewer`; it tells the caller the review really ran here.
 
