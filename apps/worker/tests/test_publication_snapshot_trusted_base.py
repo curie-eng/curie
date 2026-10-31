@@ -483,3 +483,29 @@ def test_a_change_committed_then_reverted_validates_as_an_empty_publication(
     _validate(_coordinator(prepared, archive), snapshot, tmp_path / "validation")
     tree, _ = _result(tmp_path / "result", archive, snapshot.patch)
     assert tree == _tree_of(repo, prepared)
+
+
+def test_a_line_a_checkout_clean_filter_hides_from_git_diff_is_published_and_validated(
+    tmp_path: Path,
+) -> None:
+    repo, prepared = _prepared(tmp_path)
+    archive = _archive(repo, prepared)
+    # A checkout-local clean filter drops every HIDDEN line from git's view of src/app.py.
+    _git(repo, "config", "filter.strip.clean", "grep -v HIDDEN || true")
+    _git(repo, "config", "filter.strip.smudge", "cat")
+    attributes = repo / ".git" / "info" / "attributes"
+    attributes.parent.mkdir(exist_ok=True)
+    attributes.write_text("src/app.py filter=strip\n")
+    final = b"x = 1\n# HIDDEN: published, but never shown by git diff\n"
+    _write(repo, "src/app.py", final)
+    assert _git(repo, "diff", "HEAD") == ""
+
+    snapshot = _snapshot_over_http(repo, prepared)
+
+    # The snapshot publishes the raw bytes, not git's filtered view of them.
+    assert snapshot.base_sha == prepared
+    assert snapshot.changed_paths == ("src/app.py",)
+    assert b"+# HIDDEN: published, but never shown by git diff" in snapshot.patch
+    _validate(_coordinator(prepared, archive), snapshot, tmp_path / "validation")
+    _, checkout = _result(tmp_path / "result", archive, snapshot.patch)
+    assert (checkout / "src" / "app.py").read_bytes() == final
