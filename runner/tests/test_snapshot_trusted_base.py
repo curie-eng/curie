@@ -417,6 +417,32 @@ def test_capture_leaves_the_agents_git_metadata_byte_identical(tmp_path: Path) -
     assert _git(repo, "status", "--porcelain=v1", "--untracked-files=all") == status
 
 
+def test_the_runner_git_config_environment_reaches_the_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The chart configures the runner's git through GIT_CONFIG_COUNT/KEY/VALUE
+    # (safe.directory for the mounted workspace). Here an excludes file stands in
+    # for it, so whether capture's git calls saw the setting shows in the result.
+    repo, prepared = _prepared(tmp_path)
+    excludes = tmp_path / "runner-excludes"
+    excludes.write_bytes(b"scratch.log\n")
+    _write(repo, "added.txt", b"added by the agent\n")
+    _write(repo, "scratch.log", b"excluded by the runner git config\n")
+
+    # Control: without the environment the untracked file is part of the candidate.
+    unconfigured = _capture(repo, prepared)
+    assert unconfigured.changed_paths == ("added.txt", "scratch.log")
+
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.excludesFile")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(excludes))
+    configured = _capture(repo, prepared)
+
+    assert configured.base_sha == prepared
+    assert configured.changed_paths == ("added.txt",)
+    assert b"excluded by the runner git config" not in configured.patch
+
+
 # --- history refusals -------------------------------------------------------------
 
 
