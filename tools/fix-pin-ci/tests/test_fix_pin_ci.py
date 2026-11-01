@@ -38,6 +38,7 @@ PR_TEMPLATE = REPO_ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md"
 BUG_REPORT = REPO_ROOT / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 VERIFY_FIX_PIN = REPO_ROOT / "cli" / "scripts" / "verify-fix-pin.sh"
+TEST_MODULE = REPO_ROOT / "tools" / "fix-pin-ci" / "tests" / "test_fix_pin_ci.py"
 
 VALID_SELECTOR = "apps/api/tests/test_fix_pin_ci_gate.py::test_exact_declaration"
 FACTORY_SELECTOR = (
@@ -1093,6 +1094,193 @@ def _fix_pin_job() -> tuple[dict[str, Any], list[dict[str, Any]]]:
     return job, [step for step in steps if isinstance(step, dict)]
 
 
+CI_DURATIONS_ARGUMENT = "--durations=25"
+REPORT_CHARS = set("fEsxXpPaAR")
+
+
+def _is_supported_reporting_argument(argument: str) -> bool:
+    """Whether the workflow command contract admits this reporting flag.
+
+    #2293 item 20: only a complete supported form may pass, validated the way
+    the pinned pytest CLI parses it. ``--durations`` takes an integer value,
+    ``--durations-min`` a float value, both only as ``--flag=value``, and ``-r``
+    a nonempty run of the report characters the pinned CLI documents. The old
+    ``--durations`` prefix match reported unknown suffixes, valueless flags and
+    malformed numbers green while the pinned parser exits 4 on them.
+    """
+    if argument.startswith("-r"):
+        return len(argument) > 2 and set(argument[2:]) <= REPORT_CHARS
+    option, separator, value = argument.partition("=")
+    if not separator or not value:
+        return False
+    if option == "--durations":
+        try:
+            int(value)
+        except ValueError:
+            return False
+        return True
+    if option == "--durations-min":
+        try:
+            float(value)
+        except ValueError:
+            return False
+        return True
+    return False
+
+
+def _runtime_exclusions() -> set[tuple[str, str]]:
+    """The exclusion arguments the full Python suite invocation must carry."""
+    exclusions = {("--ignore", module) for module in KIND_MODULES} | {
+        ("--deselect", ADMITTED_AGENT_SELECTOR.split("::", 1)[0]),
+        ("--ignore", "tools/factory-e2e/tests/test_c4_tracker_scope.py"),
+        ("--ignore", "examples/tests/test_sre_bot_observability_runtime.py"),
+        ("--ignore", "tools/factory-e2e/tests/test_c4_dry_run.py"),
+        ("--ignore", "tools/ci-retry-gate"),
+        ("--ignore", "tools/ci-workflow-paths"),
+        ("--ignore", "tools/ci-release-target-parity"),
+        ("--ignore", "tools/e2e-ci-selection"),
+        ("--ignore", "tools/helm-ci-gate"),
+        ("--ignore", "tools/fix-pin-ci"),
+        ("--ignore", "tools/p0-closes-ci"),
+        ("--ignore", "tools/runtime-assertion-gate"),
+        ("--ignore", "tools/dependency-audit-paths"),
+        ("--ignore", "tools/close-on-next"),
+    }
+    return exclusions | {
+        ("--ignore-glob", f"{path}/tests/*")
+        for option, path in exclusions
+        if option == "--ignore" and not path.endswith(".py")
+    }
+
+
+def _shard_pytest_boundary(document: dict[str, Any]) -> tuple[int, str, dict[str, str]]:
+    """The python-pytest job's pytest step: index, script and env bindings.
+
+    This is the reader boundary the reporting flag contract drives: the
+    committed workflow and every alternate artifact go through the same YAML
+    reader, step lookup and ``${{ }}`` binding resolution.
+    """
+    _, steps = _python_job(document, "python-pytest")
+    pytest_index = _single_step_index(
+        steps,
+        lambda step: step.get("id") == "pytest",
+        "normal Python suite",
+    )
+    pytest_step = steps[pytest_index]
+    pytest_script = _string(pytest_step, "run")
+    assert "${{" not in pytest_script
+    pytest_env = pytest_step.get("env")
+    assert isinstance(pytest_env, dict)
+    bindings: dict[str, str] = {}
+    for meaning, expression in {
+        "shard": "${{ matrix.shard }}",
+        "deselect": "${{ steps.python-runtime.outputs.pytest_deselect }}",
+        "scope": "${{ steps.python-runtime.outputs.pytest_scope }}",
+    }.items():
+        names = [name for name, value in pytest_env.items() if value == expression]
+        assert len(names) == 1, expression
+        bindings[meaning] = names[0]
+    return pytest_index, pytest_script, bindings
+
+
+def _recorded_pytest_commands(
+    pytest_script: str, bindings: dict[str, str]
+) -> list[tuple[list[str], int, str]]:
+    """Record the argv the pytest step hands uv, per shard and deselect.
+
+    The unmodified shell script runs with a recording ``uv`` shell function at
+    its command boundary, so each recorded argv is the full invocation the
+    workflow would hand to the pinned pytest CLI.
+    """
+    recorded = []
+    for shard in range(1, 7):
+        for deselect in ("", "examples/tests/test_sre_bot_observability_runtime.py"):
+            environment = {
+                **os.environ,
+                "BASH_FUNC_uv%%": "() { printf '%s\\0' \"$@\"; }",
+                bindings["shard"]: str(shard),
+                bindings["deselect"]: deselect,
+                bindings["scope"]: "full",
+            }
+            result = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", pytest_script],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            pytest_command = result.stdout.split("\0")
+            assert pytest_command.pop() == ""
+            recorded.append((pytest_command, shard, deselect))
+    return recorded
+
+
+def _assert_full_suite(command: list[str], shard: int, deselect: str) -> None:
+    """Assert a recorded argv is exactly the full Python suite invocation."""
+    assert command[:3] == ["run", "pytest", "-q"]
+    if deselect:
+        assert command.count("--deselect") == 1
+        assert command[-2:] == ["--deselect", deselect]
+        command = command[:-2]
+    distribution = [
+        "-n",
+        "4",
+        "--dist",
+        "loadgroup",
+        "--ci-shard",
+        f"{shard}/6",
+        "--reruns",
+        "1",
+    ]
+    extra = command[3:]
+    assert extra[: len(distribution)] == distribution
+    arguments = iter(extra[len(distribution) :])
+    excluded = []
+    reporting = []
+    for argument in arguments:
+        if argument in {"--ignore", "--ignore-glob", "--deselect"}:
+            path = next(arguments, None)
+            assert path is not None, f"{argument} requires a path"
+            excluded.append((argument, path))
+        elif argument.startswith(("--ignore=", "--ignore-glob=", "--deselect=")):
+            option, path = argument.split("=", 1)
+            excluded.append((option, path))
+        else:
+            reporting.append(argument)
+    runtime_exclusions = _runtime_exclusions()
+    assert len(excluded) == len(runtime_exclusions) and set(excluded) == runtime_exclusions, (
+        "the Python suite must use exactly the required runtime and CI policy exclusions, "
+        f"got {excluded!r}"
+    )
+    assert all(
+        _is_supported_reporting_argument(argument) for argument in reporting
+    ), f"the full Python suite permits only supported reporting flags, got {command!r}"
+
+
+def _write_alternate_ci_workflow(tmp_path: Path, reporting_argument: str) -> Path:
+    """Write an anonymous ci.yaml whose pytest step carries one new flag.
+
+    The mutation stays inside the python-pytest job's pytest_args line, so the
+    artifact differs from the committed workflow by that one reporting token:
+    the reader, the shard bindings and the runtime exclusions all still apply,
+    and no path under the repository's .github is touched.
+    """
+    original = CI_WORKFLOW.read_text(encoding="utf-8")
+    anchor = f'--ci-shard "$SHARD/6" --reruns 1 -rsR {CI_DURATIONS_ARGUMENT} '
+    assert anchor in original, "the pytest step must carry the reporting flag"
+    path = tmp_path / "ci.yaml"
+    path.write_text(
+        original.replace(
+            anchor,
+            anchor.replace(CI_DURATIONS_ARGUMENT, reporting_argument),
+            1,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it() -> None:
     """The suite and the gate are both required, and no longer in series.
 
@@ -1171,144 +1359,48 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         "shared database migration",
     )
     # Dedicated kind runtime modules run through their own CI callers.
-    pytest_index = _single_step_index(
-        steps,
-        lambda step: step.get("id") == "pytest",
-        "normal Python suite",
-    )
-    pytest_step = steps[pytest_index]
-    pytest_script = _string(pytest_step, "run")
-    assert "${{" not in pytest_script
-    pytest_env = pytest_step.get("env")
-    assert isinstance(pytest_env, dict)
-    bindings = {}
-    for meaning, expression in {
-        "shard": "${{ matrix.shard }}",
-        "deselect": "${{ steps.python-runtime.outputs.pytest_deselect }}",
-        "scope": "${{ steps.python-runtime.outputs.pytest_scope }}",
-    }.items():
-        names = [name for name, value in pytest_env.items() if value == expression]
-        assert len(names) == 1, expression
-        bindings[meaning] = names[0]
-    runtime_exclusions = {("--ignore", module) for module in KIND_MODULES} | {
-        ("--deselect", ADMITTED_AGENT_SELECTOR.split("::", 1)[0]),
-        ("--ignore", "tools/factory-e2e/tests/test_c4_tracker_scope.py"),
-        ("--ignore", "examples/tests/test_sre_bot_observability_runtime.py"),
-        ("--ignore", "tools/factory-e2e/tests/test_c4_dry_run.py"),
-        ("--ignore", "tools/ci-retry-gate"),
-        ("--ignore", "tools/ci-workflow-paths"),
-        ("--ignore", "tools/ci-release-target-parity"),
-        ("--ignore", "tools/e2e-ci-selection"),
-        ("--ignore", "tools/helm-ci-gate"),
-        ("--ignore", "tools/fix-pin-ci"),
-        ("--ignore", "tools/p0-closes-ci"),
-        ("--ignore", "tools/runtime-assertion-gate"),
-        ("--ignore", "tools/dependency-audit-paths"),
-        ("--ignore", "tools/close-on-next"),
-    }
-    runtime_exclusions |= {
-        ("--ignore-glob", f"{path}/tests/*")
-        for option, path in runtime_exclusions
-        if option == "--ignore" and not path.endswith(".py")
-    }
-
-    def assert_full_suite(command: list[str], shard: int, deselect: str) -> None:
-        assert command[:3] == ["run", "pytest", "-q"]
-        if deselect:
-            assert command.count("--deselect") == 1
-            assert command[-2:] == ["--deselect", deselect]
-            command = command[:-2]
-        distribution = [
-            "-n",
-            "4",
-            "--dist",
-            "loadgroup",
-            "--ci-shard",
-            f"{shard}/6",
-            "--reruns",
-            "1",
-        ]
-        extra = command[3:]
-        assert extra[: len(distribution)] == distribution
-        arguments = iter(extra[len(distribution) :])
-        excluded = []
-        reporting = []
+    pytest_index, pytest_script, bindings = _shard_pytest_boundary(document)
+    # Run the unmodified Bash with a recording uv function at its command
+    # boundary, then hold every recorded argv to the full suite contract.
+    recorded = _recorded_pytest_commands(pytest_script, bindings)
+    for pytest_command, shard, deselect in recorded:
+        _assert_full_suite(pytest_command, shard, deselect)
+    # Every mutation the contract must refuse, checked against a real
+    # recorded shard 1 command: selection changes, an unsupported reporting
+    # flag (#2293 item 20), and the exclusion-reduction and option-swap
+    # controls below.
+    pytest_command, _, _ = recorded[0]
+    runtime_exclusions = _runtime_exclusions()
+    for mutation in (
+        ["--ignore", "apps/api/tests"],
+        ["--ignore=apps/api/tests"],
+        ["--ignore-glob=*"],
+        ["--deselect=apps/api/tests"],
+        ["apps/api/tests/test_config.py"],
+        ["--durations-unsupported=30"],
+        list(sorted(runtime_exclusions)[0]),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_full_suite([*pytest_command, *mutation], 1, "")
+    for missing_option, missing_path in runtime_exclusions:
+        reduced: list[str] = []
+        arguments = iter(pytest_command)
         for argument in arguments:
             if argument in {"--ignore", "--ignore-glob", "--deselect"}:
-                path = next(arguments, None)
-                assert path is not None, f"{argument} requires a path"
-                excluded.append((argument, path))
-            elif argument.startswith(("--ignore=", "--ignore-glob=", "--deselect=")):
-                option, path = argument.split("=", 1)
-                excluded.append((option, path))
-            else:
-                reporting.append(argument)
-        assert len(excluded) == len(runtime_exclusions) and set(excluded) == runtime_exclusions, (
-            "the Python suite must use exactly the required runtime and CI policy exclusions, "
-            f"got {excluded!r}"
-        )
-        report_chars = set("fEsxXpPaAR")
-        assert all(
-            argument.startswith("--durations")
-            or (
-                argument.startswith("-r")
-                and len(argument) > 2
-                and set(argument[2:]) <= report_chars
-            )
-            for argument in reporting
-        ), f"the full Python suite permits only reporting flags, got {command!r}"
-
-    # Run the unmodified Bash with a recording uv function at its command boundary.
-    for shard in range(1, 7):
-        for deselect in ("", "examples/tests/test_sre_bot_observability_runtime.py"):
-            environment = {
-                **os.environ,
-                "BASH_FUNC_uv%%": "() { printf '%s\\0' \"$@\"; }",
-                bindings["shard"]: str(shard),
-                bindings["deselect"]: deselect,
-                bindings["scope"]: "full",
-            }
-            result = subprocess.run(
-                ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", pytest_script],
-                env=environment,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            assert result.returncode == 0, result.stdout + result.stderr
-            pytest_command = result.stdout.split("\0")
-            assert pytest_command.pop() == ""
-            assert_full_suite(pytest_command, shard, deselect)
-            if shard == 1 and not deselect:
-                for mutation in (
-                    ["--ignore", "apps/api/tests"],
-                    ["--ignore=apps/api/tests"],
-                    ["--ignore-glob=*"],
-                    ["--deselect=apps/api/tests"],
-                    ["apps/api/tests/test_config.py"],
-                    list(sorted(runtime_exclusions)[0]),
-                ):
-                    with pytest.raises(AssertionError):
-                        assert_full_suite([*pytest_command, *mutation], shard, deselect)
-                for missing_option, missing_path in runtime_exclusions:
-                    reduced: list[str] = []
-                    arguments = iter(pytest_command)
-                    for argument in arguments:
-                        if argument in {"--ignore", "--ignore-glob", "--deselect"}:
-                            path = next(arguments)
-                            if (argument, path) != (missing_option, missing_path):
-                                reduced.extend((argument, path))
-                        elif argument != f"{missing_option}={missing_path}":
-                            reduced.append(argument)
-                    with pytest.raises(AssertionError):
-                        assert_full_suite(reduced, shard, deselect)
-                    replaced = [
-                        *reduced,
-                        "--ignore" if missing_option == "--deselect" else "--deselect",
-                        missing_path,
-                    ]
-                    with pytest.raises(AssertionError):
-                        assert_full_suite(replaced, shard, deselect)
+                path = next(arguments)
+                if (argument, path) != (missing_option, missing_path):
+                    reduced.extend((argument, path))
+            elif argument != f"{missing_option}={missing_path}":
+                reduced.append(argument)
+        with pytest.raises(AssertionError):
+            _assert_full_suite(reduced, 1, "")
+        replaced = [
+            *reduced,
+            "--ignore" if missing_option == "--deselect" else "--deselect",
+            missing_path,
+        ]
+        with pytest.raises(AssertionError):
+            _assert_full_suite(replaced, 1, "")
     assert stack_index < migration_index < pytest_index
 
     # The half that keeps the win. Nothing about the gate may drift back into
@@ -1333,6 +1425,163 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     assert "failure()" in diagnostic_if
     assert "steps.python-runtime.outputs.pytest == 'true'" in diagnostic_if
     assert pytest_index < diagnostic_index
+
+
+@pytest.mark.parametrize(
+    "reporting_argument",
+    [
+        pytest.param(CI_DURATIONS_ARGUMENT, id="the-committed-duration"),
+        pytest.param("--durations=10", id="another-supported-duration"),
+        pytest.param("--durations-min=30", id="supported-minimum-duration"),
+        pytest.param("--durations-min=0.5", id="supported-fractional-minimum"),
+        pytest.param("-rsR", id="supported-report-characters"),
+    ],
+)
+def test_ci_reporting_argument_contract_accepts_supported_reporting_arguments(
+    tmp_path: Path, reporting_argument: str
+) -> None:
+    """The contract keeps admitting every supported reporting form.
+
+    Each form reaches the validator through the real workflow reader and the
+    real full-shell recording, from an alternate artifact that differs from
+    the committed workflow by that one reporting token. #2293 item 20: fixing
+    the false green must not stop the contract admitting what it legitimately
+    admitted, including the committed ``--durations=25``.
+    """
+    workflow = _write_alternate_ci_workflow(tmp_path, reporting_argument)
+    _, pytest_script, bindings = _shard_pytest_boundary(_load_workflow(workflow))
+    for pytest_command, shard, deselect in _recorded_pytest_commands(pytest_script, bindings):
+        _assert_full_suite(pytest_command, shard, deselect)
+
+
+@pytest.mark.parametrize(
+    "reporting_argument",
+    [
+        pytest.param("--durations-unsupported=30", id="unknown-duration-suffix"),
+        pytest.param("--durations", id="duration-without-a-value"),
+        pytest.param("--durations=", id="empty-duration-value"),
+        pytest.param("--durations=bad", id="malformed-duration-integer"),
+        pytest.param("--durations-min", id="minimum-without-a-value"),
+        pytest.param("--durations-min=bad", id="malformed-minimum-number"),
+        pytest.param("--maxfail=1", id="a-pytest-option-that-is-no-reporting-flag"),
+    ],
+)
+def test_ci_reporting_argument_contract_rejects_unsupported_reporting_arguments(
+    tmp_path: Path, reporting_argument: str
+) -> None:
+    """Unknown suffixes, missing values and malformed numbers stay refused.
+
+    #2293 item 20: the prefix match reported exactly these green while the
+    pinned pytest parser exits 4 on the same flags. Each one still reaches the
+    validator through the real reader and the real full-shell recording, so
+    the rejection is the workflow command contract's, not a copied command's.
+    """
+    workflow = _write_alternate_ci_workflow(tmp_path, reporting_argument)
+    _, pytest_script, bindings = _shard_pytest_boundary(_load_workflow(workflow))
+    recorded = _recorded_pytest_commands(pytest_script, bindings)
+    assert recorded, "the pytest step must record a command"
+    for pytest_command, shard, deselect in recorded:
+        with pytest.raises(AssertionError, match="reporting"):
+            _assert_full_suite(pytest_command, shard, deselect)
+
+
+def _pinned_pytest_collects(argv_tail: list[str]) -> subprocess.CompletedProcess[str]:
+    """Parse one argv tail with the pinned pytest CLI, collecting no test.
+
+    Collect-only selects this test module and executes no test, so the exit
+    code is the parser's verdict on the arguments alone. The subprocess runs
+    the same interpreter and pinned pytest the suite runs, no other binary.
+    """
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", *argv_tail],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+
+@pytest.mark.parametrize(
+    ("reporting_argument", "parser_exit", "parser_error", "admitted"),
+    [
+        pytest.param("--durations=25", 0, "", True, id="supported-duration"),
+        pytest.param("--durations-min=30", 0, "", True, id="supported-minimum-duration"),
+        pytest.param("--durations-min=0.5", 0, "", True, id="supported-fractional-minimum"),
+        pytest.param("-rsR", 0, "", True, id="supported-report-characters"),
+        pytest.param(
+            "--maxfail=1",
+            0,
+            "",
+            False,
+            id="parser-accepted-but-no-reporting-flag",
+        ),
+        pytest.param(
+            "--durations-unsupported=30",
+            4,
+            "unrecognized arguments",
+            False,
+            id="unknown-duration-suffix",
+        ),
+        pytest.param(
+            "--durations=bad",
+            4,
+            "invalid int value",
+            False,
+            id="malformed-duration-integer",
+        ),
+        pytest.param(
+            "--durations-min=bad",
+            4,
+            "invalid float value",
+            False,
+            id="malformed-minimum-number",
+        ),
+        pytest.param(
+            "--durations=",
+            4,
+            "invalid int value",
+            False,
+            id="empty-duration-value",
+        ),
+    ],
+)
+def test_ci_reporting_argument_parser_agreement(
+    reporting_argument: str, parser_exit: int, parser_error: str, admitted: bool
+) -> None:
+    """The contract admits exactly the reporting forms the parser admits.
+
+    Every example runs through the pinned pytest CLI in a bounded collect-only
+    subprocess, and the same example must get the verdict the table pins: the
+    supported forms pass the parser and the contract both, the malformed ones
+    fail both. ``--maxfail`` is the control in the other direction: the parser
+    accepts it, and the contract must still refuse it, because a pytest option
+    is not a reporting flag. #2293 item 20: the prefix match disagreed with the
+    parser on every malformed form here.
+    """
+    completed = _pinned_pytest_collects([reporting_argument, str(TEST_MODULE)])
+    assert completed.returncode == parser_exit, completed.stdout + completed.stderr
+    if parser_error:
+        assert parser_error in completed.stderr, completed.stderr
+    assert _is_supported_reporting_argument(reporting_argument) is admitted, (
+        f"the contract must {'admit' if admitted else 'refuse'} {reporting_argument!r}, "
+        "in agreement with the pinned parser"
+    )
+
+
+def test_ci_reporting_argument_parser_agreement_rejects_a_valueless_duration() -> None:
+    """A ``--durations`` without its value is a usage error, not a flag.
+
+    The valueless form only parses as a trailing token, so it cannot ride the
+    parametrize list: the parser must see it after the selected module. The
+    contract must refuse it exactly as the parser does.
+    """
+    completed = _pinned_pytest_collects([str(TEST_MODULE), "--durations"])
+    assert completed.returncode == 4, completed.stdout + completed.stderr
+    assert "expected one argument" in completed.stderr, completed.stderr
+    assert _is_supported_reporting_argument("--durations") is False, (
+        "the contract must refuse a duration flag without its value"
+    )
 
 
 def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
