@@ -30,6 +30,7 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 import factory_e2e as fe
+import kind_images
 import scripted_scenario as scenario
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -291,9 +292,16 @@ class ScriptedRun:
         # then refused, since cleanup would never measure the credit it spends.
         self.recording_closed = False
 
-    def check_disk(self, stage: str) -> None:
-        if shutil.disk_usage("/").free < 30 * 1024**3:
-            raise fe.ConfigError(f"{stage} requires at least 30 GB free disk")
+    def check_disk(self, stage: str, *, required_bytes: int = 30 * 1024**3) -> None:
+        free = shutil.disk_usage("/").free
+        print(
+            f"factory-e2e [{self.run_id}]: {stage} disk_free_bytes={free} "
+            f"disk_required_bytes={required_bytes}", file=sys.stderr, flush=True,
+        )
+        if free < required_bytes:
+            raise fe.ConfigError(
+                f"{stage} requires at least {required_bytes} bytes free disk; found {free}"
+            )
 
     def command(self, *argv: str, timeout: float = 900) -> str:
         # Print only the executable and operation. Remaining arguments can
@@ -481,7 +489,8 @@ class ScriptedRun:
         for binary in ("docker", "kind", "helm", "kubectl", "openssl", "git"):
             if shutil.which(binary) is None:
                 raise fe.ConfigError(f"missing required executable: {Path(binary).name}")
-        self.check_disk("scripted factory")
+        if self.args.build_images:
+            self.check_disk("building scripted factory")
         if "v0.24.0" not in self.command("kind", "version", timeout=30):
             raise fe.ConfigError("scripted factory requires kind v0.24.0")
         self.command("docker", "info", timeout=30)
@@ -512,6 +521,9 @@ class ScriptedRun:
                 raise fe.ConfigError(
                     f"local image {image} is missing; pass --build-images to build it"
                 ) from None
+        self.check_disk(
+            "scripted factory", required_bytes=kind_images.import_budget(self.command, IMAGES)
+        )
 
     def execute(self) -> None:
         self.prerequisites()
@@ -565,12 +577,10 @@ class ScriptedRun:
             stub_host=self.env.get("CURIE_LOCAL_STUB_HOST"),
             gateway=gateway,
         )
-        # Loading separately bounds kind's temporary Docker export to one
-        # image rather than a tar archive of all four candidate images.
-        for image in IMAGES:
-            self.check_disk("loading candidate image")
-            self.command("kind", "load", "docker-image", image, "--name", self.cluster, timeout=600)
-            self.check_disk("loaded candidate image")
+        required = kind_images.import_budget(self.command, IMAGES)
+        self.check_disk("loading candidate images", required_bytes=required)
+        kind_images.load_images(self.command, self.cluster, IMAGES)
+        self.check_disk("loaded candidate images", required_bytes=kind_images.RUNTIME_RESERVE_BYTES)
         # curie build resolves the runner base with buildx imagetools, which
         # reads a registry and never the local daemon, so the base goes to the
         # run's own registry before the chart names it.

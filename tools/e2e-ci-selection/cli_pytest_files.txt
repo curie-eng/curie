@@ -126,6 +126,7 @@ tools/factory-e2e/tests/test_forge_instance_harness.py
 tools/factory-e2e/tests/test_gitlab_acceptance.py
 tools/factory-e2e/tests/test_gitlab_driver.py
 tools/factory-e2e/tests/test_jira_driver.py
+tools/factory-e2e/tests/test_kind_images.py
 tools/factory-e2e/tests/test_recordings_hygiene.py
 tools/factory-e2e/tests/test_repo_runner.py
 tools/factory-e2e/tests/test_scripted_driver.py
