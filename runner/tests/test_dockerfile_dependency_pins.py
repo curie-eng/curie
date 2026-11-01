@@ -307,21 +307,24 @@ def _pip_requirement_operands(
     violations: list[Violation] = []
     cursor = 0
     while cursor < len(operands):
-        match = _PIP_REQUIREMENT_OPTION.fullmatch(operands[cursor])
+        option = operands[cursor]
+        match = _PIP_REQUIREMENT_OPTION.fullmatch(option)
         if match is None:
             cursor += 1
             continue
         path = match.group("long")
         if path is None:
-            path = match.group("short")
-        if path:
-            cursor += 1
-        elif cursor + 1 < len(operands) and not operands[cursor + 1].startswith("-"):
+            path = match.group("short") or None
+        if (
+            path is None
+            and cursor + 1 < len(operands)
+            and not operands[cursor + 1].startswith("-")
+        ):
             path = operands[cursor + 1]
-            cursor += 2
-        else:
-            violations.append(Violation(operands[cursor], _MISSING_REQUIREMENTS_ARGUMENT))
             cursor += 1
+        cursor += 1
+        if not path:
+            violations.append(Violation(option, _MISSING_REQUIREMENTS_ARGUMENT))
             continue
         requirements.append(path)
         if path not in _AUDITED_REQUIREMENT_PATHS:
@@ -1175,3 +1178,25 @@ def test_pip_requirement_files_fail_closed() -> None:
         "claude-agent-sdk", "pip install is missing an exact version"
     ) in violations
     assert Violation("aiohttp", "pip install is missing an exact version") in violations
+
+
+@pytest.mark.parametrize("path", (_BOOTSTRAP_REQUIREMENTS_PATH, _REQUIREMENTS_PATH))
+@pytest.mark.parametrize(
+    ("argument", "option"),
+    [
+        ("--requirement=", "--requirement="),
+        ("--requirement=''", "--requirement="),
+        ('--requirement=""', "--requirement="),
+        ("--requirement ''", "--requirement"),
+        ("-r ''", "-r"),
+    ],
+)
+def test_pip_requirement_files_fail_closed_for_empty_values(
+    path: str, argument: str, option: str
+) -> None:
+    lock_text = _UV_LOCK.read_text(encoding="utf-8")
+    dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
+    violations = _find_violations(
+        lock_text, f"{dockerfile}\nRUN pip install {argument} {path}\n"
+    )
+    assert Violation(option, "pip requirement option is missing an argument") in violations
