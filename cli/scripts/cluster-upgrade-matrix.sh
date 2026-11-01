@@ -1526,16 +1526,38 @@ retag_candidate_versions() {
     done
 }
 
+# The snapshotter the node's CRI plugin unpacks with, read the way kind reads it.
+kind_node_snapshotter() {
+    local node="$1"
+    docker exec "$node" containerd config dump | python3 -c '
+import sys, tomllib
+cri = tomllib.loads(sys.stdin.read()).get("plugins", {}).get("io.containerd.grpc.v1.cri", {})
+value = cri.get("containerd", {}).get("snapshotter")
+if not isinstance(value, str) or not value:
+    raise SystemExit("kind node " + sys.argv[1] + " containerd reports no CRI snapshotter")
+print(value)
+' "$node"
+}
+
+# kind's own image-archive import argv, streamed, plus --discard-unpacked-layers
+# (#5242). kind load keeps every uncompressed layer blob next to its unpacked
+# snapshot, doubling each image on the runner disk; the node's CRI config
+# already discards them for pulled images.
 load_kind_images() {
-    local platform archive status=0
+    local platform nodes node snapshotter
     platform="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')" || return $?
-    archive="$(mktemp "$WORKDIR/kind-images.XXXXXX.tar")" || return $?
-    docker image save --platform "$platform" --output "$archive" "$@" || status=$?
-    if (( status == 0 )); then
-        kind load image-archive "$archive" --name "$KIND_CLUSTER" || status=$?
+    nodes="$(kind get nodes --name "$KIND_CLUSTER")" || return $?
+    if [[ -z "$nodes" ]]; then
+        log "kind cluster $KIND_CLUSTER has no nodes to load images into"
+        return 1
     fi
-    rm -f "$archive"
-    return "$status"
+    for node in $nodes; do
+        snapshotter="$(kind_node_snapshotter "$node")" || return $?
+        docker image save --platform "$platform" "$@" \
+            | docker exec -i "$node" ctr --namespace=k8s.io images import \
+                --all-platforms --digests --snapshotter="$snapshotter" \
+                --discard-unpacked-layers - || return $?
+    done
 }
 
 load_tag_images() {
