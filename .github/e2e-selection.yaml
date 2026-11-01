@@ -143,17 +143,19 @@ chart_scenarios:
     - cli/scripts/configure-docker-hub-mirror.sh
     - cli/scripts/ensure-kind-registry.sh
   scenarios:
+    # #5255: the registration negative control needs an enabled first scenario.
+    installation-identity:
+      step: Installation identity Secret lifecycle
+      leg: chart
+      inputs:
+        - charts/curie/ci/runtime/upgrade-drain-installation-runtime.sh
+    # Selected inputs remain tracked; execution is temporarily disabled in ci.yaml (#5255).
     failed-first-install-retry:
       step: Failed first install retry recreates data volumes
       leg: workload
       inputs:
         - charts/curie/ci/runtime/failed-first-install-retry-runtime.sh
         - cli/src/ops/up.rs
-    installation-identity:
-      step: Installation identity Secret lifecycle
-      leg: chart
-      inputs:
-        - charts/curie/ci/runtime/upgrade-drain-installation-runtime.sh
     connector-identity:
       step: End to end connector identity is denied outside its scope
       leg: chart

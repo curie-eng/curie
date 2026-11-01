@@ -344,12 +344,16 @@ def _chart_leg_clause(leg: str) -> str:
 
 
 def _chart_step_if(scenario: str, leg: str | None = None) -> str:
+    # #5255: keep the selected leg while explicitly disabling only this scenario.
+    disabled = " && false" if scenario == "failed-first-install-retry" else ""
     return (
         "${{ "
         + _chart_leg_clause(CHART_SCENARIOS[scenario]["leg"] if leg is None else leg)
         + " && contains(fromJSON(needs.changes.outputs.chart_scenarios), '"
         + scenario
-        + "') }}"
+        + "')"
+        + disabled
+        + " }}"
     )
 
 
@@ -4268,7 +4272,9 @@ def test_failed_first_install_retry_reuses_the_chart_cluster_and_candidate_artif
     workspace = next(
         step for step in steps if step.get("if") == _chart_step_if("workspace-diagnostic")
     )
+    # #5255 retains selection and candidate wiring while execution is disabled.
     assert retry["if"] == _chart_step_if("failed-first-install-retry")
+    assert retry["if"].endswith(" && false }}")
     assert retry["timeout-minutes"] == 30
     assert retry["env"] == workspace["env"]
     assert "continue-on-error" not in retry

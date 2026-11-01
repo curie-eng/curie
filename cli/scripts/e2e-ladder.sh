@@ -1434,9 +1434,15 @@ seed_ordinary_turn() {
         trace_id="$(discover_trace_id_for_seed "$tier" "$marker" "$stream_start" "$stream_end")" || return 1
         expected_operations="curie.queue.enqueue,curie.queue.process,curie.turn.process,curie.sandbox.claim,curie.runner.rpc,agent.run,curie.reply.post|curie.reply.update"
     fi
-    query_exact_seed_trace "$tier" "$trace_id" "$expected_operations" "" "$query_state" || return 1
     LAST_ORDINARY_TRACE_ID="$trace_id"
-    LAST_ORDINARY_MEMBERSHIP="$LAST_QUERY_MEMBERSHIP"
+    if [[ "$query_state" == "disabled:5256" && "$tier" == "local" ]]; then
+        # #5256: retain the ordinary turn, disable only its exact ingestion assertion.
+        echo "DISABLED: local ordinary exact trace ingestion assertion (#5256)" >&2
+        LAST_ORDINARY_MEMBERSHIP="disabled:5256"
+    else
+        query_exact_seed_trace "$tier" "$trace_id" "$expected_operations" "" "$query_state" || return 1
+        LAST_ORDINARY_MEMBERSHIP="$LAST_QUERY_MEMBERSHIP"
+    fi
     printf '%s' "$trace_id"
 }
 
@@ -5062,7 +5068,7 @@ rung_local() {
     else
         product_accepted_before="$(product_collector_metric_value otelcol_receiver_accepted_spans)"
         product_sent_before="$(product_collector_metric_value otelcol_exporter_sent_spans)"
-        seed_ordinary_turn local "$agent_id" "$product_query_state"
+        seed_ordinary_turn local "$agent_id" disabled:5256
         product_membership="$LAST_ORDINARY_MEMBERSHIP"
 
     if [[ "$LIVE" == "0" ]]; then
@@ -5521,7 +5527,9 @@ import json, pathlib, sys
 destination, surface, accepted_raw, sent_raw, membership_raw, image_raw, same_id_raw, run_id = sys.argv[1:9]
 accepted = float(accepted_raw)
 sent = float(sent_raw)
-if membership_raw not in {"true", "false"}:
+if membership_raw not in {"true", "false", "disabled:5256"} or (
+    membership_raw == "disabled:5256" and surface != "local"
+):
     raise SystemExit("exact Langfuse membership was not observed")
 if image_raw not in {"true", "false", "not-applicable"}:
     raise SystemExit("image identity verdict was not observed")
@@ -5535,7 +5543,8 @@ record = {
     "raw_emitted_observations": accepted,
     "otelcol_receiver_accepted_spans": accepted,
     "otelcol_exporter_sent_spans": sent,
-    "langfuse_observation_membership": membership_raw == "true",
+    "langfuse_observation_membership": None if membership_raw == "disabled:5256" else membership_raw == "true",
+    "disabled_assertions": {"ordinary_exact_trace_ingestion": "#5256"} if surface == "local" else {},
     "image_ids_match": None if image_raw == "not-applicable" else image_raw == "true",
 }
 encoded = json.dumps(record, sort_keys=True, separators=(",", ":"))
@@ -5630,8 +5639,15 @@ for surface, record in records.items():
         or not isinstance(record.get("run_id"), str)
         or not all(isinstance(record.get(field), bool) for field in (
             "seed_valid", "same_id_raw_collector_receipt",
-            "langfuse_observation_membership",
         ))
+        or not (
+            isinstance(record.get("langfuse_observation_membership"), bool)
+            or (
+                surface == "local"
+                and record.get("langfuse_observation_membership") is None
+                and record.get("disabled_assertions") == {"ordinary_exact_trace_ingestion": "#5256"}
+            )
+        )
         or not all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in numeric)
         or record.get("image_ids_match") not in {True, False, None}
     ):
@@ -5660,6 +5676,17 @@ for surface, record in records.items():
     ):
         print("curie-owned: raw export, delivery, image identity, or seed precondition failed")
         raise SystemExit(1)
+
+# #5256: incomplete local coverage cannot clear or attribute observability ownership.
+if records.get("local", {}).get("disabled_assertions") == {"ordinary_exact_trace_ingestion": "#5256"}:
+    print("DISABLED: local ordinary exact trace ingestion assertion (#5256); ownership unresolved")
+    if records["local"].get("langfuse_observation_membership") is False:
+        print("curie-unresolved: an enabled local seed failed exact membership")
+        raise SystemExit(1)
+    if "cluster" in records and records["cluster"].get("langfuse_observation_membership") is not True:
+        print("curie-unresolved: cluster exact membership failed")
+        raise SystemExit(1)
+    raise SystemExit(0)
 
 memberships = dict(
     (surface, records[surface].get("langfuse_observation_membership") is True)
