@@ -1135,7 +1135,7 @@ def test_an_observation_without_a_pull_request_reads_no_pull(
 @pytest.mark.parametrize(
     ("status", "error", "reason"),
     [
-        (403, Unauthorized, "github_forbidden"),
+        (403, Unauthorized, "github_forbidden_list_check_runs"),
         (404, NotFound, "github_not_found"),
         (429, Unavailable, "github_rate_limited"),
         (502, Unavailable, "github_error"),
@@ -1151,6 +1151,42 @@ def test_observe_ci_failures_carry_a_fixed_reason(
         _with_ci_host(
             ci_credentials,
             lambda _request: httpx.Response(status, text="BODYTEXT ghs_secret"),
+            lambda host: host.observe_ci(_repository(), REVISION_HEAD),
+        )
+
+
+def test_a_status_read_403_is_attributed_to_the_combined_status_read(
+    ci_credentials: _CiCredentials,
+) -> None:
+    """#5222: the head check runs read succeeded, so the refusal is the statuses read.
+
+    https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-ref
+    documents a 403 for a read the App cannot make; the body is GitHub's own
+    "Resource not accessible by integration" text.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/check-runs"):
+            return httpx.Response(200, json={"total_count": 0, "check_runs": []})
+        return httpx.Response(403, json={"message": "Resource not accessible by integration"})
+
+    with pytest.raises(Unauthorized, match="^github_forbidden_get_combined_status$"):
+        _with_ci_host(
+            ci_credentials,
+            handler,
+            lambda host: host.observe_ci(_repository(), REVISION_HEAD),
+        )
+
+
+def test_a_check_runs_403_is_attributed_to_the_check_runs_read(
+    ci_credentials: _CiCredentials,
+) -> None:
+    """https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference"""
+
+    with pytest.raises(Unauthorized, match="^github_forbidden_list_check_runs$"):
+        _with_ci_host(
+            ci_credentials,
+            lambda _request: httpx.Response(403, json={"message": "refused"}),
             lambda host: host.observe_ci(_repository(), REVISION_HEAD),
         )
 
@@ -1454,3 +1490,69 @@ def test_required_checks_branch_not_found_is_unreadable() -> None:
             body,
         )
     assert str(refused.value) == "github_not_found"
+
+
+def test_required_checks_rules_forbidden_names_the_rules_read_and_returns_no_names() -> None:
+    """#5222: a refused rules read is never an empty required-check set.
+
+    https://docs.github.com/en/rest/branches/rules#get-rules-for-a-branch
+    """
+
+    branch = {"name": "main", "protection": {"required_status_checks": {"contexts": ["lint"]}}}
+
+    async def body(host: GitHubCodeHost) -> frozenset[str]:
+        return await host.required_checks(_repository(), "main")
+
+    with pytest.raises(Unauthorized) as refused:
+        _with_host(
+            _required_handler(
+                403,
+                {"message": "Resource not accessible by integration"},
+                branch_body=branch,
+            ),
+            body,
+        )
+    assert str(refused.value) == "github_forbidden_get_branch_rules"
+
+
+def test_required_checks_branch_forbidden_names_the_branch_read() -> None:
+    """https://docs.github.com/en/rest/branches/branches#get-a-branch"""
+
+    rules = [
+        {
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"context": "unit"}]},
+        }
+    ]
+
+    async def body(host: GitHubCodeHost) -> frozenset[str]:
+        return await host.required_checks(_repository(), "main")
+
+    with pytest.raises(Unauthorized) as refused:
+        _with_host(
+            _required_handler(200, rules, branch_status=403, branch_body={"message": "refused"}),
+            body,
+        )
+    assert str(refused.value) == "github_forbidden_get_branch"
+
+
+def test_a_refused_required_check_read_logs_only_fixed_refusal_fields(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#5222: the status comment and CI logs stay free of response bodies and paths."""
+
+    async def body(host: GitHubCodeHost) -> frozenset[str]:
+        return await host.required_checks(_repository(), "main")
+
+    with caplog.at_level(logging.WARNING, logger="curie_api.forges.github.code_host"):
+        with pytest.raises(Unauthorized):
+            _with_host(
+                _required_handler(403, {"message": f"forbidden {REPO} internal/path"}),
+                body,
+            )
+
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "status=403" in logged
+    assert "get_branch_rules" in logged
+    assert REPO not in logged
+    assert "internal/path" not in logged
