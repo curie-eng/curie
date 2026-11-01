@@ -209,9 +209,25 @@ def assert_reaches_shared_install(scenario: Scenario) -> None:
     assert all("--context" in call and "kind-acme-test" in call for call in calls), calls
     assert all("test-workload-12345-1" in call for call in calls), calls
     for call in calls:
-        if "delete" in call:
-            targets = call[call.index("delete") + 1:]
-            assert targets[0] in {"sandboxclaims", "sandboxes"}, call
+        assert not any(action in call for action in ("create", "apply")), call
+        assert "--all-namespaces" not in call and "-A" not in call, call
+        namespaces = [
+            call[index + 1] for index, argument in enumerate(call[:-1])
+            if argument in {"-n", "--namespace"}
+        ]
+        assert namespaces and namespaces[-1] == "test-workload-12345-1", call
+        if "delete" not in call:
+            continue
+        targets = call[call.index("delete") + 1:]
+        assert targets[0] in {"sandboxclaims", "sandboxes", "pods"}, call
+        if targets[0] == "pods":
+            assert "--all" not in targets, call
+            assert "-l" in targets, call
+            assert targets[targets.index("-l") + 1] == (
+                "app.kubernetes.io/component=runner-sandbox"
+            ), call
+        else:
+            assert "--all" in targets and "--wait=true" in targets, call
     assert not any(variable in output for variable in INPUTS), output
 
 

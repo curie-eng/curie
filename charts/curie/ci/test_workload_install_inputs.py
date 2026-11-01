@@ -31,6 +31,7 @@ CRDS = (
     "sandboxwarmpools.extensions.agents.x-k8s.io",
 )
 CLUSTER_OBJECTS = (
+    ("namespace", "test-workload-12345-1"),
     ("namespace", "agent-sandbox-system"),
     ("clusterrole", "agent-sandbox-controller"),
     ("clusterrole", "agent-sandbox-controller-extensions"),
@@ -50,6 +51,7 @@ CLUSTER_OBJECTS = (
 # https://github.com/kubernetes/kubernetes/blob/v1.31.0/pkg/controller/namespace/deletion/namespaced_resources_deleter.go
 # https://github.com/kubernetes/kubernetes/blob/v1.31.0/pkg/controller/namespace/namespace_controller.go
 TOOL_STUB = r"""
+import json
 import os
 import shlex
 import sqlite3
@@ -63,9 +65,10 @@ with Path(os.environ["WORKLOAD_TEST_CALL_LOG"]).open("a") as log:
 if os.environ.get("WORKLOAD_TEST_MODE") != "cluster":
     raise SystemExit(91)
 state = None
-if os.environ.get("WORKLOAD_TEST_STATEFUL_CLEANUP") == "1":
+if os.environ.get("WORKLOAD_TEST_MODE") == "cluster":
     state = sqlite3.connect(os.environ["WORKLOAD_TEST_CLUSTER_STATE"])
     state.executescript('''
+        CREATE TABLE IF NOT EXISTS objects (identity TEXT PRIMARY KEY, document TEXT);
         CREATE TABLE IF NOT EXISTS namespaces (
             name TEXT PRIMARY KEY,
             namespace_present INTEGER,
@@ -93,11 +96,52 @@ def record(action, namespace, pods_present):
 
 
 namespace = next(
-    (args[index + 1] for index, argument in enumerate(args[:-1])
-     if argument in {"-n", "--namespace"}),
+    (args[index + 1] for index in range(len(args) - 2, -1, -1)
+     if args[index] in {"-n", "--namespace"}),
     "default",
 )
 if tool == "kubectl":
+    if "create" in args or "apply" in args:
+        import yaml
+        filename = args[args.index("-f") + 1]
+        with open(filename) as source:
+            documents = list(yaml.safe_load_all(source))
+        for document in documents:
+            kind = document["kind"].lower()
+            metadata = document["metadata"]
+            name = metadata["name"]
+            state.execute(
+                "INSERT OR REPLACE INTO objects VALUES (?, ?)",
+                (f"{kind}/{name}", json.dumps(document)),
+            )
+            if kind == "namespace":
+                state.execute("INSERT OR REPLACE INTO namespaces VALUES (?, 1, 0, 0, 0)", (name,))
+        state.commit()
+        raise SystemExit(0)
+    if "label" in args or "annotate" in args:
+        action = "label" if "label" in args else "annotate"
+        tail = args[args.index(action) + 1:]
+        kind, separator, name = tail[0].partition("/")
+        if not separator:
+            name = tail[1]
+        row = state.execute(
+            "SELECT document FROM objects WHERE identity = ?", (f"{kind}/{name}",)
+        ).fetchone()
+        if row is None:
+            raise SystemExit(1)
+        document = json.loads(row[0])
+        key = "labels" if action == "label" else "annotations"
+        mapping = document["metadata"].setdefault(key, {})
+        for setting in tail[1:]:
+            if "=" in setting and not setting.startswith("-"):
+                key, value = setting.split("=", 1)
+                mapping[key] = value
+        state.execute(
+            "UPDATE objects SET document = ? WHERE identity = ?",
+            (json.dumps(document), f"{kind}/{name}"),
+        )
+        state.commit()
+        raise SystemExit(0)
     if "config" in args:
         if "current-context" in args or "get-contexts" in args:
             print(os.environ["CURIE_SCENARIO_CONTEXT"])
@@ -153,6 +197,9 @@ if tool == "kubectl":
                 ).fetchone()
                 if row is not None:
                     if action == "delete":
+                        state.execute(
+                            "DELETE FROM objects WHERE identity = ?", (f"namespace/{name}",)
+                        )
                         # Content can disappear while the pod-grace estimate
                         # still postpones the namespace's next reconciliation.
                         state.execute(
@@ -166,7 +213,18 @@ if tool == "kubectl":
                         record("namespace-wait", name, row[1])
                         raise SystemExit(1 if row[0] else 0)
                     if row[0]:
-                        print(f"namespace/{name}")
+                        if "json" in args or "-o=json" in args:
+                            document = state.execute(
+                                "SELECT document FROM objects WHERE identity = ?",
+                                (f"namespace/{name}",),
+                            ).fetchone()
+                            payload = (
+                                document[0] if document
+                                else json.dumps({"metadata": {"name": name}})
+                            )
+                            print(payload)
+                        else:
+                            print(f"namespace/{name}")
                         raise SystemExit(0)
                     ignore_missing = (
                         "--ignore-not-found" in args or "--ignore-not-found=true" in args
@@ -192,12 +250,28 @@ if tool == "kubectl":
         installed = Path(os.environ["WORKLOAD_TEST_INSTALL_MARKER"]).exists()
         present = identity == occupied or (installed and identity == remains)
         present |= kind == "customresourcedefinition" and name in retained
-        if present:
-            print(identity)
+        row = state.execute(
+            "SELECT document FROM objects WHERE identity = ?", (identity,)
+        ).fetchone()
+        if present or row:
+            if "json" in args or "-o=json" in args:
+                print(row[0] if row else json.dumps({"metadata": {"name": name}}))
+            else:
+                print(identity)
             raise SystemExit(0)
         ignore_missing = "--ignore-not-found" in args or "--ignore-not-found=true" in args
         raise SystemExit(0 if ignore_missing else 1)
-    if "delete" in args or "wait" in args:
+    if "delete" in args:
+        target = args[args.index("delete") + 1]
+        kind, separator, name = target.partition("/")
+        if not separator:
+            index = args.index(target)
+            name = args[index + 1] if len(args) > index + 1 else ""
+        kind = {"crd": "customresourcedefinition"}.get(kind, kind)
+        state.execute("DELETE FROM objects WHERE identity = ?", (f"{kind}/{name}",))
+        state.commit()
+        raise SystemExit(0)
+    if "wait" in args:
         raise SystemExit(0)
     raise SystemExit(92)
 if tool == "curie":
@@ -205,9 +279,45 @@ if tool == "curie":
         import json
         import yaml
         values_file = args[args.index("--values-file") + 1]
-        Path(os.environ["WORKLOAD_TEST_VALUES"]).write_text(json.dumps(yaml.safe_load(Path(values_file).read_text())))
+        values = yaml.safe_load(Path(values_file).read_text())
+        Path(os.environ["WORKLOAD_TEST_VALUES"]).write_text(json.dumps(values))
     Path(os.environ["WORKLOAD_TEST_INSTALL_MARKER"]).touch()
     if state is not None:
+        release = args[args.index("--release") + 1]
+        fullname = f"{release}-curie"
+        annotations = {
+            "meta.helm.sh/release-name": release,
+            "meta.helm.sh/release-namespace": namespace,
+        }
+        identities = [
+            "namespace/agent-sandbox-system",
+            "clusterrole/agent-sandbox-controller",
+            "clusterrole/agent-sandbox-controller-extensions",
+            "clusterrole/agent-sandbox-controller-networkpolicies-read",
+            "clusterrolebinding/agent-sandbox-controller",
+            "clusterrolebinding/agent-sandbox-controller-extensions",
+            "clusterrolebinding/agent-sandbox-controller-networkpolicies-read",
+            "priorityclass/curie-platform", "priorityclass/curie-sandbox",
+            f"namespace/{namespace}-{fullname}-publication",
+            f"validatingadmissionpolicy/{fullname}-runner-resources",
+            f"validatingadmissionpolicybinding/{fullname}-runner-resources",
+        ]
+        for crd in (
+            "sandboxes.agents.x-k8s.io", "sandboxclaims.extensions.agents.x-k8s.io",
+            "sandboxtemplates.extensions.agents.x-k8s.io",
+            "sandboxwarmpools.extensions.agents.x-k8s.io",
+        ):
+            if crd not in os.environ.get("WORKLOAD_TEST_EXISTING_CRDS", "").split(","):
+                identities.append(f"customresourcedefinition/{crd}")
+        for identity in identities:
+            kind, name = identity.split("/", 1)
+            document = {"metadata": {"name": name, "annotations": annotations}}
+            state.execute(
+                "INSERT OR REPLACE INTO objects VALUES (?, ?)",
+                (identity, json.dumps(document)),
+            )
+            if kind == "namespace":
+                state.execute("INSERT OR REPLACE INTO namespaces VALUES (?, 1, 0, 0, 0)", (name,))
         state.execute("INSERT OR REPLACE INTO namespaces VALUES (?, 1, 1, 0, 0)", (namespace,))
         record("partial-install", namespace, 1)
     raise SystemExit(93)
@@ -289,6 +399,7 @@ def scenario(tmp_path: Path) -> Scenario:
         "WORKLOAD_TEST_CALL_LOG": str(log),
         "WORKLOAD_TEST_INSTALL_MARKER": str(tmp_path / "installed"),
         "WORKLOAD_TEST_VALUES": str(tmp_path / "values.json"),
+        "WORKLOAD_TEST_CLUSTER_STATE": str(tmp_path / "cluster-state.sqlite3"),
         "CURIE_BIN": str(tools / "curie"),
         "CURIE_SCENARIO_CONTEXT": "kind-acme-test",
         "CURIE_SCENARIO_RUN_ID": "12345-1",
@@ -514,5 +625,52 @@ def test_down_refuses_missing_install_identity_before_tool_calls(
     completed = scenario.run("down")
     output = completed.stdout + completed.stderr
     assert completed.returncode != 0, output
-    assert any(line.startswith("FAIL:") and variable in line for line in output.splitlines()), output
+    assert any(
+        line.startswith("FAIL:") and variable in line for line in output.splitlines()
+    ), output
     assert scenario.calls() == []
+
+
+
+def test_failed_install_drains_claims_and_checks_publication_namespace_and_admission_policy(
+    scenario: Scenario,
+) -> None:
+    scenario.environment["WORKLOAD_TEST_MODE"] = "cluster"
+    completed = scenario.run()
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    calls = scenario.calls()
+    install_index = next(index for index, call in enumerate(calls) if call[0] == "curie")
+    cleanup = calls[install_index + 1:]
+    ordered = []
+    for tool, action, target in (
+        ("kubectl", "delete", "sandboxclaims"),
+        ("kubectl", "delete", "sandboxes"),
+        ("helm", "uninstall", "workload-12345-1"),
+        ("kubectl", "delete", "pods"),
+        ("kubectl", "delete", "namespace"),
+    ):
+        matches = [
+            call for call in cleanup if call[0] == tool and action in call and target in call
+        ]
+        if target == "pods":
+            matches = [
+                call for call in matches
+                if [call[index + 1] for index, item in enumerate(call[:-1])
+                    if item in {"-n", "--namespace"}][-1] == "test-workload-12345-1"
+            ]
+        assert len(matches) == 1, (tool, action, target, cleanup)
+        ordered.append(cleanup.index(matches[0]))
+        if action == "delete" and target in {"sandboxclaims", "sandboxes", "pods"}:
+            assert "--all" in matches[0] and "--wait=true" in matches[0], matches[0]
+            assert "test-workload-12345-1" in matches[0], matches[0]
+    assert ordered == sorted(ordered), cleanup
+    publication = "test-workload-12345-1-workload-12345-1-curie-publication"
+    for namespace in ("test-workload-12345-1", "agent-sandbox-system", publication):
+        matches = [call for call in cleanup if "wait" in call and f"namespace/{namespace}" in call]
+        assert len(matches) == 1, (namespace, cleanup)
+        assert "--for=delete" in matches[0], matches[0]
+    for kind in ("validatingadmissionpolicy", "validatingadmissionpolicybinding"):
+        assert any(
+            "get" in call and f"{kind}/workload-12345-1-curie-runner-resources" in call
+            for call in cleanup
+        ), (kind, cleanup)

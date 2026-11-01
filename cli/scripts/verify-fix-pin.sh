@@ -39,6 +39,7 @@ provision_run_id=
 provision_kubeconfig="$temp_root/kubeconfig"
 provision_cluster_owned=0
 provision_images=()
+workload_fixture_pending=0
 
 cleanup() {
   local status=$?
@@ -46,6 +47,11 @@ cleanup() {
   local remaining image
   trap - EXIT INT TERM
 
+  if (( workload_fixture_pending )); then
+    bash "$scratch/charts/curie/ci/scenarios/workload-install.sh" down \
+      >"$temp_root/workload-cleanup.log" 2>&1 || cleanup_status=1
+    workload_fixture_pending=0
+  fi
   if (( provision_cluster_owned )); then
     kind delete cluster --name "$provision_cluster" >/dev/null 2>&1 || cleanup_status=1
     remaining=$(kind get clusters 2>/dev/null) || cleanup_status=1
@@ -294,6 +300,25 @@ PY
     wait --for=condition=Ready node --all --timeout=300s || fail "Fix pin kind nodes are not ready"
 }
 
+is_workload_selector() {
+  case "$selector" in
+    charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh | \
+    charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh | \
+    charts/curie/ci/runtime/connector-secret-rotation-runtime.sh | \
+    charts/curie/ci/runtime/connector-apply-race-runtime.sh | \
+    charts/curie/ci/runtime/factory-resource-profile-runtime.sh) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+teardown_selector_phase() {
+  (( workload_fixture_pending )) || return 0
+  if ! bash "$scratch/charts/curie/ci/scenarios/workload-install.sh" down; then
+    return 1
+  fi
+  workload_fixture_pending=0
+}
+
 provision_selector_phase() {
   local phase=$1 component dockerfile image remaining
   local phase_images=()
@@ -301,6 +326,8 @@ provision_selector_phase() {
   export KUBECONFIG="$provision_kubeconfig"
   export CURIE_SCENARIO_CONTEXT="$provision_context"
   export CURIE_SCENARIO_RUN_ID="$provision_run_id-$phase"
+  export CURIE_SCENARIO_NAMESPACE="test-workload-$CURIE_SCENARIO_RUN_ID"
+  export CURIE_SCENARIO_RELEASE="workload-$CURIE_SCENARIO_RUN_ID"
   [[ "$chart_provision" == candidate-stack ]] || return 0
 
   echo "Building the $phase Fix pin candidate CLI and images"
@@ -329,6 +356,11 @@ provision_selector_phase() {
   export CURIE_SCENARIO_API_IMAGE="${phase_images[0]}"
   export CURIE_SCENARIO_WORKER_IMAGE="${phase_images[1]}"
   export CURIE_SCENARIO_RUNNER_IMAGE="${phase_images[2]}"
+  if is_workload_selector; then
+    workload_fixture_pending=1
+    bash "$scratch/charts/curie/ci/scenarios/workload-install.sh" up \
+      || fail "Fix pin $phase candidate workload installation failed"
+  fi
 }
 
 run_selector() {
@@ -602,12 +634,11 @@ PY
 
 provision_chart_cluster
 provision_selector_phase baseline
-if run_selector baseline >"$baseline_stdout" 2>"$baseline_stderr"; then
-  replay_selector_output "$baseline_stdout" "$baseline_stderr"
-else
-  replay_selector_output "$baseline_stdout" "$baseline_stderr"
-  fail "baseline selector is red: $selector"
-fi
+baseline_status=0
+run_selector baseline >"$baseline_stdout" 2>"$baseline_stderr" || baseline_status=$?
+teardown_selector_phase || fail "baseline candidate workload teardown failed"
+replay_selector_output "$baseline_stdout" "$baseline_stderr"
+(( baseline_status == 0 )) || fail "baseline selector is red: $selector"
 
 if [[ "$selector_kind" != chart ]]; then
   if ! git -C "$scratch" apply --check --reverse "--include=$selector_file" "$patch_file"; then
@@ -691,13 +722,14 @@ fi
 git -C "$scratch" apply --reverse "${include_args[@]}" "$patch_file"
 
 provision_selector_phase reversed
-if run_selector reversed >"$reversed_stdout" 2>"$reversed_stderr"; then
-  replay_selector_output "$reversed_stdout" "$reversed_stderr"
+reversed_status=0
+run_selector reversed >"$reversed_stdout" 2>"$reversed_stderr" || reversed_status=$?
+teardown_selector_phase || fail "reversed candidate workload teardown failed"
+replay_selector_output "$reversed_stdout" "$reversed_stderr"
+if (( reversed_status == 0 )); then
   echo "UNPINNED"
   exit 1
 fi
-
-replay_selector_output "$reversed_stdout" "$reversed_stderr"
 
 case "$selector_kind" in
   python)

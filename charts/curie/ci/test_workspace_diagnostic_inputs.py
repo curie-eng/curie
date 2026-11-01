@@ -54,7 +54,6 @@ class Scenario:
         return [shlex.split(line) for line in self.log.read_text().splitlines()]
 
 
-
 @pytest.fixture
 def scenario(tmp_path: Path) -> Scenario:
     tools = tmp_path / "tools"
@@ -154,8 +153,9 @@ def test_invalid_binary_fails_before_any_tool_call(
     assert_input_rejected(scenario, "CURIE_BIN")
 
 
-
-def test_valid_shared_install_reaches_workload_without_platform_mutation(scenario: Scenario) -> None:
+def test_valid_shared_install_reaches_workload_without_platform_mutation(
+    scenario: Scenario,
+) -> None:
     completed = scenario.run()
     assert completed.returncode != 0, "the workload boundary stub must stop the scenario"
     calls = scenario.calls()
@@ -163,7 +163,29 @@ def test_valid_shared_install_reaches_workload_without_platform_mutation(scenari
     assert all(call[0] == "kubectl" for call in calls), calls
     assert all("--context" in call and "kind-acme-test" in call for call in calls), calls
     assert all("test-workload-12345-1" in call for call in calls), calls
-    assert all(not any(action in call for action in ("create", "apply", "delete")) for call in calls), calls
+    for call in calls:
+        assert not any(action in call for action in ("create", "apply")), call
+        assert "--all-namespaces" not in call and "-A" not in call, call
+        namespaces = [
+            call[index + 1] for index, argument in enumerate(call[:-1])
+            if argument in {"-n", "--namespace"}
+        ]
+        assert namespaces and namespaces[-1] == "test-workload-12345-1", call
+        if "delete" not in call:
+            continue
+        targets = call[call.index("delete") + 1:]
+        assert targets[0] in {"configmap", "sandboxclaims", "sandboxes", "pods"}, call
+        if targets[0] == "configmap":
+            assert targets[1] == "workspace-cold-start", call
+            assert all(argument.startswith("-") for argument in targets[2:]), call
+        elif targets[0] == "pods":
+            assert "--all" not in targets, call
+            assert "-l" in targets, call
+            assert targets[targets.index("-l") + 1] == (
+                "app.kubernetes.io/component=runner-sandbox"
+            ), call
+        else:
+            assert "--all" in targets and "--wait=true" in targets, call
 
 
 @pytest.mark.parametrize(
@@ -188,5 +210,7 @@ def test_every_shared_consumer_requires_its_install_identity_before_tool_calls(
     completed = scenario.run(SCRIPT.with_name(script_name))
     output = completed.stdout + completed.stderr
     assert completed.returncode != 0, output
-    assert any(line.startswith("FAIL:") and variable in line for line in output.splitlines()), output
-    assert scenario.calls() == [], "an incomplete shared install identity must fail before tool calls"
+    assert any(
+        line.startswith("FAIL:") and variable in line for line in output.splitlines()
+    ), output
+    assert scenario.calls() == [], "incomplete install identity must fail before tool calls"

@@ -149,12 +149,31 @@ passed=0
 recovery_500=0
 other_fail=0
 export TMPDIR="$workdir"
+run_iteration() (
+    fixture_pending=0
+    finish_iteration() {
+        local status=$?
+        trap - EXIT INT TERM
+        set +e
+        if (( fixture_pending )); then
+            bash "$repo_root/charts/curie/ci/scenarios/workload-install.sh" down || status=1
+        fi
+        exit "$status"
+    }
+    trap finish_iteration EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    fixture_pending=1
+    bash "$repo_root/charts/curie/ci/scenarios/workload-install.sh" up || exit 1
+    bash "$repo_root/charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh"
+)
 for (( iteration=1; iteration<=iterations; iteration++ )); do
     export CURIE_SCENARIO_RUN_ID="wsd-$run_prefix-$iteration"
+    export CURIE_SCENARIO_NAMESPACE="test-workload-$CURIE_SCENARIO_RUN_ID"
+    export CURIE_SCENARIO_RELEASE="workload-$CURIE_SCENARIO_RUN_ID"
     logfile="$workdir/iteration-$iteration.log"
     set +e
-    bash "$repo_root/charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh" \
-        2>&1 | tee "$logfile"
+    run_iteration 2>&1 | tee "$logfile"
     statuses=("${PIPESTATUS[@]}")
     set -e
     (( statuses[1] == 0 )) || fail "could not preserve scenario output"

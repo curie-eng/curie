@@ -3,8 +3,8 @@
 # object between the CLI's read and its create.
 # fix-pin-provision: candidate-stack
 # The caller supplies the candidate CLI, context, run id, and loaded images.
-# This scenario owns two namespaces, one Helm release, and one cluster scoped
-# ValidatingWebhookConfiguration, then removes them and verifies they are gone.
+# This scenario owns a hold namespace and a cluster scoped admission webhook;
+# the caller owns the installed workload release.
 # The webhook forces the interleaving: the CLI's create of one connector
 # Service is held in admission until the reconciler's create of it commits.
 set -euo pipefail
@@ -13,21 +13,42 @@ umask 077
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 for variable in CURIE_BIN CURIE_SCENARIO_CONTEXT CURIE_SCENARIO_RUN_ID \
-    CURIE_SCENARIO_API_IMAGE CURIE_SCENARIO_WORKER_IMAGE CURIE_SCENARIO_RUNNER_IMAGE; do
+    CURIE_SCENARIO_API_IMAGE CURIE_SCENARIO_WORKER_IMAGE CURIE_SCENARIO_RUNNER_IMAGE \
+    CURIE_SCENARIO_NAMESPACE CURIE_SCENARIO_RELEASE; do
     [[ -n "${!variable:-}" ]] || fail "$variable is required"
 done
 [[ -f "$CURIE_BIN" && -x "$CURIE_BIN" ]] || fail "CURIE_BIN must name an executable curie binary"
 command -v python3 >/dev/null || fail "required executable is unavailable: python3"
 python3 - <<'PY'
-import os, pathlib, re, sys
+import os
+import pathlib
+import re
+import sys
+
+
 def fail(variable, reason):
     print(f"FAIL: {variable} {reason}", file=sys.stderr)
     raise SystemExit(1)
+
+
 context = os.environ["CURIE_SCENARIO_CONTEXT"]
 if re.search(r"[\s\x00-\x1f\x7f]", context) or context.startswith("-"):
     fail("CURIE_SCENARIO_CONTEXT", "must name one kubeconfig context")
-if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", os.environ["CURIE_SCENARIO_RUN_ID"]):
-    fail("CURIE_SCENARIO_RUN_ID", "must be a short dns token")
+if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,24}", os.environ["CURIE_SCENARIO_RUN_ID"]):
+    fail("CURIE_SCENARIO_RUN_ID", "must match ^[a-z0-9][a-z0-9-]{0,24}$")
+for variable, maximum in (("CURIE_SCENARIO_NAMESPACE", 63), ("CURIE_SCENARIO_RELEASE", 53)):
+    value = os.environ[variable]
+    if len(value) > maximum or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", value):
+        fail(variable, f"must be a DNS label of at most {maximum} characters")
+component = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+host_component = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+host = rf"(?:{host_component}(?:\.{host_component})*|\[[A-Fa-f0-9:]+\])(?::[0-9]+)?"
+repository = rf"(?:{host}/)?{component}(?:/{component})*"
+for variable in ("CURIE_SCENARIO_API_IMAGE", "CURIE_SCENARIO_WORKER_IMAGE", "CURIE_SCENARIO_RUNNER_IMAGE"):
+    image = os.environ[variable]
+    name, separator, tag = image.rpartition(":")
+    if not separator or not re.fullmatch(repository, name) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag):
+        fail(variable, "must be a repository:tag image reference")
 try:
     import yaml
 except ImportError:
@@ -38,26 +59,30 @@ for filename in dict.fromkeys(path for path in kubeconfig.split(os.pathsep) if p
     path = pathlib.Path(filename)
     if not path.exists():
         continue
-    config = yaml.safe_load(path.read_text()) or {}
-    entries = config.get("contexts", [])
-    if not isinstance(entries, list):
-        fail("CURIE_SCENARIO_CONTEXT", "cannot read the caller's kubeconfig contexts")
-    for entry in entries:
-        if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+    try:
+        config = yaml.safe_load(path.read_text()) or {}
+        entries = config.get("contexts", [])
+        if not isinstance(entries, list):
+            fail("CURIE_SCENARIO_CONTEXT", "cannot read the caller's kubeconfig contexts")
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+                fail("CURIE_SCENARIO_CONTEXT", "cannot read the caller's kubeconfig contexts")
             contexts.setdefault(entry["name"], entry.get("context"))
+    except (OSError, ValueError, AttributeError, yaml.YAMLError):
+        fail("CURIE_SCENARIO_CONTEXT", "cannot read the caller's kubeconfig")
 if not isinstance(contexts.get(context), dict):
     fail("CURIE_SCENARIO_CONTEXT", "is absent from the caller's kubeconfig")
 PY
-for command in kubectl helm docker kind openssl curl; do
+for command in kubectl docker openssl curl; do
     command -v "$command" >/dev/null || fail "required executable is unavailable: $command"
 done
 
 CONTEXT="$CURIE_SCENARIO_CONTEXT"
 RUN_ID="$CURIE_SCENARIO_RUN_ID"
-NAMESPACE="race-$RUN_ID"
-RELEASE="race-$RUN_ID"
+NAMESPACE="$CURIE_SCENARIO_NAMESPACE"
+RELEASE="$CURIE_SCENARIO_RELEASE"
 FULLNAME="$RELEASE-curie"
-AGENT="acme-bot"
+AGENT="acme-race"
 OWNER_SELECTOR="curie.dev/connector-owner=$AGENT"
 HOLD_NS="race-$RUN_ID-hold"
 WEBHOOK_CONFIG="connector-apply-race-$RUN_ID"
@@ -71,7 +96,7 @@ WORKDIR="$(mktemp -d)"
 CONNECTOR_DIGEST="busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
 CONNECTOR_IMAGE="busybox:1.36.1"
 API_PID=""
-OWNED=0
+AGENT_TOUCHED=0
 HOLD_OWNED=0
 
 kc() { kubectl --context "$CONTEXT" "$@"; }
@@ -95,41 +120,43 @@ PY
 }
 
 remove_hold() {
-    kc delete validatingwebhookconfiguration "$WEBHOOK_CONFIG" --ignore-not-found --wait=true \
-        >"$WORKDIR/vwc-delete.out" 2>"$WORKDIR/vwc-delete.err" || true
-    kc delete namespace "$HOLD_NS" --ignore-not-found --wait=true --timeout=180s \
-        >"$WORKDIR/hold-delete.out" 2>"$WORKDIR/hold-delete.err" || true
     local remaining=0
-    if kc get validatingwebhookconfiguration "$WEBHOOK_CONFIG" >/dev/null 2>&1; then
+    kc delete validatingwebhookconfiguration "$WEBHOOK_CONFIG" --ignore-not-found --wait=true --timeout=60s \
+        >"$WORKDIR/vwc-delete.out" 2>"$WORKDIR/vwc-delete.err" || remaining=1
+    local webhook
+    if ! webhook="$(kc get validatingwebhookconfiguration "$WEBHOOK_CONFIG" --ignore-not-found -o name \
+        2>"$WORKDIR/vwc-verify.err")"; then
+        echo "FAIL: could not verify owned ValidatingWebhookConfiguration deletion" >&2
+        remaining=1
+    elif [[ -n "$webhook" ]]; then
         echo "FAIL: owned ValidatingWebhookConfiguration remains" >&2
         remaining=1
     fi
-    if kc get namespace "$HOLD_NS" >/dev/null 2>&1; then
-        echo "FAIL: owned hold namespace remains" >&2
-        remaining=1
-    fi
-    return "$remaining"
+    (( remaining == 0 )) || return 1
+    kc delete namespace "$HOLD_NS" --ignore-not-found --wait=false \
+        >"$WORKDIR/hold-delete.out" 2>"$WORKDIR/hold-delete.err" || return 1
+    HOLD_OWNED=0
+    return 0
 }
 
 cleanup() {
     local status=$?
-    if [[ -n "$API_PID" ]]; then
-        kill "$API_PID" >/dev/null 2>&1 || true
-    fi
     # The webhook goes first: failurePolicy Fail must never outlive its pod.
     if (( HOLD_OWNED )); then
         remove_hold || status=1
     fi
-    if (( OWNED )); then
-        "$CURIE_BIN" cluster --context "$CONTEXT" down \
-            --namespace "$NAMESPACE" --release "$RELEASE" --yes \
-            >"$WORKDIR/down.out" 2>"$WORKDIR/down.err" || true
-        kc delete namespace "$NAMESPACE" --wait=true --timeout=180s \
-            >"$WORKDIR/ns-delete.out" 2>"$WORKDIR/ns-delete.err" || true
-        if kc get namespace "$NAMESPACE" >/dev/null 2>&1; then
-            echo "FAIL: owned namespace remains" >&2
-            status=1
-        fi
+    if (( AGENT_TOUCHED )); then
+        env CURIE_API_KEY="$API_KEY" "$CURIE_BIN" cluster --context "$CONTEXT" delete "$AGENT" --yes \
+            --namespace "$NAMESPACE" --release "$RELEASE" --api-url "http://127.0.0.1:$API_PORT" \
+            >"$WORKDIR/delete-agent.out" 2>"$WORKDIR/delete-agent.err" \
+            || { echo "FAIL: could not remove the scenario connector agent" >&2; status=1; }
+        kcn delete deployment,service,networkpolicy,secret -l "curie.dev/connector-owner=$AGENT" \
+            --ignore-not-found --wait=true --timeout=90s >"$WORKDIR/delete-connectors.out" 2>"$WORKDIR/delete-connectors.err" \
+            || { echo "FAIL: could not remove the scenario connector objects" >&2; status=1; }
+    fi
+    if [[ -n "$API_PID" ]]; then
+        kill "$API_PID" >/dev/null 2>&1 || true
+        wait "$API_PID" 2>/dev/null || true
     fi
     rm -rf "$WORKDIR"
     exit "$status"
@@ -138,7 +165,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for owned in "namespace $NAMESPACE" "namespace $HOLD_NS" \
+for owned in "namespace $HOLD_NS" \
     "validatingwebhookconfiguration $WEBHOOK_CONFIG"; do
     # shellcheck disable=SC2086
     if kc get $owned >/dev/null 2>&1; then
@@ -190,58 +217,29 @@ source "$SENTINEL_FILE"
 set +a
 
 CLUSTER="${CONTEXT#kind-}"
-# A one-line build drops the multi-arch index. kind and ctr both reject that
-# index when only one platform was pulled.
-printf 'FROM %s\n' "$CONNECTOR_DIGEST" | docker build --platform linux/amd64 \
-    --tag "$CONNECTOR_IMAGE" - >"$WORKDIR/pull.log" 2>&1 || {
-    sanitize "$WORKDIR/pull.log"
-    fail "could not pull the connector image"
-}
+# Keep the connector image in Docker's single-platform image format for import.
+# The second connector scenario reuses the first scenario's conversion.
+source_digest="$(docker image inspect "$CONNECTOR_IMAGE" \
+    --format '{{index .Config.Labels "curie.dev/connector-source"}}' 2>/dev/null || true)"
+if [[ "$source_digest" != "$CONNECTOR_DIGEST" ]]; then
+    printf 'FROM %s\nLABEL curie.dev/connector-source=%s\n' "$CONNECTOR_DIGEST" "$CONNECTOR_DIGEST" \
+        | docker build --platform linux/amd64 --tag "$CONNECTOR_IMAGE" - >"$WORKDIR/pull.log" 2>&1 || {
+        sanitize "$WORKDIR/pull.log"
+        fail "could not pull the connector image"
+    }
+fi
 docker save "$CONNECTOR_IMAGE" | docker exec -i "${CLUSTER}-control-plane" \
     ctr --namespace=k8s.io images import - >"$WORKDIR/load.log" 2>&1 || {
     sanitize "$WORKDIR/load.log"
     fail "could not load the connector image"
 }
 
-python3 -c 'import secrets; print(secrets.token_hex(24), end="")' >"$WORKDIR/api-key"
-chmod 600 "$WORKDIR/api-key"
+kcn get secret "$FULLNAME-secrets" -o jsonpath='{.data.apiKey}' \
+    | python3 -c 'import base64, sys; key=base64.b64decode(sys.stdin.read(), validate=True); assert key.strip(), "installed API key is empty"; sys.stdout.buffer.write(key)' \
+        >"$WORKDIR/api-key" || fail "could not read the installed API key"
 API_KEY="$(cat "$WORKDIR/api-key")"
 export API_KEY
 
-OWNED=1
-"$CURIE_BIN" cluster --context "$CONTEXT" up \
-    --namespace "$NAMESPACE" \
-    --release "$RELEASE" \
-    --chart "$CHART" \
-    --dev \
-    --fake-model \
-    --no-expose \
-    --set security.gvisor.mode=off \
-    --set dispatcher.deploy=false \
-    --set ui.deploy=false \
-    --set langfuse.deploy=false \
-    --set langfuse.host=langfuse.example.com \
-    --set clickhouse.deploy=false \
-    --set mailAdapter.deploy=false \
-    --set otelCollector.deploy=false \
-    --set otelCollector.telemetryDisabled=true \
-    --set "api.apiKey=${API_KEY}" \
-    --set worker.connectorReconciler.enabled=true \
-    --set worker.connectorReconciler.intervalSeconds=1 \
-    --set api.image.repository="${CURIE_SCENARIO_API_IMAGE%:*}" \
-    --set "api.image.tag=${CURIE_SCENARIO_API_IMAGE##*:}" \
-    --set api.image.pullPolicy=Never \
-    --set worker.image.repository="${CURIE_SCENARIO_WORKER_IMAGE%:*}" \
-    --set "worker.image.tag=${CURIE_SCENARIO_WORKER_IMAGE##*:}" \
-    --set worker.image.pullPolicy=Never \
-    --set agentSandbox.runner.image="${CURIE_SCENARIO_RUNNER_IMAGE%:*}" \
-    --set "agentSandbox.runner.tag=${CURIE_SCENARIO_RUNNER_IMAGE##*:}" \
-    --set agentSandbox.runner.imagePullPolicy=Never \
-    --set agentSandbox.runner.prewarm.imagePullPolicy=Never \
-    >"$WORKDIR/up.out" 2>"$WORKDIR/up.err" || {
-        sanitize "$WORKDIR/up.err"
-        fail "cluster up failed"
-    }
 kcn rollout status "deploy/${FULLNAME}-api" --timeout=300s >/dev/null
 kcn rollout status "deploy/${FULLNAME}-worker" --timeout=300s >/dev/null
 
@@ -259,6 +257,7 @@ done
 
 deploy() {
     local label="$1"
+    AGENT_TOUCHED=1
     # Pass the release key explicitly. A loopback --api-url would replace the
     # chart's default dev key with a stored local key.
     env "CURIE_API_KEY=$API_KEY" "$CURIE_BIN" --json cluster --context "$CONTEXT" deploy \

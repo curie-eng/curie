@@ -3530,6 +3530,9 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
     if: ${{ needs.changes.outputs.chart_scenarios != '[]' }}
+    env:
+      CURIE_SCENARIO_NAMESPACE: test-workload-${{ github.run_id }}-${{ github.run_attempt }}
+      CURIE_SCENARIO_RELEASE: workload-${{ github.run_id }}-${{ github.run_attempt }}
     strategy:
       fail-fast: false
       matrix:
@@ -3747,11 +3750,12 @@ jobs:
         if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-byo-egress') }}
         run: bash scripts/check-runner-byo-egress.sh charts/curie
       # The actual packaged-chart hooks must judge a no-restart upgrade and
-      # still reject an informer RBAC failure (#4197). The scenario owns and
-      # tears down its separate kind cluster; render assertions alone cannot
-      # prove Helm leaves a serving release deployed.
+      # still reject an informer RBAC failure (#4197). Its lifecycle release
+      # uses this job's cluster; render assertions cannot prove hook behavior.
       - name: Controller preflight accepts a serving upgrade and refuses broken RBAC
         if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'controller-preflight') }}
+        env:
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
         run: |
           set -euo pipefail
           uv run bash charts/curie/ci/scenarios/controller-preflight-kind.sh
@@ -3778,6 +3782,32 @@ jobs:
             curie-api:wsdiag-${{ github.sha }} \
             curie-worker:wsdiag-${{ github.sha }} \
             curie-runner:wsdiag-${{ github.sha }} --name curie-e2e
+      - name: Install the shared workload platform
+        id: workload_install
+        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile')) }}
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
+          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+        run: bash charts/curie/ci/scenarios/workload-install.sh up
+      - name: Quota progress regression
+        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
+        timeout-minutes: 30
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
+          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+        shell: uv run python tools/sandbox-admission-observer/run.py -- bash {0}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh
       - name: Workspace dependency failure reaches the terminal diagnostic
         if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') }}
         timeout-minutes: 30
@@ -3820,35 +3850,6 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/connector-apply-race-runtime.sh
-      - name: Quota progress regression
-        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
-        timeout-minutes: 30
-        env:
-          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
-          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
-          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
-        shell: uv run python tools/sandbox-admission-observer/run.py -- bash {0}
-        run: |
-          set -euo pipefail
-          bash tools/runtime-assertion-gate/run.sh \
-            charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh
-      - name: Failed first install retry recreates data volumes
-        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') }}
-        timeout-minutes: 30
-        env:
-          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
-          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
-          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
-        run: |
-          set -euo pipefail
-          bash tools/runtime-assertion-gate/run.sh \
-            charts/curie/ci/runtime/failed-first-install-retry-runtime.sh
       # #4889: a factory agent's real sandbox holds a 1280Mi workspace write for
       # at least 90 seconds, and the standard envelope evicts the same write.
       - name: Factory resource profile runtime (#4889)
@@ -3865,11 +3866,42 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/factory-resource-profile-runtime.sh
+      - name: Remove the shared workload platform
+        if: ${{ always() && matrix.leg == 'workload' && (steps.workload_install.outcome == 'success' || steps.workload_install.outcome == 'failure') }}
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
+          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+        run: bash charts/curie/ci/scenarios/workload-install.sh down
+      - name: Failed first install retry recreates data volumes
+        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') }}
+        timeout-minutes: 30
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
+          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/failed-first-install-retry-runtime.sh
       - name: Dump cluster diagnostics on failure
         if: failure()
         run: |
           kubectl get pods -A -o wide || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true
+      - name: Delete the job-owned kind cluster
+        if: always()
+        run: |
+          set -euo pipefail
+          kind delete cluster --name curie-e2e
+          remaining="$(docker ps -aq --filter label=io.x-k8s.kind.cluster=curie-e2e)"
+          test -z "$remaining"
       # Pass receipts written by tools/runtime-assertion-gate/run.sh. A script
       # that was skipped, never started, or failed leaves none, and
       # `E2E required` then fails for any added or changed one (#3391).

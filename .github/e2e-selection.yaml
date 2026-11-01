@@ -128,6 +128,9 @@ conditional_pytest_files:
     - .github/e2e-selection.yaml
     - tools/e2e-ci-selection
 chart_scenarios:
+  fixtures:
+    Install the shared workload platform: [bash, charts/curie/ci/scenarios/workload-install.sh, up]
+    Remove the shared workload platform: [bash, charts/curie/ci/scenarios/workload-install.sh, down]
   job: e2e-cluster-chart-regressions
   shared_inputs:
     - charts/curie/templates
@@ -144,6 +147,9 @@ chart_scenarios:
     - cli/scripts/ensure-kind-registry.sh
   scenarios:
     failed-first-install-retry:
+      pr_inputs:
+        - charts/curie
+        - apps/api/migrations
       step: Failed first install retry recreates data volumes
       leg: workload
       inputs:
@@ -183,6 +189,7 @@ chart_scenarios:
       step: Connector apply survives a concurrent reconciler create
       leg: workload
       inputs:
+        - charts/curie/ci/scenarios/workload-install.sh
         - charts/curie/ci/runtime/connector-apply-race-runtime.sh
         - cli
         - apps/api
@@ -194,6 +201,7 @@ chart_scenarios:
       step: Hosted connector credential rotation rolls only that connector
       leg: workload
       inputs:
+        - charts/curie/ci/scenarios/workload-install.sh
         - charts/curie/ci/runtime/connector-secret-rotation-runtime.sh
         - cli
         - apps/api
@@ -222,6 +230,7 @@ chart_scenarios:
       step: Workspace dependency failure reaches the terminal diagnostic
       leg: workload
       inputs:
+        - charts/curie/ci/scenarios/workload-install.sh
         - charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh
         - apps/api
         - apps/worker
@@ -234,6 +243,7 @@ chart_scenarios:
       step: Quota progress regression
       leg: workload
       inputs:
+        - charts/curie/ci/scenarios/workload-install.sh
         - charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh
         - apps/api
         - apps/worker
@@ -249,6 +259,7 @@ chart_scenarios:
       step: Factory resource profile runtime (#4889)
       leg: workload
       inputs:
+        - charts/curie/ci/scenarios/workload-install.sh
         - charts/curie/ci/runtime/factory-resource-profile-runtime.sh
         - charts/curie/values.yaml
         - charts/curie/values.schema.json
