@@ -6,7 +6,9 @@ authenticates the source, records work and authority in its own services, and
 runs an agent bundle in an isolated sandbox. The result returns to the
 originating workspace or work system. The [capability reference](capabilities.md)
 is the source for release status and integration limits; this page explains how
-the platform pieces fit together.
+the platform pieces fit together. For a concise technical review of the system's
+components, boundaries, failure handling, extension points, and evidence, start
+with [Evaluating Curie](evaluating-curie.md).
 
 ## Capability map
 
