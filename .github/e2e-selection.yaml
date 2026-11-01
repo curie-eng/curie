@@ -143,6 +143,7 @@ chart_scenarios:
     - cli/scripts/configure-docker-hub-mirror.sh
     - cli/scripts/ensure-kind-registry.sh
   scenarios:
+    # Selected inputs remain tracked; execution is temporarily disabled in ci.yaml (#5255).
     failed-first-install-retry:
       step: Failed first install retry recreates data volumes
       leg: workload
