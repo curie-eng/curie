@@ -224,7 +224,7 @@ def test_write_status_output_and_diagnostics_precede_cleanup(
     assert [event["reason"] for event in summary["events"]] == ["Evicted"]
     assert SECRET not in output + completed.stderr
     assert output.index("control diagnostics: ") < output.index("boundary delete sandboxclaims")
-    assert output.index("control diagnostics: ") < output.index("boundary helm")
+    assert "boundary helm" not in output
     assert not tmp_path.exists()
 
 
@@ -254,5 +254,6 @@ def test_diagnostic_read_failures_preserve_scenario_status_and_cleanup(tmp_path:
     assert summary["workspace_read_exit_status"] == 42
     assert summary["events"] is None
     assert summary["events_read_exit_status"] == 43
-    assert "boundary delete namespace" in completed.stdout
+    assert "boundary delete sandboxclaims" in completed.stdout
+    assert "boundary delete namespace" not in completed.stdout
     assert not tmp_path.exists()
