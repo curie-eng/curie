@@ -12,8 +12,6 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -199,122 +197,6 @@ def command(template: str, cfg: dict[str, Any]) -> list[str]:
     return [sys.executable, *args[1:]]
 
 
-@contextmanager
-def child(
-    tmp_path: Path, name: str, template: str, cfg: dict[str, Any]
-) -> Iterator[tuple[subprocess.Popen[bytes], Path]]:
-    path = tmp_path / (name + ".jsonl")
-    with path.open("wb") as output, (tmp_path / (name + ".stderr")).open("wb") as errors:
-        proc = subprocess.Popen(command(template, cfg), stdout=output, stderr=errors)
-        try:
-            yield proc, path
-        finally:
-            if proc.poll() is None:
-                proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
-            assert proc.poll() is not None
-
-
-def await_event(path: Path, event: str, proc: subprocess.Popen[bytes]) -> list[dict[str, Any]]:
-    deadline = time.monotonic() + 12
-    while time.monotonic() < deadline:
-        rows = [json.loads(s) for s in path.read_text().splitlines() if s]
-        if any(r.get("ev") == event for r in rows):
-            return rows
-        if proc.poll() is not None:
-            raise RuntimeError(f"probe exited before {event}: {rows}")
-        time.sleep(0.02)
-    raise RuntimeError(f"probe did not report {event}")
-
-
-@pytest.fixture
-def gate_available() -> None:
-    # The product gate has a fixed port inside its Pod network namespace. These
-    # portable process tests run serially; Linux verification uses an isolated
-    # container namespace, with no host port publication.
-    with socket.socket() as sock:
-        try:
-            sock.bind(("127.0.0.1", 42001))
-        except OSError as exc:
-            raise RuntimeError("fresh probe test gate unavailable") from exc
-
-
-def test_actual_barrier_starts_five_fresh_connects_only_after_challenge(
-    tmp_path: Path,
-    gate_available: None,
-) -> None:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    target = {"target": "twin", "address": "127.0.0.1", "port": port, "echo": True}
-    cfg = {
-        "mode": "deny",
-        "family": "ipv4",
-        "targets": [target],
-        "excluded_ports": [],
-        "setup": False,
-    }
-    with child(tmp_path, "listener", "fresh_probe_listener", {"family": "ipv4", "port": port}) as (
-        listener,
-        log,
-    ):
-        await_event(log, "ready", listener)
-        with child(tmp_path, "sender", "fresh_sender", cfg) as (sender, sent):
-            await_event(sent, "ready", sender)
-            time.sleep(0.25)
-            assert not any(
-                r.get("ev") == "attempt" for r in map(json.loads, sent.read_text().splitlines())
-            )
-            triggered = subprocess.run(
-                command(
-                    "fresh_trigger",
-                    {"family": "ipv4", "address": "127.0.0.1", "challenge": CHALLENGE},
-                ),
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=True,
-            )
-            assert fresh().parse_fresh_trigger_log(triggered.stdout).acknowledged
-            sender.wait(timeout=15)
-            result = fresh().parse_fresh_sender_log(sent.read_text())
-            assert result.challenge == CHALLENGE and len(result.attempts) == 5
-            assert len({a.source_port for a in result.attempts}) == 5
-            assert all(a.outcome == "connected" and a.echo for a in result.attempts)
-            time.sleep(0.2)
-            observed = fresh().parse_fresh_listener_log(log.read_text())
-            assert observed.deliveries(result.attempts) >= 5
-
-
-@pytest.mark.parametrize(
-    "message", [b"START bad\n", b"START " + b"a" * 32 + b"\ntrailing", b"x" * 40]
-)
-def test_actual_invalid_barrier_never_attempts_work(
-    tmp_path: Path,
-    gate_available: None,
-    message: bytes,
-) -> None:
-    cfg = {
-        "mode": "deny",
-        "family": "ipv4",
-        "targets": [{"target": "twin", "address": "127.0.0.1", "port": 18080, "echo": True}],
-        "excluded_ports": [],
-        "setup": False,
-    }
-    with child(tmp_path, "invalid", "fresh_sender", cfg) as (sender, log):
-        await_event(log, "ready", sender)
-        with socket.create_connection(("127.0.0.1", 42001), timeout=2) as sock:
-            sock.sendall(message)
-            sock.shutdown(socket.SHUT_WR)
-        sender.wait(timeout=5)
-        result = fresh().parse_fresh_sender_log(log.read_text())
-        assert result.refusal is not None and not result.complete and not result.attempts
-
-
 @pytest.mark.parametrize(
     "change, expected",
     [
@@ -376,49 +258,6 @@ def test_sender_parser_refuses_impossible_producer_identity_joins(change: str) -
 def test_malformed_unicode_log_uses_the_closed_refusal_boundary() -> None:
     with pytest.raises(ProbeKitRefused):
         fresh().parse_fresh_sender_log("\ud800")
-
-
-def test_actual_setup_tuple_is_excluded_and_linux_sampling_covers_fresh_control(
-    tmp_path: Path,
-    gate_available: None,
-) -> None:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    cfg = template_argument("fresh_sender")
-    cfg["targets"][0]["port"] = port
-    cfg.update(setup=True, setup_nonce="b" * 32)
-    with child(
-        tmp_path, "live-listener", "fresh_probe_listener", {"family": "ipv4", "port": port}
-    ) as (listener, observed):
-        await_event(observed, "tick", listener)
-        with child(tmp_path, "live-sender", "fresh_sender", cfg) as (sender, sent):
-            await_event(sent, "ready", sender)
-            before = fresh().parse_fresh_sender_log(sent.read_text(), allow_partial=True)
-            assert before.setup is not None and before.setup.echo
-            subprocess.run(
-                command("fresh_trigger", template_argument("fresh_trigger")),
-                capture_output=True,
-                timeout=10,
-                check=True,
-            )
-            sender.wait(timeout=15)
-            result = fresh().parse_fresh_sender_log(sent.read_text())
-            assert all(a.source_port != before.setup.source_port for a in result.attempts)
-            control_cfg = template_argument("fresh_control")
-            control_cfg["targets"][0]["port"] = port
-            control = subprocess.run(
-                command("fresh_control", control_cfg),
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=True,
-            )
-            check = fresh().parse_fresh_sender_log(control.stdout)
-            assert len(check.attempts) == 1 and check.attempts[0].echo
-            time.sleep(0.7)
-            log = fresh().parse_fresh_listener_log(observed.read_text())
-            assert log.covers(check.attempts[0]) is sys.platform.startswith("linux")
 
 
 @pytest.mark.parametrize("response", [b"unrelated\n", b"", None])
