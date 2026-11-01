@@ -475,10 +475,10 @@ stack runs on the baked defaults without one). Load-bearing facts:
 - **Postgres and Valkey are one pin, not two:** `postgres.image` is
   digest-pinned (`postgres:16.15-alpine@sha256:cf78e766...`, because
   PostgreSQL's version is two components) and `valkey.image` is
-  `valkey/valkey:8.1.10-alpine`. `charts/curie/values.yaml`, `compose.dev.yaml`,
-  the rust job's Valkey service in `.github/workflows/ci.yaml`, and
-  `charts/curie/ci/postgres-readiness-delay.Dockerfile` must all name the same
-  build; `compose/tests/test_generate_release_compose.py` asserts it.
+  `valkey/valkey:8.1.10-alpine`. `charts/curie/values.yaml` and
+  `compose.dev.yaml` name the same Postgres build. Those files and the rust
+  job's Valkey service in `.github/workflows/ci.yaml` name the same Valkey
+  build. `compose/tests/test_generate_release_compose.py` asserts both.
   `postgres.podSecurityContext.fsGroup` is `70`, the `postgres` gid inside the
   pinned image, asserted against the running image by
   `charts/curie/ci/postgres-fsgroup-assertions.sh` (#2319).

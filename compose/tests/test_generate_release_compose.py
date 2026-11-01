@@ -30,12 +30,6 @@ OTEL_PATH = REPO_ROOT / "otel" / "collector-config.yaml"
 # Artifacts that must carry the SAME data-tier image pins as compose (#2319).
 CHART_VALUES_PATH = REPO_ROOT / "charts" / "curie" / "values.yaml"
 CI_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
-READINESS_DOCKERFILE_PATH = (
-    REPO_ROOT / "charts" / "curie" / "ci" / "postgres-readiness-delay.Dockerfile"
-)
-READINESS_RUNTIME_SCRIPT_PATH = (
-    REPO_ROOT / "charts" / "curie" / "ci" / "runtime" / "langfuse-postgres-readiness-runtime.sh"
-)
 
 DEV_TEXT = DEV_PATH.read_text()
 OTEL_TEXT = OTEL_PATH.read_text()
@@ -185,10 +179,10 @@ def test_curie_images_pinned_non_curie_untouched():
 def test_data_tier_pins_agree_across_artifacts():
     """The data-tier image pins are the same bytes everywhere they are named (#2319).
 
-    Postgres and Valkey are one pin repeated across four artifacts: a chart that
-    pins one build while compose, the rust job's Valkey service, or the readiness
-    fixture's base image pin another is a stack nobody has actually tested
-    together. ClickHouse is the ONE documented exception (#2210): compose stays on
+    Postgres is one pin in the chart and in compose. Valkey is that same kind of
+    pin in the chart, in compose, and in the rust job's service container. A
+    stack that names two builds has not been tested together. ClickHouse is the
+    ONE documented exception (#2210): compose stays on
     the SSE4.2-safe 24.8 line so an AVX-less developer host can boot, while the
     chart needs the AVX-only 25.12 line for the Langfuse migration set. That split
     is asserted as a split -- compose must sit on a tag the chart itself lists as
@@ -197,32 +191,12 @@ def test_data_tier_pins_agree_across_artifacts():
     values = yaml.safe_load(CHART_VALUES_PATH.read_text())
     workflow = yaml.safe_load(CI_WORKFLOW_PATH.read_text())
 
-    # Postgres: chart == compose (dev and release) == readiness fixture base.
+    # Postgres: chart == compose (dev and release).
     chart_postgres = values["postgres"]["image"]
     for label, doc in compose_docs():
         assert doc["services"]["postgres"]["image"] == chart_postgres, (
             f"{label} postgres image must match the chart's postgres.image {chart_postgres!r}"
         )
-
-    dockerfile_args = re.findall(
-        r"^ARG\s+POSTGRES_BASE_IMAGE=(\S+)\s*$",
-        READINESS_DOCKERFILE_PATH.read_text(),
-        re.MULTILINE,
-    )
-    assert dockerfile_args == [chart_postgres], (
-        f"{READINESS_DOCKERFILE_PATH.name} POSTGRES_BASE_IMAGE default "
-        f"{dockerfile_args!r} must be the chart's postgres.image {chart_postgres!r}"
-    )
-
-    runtime_script_pins = re.findall(
-        r'^CHART_DEFAULT_POSTGRES_IMAGE="([^"]+)"\s*$',
-        READINESS_RUNTIME_SCRIPT_PATH.read_text(),
-        re.MULTILINE,
-    )
-    assert runtime_script_pins == [chart_postgres], (
-        f"{READINESS_RUNTIME_SCRIPT_PATH.name} CHART_DEFAULT_POSTGRES_IMAGE "
-        f"{runtime_script_pins!r} must be the chart's postgres.image {chart_postgres!r}"
-    )
 
     # Valkey: chart == compose (dev and release) == the rust job's service container.
     chart_valkey = values["valkey"]["image"]

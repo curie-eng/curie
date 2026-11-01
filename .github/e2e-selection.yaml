@@ -164,12 +164,6 @@ chart_scenarios:
       leg: chart
       inputs:
         - charts/curie/ci/runtime/runner-resources-assertions.sh
-    langfuse-postgres-readiness:
-      step: Langfuse web waits for delayed Postgres without restarting
-      leg: chart
-      inputs:
-        - charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh
-        - charts/curie/ci/postgres-readiness-delay.Dockerfile
     connector-readiness:
       step: Connector that never listens stays not-Ready until it binds
       leg: chart

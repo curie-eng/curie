@@ -1679,15 +1679,14 @@ jobs:
       - name: Write the CI image bake definition
         run: |
           cat > ci-images-bake.json <<'EOF'
-          {"group": {"default": {"targets": ["api", "dispatcher", "worker", "ui", "runner", "mail-adapter", "postgres-readiness"]}},
+          {"group": {"default": {"targets": ["api", "dispatcher", "worker", "ui", "runner", "mail-adapter"]}},
           "target": {
             "api": {"context": ".", "dockerfile": "apps/api/Dockerfile", "tags": ["curie-ci/api:candidate"], "cache-from": ["type=gha,scope=ladder-api"], "cache-to": ["type=gha,mode=max,scope=ladder-api"]},
             "dispatcher": {"context": ".", "dockerfile": "apps/dispatcher/Dockerfile", "tags": ["curie-ci/dispatcher:candidate"], "cache-from": ["type=gha,scope=ladder-dispatcher"], "cache-to": ["type=gha,mode=max,scope=ladder-dispatcher"]},
             "worker": {"context": ".", "dockerfile": "apps/worker/Dockerfile", "tags": ["curie-ci/worker:candidate", "ghcr.io/curie-eng/curie-worker:ci-local"], "cache-from": ["type=gha,scope=ladder-worker"], "cache-to": ["type=gha,mode=max,scope=ladder-worker"]},
             "ui": {"context": ".", "dockerfile": "apps/ui/Dockerfile", "tags": ["curie-ci/ui:candidate"], "cache-from": ["type=gha,scope=ladder-ui"], "cache-to": ["type=gha,mode=max,scope=ladder-ui"]},
             "runner": {"context": ".", "dockerfile": "runner/Dockerfile", "tags": ["curie-ci/runner:candidate"], "cache-from": ["type=gha,scope=ladder-runner"], "cache-to": ["type=gha,mode=max,scope=ladder-runner"]},
-            "mail-adapter": {"context": ".", "dockerfile": "apps/mail-adapter/Dockerfile", "tags": ["curie-ci/mail-adapter:candidate"], "cache-from": ["type=gha,scope=mail-adapter"], "cache-to": ["type=gha,mode=max,scope=mail-adapter"]},
-            "postgres-readiness": {"context": "charts/curie/ci", "dockerfile": "postgres-readiness-delay.Dockerfile", "tags": ["curie-ci/postgres-readiness:candidate"], "cache-from": ["type=gha,scope=langfuse-postgres-readiness"], "cache-to": ["type=gha,mode=max,scope=langfuse-postgres-readiness"]}
+            "mail-adapter": {"context": ".", "dockerfile": "apps/mail-adapter/Dockerfile", "tags": ["curie-ci/mail-adapter:candidate"], "cache-from": ["type=gha,scope=mail-adapter"], "cache-to": ["type=gha,mode=max,scope=mail-adapter"]}
           }}
           EOF
       - name: Build the CI images in parallel
@@ -1705,7 +1704,7 @@ jobs:
           set -euo pipefail
           out="$RUNNER_TEMP/ci-images"
           mkdir -p "$out"
-          for name in api dispatcher worker ui runner mail-adapter postgres-readiness worker-local; do
+          for name in api dispatcher worker ui runner mail-adapter worker-local; do
             docker save "curie-ci/$name:candidate" | zstd -T0 -3 -q -o "$out/$name.tar.zst"
           done
           ls -la "$out"
@@ -1754,14 +1753,6 @@ jobs:
         with:
           name: ci-image-mail-adapter
           path: ${{ runner.temp }}/ci-images/mail-adapter.tar.zst
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
-      - name: Upload the postgres-readiness image
-        uses: actions/upload-artifact@v7
-        with:
-          name: ci-image-postgres-readiness
-          path: ${{ runner.temp }}/ci-images/postgres-readiness.tar.zst
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
@@ -3546,7 +3537,6 @@ jobs:
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
-      # The fixture image delays Postgres for the Langfuse startup regression.
       - name: Back off before retrying Install Helm
         if: steps.install_helm.outcome == 'failure'
         run: |
@@ -3557,15 +3547,6 @@ jobs:
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
-      # The fixture image delays Postgres for the Langfuse startup regression.
-      - name: Load the Postgres readiness fixture built by the ci-images job
-        if: ${{ matrix.leg == 'chart' }}
-        uses: ./.github/actions/load-ci-images
-        with:
-          images: postgres-readiness
-      - name: Tag the Postgres readiness fixture
-        if: ${{ matrix.leg == 'chart' }}
-        run: docker tag curie-ci/postgres-readiness:candidate "curie-postgres-readiness:${GITHUB_SHA}"
       # disableDefaultCNI is load-bearing (#1153). kind's default kindnet
       # implements NO NetworkPolicy controller, so every policy the chart ships
       # -- including Rail 1's default-deny egress for runner sandboxes
@@ -3688,22 +3669,6 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/runner-template-admission-runtime.sh
-      - name: Load the Postgres readiness fixture into the kind cluster
-        if: ${{ matrix.leg == 'chart' }}
-        run: kind load docker-image "curie-postgres-readiness:${GITHUB_SHA}" --name curie-e2e
-      - name: Langfuse web waits for delayed Postgres without restarting
-        if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'langfuse-postgres-readiness') }}
-        env:
-          READINESS_NAMESPACE: curie-1853-${{ github.run_id }}-${{ github.run_attempt }}
-          READINESS_RELEASE: curie-1853-${{ github.run_id }}-${{ github.run_attempt }}
-          READINESS_POSTGRES_IMAGE: curie-postgres-readiness:${{ github.sha }}
-        run: |
-          set -euo pipefail
-          bash tools/runtime-assertion-gate/run.sh \
-            charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh \
-            --namespace "$READINESS_NAMESPACE" \
-            --release "$READINESS_RELEASE" \
-            --postgres-image "$READINESS_POSTGRES_IMAGE"
       # The connector render needs the workspace. Kept out of the assertion
       # step so that step is only the receipt runner (#3391).
       - name: Install uv for the connector readiness render

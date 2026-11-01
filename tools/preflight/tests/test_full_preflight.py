@@ -785,7 +785,7 @@ def test_ci_only_docs_change_has_no_tiers(repository: Path) -> None:
         ("scripts/check-netpol-enforcement.sh", "main", True, False),
         ("docs/example.md", "main", False, False),
         ("apps/api/src/curie_api/main.py", "next", False, False),
-        ("charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh", "next", True, True),
+        ("charts/curie/ci/runtime/connector-readiness-runtime.sh", "next", True, True),
     ],
 )
 def test_ci_only_chart_job_listing_follows_chart_scenarios(
