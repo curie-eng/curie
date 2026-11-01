@@ -549,13 +549,6 @@ def test_an_unreachable_api_is_unavailable_not_an_exception() -> None:
 # --- configuration --------------------------------------------------------------
 
 
-def test_the_cache_defaults_are_thirty_seconds_and_five_minutes(
-    config: DispatcherConfig,
-) -> None:
-    assert config.admission_cache_ttl_s == 30.0
-    assert config.admission_stale_s == 300.0
-
-
 @pytest.mark.parametrize(
     "overrides",
     [

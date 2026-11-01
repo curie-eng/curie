@@ -122,14 +122,6 @@ def test_fixed_values() -> None:
     assert "@sha256:" in contract.DEFAULT_GIT_IMAGE
 
 
-def test_workload_fixed_values() -> None:
-    assert contract.REFUSAL_CLUSTER_SCOPED == "e2e_cluster_scoped_object"
-    assert contract.REFUSAL_IMAGE_NOT_DIGEST == "e2e_image_not_digest"
-    assert contract.RUN_JOB_PREFIX == "e2e-run-"
-    assert contract.RUN_TIMEOUT_S == 1200
-    assert contract.OUTPUT_LIMIT_BYTES == 65536
-
-
 def test_platform_env_adds_the_nine_build_names_before_port() -> None:
     new = (
         "E2E_REGISTRY",

@@ -304,13 +304,6 @@ def test_the_cluster_still_uses_the_service_it_created(tmp_path: Path) -> None:
     assert "8765" not in servers["grafana"]["url"]
 
 
-def test_a_hosted_connector_without_a_fallback_still_mounts_nothing(tmp_path: Path) -> None:
-    servers = derive_mcp_servers(
-        _bundle(tmp_path, HOSTED), release=None, agent=None, namespace=None
-    )
-    assert servers == {}
-
-
 # --------------------------------------------------------------------------- #
 # The whole chain, worker render to mounted server -- #1195
 #

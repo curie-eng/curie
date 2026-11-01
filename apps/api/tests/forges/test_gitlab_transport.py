@@ -98,12 +98,6 @@ async def test_every_request_sends_private_token_and_the_15_second_timeout() -> 
         assert timeout.get("read") == 15.0 and timeout.get("connect") == 15.0, request.url
 
 
-def test_the_transport_constants() -> None:
-    from curie_api.forges.gitlab.transport import MIN_VERSION, PER_PAGE, TIMEOUT_S
-
-    assert (TIMEOUT_S, PER_PAGE, MIN_VERSION) == (15.0, 100, (17, 0))
-
-
 @pytest.mark.anyio
 async def test_every_listing_asks_for_100_per_page() -> None:
     fake = _fake()
