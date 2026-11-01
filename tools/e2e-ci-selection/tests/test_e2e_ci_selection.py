@@ -16,7 +16,7 @@ import tomllib
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 import pytest
 import yaml
@@ -203,6 +203,10 @@ class _ChartScenario(TypedDict):
     step: str
     inputs: list[str]
     leg: str
+    pr_inputs: NotRequired[list[str]]
+
+
+WORKLOAD_INSTALL = "charts/curie/ci/scenarios/workload-install.sh"
 
 
 CHART_SCENARIOS: dict[str, _ChartScenario] = {
@@ -212,6 +216,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
             "charts/curie/ci/runtime/failed-first-install-retry-runtime.sh",
             "cli/src/ops/up.rs",
         ],
+        "pr_inputs": ["charts/curie", "apps/api/migrations"],
         "leg": "workload",
     },
     "installation-identity": {
@@ -258,6 +263,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
             "packages",
             "pyproject.toml",
             "uv.lock",
+            WORKLOAD_INSTALL,
         ],
         "leg": "workload",
     },
@@ -271,6 +277,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
             "packages",
             "pyproject.toml",
             "uv.lock",
+            WORKLOAD_INSTALL,
         ],
         "leg": "workload",
     },
@@ -298,6 +305,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
         "inputs": [
             "charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh",
             *CHART_IMAGE_INPUTS,
+            WORKLOAD_INSTALL,
         ],
         "leg": "workload",
     },
@@ -306,6 +314,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
         "inputs": [
             "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",
             *CHART_IMAGE_INPUTS,
+            WORKLOAD_INSTALL,
         ],
         "leg": "workload",
     },
@@ -319,6 +328,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
             "charts/curie/templates/_sandbox_envelope.tpl",
             "charts/curie/templates/_helpers.tpl",
             *CHART_IMAGE_INPUTS,
+            WORKLOAD_INSTALL,
         ],
         "leg": "workload",
     },
@@ -369,12 +379,15 @@ def _matches_chart_input(path: str, value: str) -> bool:
 
 
 def _expected_chart_for_path(path: str) -> tuple[str, ...]:
-    if any(_matches_chart_input(path, value) for value in CHART_SHARED_INPUTS):
-        return CHART_IDS
     matched = tuple(
         scenario
         for scenario in CHART_IDS
-        if any(_matches_chart_input(path, value) for value in CHART_SCENARIOS[scenario]["inputs"])
+        if any(
+            _matches_chart_input(path, value)
+            for value in CHART_SCENARIOS[scenario].get(
+                "pr_inputs", [*CHART_SHARED_INPUTS, *CHART_SCENARIOS[scenario]["inputs"]]
+            )
+        )
     )
     if matched:
         return matched
@@ -5351,10 +5364,42 @@ def test_failed_first_install_retry_script_alone_selects_its_scenario(tmp_path: 
     assert json.loads(selected["chart_legs"]) == ["workload"]
 
 
-def test_failed_first_install_retry_tracks_the_production_discard_path(tmp_path: Path) -> None:
-    completed, output = _invoke_selector(tmp_path, "cli/src/ops/up.rs")
+@pytest.mark.parametrize(
+    ("path", "selected"),
+    [
+        ("charts/curie/templates/postgres.yaml", True),
+        ("charts/curie/values.yaml", True),
+        ("apps/api/migrations/versions/9999_example.py", True),
+        ("apps/api/src/curie_api/main.py", False),
+        ("cli/src/ops/up.rs", False),
+        (".github/workflows/ci.yaml", False),
+    ],
+)
+def test_failed_first_install_retry_pr_selection_follows_chart_or_migration_changes(
+    tmp_path: Path, path: str, selected: bool
+) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
     assert completed.returncode == 0, completed.stderr
-    assert "failed-first-install-retry" in json.loads(_outputs_of(output)["chart_scenarios"])
+    assert ("failed-first-install-retry" in json.loads(_outputs_of(output)["chart_scenarios"])) is selected
+
+
+def test_nightly_full_selection_keeps_failed_first_install_retry(tmp_path: Path) -> None:
+    completed, output = _invoke_selector(tmp_path, push=True)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(_outputs_of(output)["chart_scenarios"]) == list(CHART_IDS)
+
+
+def test_workload_install_change_selects_every_shared_consumer(tmp_path: Path) -> None:
+    completed, output = _invoke_selector(tmp_path, WORKLOAD_INSTALL)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(_outputs_of(output)["chart_scenarios"]) == [
+        "connector-apply-race",
+        "connector-secret-rotation",
+        "factory-resource-profile",
+        "failed-first-install-retry",
+        "quota-progress",
+        "workspace-diagnostic",
+    ]
 
 
 def test_chart_scenario_union_is_sorted_and_deduplicated(tmp_path: Path) -> None:
@@ -5635,6 +5680,35 @@ def test_chart_scenario_registry_rejects_malformed_entries(tmp_path: Path, mutat
         _SELECTOR_MODULE._load_registry(path)
 
 
+@pytest.mark.parametrize("value", [[], "charts/curie", [""], ["/charts/curie"], ["charts/curie/"]])
+def test_chart_scenario_registry_rejects_malformed_pr_inputs(tmp_path: Path, value: object) -> None:
+    registry = yaml.safe_load(VALID_REGISTRY)
+    registry["chart_scenarios"]["scenarios"]["failed-first-install-retry"]["pr_inputs"] = value
+    path = tmp_path / "registry.yaml"
+    path.write_text(yaml.safe_dump(registry))
+    with pytest.raises(_SELECTOR_MODULE.RegistryError):
+        _SELECTOR_MODULE._load_registry(path)
+
+
+def test_chart_scenario_pr_inputs_override_shared_inputs_but_keep_full_selection(tmp_path: Path) -> None:
+    registry = yaml.safe_load(VALID_REGISTRY)
+    registry["chart_scenarios"]["scenarios"]["connector-readiness"]["pr_inputs"] = ["apps/api/migrations"]
+    path = tmp_path / "registry.yaml"
+    path.write_text(yaml.safe_dump(registry))
+    # A valid narrow entry must load and still participate in a full nightly run.
+    _SELECTOR_MODULE._load_registry(path)
+    for changed_path, expected in (
+        ("charts/curie/values.yaml", False),
+        ("apps/api/migrations/versions/9999_example.py", True),
+    ):
+        completed, output = _invoke_selector(tmp_path, changed_path, registry=path)
+        assert completed.returncode == 0, completed.stderr
+        assert ("connector-readiness" in json.loads(_outputs_of(output)["chart_scenarios"])) is expected
+    completed, output = _invoke_selector(tmp_path, registry=path, push=True)
+    assert completed.returncode == 0, completed.stderr
+    assert "connector-readiness" in json.loads(_outputs_of(output)["chart_scenarios"])
+
+
 @pytest.mark.parametrize("mode", ["paths", "push", "revisions"])
 def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
     tmp_path: Path,
@@ -5671,7 +5745,9 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
     assert completed.returncode == 0, completed.stderr
     expected = (
         CHART_IDS
-        if mode in {"push", "revisions"}
+        if mode == "push"
+        else tuple(scenario for scenario in CHART_IDS if scenario != "failed-first-install-retry")
+        if mode == "revisions"
         else (
                 "connector-apply-race",
                 "connector-secret-rotation",
