@@ -628,10 +628,27 @@ class GitHubCodeHost:
 
     async def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:
         path = f"{self._repo(repository.path)}/git/ref/heads/{quote(branch, safe='')}"
+        token = await self._token(repository.path)
         try:
-            payload = await self._json("GET", path, token=await self._token(repository.path))
+            payload = await self._json("GET", path, token=token)
         except NotFound:
-            return None
+            matches = await self._json(
+                "GET",
+                f"{self._repo(repository.path)}/git/matching-refs/heads/{quote(branch, safe='')}",
+                token=token,
+            )
+            if not isinstance(matches, list):
+                raise Unavailable("malformed_response") from None
+            head = None
+            for match in matches:
+                ref = match.get("ref") if isinstance(match, dict) else None
+                obj = match.get("object") if isinstance(match, dict) else None
+                sha = obj.get("sha") if isinstance(obj, dict) else None
+                if not isinstance(ref, str) or not isinstance(sha, str) or not _SHA.fullmatch(sha):
+                    raise Unavailable("malformed_response") from None
+                if ref == f"refs/heads/{branch}":
+                    head = sha
+            return head
         sha = payload.get("object", {}).get("sha") if isinstance(payload, dict) else None
         if not isinstance(sha, str) or _SHA.fullmatch(sha) is None:
             raise Unavailable("malformed_response")

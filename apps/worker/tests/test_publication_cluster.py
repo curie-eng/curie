@@ -1455,7 +1455,14 @@ async def test_job_from_another_runner_image_is_adopted_through_github(
                     assert provider_requests == [
                         ("GET", f"/repos/{REPO_FULL_NAME}"),
                         ("GET", provider_branch_path),
-                    ] * base_reads
+                        (
+                            "GET",
+                            f"/repos/{REPO_FULL_NAME}/git/matching-refs/heads/{payload.branch}",
+                        ),
+                    ] + [
+                        ("GET", f"/repos/{REPO_FULL_NAME}"),
+                        ("GET", provider_branch_path),
+                    ] * (base_reads - 1)
                     assert cluster.applications == [resources.names.job]
                     assert cluster.cleanups == []
                     assert replies.texts == []

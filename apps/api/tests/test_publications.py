@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import itertools
 import json
 import subprocess
 import sys
@@ -17,7 +18,7 @@ import tarfile
 import threading
 import time
 import uuid
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
@@ -763,8 +764,10 @@ def _open_lineage(
     *,
     conversation_id: str,
     pr_url: str = PR_URL,
+    deployment: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    deployment = _create_deployment(client, auth_headers)
+    if deployment is None:
+        deployment = _create_deployment(client, auth_headers)
     _, publication = _create_publication(
         client,
         _publication_payload(
@@ -4216,6 +4219,896 @@ def test_denied_first_revision_leaves_absent_pr_create_path_available(
     assert retry["pr_url"] is None
     assert retry["lineage_head_sha"] is None
     assert _counts() == (2, 2)
+
+
+_READMIT_ISSUE_SEQUENCE = itertools.count(1)
+
+
+def _readmit_tracker_issue_id() -> str:
+    """A distinct numeric tracker issue id per seeded WorkItem."""
+
+    return str(494_800 + next(_READMIT_ISSUE_SEQUENCE))
+
+
+# Execution-request state shapes for the readmit fixture, as SQL value tails
+# for (status, wait_deadline, started_at, execution_deadline, terminal_at,
+# terminal_cause) -- every shape satisfies execution_requests_state_shape_ck.
+_READMIT_EXECUTION_SHAPES = {
+    "failed": (
+        "'failed', clock_timestamp() - interval '2 minutes', "
+        "clock_timestamp() - interval '90 minutes', "
+        "clock_timestamp() - interval '30 minutes', "
+        "clock_timestamp() - interval '29 minutes', 'early_stop'"
+    ),
+    "running": (
+        "'running', clock_timestamp() - interval '2 minutes', "
+        "clock_timestamp() - interval '5 minutes', "
+        "clock_timestamp() + interval '55 minutes', NULL, NULL"
+    ),
+    "completed": (
+        "'completed', clock_timestamp() - interval '2 minutes', "
+        "clock_timestamp() - interval '90 minutes', "
+        "clock_timestamp() - interval '30 minutes', "
+        "clock_timestamp() - interval '29 minutes', 'completed'"
+    ),
+}
+
+
+def _seed_readmit_stale_lineage(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    *,
+    conversation_id: str,
+    base_sha: str = BASE_SHA,
+    execution_status: str = "failed",
+    work_item_conversation: str | None = None,
+    outcome_ready: bool = True,
+    deployment: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Seed #4948's bug shape: an open headless lineage at ``base_sha`` whose
+    single publication is the failed prior execution of a live WorkItem.
+
+    Every scenario lives on its own conversation, so one caller-created
+    deployment (one agent bound to one Slack route) can host them all: the
+    ``agent_channels_route_key`` uniqueness makes a second agent on the same
+    route a 409, and a shared agent is the production shape anyway.
+    """
+
+    if deployment is None:
+        deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            dedupe_key=f"{conversation_id}-failed-first",
+            base_sha=base_sha,
+        ),
+    )
+    _execute(
+        "UPDATE curie.publications SET status = 'failed'"
+        + (", outcome_history_ready_at = now()" if outcome_ready else "")
+        + " WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    )
+    lineage_id = uuid.UUID(publication["lineage_id"])
+    lineage = _rows(
+        "SELECT agent_id, conversation_id FROM curie.thread_publication_lineages WHERE id = :id",
+        {"id": lineage_id},
+    )[0]
+    item_id, request_id = uuid.uuid4(), uuid.uuid4()
+    _execute(
+        "INSERT INTO curie.work_items (id, code_host_kind, code_host_host, "
+        "tracker_kind, tracker_host, tracker_scope_id, repository_project_id, tracker_issue_id, "
+        "code_host_installation_id, agent_id, repository_path, conversation_id, version, "
+        "base_branch, base_source, base_commit) "
+        "VALUES (:id, 'github', 'github.com', 'github', 'github.com', '9001', "
+        "'9001', :issue, 41, :agent, :repo, :conversation, 1, 'main', 'default', :base)",
+        {
+            "id": item_id,
+            "issue": _readmit_tracker_issue_id(),
+            "agent": lineage["agent_id"],
+            "repo": REPO,
+            "conversation": work_item_conversation or lineage["conversation_id"],
+            "base": base_sha,
+        },
+    )
+    _execute(
+        "INSERT INTO curie.execution_requests (id, work_item_id, sequence, status, "
+        "wait_deadline, started_at, execution_deadline, terminal_at, terminal_cause, "
+        "execution_attempts) "
+        f"VALUES (:id, :item, 1, {_READMIT_EXECUTION_SHAPES[execution_status]}, 1)",
+        {"id": request_id, "item": item_id},
+    )
+    _execute(
+        "UPDATE curie.publications SET execution_request_id = :request WHERE id = :id",
+        {"id": uuid.UUID(publication["id"]), "request": request_id},
+    )
+    return {
+        "deployment": deployment,
+        "publication": publication,
+        "lineage_id": lineage_id,
+        "item_id": item_id,
+        "request_id": request_id,
+    }
+
+
+def _readmit_lineage_row(lineage_id: uuid.UUID) -> dict[str, Any]:
+    return _rows(
+        "SELECT * FROM curie.thread_publication_lineages WHERE id = :id",
+        {"id": lineage_id},
+    )[0]
+
+
+def _absent_branch(request: httpx.Request) -> httpx.Response:
+    """The code host's answer when the lineage branch was never pushed."""
+
+    if "/git/matching-refs/heads/" in request.url.path:
+        return httpx.Response(200, json=[])
+    assert "/git/ref/heads/" in request.url.path, request.url.path
+    return httpx.Response(404, json={"message": "Branch not found"})
+
+
+@pytest.mark.parametrize("contents_status", [404, 401, 403, 503])
+def test_readmit_masked_ref_404_preserves_pushed_lineage(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    contents_status: int,
+) -> None:
+    # GitHub masks inaccessible resources as 404, including existing refs:
+    # https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api
+    # Repository metadata permission does not grant Contents read permission:
+    # https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens#repository-permissions-for-contents
+    from forge_fakes.github import GitHubRepositoryFake
+
+    client, _ = publication_stack
+    conversation_id = "thread-readmit-masked-ref"
+    seed = _seed_readmit_stale_lineage(client, auth_headers, conversation_id=conversation_id)
+    original = _readmit_lineage_row(seed["lineage_id"])
+    forge = GitHubRepositoryFake()
+    forge.branches[original["branch"]] = SECOND_REVISION_SHA
+    requests: list[httpx.Request] = []
+
+    def inaccessible_contents(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if "/git/ref/heads/" in request.url.path:
+            assert forge.handle(request).status_code == 200
+            return httpx.Response(404, json={"message": "Not Found"})
+        if "/git/matching-refs/heads/" in request.url.path:
+            return httpx.Response(contents_status, json={"message": "Not Found"})
+        return forge.handle(request)
+
+    kept = _get_lineage_with_http(
+        client,
+        deployment_id=seed["deployment"]["id"],
+        conversation_id=conversation_id,
+        handler=inaccessible_contents,
+    )
+    assert kept.status_code == 200, kept.text
+    assert uuid.UUID(kept.json()["id"]) == seed["lineage_id"]
+    assert _readmit_lineage_row(seed["lineage_id"]) == original
+    assert len(requests) == 2
+    assert "/git/matching-refs/heads/" in requests[1].url.path
+    assert requests[0].headers["Authorization"] == requests[1].headers["Authorization"]
+    _execute(
+        "UPDATE curie.work_items SET base_commit = :base WHERE id = :id",
+        {"id": seed["item_id"], "base": SECOND_REVISION_SHA},
+    )
+    status_code, revision = _create_publication(
+        client,
+        _publication_payload(
+            seed["deployment"]["id"],
+            conversation_id=conversation_id,
+            dedupe_key="readmit-masked-ref-two",
+        ),
+    )
+    assert status_code == 201
+    assert uuid.UUID(revision["lineage_id"]) == seed["lineage_id"]
+    assert revision["revision_number"] == 2
+    assert revision["base_sha"] == original["base_sha"]
+    after = _readmit_lineage_row(seed["lineage_id"])
+    assert after["status"] == "open"
+    assert after["version"] == original["version"]
+    assert after["branch"] == original["branch"]
+    assert after["head_sha"] is None
+    assert after["pr_number"] is None
+
+
+def test_readmitted_never_pushed_lineage_prepares_current_base(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    tmp_path: Path,
+) -> None:
+    """#4948: a re-admitted run whose failed first publication never pushed
+    prepares its workspace at the WorkItem's re-admit base.
+
+    The lineage read drives the production route, credential redemption the
+    production client, and the workspace the production preparer over a real
+    two-commit git fixture; only the forge and the object store are faked.
+    """
+    from curie_worker.workspace import (
+        WorkspaceCredentialClient,
+        WorkspaceLimits,
+        WorkspacePreparer,
+    )
+
+    client, _ = publication_stack
+    repo_path, stale_base, readmit_base = _two_commit_repository(tmp_path)
+    conversation_id = "thread-readmit-current-base"
+    seed = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=conversation_id,
+        base_sha=stale_base,
+    )
+    # Re-admission: the WorkItem's base moves to the newer commit.
+    _execute(
+        "UPDATE curie.work_items SET base_commit = :base WHERE id = :id",
+        {"id": seed["item_id"], "base": readmit_base},
+    )
+
+    retired = _get_lineage_with_http(
+        client,
+        deployment_id=seed["deployment"]["id"],
+        conversation_id=conversation_id,
+        handler=_absent_branch,
+    )
+    assert retired.status_code == 404, retired.text
+
+    scoped = channel_protocol.scoped_conversation_id("slack", "C0EXAMPLE1", conversation_id)
+    credentials = WorkspaceCredentialClient(
+        api_url="http://internal-api.test",
+        worker_token=WORKER_TOKEN,
+        transport=_testclient_transport(client),
+    )
+    credential = credentials.redeem(uuid.UUID(seed["deployment"]["id"]), scoped)
+    assert credential.base_commit == readmit_base
+
+    preparer = WorkspacePreparer(
+        credentials=credentials,
+        commands=_ReadmitGitCommands(repo_path),
+        objects=_PresigningObjects(),
+        scratch_root=tmp_path / "claim-scratch",
+        limits=WorkspaceLimits(
+            clone_timeout_seconds=90,
+            archive_timeout_seconds=30,
+            upload_timeout_seconds=30,
+            total_timeout_seconds=150,
+            max_checkout_bytes=512 * 1024 * 1024,
+            max_archive_bytes=256 * 1024 * 1024,
+            max_members=4096,
+            max_compression_ratio=20.0,
+            reference_ttl_seconds=300,
+            max_concurrent_clones=2,
+        ),
+    )
+    prepared = preparer.prepare(
+        deployment_id=uuid.UUID(seed["deployment"]["id"]),
+        thread_key=scoped,
+        generation="claim-readmit-one",
+    )
+    assert prepared.base_sha == readmit_base
+    assert prepared.materialized_head == readmit_base
+    commands = preparer.commands
+    fetch_pins = [call["argv"][-1] for call in commands.calls if "fetch" in call["argv"]]
+    assert readmit_base in fetch_pins
+    assert stale_base not in fetch_pins
+    checkout_pins = [
+        call["argv"][-1]
+        for call in commands.calls
+        if "checkout" in call["argv"] and "--detach" in call["argv"]
+    ]
+    assert checkout_pins == [readmit_base]
+
+
+def test_readmit_preserves_published_or_pushed_lineage(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """#4948: retirement fires only for the never-pushed failed-execution shape.
+
+    Control first: the eligible lineage retires. A lineage that reached a pull
+    request (a recorded head always arrives with one), a branch that exists
+    remotely although no push was recorded, and a publication whose execution
+    is not a failed prior execution of this thread's WorkItem each keep the
+    lineage and its revision sequence.
+    """
+    client, _ = publication_stack
+    control_conversation = "thread-readmit-preserve-control"
+    control = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=control_conversation,
+    )
+    retired = _get_lineage_with_http(
+        client,
+        deployment_id=control["deployment"]["id"],
+        conversation_id=control_conversation,
+        handler=_absent_branch,
+    )
+    assert retired.status_code == 404, retired.text
+    assert _readmit_lineage_row(control["lineage_id"])["status"] == "closed"
+
+    # A lineage that reached a pull request keeps its recorded identity.
+    pr_conversation = "thread-readmit-preserve-pull-request"
+    pr_deployment, pr_publication = _open_lineage(
+        client,
+        auth_headers,
+        conversation_id=pr_conversation,
+        deployment=control["deployment"],
+    )
+
+    def pull_request_reads(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        assert "/git/ref/heads/" not in path, "a pull request lineage is never probed"
+        assert path.endswith(f"/repos/{REPO}/pulls/{PR_NUMBER}"), path
+        return _healthy_github_pr(
+            branch=pr_publication["branch"],
+            head_sha=FIRST_REVISION_SHA,
+        )
+
+    preserved = _get_lineage_with_http(
+        client,
+        deployment_id=pr_deployment["id"],
+        conversation_id=pr_conversation,
+        handler=pull_request_reads,
+    )
+    assert preserved.status_code == 200, preserved.text
+    assert preserved.json()["pr_number"] == PR_NUMBER
+    assert preserved.json()["head_sha"] == FIRST_REVISION_SHA
+    assert _readmit_lineage_row(uuid.UUID(pr_publication["lineage_id"]))["status"] == "open"
+    _, pr_revision = _create_publication(
+        client,
+        _publication_payload(
+            pr_deployment["id"],
+            conversation_id=pr_conversation,
+            dedupe_key="readmit-preserve-pull-request-two",
+            base_sha=FIRST_REVISION_SHA,
+        ),
+    )
+    assert uuid.UUID(pr_revision["lineage_id"]) == uuid.UUID(pr_publication["lineage_id"])
+    assert pr_revision["revision_number"] == 2
+
+    # A branch that exists remotely although no push was recorded is preserved.
+    pushed_conversation = "thread-readmit-preserve-pushed"
+    pushed = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=pushed_conversation,
+        deployment=control["deployment"],
+    )
+
+    def present_branch(request: httpx.Request) -> httpx.Response:
+        assert "/git/ref/heads/" in request.url.path, request.url.path
+        return httpx.Response(
+            200,
+            json={
+                "ref": "refs/heads/unrecorded-push",
+                "object": {"type": "commit", "sha": SECOND_REVISION_SHA},
+            },
+        )
+
+    kept = _get_lineage_with_http(
+        client,
+        deployment_id=pushed["deployment"]["id"],
+        conversation_id=pushed_conversation,
+        handler=present_branch,
+    )
+    assert kept.status_code == 200, kept.text
+    assert _readmit_lineage_row(pushed["lineage_id"])["status"] == "open"
+    _, pushed_revision = _create_publication(
+        client,
+        _publication_payload(
+            pushed["deployment"]["id"],
+            conversation_id=pushed_conversation,
+            dedupe_key="readmit-preserve-pushed-two",
+        ),
+    )
+    assert uuid.UUID(pushed_revision["lineage_id"]) == pushed["lineage_id"]
+    assert pushed_revision["revision_number"] == 2
+
+    # Eligibility predicates: the failed publication must be the failed prior
+    # execution of this thread's own WorkItem.
+    for label, kwargs in (
+        ("running-execution", {"execution_status": "running"}),
+        ("completed-execution", {"execution_status": "completed"}),
+        (
+            "another-work-item",
+            {"work_item_conversation": "thread-readmit-preserve-foreign-item"},
+        ),
+    ):
+        conversation_id = f"thread-readmit-preserve-{label}"
+        seed = _seed_readmit_stale_lineage(
+            client,
+            auth_headers,
+            conversation_id=conversation_id,
+            deployment=control["deployment"],
+            **kwargs,
+        )
+        ineligible = _get_lineage_with_http(
+            client,
+            deployment_id=seed["deployment"]["id"],
+            conversation_id=conversation_id,
+            handler=_absent_branch,
+        )
+        assert ineligible.status_code == 200, f"{label}: {ineligible.text}"
+        assert _readmit_lineage_row(seed["lineage_id"])["status"] == "open", label
+
+
+def test_readmit_creates_new_lineage_after_never_pushed_failure(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """#4948: the abandoned lineage closes before the new workspace is exposed,
+    and the next publication opens a distinct open lineage at the re-admit
+    base. Reads and creates never resurrect the closed row, and a lineage that
+    closed with a pull request keeps its terminal refusal.
+    """
+    client, _ = publication_stack
+    conversation_id = "thread-readmit-fresh-lineage"
+    seed = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=conversation_id,
+    )
+    retired = _get_lineage_with_http(
+        client,
+        deployment_id=seed["deployment"]["id"],
+        conversation_id=conversation_id,
+        handler=_absent_branch,
+    )
+    assert retired.status_code == 404, retired.text
+    old = _readmit_lineage_row(seed["lineage_id"])
+    assert old["status"] == "closed"
+    assert old["pr_number"] is None
+    assert old["head_sha"] is None
+    assert old["version"] == 2
+
+    _execute(
+        "UPDATE curie.work_items SET base_commit = :base WHERE id = :id",
+        {"id": seed["item_id"], "base": SECOND_REVISION_SHA},
+    )
+    status_code, fresh = _create_publication(
+        client,
+        _publication_payload(
+            seed["deployment"]["id"],
+            conversation_id=conversation_id,
+            dedupe_key="readmit-fresh-lineage-two",
+            base_sha=SECOND_REVISION_SHA,
+        ),
+    )
+    assert status_code == 201
+    assert uuid.UUID(fresh["lineage_id"]) != seed["lineage_id"]
+    assert fresh["revision_number"] == 1
+    assert fresh["base_sha"] == SECOND_REVISION_SHA
+    assert fresh["branch"] != old["branch"]
+    fresh_row = _readmit_lineage_row(uuid.UUID(fresh["lineage_id"]))
+    assert fresh_row["status"] == "open"
+    assert fresh_row["base_sha"] == SECOND_REVISION_SHA
+    assert _readmit_lineage_row(seed["lineage_id"])["status"] == "closed"
+
+    read = _get_lineage(
+        client,
+        deployment_id=seed["deployment"]["id"],
+        conversation_id=conversation_id,
+    )
+    assert read.status_code == 200, read.text
+    assert uuid.UUID(read.json()["id"]) == uuid.UUID(fresh["lineage_id"])
+
+    # A reader whose probe overlapped another reader's close is never answered
+    # with the retired row: the close lands while its probe is in flight, so
+    # its locked re-read finds the lineage closed and it must answer absence,
+    # not the closed headless lineage a naive lock holder would hand back.
+    overlap_conversation = "thread-readmit-overlapping-readers"
+    overlap = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=overlap_conversation,
+        deployment=seed["deployment"],
+    )
+    probe_started = threading.Event()
+    close_landed = threading.Event()
+
+    def probe_then_close(request: httpx.Request) -> httpx.Response:
+        if "/git/matching-refs/heads/" in request.url.path:
+            return httpx.Response(200, json=[])
+        assert "/git/ref/heads/" in request.url.path, request.url.path
+        probe_started.set()
+        assert close_landed.wait(timeout=30), "closing reader never landed during the probe"
+        return httpx.Response(404, json={"message": "Branch not found"})
+
+    def closing_reader() -> None:
+        assert probe_started.wait(timeout=30), "the probe never started"
+        with TestClient(create_app()) as closing_client:
+            response = _get_lineage_with_http(
+                closing_client,
+                deployment_id=overlap["deployment"]["id"],
+                conversation_id=overlap_conversation,
+                handler=_absent_branch,
+            )
+        assert response.status_code == 404, response.text
+        close_landed.set()
+
+    closing_thread = threading.Thread(target=closing_reader)
+    closing_thread.start()
+    try:
+        second = _get_lineage_with_http(
+            client,
+            deployment_id=overlap["deployment"]["id"],
+            conversation_id=overlap_conversation,
+            handler=probe_then_close,
+        )
+    finally:
+        close_landed.set()
+        closing_thread.join(timeout=30)
+    assert second.status_code == 404, second.text
+    assert _readmit_lineage_row(overlap["lineage_id"])["status"] == "closed"
+
+    # A lineage that closed carrying a pull request remains terminal.
+    terminal_conversation = "thread-readmit-terminal-pull-request"
+    terminal_deployment, terminal_first = _open_lineage(
+        client,
+        auth_headers,
+        conversation_id=terminal_conversation,
+        deployment=seed["deployment"],
+    )
+    _, terminal_second = _create_publication(
+        client,
+        _publication_payload(
+            terminal_deployment["id"],
+            conversation_id=terminal_conversation,
+            dedupe_key="readmit-terminal-two",
+            base_sha=FIRST_REVISION_SHA,
+        ),
+    )
+    assert (
+        _resolve(client, auth_headers, terminal_second["approval_id"]).status_code == 200
+    )
+    terminal = _advance_lineage(
+        client,
+        terminal_second["id"],
+        expected_version=2,
+        expected_head_sha=FIRST_REVISION_SHA,
+        head_sha=FIRST_REVISION_SHA,
+        state="closed",
+    )
+    assert terminal.status_code == 200, terminal.text
+    refused = client.post(
+        "/v1/internal/publications",
+        json=_publication_payload(
+            terminal_deployment["id"],
+            conversation_id=terminal_conversation,
+            dedupe_key="readmit-terminal-three",
+            base_sha=FIRST_REVISION_SHA,
+        ),
+        headers=WORKER_HEADERS,
+    )
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["code"] == "publication.lineage_terminal"
+
+
+def test_readmit_lineage_retirement_fails_closed(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """#4948: retirement is refused unless remote branch absence is proven.
+
+    An unavailable or unauthorized forge read, a publication writer admitted
+    during the probe, an in-flight revision, an undurable outcome, and a
+    lineage-version bump during the probe each leave the lineage unchanged
+    and claim no fresh lineage. The control proves the machinery retires when
+    nothing races it.
+    """
+    client, _ = publication_stack
+    control_conversation = "thread-readmit-failclosed-control"
+    control = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=control_conversation,
+    )
+    retired = _get_lineage_with_http(
+        client,
+        deployment_id=control["deployment"]["id"],
+        conversation_id=control_conversation,
+        handler=_absent_branch,
+    )
+    assert retired.status_code == 404, retired.text
+    assert _readmit_lineage_row(control["lineage_id"])["status"] == "closed"
+
+    unavailable_conversation = "thread-readmit-failclosed-unavailable"
+    unavailable = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=unavailable_conversation,
+        deployment=control["deployment"],
+    )
+
+    def unreachable(request: httpx.Request) -> httpx.Response:
+        assert "/git/ref/heads/" in request.url.path, request.url.path
+        raise httpx.ConnectError("forge unreachable")
+
+    kept = _get_lineage_with_http(
+        client,
+        deployment_id=unavailable["deployment"]["id"],
+        conversation_id=unavailable_conversation,
+        handler=unreachable,
+    )
+    assert kept.status_code == 200, kept.text
+    assert _readmit_lineage_row(unavailable["lineage_id"])["status"] == "open"
+    _, unavailable_revision = _create_publication(
+        client,
+        _publication_payload(
+            unavailable["deployment"]["id"],
+            conversation_id=unavailable_conversation,
+            dedupe_key="readmit-failclosed-unavailable-two",
+        ),
+    )
+    assert uuid.UUID(unavailable_revision["lineage_id"]) == unavailable["lineage_id"]
+    assert unavailable_revision["revision_number"] == 2
+
+    unauthorized_conversation = "thread-readmit-failclosed-unauthorized"
+    unauthorized = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=unauthorized_conversation,
+        deployment=control["deployment"],
+    )
+
+    def refused_credentials(request: httpx.Request) -> httpx.Response:
+        assert "/git/ref/heads/" in request.url.path, request.url.path
+        return httpx.Response(401, json={"message": "Bad credentials"})
+
+    kept = _get_lineage_with_http(
+        client,
+        deployment_id=unauthorized["deployment"]["id"],
+        conversation_id=unauthorized_conversation,
+        handler=refused_credentials,
+    )
+    assert kept.status_code == 200, kept.text
+    assert _readmit_lineage_row(unauthorized["lineage_id"])["status"] == "open"
+
+    inflight_conversation = "thread-readmit-failclosed-inflight"
+    inflight = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=inflight_conversation,
+        deployment=control["deployment"],
+    )
+    _, _pending = _create_publication(
+        client,
+        _publication_payload(
+            inflight["deployment"]["id"],
+            conversation_id=inflight_conversation,
+            dedupe_key="readmit-failclosed-inflight-two",
+        ),
+    )
+    read = _get_lineage_with_http(
+        client,
+        deployment_id=inflight["deployment"]["id"],
+        conversation_id=inflight_conversation,
+        handler=_absent_branch,
+    )
+    assert read.status_code == 200, read.text
+    assert read.json()["has_pending_revision"] is True
+    assert _readmit_lineage_row(inflight["lineage_id"])["status"] == "open"
+
+    undurable_conversation = "thread-readmit-failclosed-undurable"
+    undurable = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=undurable_conversation,
+        outcome_ready=False,
+        deployment=control["deployment"],
+    )
+    read = _get_lineage_with_http(
+        client,
+        deployment_id=undurable["deployment"]["id"],
+        conversation_id=undurable_conversation,
+        handler=_absent_branch,
+    )
+    assert read.status_code == 200, read.text
+    assert read.json()["has_pending_outcome"] is True
+    blocked = client.post(
+        "/v1/internal/publications",
+        json=_publication_payload(
+            undurable["deployment"]["id"],
+            conversation_id=undurable_conversation,
+            dedupe_key="readmit-failclosed-undurable-two",
+        ),
+        headers=WORKER_HEADERS,
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "publication.outcome_pending"
+    assert _readmit_lineage_row(undurable["lineage_id"])["status"] == "open"
+
+    # A publication writer admitted while the probe is in flight serializes
+    # against the retirement lock and keeps the lineage.
+    writer_conversation = "thread-readmit-failclosed-writer"
+    writer = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=writer_conversation,
+        deployment=control["deployment"],
+    )
+    probe_started = threading.Event()
+    writer_landed = threading.Event()
+
+    def probe_then_wait(request: httpx.Request) -> httpx.Response:
+        if "/git/matching-refs/heads/" in request.url.path:
+            return httpx.Response(200, json=[])
+        assert "/git/ref/heads/" in request.url.path, request.url.path
+        probe_started.set()
+        assert writer_landed.wait(timeout=30), "writer never landed during the probe"
+        return httpx.Response(404, json={"message": "Branch not found"})
+
+    def admit_writer() -> None:
+        assert probe_started.wait(timeout=30), "the probe never started"
+        with TestClient(create_app()) as writer_client:
+            response = writer_client.post(
+                "/v1/internal/publications",
+                json=_publication_payload(
+                    writer["deployment"]["id"],
+                    conversation_id=writer_conversation,
+                    dedupe_key="readmit-failclosed-writer-two",
+                ),
+                headers=WORKER_HEADERS,
+            )
+        assert response.status_code in (200, 201), response.text
+        writer_landed.set()
+
+    writer_thread = threading.Thread(target=admit_writer)
+    writer_thread.start()
+    try:
+        kept = _get_lineage_with_http(
+            client,
+            deployment_id=writer["deployment"]["id"],
+            conversation_id=writer_conversation,
+            handler=probe_then_wait,
+        )
+    finally:
+        writer_landed.set()
+        writer_thread.join(timeout=30)
+    assert kept.status_code == 200, kept.text
+    assert _readmit_lineage_row(writer["lineage_id"])["status"] == "open"
+    assert _rows(
+        "SELECT revision_number FROM curie.publications WHERE lineage_id = :id "
+        "ORDER BY revision_number",
+        {"id": writer["lineage_id"]},
+    ) == [{"revision_number": 1}, {"revision_number": 2}]
+
+    # A lineage-version bump during the probe makes the close refuse.
+    stale_conversation = "thread-readmit-failclosed-stale"
+    stale = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=stale_conversation,
+        deployment=control["deployment"],
+    )
+    bump_seen = threading.Event()
+    bump_done = threading.Event()
+
+    def probe_then_bump(request: httpx.Request) -> httpx.Response:
+        if "/git/matching-refs/heads/" in request.url.path:
+            return httpx.Response(200, json=[])
+        assert "/git/ref/heads/" in request.url.path, request.url.path
+        bump_seen.set()
+        assert bump_done.wait(timeout=30), "version bump never landed during the probe"
+        return httpx.Response(404, json={"message": "Branch not found"})
+
+    def bump_lineage_version() -> None:
+        assert bump_seen.wait(timeout=30), "the probe never started"
+        _execute(
+            "UPDATE curie.thread_publication_lineages SET version = version + 1, "
+            "updated_at = now() WHERE id = :id",
+            {"id": stale["lineage_id"]},
+        )
+        bump_done.set()
+
+    bump_thread = threading.Thread(target=bump_lineage_version)
+    bump_thread.start()
+    try:
+        kept = _get_lineage_with_http(
+            client,
+            deployment_id=stale["deployment"]["id"],
+            conversation_id=stale_conversation,
+            handler=probe_then_bump,
+        )
+    finally:
+        bump_done.set()
+        bump_thread.join(timeout=30)
+    assert kept.status_code == 200, kept.text
+    bumped_row = _readmit_lineage_row(stale["lineage_id"])
+    assert bumped_row["status"] == "open"
+    assert bumped_row["version"] == 2
+    _, stale_revision = _create_publication(
+        client,
+        _publication_payload(
+            stale["deployment"]["id"],
+            conversation_id=stale_conversation,
+            dedupe_key="readmit-failclosed-stale-two",
+        ),
+    )
+    assert uuid.UUID(stale_revision["lineage_id"]) == stale["lineage_id"]
+    assert stale_revision["revision_number"] == 2
+
+
+def _two_commit_repository(root: Path) -> tuple[Path, str, str]:
+    """A real repository on branch ``main``: (path, stale base, newer base)."""
+
+    repo = root / "readmit-fixture-repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    subprocess.run(["git", "init", "--initial-branch=main", "--quiet"], cwd=repo, check=True)
+    git("config", "user.email", "coder@example.com")
+    git("config", "user.name", "Coder Test")
+    (repo / "README.md").write_text("stale proposal base\n")
+    git("add", "README.md")
+    git("commit", "--quiet", "-m", "stale base")
+    stale_base = git("rev-parse", "HEAD")
+    (repo / "README.md").write_text("re-admit base\n")
+    git("commit", "--quiet", "-am", "readmit base")
+    return repo, stale_base, git("rev-parse", "HEAD")
+
+
+class _ReadmitGitCommands:
+    """A CommandPort double that runs the production argv with real git.
+
+    Only the clone URL is redirected to the on-disk fixture; the preparer's
+    pin order alone decides which base the checkout lands on (#4948).
+    """
+
+    def __init__(self, source: Path) -> None:
+        self.source = source
+        self.calls: list[dict[str, Any]] = []
+
+    def require(self, executable: str) -> None:
+        subprocess.run(["git", "--version"], check=True, capture_output=True)
+
+    def run(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float,
+    ) -> Any:
+        del env, timeout_seconds
+        args = [str(part) for part in argv]
+        self.calls.append({"argv": args, "cwd": cwd})
+        assert args[0] == "git"
+        forwarded = ["git", "-c", "protocol.file.allow=always", *args[1:]]
+        if "clone" in args:
+            forwarded[-2] = f"file://{self.source}"
+        result = subprocess.run(
+            forwarded,
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return SimpleNamespace(stdout=result.stdout)
+
+
+class _PresigningObjects(_MemoryWorkspaceObjects):
+    """`_MemoryWorkspaceObjects` plus the reference signing the preparer needs."""
+
+    def presign_get(self, key: str, *, expires_seconds: int) -> str:
+        del expires_seconds
+        return f"https://objects.example.test/{key}"
 
 
 def test_redeployment_reuses_agent_owned_thread_lineage(

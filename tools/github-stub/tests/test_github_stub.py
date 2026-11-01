@@ -420,6 +420,10 @@ def test_missing_branch_lookups_answer_404_like_github(github: httpx.Client, stu
     ref = github.get(f"/repos/{REPO}/git/ref/heads/factory%2Fnot-pushed-yet")
     assert ref.status_code == 404, ref.text
     assert ref.json()["message"] == "Not Found"
+    # https://docs.github.com/en/rest/git/refs#list-matching-references
+    matches = github.get(f"/repos/{REPO}/git/matching-refs/heads/factory%2Fnot-pushed-yet")
+    assert matches.status_code == 200, matches.text
+    assert matches.json() == []
     assert stub.unknown_requests == []
 
 
@@ -469,4 +473,8 @@ def test_existing_branch_lookups_still_resolve_main_and_pushed_branches(
     assert _ok(github.get(f"/repos/{REPO}/branches/factory%2Fprobe"))["commit"]["sha"] == pushed_sha
     pushed_ref = _ok(github.get(f"/repos/{REPO}/git/ref/heads/factory%2Fprobe"))
     assert pushed_ref["object"]["sha"] == pushed_sha
+    matches = _ok(github.get(f"/repos/{REPO}/git/matching-refs/heads/factory%2Fpro"))
+    assert matches == [
+        {"ref": "refs/heads/factory/probe", "object": {"sha": pushed_sha, "type": "commit"}}
+    ]
     assert stub.unknown_requests == []

@@ -488,6 +488,23 @@ class FixtureHandler(BaseHTTPRequestHandler):
                     },
                 )
             return
+        matching_prefix = f"{repo_path}/git/matching-refs/heads/"
+        if parsed.path.startswith(matching_prefix):
+            # https://docs.github.com/en/rest/git/refs#list-matching-references
+            prefix = unquote(parsed.path.removeprefix(matching_prefix))
+            refs = _git(
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads/",
+                cwd=self.server.state.bare_repo,
+            )
+            matches = []
+            for line in refs.splitlines():
+                ref, sha = line.split(" ", 1)
+                if ref.startswith(f"refs/heads/{prefix}"):
+                    matches.append({"ref": ref, "object": {"type": "commit", "sha": sha}})
+            self._json(HTTPStatus.OK, matches)
+            return
         if parsed.path == self._pulls_path():
             query = parse_qs(parsed.query)
             requested_head = (query.get("head") or [""])[0]
