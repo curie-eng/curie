@@ -19,6 +19,57 @@ _REQUIREMENTS_PATH = "/tmp/runner-dependency-pins.txt"
 _EXACT_NPM_VERSION = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?")
 _NPM_PACKAGE = re.compile(r"(?:@[0-9A-Za-z._-]+/)?[0-9A-Za-z._-]+")
 _PIP_EXECUTABLE = re.compile(r"pip(?:\d+(?:\.\d+)?)?$")
+_PYTHON_EXECUTABLE = re.compile(r"python(?:\d+(?:\.\d+)?)?$")
+_BOOTSTRAP_REQUIREMENTS_PATH = "runner/pip-requirements.txt"
+_AUDITED_REQUIREMENT_PATHS = frozenset({_BOOTSTRAP_REQUIREMENTS_PATH, _REQUIREMENTS_PATH})
+_PIP_REQUIREMENT_OPTION = re.compile(r"--requirement(?:=(?P<long>.*))?|-r(?P<short>.*)")
+_PIP_SHORT_VERBOSITY = re.compile(r"-[qv]+$")
+_PIP_NON_INSTALL_FLAGS = frozenset({"-h", "--help", "-V", "--version"})
+_PIP_GLOBAL_FLAG_OPTIONS = frozenset(
+    {
+        "--debug",
+        "--disable-pip-version-check",
+        "--isolated",
+        "--no-cache-dir",
+        "--no-color",
+        "--no-input",
+        "--no-progress",
+        "--quiet",
+        "--require-hashes",
+        "--require-virtualenv",
+        "--verbose",
+    }
+)
+_PIP_GLOBAL_VALUE_OPTIONS = frozenset(
+    {
+        "-i",
+        "--cache-dir",
+        "--cert",
+        "--client-cert",
+        "--default-timeout",
+        "--exists-action",
+        "--extra-index-url",
+        "--index-url",
+        "--keyring-provider",
+        "--log",
+        "--progress-bar",
+        "--proxy",
+        "--python",
+        "--resume-retries",
+        "--retries",
+        "--root",
+        "--root-user-action",
+        "--timeout",
+        "--trusted-host",
+        "--use-deprecated",
+        "--use-feature",
+        "--upgrade-strategy",
+    }
+)
+_UNSUPPORTED_PIP_GLOBAL_OPTION = "unsupported pip global option"
+_MISSING_PIP_OPTION_VALUE = "pip global option is missing a value"
+_UNAUDITED_REQUIREMENTS_FILE = "pip requirements file is not audited"
+_MISSING_REQUIREMENTS_ARGUMENT = "pip requirement option is missing an argument"
 _NPM_INSTALL_ALIASES = {"install", "i", "add"}
 _HASH = " --hash=sha256:" + "1" * 64
 _SYNTHETIC_RECURSIVE_LOCK = """\
@@ -134,113 +185,239 @@ def _locked_runner_dependencies(lock_text: str) -> dict[str, str]:
     return expected
 
 
+@dataclass(frozen=True)
+class _PipInvocation:
+    """One normalized `pip install` command found in a Dockerfile RUN instruction."""
+
+    operands: tuple[str, ...]
+    requirements: tuple[str, ...]
+    violations: tuple[Violation, ...]
+
+
+def _pip_invocation_start(tokens: list[str], index: int) -> int | None:
+    """Return the index after a recognized pip invocation, or None."""
+    basename = tokens[index].rsplit("/", 1)[-1]
+    if _PIP_EXECUTABLE.fullmatch(basename):
+        return index + 1
+    if (
+        _PYTHON_EXECUTABLE.fullmatch(basename)
+        and tokens[index + 1 : index + 2] == ["-m"]
+        and tokens[index + 2 : index + 3] == ["pip"]
+    ):
+        return index + 3
+    if basename == "uv" and tokens[index + 1 : index + 2] == ["pip"]:
+        return index + 2
+    return None
+
+
+def _shell_segments(instruction: str) -> list[list[str]]:
+    """Split an instruction into shell command segments at unquoted operators.
+
+    A quoted or escaped `&&`, `||` or `;` is an option value, not a boundary.
+    """
+    raw_segments: list[str] = []
+    buffer: list[str] = []
+    index = 0
+    quote: str | None = None
+    while index < len(instruction):
+        char = instruction[index]
+        if quote is not None:
+            buffer.append(char)
+            if char == "\\" and quote == '"' and index + 1 < len(instruction):
+                buffer.append(instruction[index + 1])
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            buffer.append(char)
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(instruction):
+            buffer.append(char)
+            buffer.append(instruction[index + 1])
+            index += 2
+            continue
+        if instruction.startswith("&&", index) or instruction.startswith("||", index):
+            raw_segments.append("".join(buffer))
+            buffer = []
+            index += 2
+            continue
+        if char == ";":
+            raw_segments.append("".join(buffer))
+            buffer = []
+            index += 1
+            continue
+        buffer.append(char)
+        index += 1
+    raw_segments.append("".join(buffer))
+    return [_shell_tokens(segment) for segment in raw_segments if segment.strip()]
+
+
+def _pip_install_at(
+    tokens: list[str], start: int
+) -> tuple[int | None, list[Violation]]:
+    """Find the `install` subcommand after consuming global options by arity."""
+    violations: list[Violation] = []
+    unsupported_value = False
+    cursor = start
+    while cursor < len(tokens):
+        token = tokens[cursor]
+        if token in _PIP_NON_INSTALL_FLAGS:
+            return None, []
+        if token in _PIP_GLOBAL_FLAG_OPTIONS or _PIP_SHORT_VERBOSITY.fullmatch(token):
+            cursor += 1
+            continue
+        if token in _PIP_GLOBAL_VALUE_OPTIONS:
+            if cursor + 1 >= len(tokens):
+                return None, []
+            cursor += 2
+            continue
+        name, separator, value = token.partition("=")
+        if separator and name in _PIP_GLOBAL_VALUE_OPTIONS:
+            if not value:
+                violations.append(Violation(token, _MISSING_PIP_OPTION_VALUE))
+            cursor += 1
+            continue
+        if token == "install":
+            return cursor, violations
+        if token.startswith("-"):
+            violations.append(Violation(token, _UNSUPPORTED_PIP_GLOBAL_OPTION))
+            unsupported_value = True
+            cursor += 1
+            continue
+        if unsupported_value:
+            # An unsupported option may take a separate value; skip it so the
+            # subcommand is still found and the install is still validated.
+            unsupported_value = False
+            cursor += 1
+            continue
+        return None, []
+    return None, []
+
+
+def _pip_requirement_operands(
+    operands: list[str],
+) -> tuple[list[str], list[Violation]]:
+    """Collect requirement files in every spelling and audit their literal paths."""
+    requirements: list[str] = []
+    violations: list[Violation] = []
+    cursor = 0
+    while cursor < len(operands):
+        match = _PIP_REQUIREMENT_OPTION.fullmatch(operands[cursor])
+        if match is None:
+            cursor += 1
+            continue
+        path = match.group("long")
+        if path is None:
+            path = match.group("short")
+        if path:
+            cursor += 1
+        elif cursor + 1 < len(operands) and not operands[cursor + 1].startswith("-"):
+            path = operands[cursor + 1]
+            cursor += 2
+        else:
+            violations.append(Violation(operands[cursor], _MISSING_REQUIREMENTS_ARGUMENT))
+            cursor += 1
+            continue
+        requirements.append(path)
+        if path not in _AUDITED_REQUIREMENT_PATHS:
+            violations.append(Violation(path, _UNAUDITED_REQUIREMENTS_FILE))
+    return requirements, violations
+
+
+def _pip_invocations(tokens: list[str]) -> list[_PipInvocation]:
+    """Normalize the `pip install` in one shell segment's tokens.
+
+    Invocations without an `install` subcommand (`pip check`, `pip --version`,
+    `pip help install`, `uv pip list`, ...) are not installs and stay outside
+    the gate.
+    """
+    invocations: list[_PipInvocation] = []
+    for index in range(len(tokens)):
+        start = _pip_invocation_start(tokens, index)
+        if start is None:
+            continue
+        install_at, option_violations = _pip_install_at(tokens, start)
+        if install_at is None:
+            continue
+        operands = tokens[install_at + 1 :]
+        requirements, operand_violations = _pip_requirement_operands(operands)
+        invocations.append(
+            _PipInvocation(
+                operands=tuple(operands),
+                requirements=tuple(requirements),
+                violations=tuple(option_violations + operand_violations),
+            )
+        )
+        break
+    return invocations
+
+
+def _pip_install_operands(invocation: _PipInvocation) -> list[str]:
+    """Package operands only: options and requirement-file arguments are removed."""
+    requirements = set(invocation.requirements)
+    return [
+        operand
+        for operand in invocation.operands
+        if not operand.startswith("-") and operand not in requirements
+    ]
+
+
+def _dockerfile_pip_installs(instructions: list[str]) -> list[_PipInvocation]:
+    invocations: list[_PipInvocation] = []
+    for instruction in instructions:
+        for position, segment in enumerate(_shell_segments(instruction)):
+            if position == 0:
+                if not segment or segment[0].upper() != "RUN":
+                    break
+                segment = segment[1:]
+            invocations.extend(_pip_invocations(segment))
+    return invocations
+
+
 def _dockerfile_python_pins(instructions: list[str]) -> dict[str, list[str]]:
     pins: dict[str, list[str]] = {}
-    controls = {"&&", "||", ";"}
-    for instruction in instructions:
-        tokens = _shell_tokens(instruction)
-        if not tokens or tokens[0].upper() != "RUN":
-            continue
-        for index, token in enumerate(tokens[:-1]):
-            if not _PIP_EXECUTABLE.fullmatch(token.rsplit("/", 1)[-1]) or (
-                tokens[index + 1] != "install"
-            ):
+    for invocation in _dockerfile_pip_installs(instructions):
+        for operand in _pip_install_operands(invocation):
+            if "==" not in operand:
                 continue
-            for operand in tokens[index + 2 :]:
-                if operand in controls:
-                    break
-                if operand.startswith("-") or "==" not in operand:
-                    continue
-                name, version = operand.split("==", 1)
-                if name:
-                    pins.setdefault(_normalize_python_name(name), []).append(version)
+            name, version = operand.split("==", 1)
+            if name:
+                pins.setdefault(_normalize_python_name(name), []).append(version)
     return pins
 
 
 def _dockerfile_pip_violations(instructions: list[str]) -> list[Violation]:
     violations: list[Violation] = []
-    controls = {"&&", "||", ";"}
-    for instruction in instructions:
-        tokens = _shell_tokens(instruction)
-        if not tokens or tokens[0].upper() != "RUN":
-            continue
-        for index, token in enumerate(tokens[:-1]):
-            if not _PIP_EXECUTABLE.fullmatch(token.rsplit("/", 1)[-1]) or (
-                tokens[index + 1] != "install"
-            ):
+    for invocation in _dockerfile_pip_installs(instructions):
+        violations.extend(invocation.violations)
+        for operand in _pip_install_operands(invocation):
+            if operand == "pip" or operand.startswith(("./", "../", "/")):
                 continue
-            command: list[str] = []
-            for operand in tokens[index + 2 :]:
-                if operand in controls:
-                    break
-                command.append(operand)
-            skip_next = False
-            for operand in command:
-                if skip_next:
-                    skip_next = False
-                    continue
-                if operand in {"-r", "--requirement"}:
-                    skip_next = True
-                    continue
-                if (
-                    operand.startswith("-")
-                    or operand == "pip"
-                    or operand.startswith(("./", "../", "/"))
-                ):
-                    continue
-                if "==" not in operand:
-                    violations.append(Violation(operand, "pip install is missing an exact version"))
+            if "==" not in operand:
+                violations.append(Violation(operand, "pip install is missing an exact version"))
     return violations
 
 
 def _installs_generated_runner_requirements(instructions: list[str]) -> bool:
-    controls = {"&&", "||", ";"}
-    for instruction in instructions:
-        tokens = _shell_tokens(instruction)
-        if not tokens or tokens[0].upper() != "RUN":
-            continue
-        for index, token in enumerate(tokens[:-1]):
-            if not _PIP_EXECUTABLE.fullmatch(token.rsplit("/", 1)[-1]) or (
-                tokens[index + 1] != "install"
-            ):
-                continue
-            command: list[str] = []
-            for operand in tokens[index + 2 :]:
-                if operand in controls:
-                    break
-                command.append(operand)
-            if any(
-                option in {"-r", "--requirement"} and requirement == _REQUIREMENTS_PATH
-                for option, requirement in zip(command, command[1:], strict=False)
-            ):
-                return True
-    return False
+    return any(
+        _REQUIREMENTS_PATH in invocation.requirements
+        for invocation in _dockerfile_pip_installs(instructions)
+    )
 
 
 def _generated_runner_requirements_install_command(
     instructions: list[str],
 ) -> list[str]:
-    controls = {"&&", "||", ";"}
-    matches: list[list[str]] = []
-    for instruction in instructions:
-        tokens = _shell_tokens(instruction)
-        if not tokens or tokens[0].upper() != "RUN":
-            continue
-        for index, token in enumerate(tokens[:-1]):
-            if not _PIP_EXECUTABLE.fullmatch(token.rsplit("/", 1)[-1]) or (
-                tokens[index + 1] != "install"
-            ):
-                continue
-            command: list[str] = []
-            for operand in tokens[index + 2 :]:
-                if operand in controls:
-                    break
-                command.append(operand)
-            if any(
-                option in {"-r", "--requirement"} and requirement == _REQUIREMENTS_PATH
-                for option, requirement in zip(command, command[1:], strict=False)
-            ):
-                matches.append(command)
+    matches = [
+        list(invocation.operands)
+        for invocation in _dockerfile_pip_installs(instructions)
+        if _REQUIREMENTS_PATH in invocation.requirements
+    ]
     assert len(matches) == 1, "Dockerfile must install runner requirements once"
     return matches[0]
 
@@ -819,3 +996,182 @@ def test_python_pin_set_must_match_all_direct_registry_dependencies() -> None:
     assert Violation("aiohttp", "duplicate exact Dockerfile pin") in _find_violations(
         lock_text, duplicate
     )
+
+
+_PIP_INVOCATION_FAMILIES = [
+    pytest.param("pip", ["--disable-pip-version-check"], id="pip"),
+    pytest.param("pip3", ["--quiet"], id="pip3"),
+    pytest.param("python3", ["-m", "pip", "--isolated"], id="python-m-pip"),
+    pytest.param("uv", ["pip", "--no-progress"], id="uv-pip"),
+]
+
+
+@pytest.mark.parametrize(("command", "global_options"), _PIP_INVOCATION_FAMILIES)
+def test_pip_global_options_preserve_pin_validation(
+    command: str, global_options: list[str]
+) -> None:
+    lock_text = _UV_LOCK.read_text(encoding="utf-8")
+    expected = _locked_runner_dependencies(lock_text)
+    prefix = " ".join([command, *global_options])
+    pinned = " ".join(f'"{package}=={version}"' for package, version in expected.items())
+
+    # The unchanged Dockerfile stays the positive control.
+    assert _find_violations(lock_text, _DOCKERFILE.read_text(encoding="utf-8")) == []
+
+    # Valid pinned operands are still accepted behind documented global options.
+    assert _find_violations(lock_text, f"RUN {prefix} install {pinned}\n") == []
+    for verbosity in ("-q", "-qq", "-v", "-vvv"):
+        assert (
+            _find_violations(lock_text, f"RUN {prefix} {verbosity} install {pinned}\n")
+            == []
+        )
+
+    # Unpinned registry operands are still rejected behind those same options.
+    unpinned = _find_violations(lock_text, f"RUN {prefix} install claude-agent-sdk aiohttp\n")
+    assert Violation(
+        "claude-agent-sdk", "pip install is missing an exact version"
+    ) in unpinned
+    assert Violation("aiohttp", "pip install is missing an exact version") in unpinned
+
+    # A wrong pin is still compared with the lock.
+    stale = f"{expected['aiohttp']}.stale"
+    drift = _find_violations(lock_text, f'RUN {prefix} install "aiohttp=={stale}"\n')
+    assert (
+        Violation(
+            "aiohttp",
+            f"expected lock version {expected['aiohttp']}, found Dockerfile version {stale}",
+        )
+        in drift
+    )
+
+    # Unknown or malformed global options fail closed instead of hiding the install.
+    unknown = _find_violations(
+        lock_text, f"RUN {prefix} --frobnicate install claude-agent-sdk\n"
+    )
+    assert Violation("--frobnicate", "unsupported pip global option") in unknown
+    assert Violation(
+        "claude-agent-sdk", "pip install is missing an exact version"
+    ) in unknown
+    missing_value = _find_violations(
+        lock_text, f"RUN {prefix} --timeout= install claude-agent-sdk\n"
+    )
+    assert (
+        Violation("--timeout=", "pip global option is missing a value") in missing_value
+    )
+
+    if command == "pip":
+        # A global option value is consumed by arity, even when it spells `install`.
+        arity = (
+            _DOCKERFILE.read_text(encoding="utf-8")
+            + f"\nRUN {prefix} --log install install -r {_BOOTSTRAP_REQUIREMENTS_PATH}\n"
+            + f"RUN {prefix} --log=install install -r {_BOOTSTRAP_REQUIREMENTS_PATH}\n"
+        )
+        assert _find_violations(lock_text, arity) == []
+
+        # Supported value-option aliases are consumed by arity.
+        for options in (
+            "--resume-retries 5",
+            "--default-timeout 15",
+            "--retries 3",
+            "--timeout 30",
+        ):
+            assert (
+                _find_violations(lock_text, f"RUN pip {options} install {pinned}\n")
+                == []
+            )
+        resume = _find_violations(lock_text, "RUN pip --resume-retries 5 install aiohttp\n")
+        assert Violation("aiohttp", "pip install is missing an exact version") in resume
+
+        # An unsupported option's separate value cannot hide the install.
+        unknown_value = _find_violations(
+            lock_text, "RUN pip --frobnicate 5 install claude-agent-sdk\n"
+        )
+        assert (
+            Violation("--frobnicate", "unsupported pip global option") in unknown_value
+        )
+        assert Violation(
+            "claude-agent-sdk", "pip install is missing an exact version"
+        ) in unknown_value
+
+        # A quoted operator is an option value, not a command boundary.
+        quoted = _find_violations(
+            lock_text, f"RUN {prefix} --log ';' install claude-agent-sdk\n"
+        )
+        assert Violation(
+            "claude-agent-sdk", "pip install is missing an exact version"
+        ) in quoted
+
+    # Benign non-install invocations are not installs and stay outside the gate.
+    benign = (
+        _DOCKERFILE.read_text(encoding="utf-8")
+        + "\nRUN pip check\nRUN pip --version\nRUN uv pip list\n"
+        + "RUN python3 -m pip freeze\nRUN pip help install\n"
+    )
+    assert _find_violations(lock_text, benign) == []
+
+
+def test_pip_requirement_files_fail_closed() -> None:
+    lock_text = _UV_LOCK.read_text(encoding="utf-8")
+    dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
+
+    # The unchanged Dockerfile stays the positive control.
+    assert _find_violations(lock_text, dockerfile) == []
+
+    # Both audited paths are accepted in every supported spelling.
+    for path in (_BOOTSTRAP_REQUIREMENTS_PATH, _REQUIREMENTS_PATH):
+        for spelling in (
+            f"-r {path}",
+            f"--requirement {path}",
+            f"--requirement={path}",
+            f"-r{path}",
+        ):
+            assert (
+                _find_violations(lock_text, f"{dockerfile}\nRUN pip install {spelling}\n")
+                == []
+            )
+
+    # Every unaudited path is rejected in every supported spelling.
+    for spelling in (
+        "-r /tmp/extra.txt",
+        "--requirement /tmp/extra.txt",
+        "--requirement=/tmp/extra.txt",
+        "-r/tmp/extra.txt",
+    ):
+        violations = _find_violations(
+            lock_text, f"{dockerfile}\nRUN pip install {spelling}\n"
+        )
+        assert Violation("/tmp/extra.txt", "pip requirements file is not audited") in violations
+
+    # A missing requirement argument is a diagnostic, not a silent pass.
+    for option in ("-r", "--requirement"):
+        violations = _find_violations(lock_text, f"{dockerfile}\nRUN pip install {option}\n")
+        assert (
+            Violation(option, "pip requirement option is missing an argument") in violations
+        )
+
+    # A supported timeout alias does not hide an unaudited requirement file.
+    default_timeout = _find_violations(
+        lock_text,
+        f"{dockerfile}\nRUN pip --default-timeout 15 install -r /tmp/extra.txt\n",
+    )
+    assert Violation("/tmp/extra.txt", "pip requirements file is not audited") in default_timeout
+
+    # A quoted operator is an option value, not a boundary; the file is still audited.
+    quoted = _find_violations(
+        lock_text, f"{dockerfile}\nRUN pip --log '&&' install -r /tmp/extra.txt\n"
+    )
+    assert Violation("/tmp/extra.txt", "pip requirements file is not audited") in quoted
+    quoted_audited = _find_violations(
+        lock_text,
+        f"{dockerfile}\nRUN pip --log '&&' install -r {_BOOTSTRAP_REQUIREMENTS_PATH}\n",
+    )
+    assert quoted_audited == []
+
+    # A separate invalid install is still checked beside the generated install.
+    violations = _find_violations(
+        lock_text, f"{dockerfile}\nRUN pip install claude-agent-sdk aiohttp\n"
+    )
+    assert Violation(
+        "claude-agent-sdk", "pip install is missing an exact version"
+    ) in violations
+    assert Violation("aiohttp", "pip install is missing an exact version") in violations
