@@ -2234,6 +2234,17 @@ fn hook_agent_path(agent: &str, name: &str, tail: &[&str]) -> String {
     url.path().to_string()
 }
 
+/// The `{address}` segment of a `/state/bindings/{kind}/{address}` route
+/// before it is pushed as a path segment: only `%` and `/` escaped, `%` first.
+/// The API decodes the request path once before routing and the address
+/// segment once more (`_binding_address` in `routers/state.py`), so a GitHub
+/// `owner/name` reaches its route as one segment instead of splitting at the
+/// slash. An address holding neither character goes out byte for byte as it
+/// did before, so an API that decodes the segment only once still reads it.
+fn binding_address_segment(address: &str) -> String {
+    address.replace('%', "%25").replace('/', "%2F")
+}
+
 /// Build the existing agent or binding memory state route. Every identity is
 /// pushed as a path segment, including addresses containing literal escapes.
 pub(crate) fn memory_state_url(
@@ -2252,7 +2263,9 @@ pub(crate) fn memory_state_url(
             .push(agent_id)
             .push("state");
         if let Some((kind, address)) = channel {
-            path.push("bindings").push(kind).push(address);
+            path.push("bindings")
+                .push(kind)
+                .push(&binding_address_segment(address));
         }
         path.push("memory");
         if let Some(key) = key {
@@ -5188,6 +5201,66 @@ mod tests {
     /// A typed request body as it goes on the wire.
     fn wire<T: serde::Serialize>(body: &T) -> serde_json::Value {
         serde_json::to_value(body).expect("request bodies serialize")
+    }
+
+    /// One percent-decoding pass, as the API applies to the request path and
+    /// then to the address segment.
+    fn percent_decode(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%'
+                && i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit()
+            {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).expect("hex digits");
+                out.push(u8::from_str_radix(hex, 16).expect("hex digits"));
+                i += 3;
+                continue;
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8(out).expect("decoded test addresses are UTF-8")
+    }
+
+    /// The address segment of a binding memory URL as it goes on the wire.
+    fn wire_address(kind: &str, address: &str) -> String {
+        let url = super::memory_state_url("http://api.invalid", "a", Some((kind, address)), None)
+            .expect("memory URL builds");
+        let path = url.path().to_string();
+        let segments: Vec<&str> = path.split('/').collect();
+        assert_eq!(segments.len(), 8, "{path}");
+        segments[6].to_string()
+    }
+
+    /// An address with no `%` or `/` (a mail address, a Slack channel) goes out
+    /// byte for byte as the single segment push the CLI sent before, so an API
+    /// that decodes the segment only once still reads it; an `owner/name` and a
+    /// literal `%` survive the API's two decodes as one segment.
+    #[test]
+    fn binding_address_segment_keeps_the_old_wire_and_round_trips() {
+        for (kind, address) in [("mail", "ops@example.com"), ("slack", "C0123ABCD")] {
+            let mut old = reqwest::Url::parse("http://api.invalid").expect("parses");
+            old.path_segments_mut().expect("segments").push(address);
+            assert_eq!(
+                wire_address(kind, address),
+                old.path().trim_start_matches('/')
+            );
+        }
+        for address in [
+            "acme-corp/widgets",
+            "50%off",
+            "a%2Fb/c",
+            "inbox@x.example?v=1#r%25",
+        ] {
+            let wire = wire_address("github", address);
+            let routed = percent_decode(&wire);
+            assert!(!routed.contains('/'), "{wire} splits at routing");
+            assert_eq!(percent_decode(&routed), address, "{wire}");
+        }
     }
 
     /// The pre-dispatch span guard allows exactly the cap (#1948): 1,000 hour

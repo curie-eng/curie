@@ -70,7 +70,11 @@ def _need_http(
 def _state_path(agent_id: str, key: str | None = None, channel: tuple[str, str] | None = None):
     segments = ["agents", agent_id, "state"]
     if channel is not None:
-        segments.extend(["bindings", *channel])
+        # Only ``%`` and ``/`` are escaped here before the segment is encoded
+        # below, as the CLI and worker send it (routers/state.py
+        # _binding_address decodes the segment once more).
+        address = channel[1].replace("%", "%25").replace("/", "%2F")
+        segments.extend(["bindings", channel[0], address])
     segments.append("memory")
     if key is not None:
         segments.append(key)
