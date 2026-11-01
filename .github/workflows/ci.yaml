@@ -3276,7 +3276,7 @@ jobs:
           install_only: true
       # This ubuntu-24.04 job owns a disposable hosted runner. The Android,
       # .NET and Haskell SDKs are unused here; remove only those preinstalled
-      # SDK trees before downloading images to preserve the driver's 30 GB floor.
+      # SDK trees before candidate builds and image imports.
       - name: Free disk for the disposable factory cluster
         run: |
           set -euo pipefail
@@ -3401,7 +3401,7 @@ jobs:
           install_only: true
       # This ubuntu-24.04 job owns a disposable hosted runner. The Android,
       # .NET and Haskell SDKs are unused here; remove only those preinstalled
-      # SDK trees before downloading images to preserve the driver's 30 GB floor.
+      # SDK trees before candidate builds and image imports.
       - name: Free disk for the disposable factory cluster
         run: |
           set -euo pipefail
@@ -3503,7 +3503,7 @@ jobs:
           install_only: true
       # This ubuntu-24.04 job owns a disposable hosted runner. The Android,
       # .NET and Haskell SDKs are unused here; remove only those preinstalled
-      # SDK trees before downloading images to preserve the driver's 30 GB floor.
+      # SDK trees before candidate builds and image imports.
       - name: Free disk for the disposable factory cluster
         run: |
           set -euo pipefail

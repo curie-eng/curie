@@ -1363,7 +1363,7 @@ def _image_check_commands(
 
     monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(sk.shutil, "which", lambda binary: f"/usr/bin/{Path(binary).name}")
-    monkeypatch.setattr(sk.ScriptedRun, "check_disk", lambda _self, _stage: None)
+    monkeypatch.setattr(sk.ScriptedRun, "check_disk", lambda _self, _stage, **_kwargs: None)
     calls: list[tuple[str, ...]] = []
     mutating: list[tuple[str, ...]] = []
 
@@ -1377,7 +1377,9 @@ def _image_check_commands(
         if argv[:3] == ("docker", "image", "inspect"):
             if argv[3] == missing:
                 return subprocess.CompletedProcess(argv, 1, "", f"Error: No such image: {missing}")
-            return subprocess.CompletedProcess(argv, 0, "[]", "")
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps([{"Size": 1024} for _ in argv[3:]]), ""
+            )
         mutating.append(argv)
         if argv[:3] in {("docker", "rm", "-f"), ("docker", "ps", "-aq")}:
             return subprocess.CompletedProcess(argv, 0, "", "")
@@ -1413,7 +1415,10 @@ def test_present_local_images_pass_the_check_and_reach_resource_creation(
     calls, mutating = _image_check_commands(tmp_path, monkeypatch, None)
 
     assert sk.main(_replay_args(tmp_path)) == fe.EXIT_FAILED
-    inspected = [argv[3] for argv in calls if argv[:3] == ("docker", "image", "inspect")]
+    inspected = {
+        image for argv in calls if argv[:3] == ("docker", "image", "inspect")
+        for image in argv[3:]
+    }
     assert sorted(inspected) == sorted(sk.IMAGES)
     assert mutating, "the run must proceed past the image check"
     assert mutating[0][:2] in {("docker", "run"), ("kind", "create")}
@@ -1566,4 +1571,20 @@ def test_runtime_disk_budget_reserves_candidate_import_and_workloads(
         with pytest.raises(fe.ConfigError, match="free disk"):
             run.prerequisites()
     else:
+        run.prerequisites()
+
+
+
+def test_image_builds_retain_the_existing_disk_reserve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sk.shutil, "which", lambda binary: f"/usr/bin/{binary}")
+    monkeypatch.setattr(
+        sk.shutil, "disk_usage", lambda _path: type("Usage", (), {"free": 20 * 1024**3})(),
+    )
+    args = _replay_args(tmp_path)
+    args.build_images = True
+    run = sk.ScriptedRun(args)
+    monkeypatch.setattr(run, "command", _refuse_external_command)
+    with pytest.raises(fe.ConfigError, match=str(30 * 1024**3)):
         run.prerequisites()
