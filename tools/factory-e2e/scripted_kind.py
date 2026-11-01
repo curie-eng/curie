@@ -1279,7 +1279,12 @@ class ScriptedRun:
                 host = service.host
                 with socket.socket() as sock:
                     sock.settimeout(1)
-                    if sock.connect_ex((host, port)) == 0:
+                    # Linux can connect a socket to itself when its ephemeral
+                    # source port reuses the closed listener's port.
+                    if (
+                        sock.connect_ex((host, port)) == 0
+                        and sock.getsockname() != sock.getpeername()
+                    ):
                         errors.append(f"owned endpoint still listens on port {port}")
             except (
                 OSError,

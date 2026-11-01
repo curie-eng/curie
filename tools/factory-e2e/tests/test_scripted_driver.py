@@ -489,6 +489,63 @@ def test_endpoint_probe_error_does_not_interrupt_cluster_and_registry_teardown(
         model.close()
 
 
+def test_closed_endpoint_self_connection_does_not_fail_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_module = sk._module(
+        "factory_cleanup_self_connection_model", REPO_ROOT / "tools/model-script/model_script.py"
+    )
+    run = _cleanup_run(tmp_path, monkeypatch)
+    model = model_module.ModelScript(Path(run.args.transcript))
+    model.start()
+    run.model = model
+    calls = _successful_cleanup_commands(monkeypatch)
+    connections: list[tuple[Any, Any]] = []
+
+    class SelfConnectingSocket(socket.socket):
+        def connect_ex(self, address: Any) -> int:
+            # Force Linux's ephemeral source-port allocation to choose the
+            # just-closed listener's port. The TCP connection itself is real.
+            self.bind(address)
+            result = super().connect_ex(address)
+            assert result == 0
+            connections.append((self.getsockname(), self.getpeername()))
+            return result
+
+    monkeypatch.setattr(sk.socket, "socket", SelfConnectingSocket)
+    try:
+        errors = run.cleanup()
+        assert connections == [((model.host, model.port), (model.host, model.port))]
+        assert errors == []
+        assert run.evidence["cleanup_verified"] is True
+        _assert_remaining_teardown_attempted(run, calls)
+    finally:
+        model.close()
+
+
+def test_listening_endpoint_fails_cleanup_and_remaining_teardown_still_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_module = sk._module(
+        "factory_cleanup_listening_model", REPO_ROOT / "tools/model-script/model_script.py"
+    )
+    run = _cleanup_run(tmp_path, monkeypatch)
+    model = model_module.ModelScript(Path(run.args.transcript))
+    model.start()
+    run.model = model
+    calls = _successful_cleanup_commands(monkeypatch)
+    close = model.close
+    monkeypatch.setattr(model, "close", lambda: None)
+    try:
+        assert run.cleanup() == [f"owned endpoint still listens on port {model.port}"]
+        assert run.evidence["cleanup_verified"] is False
+        _assert_remaining_teardown_attempted(run, calls)
+    finally:
+        close()
+
+
 def test_failed_registry_delete_and_verification_still_remove_owned_workdir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
