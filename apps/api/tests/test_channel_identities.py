@@ -750,6 +750,121 @@ def test_attributes_cannot_smuggle_a_credential(
     assert good_patch.json()["attributes"] == {"team_id": "T0123456"}
 
 
+# --- scopes cannot smuggle a credential either (#5246) ---------------------
+
+# Synthetic credential-shaped scope values the attributes deny already
+# refuses; gitleaks:allow -- fabricated test fixtures, never real credentials.
+_PASTED_SCOPES = [
+    RAW_TOKEN,
+    CANARY,
+    "xoxe.xoxp-1-abc",
+    "xapp-1-abc",
+    "ghp_abc123def456",
+    "sk-ant-api03-abc",
+    "sk_live_abc123",
+    "rk_live_abc123",
+    "lin_api_abc123",
+    "AIzaSyA1b2c3D4e5F6g7",
+    "AKIA1234567890ABCDEF",
+    "0123456789abcdef" * 2,
+    "eyJhbGciOiJIUzI1NiJ9.e30.sig",
+]
+
+
+@pytest.mark.parametrize("scope", _PASTED_SCOPES)
+def test_scope_credential_values_are_refused_without_persistence(
+    api: TestClient, auth_headers: dict[str, str], scope: str
+) -> None:
+    # A second row, and one in another tenant, must both survive a refused
+    # request untouched. That is update isolation, not a new tenant
+    # authorization policy: this router stays platform-administrator-only.
+    other = _create(api, auth_headers, name="other", scopes=["chat:write"])
+    tenant_id = _committed_tenant()
+    foreign = _create(
+        api, auth_headers, name="foreign", tenant_id=tenant_id, scopes=["im:history"]
+    )
+
+    # Create: refused before the insert, so no row exists afterwards.
+    posted = api.post(
+        BASE,
+        json={
+            "provider": "slack",
+            "name": "pasted",
+            "scopes": ["chat:write", scope, "users:read"],
+        },
+        headers=auth_headers,
+    )
+    assert posted.status_code == 422
+    assert scope not in posted.text
+    names = {row["name"] for row in api.get(BASE, headers=auth_headers).json()}
+    assert "pasted" not in names
+
+    # Update: refused before the lock, before any field is applied, so the
+    # target keeps its scopes AND every other valid field this same body
+    # supplied.
+    target = _create(api, auth_headers, name="target", scopes=["chat:write"])
+    patched = api.patch(
+        f"{BASE}/{target['id']}",
+        json={
+            "scopes": ["chat:write", scope],
+            "name": "renamed",
+            "attributes": {"team_id": "T0123456"},
+            "status": "disabled",
+        },
+        headers=auth_headers,
+    )
+    assert patched.status_code == 422
+    assert scope not in patched.text
+    fetched = api.get(f"{BASE}/{target['id']}", headers=auth_headers).json()
+    assert fetched["scopes"] == ["chat:write"]
+    assert fetched["name"] == "target"
+    assert fetched["attributes"] == {}
+    assert fetched["status"] == "active"
+
+    # Neither the second row nor the second-tenant row moved.
+    assert api.get(f"{BASE}/{other['id']}", headers=auth_headers).json() == other
+    assert api.get(f"{BASE}/{foreign['id']}", headers=auth_headers).json() == foreign
+
+
+def test_scope_empty_list_create_and_update_round_trip(
+    api: TestClient, auth_headers: dict[str, str]
+) -> None:
+    # An explicitly empty list is a valid write on both surfaces, not a refusal.
+    created = _create(api, auth_headers, scopes=[])
+    assert created["scopes"] == []
+    created = _create(api, auth_headers, name="emptied", scopes=["chat:write"])
+    updated = api.patch(
+        f"{BASE}/{created['id']}", json={"scopes": []}, headers=auth_headers
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["scopes"] == []
+    assert api.get(f"{BASE}/{created['id']}", headers=auth_headers).json()["scopes"] == []
+
+
+def test_unrelated_patch_retains_scopes(api: TestClient, auth_headers: dict[str, str]) -> None:
+    # Omitted scopes on a PATCH touching other fields: unchanged, not cleared.
+    created = _create(api, auth_headers, scopes=["chat:write", "users:read"])
+    patched = api.patch(
+        f"{BASE}/{created['id']}", json={"name": "renamed-bot"}, headers=auth_headers
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["name"] == "renamed-bot"
+    assert patched.json()["scopes"] == ["chat:write", "users:read"]
+
+
+def test_patch_scopes_to_null_rejected_without_mutation(
+    api: TestClient, auth_headers: dict[str, str]
+) -> None:
+    # Explicit null keeps its existing refusal (may be omitted, not null), and
+    # the rejected body mutates nothing.
+    created = _create(api, auth_headers, scopes=["chat:write"])
+    response = api.patch(f"{BASE}/{created['id']}", json={"scopes": None}, headers=auth_headers)
+    assert response.status_code == 422
+    unchanged = api.get(f"{BASE}/{created['id']}", headers=auth_headers).json()
+    assert unchanged["scopes"] == ["chat:write"]
+    assert unchanged["name"] == "default"
+
+
 @pytest.mark.parametrize(
     "body",
     [

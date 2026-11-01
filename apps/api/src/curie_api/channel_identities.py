@@ -144,6 +144,28 @@ def check_attributes(attributes: dict[str, Any]) -> None:
     _check_attributes_deny(attributes)
 
 
+def check_scopes(scopes: list[str]) -> None:
+    """Refuse a well-known credential shape anywhere inside ``scopes`` (#5246).
+
+    A scope is a provider permission name (``chat:write``), never a value, but
+    the column has no fixed grammar to anchor a known prefix to -- the same
+    position ``attributes`` is in (ADR 0168 decision 1) -- so each supplied
+    scope gets the same finite deny the attributes bag gets. The re-raise keeps
+    the class the router answers with a sanitized 422 while making the reason
+    scope-related; ``from None`` because a chained exception is still input
+    this module refuses to echo.
+    """
+
+    for scope in scopes:
+        try:
+            _check_attributes_deny(scope)
+        except IdentityInvalid:
+            raise IdentityInvalid(
+                "scopes must not contain a well-known credential shape; "
+                "the submitted value is not echoed"
+            ) from None
+
+
 # Only named constraints are translated; anything else is a bug and re-raises.
 _CONSTRAINT_ERRORS: dict[str, tuple[type[Exception], str]] = {
     "channel_identities_tenant_provider_name_key": (
@@ -187,6 +209,7 @@ async def create_identity(
     for field in _REFERENCE_FIELDS:
         check_reference(field, getattr(data, field))
     _check_attributes_deny(data.attributes)
+    check_scopes(data.scopes)
     identity = ChannelIdentity(
         tenant_id=data.tenant_id or DEFAULT_TENANT_ID,
         provider=data.provider,
@@ -245,6 +268,13 @@ async def update_identity(
             check_reference(field, getattr(data, field))
     if "attributes" in fields:
         _check_attributes_deny(data.attributes)
+    # Before the lock and before any field is applied, so a refused PATCH --
+    # including one that also supplies other valid fields -- mutates nothing.
+    # The schema already refuses an explicit null scope list, so a set
+    # ``scopes`` is a list here; the ``is not None`` keeps that invariant
+    # local rather than trusting it.
+    if "scopes" in fields and data.scopes is not None:
+        check_scopes(data.scopes)
 
     target: ProviderInstallation | None = None
     if "provider_installation_id" in fields and data.provider_installation_id is not None:
