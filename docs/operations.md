@@ -1254,6 +1254,14 @@ Secret reference through `api.githubAppExistingSecret` and
 `api.githubAppExistingSecretKey`. An `owner/*` allowlist or an inline-only
 `api.githubAppPrivateKey` refuses.
 
+After upgrading to a version implementing
+[ADR 0253](adr/0253-factory-base-labels-resolve-at-claim-and-follow-relabels.md),
+base selection resolves at claim after the label settling interval. A ticket
+with a disallowed `base:` label can have a waiting WorkItem and execution
+request; it cannot start execution. The factory records `base_not_allowed`
+and posts a marked refusal comment. Correcting the label lets that request
+retry against the retained repository base policy.
+
 The CLI machine must reach the retained `api.githubApiUrl` for identity
 resolution. Live `curie cluster up`, `curie apply`, `curie diff` and
 `curie cluster upgrade`, including upgrade `--dry-run`, may mint external

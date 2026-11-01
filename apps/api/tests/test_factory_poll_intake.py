@@ -719,6 +719,20 @@ def test_poll_admits_a_young_labeled_issue_once(
             "label",
             _NEXT_SHA,
         ),
+        (
+            {"bases": ["main", "maint", "release"], "default_base": "maint"},
+            (),
+            "maint",
+            "default",
+            _MAIN_SHA,
+        ),
+        (
+            {"bases": ["main", "maint", "release"], "default_base": "maint"},
+            ("base:release",),
+            "release",
+            "label",
+            _NEXT_SHA,
+        ),
     ],
 )
 def test_poll_defers_base_resolution_until_current_selection_is_acquired(
@@ -732,6 +746,7 @@ def test_poll_defers_base_resolution_until_current_selection_is_acquired(
     commit: str,
 ) -> None:
     client, github = poll_factory
+    github.branches[branch] = commit
     if entry is not None:
         _reconfigure(monkeypatch, tmp_path, bindings=[github_repository_binding(**entry)])
     number = github.plant_issue(base_labels=labels)
@@ -769,11 +784,12 @@ def test_poll_defers_base_resolution_until_current_selection_is_acquired(
 
 
 @pytest.mark.parametrize(
-    ("labels", "allowed", "reason"),
+    ("labels", "allowed", "default_base", "reason"),
     [
-        (("base:main", "base:next"), ["main", "next"], "more than one base label"),
-        (("base:next",), ["main"], "not an allowed base"),
-        (("base:missing",), ["main", "missing"], "does not exist"),
+        (("base:main", "base:next"), ["main", "next"], "main", "more than one base label"),
+        (("base:next",), ["main"], "main", "not an allowed base"),
+        (("base:missing",), ["main", "missing"], "main", "does not exist"),
+        (("base:unapproved",), ["main", "maint", "release"], "maint", "not an allowed base"),
     ],
 )
 def test_poll_admits_invalid_base_then_acquisition_rechecks_the_same_request_after_correction(
@@ -782,13 +798,15 @@ def test_poll_admits_invalid_base_then_acquisition_rechecks_the_same_request_aft
     tmp_path: Path,
     labels: tuple[str, ...],
     allowed: list[str],
+    default_base: str,
     reason: str,
 ) -> None:
     client, github = poll_factory
+    github.branches[default_base] = _MAIN_SHA
     _reconfigure(
         monkeypatch,
         tmp_path,
-        bindings=[github_repository_binding(bases=allowed, default_base="main")],
+        bindings=[github_repository_binding(bases=allowed, default_base=default_base)],
     )
     number = github.plant_issue(base_labels=labels)
 
@@ -856,7 +874,7 @@ def test_poll_admits_invalid_base_then_acquisition_rechecks_the_same_request_aft
     assert rows[0]["id"] == request_id
     assert rows[0]["base_resolved_request_id"] == request_id
     assert (rows[0]["base_branch"], rows[0]["base_source"], rows[0]["base_commit"]) == (
-        "main",
+        default_base,
         "default",
         _MAIN_SHA,
     )
