@@ -35,8 +35,8 @@
 # applies on the worker. `langfuse-runasuser-assertions.sh` stays web-only; these
 # two renders are what makes that deferral safe.
 #
-# The executable live delayed-start regression is nested under ci/runtime so
-# chart-check keeps discovering only the fast top-level assertion scripts.
+# The live delayed-start cluster scenario was removed. This render contract
+# is what still checks that both Langfuse Deployments carry the gate.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

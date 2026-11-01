@@ -132,7 +132,6 @@ def test_real_ci_registers_its_calico_runtime_assertions() -> None:
         CI,
         [
             "charts/curie/ci/runtime/publication-job-assertions.sh",
-            "charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh",
             "charts/curie/ci/runtime/connector-readiness-runtime.sh",
         ],
     )
@@ -335,7 +334,6 @@ CHART_RUNTIME_SCRIPTS = [
     "charts/curie/ci/runtime/upgrade-drain-installation-runtime.sh",
     "charts/curie/ci/runtime/e2e-connector-identity-runtime.sh",
     "charts/curie/ci/runtime/runner-resources-assertions.sh",
-    "charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh",
     "charts/curie/ci/runtime/connector-readiness-runtime.sh",
     "charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh",
     "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",

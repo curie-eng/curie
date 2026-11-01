@@ -229,14 +229,6 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
         "inputs": ["charts/curie/ci/runtime/runner-resources-assertions.sh"],
         "leg": "chart",
     },
-    "langfuse-postgres-readiness": {
-        "step": "Langfuse web waits for delayed Postgres without restarting",
-        "inputs": [
-            "charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh",
-            "charts/curie/ci/postgres-readiness-delay.Dockerfile",
-        ],
-        "leg": "chart",
-    },
     "connector-readiness": {
         "step": "Connector that never listens stays not-Ready until it binds",
         "inputs": [
@@ -4146,7 +4138,6 @@ def _selector_outputs_omit_kind(tmp_path: Path, path: str) -> dict[str, str]:
 
 
 CLUSTER_RUNG_MOVED_PROOFS = {
-    "Langfuse web waits for delayed Postgres without restarting": "e2e-cluster-chart-regressions",
     "Connector that never listens stays not-Ready until it binds": "e2e-cluster-chart-regressions",
     "Runner BYO egress enforces (not just rendered)": "e2e-cluster-chart-regressions",
     "Rollout-free first invocation and dead-consumer recovery": "e2e-cluster-rollout-recovery",
@@ -5262,10 +5253,10 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
         ((), True, True, ()),
         (("apps/api/src/curie_api/main.py",), False, True, ()),
         (
-            ("charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh",),
+            ("charts/curie/ci/runtime/connector-readiness-runtime.sh",),
             False,
             True,
-            ("langfuse-postgres-readiness",),
+            ("connector-readiness",),
         ),
         (_version_only_paths(_repo_version()), False, False, ()),
     ],
@@ -5313,7 +5304,6 @@ def test_chart_scenarios_follow_changed_inputs_and_final_tiers(
         ("charts/curie/values-dev.yaml", CHART_IDS),
         ("charts/curie/values.schema.json", CHART_IDS),
         ("charts/curie/values-custom.yaml", CHART_IDS),
-        ("charts/curie/ci/postgres-readiness-delay.Dockerfile", ("langfuse-postgres-readiness",)),
         (
             "apps/worker/src/curie_worker/connector_k8s.py.bak",
             (
@@ -5519,11 +5509,6 @@ def test_chart_scenario_registry_rejects_a_scenario_without_a_valid_leg(
         _SELECTOR_MODULE._load_registry(path)
 
 
-CHART_FIXTURE_STEPS = (
-    "Load the Postgres readiness fixture built by the ci-images job",
-    "Tag the Postgres readiness fixture",
-    "Load the Postgres readiness fixture into the kind cluster",
-)
 WORKLOAD_STAGING_STEPS = (
     "Download the workspace diagnostic CLI",
     "Load the workspace diagnostic candidate images",
@@ -5541,8 +5526,6 @@ def test_chart_job_runs_one_leg_per_runner_from_the_selected_legs() -> None:
     }
     assert chart["if"] == CHART_JOB_IF
     steps = {step.get("name"): step for step in chart["steps"]}
-    for name in CHART_FIXTURE_STEPS:
-        assert steps[name].get("if") == "${{ matrix.leg == 'chart' }}", name
     for name in WORKLOAD_STAGING_STEPS:
         assert steps[name].get("if") == WORKLOAD_STAGING_IF, name
     upload = steps["Upload runtime assertion receipts"]
