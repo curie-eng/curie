@@ -5187,6 +5187,12 @@ jobs:
           persist-credentials: false
       - name: Pull Docker Hub images through the mirror
         run: bash cli/scripts/configure-docker-hub-mirror.sh
+      - name: Free disk for the disposable upgrade matrix cluster
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
       - name: Download the candidate curie binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
