@@ -1533,3 +1533,37 @@ def test_publication_runtime_keeps_bounded_redacted_pod_failure_after_removal(
     assert all(
         "curietech.ai/component=publication" in call for call in calls if "jobs,pods" in call
     )
+
+
+# Observed Docker image inspect Size values from a fresh main candidate build.
+_CANDIDATE_IMAGE_BYTES = (716245847, 708133868, 74690291, 1065367629)
+
+
+@pytest.mark.parametrize("free_gib", [20, 8])
+def test_runtime_disk_budget_reserves_candidate_import_and_workloads(
+    free_gib: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sk.shutil, "which", lambda binary: f"/usr/bin/{binary}")
+    monkeypatch.setattr(
+        sk.shutil, "disk_usage",
+        lambda _path: type("Usage", (), {"free": free_gib * 1024**3})(),
+    )
+    run = sk.ScriptedRun(_replay_args(tmp_path))
+
+    def command(*argv: str, **_kwargs: Any) -> str:
+        if argv[:2] == ("kind", "version"):
+            return "kind v0.24.0"
+        if argv[:3] == ("docker", "image", "inspect"):
+            return json.dumps([
+                {"Size": _CANDIDATE_IMAGE_BYTES[sk.IMAGES.index(image)]}
+                for image in argv[3:]
+            ])
+        assert argv[:2] in _READ_ONLY_PREREQUISITES
+        return ""
+
+    monkeypatch.setattr(run, "command", command)
+    if free_gib == 8:
+        with pytest.raises(fe.ConfigError, match="free disk"):
+            run.prerequisites()
+    else:
+        run.prerequisites()
