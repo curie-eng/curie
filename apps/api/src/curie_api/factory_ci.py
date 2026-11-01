@@ -31,7 +31,10 @@ pure ``decide``:
   example a label). Publication applies only operator-configured labels. A rules
   HTTP 404 or an empty rules list adds no names. A transient required-check read stays
   pending until the deadline and then ends ``ci_timeout``. Any other unreadable
-  read, including ``github_forbidden``, ends ``ci_unverified`` immediately;
+  read ends ``ci_unverified`` immediately, and a 403 names the read it refused
+  (``github_forbidden_list_check_runs``, ``github_forbidden_get_combined_status``,
+  ``github_forbidden_get_branch_rules`` or ``github_forbidden_get_branch``)
+  rather than claiming a missing App permission (#5222);
 - a failing check run or commit status whose ``name`` or ``context`` is also
   failing on the commit the PR's base branch points to now is pre-existing,
   not caused by the change (#4105). Only caused failures fail the gate or
@@ -112,6 +115,10 @@ PERMANENT_UNREADABLE = frozenset(
         "installation_refused",
         "github_unauthorized",
         "github_forbidden",
+        "github_forbidden_list_check_runs",
+        "github_forbidden_get_combined_status",
+        "github_forbidden_get_branch_rules",
+        "github_forbidden_get_branch",
         "github_not_found",
         "malformed_response",
         "too_many_check_runs",
@@ -120,6 +127,16 @@ PERMANENT_UNREADABLE = frozenset(
 )
 # Reason codes that count as pending until the CI deadline.
 TRANSIENT = frozenset({"timeout", "observation_busy", "github_rate_limited", "github_error"})
+
+# Which GitHub read each attributed 403 refused (#5222). The notice names the
+# operation GitHub refused; it does not infer a missing App permission from the
+# status alone, which is what the bare ``github_forbidden`` read leaves open.
+GITHUB_FORBIDDEN_OPERATIONS = {
+    "github_forbidden_list_check_runs": "List check runs for a commit",
+    "github_forbidden_get_combined_status": "Get the combined status for a commit",
+    "github_forbidden_get_branch_rules": "Get rules for a branch",
+    "github_forbidden_get_branch": "Get a branch",
+}
 
 _MARKER_ROUNDS = "|".join(str(r) for r in range(CI_FIRST_FIX_ROUND, CI_MAX_ROUNDS + 1))
 MARKER = re.compile(rf"^Curie wait_ci round ({_MARKER_ROUNDS}) of {CI_MAX_ROUNDS}: ")
@@ -1005,15 +1022,19 @@ def tried_summary(publications: Iterable[Any], verdict: Verdict, pr_url: str | N
         lines.append(f"Reason: {verdict.reason}")
     if verdict.note:
         lines.append(verdict.note)
-    if verdict.reason == "github_forbidden":
-        # A 403 on check runs or commit statuses does not say which permission
-        # was missing, so the notice names both reads the wait needs.
+    operation = GITHUB_FORBIDDEN_OPERATIONS.get(verdict.reason or "")
+    if operation is not None:
+        # The attributed 403 names the read GitHub refused (#5222); it still
+        # does not say which App permission is missing, so no grant is claimed.
         lines.append(
-            "GitHub returned 403, so check that the installation grants "
-            "Checks: read and Commit statuses: read. The 403 does not say "
-            "which one is missing. On the GitHub App, open Permissions and "
-            "events, set each missing permission to Read, save, then accept "
-            "the permission update on the installation."
+            f"GitHub refused {operation}. That names the read the CI wait could "
+            "not complete, not which App permission is missing: the checks stay "
+            "unread until the GitHub side can serve the read."
+        )
+    elif verdict.reason == "github_forbidden":
+        lines.append(
+            "GitHub returned 403 to a CI read. The refusal does not say which "
+            "read or which App permission, so the checks cannot be read."
         )
     if pr_url:
         lines.append(pr_url)

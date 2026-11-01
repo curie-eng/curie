@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import threading
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
 
 import anyio
@@ -75,6 +75,30 @@ _STATUS_REASONS = {
     404: "github_not_found",
     429: "github_rate_limited",
 }
+
+logger = logging.getLogger(__name__)
+
+# A 403 does not say which App permission is missing, so the reason names the
+# read GitHub refused instead (#5222). The factory gate only needs to tell them
+# apart; none of them is ever treated as an empty check or required-check set.
+FORBIDDEN_LIST_CHECK_RUNS = "github_forbidden_list_check_runs"
+FORBIDDEN_GET_COMBINED_STATUS = "github_forbidden_get_combined_status"
+FORBIDDEN_GET_BRANCH_RULES = "github_forbidden_get_branch_rules"
+FORBIDDEN_GET_BRANCH = "github_forbidden_get_branch"
+_FORBIDDEN_REASONS = {
+    "list_check_runs": FORBIDDEN_LIST_CHECK_RUNS,
+    "get_combined_status": FORBIDDEN_GET_COMBINED_STATUS,
+    "get_branch_rules": FORBIDDEN_GET_BRANCH_RULES,
+    "get_branch": FORBIDDEN_GET_BRANCH,
+}
+
+
+class CiRead(Protocol):
+    """One REST read of the CI observation, named by its operation."""
+
+    async def __call__(
+        self, path: str, params: dict[str, Any], *, operation: str | None = None
+    ) -> tuple[Any, str | None]: ...
 
 
 def _verdict(payload: Any) -> str:
@@ -256,7 +280,7 @@ def _has_failure(check_runs: list[dict[str, Any]], statuses: list[dict[str, Any]
 
 
 async def _read_base_checks(
-    get: Callable[[str, dict[str, Any]], Awaitable[tuple[Any, str | None]]],
+    get: CiRead,
     base_ref: str,
     log_deadline: float,
 ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]] | None:
@@ -273,7 +297,9 @@ async def _read_base_checks(
     try:
         async with asyncio.timeout(budget):
             # https://docs.github.com/en/rest/branches/branches#get-a-branch
-            branch, reason = await get(f"/branches/{quote(base_ref, safe='/')}", {})
+            branch, reason = await get(
+                f"/branches/{quote(base_ref, safe='/')}", {}, operation="get_branch"
+            )
             commit = branch.get("commit") if reason is None and isinstance(branch, dict) else None
             sha = commit.get("sha") if isinstance(commit, dict) else None
             if not isinstance(sha, str) or not _COMMIT_SHA_RE.fullmatch(sha):
@@ -281,11 +307,14 @@ async def _read_base_checks(
             runs_payload, reason = await get(
                 f"/commits/{sha}/check-runs",
                 {"per_page": CHECK_RUNS_PAGE, "filter": "latest"},
+                operation="list_check_runs",
             )
             if reason is not None or _check_runs_reason(runs_payload) is not None:
                 return None
             status_payload, reason = await get(
-                f"/commits/{sha}/status", {"per_page": CHECK_RUNS_PAGE}
+                f"/commits/{sha}/status",
+                {"per_page": CHECK_RUNS_PAGE},
+                operation="get_combined_status",
             )
             statuses = _statuses_list(status_payload) if reason is None else None
             if statuses is None:
@@ -409,7 +438,9 @@ async def read_ci_detail(
         except ValueError:
             return _detail_unavailable("github_error", head_sha)
 
-        async def get(path: str, params: dict[str, Any]) -> tuple[Any, str | None]:
+        async def get(
+            path: str, params: dict[str, Any], *, operation: str | None = None
+        ) -> tuple[Any, str | None]:
             try:
                 response = await client.get(
                     f"{base}{path}",
@@ -424,7 +455,18 @@ async def read_ci_detail(
             except httpx.HTTPError:
                 return None, "github_error"
             if response.status_code in _STATUS_REASONS:
-                return None, _STATUS_REASONS[response.status_code]
+                reason = _STATUS_REASONS[response.status_code]
+                if response.status_code == 403 and operation is not None:
+                    reason = _FORBIDDEN_REASONS.get(operation, reason)
+                if operation is not None:
+                    # Fixed fields only: no response body, header, URL, token
+                    # or repository path reaches a log or the issue status.
+                    logger.warning(
+                        "GitHub CI read refused operation=%s status=%s",
+                        operation,
+                        response.status_code,
+                    )
+                return None, reason
             if response.status_code != 200:
                 return None, "github_error"
             try:
@@ -435,13 +477,16 @@ async def read_ci_detail(
         runs_payload, reason = await get(
             f"/commits/{head_sha}/check-runs",
             {"per_page": CHECK_RUNS_PAGE, "filter": "latest"},
+            operation="list_check_runs",
         )
         if reason is None:
             reason = _check_runs_reason(runs_payload)
         if reason is not None:
             return _detail_unavailable(reason, head_sha)
         status_payload, reason = await get(
-            f"/commits/{head_sha}/status", {"per_page": CHECK_RUNS_PAGE}
+            f"/commits/{head_sha}/status",
+            {"per_page": CHECK_RUNS_PAGE},
+            operation="get_combined_status",
         )
         if reason is not None:
             return _detail_unavailable(reason, head_sha)

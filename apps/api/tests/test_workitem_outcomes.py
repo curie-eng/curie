@@ -1935,7 +1935,7 @@ def test_ci_unavailable_when_the_token_mint_fails(
     ("status", "reason"),
     [
         (401, "github_unauthorized"),
-        (403, "github_forbidden"),
+        (403, "github_forbidden_list_check_runs"),
         (404, "github_not_found"),
         (429, "github_rate_limited"),
         (500, "github_error"),
@@ -3315,7 +3315,11 @@ def test_ci_detail_uses_the_statuses_list_not_the_combined_state(
 
 @pytest.mark.parametrize(
     ("status", "reason"),
-    [(401, "github_unauthorized"), (403, "github_forbidden"), (404, "github_not_found")],
+    [
+        (401, "github_unauthorized"),
+        (403, "github_forbidden_list_check_runs"),
+        (404, "github_not_found"),
+    ],
 )
 def test_ci_detail_refusals_map_to_fixed_reasons(
     monkeypatch: pytest.MonkeyPatch, status: int, reason: str

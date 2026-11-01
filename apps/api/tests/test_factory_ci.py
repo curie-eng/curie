@@ -55,6 +55,10 @@ PERMANENT = [
     "installation_refused",
     "github_unauthorized",
     "github_forbidden",
+    "github_forbidden_list_check_runs",
+    "github_forbidden_get_combined_status",
+    "github_forbidden_get_branch_rules",
+    "github_forbidden_get_branch",
     "github_not_found",
     "malformed_response",
     "too_many_check_runs",
@@ -1720,16 +1724,34 @@ def test_tried_summary_lists_each_fix_round() -> None:
     assert PR_URL in summary
 
 
-def test_tried_summary_names_the_403_permission_and_how_to_grant_it() -> None:
+def test_tried_summary_names_the_refused_operation_without_a_permission_claim() -> None:
+    verdict = factory_ci.Verdict(
+        kind="unverified", reason="github_forbidden_get_branch_rules"
+    )
+    summary = factory_ci.tried_summary([], verdict, PR_URL)
+    assert "Reason: github_forbidden_get_branch_rules" in summary
+    # The status names the read GitHub refused (#5222).
+    assert "Get rules for a branch" in summary
+    # ...and never infers which App permission is missing from the status alone.
+    assert "Checks: read" not in summary
+    assert "Commit statuses: read" not in summary
+    assert "does not say which one is missing" not in summary
+    assert "Permissions and events" not in summary
+
+
+def test_tried_summary_keeps_a_bare_403_generic_and_free_of_a_permission_claim() -> None:
     verdict = factory_ci.Verdict(kind="unverified", reason="github_forbidden")
     summary = factory_ci.tried_summary([], verdict, PR_URL)
     assert "Reason: github_forbidden" in summary
-    assert "Checks: read" in summary
-    assert "Commit statuses: read" in summary
-    assert "does not say which one is missing" in summary
-    assert "Missing permission:" not in summary
-    assert "Permissions and events" in summary
-    assert "accept the permission update" in summary
+    assert "Checks: read" not in summary
+    assert "Commit statuses: read" not in summary
+    assert "permission" in summary.lower()
+
+
+def test_a_summary_without_a_403_says_nothing_about_github_permissions() -> None:
+    verdict = factory_ci.Verdict(kind="unverified", reason="github_not_found")
+    summary = factory_ci.tried_summary([], verdict, PR_URL)
+    assert "GitHub refused" not in summary
 
 
 def test_tried_summary_clips_a_long_title() -> None:
@@ -2363,6 +2385,46 @@ def test_required_checks_empty_set_keeps_todays_no_ci() -> None:
     clean = _pull(mergeable=True)
     assert _decide(empty, 130, pull=clean, host_required_checks=()).kind == "no_ci"
     assert _decide(empty, 130, pull=clean, host_required_checks=None).kind == "no_ci"
+
+
+def test_a_verified_empty_rollup_and_required_set_reach_no_ci_after_the_grace_period() -> None:
+    """#5222 decision 2: a mergeable no-CI pull request still completes."""
+
+    verdict = _decide(_detail(), 130, pull=_pull(mergeable=True), host_required_checks=())
+    assert verdict.kind == "no_ci"
+    assert verdict.reason is None
+    assert verdict.note is not None
+    assert "No CI checks appeared" in verdict.note
+
+
+def test_a_refused_required_check_read_never_reaches_no_ci() -> None:
+    """#5222 decision 1: unreadable required-check data is not an empty set."""
+
+    verdict = _decide(
+        _detail(reason="github_forbidden_get_branch_rules"),
+        130,
+        pull=_pull(mergeable=True),
+        host_required_checks=(),
+    )
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "github_forbidden_get_branch_rules"
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "github_forbidden_list_check_runs",
+        "github_forbidden_get_combined_status",
+        "github_forbidden_get_branch_rules",
+        "github_forbidden_get_branch",
+    ],
+)
+def test_an_attributed_403_is_unverified_at_once_never_pending(reason: str) -> None:
+    """#5222 decision 1: a refused read is terminal, never a wait."""
+
+    verdict = _decide(_detail(reason=reason), 30, pull=_pull(mergeable=True))
+    assert verdict.kind == "unverified"
+    assert verdict.reason == reason
 
 
 def test_required_checks_missing_python_check_stays_pending_with_its_name() -> None:
