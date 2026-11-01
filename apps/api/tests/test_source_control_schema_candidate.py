@@ -51,7 +51,7 @@ def test_current_release_fields_match_cli_version(field: str) -> None:
     else:
         chart = yaml.safe_load((ROOT / "charts/curie/Chart.yaml").read_text())
         value = chart["version" if field == "chart" else "appVersion"]
-    assert value == "0.14.3"
+    assert value == "0.14.4"
     assert value in catalog()["windows"]
 
 
