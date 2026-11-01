@@ -63,6 +63,7 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -1245,3 +1246,125 @@ def test_working_directory_precedence_is_applied_in_order() -> None:
         "override is now being resolved at the wrong level. Prefix seen: "
         f"{swept.get(step_level)!r}"
     )
+
+
+QUEUE_WORKFLOWS = (
+    "ci.yaml", "helm-ci.yaml", "gitleaks.yaml", "codeql.yaml",
+    "fix-pin.yaml", "pr-body.yaml", "p0-closes.yaml",
+)
+
+
+@pytest.mark.parametrize("filename", QUEUE_WORKFLOWS)
+def test_queue_producers_receive_checks_requested(filename: str) -> None:
+    workflow = _load_workflows()[filename]
+    triggers = workflow.get(True, workflow.get("on"))
+    assert triggers["merge_group"] == {"types": ["checks_requested"]}
+
+
+@pytest.mark.parametrize("filename", QUEUE_WORKFLOWS)
+def test_queue_runs_cannot_cancel_another_group(filename: str) -> None:
+    workflow = _load_workflows()[filename]
+    concurrency = workflow.get("concurrency")
+    if concurrency is None:
+        return
+    assert "github.ref" in concurrency["group"]
+    assert "github.event_name" in concurrency["group"]
+    assert concurrency["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
+
+
+def _queue_job_runs(job: dict[str, Any], bindings: dict[str, Any], results: dict[str, str]) -> bool:
+    expression = str(job.get("if", "success()"))
+    expression = " ".join(expression.removeprefix("${{").removesuffix("}}").split())
+    needs = job.get("needs", [])
+    needs = [needs] if isinstance(needs, str) else needs
+    success = all(results.get(name, "success") == "success" for name in needs)
+    if not re.search(r"\b(?:always|success|failure|cancelled)\(", expression) and not success:
+        return False
+    expression = re.sub(r"(?<!['\"])\btrue\b(?!['\"])", "True", expression)
+    expression = re.sub(r"(?<!['\"])\bfalse\b(?!['\"])", "False", expression)
+    expression = re.sub(
+        r"(?:github|needs|inputs)\.[A-Za-z0-9_.-]+",
+        lambda match: repr(bindings.get(match[0], "")), expression,
+    )
+    expression = expression.replace("&&", " and ").replace("||", " or ")
+    expression = re.sub(r"!(?!=)", "not ", expression)
+    return bool(eval(expression, {"__builtins__": {}}, {
+        "always": lambda: True, "cancelled": lambda: False,
+        "success": lambda: success, "failure": lambda: not success,
+        "contains": lambda value, item: item in value,
+        "format": lambda pattern, *args: pattern.format(*args),
+    }))
+
+
+@pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("filename", QUEUE_WORKFLOWS)
+def test_every_job_condition_has_pr_equivalent_queue_behavior(
+    filename: str, selected: bool, failed: bool,
+) -> None:
+    jobs = _load_workflows()[filename]["jobs"]
+    outputs = {
+        "skill", "local", "local_release", "cluster", "released_upgrade",
+        "released_upgrade_full", "images", "cli_release", "pytest", "ci_policy",
+        "factory", "approval_resume",
+    }
+    bindings: dict[str, Any] = {
+        **{f"needs.changes.outputs.{name}": str(selected).lower() for name in outputs},
+        "needs.changes.outputs.chart_scenarios": '["example"]' if selected else "[]",
+        "needs.changes.outputs.pytest_deselect": "",
+        "needs.chart-changes.outputs.chart": str(selected).lower(),
+        "needs.rust-select.outputs.tests": str(selected).lower(),
+        "inputs.nightly": False,
+    }
+    decisions = {}
+    for event in ("pull_request", "merge_group"):
+        remaining = dict(jobs)
+        results: dict[str, str] = {}
+        while remaining:
+            ready = []
+            for name, job in remaining.items():
+                needs = job.get("needs", [])
+                needs = [needs] if isinstance(needs, str) else needs
+                if all(dependency in results for dependency in needs):
+                    ready.append(name)
+            assert ready, "workflow job dependencies must be acyclic"
+            for name in ready:
+                job = remaining.pop(name)
+                context = {**bindings, "github.event_name": event,
+                           **{f"needs.{key}.result": value for key, value in results.items()}}
+                runs = _queue_job_runs(job, context, results)
+                results[name] = ("failure" if failed else "success") if runs else "skipped"
+        decisions[event] = results
+    assert decisions["merge_group"] == decisions["pull_request"]
+    required = {
+        "ci.yaml": {"compose", "contracts-ts", "python", "rust", "ui", "e2e-required"},
+        "helm-ci.yaml": {"helm"}, "gitleaks.yaml": {"gitleaks"},
+        "fix-pin.yaml": {"fix-pin"}, "codeql.yaml": {"analyze"},
+    }
+    for name in required.get(filename, set()):
+        assert decisions["merge_group"][name] != "skipped", name
+
+
+@pytest.mark.parametrize(
+    ("filename", "job_id"),
+    [("fix-pin.yaml", "fix-pin"), ("pr-body.yaml", "pr-body"),
+     ("p0-closes.yaml", "remind"), ("ci.yaml", "commit-messages")],
+)
+def test_queue_metadata_jobs_acknowledge_the_pr_judgment(
+    tmp_path: Path, filename: str, job_id: str,
+) -> None:
+    job = _load_workflows()[filename]["jobs"][job_id]
+    context = {"github.event_name": "merge_group"}
+    assert _queue_job_runs(job, context, {})
+    steps = job["steps"]
+    active = [step for step in steps if _queue_job_runs(step, context, {})]
+    assert len(active) == 1
+    step = active[0]
+    assert "GITHUB_STEP_SUMMARY" in step["run"]
+    summary = tmp_path / "summary"
+    result = subprocess.run(
+        ["bash", "-e", "-c", step["run"]],
+        env={"GITHUB_STEP_SUMMARY": str(summary)}, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "PR-event run already judged" in summary.read_text()

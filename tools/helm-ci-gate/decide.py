@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -79,7 +80,7 @@ def select_chart(event: str, changed: Sequence[str]) -> bool:
     """Whether this event should run the chart shards."""
     if event == "push":
         return True
-    if event == "pull_request":
+    if event in {"pull_request", "merge_group"}:
         return chart_relevant(changed)
     raise SystemExit(1)
 
@@ -102,6 +103,20 @@ def _write_chart(value: str) -> None:
             handle.write(line)
         return
     sys.stdout.write(line)
+
+
+def _changed_merge_group_paths() -> list[str]:
+    with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as handle:
+        group = json.load(handle)["merge_group"]
+    base, head = group["base_sha"], group["head_sha"]
+    if not all(isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha)
+               for sha in (base, head)):
+        raise SystemExit(1)
+    diff = subprocess.run(
+        ["git", "diff", "-z", "--name-only", "--no-renames", f"{base}..{head}"],
+        check=True, capture_output=True,
+    )
+    return [part.decode("utf-8", "surrogateescape") for part in diff.stdout.split(b"\0") if part]
 
 
 def _changed_pull_request_paths() -> list[str]:
@@ -135,9 +150,12 @@ def cmd_select() -> None:
     if event == "push":
         _write_chart("true")
         return
-    if event != "pull_request":
+    if event == "merge_group":
+        changed = _changed_merge_group_paths()
+    elif event == "pull_request":
+        changed = _changed_pull_request_paths()
+    else:
         raise SystemExit(1)
-    changed = _changed_pull_request_paths()
     _write_chart("true" if select_chart(event, changed) else "false")
 
 

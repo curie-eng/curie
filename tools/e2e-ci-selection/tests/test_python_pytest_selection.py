@@ -1386,12 +1386,16 @@ def test_ci_policy_pytest_rejects_bad_file_lists_before_uv(tmp_path: Path, files
 
 
 @pytest.mark.parametrize("event", ["push", "workflow_dispatch"])
-def test_ci_policy_changes_routes_non_pr_events_through_push(tmp_path: Path, event: str) -> None:
+def test_ci_policy_changes_routes_push_and_dispatch_through_push(
+    tmp_path: Path, event: str,
+) -> None:
     step = next(step for step in _python_job("changes")["steps"] if step.get("id") == "filter")
     script = _substitute_expressions(step["run"], {
         "${{ github.event_name }}": event,
         "${{ github.ref }}": "refs/heads/next",
         "${{ github.base_ref }}": "",
+        "${{ github.event.merge_group.base_sha }}": "",
+        "${{ github.event.merge_group.head_sha }}": "",
     })
     bin_dir, log = _recording_stubs(tmp_path, "uv", "git")
     result = _run_bash(script, {"PATH": f"{bin_dir}:{os.environ['PATH']}"}, tmp_path)
@@ -1943,6 +1947,8 @@ def _run_decision_step(tmp_path: Path, job_id: str, event: str) -> list[str]:
         {
             "${{ github.event_name }}": event,
             "${{ github.base_ref || 'main' }}": "main",
+            "${{ github.event.merge_group.base_sha }}": "a" * 40,
+            "${{ github.event.merge_group.head_sha }}": "b" * 40,
         },
     )
     bin_dir, log = _recording_stubs(tmp_path, "uv", "git")
@@ -1990,6 +1996,7 @@ def test_rust_select_waits_for_the_version_only_selection() -> None:
     ("event", "version_only", "expected"),
     [
         ("pull_request", "true", "tests=false"),
+        ("merge_group", "true", "tests=false"),
         ("push", "true", "tests=true"),
         ("push", "false", "tests=true"),
         ("workflow_dispatch", "true", "tests=true"),
@@ -2216,3 +2223,12 @@ raise SystemExit(pytest.main(sys.argv[1:], plugins=[Groups()]))
     assert set(groups) == set(files)
     assert groups[files[0]] == groups[files[1]] == groups[files[2]]
     assert groups[files[3]] != groups[files[0]]
+
+
+@pytest.mark.parametrize("job_id", ["python-pytest"])
+def test_decision_steps_use_queue_sha_bounds(tmp_path: Path, job_id: str) -> None:
+    calls = _run_decision_step(tmp_path, job_id, "merge_group")
+    assert len(calls) == 1
+    assert "--base " + "a" * 40 in calls[0]
+    assert "--head " + "b" * 40 in calls[0]
+    assert "--push" not in calls[0]

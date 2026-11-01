@@ -300,7 +300,7 @@ def test_scheduled_and_manual_scans_stay_unscoped() -> None:
     assert setters, "the workflow must scope at least one event"
     for step in setters:
         condition = str(step.get("if", ""))
-        assert "pull_request" in condition or "push" in condition, (
+        assert any(event in condition for event in ("pull_request", "merge_group", "push")), (
             f"step {step.get('name')!r} narrows the log range without a pull request or push "
             "guard, which would also narrow the scheduled sweep and manual dispatches"
         )
@@ -755,3 +755,19 @@ def test_path_allowlist_scopes_the_scanner_to_generated_roots(
     findings = json.loads((repo / "findings.json").read_text(encoding="utf-8"))
     assert len(findings) == expected_findings
     assert {finding["RuleID"] for finding in findings} <= {"aws-account-id"}
+
+
+def test_merge_group_scans_only_the_event_commit_range(tmp_path: Path) -> None:
+    steps = _gitleaks_job()["steps"]
+    scope = next(step for step in steps
+                 if step.get("if") == "github.event_name == 'merge_group'")
+    script = scope["run"]
+    base, head = "a" * 40, "b" * 40
+    script = script.replace("${{ github.event.merge_group.base_sha }}", base)
+    script = script.replace("${{ github.event.merge_group.head_sha }}", head)
+    assert "${{" not in script
+    output = tmp_path / "env"
+    result = subprocess.run(["bash", "-e", "-c", script],
+                            env={"GITHUB_ENV": str(output)}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert output.read_text().strip() == f"GITLEAKS_LOG_OPTS=--log-opts={base}..{head}"
