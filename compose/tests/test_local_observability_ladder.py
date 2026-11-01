@@ -1500,17 +1500,20 @@ query_exact_seed_trace() {
         assert events.index(":absent") < events.index("restored") < events.index(recovered)
 
 
-def test_default_local_exact_positive_rejects_incomplete_membership(
+def test_disabled_ordinary_seed_keeps_enabled_exact_queries_strict(
     tmp_path: Path,
 ) -> None:
-    """Normal local is strict; only ownership diagnostics may retain a miss."""
+    """#5256 disables only ordinary ingestion; enabled queries stay strict."""
 
     source = LADDER_PATH.read_text()
     rung = _function_body(source, "rung_local", "# local-release mode:")
     assert "product_query_state=present" in rung
     assert 'if [[ "$PRODUCT_OBSERVABILITY" == "1" ]]' in rung
     assert rung.count("product_query_state=observe") == 1
-    assert 'seed_ordinary_turn local "$agent_id" "$product_query_state"' in rung
+    assert 'seed_ordinary_turn local "$agent_id" disabled:5256' in rung
+    assert 'seed_approval_resume_turn local "$agent_id" "$product_query_state"' in rung
+    assert 'seed_mcp_read_turn local "$agent_id" "$agent_name" "$product_query_state"' in rung
+    assert 'seed_coding_tool_turn local "$agent_id" "$product_query_state"' in rung
     assert "invalid-auth negative skipped" not in rung
 
     complete_dir = tmp_path / "complete"
