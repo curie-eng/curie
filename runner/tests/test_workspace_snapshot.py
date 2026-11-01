@@ -552,13 +552,14 @@ def test_snapshot_refuses_a_workspace_that_changes_during_capture(
     fired = False
 
     def write_mid_capture(*args: Any, **kwargs: Any) -> Any:
-        # The hashing, scratch index and diff stages all follow the read of
-        # the working tree, so a write there lands after the paths were read.
+        # The hashing and scratch index stages all follow the first read of
+        # the working tree (whose own ``git diff`` listing comes before it),
+        # so a write there lands after the paths were read.
         nonlocal fired
         words: list[str] = []
         for arg in args[1:]:
             words.extend(map(str, arg) if isinstance(arg, list | tuple) else [str(arg)])
-        if not fired and {"hash-object", "update-index", "write-tree", "diff"} & set(words):
+        if not fired and {"hash-object", "update-index", "write-tree"} & set(words):
             fired = True
             target = repo / path
             target.parent.mkdir(parents=True, exist_ok=True)

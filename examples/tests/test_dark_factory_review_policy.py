@@ -660,7 +660,7 @@ def test_subagent_type_reviewer_aliases_route(tmp_path: Path, alias: str, kind: 
     assert "isolation" not in updated and "model" not in updated
     assert updated["prompt"].startswith("Review it\n\n")
     # The diff reviewer also gets the CANDIDATE block naming the run's base (#5230).
-    tail = gate.candidate_block(gate._head(s)) if kind == DIFF else ""
+    tail = gate.expected_candidate_block(s, gate._head(s)) if kind == DIFF else ""
     assert updated["prompt"].endswith(gate.contract() + tail)
     phase = "plan_review" if kind == PLAN else "review_diff"
     assert s.phases()[-1] == (phase, 1)

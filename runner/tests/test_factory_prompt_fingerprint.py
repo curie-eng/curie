@@ -24,7 +24,8 @@ import sys
 import time
 
 args = sys.argv[1:]
-capture = args[-3:] == ["rev-parse", "--show-toplevel", "HEAD"]
+# A candidate build (the fingerprint) starts with this call, once per build.
+capture = args[-2:] == ["rev-parse", "--show-object-format"]
 db = sqlite3.connect(os.environ["FACTORY_FINGERPRINT_DB"])
 db.execute("INSERT INTO calls (capture) VALUES (?)", (int(capture),))
 attempt = db.execute("SELECT count(*) FROM calls WHERE capture = 1").fetchone()[0]

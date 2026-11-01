@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import os
+import shlex
 import stat
 import subprocess
 from collections import Counter
@@ -649,6 +650,654 @@ def test_an_absent_skip_worktree_entry_the_agent_restaged_is_a_deletion_of_the_b
     fresh = _checkout_of(repo, prepared, tmp_path / "fresh")
     _apply(fresh, captured.patch)
     assert not (fresh / "kept.cfg").exists()
+
+
+# --- tracked files publish git's view of them --------------------------------------
+
+_HIDDEN = b"# HIDDEN: never shown by git diff\n"
+
+
+def _crlf_checkout(root: Path) -> tuple[Path, str]:
+    """P stores LF content under ``*.bat text eol=crlf``; checkout writes it as CRLF."""
+
+    repo, _ = _prepared(root)
+    _write(repo, ".gitattributes", b"*.bat text eol=crlf\n")
+    _write(repo, "run.bat", b"@echo off\necho one\necho two\n")
+    _git(repo, "add", "-A")
+    prepared = _commit(repo, "Prepared base with a CRLF script")
+    (repo / "run.bat").unlink()
+    _git(repo, "checkout", "--", "run.bat")
+    assert (repo / "run.bat").read_bytes() == b"@echo off\r\necho one\r\necho two\r\n"
+    assert _git(repo, "status", "--porcelain") == ""
+    return repo, prepared
+
+
+def _changed_lines(section: bytes) -> list[bytes]:
+    return [
+        line
+        for line in section.splitlines()
+        if line.startswith((b"+", b"-")) and not line.startswith((b"+++", b"---"))
+    ]
+
+
+def test_an_untouched_crlf_checkout_is_an_empty_capture(tmp_path: Path) -> None:
+    repo, prepared = _crlf_checkout(tmp_path)
+
+    captured = _capture(repo, prepared)
+
+    assert captured.base_sha == prepared
+    assert captured.patch == b""
+    assert captured.changed_paths == ()
+
+
+def test_an_edit_to_one_line_of_a_crlf_file_publishes_that_line_in_git_normal_form(
+    tmp_path: Path,
+) -> None:
+    repo, prepared = _crlf_checkout(tmp_path)
+    _write(repo, "run.bat", b"@echo off\r\necho one\r\necho changed\r\n")
+
+    captured = _capture(repo, prepared)
+
+    assert captured.changed_paths == ("run.bat",)
+    assert _changed_lines(_sections(captured.patch)["run.bat"]) == [
+        b"-echo two",
+        b"+echo changed",
+    ]
+    assert b"\r" not in captured.patch
+
+
+def test_an_untracked_crlf_file_under_an_eol_attribute_is_published_byte_for_byte(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _prepared(tmp_path)
+    _write(repo, ".gitattributes", b"*.bat text eol=crlf\n")
+    _git(repo, "add", ".gitattributes")
+    prepared = _commit(repo, "Prepared base with an eol attribute")
+    _write(repo, "new.bat", b"@echo off\r\necho new\r\n")
+
+    captured = _capture(repo, prepared)
+
+    # git does not read an untracked file, so its bytes publish unconverted.
+    assert captured.changed_paths == ("new.bat",)
+    assert b"+@echo off\r\n+echo new\r\n" in _sections(captured.patch)["new.bat"]
+
+
+# --- candidate construction never runs a filter program ---------------------------
+
+FILTER_REFUSAL = "has a filter attribute"
+
+
+def _unsupported_filter() -> type[workspace_snapshot.WorkspaceSnapshotError]:
+    """The runner's filter refusal: a snapshot refusal, never a history refusal."""
+
+    from curie_runner.workspace_snapshot import UnsupportedFilterError
+
+    assert issubclass(UnsupportedFilterError, workspace_snapshot.WorkspaceSnapshotError)
+    assert not issubclass(UnsupportedFilterError, workspace_snapshot.WorkspaceHistoryError)
+    return UnsupportedFilterError
+
+
+def _marking_filter(repo: Path, marker: Path, name: str = "strip") -> None:
+    """Configure driver ``name`` whose clean program creates ``marker`` whenever git runs it.
+
+    The program also drops every HIDDEN line, so a line it would hide from git
+    never reaches a publication by way of the filter either.
+    """
+
+    program = f"touch {shlex.quote(str(marker))}; grep -v HIDDEN || true"
+    _git(repo, "config", f"filter.{name}.clean", program)
+
+
+def _info_attributes(repo: Path, line: bytes) -> None:
+    attributes = repo / ".git" / "info" / "attributes"
+    attributes.parent.mkdir(exist_ok=True)
+    attributes.write_bytes(line + b"\n")
+
+
+def _assert_filter_is_live(repo: Path, marker: Path) -> None:
+    """The checkout's own git diff runs the filter, so an absent marker later means something."""
+
+    assert "HIDDEN" not in _git(repo, "diff", "HEAD")
+    assert marker.exists(), "git diff did not run the configured filter"
+    marker.unlink()
+
+
+def _assert_filter_refused(repo: Path, prepared: str, path: str, marker: Path | None) -> None:
+    """The capture refuses ``path`` by name, publishes nothing, and runs no filter program."""
+
+    with pytest.raises(_unsupported_filter(), match=FILTER_REFUSAL) as refused:
+        _capture(repo, prepared)
+    assert path in str(refused.value)
+    if marker is not None:
+        assert not marker.exists(), "candidate construction ran a filter program"
+
+
+@pytest.mark.parametrize("visible", [False, True], ids=["hidden_line_alone", "beside_an_edit"])
+def test_an_edit_under_a_checkout_clean_filter_is_refused_without_running_it(
+    tmp_path: Path, visible: bool
+) -> None:
+    repo, prepared = _prepared(tmp_path)
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _info_attributes(repo, b"src/app.py filter=strip")
+    _write(repo, "src/app.py", (b"x = 2\n" if visible else b"x = 1\n") + _HIDDEN)
+    _assert_filter_is_live(repo, marker)
+
+    # No silent fallback to the raw bytes and no git clean form: a refusal by name.
+    _assert_filter_refused(repo, prepared, "src/app.py", marker)
+
+
+def test_a_staged_edit_under_a_clean_filter_is_refused_without_running_it(
+    tmp_path: Path,
+) -> None:
+    repo, prepared = _prepared(tmp_path)
+    _write(repo, "src/app.py", b"x = 2\n")
+    _git(repo, "add", "src/app.py")
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _info_attributes(repo, b"src/app.py filter=strip")
+    with (repo / "src" / "app.py").open("ab") as handle:
+        handle.write(_HIDDEN)
+
+    _assert_filter_refused(repo, prepared, "src/app.py", marker)
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    [b"filter=strip", b"filter", b"-filter", b"filter=unspecified"],
+    ids=["named_driver", "bare_set", "unset", "driver_named_unspecified"],
+)
+def test_every_form_of_a_filter_attribute_on_an_edited_file_is_refused(
+    tmp_path: Path, attribute: bytes
+) -> None:
+    repo, prepared = _prepared(tmp_path)
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker, "strip")
+    # git check-attr reports this driver's value as the word "unspecified".
+    _marking_filter(repo, marker, "unspecified")
+    _info_attributes(repo, b"src/app.py " + attribute)
+    _write(repo, "src/app.py", b"x = 2\n")
+
+    _assert_filter_refused(repo, prepared, "src/app.py", marker)
+
+
+def test_a_filter_attribute_from_a_nested_gitattributes_is_refused(tmp_path: Path) -> None:
+    repo, _ = _prepared(tmp_path)
+    _write(repo, "sub/data.txt", b"data = base\n")
+    _write(repo, "sub/.gitattributes", b"data.txt filter=strip\n")
+    _git(repo, "add", "-A")
+    prepared = _commit(repo, "Prepared base with a nested filter attribute")
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _write(repo, "sub/data.txt", b"data = edited\n")
+
+    _assert_filter_refused(repo, prepared, "sub/data.txt", marker)
+
+
+def test_a_process_filter_driver_is_refused_without_starting_it(tmp_path: Path) -> None:
+    repo, prepared = _prepared(tmp_path)
+    marker = tmp_path / "filter-ran"
+    _git(repo, "config", "filter.x.process", f"touch {shlex.quote(str(marker))}; cat")
+    _info_attributes(repo, b"src/app.py filter=x")
+    _write(repo, "src/app.py", b"x = 2\n")
+
+    _assert_filter_refused(repo, prepared, "src/app.py", marker)
+
+
+_REPOSITORY_CLEAN_SCRIPT = b"""import pathlib
+import sys
+
+pathlib.Path(sys.argv[1]).touch()
+sys.stdout.buffer.write(b"".join(line for line in sys.stdin.buffer if b"HIDDEN" not in line))
+"""
+
+
+@pytest.mark.parametrize("clean", ["failing_program", "repository_script"])
+def test_an_optional_filter_git_would_skip_is_refused_not_published_as_raw_bytes(
+    tmp_path: Path, clean: str
+) -> None:
+    """Neither filter is ``required``, so git falls back to the raw bytes when it fails.
+
+    ``false`` always fails. The repository-relative script is tracked and
+    unchanged, so it works in the checkout but is absent from any scratch copy
+    of the edited paths. Either way the capture refuses rather than publishing
+    the raw bytes, HIDDEN line included.
+    """
+
+    repo, _ = _prepared(tmp_path)
+    _write(repo, "tools/clean.py", _REPOSITORY_CLEAN_SCRIPT)
+    _git(repo, "add", "tools/clean.py")
+    prepared = _commit(repo, "Prepared base with a repository clean script")
+    marker = tmp_path / "filter-ran"
+    if clean == "failing_program":
+        _git(repo, "config", "filter.strip.clean", "false")
+    else:
+        _git(
+            repo,
+            "config",
+            "filter.strip.clean",
+            f"python3 tools/clean.py {shlex.quote(str(marker))}",
+        )
+    _info_attributes(repo, b"src/app.py filter=strip")
+    _write(repo, "src/app.py", b"x = 2\n" + _HIDDEN)
+    if clean == "repository_script":
+        _assert_filter_is_live(repo, marker)
+
+    _assert_filter_refused(repo, prepared, "src/app.py", marker)
+
+
+def test_an_unchanged_file_under_a_filter_attribute_does_not_refuse_an_unfiltered_edit(
+    tmp_path: Path,
+) -> None:
+    # Liveness for the refusals above: only a path whose bytes or mode differ
+    # from the base asks git about attributes.
+    repo, prepared = _prepared(tmp_path)
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _info_attributes(repo, b"README.md filter=strip")
+    # Same bytes as the base, rewritten so git's stat cache no longer matches.
+    _write(repo, "README.md", _PREPARED_FILES["README.md"])
+    _write(repo, "src/app.py", b"x = 2\n")
+
+    captured = _capture(repo, prepared)
+
+    assert captured.base_sha == prepared
+    assert captured.changed_paths == ("src/app.py",)
+    assert _header_paths(captured.patch) == ["src/app.py"]
+    assert _changed_lines(_sections(captured.patch)["src/app.py"]) == [b"-x = 1", b"+x = 2"]
+    assert not marker.exists(), "candidate construction ran a filter program"
+
+
+def _trust_stat(repo: Path, path: str) -> int:
+    """Make git trust ``path``'s cached stat; the mtime it caches, in nanoseconds.
+
+    Whole-second mtime and size become git's only checks, and the index is
+    refreshed after an mtime a minute in the past, so the entry is not racy.
+    Every tracked file must equal its index entry when this runs.
+    """
+
+    _git(repo, "config", "core.checkStat", "minimal")
+    _git(repo, "config", "core.trustctime", "false")
+    target = repo / path
+    past = target.stat().st_mtime_ns - 60 * 1_000_000_000
+    os.utime(target, ns=(past, past))
+    _git(repo, "update-index", "--refresh")
+    return past
+
+
+def _rewrite_keeping_stat(repo: Path, path: str, data: bytes, mtime_ns: int) -> None:
+    """Rewrite ``path`` with same-size bytes and put its mtime back."""
+
+    target = repo / path
+    assert len(data) == target.stat().st_size and data != target.read_bytes()
+    target.write_bytes(data)
+    os.utime(target, ns=(mtime_ns, mtime_ns))
+
+
+def _prepared_with_attributes(root: Path, attributes: bytes | None) -> tuple[Path, str]:
+    """P, optionally with a committed ``.gitattributes``, so tracked files convert at check-in."""
+
+    repo, prepared = _prepared(root)
+    if attributes is None:
+        return repo, prepared
+    _write(repo, ".gitattributes", attributes)
+    _git(repo, "add", ".gitattributes")
+    return repo, _commit(repo, "Prepared base with attributes")
+
+
+@pytest.mark.parametrize("attributes", [None, b"*.py text\n"], ids=["raw", "text_attribute"])
+def test_a_stale_stat_rewrite_of_a_file_whose_index_entry_is_the_base_is_published(
+    tmp_path: Path, attributes: bytes | None
+) -> None:
+    repo, prepared = _prepared_with_attributes(tmp_path, attributes)
+    past = _trust_stat(repo, "src/app.py")
+    _rewrite_keeping_stat(repo, "src/app.py", b"x = 3\n", past)
+    # git trusts the cached stat: git diff <P> does not list the file.
+    assert _git(repo, "diff", "--name-only", prepared) == ""
+
+    captured = _capture(repo, prepared)
+
+    # Final disk bytes win over the stat cache.
+    assert captured.base_sha == prepared
+    assert captured.changed_paths == ("src/app.py",)
+    assert _changed_lines(_sections(captured.patch)["src/app.py"]) == [b"-x = 1", b"+x = 3"]
+
+
+@pytest.mark.parametrize("attributes", [None, b"*.py text\n"], ids=["raw", "text_attribute"])
+@pytest.mark.parametrize("recorded", ["staged", "committed"])
+def test_a_stale_stat_rewrite_after_the_edit_was_recorded_publishes_the_rewrite(
+    tmp_path: Path, recorded: str, attributes: bytes | None
+) -> None:
+    repo, prepared = _prepared_with_attributes(tmp_path, attributes)
+    _write(repo, "src/app.py", b"x = 2\n")
+    _git(repo, "add", "src/app.py")
+    if recorded == "committed":
+        _commit(repo, "Change src/app.py")
+    past = _trust_stat(repo, "src/app.py")
+    _rewrite_keeping_stat(repo, "src/app.py", b"x = 3\n", past)
+
+    captured = _capture(repo, prepared)
+
+    # Final disk bytes win over staging, commits and the stat cache.
+    assert captured.base_sha == prepared
+    assert captured.changed_paths == ("src/app.py",)
+    assert _changed_lines(_sections(captured.patch)["src/app.py"]) == [b"-x = 1", b"+x = 3"]
+    assert b"x = 2" not in captured.patch
+
+
+# --- attributes git finds only in the index still apply to the final bytes --------
+
+
+def test_a_deleted_gitattributes_kept_in_the_index_still_normalizes_an_edited_crlf_file(
+    tmp_path: Path,
+) -> None:
+    repo, prepared = _crlf_checkout(tmp_path)
+    (repo / ".gitattributes").unlink()
+    assert _git(repo, "ls-files", "--", ".gitattributes") == ".gitattributes"
+    _write(repo, "run.bat", b"@echo off\r\necho one\r\necho changed\r\n")
+
+    captured = _capture(repo, prepared)
+
+    sections = _sections(captured.patch)
+    assert captured.changed_paths == (".gitattributes", "run.bat")
+    assert b"deleted file mode 100644" in sections[".gitattributes"]
+    # git's attribute lookup falls back to the index copy: the edit is normalized to LF.
+    assert _changed_lines(sections["run.bat"]) == [b"-echo two", b"+echo changed"]
+    assert b"\r" not in sections["run.bat"]
+
+
+def test_a_filter_attribute_from_a_gitattributes_kept_only_in_the_index_is_refused(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _prepared(tmp_path)
+    _write(repo, ".gitattributes", b"src/app.py filter=strip\n")
+    _git(repo, "add", ".gitattributes")
+    prepared = _commit(repo, "Prepared base with a clean filter attribute")
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    (repo / ".gitattributes").unlink()
+    assert _git(repo, "ls-files", "--", ".gitattributes") == ".gitattributes"
+    _write(repo, "src/app.py", b"x = 2\n" + _HIDDEN)
+
+    # git's attribute lookup falls back to the index copy, so the attribute still applies.
+    _assert_filter_refused(repo, prepared, "src/app.py", marker)
+
+
+# --- a relative core.attributesFile resolves against the checkout ------------------
+
+
+def _prepared_with_attributes_file(
+    root: Path, attributes: bytes, files: dict[str, bytes] | None = None
+) -> tuple[Path, str]:
+    """P tracks ``attrs``, and the checkout names it as a relative core.attributesFile.
+
+    git resolves a relative value against the work tree root, so the
+    checkout's own git reads the tracked, unchanged ``attrs`` although no
+    .gitattributes file mentions it.
+    """
+
+    repo, _ = _prepared(root)
+    _git(repo, "config", "core.attributesFile", "attrs")
+    _write(repo, "attrs", attributes)
+    for path, data in (files or {}).items():
+        _write(repo, path, data)
+    _git(repo, "add", "-A")
+    return repo, _commit(repo, "Prepared base with a relative attributes file")
+
+
+def test_a_filter_attribute_from_a_relative_attributes_file_is_refused(tmp_path: Path) -> None:
+    repo, prepared = _prepared_with_attributes_file(tmp_path, b"src/app.py filter=strip\n")
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _write(repo, "src/app.py", b"x = 2\n" + _HIDDEN)
+    # attrs itself is unchanged, so it is not one of the converted paths.
+    assert _git(repo, "status", "--porcelain") == "M src/app.py"
+    _assert_filter_is_live(repo, marker)
+
+    _assert_filter_refused(repo, prepared, "src/app.py", marker)
+
+
+def _assert_attributes_file_refused(repo: Path, prepared: str, marker: Path) -> None:
+    """The capture refuses the attributes file setting itself and runs no filter program."""
+
+    with pytest.raises(
+        workspace_snapshot.WorkspaceSnapshotError, match="core.attributesFile"
+    ) as refused:
+        _capture(repo, prepared)
+    assert not isinstance(refused.value, workspace_snapshot.WorkspaceHistoryError)
+    assert not marker.exists(), "candidate construction ran a filter program"
+
+
+def _prepared_with_links(
+    root: Path, links: dict[str, str], files: dict[str, bytes] | None = None
+) -> tuple[Path, str]:
+    """P commits each ``links`` path as a symlink to its target, beside ``files``."""
+
+    repo, _ = _prepared(root)
+    for path, target in links.items():
+        os.symlink(target, repo / path)
+    for path, data in (files or {}).items():
+        _write(repo, path, data)
+    _git(repo, "add", "-A")
+    return repo, _commit(repo, "Prepared base with linked attributes")
+
+
+def test_a_relative_attributes_file_outside_the_workspace_is_refused(tmp_path: Path) -> None:
+    repo, prepared = _prepared(tmp_path)
+    (tmp_path / "attrs").write_bytes(b"src/app.py filter=strip\n")
+    _git(repo, "config", "core.attributesFile", "../attrs")
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _write(repo, "src/app.py", b"x = 2\n" + _HIDDEN)
+    # The checkout's git reads the file beside the work tree, so the attribute is real.
+    _assert_filter_is_live(repo, marker)
+
+    _assert_attributes_file_refused(repo, prepared, marker)
+
+
+def test_a_relative_attributes_file_with_a_dotdot_segment_is_refused(tmp_path: Path) -> None:
+    """``sub/../attrs`` names the tracked ``attrs`` as text, but git follows ``sub`` first.
+
+    ``sub`` links to a directory outside the workspace, so the file git reads
+    is the filter line beside that directory, not the harmless ``attrs`` a
+    text-only normalization of the value would pick.
+    """
+
+    outside = tmp_path / "linked"
+    (outside / "inner").mkdir(parents=True)
+    (outside / "attrs").write_bytes(b"src/app.py filter=strip\n")
+    repo, prepared = _prepared_with_links(
+        tmp_path, {"sub": "../linked/inner"}, {"attrs": b"# no filter here\n"}
+    )
+    _git(repo, "config", "core.attributesFile", "sub/../attrs")
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _write(repo, "src/app.py", b"x = 2\n" + _HIDDEN)
+    _assert_filter_is_live(repo, marker)
+
+    _assert_attributes_file_refused(repo, prepared, marker)
+
+
+@pytest.mark.parametrize("linked", ["file", "parent_directory"])
+def test_a_symlinked_relative_attributes_file_is_refused(tmp_path: Path, linked: str) -> None:
+    # Both links are tracked and unchanged in P, so neither is a converted
+    # path or a symlink change; only the attributes file setting reaches them.
+    outside = tmp_path / "linked"
+    outside.mkdir()
+    (outside / "attrs").write_bytes(b"src/app.py filter=strip\n")
+    if linked == "file":
+        repo, prepared = _prepared_with_links(tmp_path, {"attrs": "../linked/attrs"})
+        _git(repo, "config", "core.attributesFile", "attrs")
+    else:
+        repo, prepared = _prepared_with_links(tmp_path, {"conf": "../linked"})
+        _git(repo, "config", "core.attributesFile", "conf/attrs")
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _write(repo, "src/app.py", b"x = 2\n" + _HIDDEN)
+    assert _git(repo, "status", "--porcelain") == "M src/app.py"
+    _assert_filter_is_live(repo, marker)
+
+    _assert_attributes_file_refused(repo, prepared, marker)
+
+
+def test_a_relative_attributes_file_still_applies_built_in_conversion(tmp_path: Path) -> None:
+    # Liveness for the refusals above: a relative attributes file without a
+    # filter publishes, and its eol attribute normalizes the edit as git would.
+    repo, prepared = _prepared_with_attributes_file(
+        tmp_path,
+        b"*.bat text eol=crlf\n",
+        {"run.bat": b"@echo off\necho one\necho two\n"},
+    )
+    (repo / "run.bat").unlink()
+    _git(repo, "checkout", "--", "run.bat")
+    assert (repo / "run.bat").read_bytes() == b"@echo off\r\necho one\r\necho two\r\n"
+    assert _git(repo, "status", "--porcelain") == ""
+    _write(repo, "run.bat", b"@echo off\r\necho one\r\necho changed\r\n")
+
+    captured = _capture(repo, prepared)
+
+    assert captured.base_sha == prepared
+    assert captured.changed_paths == ("run.bat",)
+    assert _changed_lines(_sections(captured.patch)["run.bat"]) == [
+        b"-echo two",
+        b"+echo changed",
+    ]
+    assert b"\r" not in captured.patch
+
+
+# --- relative git configuration paths in the environment --------------------------
+
+
+def _prepared_with_repository_config(root: Path, marker: Path) -> tuple[Path, str]:
+    """P tracks ``cfg``, which names the tracked relative attributes file ``attrs``.
+
+    ``attrs`` gives src/app.py the marking filter, and the checkout edits
+    src/app.py with a HIDDEN line. Neither ``cfg`` nor ``attrs`` changes.
+    """
+
+    repo, _ = _prepared(root)
+    _write(repo, "cfg", b"[core]\n\tattributesFile = attrs\n")
+    _write(repo, "attrs", b"src/app.py filter=strip\n")
+    _git(repo, "add", "cfg", "attrs")
+    prepared = _commit(repo, "Prepared base with a repository git config file")
+    _marking_filter(repo, marker)
+    _write(repo, "src/app.py", b"x = 2\n" + _HIDDEN)
+    return repo, prepared
+
+
+@pytest.mark.parametrize("name", ["GIT_CONFIG_GLOBAL", "GIT_CONFIG", "XDG_CONFIG_HOME", "HOME"])
+def test_a_relative_git_configuration_path_in_the_environment_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    marker = tmp_path / "filter-ran"
+    if name == "GIT_CONFIG_GLOBAL":
+        repo, prepared = _prepared_with_repository_config(tmp_path, marker)
+        monkeypatch.setenv(name, "cfg")
+        # The checkout's git reads cfg from the work tree, so its attributes file applies.
+        _assert_filter_is_live(repo, marker)
+    else:
+        repo, prepared = _prepared(tmp_path)
+        _write(repo, "src/app.py", b"x = 2\n")
+        # Set only now, so every helper above ran git with the real environment.
+        monkeypatch.setenv(name, "relative-config")
+    # GIT_CONFIG is refused whatever its value, so its refusal does not say relative.
+    state = "is set" if name == "GIT_CONFIG" else "is relative"
+
+    with pytest.raises(
+        workspace_snapshot.WorkspaceSnapshotError,
+        match=f"git configuration path {name} {state}",
+    ) as refused:
+        _capture(repo, prepared)
+
+    assert not isinstance(refused.value, workspace_snapshot.WorkspaceHistoryError)
+    assert not marker.exists(), "candidate construction ran a filter program"
+
+
+def test_any_git_config_environment_override_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GIT_CONFIG makes ``git config`` read only that file; conversion reads the repository's.
+
+    So an absolute GIT_CONFIG would hide the repository's relative
+    core.attributesFile from discovery while the checkout's git still applies it.
+    """
+
+    repo, prepared = _prepared_with_attributes_file(tmp_path, b"src/app.py filter=strip\n")
+    marker = tmp_path / "filter-ran"
+    _marking_filter(repo, marker)
+    _write(repo, "src/app.py", b"x = 2\n" + _HIDDEN)
+    _assert_filter_is_live(repo, marker)
+    monkeypatch.setenv("GIT_CONFIG", os.devnull)
+
+    with pytest.raises(
+        workspace_snapshot.WorkspaceSnapshotError,
+        match="git configuration path GIT_CONFIG is set",
+    ) as refused:
+        _capture(repo, prepared)
+
+    assert not isinstance(refused.value, workspace_snapshot.WorkspaceHistoryError)
+    assert not marker.exists(), "candidate construction ran a filter program"
+
+
+def test_an_absolute_git_config_global_still_resolves_its_relative_attributes_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Liveness for the refusal above: the same cfg named by an absolute path is
+    # read, so its attributes file reaches the candidate and the filter is refused.
+    marker = tmp_path / "filter-ran"
+    repo, prepared = _prepared_with_repository_config(tmp_path, marker)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(repo / "cfg"))
+    _assert_filter_is_live(repo, marker)
+
+    _assert_filter_refused(repo, prepared, "src/app.py", marker)
+
+
+# --- one builder: the capture publishes the rendered candidate --------------------
+
+
+def test_the_capture_patch_is_the_rendered_shared_candidate(tmp_path: Path) -> None:
+    repo, prepared, expected = _mixed_workspace(tmp_path)
+
+    built = workspace_snapshot.build_candidate(repo, prepared, render_patch=True)
+    captured = _capture(repo, prepared)
+
+    assert built.base_sha == prepared
+    assert set(built.changed_paths) == expected
+    assert tuple(built.changed_paths) == captured.changed_paths
+    assert built.patch == captured.patch
+    # The tree is the one the patch describes: P with the patch applied.
+    fresh = _checkout_of(repo, prepared, tmp_path / "fresh")
+    patch_file = tmp_path / "candidate.patch"
+    patch_file.write_bytes(built.patch)
+    _git(fresh, "apply", "--binary", "--index", str(patch_file))
+    assert _git(fresh, "write-tree") == built.tree
+
+
+def test_a_mode_only_chmod_publishes_when_the_checkout_sets_core_filemode_false(
+    tmp_path: Path,
+) -> None:
+    repo, prepared = _prepared(tmp_path)
+    _git(repo, "config", "core.fileMode", "false")
+    (repo / "script.sh").chmod(0o755)
+    assert _git(repo, "status", "--porcelain") == ""
+
+    captured = _capture(repo, prepared)
+
+    assert captured.changed_paths == ("script.sh",)
+    assert b"old mode 100644\nnew mode 100755\n" in _sections(captured.patch)["script.sh"]
+
+
+def test_an_assume_unchanged_file_publishes_its_bytes_on_disk(tmp_path: Path) -> None:
+    repo, prepared = _prepared(tmp_path)
+    _git(repo, "update-index", "--assume-unchanged", "--", "README.md")
+    _write(repo, "README.md", b"edited behind an index flag\n")
+    assert _git(repo, "status", "--porcelain") == ""
+
+    captured = _capture(repo, prepared)
+
+    # git no longer reads a flagged file, so its bytes on disk publish.
+    assert captured.changed_paths == ("README.md",)
+    assert b"+edited behind an index flag" in _sections(captured.patch)["README.md"]
 
 
 # --- the /v1/snapshot route -------------------------------------------------------
