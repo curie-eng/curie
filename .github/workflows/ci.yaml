@@ -5190,7 +5190,6 @@ jobs:
       - name: Free disk for the disposable upgrade matrix cluster
         run: |
           set -euo pipefail
-          df -h /
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
           df -h /
       - name: Download the candidate curie binary
