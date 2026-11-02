@@ -1204,7 +1204,7 @@ jobs:
           cargo nextest run
           --archive-file "$RUNNER_TEMP/nextest/nextest-archive.tar.zst"
           --workspace-remap . --extract-to .
-          --profile ci
+          --profile ci --success-output final
           -E 'test(/^ops::convergence::tests::/)'
 
   rust:
