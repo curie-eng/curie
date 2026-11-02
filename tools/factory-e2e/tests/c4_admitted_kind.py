@@ -53,6 +53,10 @@ VALUE_FROM_KINDS = frozenset({"secretKeyRef", "configMapKeyRef", "fieldRef", "re
 # Tables the install owns for its whole lifetime; they are not inventoried.
 # apps/api/alembic/env.py pins the version table into the curie schema.
 INSTALL_LIFETIME_TABLES = frozenset({"alembic_version"})
+# Intake's per-scope poll positions. Every reset truncates them so the next
+# case's intake starts from a fresh install's position, and intake rewrites
+# its row within one poll interval, so their row count is not compared.
+INTAKE_CURSOR_TABLES = frozenset({"factory_poll_cursors"})
 # Truncated by the reset's existing statements rather than the generic sweep.
 RESET_COVERED_TABLES = frozenset({"work_items", "agents", "tenants"})
 TABLE_NAME = re.compile(r"[a-z_][a-z0-9_]*")
@@ -71,6 +75,12 @@ PERSISTENT_KEYS_SCRIPT = (
     "if redis.call('TTL', key) == -1 then found[#found + 1] = key end end "
     "until cursor == '0' return found"
 )
+# The chart points Langfuse at the platform Valkey (REDIS_HOST, no key
+# prefix), and its BullMQ ingestion queues use BullMQ's default "bull:"
+# keyspace. Those keys belong to the trace backend, which writes them
+# asynchronously while a finished case's traces are ingested. They are not
+# factory state, and deleting them would corrupt Langfuse's queues.
+TRACE_BACKEND_KEY_PREFIX = "bull:"
 EVIDENCE_LOG_LINES = 400
 EVIDENCE_TEXT_LIMIT = 32768
 
@@ -983,12 +993,16 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
             sorted(
                 (str(table), int(count))
                 for table, count in counts.items()
-                if table not in INSTALL_LIFETIME_TABLES
+                if table not in INSTALL_LIFETIME_TABLES | INTAKE_CURSOR_TABLES
             )
         )
 
     def persistent_keys(self) -> frozenset[str]:
-        return frozenset(str(key) for key in self.valkey("EVAL", PERSISTENT_KEYS_SCRIPT, "0"))
+        return frozenset(
+            str(key)
+            for key in self.valkey("EVAL", PERSISTENT_KEYS_SCRIPT, "0")
+            if not str(key).startswith(TRACE_BACKEND_KEY_PREFIX)
+        )
 
     def install_snapshot(self) -> InstallSnapshot:
         """Read every piece of shared install state a case can change."""
@@ -1317,7 +1331,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         # tables. A baseline table the cascade reaches shows up as a changed
         # count in the verification snapshot and fails the case.
         swept = ["curie.work_items", "curie.agents"] + [
-            f'curie."{table}"' for table in empty_tables
+            f'curie."{table}"' for table in sorted(INTAKE_CURSOR_TABLES | set(empty_tables))
         ]
         self.write_sql(
             "TRUNCATE " + ", ".join(swept) + " CASCADE; "
