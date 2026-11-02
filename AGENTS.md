@@ -67,8 +67,8 @@ retarget its dependent PR promptly and rerun the required gates before merging.
 
 ## CI gates
 
-1. PR gate: static checks, unit tests and impact-selected tests, with at most one
-   shared real install. The target is p90 at most 10 minutes.
+1. PR gate target being rolled out: static checks, unit tests and impact-selected
+   tests, with at most one shared real install. The target is p90 at most 10 minutes.
 2. Merge queue target state, once the queue is enabled: GitHub `merge_group` runs
    the deep shared-install factory and chart suites, plus lifecycle and upgrade
    suites when chart, migration or upgrade paths change. Nothing lands without
@@ -79,11 +79,14 @@ retarget its dependent PR promptly and rerun the required gates before merging.
    ladder. Fix a red nightly or delete the suite within one working day.
 4. Release: version-only release PRs and forward merges reuse proof from the
    identical tree.
-5. Shared installs: a CI job performs at most one kind cluster and one platform
-   install. A test owns its own cluster or install only when cluster or install
-   lifecycle is the behavior under test; those tests run nightly.
-6. Flakes: a test that fails and then passes on an unchanged rerun is deleted or
-   demoted, never retried or repaired in place. The deleting PR names lost coverage.
+5. Shared-install target being rolled out: a CI job performs at most one kind
+   cluster and one platform install. A test owns its own cluster or install only
+   when cluster or install lifecycle is the behavior under test; those tests run
+   nightly.
+6. Flake target being rolled out: a test that fails and then passes on an unchanged
+   rerun is deleted or demoted, never retried or repaired in place. The deleting PR
+   names lost coverage. Current pytest runs still use `--reruns 1`; several PR jobs
+   still create their own clusters while these targets are being implemented.
 
 ## Verify commands (per package)
 
@@ -447,7 +450,9 @@ component, with nothing faked inside that boundary. Explain the failure mode a
 higher tier catches that the lower tier cannot. Record what ran locally and any
 live or external proof CI cannot produce; read CI tier results from CI rather
 than restating them in the PR body. Documentation and behavior-preserving
-refactors use the validators appropriate to the changed artifact.
+refactors use the validators appropriate to the changed artifact. File type alone
+does not grant the exemption: a documentation or ADR change that alters runtime
+behavior remains behavior-bearing.
 
 A runtime acceptance criterion still requires its named runtime observation.
 Provider auth, credential resolution and external API shape require real-provider

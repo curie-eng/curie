@@ -35,8 +35,9 @@ body:
       label: Discovery surface
       description: >-
         Where the defect was observed. Apply the matching `found:*` label on
-        the issue; the fix-pin gate reads that label and rejects a pin below
-        this surface unless the pull request carries `Fix pin waiver:`.
+        the issue. A lower-tier Fix pin that reproduces the defect is accepted
+        without a waiver; the verifier still checks that it passes with the fix
+        and fails when the fix is reversed.
         `found:unit` is a unit test or skill runner, `found:local` is the
         Docker Compose stack, `found:cluster` is a deployed Kubernetes
         release, `found:live` is a live provider or Slack.

@@ -81,11 +81,11 @@ as a whole; remembered only):
 13. CLI-side vs API-side input validation (validate at the API/persistence
   boundary, mirror in the CLI). [convention]
 14. `local up` vs `local down` compose profile sets.
-  [gate: `cli/src/local.rs`]
+  [gate: `cli/src/local.rs`, test `down_passes_every_up_profile`]
 15. `compose.dev.yaml` vs the generated release compose.
   [by construction: `compose/generate_release_compose.py`]
 16. `core` vs `full` compose profiles.
-  [gate: `cli/src/local.rs`]
+  [gate: `cli/src/local.rs`, test `compose_file_declares_core_and_full_profiles`]
 17. `local` vs `cluster` verb pairs (reachability defaults, outcome enums). [convention]
 18. CLI `--json` DTOs vs the API models they mirror. [gate: `cli/tests/api_field_parity.rs`]
 19. deploy-time validators vs the runtime loaders that re-parse the same value
