@@ -1118,14 +1118,14 @@ fn install_factory_revision_reads(fixture: &HelmFixture, legacy: bool) {
     let helm = fs::canonicalize(helm.trim()).expect("real Helm executable");
     let helm = serde_json::to_string(helm.to_str().expect("UTF-8 Helm path")).unwrap();
     let wrapper = format!(
-        r#"#!/usr/bin/python3
+        r#"#!/usr/bin/env python3
 import os
 import sys
 if sys.argv[1:3] == ['template', 'curie-values-lint']:
     os.execv({helm}, [{helm}, *sys.argv[1:]])
 {}"#,
         super::cluster_upgrade::FACTORY_READ_WRAPPER
-            .strip_prefix("#!/usr/bin/python3\n")
+            .strip_prefix("#!/usr/bin/env python3\n")
             .expect("Python factory wrapper")
     );
     test_executable::install(&bin_dir.join("helm"), &wrapper);

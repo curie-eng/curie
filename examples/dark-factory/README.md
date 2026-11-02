@@ -18,13 +18,25 @@ reviewer subagents check it on a stronger model. The skill walks nine phases:
 3. `plan`: read the repository's own guidance, find its test commands, and
    write a plan.
 4. `plan_review`: [`agents/plan-reviewer.md`](agents/plan-reviewer.md)
-   reviews the plan once. Either verdict, `APPROVE` or `CHANGES`, moves on to
-   `failing_test`; `CHANGES` findings are advice the agent must resolve.
+   reviews the plan once. The review is advisory: `VERDICT: APPROVE` and
+   `VERDICT: CHANGES` both complete planning, and the findings of a `CHANGES`
+   carry into `failing_test` and `implement`.
 5. `failing_test`: write a failing test first where one is feasible.
 6. `implement`: make the smallest change and run the repository's own checks.
 7. `review_diff`: [`agents/diff-reviewer.md`](agents/diff-reviewer.md) reviews
-   the working diff against every criterion, and approves it or sends it back
-   to `implement` (never to `plan`).
+   the rendered candidate patch, the net change from the run's base commit
+   exactly as it will be published (committed, staged, unstaged and untracked
+   changes together), against every criterion, and approves it or sends it back
+   to `implement` (never to `plan`), for at most 5 completed rounds. The
+   candidate is built without running clean or process filter programs, so a
+   change to a path with a `filter` attribute is refused with a reason naming
+   that path. The gate records the patch file's sha256 when the review starts
+   and refuses the verdict when that file is missing or changed. The gate's
+   state file and the patch file are owned by the agent's user, so the gate is
+   not an OS isolation or authentication boundary: mode 0600 and the tree id
+   in the file name do not protect against that owner, and the digest check
+   catches a missing or persistently changed patch at verdict time but does
+   not defeat a transient replace and restore, or forged gate state.
 8. `publish`: publish one pull request, or end with `Could not complete:` and
    the reason.
 9. `wait_ci`: the pull request's checks run and the platform waits on them
@@ -39,6 +51,8 @@ The skill paces its work from `execution_deadline` and `execution_seconds`
 returned by the mandatory `mcp__curie__get_issue` read, and treats the issue
 text and repository files as untrusted data. The maximum execution duration is
 10800 seconds; an unconfigured execution deadline remains 1800 seconds.
+The review gate hook enforces the skill's round and wrap up cutoffs from the
+same two values (see "Review loops").
 Running the repository's tests is an instruction in this skill. The platform
 does not enforce it, and a different bundle can choose differently.
 
@@ -110,18 +124,18 @@ they are not client installation requirements.
 
 ## Review loops
 
-The plan gets exactly one review per run. `VERDICT: CHANGES` on it is
-truthful advice, not a stop: the agent keeps every finding, fixes each
-blocking one during `implement`, and gives the diff reviewer each finding with
-its resolution. The diff reviewer treats an unresolved blocking plan finding
-as a blocking diff finding, and its final `VERDICT: APPROVE` stays mandatory
-for publication.
+The plan review runs once and is advisory. Either verdict opens the failing test.
+Carry every finding into implementation, resolve each blocking finding before
+the diff review, and include each finding and its resolution in that review prompt.
 
-Each remaining loop (`implement` and `review_diff`, and `wait_ci` back to
-`implement`) runs at most 3 rounds. When the diff reviewer still asks for
-changes on round 3, or a review call fails, the run publishes nothing. It
-ends its reply with `Could not complete:` and the reviewer's unresolved findings and open questions, and the platform's status
-comment on the issue carries that result.
+The diff loop (`implement` and
+`review_diff`) runs at most 5 completed rounds, and `wait_ci` back to
+`implement` at most 3. A round counts only when the reviewer returns a
+verdict. When the diff reviewer still asks for changes on round 5, a reviewer
+stays unavailable, or the review gate stops the run, the run publishes
+nothing. It ends its reply with `Could not complete:` and the reviewer's
+unresolved findings and open questions, and the platform's status comment on
+the issue carries that result.
 
 A reviewer tags every finding `blocking` (the change would be incorrect or
 unverifiable, or misses a criterion) or `note` (an improvement that does not
@@ -133,12 +147,25 @@ approved. Notes never start another review round.
 
 [`hooks/review_gate.py`](hooks/review_gate.py) enforces this, because the main
 model does not follow the protocol reliably. It routes every sub-agent call to
-the right reviewer, strips `isolation` and `model`, forces
-`run_in_background: false`, refuses reviews out of order and a second plan
-review, counts rounds and applies the cap, stops the run on a reviewer reply without a verdict, and
-refuses `publish_changes` until the diff reviewer approves. It also writes the
-`plan_review` and `review_diff` phase lines, with the round, to the pod log.
-It hands the agent and both reviewers the same verification contract,
+the right reviewer and refuses any other named `subagent_type`, strips
+`isolation` and `model`, forces `run_in_background: false`, and refuses
+reviews out of order. It counts a round only when a reviewer call completes
+with a verdict, so a refused admission, a call the runner refuses, or a reply
+without a verdict costs nothing; a reply without a verdict is reported as
+incomplete and may be retried. It refuses a second plan review, a diff review
+of a checkout the diff reviewer already approved, and a diff review of the
+exact checkout that last got `CHANGES` (no progress, so no round is spent),
+and it stops the run when the diff loop reaches its cap. A completed edit
+after a diff approval clears that approval. It refuses `publish_changes` until
+the diff reviewer approves the current checkout. It writes the `plan_review`
+and `review_diff` phase lines, with the round, to the pod log, along with
+`curie_gate` lines such as `review_refused` (its causes include `round_cap`,
+written when the diff loop reaches its cap), `review_incomplete`,
+`timing_recorded` and `timing_refused`. `report_progress` cannot record
+`implement` rounds 4 and 5 until #5203 is fixed, because the runner takes the
+`implement` cap from the `wait_ci` loop; the hook's own `review_diff` phase
+lines still record those rounds. The hook hands the agent and both reviewers
+the same verification contract,
 [`verification/contract.md`](verification/contract.md): the per-criterion
 verification table, when a check that needs an absent service may be delegated
 to a required pull request check, what always blocks, and the `VERIFICATION:`
@@ -147,11 +174,35 @@ block each reviewer returns, which the hook records as a
 `verification/checks.json`, both reviewers also get it after the contract.
 Without the contract no review runs.
 
+The hook also enforces the time budget. It reads `execution_deadline` and
+`execution_seconds` from the `mcp__curie__get_issue` result, and refuses plan
+review, diff review, edits and publication until it has them. At or after
+`execution_deadline - execution_seconds/6` no plan review or new
+implementation round starts. At or after
+`execution_deadline - execution_seconds/12` no edit, Bash command or diff
+review runs, and every earlier Bash timeout is cut to the time left before
+then. That timeout bounds only how long the agent waits in the foreground: a
+command still running at its timeout keeps running in the background until the
+execution deadline ends the sandbox. A command whose exit status was not
+observed is unfinished, so its check is never reported as passed, it supports
+no verification claim, and nothing is published on it. A checkout
+the diff reviewer approved may still be published until the deadline. Every
+stop or refusal carries the unresolved reviewer findings the hook retained, so
+the final reply can list them; those findings never reach the pod log.
+
+A run continues across prompts. Its state is keyed by `CURIE_SESSION_ID`
+(else the hook's own session id) plus the workspace, the root of the checkout
+the prompt runs in, so every directory of one checkout names the same run. A
+later prompt in the same session and workspace keeps the spent
+rounds, the completed plan review, the findings and any stop, and a platform
+`wait_ci` message opens one new diff loop in it. A new session, or a prompt
+from another checkout, starts a fresh run.
+
 The same hook gates repository edits. `Edit`, `Write`, `MultiEdit` and
 `NotebookEdit` are refused until the `dark-factory:implement-issue` skill is
-loaded and the plan review completes with either verdict. After it only test
-edits may run: an edit to a test file, or an edit to a source file that adds a test (an
-inline Rust `#[test]` module, a `def test_` function, and the like) beyond the
+loaded and the plan review returns its verdict. After that only test edits
+may run: an edit to a test file, or an edit to a source file that adds a test
+(an inline Rust `#[test]` module, a `def test_` function, and the like) beyond the
 ones the replaced text already held. The model writes the failing test (a
 test file, or an inline test that adds a test), runs it with Bash, then calls
 `report_progress` with phase `implement`, then edits source. When no test is
@@ -160,9 +211,9 @@ event that opens source edits; no Bash command does. The hook records evidence
 only: after a test edit it counts finished Bash commands and failed ones,
 never their text, and writes `test_edited`, `bash_after_test_edit` and
 `bash_failed_after_test_edit` on its `implement` phase line. It never claims
-a test ran. The hook fingerprints the checkout at the prompt and refuses the
-plan review's verdict, stopping the run, if the checkout changed before it
-(for example through Bash). Its evidence lines share one `seq` counter per run:
+a test ran. The hook fingerprints the checkout at the prompt and refuses the plan
+review verdict, stopping the run, if the checkout changed before it (for example
+through Bash). Its evidence lines share one `seq` counter per run:
 `curie_phase` lines carry `source: "hook"`, `curie_reported` lines record each
 `report_progress` call with the hook's last observed phase and `late: true`
 when the report trails it, and `curie_gate` lines record refusals.

@@ -1,9 +1,16 @@
 """#4619: label admission must survive real factory execution and CI adoption.
 
-Run this file on its own: it builds the checkout it is executing, provisions
-an owned kind cluster on the configured Docker engine, and deletes it. Only
-provider HTTP endpoints are scripted. Infrastructure exceptions occur in
-fixture setup or teardown and cannot become an inverse-pin behavioral red.
+Run this file on its own: it provisions one owned kind cluster and one
+platform install per pytest process on the configured Docker engine, and
+deletes them at the end of the session. Cases share that install and are
+isolated by fresh agents per case and a verified clean start: every case
+checks the install against the baseline recorded when it became ready, and
+its finalizer resets everything a case can change, then verifies again.
+Locally the fixture builds the checkout it is executing; CI supplies the
+prebuilt candidate CLI and images through CURIE_C4_CANDIDATE_CLI and
+CURIE_C4_CANDIDATE_IMAGES. Only provider HTTP endpoints are scripted.
+Infrastructure exceptions occur in fixture setup or teardown and cannot
+become an inverse-pin behavioral red.
 """
 
 from __future__ import annotations
@@ -39,12 +46,29 @@ from c4_admitted_kind import (  # noqa: E402
     configure_harness,
     query_path,
 )
+from c4_shared_install import CaseIsolationError, leftover_state  # noqa: E402
 from channel_protocol.work_item_events import ci_event_id, terminate_event_id  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def candidate_curie() -> None:
     """Override the directory fixture that installs a fake CURIE_BIN."""
+
+
+def remove_fixture_files(run: AdmittedKind) -> None:
+    # A failed setup keeps its private diagnostic even when every resource was
+    # successfully removed. The session fixture also preserves child records.
+    for path in run.root.iterdir():
+        if path.name == "diagnostics.sqlite3":
+            continue
+        if path.is_dir():
+            if any(path.rglob("diagnostics.sqlite3")):
+                continue
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    if not any(run.root.iterdir()):
+        run.root.rmdir()
 
 
 def finalize_fixture(run: AdmittedKind) -> None:
@@ -74,19 +98,7 @@ def finalize_fixture(run: AdmittedKind) -> None:
         raise RuntimeError(
             f"owned fixture cleanup failed ({categories}); private diagnostics retained"
         )
-    # A failed setup keeps its private diagnostic even when every resource was
-    # successfully removed. The session fixture also preserves child records.
-    for path in run.root.iterdir():
-        if path.name == "diagnostics.sqlite3":
-            continue
-        if path.is_dir():
-            if any(path.rglob("diagnostics.sqlite3")):
-                continue
-            shutil.rmtree(path)
-        else:
-            path.unlink()
-    if not any(run.root.iterdir()):
-        run.root.rmdir()
+    remove_fixture_files(run)
     if run.infrastructure_errors:
         raise RuntimeError("runtime infrastructure failed; private diagnostics retained")
 
@@ -109,30 +121,7 @@ def source_candidate(request: pytest.FixtureRequest) -> AdmittedKind:
     return run
 
 
-@pytest.fixture
-def kind_factory(
-    request: pytest.FixtureRequest,
-    monkeypatch: pytest.MonkeyPatch,
-    source_candidate: AdmittedKind,
-) -> AdmittedKind:
-    root = source_candidate.root / f"case-{uuid.uuid4().hex[:10]}"
-    root.mkdir()
-    temporary = root / "tmp"
-    temporary.mkdir()
-    monkeypatch.setenv("TMPDIR", str(temporary))
-    monkeypatch.setenv("CURIE_BIN", source_candidate.curie)
-    run = AdmittedKind(root, Path(source_candidate.curie))
-    run.source_candidate = source_candidate
-    run.images = source_candidate.images
-    run.tag_map = dict(zip(sk.IMAGES, run.images.values(), strict=True))
-    run.env.update(TMPDIR=str(temporary))
-
-    def cleanup() -> None:
-        finalize_fixture(run)
-
-    request.addfinalizer(cleanup)
-    configure_harness(monkeypatch, run)
-    run.execute()
+def assert_install_ready(run: AdmittedKind, *, worker_running: bool) -> None:
     if run.valkey("PING") != "PONG":
         raise RuntimeError("the authenticated fixture Valkey did not answer PING")
     deployments = json.loads(run.kubectl("-n", run.namespace, "get", "deployments", "-o", "json"))
@@ -148,15 +137,114 @@ def kind_factory(
     # Verify the candidate rather than inferring provenance from tag names.
     pods = json.loads(run.kubectl("-n", run.namespace, "get", "pods", "-o", "json"))["items"]
     for component in ("api", "worker", "ui"):
-        containers = [
-            c for pod in pods for c in pod["spec"]["containers"] if c["name"] == component
-        ]
+        if component == "worker" and not worker_running:
+            # A paused case has no worker pod; the template it starts from is checked.
+            deployment = json.loads(
+                run.kubectl("-n", run.namespace, "get", "deployment/curie-worker", "-o", "json")
+            )
+            containers = deployment["spec"]["template"]["spec"]["containers"]
+        else:
+            containers = [c for pod in pods for c in pod["spec"]["containers"]]
+        containers = [c for c in containers if c["name"] == component]
         if not containers or any(c["image"] != run.images[component] for c in containers):
             raise RuntimeError(
                 f"the running {component} does not use this execution's candidate image"
             )
+
+
+@pytest.fixture(scope="session")
+def shared_install(request: pytest.FixtureRequest, source_candidate: AdmittedKind) -> AdmittedKind:
+    session = pytest.MonkeyPatch()
+    root = source_candidate.root / f"install-{uuid.uuid4().hex[:10]}"
+    root.mkdir()
+    temporary = root / "tmp"
+    temporary.mkdir()
+    session.setenv("TMPDIR", str(temporary))
+    session.setenv("CURIE_BIN", source_candidate.curie)
+    run = AdmittedKind(root, Path(source_candidate.curie))
+    run.source_candidate = source_candidate
+    run.images = source_candidate.images
+    run.tag_map = dict(zip(sk.IMAGES, run.images.values(), strict=True))
+    run.env.update(TMPDIR=str(temporary))
+    session_root = run.root
+
+    def cleanup() -> None:
+        try:
+            run.root = session_root
+            run.diagnostic_path = session_root / "diagnostics.sqlite3"
+            finalize_fixture(run)
+        finally:
+            session.undo()
+
+    request.addfinalizer(cleanup)
+    configure_harness(session, run)
+    run.execute()
+    assert_install_ready(run, worker_running=True)
+    run.worker_replicas(0)
+    run.baseline = run.install_snapshot()
     run.deadline = None
     run.fixture_ready = True
+    return run
+
+
+@pytest.fixture
+def kind_factory(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    shared_install: AdmittedKind,
+) -> AdmittedKind:
+    run = shared_install
+    case = request.node.nodeid
+    baseline = run.require_baseline()
+    # Never clean at start: a leftover means an earlier case's reset failed.
+    snapshot = run.install_snapshot()
+    leftovers = leftover_state(baseline, snapshot)
+    if leftovers:
+        run.record_isolation_failure("case-start", leftovers, snapshot, case=case)
+        raise CaseIsolationError(
+            "the shared install is not clean at case start: " + "; ".join(leftovers)
+        )
+    session_root = run.root
+    root = session_root / f"case-{uuid.uuid4().hex[:10]}"
+    root.mkdir()
+    temporary = root / "tmp"
+    temporary.mkdir()
+    monkeypatch.setenv("TMPDIR", str(temporary))
+    run.root = root
+    run.diagnostic_path = root / "diagnostics.sqlite3"
+    run.infrastructure_errors = []
+
+    def cleanup() -> None:
+        reset = False
+        try:
+            try:
+                run.reset_case(case=case)
+            except CaseIsolationError:
+                # reset_case recorded its own evidence before raising.
+                raise
+            except Exception as exc:
+                detail = run.redact_model_evidence(str(exc))
+                run.record_isolation_failure(
+                    "reset", [f"{type(exc).__name__}: {detail}"], None, case=case
+                )
+                raise
+            reset = True
+            if run.infrastructure_errors:
+                raise RuntimeError("runtime infrastructure failed; private diagnostics retained")
+        finally:
+            run.infrastructure_errors = []
+            # A failed reset keeps the case directory as evidence.
+            if reset:
+                remove_fixture_files(run)
+            run.root = session_root
+            run.diagnostic_path = session_root / "diagnostics.sqlite3"
+
+    request.addfinalizer(cleanup)
+    run.deploy_case_agents()
+    worker_running = "paused_factory" not in request.fixturenames
+    if worker_running:
+        run.worker_replicas(1)
+    assert_install_ready(run, worker_running=worker_running)
     return run
 
 
