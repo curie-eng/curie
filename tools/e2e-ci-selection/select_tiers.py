@@ -9,8 +9,10 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import tomllib
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
@@ -88,6 +90,12 @@ UPGRADE_WORKFLOW_JOBS = frozenset(
     }
 )
 WORKFLOW_PATH = ".github/workflows/ci.yaml"
+REGISTRY_PATH = ".github/e2e-selection.yaml"
+# A ci.yaml hunk outside every job changes the workflow header.
+WORKFLOW_HEADER = "<header>"
+# Registry sections that never change what pytest runs on a pull request.
+NON_PYTEST_REGISTRY_SECTIONS = ("chart_scenarios", "ci_policy_tests")
+PYTEST_SHARDS = 6
 CHART_JOB = "e2e-cluster-chart-regressions"
 CHART_LEGS = ("chart", "workload")
 SCENARIO_SCRIPT = re.compile(r"^(?:charts/curie/ci|scripts)/[^\s]+\.sh(?:$|[;|&])")
@@ -167,6 +175,9 @@ class Registry:
     conditional_pytest_files: dict[str, tuple[str, ...]]
     pytest_scopes: dict[str, PytestScope]
     ci_policy_tests: dict[str, tuple[str, ...]]
+    # The pytest_impact section (pytest_impact.ImpactConfig). None when the
+    # registry has none, which keeps the full or cli scope on six shards.
+    pytest_impact: Any = None
 
 
 def _mapping(value: object, label: str) -> dict[str, object]:
@@ -502,6 +513,14 @@ def _load_registry(path: Path) -> Registry:
         if len(set(inputs)) != len(inputs):
             raise RegistryError(f"{label} contains duplicate inputs")
         conditional_pytest_files[test_file] = inputs
+    pytest_scopes = _pytest_scopes(root.get("pytest_scopes"))
+    ci_policy_tests = _ci_policy_tests(root.get("ci_policy_tests"))
+    pytest_impact = None
+    if "pytest_impact" in root:
+        try:
+            pytest_impact = _impact().load_config(root)
+        except ValueError as exc:
+            raise RegistryError(str(exc)) from exc
     return Registry(
         fallback,
         exact,
@@ -510,8 +529,9 @@ def _load_registry(path: Path) -> Registry:
         tuple(ignored_prefixes),
         chart_scenarios,
         conditional_pytest_files,
-        _pytest_scopes(root.get("pytest_scopes")),
-        _ci_policy_tests(root.get("ci_policy_tests")),
+        pytest_scopes,
+        ci_policy_tests,
+        pytest_impact,
     )
 
 
@@ -642,6 +662,12 @@ def _changed_paths(base: str, head: str) -> list[str]:
 
 
 def _workflow_job_spans(content: str) -> dict[str, tuple[int, int]]:
+    """Line spans [beginning, end) of every workflow job, 1-based.
+
+    A job owns its key line through the line before the next job key; the last
+    job runs to the end of the file. Malformed workflows and an aliased
+    released-upgrade job raise RegistryError.
+    """
     try:
         root = yaml.compose(content)
     except yaml.YAMLError as exc:
@@ -679,58 +705,64 @@ def _workflow_job_spans(content: str) -> dict[str, tuple[int, int]]:
         if key.value in seen_jobs:
             raise RegistryError(f"duplicate workflow job: {key.value}")
         seen_jobs.add(key.value)
-        if key.value in UPGRADE_WORKFLOW_JOBS:
-            if not isinstance(value, yaml.nodes.MappingNode):
-                raise RegistryError(f"workflow job {key.value} must be a mapping")
-            beginning = key.start_mark.line + 1
-            if index + 1 < len(jobs_node.value):
-                next_key, _ = jobs_node.value[index + 1]
-                end = next_key.start_mark.line + 1
-            else:
-                end = len(content.splitlines()) + 1
-            # Two flow-style job keys can share a physical line. Both own it.
-            spans[key.value] = (beginning, max(beginning + 1, end))
+        if key.value in UPGRADE_WORKFLOW_JOBS and not isinstance(value, yaml.nodes.MappingNode):
+            raise RegistryError(f"workflow job {key.value} must be a mapping")
+        beginning = key.start_mark.line + 1
+        if index + 1 < len(jobs_node.value):
+            next_key, _ = jobs_node.value[index + 1]
+            end = next_key.start_mark.line + 1
+        else:
+            end = len(content.splitlines()) + 1
+        # Two flow-style job keys can share a physical line. Both own it.
+        spans[key.value] = (beginning, max(beginning + 1, end))
 
     # PyYAML resolves aliases to the anchor's source node and keeps the anchor's
     # marks. Until we track anchor dependencies, refuse an aliased target job
     # instead of silently treating its external definition as unrelated.
+    upgrade_spans = [span for job, span in spans.items() if job in UPGRADE_WORKFLOW_JOBS]
     try:
         alias_lines = (
             event.start_mark.line + 1
             for event in yaml.parse(content)
             if isinstance(event, yaml.events.AliasEvent) and event.start_mark is not None
         )
-        if any(
-            beginning <= line < end for line in alias_lines for beginning, end in spans.values()
-        ):
+        if any(beginning <= line < end for line in alias_lines for beginning, end in upgrade_spans):
             raise RegistryError("released-upgrade job uses a YAML alias")
     except yaml.YAMLError as exc:
         raise RegistryError("workflow YAML is malformed") from exc
     return spans
 
 
-def _changes_upgrade_workflow_jobs(base: str, head: str) -> bool:
-    merge_base = subprocess.run(
+def _git_show(revision: str, path: str) -> str:
+    return subprocess.run(
+        ["git", "show", f"{revision}:{path}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+
+def _merge_base(base: str, head: str) -> str:
+    return subprocess.run(
         ["git", "merge-base", base, head],
         capture_output=True,
         text=True,
         check=True,
     ).stdout.strip()
-    old_content = subprocess.run(
-        ["git", "show", f"{merge_base}:{WORKFLOW_PATH}"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    new_content = subprocess.run(
-        ["git", "show", f"{head}:{WORKFLOW_PATH}"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
+
+
+def _workflow_changes(base: str, head: str) -> tuple[bool, frozenset[str]]:
+    """Does the ci.yaml diff touch a released-upgrade job, and which jobs it touches.
+
+    The job set names every job whose span a hunk overlaps on either side, plus
+    WORKFLOW_HEADER when a hunk covers a line outside every job.
+    """
+    merge_base = _merge_base(base, head)
+    old_content = _git_show(merge_base, WORKFLOW_PATH)
+    new_content = _git_show(head, WORKFLOW_PATH)
     old_spans = _workflow_job_spans(old_content)
     new_spans = _workflow_job_spans(new_content)
-    if not (old_spans or new_spans):
+    if not any(job in UPGRADE_WORKFLOW_JOBS for spans in (old_spans, new_spans) for job in spans):
         raise RegistryError("workflow has no released-upgrade job anchors")
 
     diff = subprocess.run(
@@ -742,6 +774,7 @@ def _changes_upgrade_workflow_jobs(base: str, head: str) -> bool:
     hunk_lines = [line for line in diff.splitlines() if line.startswith("@@")]
     if not hunk_lines:
         raise RegistryError("changed workflow has no text hunks")
+    touched: set[str] = set()
     for line in hunk_lines:
         match = HUNK_HEADER.match(line)
         if match is None:
@@ -751,11 +784,61 @@ def _changes_upgrade_workflow_jobs(base: str, head: str) -> bool:
             (int(old_start), int(old_count or "1"), old_spans),
             (int(new_start), int(new_count or "1"), new_spans),
         ):
-            if count and any(
-                start < end and start + count > beginning for beginning, end in spans.values()
+            if not count:
+                continue
+            covered = [
+                job
+                for job, (beginning, end) in spans.items()
+                if start < end and start + count > beginning
+            ]
+            touched.update(covered)
+            lines = range(start, start + count)
+            if any(
+                not any(beginning <= number < end for beginning, end in spans.values())
+                for number in lines
             ):
-                return True
-    return False
+                touched.add(WORKFLOW_HEADER)
+    return bool(touched & UPGRADE_WORKFLOW_JOBS), frozenset(touched)
+
+
+def _changes_upgrade_workflow_jobs(base: str, head: str) -> bool:
+    return _workflow_changes(base, head)[0]
+
+
+def _registry_without_non_pytest_sections(content: str) -> object:
+    document = yaml.load(content, Loader=UniqueKeyLoader)
+    if isinstance(document, dict):
+        for section in NON_PYTEST_REGISTRY_SECTIONS:
+            document.pop(section, None)
+    return document
+
+
+def _registry_pytest_changed(base: str, head: str) -> bool:
+    """Does the registry diff change anything that decides what pytest runs?
+
+    A base or head that is missing or does not parse counts as changed.
+    """
+    try:
+        merge_base = _merge_base(base, head)
+        old = _registry_without_non_pytest_sections(_git_show(merge_base, REGISTRY_PATH))
+        new = _registry_without_non_pytest_sections(_git_show(head, REGISTRY_PATH))
+    except (subprocess.CalledProcessError, yaml.YAMLError, RegistryError):
+        return True
+    return old != new
+
+
+@lru_cache(maxsize=1)
+def _impact() -> ModuleType:
+    """Load pytest_impact.py by path; it owns the impact graph and shard plan."""
+    path = Path(__file__).resolve().with_name("pytest_impact.py")
+    name = "e2e_ci_selection_pytest_impact"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    # Dataclasses resolve their module through sys.modules while the class body runs.
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _load_atlas() -> ModuleType:
@@ -819,6 +902,118 @@ def _is_version_only(paths: list[str], base: str | None, head: str | None) -> bo
         return False
 
 
+@dataclass(frozen=True)
+class PytestPlan:
+    """The pytest scope, its impact targets, and the shard plan."""
+
+    scope: str
+    reason: str
+    targets: tuple[str, ...]
+    shards: int
+    storage_shards: int
+    full_shards: int
+
+
+def _cli_list_files(registry: Registry) -> list[str]:
+    text = (REPO_ROOT / registry.pytest_scopes["cli"].test_files).read_text(encoding="utf-8")
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+@lru_cache(maxsize=1)
+def _impact_graph() -> Any:
+    # The graph is always this checkout's, wherever the selector runs from.
+    return _impact().ImpactGraph.build(REPO_ROOT)
+
+
+def _pytest_needed(
+    registry: Registry,
+    paths: list[str],
+    *,
+    pull_request: bool,
+    workflow_jobs_changed: frozenset[str] | None,
+    registry_pytest_changed: bool | None,
+) -> bool:
+    """The path rules' answer, widened on a pull request by impact readers.
+
+    A pull request whose paths the rules skip (documentation, root docs) still
+    runs pytest when a test reads one of them or the always-selected set is
+    not empty.
+    """
+    if _needs_pytest(registry, paths):
+        return True
+    if not pull_request or registry.pytest_impact is None:
+        return False
+    return _impact().needs_pytest(
+        _impact_graph(),
+        registry.pytest_impact,
+        paths,
+        cli_files=_cli_list_files(registry),
+        workflow_jobs_changed=workflow_jobs_changed,
+        registry_pytest_changed=registry_pytest_changed,
+    )
+
+
+def _pytest_plan(
+    registry: Registry,
+    paths: list[str],
+    scope: str,
+    *,
+    pull_request: bool,
+    pytest_needed: bool,
+    workflow_jobs_changed: frozenset[str] | None,
+    registry_pytest_changed: bool | None,
+) -> PytestPlan:
+    """Narrow a pull request's full scope to impact targets and plan its shards.
+
+    Every other event, a run without pytest, or a registry without a
+    pytest_impact section keeps `scope` on all six shards at the full tier.
+    """
+    config = registry.pytest_impact
+    if not pull_request:
+        reason = "not a pull request"
+    elif not pytest_needed:
+        reason = "pytest not selected"
+    elif config is None:
+        reason = "no pytest_impact registry section"
+    else:
+        reason = ""
+    if reason:
+        return PytestPlan(scope, reason, (), PYTEST_SHARDS, PYTEST_SHARDS, PYTEST_SHARDS)
+    impact = _impact()
+    graph = _impact_graph()
+    cli_files = _cli_list_files(registry)
+    targets: tuple[str, ...] = ()
+    if scope == "cli":
+        reason = "cli scope"
+        files = [path for path in cli_files if path in graph.tracked]
+    elif not paths:
+        reason = "empty diff"
+        files = list(graph.test_files)
+    else:
+        selection = impact.select(
+            graph,
+            config,
+            paths,
+            cli_files=cli_files,
+            workflow_jobs_changed=workflow_jobs_changed,
+            registry_pytest_changed=registry_pytest_changed,
+        )
+        reason = selection.reason
+        if selection.everything:
+            files = list(graph.test_files)
+        else:
+            scope = "impact"
+            targets = selection.targets
+            files = list(targets)
+    files = [path for path in files if not any(_matches_prefix(path, p) for p in config.excluded)]
+    plan = impact.plan_shards(graph, config, files, impact.conftest_groups(REPO_ROOT))
+    return PytestPlan(scope, reason, targets, plan.shards, plan.storage_shards, plan.full_shards)
+
+
 def _render(
     selected: set[str],
     pytest_needed: bool,
@@ -833,6 +1028,7 @@ def _render(
     approval_resume_needed: bool,
     chart_scenarios: list[str],
     chart_legs: list[str],
+    pytest_plan: PytestPlan,
 ) -> str:
     lines = [f"{OUTPUT_KEYS[tier]}={'true' if tier in selected else 'false'}" for tier in TIERS]
     skill_local = ",".join(tier for tier in TIERS[:2] if tier in selected)
@@ -850,6 +1046,11 @@ def _render(
     lines.append(f"approval_resume={'true' if approval_resume_needed else 'false'}")
     lines.append("chart_scenarios=" + json.dumps(chart_scenarios, separators=(",", ":")))
     lines.append("chart_legs=" + json.dumps(chart_legs, separators=(",", ":")))
+    digest = _impact().targets_digest(pytest_plan.targets) if pytest_plan.targets else ""
+    lines.append(f"pytest_targets={digest}")
+    lines.append(f"pytest_shards={pytest_plan.shards}")
+    lines.append(f"pytest_storage_shards={pytest_plan.storage_shards}")
+    lines.append(f"pytest_full_shards={pytest_plan.full_shards}")
     return "\n".join(lines) + "\n"
 
 
@@ -860,6 +1061,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--base")
     parser.add_argument("--head")
     parser.add_argument("--push", action="store_true")
+    parser.add_argument(
+        "--pytest-targets-out",
+        type=Path,
+        help="Write the impact targets one per line (empty unless the scope is impact).",
+    )
     parser.add_argument(
         "--omit-kind",
         action="store_true",
@@ -874,6 +1080,8 @@ def _run() -> None:
 
     paths: list[str] = []
     workflow_upgrade_changed = False
+    workflow_jobs_changed: frozenset[str] | None = None
+    registry_pytest_changed: bool | None = None
     version_only = False
     factory_needed = False
     approval_resume_needed = False
@@ -893,12 +1101,24 @@ def _run() -> None:
             paths = args.path
         elif args.base and args.head:
             paths = _changed_paths(args.base, args.head)
+            workflow_jobs_changed = frozenset()
             if WORKFLOW_PATH in paths:
-                workflow_upgrade_changed = _changes_upgrade_workflow_jobs(args.base, args.head)
+                workflow_upgrade_changed, workflow_jobs_changed = _workflow_changes(
+                    args.base, args.head
+                )
+            registry_pytest_changed = REGISTRY_PATH in paths and _registry_pytest_changed(
+                args.base, args.head
+            )
         else:
             raise RegistryError("provide paths, push, or both base and head revisions")
         selected = set().union(*(_select_path(registry, path) for path in paths))
-        pytest_needed = _needs_pytest(registry, paths)
+        pytest_needed = _pytest_needed(
+            registry,
+            paths,
+            pull_request=True,
+            workflow_jobs_changed=workflow_jobs_changed,
+            registry_pytest_changed=registry_pytest_changed,
+        )
         images_needed = _needs_images(paths)
         cli_release_needed = _needs_cli_release(paths)
         version_only = _is_version_only(
@@ -984,13 +1204,31 @@ def _run() -> None:
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
         raise RegistryError("GITHUB_OUTPUT is required")
+    pytest_plan = _pytest_plan(
+        registry,
+        paths,
+        pytest_scope,
+        pull_request=not args.push,
+        pytest_needed=pytest_needed,
+        workflow_jobs_changed=workflow_jobs_changed,
+        registry_pytest_changed=registry_pytest_changed,
+    )
+    print(
+        f"pytest selection: scope={pytest_plan.scope} reason={pytest_plan.reason} "
+        f"targets={len(pytest_plan.targets)} shards={pytest_plan.shards} "
+        f"storage={pytest_plan.storage_shards} full={pytest_plan.full_shards}"
+    )
+    if args.pytest_targets_out is not None:
+        args.pytest_targets_out.write_text(
+            "".join(f"{target}\n" for target in pytest_plan.targets), encoding="utf-8"
+        )
     with Path(output_path).open("a", encoding="utf-8") as stream:
         stream.write(
             _render(
                 selected,
                 pytest_needed,
                 pytest_deselect,
-                pytest_scope,
+                pytest_plan.scope,
                 ci_policy_files,
                 images_needed,
                 cli_release_needed,
@@ -1000,6 +1238,7 @@ def _run() -> None:
                 approval_resume_needed,
                 chart_scenarios,
                 chart_legs,
+                pytest_plan,
             )
         )
 

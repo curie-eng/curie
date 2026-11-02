@@ -166,9 +166,10 @@ def _run_collection(root: Path, *arguments: str) -> subprocess.CompletedProcess[
 @pytest.mark.parametrize(
     ("event", "paths", "scope"),
     [
-        pytest.param(
-            "pull_request", ("apps/api/src/curie_api/main.py",), "full", id="full-pr"
-        ),
+        # uv.lock selects everything, so the pull request keeps the full scope
+        # (an application diff narrows to impact targets, which exclude the
+        # upgrade regression through the registry's pytest_impact.excluded).
+        pytest.param("pull_request", ("uv.lock",), "full", id="full-pr"),
         pytest.param(
             "pull_request", ("cli/src/config_migrate.rs",), "cli", id="cli-pr"
         ),

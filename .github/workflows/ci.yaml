@@ -188,10 +188,14 @@ jobs:
           uv run pytest -q -n 4 -rsR "${ci_policy_files[@]}"
 
   # The suite runs as six parallel shards, each with its own runner and dev
-  # stack. Container fixtures run in `python-container-fixtures`, the kind dry
-  # run regression in `python-dry-run-fixture`, static gates in `python-static`,
-  # and workflow meta-tests in `ci-policy`. The required Python job below
-  # aggregates all of them.
+  # stack. On a pull request the selector's shard plan may narrow the run to
+  # the test files the diff can affect (impact scope), use fewer active shards,
+  # and boot only the stack tier each shard's tests need; an inactive shard
+  # records a skip. Every other event runs the whole suite on six shards with
+  # the full stack. Container fixtures run in `python-container-fixtures`, the
+  # kind dry run regression in `python-dry-run-fixture`, static gates in
+  # `python-static`, and workflow meta-tests in `ci-policy`. The required
+  # Python job below aggregates all of them.
   python-pytest:
     name: Python pytest (shard ${{ matrix.shard }}/6)
     # Job-level gate (#3858): an unselected run (docs-only or version-only)
@@ -248,16 +252,22 @@ jobs:
       # not select pytest. The shard still recomputes the selection itself and
       # records it, so the required job can cross-check that every shard agreed
       # with its own decision. Every event other than a pull request selects
-      # everything, as `changes` does (#3858).
+      # everything on six full tier shards, as `changes` does (#3858). From the
+      # shard plan the selector writes, this shard derives whether it is active
+      # and which stack tier it boots; a pull request also writes the impact
+      # targets file the Pytest step reads.
       - name: Decide whether compose and pytest are needed
         id: python-runtime
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "merge_group" ]; then
             uv run python tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --base "${{ github.event.merge_group.base_sha }}" \
-              --head "${{ github.event.merge_group.head_sha }}"
+              --head "${{ github.event.merge_group.head_sha }}" \
+              --pytest-targets-out pytest-targets.txt
           elif [ "${{ github.event_name }}" != "pull_request" ]; then
             uv run python tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
@@ -268,28 +278,68 @@ jobs:
             uv run python tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --base "origin/$base" \
-              --head HEAD
+              --head HEAD \
+              --pytest-targets-out pytest-targets.txt
           fi
+          # The last line written for a name wins, as it does in GitHub.
+          selection() {
+            local line value=""
+            while IFS= read -r line || [[ -n "$line" ]]; do
+              if [[ "$line" == "$1="* ]]; then
+                value="${line#*=}"
+              fi
+            done < "$GITHUB_OUTPUT"
+            printf '%s' "$value"
+          }
+          active=false
+          stack_tier=none
+          if [[ "$(selection pytest)" == "true" ]]; then
+            shards="$(selection pytest_shards)"
+            storage_shards="$(selection pytest_storage_shards)"
+            full_shards="$(selection pytest_full_shards)"
+            for count in "$shards" "$storage_shards" "$full_shards"; do
+              if [[ ! "$count" =~ ^(0|[1-9][0-9]*)$ ]]; then
+                echo "invalid shard plan '$shards/$storage_shards/$full_shards' from the selector" >&2
+                exit 1
+              fi
+            done
+            if (( SHARD <= shards )); then
+              active=true
+              if (( SHARD <= full_shards )); then
+                stack_tier=full
+              elif (( SHARD <= storage_shards )); then
+                stack_tier=storage
+              else
+                stack_tier=core
+              fi
+            fi
+          fi
+          echo "active=$active" >> "$GITHUB_OUTPUT"
+          echo "stack_tier=$stack_tier" >> "$GITHUB_OUTPUT"
+          echo "shard $SHARD: active=$active stack_tier=$stack_tier"
       # Integration tests dial the real dev stack (Postgres 25432, Valkey 26379,
-      # RustFS 29000, Langfuse 23000 + ClickHouse + OTel Collector). Boot it after
-      # ruff/mypy so cheap failures stay fast. The readiness helper waits for
-      # backing services and bucket creation, then starts Langfuse web before
-      # its worker so migrations and bootstrap cannot race worker startup.
+      # RustFS 29000, Langfuse 23000 + ClickHouse + OTel Collector). The shard
+      # boots only its plan's tier: core is Postgres and Valkey, storage adds
+      # RustFS and its bucket, full is the whole stack, where the readiness
+      # helper starts Langfuse web before its worker so migrations and bootstrap
+      # cannot race worker startup.
       # The app services (curie-api, curie-migrate) are deliberately NOT
       # started: the suite runs the app in-process via uv and migrates the shared
       # DB with alembic below, so their image is never needed here -- and it lives
       # in a private registry, so a bare `up` that pulled it failed the job.
       - name: Start dev stack
         id: dev-stack
-        if: steps.python-runtime.outputs.pytest == 'true'
-        run: python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480
+        if: steps.python-runtime.outputs.pytest == 'true' && steps.python-runtime.outputs.active == 'true'
+        env:
+          STACK_TIER: ${{ steps.python-runtime.outputs.stack_tier }}
+        run: python3 scripts/wait-for-langfuse.py --start --tier "$STACK_TIER" --timeout-seconds 480
       # Recheck authenticated web reads and worker readiness at the test
       # boundary. A running container alone does not prove usable Langfuse.
       - name: Wait for Langfuse to serve
-        if: steps.python-runtime.outputs.pytest == 'true'
+        if: steps.python-runtime.outputs.pytest == 'true' && steps.python-runtime.outputs.active == 'true' && steps.python-runtime.outputs.stack_tier == 'full'
         run: python3 scripts/wait-for-langfuse.py
       - name: Released database upgrade gate
-        if: steps.python-runtime.outputs.pytest == 'true' && matrix.shard == 1
+        if: steps.python-runtime.outputs.pytest == 'true' && steps.python-runtime.outputs.active == 'true' && matrix.shard == 1
         run: |
           uv run python scripts/check-released-upgrade.py --self-test
           uv run python scripts/check-released-upgrade.py
@@ -299,7 +349,7 @@ jobs:
       # Apply the real migrations to it so those tests run against a real
       # schema; this also exercises the alembic upgrade path on virgin Postgres.
       - name: Migrate the shared database
-        if: steps.python-runtime.outputs.pytest == 'true'
+        if: steps.python-runtime.outputs.pytest == 'true' && steps.python-runtime.outputs.active == 'true'
         working-directory: apps/api
         run: uv run alembic upgrade head
       # --durations is why this line is not a bare `-q`: it prints the real
@@ -309,8 +359,13 @@ jobs:
       # `-n 4 --dist loadgroup` runs this shard on the runner's four cores. The
       # root conftest.py groups every test by its file, pins the files sharing
       # unnamespaced Valkey keys or the Langfuse project to one group, and
-      # `--ci-shard` cuts the suite along those groups, so a group never
-      # straddles two shards and the shards together are the unfiltered suite.
+      # `--ci-shard` cuts the suite along those groups over the plan's active
+      # shards, so a group never straddles two shards and the shards together
+      # are the selected suite. On a pull request `--ci-shard-tiers` keeps each
+      # group on a shard whose stack tier serves it, and CURIE_CI_STACK_TIER
+      # makes a skip that blames a service this tier did not boot fail. In
+      # impact scope the selector's target files are passed explicitly. The
+      # xunit1 JUnit report carries per test durations for the replay tool.
       #
       # `--reruns 1` gives a failed test exactly one more attempt: 37% of
       # commits with a pytest failure passed on a plain rerun of the same
@@ -321,13 +376,30 @@ jobs:
       # because pytest keeps only the last `-r` option.
       - name: Pytest
         id: pytest
-        if: steps.python-runtime.outputs.pytest == 'true'
+        if: steps.python-runtime.outputs.pytest == 'true' && steps.python-runtime.outputs.active == 'true'
         env:
           SHARD: ${{ matrix.shard }}
           PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
           PYTEST_SCOPE: ${{ steps.python-runtime.outputs.pytest_scope }}
+          PYTEST_SHARDS: ${{ steps.python-runtime.outputs.pytest_shards }}
+          PYTEST_STORAGE_SHARDS: ${{ steps.python-runtime.outputs.pytest_storage_shards }}
+          PYTEST_FULL_SHARDS: ${{ steps.python-runtime.outputs.pytest_full_shards }}
+          STACK_TIER: ${{ steps.python-runtime.outputs.stack_tier }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          pytest_args=(-q -n 4 --dist loadgroup --ci-shard "$SHARD/6" --reruns 1 -rsR --durations=25 --ignore=tools/factory-e2e/tests/test_c4_initial_binding.py --ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py --ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py --ignore=tools/factory-e2e/tests/test_c4_forge_instances.py)
+          case "$STACK_TIER" in
+            core|storage|full) ;;
+            *)
+              echo "an active shard needs a stack tier of core, storage or full, got ${STACK_TIER:-<empty>}" >&2
+              exit 1
+              ;;
+          esac
+          pytest_args=(-q -n 4 --dist loadgroup --ci-shard "$SHARD/$PYTEST_SHARDS" --reruns 1 -rsR --durations=25 --ignore=tools/factory-e2e/tests/test_c4_initial_binding.py --ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py --ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py --ignore=tools/factory-e2e/tests/test_c4_forge_instances.py)
+          pytest_args+=(--junitxml shard-result-durations/junit.xml -o junit_family=xunit1)
+          # The merge queue selects exactly what the pull request did (#5262).
+          if [[ "$EVENT_NAME" == "pull_request" || "$EVENT_NAME" == "merge_group" ]]; then
+            pytest_args+=(--ci-shard-tiers "$PYTEST_STORAGE_SHARDS,$PYTEST_FULL_SHARDS")
+          fi
           pytest_args+=(--deselect=tools/factory-e2e/tests/test_c4_admitted_agent.py)
           pytest_args+=(--ignore tools/factory-e2e/tests/test_c4_upgrade_migration.py)
           pytest_args+=(--ignore tools/factory-e2e/tests/test_c4_cluster_up.py)
@@ -373,7 +445,23 @@ jobs:
               fi
             done
           fi
+          if [[ "$PYTEST_SCOPE" == "impact" ]]; then
+            impact_targets=()
+            if [[ -f pytest-targets.txt ]]; then
+              while IFS= read -r path || [[ -n "$path" ]]; do
+                if [[ -n "$path" ]]; then
+                  impact_targets+=("$path")
+                fi
+              done < pytest-targets.txt
+            fi
+            if (( ${#impact_targets[@]} == 0 )); then
+              echo "impact scope needs target files, but pytest-targets.txt is missing or empty" >&2
+              exit 1
+            fi
+            pytest_args+=("${impact_targets[@]}")
+          fi
           unset PYTEST_SCOPE
+          export CURIE_CI_STACK_TIER="$STACK_TIER"
           uv run pytest "${pytest_args[@]}"
       # Record what this shard decided and did, for the required job to check.
       # Written on every outcome, so a failed shard still reports.
@@ -386,11 +474,15 @@ jobs:
           STACK_RESULT: ${{ steps.dev-stack.outcome }}
           PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
           PYTEST_SCOPE: ${{ steps.python-runtime.outputs.pytest_scope }}
+          PYTEST_SHARDS: ${{ steps.python-runtime.outputs.pytest_shards }}
+          STACK_TIER: ${{ steps.python-runtime.outputs.stack_tier }}
+          PYTEST_TARGETS: ${{ steps.python-runtime.outputs.pytest_targets }}
         run: |
           mkdir -p shard-result
-          printf 'shard=%s selected=%s pytest=%s stack=%s deselect=%s scope=%s\n' \
+          printf 'shard=%s selected=%s pytest=%s stack=%s deselect=%s scope=%s shards=%s tier=%s targets=%s\n' \
             "$SHARD" "${PYTEST_SELECTED:-}" "${PYTEST_RESULT:-}" "${STACK_RESULT:-}" \
-            "${PYTEST_DESELECT:-}" "$PYTEST_SCOPE" \
+            "${PYTEST_DESELECT:-}" "$PYTEST_SCOPE" "${PYTEST_SHARDS:-}" "${STACK_TIER:-}" \
+            "${PYTEST_TARGETS:-}" \
             > "shard-result/shard-${SHARD}.txt"
           cat "shard-result/shard-${SHARD}.txt"
       - name: Upload shard result
@@ -399,8 +491,17 @@ jobs:
         with:
           name: python-pytest-shard-${{ matrix.shard }}
           path: shard-result/
+      # Per test durations for shard planning. The name stays outside the
+      # required job's `python-pytest-shard-*` download.
+      - name: Upload pytest durations
+        if: always() && steps.python-runtime.outputs.pytest == 'true' && steps.python-runtime.outputs.active == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-pytest-durations-${{ matrix.shard }}
+          path: shard-result-durations/
+          retention-days: 7
       - name: Dump dev stack logs on failure
-        if: ${{ failure() && steps.python-runtime.outputs.pytest == 'true' }}
+        if: ${{ failure() && steps.python-runtime.outputs.pytest == 'true' && steps.python-runtime.outputs.active == 'true' }}
         run: docker compose -f compose.dev.yaml logs --no-color --tail=200
 
   python-container-fixtures:
@@ -484,9 +585,9 @@ jobs:
         run: |
           set -euo pipefail
           case "$PYTEST_SCOPE" in
-            full|cli) ;;
+            full|cli|impact) ;;
             *)
-              echo "pytest scope must be full or cli, got ${PYTEST_SCOPE:-<empty>}" >&2
+              echo "pytest scope must be full, cli or impact, got ${PYTEST_SCOPE:-<empty>}" >&2
               exit 1
               ;;
           esac
@@ -597,9 +698,9 @@ jobs:
         run: |
           set -euo pipefail
           case "$PYTEST_SCOPE" in
-            full|cli) ;;
+            full|cli|impact) ;;
             *)
-              echo "pytest scope must be full or cli, got ${PYTEST_SCOPE:-<empty>}" >&2
+              echo "pytest scope must be full, cli or impact, got ${PYTEST_SCOPE:-<empty>}" >&2
               exit 1
               ;;
           esac
@@ -775,18 +876,23 @@ jobs:
           path: shard-results
           merge-multiple: true
       # Keep the required Python check honest. When `changes` selected pytest,
-      # every shard must have reported, agreed with that selection, and run it,
-      # and the shard jobs themselves must have succeeded, so a real test
-      # failure in any shard fails this check. When it did not, the shard job
-      # must have been skipped by its job-level gate and left no shard record
-      # (#3858); a shard job that ran, or any record, means the two selections
-      # disagreed.
+      # every shard must have reported and agreed with that selection and its
+      # shard plan: the plan's active shards ran pytest on their planned stack
+      # tier, the rest skipped with tier none, and the shard jobs themselves
+      # succeeded, so a real test failure in any shard fails this check. When
+      # it did not, the shard job must have been skipped by its job-level gate
+      # and left no shard record (#3858); a shard job that ran, or any record,
+      # means the two selections disagreed.
       - name: Require pytest outcome to match selection
         if: success()
         env:
           PYTEST_SELECTED: ${{ needs.changes.outputs.pytest }}
           PYTEST_DESELECT: ${{ needs.changes.outputs.pytest_deselect }}
           PYTEST_SCOPE: ${{ needs.changes.outputs.pytest_scope }}
+          PYTEST_TARGETS: ${{ needs.changes.outputs.pytest_targets }}
+          PYTEST_SHARDS: ${{ needs.changes.outputs.pytest_shards }}
+          PYTEST_STORAGE_SHARDS: ${{ needs.changes.outputs.pytest_storage_shards }}
+          PYTEST_FULL_SHARDS: ${{ needs.changes.outputs.pytest_full_shards }}
           SHARDS_RESULT: ${{ needs.python-pytest.result }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           CONTAINER_RESULT: ${{ needs.python-container-fixtures.result }}
@@ -825,9 +931,9 @@ jobs:
             exit 1
           fi
           case "$PYTEST_SCOPE" in
-            full|cli) ;;
+            full|cli|impact) ;;
             *)
-              echo "pytest scope must be full or cli, got ${PYTEST_SCOPE:-<empty>}" >&2
+              echo "pytest scope must be full, cli or impact, got ${PYTEST_SCOPE:-<empty>}" >&2
               exit 1
               ;;
           esac
@@ -860,7 +966,18 @@ jobs:
             echo "Python pytest not selected; the shard job was skipped"
             exit 0
           fi
-          expected=success
+          for count in "$PYTEST_SHARDS" "$PYTEST_STORAGE_SHARDS" "$PYTEST_FULL_SHARDS"; do
+            if [[ ! "$count" =~ ^(0|[1-9][0-9]*)$ ]]; then
+              echo "pytest shard plan must be three non-negative integers, got '$PYTEST_SHARDS/$PYTEST_STORAGE_SHARDS/$PYTEST_FULL_SHARDS'" >&2
+              exit 1
+            fi
+          done
+          if (( PYTEST_SHARDS < 1 || PYTEST_SHARDS > SHARD_COUNT
+                || PYTEST_STORAGE_SHARDS > PYTEST_SHARDS
+                || PYTEST_FULL_SHARDS > PYTEST_STORAGE_SHARDS )); then
+            echo "pytest shard plan $PYTEST_SHARDS/$PYTEST_STORAGE_SHARDS/$PYTEST_FULL_SHARDS needs 1 <= shards <= $SHARD_COUNT and full <= storage <= shards" >&2
+            exit 1
+          fi
           if [[ "$SHARDS_RESULT" != "success" ]]; then
             echo "pytest shards finished $SHARDS_RESULT" >&2
             exit 1
@@ -871,14 +988,25 @@ jobs:
               echo "pytest shard $shard reported no result" >&2
               exit 1
             fi
-            want="shard=$shard selected=$PYTEST_SELECTED pytest=$expected stack=$expected deselect=$PYTEST_DESELECT scope=$PYTEST_SCOPE"
+            outcome=success
+            if (( shard > PYTEST_SHARDS )); then
+              outcome=skipped
+              tier=none
+            elif (( shard <= PYTEST_FULL_SHARDS )); then
+              tier=full
+            elif (( shard <= PYTEST_STORAGE_SHARDS )); then
+              tier=storage
+            else
+              tier=core
+            fi
+            want="shard=$shard selected=$PYTEST_SELECTED pytest=$outcome stack=$outcome deselect=$PYTEST_DESELECT scope=$PYTEST_SCOPE shards=$PYTEST_SHARDS tier=$tier targets=$PYTEST_TARGETS"
             got="$(cat "$record")"
             if [[ "$got" != "$want" ]]; then
               echo "pytest shard $shard: expected '$want', got '$got'" >&2
               exit 1
             fi
           done
-          echo "Python pytest selection matched $expected on $SHARD_COUNT shards"
+          echo "Python pytest selection matched on $PYTEST_SHARDS active of $SHARD_COUNT shards (scope $PYTEST_SCOPE)"
 
   # The Rust quality gate is five jobs so the test suite runs in parallel
   # partitions beside fmt and clippy instead of one 14.5 minute serial step.
@@ -2814,6 +2942,10 @@ jobs:
       pytest: ${{ steps.filter.outputs.pytest }}
       pytest_deselect: ${{ steps.filter.outputs.pytest_deselect }}
       pytest_scope: ${{ steps.filter.outputs.pytest_scope }}
+      pytest_targets: ${{ steps.filter.outputs.pytest_targets }}
+      pytest_shards: ${{ steps.filter.outputs.pytest_shards }}
+      pytest_storage_shards: ${{ steps.filter.outputs.pytest_storage_shards }}
+      pytest_full_shards: ${{ steps.filter.outputs.pytest_full_shards }}
       ci_policy: ${{ steps.filter.outputs.ci_policy }}
       ci_policy_files: ${{ steps.filter.outputs.ci_policy_files }}
       version_only: ${{ steps.filter.outputs.version_only }}
