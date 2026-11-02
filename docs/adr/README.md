@@ -275,4 +275,6 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0253 | [Factory base labels resolve at claim and follow relabels](0253-factory-base-labels-resolve-at-claim-and-follow-relabels.md) | Accepted |
 | 0254 | [HTTP identity applies to the channel identities an operator registers](0254-http-identity-applies-to-the-channel-identities-an-operator-registers.md) | Accepted |
 | 0255 | [Claim-backed sandbox scratch is bounded by its storage request](0255-claim-backed-sandbox-scratch-is-bounded-by-its-storage-request.md) | Draft |
+| 0256 | [Publication validates and pushes a Git object overlay](0256-publication-validates-and-pushes-a-git-object-overlay.md) | Draft |
+| 0257 | [A release registers its schema window only at the cut](0257-a-release-registers-its-schema-window-only-at-the-cut.md) | Accepted |
 <!-- END GENERATED: adr-index -->

@@ -720,8 +720,52 @@ async def get_publication_lineage(
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     if lineage is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "publication lineage not found")
+    lineage = await _retire_abandoned_readmit_lineage(request, session, lineage)
+    if lineage is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "publication lineage not found")
     lineage = await _refresh_publication_lineage(request, session, lineage)
     return await _publication_lineage_out(session, lineage)
+
+
+async def _retire_abandoned_readmit_lineage(
+    request: Request,
+    session: SessionDep,
+    lineage: ThreadPublicationLineage,
+) -> ThreadPublicationLineage | None:
+    """Retire a never-pushed failed-execution lineage before a re-admitted
+    run reads it (#4948).
+
+    A first publication that failed before any push leaves an open headless
+    lineage pinned at the run's starting base, and the re-admitted run would
+    otherwise prepare its workspace there instead of at the WorkItem's
+    re-admit base. When the lineage's only publications are the failed prior
+    executions of one live WorkItem, the lineage is closed and the caller
+    answers absent, so the next publication opens a fresh lineage at the new
+    base.
+
+    Remote branch absence is established through the production CodeHost port
+    first: null database fields alone never prove no push, a branch that
+    exists remotely although no push was recorded is preserved, and any
+    unavailable or unauthorized read fails closed, keeping the lineage and
+    its pin exactly as they were. Returns the lineage row to answer with, or
+    None when the lineage is now absent.
+    """
+
+    if not await crud_lineages.readmit_retirement_eligible(session, lineage):
+        return lineage
+    settings = get_settings()
+    repository = await lineage_repository(session, settings, lineage)
+    code_host = publishing_code_host(settings, request.app.state.http_client, repository)
+    try:
+        remote_head = await code_host.branch_head(repository, lineage.branch)
+    except ForgeError:
+        # Unavailable, unauthorized, or an upstream failure never proves the
+        # branch is absent; the lineage keeps pinning as before.
+        return lineage
+    if remote_head is not None:
+        # Pushed but unrecorded: the remote branch outranks the local record.
+        return lineage
+    return await crud_lineages.retire_abandoned_headless_lineage(session, lineage)
 
 
 async def _verified_identity(

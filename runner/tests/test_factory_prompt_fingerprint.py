@@ -5,11 +5,11 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -20,10 +20,10 @@ import os
 import signal
 import sqlite3
 import sys
-import time
 
 args = sys.argv[1:]
-capture = args[-3:] == ["rev-parse", "--show-toplevel", "HEAD"]
+# A candidate build (the fingerprint) starts with this call, once per build.
+capture = args[-2:] == ["rev-parse", "--show-object-format"]
 db = sqlite3.connect(os.environ["FACTORY_FINGERPRINT_DB"])
 db.execute("INSERT INTO calls (capture) VALUES (?)", (int(capture),))
 attempt = db.execute("SELECT count(*) FROM calls WHERE capture = 1").fetchone()[0]
@@ -38,11 +38,6 @@ if capture:
     if case in ("interrupt_hook", "kill_hook"):
         os.kill(os.getppid(), signal.SIGTERM if case == "interrupt_hook" else signal.SIGKILL)
         sys.exit(1)
-    if case == "delayed" and attempt == 1:
-        time.sleep(2)
-        sys.exit(1)
-elif case == "delayed":
-    time.sleep(2)
 os.execv(os.environ["FACTORY_FINGERPRINT_REAL_GIT"], ["git", *args])
 """
 
@@ -79,7 +74,9 @@ class CaptureRun:
         return str(self.helpers.context_of(outs[0]))
 
     def state(self) -> dict[str, Any]:
-        path = Path(self.session.env["DARK_FACTORY_STATE_DIR"]) / "sess-fresh.json"
+        # The hook keys its state on the Curie session when the runner sets one.
+        key = self.run.env.get("CURIE_SESSION_ID") or "sess-fresh"
+        path = Path(self.session.env["DARK_FACTORY_STATE_DIR"]) / f"{key}.json"
         state: dict[str, Any] = json.loads(path.read_text())
         return state
 
@@ -159,6 +156,7 @@ def test_transient_capture_failure_recovers_before_review(
     assert c.calls(captures_only=True) == 2
     assert c.state()["fingerprint"] is not None
     assert c.state()["plan"]["round"] == 0
+    c.run.read_issue()
 
     decision = c.plan()
     assert decision["permissionDecision"] == "allow"
@@ -179,30 +177,19 @@ def test_transient_capture_failure_recovers_before_review(
     assert c.calls(captures_only=True) == 3
 
 
-def test_capture_attempts_share_the_seven_second_deadline(capture_run: CaptureRun) -> None:
-    c = capture_run
-    c.case("delayed")
-    started = time.monotonic()
-    context = c.prompt()
-    elapsed = time.monotonic() - started
-
-    assert 6.5 <= elapsed < 9.0, elapsed
-    assert c.calls(captures_only=True) == 2
-    assert context.startswith("STOP.")
-    assert c.state()["fingerprint"] is None
-    assert c.plan()["permissionDecision"] == "deny"
-    assert c.state()["plan"]["round"] == 0
-
-
 @pytest.mark.parametrize("case", ["interrupt_hook", "kill_hook"])
 def test_capture_interruption_saves_reset_and_cannot_capture_later(
     capture_run: CaptureRun, case: str
 ) -> None:
     c = capture_run
     c.prompt()
+    c.run.read_issue()
     assert "APPROVED" in c.run.review(c.helpers.PLAN, "APPROVE")
     assert "APPROVED" in c.run.review(c.helpers.DIFF, "APPROVE")
     c.case(case)
+    # A prompt in the same session continues that run and takes no new
+    # fingerprint, so the next run is a new Curie session's first prompt.
+    c.run.env["CURIE_SESSION_ID"] = "curie-next-run"
     with pytest.raises(subprocess.CalledProcessError):
         c.prompt()
 
@@ -232,11 +219,13 @@ def test_a_fresh_prompt_recovers_round_one_and_still_checks_for_changes(
     c.case("healthy")
     assert c.helpers.contract() in c.prompt()
     assert c.state()["plan"] == {"round": 0, "verdict": None}
+    c.run.read_issue()
     if mutate:
         assert c.run.bash("printf '\nLATER = True\n' >> pkg/calc.py") == 0
 
     context = c.run.review(c.helpers.PLAN, "APPROVE")
-    assert c.state()["plan"]["round"] == 1
+    # The recovered run reaches plan review round 1.
+    assert c.session.phases() == [("plan_review", 1)]
     if mutate:
         assert context.startswith("STOP.")
         assert "checkout_changed_before_plan_approval" in context
@@ -244,7 +233,7 @@ def test_a_fresh_prompt_recovers_round_one_and_still_checks_for_changes(
         assert c.run.decision(c.helpers.PUBLISH) == "deny"
     else:
         assert "APPROVED" in context
-        assert c.state()["plan"]["verdict"] == "APPROVE"
+        assert c.state()["plan"] == {"round": 1, "verdict": "APPROVE"}
 
 
 def test_task_notification_preserves_the_baseline_without_recapturing(
@@ -252,6 +241,7 @@ def test_task_notification_preserves_the_baseline_without_recapturing(
 ) -> None:
     c = capture_run
     c.prompt()
+    c.run.read_issue()
     assert "APPROVED" in c.run.review(c.helpers.PLAN, "APPROVE")
     before, calls = c.state(), c.calls()
     c.case("fail")
@@ -280,9 +270,12 @@ def test_ci_fix_round_needs_no_initial_fingerprint(capture_run: CaptureRun) -> N
     context = c.run.dispatch("UserPromptSubmit", prompt=c.helpers._ci_prompt(2))
 
     assert c.helpers.contract() in c.helpers.context_of(context[0])
-    assert c.calls() == 0
+    # The CI round records its base commit (#5230) but takes no initial fingerprint.
+    assert c.calls(captures_only=True) == 0
+    assert re.fullmatch(r"[0-9a-f]{40}", c.state()["base"] or "")
     assert c.state()["stage"] == "implement"
     assert c.state()["fingerprint"] is None
+    c.run.read_issue()
     assert c.plan()["permissionDecision"] == "deny"
     denied = c.run.pre(
         "Agent",

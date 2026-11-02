@@ -109,6 +109,7 @@ def dynamic_factory(
         != {"key": "dynamic-ci", "paths": [CHANGE], "pending_key_prefix": None}
     ):
         raise RuntimeError("the API did not consume the dynamic-base GitHub repository policy")
+    run.deploy_case_agents()
     run.deadline = None
     run.fixture_ready = True
     return run

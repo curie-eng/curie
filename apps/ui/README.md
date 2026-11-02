@@ -38,7 +38,7 @@ unchanged.
 
 For the wired proof, start a task-owned full backing stack and the candidate API
 with its schema applied. Follow the repository's
-[concurrent verification instructions](../../AGENTS.md#concurrent-local-verification)
+[concurrent verification instructions](../../docs/local-verification.md#concurrent-local-verification)
 for isolated ports, endpoints, and cleanup. Export `CURIE_API_TARGET` for that API,
 an unused loopback `PW_PORT`, and `CURIE_API_KEY` matching the API's `API_KEY`
 setting. The platform key is used only by the Node harness to mint a login code;

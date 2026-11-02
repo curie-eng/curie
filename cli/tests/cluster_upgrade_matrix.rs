@@ -915,3 +915,244 @@ fn migration_crash_bounds_the_interrupted_upgrade_wait() {
         "{text}"
     );
 }
+
+/// The CRI section of `containerd config dump` from the pinned
+/// kindest/node:v1.31.4 image, trimmed to the keys the loader reads.
+const KIND_NODE_CONTAINERD_DUMP: &str = r#"version = 2
+
+[plugins]
+
+  [plugins."io.containerd.grpc.v1.cri"]
+
+    [plugins."io.containerd.grpc.v1.cri".containerd]
+      default_runtime_name = "runc"
+      disable_snapshot_annotations = true
+      discard_unpacked_layers = true
+      snapshotter = "overlayfs"
+
+  [plugins."io.containerd.transfer.v1.local"]
+
+    [[plugins."io.containerd.transfer.v1.local".unpack_config]]
+      platform = "linux/amd64"
+      snapshotter = "overlayfs"
+"#;
+
+const FAKE_KIND: &str = r#"#!/usr/bin/env bash
+printf 'kind %s\n' "$*" >>"$FAKE_LOG"
+if [[ "$1 $2" == "get nodes" && "$3" == "--name" && "$4" == "$FAKE_CLUSTER" ]]; then
+    [[ -n "$FAKE_NODES" ]] && printf '%s\n' $FAKE_NODES
+    [[ -n "$FAKE_NODES" ]] || echo "No kind nodes found for cluster \"$4\"." >&2
+    exit 0
+fi
+exit 97
+"#;
+
+const FAKE_DOCKER: &str = r#"#!/usr/bin/env bash
+case "$1" in
+version)
+    echo linux/amd64
+    exit 0 ;;
+image)
+    printf 'docker %s\n' "$*" >>"$FAKE_LOG"
+    [[ "$2 $3 $4" == "save --platform linux/amd64" ]] || exit 96
+    shift 4
+    [[ -z "${FAKE_SAVE_FAIL:-}" ]] || { echo "save failed" >&2; exit 1; }
+    printf 'archive:%s\n' "$*"
+    exit 0 ;;
+exec)
+    if [[ "$2" == -i ]]; then
+        node="$3"; shift 3
+        printf 'import %s %s\n' "$node" "$*" >>"$FAKE_LOG"
+        stdin="$(cat)"
+        printf 'stdin %s %s\n' "$node" "$stdin" >>"$FAKE_LOG"
+        if [[ -n "${FAKE_IMPORT_FAIL:-}" ]]; then
+            echo "flag provided but not defined: -discard-unpacked-layers" >&2
+            exit 1
+        fi
+        exit 0
+    fi
+    node="$2"; shift 2
+    printf 'exec %s %s\n' "$node" "$*" >>"$FAKE_LOG"
+    [[ "$*" == "containerd config dump" ]] || exit 95
+    cat "$FAKE_DUMP"
+    exit 0 ;;
+esac
+exit 94
+"#;
+
+fn script_function(source: &str, name: &str) -> String {
+    let start = source
+        .find(&format!("\n{name}() {{"))
+        .unwrap_or_else(|| panic!("{name} must be defined"));
+    let body = &source[start + 1..];
+    let first_line = body.split_once('\n').expect("function line").0;
+    if first_line.trim_end().ends_with('}') {
+        return format!("{first_line}\n");
+    }
+    let end = body.find("\n}\n").expect("function end") + 3;
+    body[..end].to_string()
+}
+
+struct LoadRun {
+    output: std::process::Output,
+    log: String,
+    workdir_entries: usize,
+}
+
+fn run_load_kind_images(nodes: &str, dump: &str, envs: &[(&str, &str)]) -> LoadRun {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bin_dir = tmp.path().join("bin");
+    let workdir = tmp.path().join("work");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&workdir).unwrap();
+    for (name, body) in [("kind", FAKE_KIND), ("docker", FAKE_DOCKER)] {
+        let path = bin_dir.join(name);
+        fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let dump_path = tmp.path().join("containerd-dump.toml");
+    fs::write(&dump_path, dump).unwrap();
+    let log_path = tmp.path().join("calls.log");
+    fs::write(&log_path, "").unwrap();
+
+    let source = fs::read_to_string(script()).expect("read script");
+    let mut harness = String::from("set -euo pipefail\n");
+    for name in ["log", "die", "kind_node_snapshotter", "load_kind_images"] {
+        harness.push_str(&script_function(&source, name));
+    }
+    harness
+        .push_str("load_kind_images ghcr.io/curie-eng/curie-runner:0.10.0 curie-runner:0.10.0\n");
+
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut command = Command::new("bash");
+    command
+        .arg("-c")
+        .arg(&harness)
+        .env("PATH", path)
+        .env("WORKDIR", &workdir)
+        .env("KIND_CLUSTER", "curie-upgrade-matrix")
+        .env("FAKE_CLUSTER", "curie-upgrade-matrix")
+        .env("FAKE_NODES", nodes)
+        .env("FAKE_DUMP", &dump_path)
+        .env("FAKE_LOG", &log_path);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command.output().expect("run load_kind_images harness");
+    LoadRun {
+        output,
+        log: fs::read_to_string(&log_path).unwrap(),
+        workdir_entries: fs::read_dir(&workdir).unwrap().count(),
+    }
+}
+
+const DISCARDING_IMPORT: &str = "ctr --namespace=k8s.io images import --all-platforms --digests \
+     --snapshotter=overlayfs --discard-unpacked-layers -";
+
+#[test]
+fn load_kind_images_streams_a_discarding_import_into_every_node() {
+    // #5242: kind load image-archive kept every uncompressed layer blob next
+    // to its unpacked snapshot and filled the runner disk.
+    let run = run_load_kind_images(
+        "curie-upgrade-matrix-control-plane curie-upgrade-matrix-worker",
+        KIND_NODE_CONTAINERD_DUMP,
+        &[],
+    );
+    let text = output_text(&run.output);
+    assert!(run.output.status.success(), "{text}\n{}", run.log);
+    let refs = "ghcr.io/curie-eng/curie-runner:0.10.0 curie-runner:0.10.0";
+    for node in [
+        "curie-upgrade-matrix-control-plane",
+        "curie-upgrade-matrix-worker",
+    ] {
+        assert!(
+            run.log
+                .contains(&format!("import {node} {DISCARDING_IMPORT}\n")),
+            "{node} must import with the kind argv plus --discard-unpacked-layers\n{}",
+            run.log
+        );
+        assert!(
+            run.log.contains(&format!("stdin {node} archive:{refs}\n")),
+            "{node} must receive the streamed save of every ref\n{}",
+            run.log
+        );
+        assert!(
+            run.log
+                .contains(&format!("exec {node} containerd config dump\n")),
+            "{node} snapshotter must come from the node's containerd config\n{}",
+            run.log
+        );
+    }
+    assert!(
+        !run.log.contains("--output") && run.workdir_entries == 0,
+        "the save must stream, not leave an archive in WORKDIR\n{}",
+        run.log
+    );
+    assert!(
+        run.log
+            .lines()
+            .filter(|line| line.starts_with("kind "))
+            .all(|line| line == "kind get nodes --name curie-upgrade-matrix"),
+        "kind must only list nodes, never load\n{}",
+        run.log
+    );
+}
+
+#[test]
+fn load_kind_images_refuses_a_failed_import() {
+    let run = run_load_kind_images(
+        "curie-upgrade-matrix-control-plane",
+        KIND_NODE_CONTAINERD_DUMP,
+        &[("FAKE_IMPORT_FAIL", "1")],
+    );
+    assert!(
+        !run.output.status.success(),
+        "an unsupported flag or failed import must fail the load\n{}",
+        run.log
+    );
+}
+
+#[test]
+fn load_kind_images_refuses_a_failed_save() {
+    let run = run_load_kind_images(
+        "curie-upgrade-matrix-control-plane",
+        KIND_NODE_CONTAINERD_DUMP,
+        &[("FAKE_SAVE_FAIL", "1")],
+    );
+    assert!(
+        !run.output.status.success(),
+        "a failed save must fail the load even though ctr read the stream\n{}",
+        run.log
+    );
+}
+
+#[test]
+fn load_kind_images_refuses_a_cluster_without_nodes() {
+    let run = run_load_kind_images("", KIND_NODE_CONTAINERD_DUMP, &[]);
+    let text = output_text(&run.output);
+    assert!(!run.output.status.success(), "{text}");
+    assert!(text.contains("has no nodes"), "{text}");
+    assert!(!run.log.contains("docker image save"), "{}", run.log);
+}
+
+#[test]
+fn load_kind_images_refuses_a_node_without_a_cri_snapshotter() {
+    let dump = KIND_NODE_CONTAINERD_DUMP.replace("      snapshotter = \"overlayfs\"\n\n", "\n");
+    assert!(
+        dump.matches("snapshotter = ").count() == 1,
+        "only the transfer unpack snapshotter may remain"
+    );
+    let run = run_load_kind_images("curie-upgrade-matrix-control-plane", &dump, &[]);
+    let text = output_text(&run.output);
+    assert!(!run.output.status.success(), "{text}");
+    assert!(text.contains("no CRI snapshotter"), "{text}");
+    assert!(!run.log.contains("import "), "{}", run.log);
+}
