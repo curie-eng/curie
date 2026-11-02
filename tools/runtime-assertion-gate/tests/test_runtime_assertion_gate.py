@@ -341,7 +341,7 @@ CHART_STEP_IF = (
     "contains(fromJSON(needs.changes.outputs.chart_scenarios), 'example-runtime') }}"
 )
 CHART_RUNTIME_SCRIPTS = [
-    "charts/curie/ci/runtime/failed-first-install-retry-runtime.sh",
+    # failed-first-install-retry-runtime.sh is temporarily disabled in CI (#5255).
     "charts/curie/ci/runtime/upgrade-drain-installation-runtime.sh",
     "charts/curie/ci/runtime/e2e-connector-identity-runtime.sh",
     "charts/curie/ci/runtime/runner-resources-assertions.sh",
