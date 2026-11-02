@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
@@ -23,6 +24,7 @@ INPUTS = (
     "CURIE_SCENARIO_RELEASE",
 )
 TOOL_STUB = r"""
+import json
 import os
 import shlex
 import sys
@@ -30,6 +32,22 @@ from pathlib import Path
 
 with Path(os.environ["WSDIAG_CALL_LOG"]).open("a") as log:
     log.write(shlex.join([Path(sys.argv[0]).name, *sys.argv[1:]]) + "\n")
+if os.environ.get("CONNECTOR_CONFIG_TEST"):
+    tool, args = Path(sys.argv[0]).name, sys.argv[1:]
+    if tool == "helm" and "get" in args:
+        print(json.dumps({"worker": {"connectorReconciler": json.loads(
+            os.environ["CONNECTOR_ORIGINAL_SETTINGS"]
+        )}}))
+        raise SystemExit(0)
+    if tool == "helm" and "upgrade" in args:
+        if "--values" in args:
+            original = Path(args[args.index("--values") + 1]).read_text()
+            Path(os.environ["CONNECTOR_RESTORED_SETTINGS"]).write_text(original)
+        raise SystemExit(0 if "--no-hooks" in args else 92)
+    if tool == "kubectl" and "rollout" in args:
+        raise SystemExit(0)
+    if tool == "kubectl" and "get" in args:
+        raise SystemExit(1)
 raise SystemExit(91)
 """
 
@@ -214,3 +232,36 @@ def test_every_shared_consumer_requires_its_install_identity_before_tool_calls(
         line.startswith("FAIL:") and variable in line for line in output.splitlines()
     ), output
     assert scenario.calls() == [], "incomplete install identity must fail before tool calls"
+
+
+@pytest.mark.parametrize("script_name", [
+    "connector-secret-rotation-runtime.sh", "connector-apply-race-runtime.sh",
+])
+@pytest.mark.parametrize("original", [
+    {"enabled": False, "intervalSeconds": 60},
+    {"enabled": True, "intervalSeconds": 17},
+])
+def test_connector_configuration_and_failure_cleanup_avoid_platform_lifecycle_hooks(
+    scenario: Scenario, tmp_path: Path, script_name: str, original: dict[str, object],
+) -> None:
+    restored = tmp_path / "restored.json"
+    scenario.environment.update({
+        "CONNECTOR_CONFIG_TEST": "1",
+        "CONNECTOR_ORIGINAL_SETTINGS": json.dumps(original),
+        "CONNECTOR_RESTORED_SETTINGS": str(restored),
+    })
+    completed = scenario.run(SCRIPT.with_name(script_name))
+    calls = scenario.calls()
+    upgrades = [call for call in calls if call[0] == "helm" and "upgrade" in call]
+    assert len(upgrades) == 2, (completed.stdout, completed.stderr, calls)
+    assert all("--no-hooks" in call for call in upgrades), upgrades
+    assert all("--reuse-values" in call and "--wait" in call for call in upgrades)
+    assert all("--install" not in call and "install" not in call for call in upgrades)
+    assert "worker.connectorReconciler.enabled=true" in upgrades[0]
+    assert "worker.connectorReconciler.intervalSeconds=1" in upgrades[0]
+    assert json.loads(restored.read_text()) == {"worker": {"connectorReconciler": original}}
+    assert any(call[0] == "docker" for call in calls), "valid configuration must reach the body"
+    assert sum(call[0] == "kubectl" and "rollout" in call for call in calls) == 2
+    assert completed.returncode != 0, "the controlled image tool failure must remain a failure"
+    assert "could not configure the connector reconciler" not in completed.stderr
+    assert "could not restore" not in completed.stderr
