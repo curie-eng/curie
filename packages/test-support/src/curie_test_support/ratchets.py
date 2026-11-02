@@ -350,14 +350,16 @@ class Durations:
 
 
 def duration_observations(paths: Sequence[Path]) -> Durations:
-    if len({path.resolve() for path in paths}) < 2:
-        raise ValueError("duration regeneration requires artifacts from at least two CI runs")
+    run_ids: set[str] = set()
     result = Durations()
     pattern = re.compile(r"([0-9]+(?:\.[0-9]+)?)s call\s+(.+?)$")
     for path in paths:
         observed = False
         for raw in path.read_text().splitlines():
             line = re.sub(r"\x1b\[[0-9;]*m", "", raw)
+            run = re.search(r"test-time source run: ([1-9][0-9]*)\s*$", line)
+            if run:
+                run_ids.add(run[1])
             if "test-time duration observations:" in line:
                 observed = True
             if "test-time collected: " in line:
@@ -369,6 +371,8 @@ def duration_observations(paths: Sequence[Path]) -> Durations:
                 result.maxima[nodeid] = max(float(match[1]), result.maxima.get(nodeid, 0))
         if not observed:
             raise ValueError("duration artifact contains no call-phase observations")
+    if len(run_ids) < 2:
+        raise ValueError("duration regeneration requires artifacts from at least two CI runs")
     return result
 
 
@@ -460,6 +464,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         errors = growth(actual, authority) if authority else []
         if previous and ancestor:
             errors.extend(growth(previous, ancestor))
+        if previous and not args.regenerate:
+            errors.extend(growth(actual, previous))
         if errors:
             print("\n".join(errors))
             return 1

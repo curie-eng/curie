@@ -50,9 +50,11 @@ def pytest_configure(config: pytest.Config) -> None:
     path = config.getoption("test_time_baseline") or config.rootpath / BASELINE
     try:
         baseline = read_baseline(path)
-        if config.getoption("test_time_baseline") is None:
-            baseline = ancestor_baseline(config.rootpath) or baseline
         exemptions = set(baseline["durations"])
+        if config.getoption("test_time_baseline") is None:
+            ancestor = ancestor_baseline(config.rootpath)
+            if ancestor is not None:
+                exemptions.intersection_update(ancestor["durations"])
     except (ValueError, OSError) as error:
         raise pytest.UsageError(f"Cannot load required test-time baseline: {error}") from error
     config.stash[_EXEMPTIONS] = exemptions

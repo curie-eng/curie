@@ -157,14 +157,15 @@ def test_missing_baseline_fails_closed(tmp_path: Path) -> None:
 
 def test_duration_baseline_uses_call_phase_and_normalizes_xdist(tmp_path: Path) -> None:
     artifact = tmp_path / "durations.log"
-    artifact.write_text("""30.00s setup tests/test_case.py::test_setup
+    artifact.write_text("""test-time source run: 12345
+30.00s setup tests/test_case.py::test_setup
 31.00s call tests/test_case.py::test_slow@tests/test_case.py
 19.99s call tests/test_case.py::test_fast
 40.00s teardown tests/test_case.py::test_teardown
 """)
     source(tmp_path, "tests/test_case.py", "def test_slow(): pass\n")
     artifact2 = tmp_path / "second.log"
-    artifact2.write_text(artifact.read_text())
+    artifact2.write_text(artifact.read_text().replace("12345", "12346"))
     result = command(
         tmp_path, "--regenerate", "--durations", str(artifact), "--durations", str(artifact2)
     )
@@ -269,7 +270,10 @@ def duration_artifacts(root: Path, *seconds: float) -> list[str]:
     arguments = []
     for index, duration in enumerate(seconds):
         artifact = root / f"run-{index}.log"
-        artifact.write_text(f"{duration}s call tests/test_case.py::test_case\n")
+        artifact.write_text(
+            f"test-time source run: {12345 + index}\n"
+            f"{duration}s call tests/test_case.py::test_case\n"
+        )
         arguments.extend(["--durations", str(artifact)])
     return arguments
 
@@ -314,26 +318,27 @@ def test_removed_duration_parameter_is_ignored_at_collection(tmp_path: Path) -> 
             {"sleeps": {}, "fixtures": [], "durations": ["test_case.py::test_case[removed]"]}
         ),
     )
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "-p",
-            "curie_test_support.duration_budget",
-            "--test-duration-budget",
-            "--test-time-baseline",
-            str(tmp_path / "baseline.json"),
-        ],
-        cwd=tmp_path,
-        text=True,
-        capture_output=True,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    source(tmp_path, BASELINE, (tmp_path / "baseline.json").read_text())
     for index in range(2):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "-p",
+                "curie_test_support.duration_budget",
+                "--test-duration-budget",
+                "--test-time-baseline",
+                str(tmp_path / "baseline.json"),
+            ],
+            cwd=tmp_path,
+            env={**os.environ, "GITHUB_RUN_ID": str(12345 + index)},
+            text=True,
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
         source(tmp_path, f"run-{index}.log", result.stdout)
+    source(tmp_path, BASELINE, (tmp_path / "baseline.json").read_text())
     regenerated = command(
         tmp_path,
         "--regenerate",
@@ -476,7 +481,11 @@ def test_committed_baseline_cannot_undercount_the_scan(tmp_path: Path, kind: str
     git(tmp_path, "config", "user.name", "Example")
     git(tmp_path, "config", "user.email", "test@example.com")
     git(tmp_path, "config", "core.hooksPath", os.devnull)
-    code = "import time\nimport pytest\n@pytest.fixture\ndef cluster(): run('kind', 'create', 'cluster')\ndef test_case(): time.sleep(1); time.sleep(2)\n"
+    code = (
+        "import time\nimport pytest\n@pytest.fixture\n"
+        "def cluster(): run('kind', 'create', 'cluster')\n"
+        "def test_case(): time.sleep(1); time.sleep(2)\n"
+    )
     source(tmp_path, "tests/test_case.py", code)
     baseline = generate(tmp_path)
     git(tmp_path, "add", ".")
@@ -514,11 +523,24 @@ def test_six_shards_from_one_ci_run_do_not_satisfy_two_run_rule(tmp_path: Path) 
     assert "two" in result.stdout
 
 
+@pytest.mark.parametrize("run_id", ["", "local", "0"])
+def test_unidentified_logs_do_not_satisfy_two_run_rule(tmp_path: Path, run_id: str) -> None:
+    arguments = []
+    for index in range(2):
+        path = tmp_path / f"unidentified-{index}.log"
+        path.write_text(f"test-time source run: {run_id}\n31s call tests/test_case.py::test_case\n")
+        arguments.extend(["--durations", str(path)])
+    result = command(tmp_path, "--regenerate", *arguments)
+    assert result.returncode == 2, result.stdout
+    assert "two CI runs" in result.stdout
+
+
 def test_combined_artifact_with_two_ci_run_ids_is_accepted(tmp_path: Path) -> None:
     source(tmp_path, "tests/test_case.py", "def test_case(): pass\n")
     path = tmp_path / "combined.log"
     path.write_text(
-        "test-time source run: 12345\n31s call tests/test_case.py::test_case\ntest-time source run: 12346\n32s call tests/test_case.py::test_case\n"
+        "test-time source run: 12345\n31s call tests/test_case.py::test_case\n"
+        "test-time source run: 12346\n32s call tests/test_case.py::test_case\n"
     )
     result = command(tmp_path, "--regenerate", "--durations", str(path))
     assert result.returncode == 0, result.stdout + result.stderr
