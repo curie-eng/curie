@@ -226,6 +226,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
         "pr_inputs": [
             "charts/curie",
             "apps/api/migrations",
+            "apps/api/src/curie_api/migrations",
             "cli/src/ops/up.rs",
             "charts/curie/ci/runtime/failed-first-install-retry-runtime.sh",
             ".github/workflows/ci.yaml",
@@ -5427,6 +5428,7 @@ def test_failed_first_install_retry_script_alone_selects_its_scenario(tmp_path: 
         ("charts/curie/templates/postgres.yaml", True),
         ("charts/curie/values.yaml", True),
         ("apps/api/migrations/versions/9999_example.py", True),
+        ("apps/api/src/curie_api/migrations/versions/9999_example.py", True),
         ("apps/api/src/curie_api/main.py", False),
         ("cli/src/ops/up.rs", True),
         (".github/workflows/ci.yaml", True),

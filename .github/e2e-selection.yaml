@@ -151,6 +151,7 @@ chart_scenarios:
       pr_inputs:
         - charts/curie
         - apps/api/migrations
+        - apps/api/src/curie_api/migrations
         - cli/src/ops/up.rs
         - charts/curie/ci/runtime/failed-first-install-retry-runtime.sh
         - .github/workflows/ci.yaml
