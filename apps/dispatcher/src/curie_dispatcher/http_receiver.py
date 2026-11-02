@@ -1,4 +1,4 @@
-"""Selected native Slack intake. @spec HTTP-INVOCATION-EXECUTION-1/2/3/19."""
+"""Selected native Slack intake. @spec HTTP-INVOCATION-EXECUTION-1/2/3/19/26."""
 
 from __future__ import annotations
 
@@ -26,6 +26,26 @@ from .inbound_attachments import derive_attachments
 from .inbound_text import derive_text, strip_self_mention
 from .installation_report import auth_test_report
 from .relevance import NON_CONTENT_SUBTYPES
+
+DIRECT_MESSAGE_CHANNEL_TYPE = "im"
+
+
+def is_plain_direct_message(event: Any) -> bool:
+    """A person's own one-to-one direct message to the bot (ADR 0263 decision 1).
+
+    Exactly ``channel_type`` ``im``, no ``subtype`` key at all, no ``bot_id``
+    key and a nonempty user: group DMs, channel messages, edits, deletions,
+    file shares and bot posts are not. @spec HTTP-INVOCATION-EXECUTION-26.
+    """
+    if type(event) is not dict:
+        return False
+    user = event.get("user")
+    return (
+        event.get("type") == "message"
+        and event.get("channel_type") == DIRECT_MESSAGE_CHANNEL_TYPE
+        and "subtype" not in event and "bot_id" not in event
+        and type(user) is str and bool(user)
+    )
 
 
 class _Frozen(BaseModel):
@@ -280,14 +300,15 @@ class HttpReceiverRuntime:
         self, *, body: dict[str, Any], event: dict[str, Any], slack_identity: str,
         bot_user_id: str | None,
     ) -> ReceiverSubmission:
-        """@spec HTTP-INVOCATION-EXECUTION-2/3/19."""
+        """@spec HTTP-INVOCATION-EXECUTION-2/3/19/26."""
         scope = self._scope
         try:
             if (
                 type(body) is not dict or type(event) is not dict
                 or body.get("event") != event or body.get("type") != "event_callback"
                 or body.get("team_id") != scope.installation_account
-                or event.get("type") != "app_mention" or event.get("bot_id")
+                or not (event.get("type") == "app_mention" or is_plain_direct_message(event))
+                or event.get("bot_id")
                 or event.get("subtype") in NON_CONTENT_SUBTYPES
                 or slack_identity != scope.channel_identity_name or bot_user_id != scope.bot_user_id
             ):
@@ -312,6 +333,10 @@ class HttpReceiverRuntime:
                 **evidence,
             }
             evidence["enterprise_ids"] = tuple(evidence.get("enterprise_ids", ()))
+            # The shared copier is unchanged; only this receiver states the
+            # conversation type, and only for a DM. @spec HTTP-INVOCATION-EXECUTION-26.
+            if event.get("type") == "message":
+                evidence["channel_type"] = DIRECT_MESSAGE_CHANNEL_TYPE
             conversation = timestamp
             payload = json.dumps({
                 "kind": "slack", "address": channel, "adapter": scope.channel_identity_name,

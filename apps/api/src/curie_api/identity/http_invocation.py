@@ -379,14 +379,15 @@ def _receiver_source(
     registration: ReceiverRegistrationV1, proof: codec.ReceiverProofV1,
     claims: channel_token.ChannelClaims, body: Any,
 ) -> AuthenticatedSource:
-    """@spec HTTP-INVOCATION-EXECUTION-2/15/21/24."""
+    """@spec HTTP-INVOCATION-EXECUTION-2/15/21/24/26."""
     # A Connect channel (shared flag True) is attributed by the owner below; an
-    # absent flag is never a channel of either kind.
+    # absent flag is never a channel of either kind. A direct message (ADR 0263)
+    # is attributed by the same owner and routed by the same binding checks.
     if (
         proof.binding_id != claims.channel_id or proof.binding_generation != claims.generation
         or proof.channel_identity_id != registration.channel_identity_id
         or proof.provider_installation_id != registration.provider_installation_id
-        or proof.slack.delivery != "app_mention"
+        or proof.slack.delivery not in {"app_mention", "message"}
         or type(proof.slack.is_ext_shared_channel) is not bool
         or body.kind != "slack" or body.address != proof.native_channel_id
         or body.delivery_id != proof.delivery_id or body.conversation_id != proof.conversation_id
