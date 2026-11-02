@@ -59,6 +59,12 @@ decision 1. Every route candidate is classified, so an ambiguous route cannot
 hide a selected one. A classification that cannot be completed refuses with
 the fixed unavailable response; it never selects the legacy path.
 
+An ambiguous route in an adopted tenant, one that resolves to more than one
+binding, is refused strictly: the approval is selected even when no candidate
+requires HTTP identity, including when every candidate is the agent's own
+binding. The legacy path is only for a route that resolves to exactly one of
+the agent's own bindings that needs nothing under decision 1.
+
 Every other approval in an adopted tenant keeps the legacy approval path,
 which replaces ADR 0254's note that approvals stay tenant-wide.
 
