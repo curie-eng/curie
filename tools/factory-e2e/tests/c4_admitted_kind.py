@@ -29,7 +29,12 @@ import httpx
 import scripted_kind as sk
 from aci_protocol import RUNS_STREAM_DEFAULT, STREAM_PAYLOAD_FIELD, QueuedTurn
 from c4_admitted_http import gitlab, jira, marker_model_type, tracker_stub_type
-from c4_shared_install import CaseIsolationError, InstallSnapshot, leftover_state
+from c4_shared_install import (
+    CaseIsolationError,
+    InstallSnapshot,
+    case_owned_streams,
+    leftover_state,
+)
 from curie_telemetry.redact import redact_text
 
 _SCRIPTED_INPUTS = (sk._module, sk.scripted_values, sk.tempfile.mkdtemp)
@@ -992,7 +997,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
             keys.update(str(key) for key in batch)
             cursor = str(cursor)
             if cursor == "0":
-                return frozenset(keys)
+                return case_owned_streams(keys)
 
     def table_rows(self) -> tuple[tuple[str, int], ...]:
         counts = self.sql(TABLE_ROWS_QUERY)
