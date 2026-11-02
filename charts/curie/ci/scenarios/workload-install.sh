@@ -110,11 +110,38 @@ ABSENT_CRDS=()
 NAMESPACE_OWNED=0
 WORKDIR="$(python3 -c 'import tempfile; print(tempfile.mkdtemp(prefix="curie-workload-install-"))')"
 export CURIE_CONFIG_DIR="$WORKDIR/curie-config"
+INSTALL_REDACTIONS="$(python3 - <<'PY'
+import json, os, re
+print(json.dumps([value for key, value in os.environ.items() if value
+                  and re.search(r"TOKEN|PASSWORD|SECRET|CREDENTIAL|API_KEY|AUTH|PRIVATE_KEY", key, re.I)]))
+PY
+)"
 unset CURIE_CREDENTIALS ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL
 unset CURIE_GITHUB_TOKEN GITHUB_TOKEN GH_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN
 unset CURIE_API_URL CURIE_API_KEY CURIE_VALKEY_PASSWORD CURIE_NAMESPACE CURIE_STREAM
 unset CURIE_MODEL_BASE_URL CURIE_FAKE_MODEL CURIE_FAKE_SCRIPT CURIE_FAKE_SCRIPT_FILE
 kc() { kubectl --context "$CONTEXT" -n "$NAMESPACE" "$@"; }
+
+install_diagnostics() {
+    [[ -f "$WORKDIR/install.log" ]] || return 0
+    python3 - "$WORKDIR/install.log" 3<<<"$INSTALL_REDACTIONS" <<'PY'
+import json, os, pathlib, re, sys
+redactions = json.load(os.fdopen(3))
+text = pathlib.Path(sys.argv[1]).read_text(errors="replace")
+for value in sorted(redactions, key=len, reverse=True):
+    text = text.replace(value, "[redacted]")
+credentials = re.compile(
+    r"\b(?:authorization|proxy-authorization|bearer|basic)\b|"
+    r"[A-Za-z0-9_-]*(?:token|password|passwd|secret|credential|api[_-]?key|private[_-]?key)"
+    r"[A-Za-z0-9_-]*\s*[:=]", re.I)
+for line in text.splitlines()[-80:]:
+    if credentials.search(line):
+        print("[redacted credential-bearing diagnostic]", file=sys.stderr)
+        continue
+    line = re.sub(r"\b[a-z][a-z0-9+.-]*://[^\s<>\"']+", "[redacted URL]", line, flags=re.I)
+    print(line, file=sys.stderr)
+PY
+}
 
 teardown() {
     local cleanup_status=0 object remaining crd resource
@@ -214,8 +241,11 @@ cleanup() {
     local status=$? cleanup_status=0
     trap - EXIT INT TERM
     set +e
-    if [[ "$ACTION" == up && "$status" != 0 ]] && (( NAMESPACE_OWNED )); then
-        teardown || cleanup_status=1
+    if [[ "$ACTION" == up && "$status" != 0 ]]; then
+        install_diagnostics || cleanup_status=1
+        if (( NAMESPACE_OWNED )); then
+            teardown || cleanup_status=1
+        fi
     fi
     rm -rf -- "$WORKDIR" || cleanup_status=1
     (( cleanup_status == 0 )) || exit 1
@@ -300,11 +330,8 @@ sets=(
     --set agentSandbox.runner.imagePullPolicy=Never --set agentSandbox.runner.prewarm.imagePullPolicy=Never
     --set agentSandbox.deploy=true --set agentSandbox.controller.deploy=true
     --set agentSandbox.platformPool.replicas=0 --set agentSandbox.runner.fakeModel=true
-    --set worker.replicas=1 --set agentSandbox.runner.workspace.enabled=true
-    --set worker.claimTimeoutSeconds=90 --set worker.routeTtlSeconds=3600
+    --set worker.replicas=1
     --set resourceQuota.hard.sandboxPodCount=2
-    --set api.readinessProbe.failureThreshold=120 --set api.livenessProbe.failureThreshold=60
-    --set worker.connectorReconciler.enabled=true --set worker.connectorReconciler.intervalSeconds=1
     --set agentSandbox.agentResourceProfiles.acme-fp=factory
     --set security.gvisor.mode=off
     --set langfuse.deploy=false --set langfuse.host=langfuse.example.com

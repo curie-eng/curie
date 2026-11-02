@@ -73,7 +73,7 @@ for filename in dict.fromkeys(path for path in kubeconfig.split(os.pathsep) if p
 if not isinstance(contexts.get(context), dict):
     fail("CURIE_SCENARIO_CONTEXT", "is absent from the caller's kubeconfig")
 PY
-for command in kubectl docker openssl curl; do
+for command in kubectl helm docker openssl curl; do
     command -v "$command" >/dev/null || fail "required executable is unavailable: $command"
 done
 
@@ -98,6 +98,7 @@ CONNECTOR_IMAGE="busybox:1.36.1"
 API_PID=""
 AGENT_TOUCHED=0
 HOLD_OWNED=0
+RECONCILER_TOUCHED=0
 
 kc() { kubectl --context "$CONTEXT" "$@"; }
 kcn() { kubectl --context "$CONTEXT" -n "$NAMESPACE" "$@"; }
@@ -139,8 +140,19 @@ remove_hold() {
     return 0
 }
 
+restore_reconciler() {
+    (( RECONCILER_TOUCHED )) || return 0
+    helm --kube-context "$CONTEXT" upgrade "$RELEASE" "$CHART" -n "$NAMESPACE" --reuse-values \
+        --values "$WORKDIR/reconciler-original.json" --wait --timeout 300s \
+        >"$WORKDIR/restore-reconciler.log" 2>&1 || return 1
+    kcn rollout status "deploy/${FULLNAME}-worker" --timeout=300s >/dev/null || return 1
+    RECONCILER_TOUCHED=0
+}
+
 cleanup() {
     local status=$?
+    trap - EXIT INT TERM
+    set +e
     # The webhook goes first: failurePolicy Fail must never outlive its pod.
     if (( HOLD_OWNED )); then
         remove_hold || status=1
@@ -154,11 +166,12 @@ cleanup() {
             --ignore-not-found --wait=true --timeout=90s >"$WORKDIR/delete-connectors.out" 2>"$WORKDIR/delete-connectors.err" \
             || { echo "FAIL: could not remove the scenario connector objects" >&2; status=1; }
     fi
+    restore_reconciler || { echo "FAIL: could not restore the recorded connector reconciler settings" >&2; status=1; }
     if [[ -n "$API_PID" ]]; then
         kill "$API_PID" >/dev/null 2>&1 || true
         wait "$API_PID" 2>/dev/null || true
     fi
-    rm -rf "$WORKDIR"
+    rm -rf "$WORKDIR" || status=1
     exit "$status"
 }
 trap cleanup EXIT
@@ -172,6 +185,26 @@ for owned in "namespace $HOLD_NS" \
         fail "$owned already exists"
     fi
 done
+
+helm --kube-context "$CONTEXT" get values "$RELEASE" -n "$NAMESPACE" --all -o json \
+    >"$WORKDIR/helm-values.json" 2>"$WORKDIR/get-helm-values.log" \
+    || fail "could not read the installed connector reconciler settings"
+python3 - "$WORKDIR/helm-values.json" "$WORKDIR/reconciler-original.json" <<'PY'
+import json, pathlib, sys
+values = json.loads(pathlib.Path(sys.argv[1]).read_text())["worker"]["connectorReconciler"]
+enabled, interval = values["enabled"], values["intervalSeconds"]
+assert type(enabled) is bool, "installed connector reconciler enabled value is not boolean"
+assert type(interval) is int and interval > 0, "installed connector reconciler interval is not a positive integer"
+pathlib.Path(sys.argv[2]).write_text(json.dumps({"worker": {"connectorReconciler": {
+    "enabled": enabled, "intervalSeconds": interval,
+}}}))
+PY
+RECONCILER_TOUCHED=1
+helm --kube-context "$CONTEXT" upgrade "$RELEASE" "$CHART" -n "$NAMESPACE" --reuse-values \
+    --set worker.connectorReconciler.enabled=true --set worker.connectorReconciler.intervalSeconds=1 \
+    --wait --timeout 300s >"$WORKDIR/configure-reconciler.log" 2>&1 \
+    || fail "could not configure the connector reconciler for the apply race scenario"
+kcn rollout status "deploy/${FULLNAME}-worker" --timeout=300s >/dev/null
 
 write_bundle() {
     local with_extra="$1"

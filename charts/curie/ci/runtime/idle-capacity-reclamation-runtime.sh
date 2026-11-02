@@ -482,7 +482,7 @@ def batch(phase, count, *, progress=True, stale=None, expect_pressure=False):
 
 
 def clear_owned_sandboxes():
-    # This fresh namespace contains only this selector's release and runners.
+    # Quota runs first on the job-owned shared release, before other workloads.
     # Keep Valkey affinity records intact to reproduce a preceding cleanup phase.
     run([*kube, "delete", "sandboxclaims", "--all", "--wait=true", "--timeout=90s"], timeout=100)
     run([*kube, "delete", "sandboxes", "--all", "--wait=true", "--timeout=90s"], timeout=100)

@@ -928,15 +928,17 @@ def test_registry_maps_each_known_surface(
 
 
 @pytest.mark.parametrize(
-    "path",
+    ("path", "selected"),
     [
-        ".github/e2e-selection.yaml",
-        ".github/workflows/ci.yaml",
-        "tools/e2e-ci-selection/select_tiers.py",
+        (".github/e2e-selection.yaml", ()),
+        (".github/workflows/ci.yaml", ("cluster",)),
+        ("tools/e2e-ci-selection/select_tiers.py", ()),
     ],
 )
-def test_selector_and_workflow_paths_do_not_boot_kind(tmp_path: Path, path: str) -> None:
-    _assert_selection(tmp_path, path, (), pytest_needed=True)
+def test_selector_and_workflow_paths_select_their_required_tiers(
+    tmp_path: Path, path: str, selected: tuple[str, ...],
+) -> None:
+    _assert_selection(tmp_path, path, selected, pytest_needed=True)
 
 
 @pytest.mark.parametrize(
@@ -2276,6 +2278,7 @@ ci_policy_tests:
 rules:
   exact:
     compose.dev.yaml: [local]
+    .github/workflows/ci.yaml: [cluster]
     apps/worker/src/curie_worker/config.py: [released-upgrade]
   prefixes:
     charts: [cluster]
@@ -5301,6 +5304,20 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
             True,
             ("failed-first-install-retry", "langfuse-postgres-readiness"),
         ),
+        (
+            (WORKLOAD_INSTALL,),
+            False,
+            True,
+            (
+                "connector-apply-race",
+                "connector-secret-rotation",
+                "factory-resource-profile",
+                "failed-first-install-retry",
+                "quota-progress",
+                "workspace-diagnostic",
+            ),
+        ),
+        (("charts/curie/ci/scenarios/other-fixture.sh",), False, True, ()),
         (_version_only_paths(_repo_version()), False, False, ()),
     ],
     ids=(
@@ -5316,6 +5333,8 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
         "next-push",
         "next-api",
         "next-runtime-assertion",
+        "next-workload-install",
+        "next-unreceipted-fixture",
         "version-only",
     ),
 )
@@ -5992,14 +6011,12 @@ def test_chart_shared_workload_order_preserves_scenario_isolation() -> None:
     remove = positions["Remove the shared workload platform"]
     assert install < positions[shared[0]["name"]]
     assert all(install < positions[step["name"]] < remove for step in shared)
-    assert positions[chart[-1]["name"]] < positions["Delete cluster"]
-    assert positions["Delete cluster"] < positions["Upload runtime assertion receipts"]
-    diagnostics = [
-        index for index, step in enumerate(steps)
-        if "diagnostic" in step.get("name", "").lower()
-        and step.get("name") not in scenario_names
-    ]
-    assert diagnostics and all(index < remove for index in diagnostics)
+    assert positions[chart[-1]["name"]] < positions["Delete the job-owned kind cluster"]
+    assert (
+        positions["Delete the job-owned kind cluster"]
+        < positions["Upload runtime assertion receipts"]
+    )
+    assert positions["Dump cluster diagnostics on failure"] < remove
     cleanup = steps[remove]
     assert cleanup["if"] == "${{ always() && matrix.leg == 'workload' }}"
     assert "steps." not in cleanup["if"]

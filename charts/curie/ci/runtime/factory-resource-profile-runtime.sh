@@ -277,11 +277,11 @@ for agent in "$FACTORY_AGENT" "$CONTROL_AGENT"; do
 done
 "$CURIE_BIN" --json cluster --context "$CONTEXT" deploy --namespace "$NAMESPACE" --release "$RELEASE" \
     --chart "$REPO_ROOT/charts/curie" --plugin-dir "$WORKDIR/bundle-$FACTORY_AGENT" --agent "$FACTORY_AGENT" \
-    --slack-channel C0EXAMPLE1 >"$WORKDIR/deploy-$FACTORY_AGENT.json" 2>"$WORKDIR/deploy-$FACTORY_AGENT.log" \
+    --slack-channel C0EXAMPLE3 >"$WORKDIR/deploy-$FACTORY_AGENT.json" 2>"$WORKDIR/deploy-$FACTORY_AGENT.log" \
     || fail "factory agent deployment failed"
 "$CURIE_BIN" --json cluster --context "$CONTEXT" deploy --namespace "$NAMESPACE" --release "$RELEASE" \
     --chart "$REPO_ROOT/charts/curie" --plugin-dir "$WORKDIR/bundle-$CONTROL_AGENT" --agent "$CONTROL_AGENT" \
-    --slack-channel C0EXAMPLE2 >"$WORKDIR/deploy-$CONTROL_AGENT.json" 2>"$WORKDIR/deploy-$CONTROL_AGENT.log" \
+    --slack-channel C0EXAMPLE4 >"$WORKDIR/deploy-$CONTROL_AGENT.json" 2>"$WORKDIR/deploy-$CONTROL_AGENT.log" \
     || fail "control agent deployment failed"
 python3 - "$WORKDIR/deploy-$FACTORY_AGENT.json" "$WORKDIR/deploy-$CONTROL_AGENT.json" <<'PY'
 import json, pathlib, sys
@@ -517,7 +517,7 @@ PY
 
 # Phase 4: the factory agent's sandbox, alone.
 log "Starting one real turn for $FACTORY_AGENT (the control agent has no claim yet)"
-start_turn "$FACTORY_AGENT" C0EXAMPLE1
+start_turn "$FACTORY_AGENT" C0EXAMPLE3
 finish_turn "$FACTORY_AGENT"
 [[ -z "$(kc get sandboxclaims -l "curietech.ai/agent=$CONTROL_AGENT" -o name)" ]] \
     || fail "a control claim exists during the factory phase"
@@ -578,7 +578,7 @@ log "OK: the factory claim, sandbox, and pod are gone"
 
 # Phase 6: the standard control sandbox, alone.
 log "Starting one real turn for $CONTROL_AGENT"
-start_turn "$CONTROL_AGENT" C0EXAMPLE2
+start_turn "$CONTROL_AGENT" C0EXAMPLE4
 finish_turn "$CONTROL_AGENT"
 found="$(claimed_pod "$CONTROL_AGENT")" || fail "no bound SandboxClaim for $CONTROL_AGENT"
 read -r CONTROL_CLAIM CONTROL_POD <<<"$found"

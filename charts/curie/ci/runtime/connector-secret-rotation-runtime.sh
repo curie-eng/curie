@@ -69,7 +69,7 @@ for filename in dict.fromkeys(path for path in kubeconfig.split(os.pathsep) if p
 if not isinstance(contexts.get(context), dict):
     fail("CURIE_SCENARIO_CONTEXT", "is absent from the caller's kubeconfig")
 PY
-for command in kubectl docker curl; do
+for command in kubectl helm docker curl; do
     command -v "$command" >/dev/null || fail "required executable is unavailable: $command"
 done
 
@@ -86,6 +86,7 @@ CONNECTOR_DIGEST="busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2
 CONNECTOR_IMAGE="busybox:1.36.1"
 API_PID=""
 AGENT_TOUCHED=0
+RECONCILER_TOUCHED=0
 
 kc() { kubectl --context "$CONTEXT" "$@"; }
 kcn() { kubectl --context "$CONTEXT" -n "$NAMESPACE" "$@"; }
@@ -107,8 +108,19 @@ sys.stdout.write(text[-4000:])
 PY
 }
 
+restore_reconciler() {
+    (( RECONCILER_TOUCHED )) || return 0
+    helm --kube-context "$CONTEXT" upgrade "$RELEASE" "$CHART" -n "$NAMESPACE" --reuse-values \
+        --values "$WORKDIR/reconciler-original.json" --wait --timeout 300s \
+        >"$WORKDIR/restore-reconciler.log" 2>&1 || return 1
+    kcn rollout status "deploy/${FULLNAME}-worker" --timeout=300s >/dev/null || return 1
+    RECONCILER_TOUCHED=0
+}
+
 cleanup() {
     local status=$?
+    trap - EXIT INT TERM
+    set +e
     if (( AGENT_TOUCHED )); then
         env CURIE_API_KEY="$API_KEY" "$CURIE_BIN" cluster --context "$CONTEXT" delete "$AGENT" --yes \
             --namespace "$NAMESPACE" --release "$RELEASE" --api-url "http://127.0.0.1:$API_PORT" \
@@ -118,16 +130,37 @@ cleanup() {
             --ignore-not-found --wait=true --timeout=90s >"$WORKDIR/delete-connectors.out" 2>"$WORKDIR/delete-connectors.err" \
             || { echo "FAIL: could not remove the scenario connector objects" >&2; status=1; }
     fi
+    restore_reconciler || { echo "FAIL: could not restore the recorded connector reconciler settings" >&2; status=1; }
     if [[ -n "$API_PID" ]]; then
         kill "$API_PID" >/dev/null 2>&1 || true
         wait "$API_PID" 2>/dev/null || true
     fi
-    rm -rf "$WORKDIR"
+    rm -rf "$WORKDIR" || status=1
     exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+helm --kube-context "$CONTEXT" get values "$RELEASE" -n "$NAMESPACE" --all -o json \
+    >"$WORKDIR/helm-values.json" 2>"$WORKDIR/get-helm-values.log" \
+    || fail "could not read the installed connector reconciler settings"
+python3 - "$WORKDIR/helm-values.json" "$WORKDIR/reconciler-original.json" <<'PY'
+import json, pathlib, sys
+values = json.loads(pathlib.Path(sys.argv[1]).read_text())["worker"]["connectorReconciler"]
+enabled, interval = values["enabled"], values["intervalSeconds"]
+assert type(enabled) is bool, "installed connector reconciler enabled value is not boolean"
+assert type(interval) is int and interval > 0, "installed connector reconciler interval is not a positive integer"
+pathlib.Path(sys.argv[2]).write_text(json.dumps({"worker": {"connectorReconciler": {
+    "enabled": enabled, "intervalSeconds": interval,
+}}}))
+PY
+RECONCILER_TOUCHED=1
+helm --kube-context "$CONTEXT" upgrade "$RELEASE" "$CHART" -n "$NAMESPACE" --reuse-values \
+    --set worker.connectorReconciler.enabled=true --set worker.connectorReconciler.intervalSeconds=1 \
+    --wait --timeout 300s >"$WORKDIR/configure-reconciler.log" 2>&1 \
+    || fail "could not configure the connector reconciler for the rotation scenario"
+kcn rollout status "deploy/${FULLNAME}-worker" --timeout=300s >/dev/null
 
 export CONNECTOR_IMAGE
 python3 - "$WORKDIR" <<PY

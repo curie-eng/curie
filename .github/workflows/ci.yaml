@@ -3784,7 +3784,7 @@ jobs:
             curie-runner:wsdiag-${{ github.sha }} --name curie-e2e
       - name: Install the shared workload platform
         id: workload_install
-        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile')) }}
+        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic')) }}
         env:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
           CURIE_SCENARIO_CONTEXT: kind-curie-e2e
@@ -3792,7 +3792,7 @@ jobs:
           CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
           CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
           CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
-        run: bash charts/curie/ci/scenarios/workload-install.sh up
+        run: bash tools/runtime-assertion-gate/run.sh charts/curie/ci/scenarios/workload-install.sh up
       - name: Quota progress regression
         if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
         timeout-minutes: 30
@@ -3808,20 +3808,6 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh
-      - name: Workspace dependency failure reaches the terminal diagnostic
-        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') }}
-        timeout-minutes: 30
-        env:
-          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
-          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
-          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
-        run: |
-          set -euo pipefail
-          bash tools/runtime-assertion-gate/run.sh \
-            charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh
       - name: Hosted connector credential rotation rolls only that connector
         if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') }}
         timeout-minutes: 45
@@ -3866,8 +3852,27 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/factory-resource-profile-runtime.sh
+      - name: Workspace dependency failure reaches the terminal diagnostic
+        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') }}
+        timeout-minutes: 30
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
+          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh
+      - name: Dump cluster diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true
       - name: Remove the shared workload platform
-        if: ${{ always() && matrix.leg == 'workload' && (steps.workload_install.outcome == 'success' || steps.workload_install.outcome == 'failure') }}
+        if: ${{ always() && matrix.leg == 'workload' }}
         env:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
           CURIE_SCENARIO_CONTEXT: kind-curie-e2e
@@ -3890,11 +3895,6 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/failed-first-install-retry-runtime.sh
-      - name: Dump cluster diagnostics on failure
-        if: failure()
-        run: |
-          kubectl get pods -A -o wide || true
-          kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true
       - name: Delete the job-owned kind cluster
         if: always()
         run: |

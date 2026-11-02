@@ -72,7 +72,8 @@ ci_policy_tests:
      tools/e2e-ci-selection/cli_pytest_files.txt]
   tools/runtime-assertion-gate/tests/test_runtime_assertion_gate.py:
     [.github, tools/runtime-assertion-gate, conftest.py, pyproject.toml, uv.lock,
-     charts/curie/ci/runtime, charts/curie/templates]
+     charts/curie/ci/runtime, charts/curie/templates,
+     charts/curie/ci/scenarios/workload-install.sh]
 pytest_scopes:
   cli:
     prefixes: [cli]
@@ -129,7 +130,7 @@ conditional_pytest_files:
     - tools/e2e-ci-selection
 chart_scenarios:
   fixtures:
-    Install the shared workload platform: [bash, charts/curie/ci/scenarios/workload-install.sh, up]
+    Install the shared workload platform: [bash, tools/runtime-assertion-gate/run.sh, charts/curie/ci/scenarios/workload-install.sh, up]
     Remove the shared workload platform: [bash, charts/curie/ci/scenarios/workload-install.sh, down]
   job: e2e-cluster-chart-regressions
   shared_inputs:
@@ -150,6 +151,9 @@ chart_scenarios:
       pr_inputs:
         - charts/curie
         - apps/api/migrations
+        - cli/src/ops/up.rs
+        - charts/curie/ci/runtime/failed-first-install-retry-runtime.sh
+        - .github/workflows/ci.yaml
       step: Failed first install retry recreates data volumes
       leg: workload
       inputs:
@@ -275,6 +279,7 @@ chart_scenarios:
         - uv.lock
 rules:
   exact:
+    .github/workflows/ci.yaml: [cluster]
     compose.dev.yaml: [local]
     .github/workflows/release.yaml: [local-release]
     pyproject.toml: [skill, local, local-release, cluster]
@@ -386,7 +391,8 @@ rules:
     scripts: []
     # The revision-based selector inspects ci.yaml hunks and selects the
     # released-upgrade smoke shard and negative control for upgrade job edits.
-    # Other workflow edits stay ignored; path-only requests cannot inspect hunks.
+    # The exact main CI rule above selects cluster proof for its shared scenario
+    # wiring. Other workflows stay ignored; path-only requests cannot inspect hunks.
     .github/workflows: []
     .github/e2e-selection.yaml: []
     tools: []

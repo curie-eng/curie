@@ -73,7 +73,7 @@ for filename in dict.fromkeys(path for path in kubeconfig.split(os.pathsep) if p
 if not isinstance(contexts.get(context), dict):
     fail("CURIE_SCENARIO_CONTEXT", "is absent from the caller's kubeconfig")
 PY
-for command in kubectl setsid; do
+for command in kubectl helm setsid; do
     command -v "$command" >/dev/null || fail "required executable is unavailable: $command"
 done
 CURIE_BIN="$(python3 -c 'import os; print(os.path.abspath(os.environ["CURIE_BIN"]))')"
@@ -163,10 +163,14 @@ done
     || fail "worker claim timeout must retain its normal 90-second value"
 [[ "$(kc get deployment "$FULLNAME-worker" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="CURIE_WORKSPACE_ENABLED")].value}')" == true ]] \
     || fail "real workspace selection must be enabled"
+helm --kube-context "$CONTEXT" upgrade "$RELEASE" "$REPO_ROOT/charts/curie" -n "$NAMESPACE" --reuse-values \
+    --set api.readinessProbe.failureThreshold=120 --set api.livenessProbe.failureThreshold=60 \
+    --wait --timeout 300s >"$WORKDIR/configure-probes.log" 2>&1 \
+    || fail "could not configure the workspace diagnostic API probes"
 "$CURIE_BIN" init "$AGENT" --dir "$WORKDIR/bundle" >"$WORKDIR/init.log" 2>&1
 "$CURIE_BIN" --json cluster --context "$CONTEXT" deploy --namespace "$NAMESPACE" --release "$RELEASE" \
     --chart "$REPO_ROOT/charts/curie" --plugin-dir "$WORKDIR/bundle" --agent "$AGENT" \
-    --slack-channel C0EXAMPLE1 >"$WORKDIR/deploy.json" 2>"$WORKDIR/deploy.log" \
+    --slack-channel C0EXAMPLE5 >"$WORKDIR/deploy.json" 2>"$WORKDIR/deploy.log" \
     || fail "candidate agent deployment failed"
 python3 - "$WORKDIR/deploy.json" <<'PY'
 import json, pathlib, sys
@@ -216,7 +220,7 @@ start_turn() {
     local phase=$1 thread
     thread="$(python3 -c 'import time; stamp=time.time_ns(); print(f"{stamp // 10**9}.{stamp % 10**9 // 10**3:06}")')"
     setsid "$CURIE_BIN" --json cluster --context "$CONTEXT" message \
-        --namespace "$NAMESPACE" --release "$RELEASE" --agent "$AGENT" --channel C0EXAMPLE1 \
+        --namespace "$NAMESPACE" --release "$RELEASE" --agent "$AGENT" --channel C0EXAMPLE5 \
         --chart "$REPO_ROOT/charts/curie" \
         --thread "$thread" --timeout-secs 300 "Reply with a short workspace diagnostic check." \
         >"$WORKDIR/$phase.json" 2>"$WORKDIR/$phase.log" &
@@ -359,7 +363,7 @@ try:
 except ValidationError:
     raise SystemExit(65) from None
 matches = [agent for agent in agents if agent.name == expected_agent]
-if len(matches) != 1 or not any(binding.kind == "slack" and binding.address == "C0EXAMPLE1"
+if len(matches) != 1 or not any(binding.kind == "slack" and binding.address == "C0EXAMPLE5"
                                 and binding.adapter == "default" for binding in matches[0].channels):
     raise SystemExit(66)
 PY

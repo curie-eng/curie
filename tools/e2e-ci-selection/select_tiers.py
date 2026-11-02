@@ -258,13 +258,19 @@ def _chart_registry(value: object) -> ChartScenarios:
     for step, command in fixtures.items():
         if not isinstance(step, str) or not step.strip() or step in step_names:
             raise RegistryError("chart fixture step must be nonempty and distinct from scenarios")
-        if (not isinstance(command, list) or len(command) != 3 or command[0] != "bash"
-                or not isinstance(command[1], str) or not SCENARIO_SCRIPT.fullmatch(command[1])
-                or command[2] not in ("up", "down")):
-            raise RegistryError(
-                "chart fixture command must name bash, a scenario script, and up or down"
-            )
-        if not any(command[1] in scenario.inputs for scenario in scenarios.values()):
+        if not isinstance(command, list) or any(not isinstance(word, str) for word in command):
+            raise RegistryError("chart fixture command must be a list of strings")
+        if len(command) == 4 and command[:2] == ["bash", "tools/runtime-assertion-gate/run.sh"]:
+            script, phase = command[2:]
+            valid = phase == "up"
+        elif len(command) == 3 and command[0] == "bash":
+            script, phase = command[1:]
+            valid = phase == "down"
+        else:
+            raise RegistryError("chart fixture must receipt up or invoke down directly")
+        if not valid or not SCENARIO_SCRIPT.fullmatch(script):
+            raise RegistryError("chart fixture must name a scenario script and the correct phase")
+        if not any(script in scenario.inputs for scenario in scenarios.values()):
             raise RegistryError("chart fixture must be registered as a scenario input")
         commands[step] = tuple(command)
     return ChartScenarios(CHART_JOB, shared_inputs, scenarios, commands)
@@ -409,7 +415,8 @@ RUNTIME_ASSERTION_DIR = "charts/curie/ci/runtime"
 
 def _is_runtime_assertion(path: str) -> bool:
     parent, _, name = path.rpartition("/")
-    return parent == RUNTIME_ASSERTION_DIR and name.endswith(".sh")
+    return (path == "charts/curie/ci/scenarios/workload-install.sh"
+            or parent == RUNTIME_ASSERTION_DIR and name.endswith(".sh"))
 
 
 def _matches_scenario(path: str, prefixes: tuple[str, ...]) -> bool:
@@ -589,12 +596,10 @@ def _select_chart_scenarios(
     selected = {
         scenario_id
         for scenario_id, scenario in chart.scenarios.items()
-        if push or (
-            any(_matches_scenario(path, scenario.pr_inputs) for path in paths)
-            if scenario.pr_inputs is not None else
-            fallback or any(
-                _matches_scenario(path, (*chart.shared_inputs, *scenario.inputs)) for path in paths
-            )
+        if push or fallback or any(
+            _matches_scenario(
+                path, (*chart.shared_inputs, *scenario.inputs, *(scenario.pr_inputs or ()))
+            ) for path in paths
         )
     }
     registered_steps = {scenario.step for scenario in chart.scenarios.values()}
