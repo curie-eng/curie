@@ -29,6 +29,8 @@ def clean_baseline() -> InstallSnapshot:
         tenants=frozenset({"tenant-a", "tenant-b"}),
         sandbox_claims=frozenset(),
         publication_jobs=frozenset(),
+        publication_secrets=frozenset(),
+        publication_config_maps=frozenset(),
         api_forges={
             "trackers": [{"name": "gitlab", "kind": "gitlab"}],
             "bindings": [],
@@ -68,6 +70,8 @@ def test_separately_built_equal_snapshot_is_clean() -> None:
         tenants=frozenset(["tenant-b", "tenant-a"]),
         sandbox_claims=frozenset(),
         publication_jobs=frozenset(),
+        publication_secrets=frozenset(),
+        publication_config_maps=frozenset(),
         api_forges={
             "bindings": [],
             "trackers": [{"kind": "gitlab", "name": "gitlab"}],
@@ -107,6 +111,8 @@ def test_separately_built_equal_snapshot_is_clean() -> None:
         ("tenants", frozenset({"tenant-a", "tenant-b", "tenant-c"})),
         ("sandbox_claims", frozenset({"claim-1"})),
         ("publication_jobs", frozenset({"publish-1"})),
+        ("publication_secrets", frozenset({"publish-1-secret"})),
+        ("publication_config_maps", frozenset({"publish-1-config"})),
         ("api_forges", {"trackers": [], "bindings": []}),
         (
             "worker_env",
@@ -249,6 +255,21 @@ def test_leftover_claim_and_job_are_named() -> None:
     jobs = replace(baseline, publication_jobs=frozenset({"publish-xyz"}))
     assert "claim-xyz" in leftover_state(baseline, claims)[0]
     assert "publish-xyz" in leftover_state(baseline, jobs)[0]
+
+
+def test_publication_secret_and_config_map_left_by_a_job_are_named() -> None:
+    # Their owner is the persistent publication owner ConfigMap, so deleting
+    # the Job does not remove them.
+    baseline = clean_baseline()
+    current = replace(
+        baseline,
+        publication_secrets=frozenset({"publish-xyz-secret"}),
+        publication_config_maps=frozenset({"publish-xyz-config"}),
+    )
+    messages = leftover_state(baseline, current)
+    assert len(messages) == 2
+    assert any("publication_secrets" in m and "publish-xyz-secret" in m for m in messages)
+    assert any("publication_config_maps" in m and "publish-xyz-config" in m for m in messages)
 
 
 def test_worker_env_message_names_variable_not_values() -> None:
