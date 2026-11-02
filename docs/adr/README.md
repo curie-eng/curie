@@ -280,4 +280,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0260 | [HTTP identity admits an email sender only on a signed email receiver proof](0260-http-identity-admits-an-email-sender-only-on-a-signed-email-receiver-proof.md) | Draft |
 | 0261 | [HTTP identity resolves Slack Connect senders from operator-trusted partner namespaces](0261-http-identity-resolves-slack-connect-senders-from-operator-trusted-partner-namespaces.md) | Draft |
 | 0263 | [HTTP identity accepts a one-to-one direct message to a registered receiver's bot](0263-http-identity-accepts-a-one-to-one-direct-message-to-a-registered-receivers-bot.md) | Draft |
+| 0264 | [A selected delivery's reply slot is authenticated but outside its delivery intent](0264-a-selected-deliverys-reply-slot-is-authenticated-but-outside-its-delivery-intent.md) | Draft |
 <!-- END GENERATED: adr-index -->
