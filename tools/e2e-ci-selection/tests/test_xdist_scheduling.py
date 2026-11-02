@@ -80,7 +80,9 @@ def test_independent_shards_partition_cases_and_keep_shared_groups_together(
         assert result.ret == 0
         selected.append({line for line in result.outlines if "::test_worker[" in line})
     assert sum(map(len, selected)) == len(set.union(*selected)) == 24
-    isolated = [{node for node in shard if node.startswith("test_isolated.py::")} for shard in selected]
+    isolated = [
+        {node for node in shard if node.startswith("test_isolated.py::")} for shard in selected
+    ]
     assert sum(bool(shard) for shard in isolated) > 1
     shared = [{node for node in shard if node.startswith("apps/")} for shard in selected]
     assert sorted(map(len, shared)) == [0, 0, 16]

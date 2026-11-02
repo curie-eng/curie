@@ -24,6 +24,8 @@ from curie_runner import RunTracer, SideEffectClassifier, create_app, workspace_
 from curie_runner.fake import FakeModelSession
 from curie_runner.session import SessionRunner
 
+pytestmark = pytest.mark.xdist_independent
+
 REPO = "acme-corp/acme-bot"
 GITHUB = "https://github.com"
 TOKEN = "runner-token-value"
