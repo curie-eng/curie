@@ -499,7 +499,7 @@ read_worker_snapshot "$WORKER_POD"
 # to 0), so this check passes identically before and after #2330's probe change
 # and falsifies nothing about the probes. The discriminating runtime assertion
 # is the Deployment read-back below; the probes' semantic contract is pinned at
-# the render surface by ci/langfuse-worker-probe-assertions.sh.
+# the render surface by ci/policy/engine.py (P2).
 [[ "$WORKER_READY" == "true" && "${WORKER_RESTART:-0}" == "0" ]] || \
   fail "langfuse-worker did not become Ready with zero restarts (ready=$WORKER_READY restarts=${WORKER_RESTART:-0})"
 assert_no_backoff "$WORKER_POD"
