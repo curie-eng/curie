@@ -265,4 +265,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0250 | [Verbatim Slack answers render as rich text sections with literal links](0250-verbatim-slack-answers-render-as-rich-text-sections-with-literal-links.md) | Accepted |
 | 0251 | [Claim-backed sandbox scratch is bounded by its storage request](0251-claim-backed-sandbox-scratch-is-bounded-by-its-storage-request.md) | Draft |
 | 0256 | [Publication validates and pushes a Git object overlay](0256-publication-validates-and-pushes-a-git-object-overlay.md) | Draft |
+| 0257 | [A release registers its schema window only at the cut](0257-a-release-registers-its-schema-window-only-at-the-cut.md) | Accepted |
 <!-- END GENERATED: adr-index -->

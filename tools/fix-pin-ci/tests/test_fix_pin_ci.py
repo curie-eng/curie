@@ -1161,7 +1161,8 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         steps,
         lambda step: (
             _string(step, "run").strip()
-            == "python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480"
+            == 'python3 scripts/wait-for-langfuse.py --start --tier "$STACK_TIER"'
+            " --timeout-seconds 480"
         ),
         "dev stack startup",
     )
@@ -1186,6 +1187,11 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         "shard": "${{ matrix.shard }}",
         "deselect": "${{ steps.python-runtime.outputs.pytest_deselect }}",
         "scope": "${{ steps.python-runtime.outputs.pytest_scope }}",
+        "shards": "${{ steps.python-runtime.outputs.pytest_shards }}",
+        "storage_shards": "${{ steps.python-runtime.outputs.pytest_storage_shards }}",
+        "full_shards": "${{ steps.python-runtime.outputs.pytest_full_shards }}",
+        "stack_tier": "${{ steps.python-runtime.outputs.stack_tier }}",
+        "event_name": "${{ github.event_name }}",
     }.items():
         names = [name for name, value in pytest_env.items() if value == expression]
         assert len(names) == 1, expression
@@ -1233,6 +1239,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         arguments = iter(extra[len(distribution) :])
         excluded = []
         reporting = []
+        junit = []
         for argument in arguments:
             if argument in {"--ignore", "--ignore-glob", "--deselect"}:
                 path = next(arguments, None)
@@ -1241,8 +1248,19 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
             elif argument.startswith(("--ignore=", "--ignore-glob=", "--deselect=")):
                 option, path = argument.split("=", 1)
                 excluded.append((option, path))
+            elif argument in {"--junitxml", "-o"}:
+                value = next(arguments, None)
+                assert value is not None, f"{argument} requires a value"
+                junit.append((argument, value))
             else:
                 reporting.append(argument)
+        # A push runs every group on every shard's stack, so the tier map that
+        # a pull request passes must be absent, and the duration report is the
+        # one always present addition.
+        assert junit == [
+            ("--junitxml", "shard-result-durations/junit.xml"),
+            ("-o", "junit_family=xunit1"),
+        ], f"the full Python suite must write exactly the xunit1 duration report, got {junit!r}"
         assert len(excluded) == len(runtime_exclusions) and set(excluded) == runtime_exclusions, (
             "the Python suite must use exactly the required runtime and CI policy exclusions, "
             f"got {excluded!r}"
@@ -1267,6 +1285,11 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
                 bindings["shard"]: str(shard),
                 bindings["deselect"]: deselect,
                 bindings["scope"]: "full",
+                bindings["shards"]: "6",
+                bindings["storage_shards"]: "6",
+                bindings["full_shards"]: "6",
+                bindings["stack_tier"]: "full",
+                bindings["event_name"]: "push",
             }
             result = subprocess.run(
                 ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", pytest_script],
@@ -1285,6 +1308,8 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
                     ["--ignore=apps/api/tests"],
                     ["--ignore-glob=*"],
                     ["--deselect=apps/api/tests"],
+                    ["--ci-shard-tiers", "6,6"],
+                    ["--junitxml", "elsewhere/junit.xml"],
                     ["apps/api/tests/test_config.py"],
                     list(sorted(runtime_exclusions)[0]),
                 ):

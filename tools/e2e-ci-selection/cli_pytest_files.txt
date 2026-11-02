@@ -61,8 +61,6 @@ release/tests/test_atlas.py
 release/tests/test_authorize.py
 release/tests/test_get_curie.py
 release/tests/test_kind_ci.py
-release/tests/test_nightly_gate.py
-release/tests/test_preserve_next.py
 release/tests/test_sdk_approval_gate_workflow.py
 runner/tests/test_dark_factory_runner_toolchain.py
 runner/tests/test_dockerfile_registry_layer.py
@@ -105,6 +103,8 @@ tools/e2e-ci-selection/tests/test_deep_tier_aggregates.py
 tools/e2e-ci-selection/tests/test_e2e_ci_selection.py
 tools/e2e-ci-selection/tests/test_factory_upgrade_selection.py
 tools/e2e-ci-selection/tests/test_live_manifest_parity.py
+tools/e2e-ci-selection/tests/test_pytest_impact.py
+tools/e2e-ci-selection/tests/test_pytest_shard_services.py
 tools/e2e-ci-selection/tests/test_python_pytest_selection.py
 tools/e2e-ci-selection/tests/test_upgrade_matrix_budget.py
 tools/e2e-ci-selection/tests/test_workflow_hunk_selection.py

@@ -98,14 +98,17 @@ PR and candidate CI round are not required.
 1. Finish and review the fixes, tests, and documentation. Commit every change
    outside the release's version-only path set before generating the atlas
    snapshot. Record that final non-version commit's full SHA as the atlas pin.
-2. Generate the release snapshot from that pin. Make the version changes and
-   register the snapshot in a following version/snapshot commit. The only
-   permitted paths after the pin are `charts/curie/Chart.yaml`,
+2. Generate the release snapshot from that pin. Run `curie dev bump-version
+   X.Y.Z` and register the snapshot in a following version/snapshot commit. The
+   only permitted paths after the pin are `charts/curie/Chart.yaml`,
    `cli/Cargo.toml`, `cli/Cargo.lock`,
    `docs/architecture-atlas/versions.json`, and
-   `docs/architecture-atlas/snapshots/<tag>.json`. This is the shared set from
-   `release/atlas.py::version_only_paths`; another release's snapshot is outside
-   it.
+   `docs/architecture-atlas/snapshots/<tag>.json`, plus
+   `cli/src/application_schema_windows.json` when its only change registers this
+   release's own window equal to the candidate. This is
+   `release/atlas.py::version_only_extra`; another release's snapshot or window
+   is outside it. Never register a window before the cut
+   ([ADR 0257](adr/0257-a-release-registers-its-schema-window-only-at-the-cut.md)).
 3. Open the preparation PR with the title `Prepare the vX.Y.Z release`, its
    trigger issue numbers, and its Live proof. Run the required CI on the final
    head. Those checks cover the combined preparation tree, including its
@@ -134,8 +137,9 @@ when the tagged commit's own checks are absent or still running.
    version-only path set. A delta that also changes
    `cli/src/application_schema_windows.json` continues the walk only when it
    adds exactly the release's own schema window, equal to the ancestor's
-   candidate, and changes nothing else. This is the authorizer's walk, not the
-   atlas pin rule above.
+   candidate, and changes nothing else. The atlas pin gate and the PR selector
+   apply the same rule under
+   [ADR 0257](adr/0257-a-release-registers-its-schema-window-only-at-the-cut.md).
 
 The authorizer prints which path it used and the proof commit, for example
 `checked via tree-identical parent <sha> ...` or
