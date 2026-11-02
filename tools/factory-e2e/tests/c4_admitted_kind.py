@@ -41,9 +41,9 @@ CANDIDATE_CLI_ENV = "CURIE_C4_CANDIDATE_CLI"
 CANDIDATE_IMAGES_ENV = "CURIE_C4_CANDIDATE_IMAGES"
 # ScriptedRun.execute labels this scenario issue `factory`; it is not a case ticket.
 SCENARIO_ISSUE = 3815
-# GitHub intake polls every 5 s, GitLab and Jira every 1 s. Retired labels
-# must be observed before the WorkItems that dedupe them are truncated.
-RETIRE_OBSERVE_SECONDS = 12
+# Every tracker polls every 1 s. Retired labels must be observed before the
+# WorkItems that dedupe them are truncated; 4 s allows several polls of each.
+RETIRE_OBSERVE_SECONDS = 4
 VALUE_FROM_KINDS = frozenset({"secretKeyRef", "configMapKeyRef", "fieldRef", "resourceFieldRef"})
 
 
@@ -612,6 +612,10 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         values = original(**kwargs)
         host = urlsplit(self.stub.base_url).netloc
         factory = values["factory"]
+        # Matches the GitLab and Jira trackers below; shortens each case's admission and reset wait.
+        for tracker in factory["trackers"]:
+            if tracker.get("kind") == "github":
+                tracker["pollIntervalSeconds"] = 1
         for component in ("api", "worker", "ui"):
             repository, tag = self.images[component].rsplit(":", 1)
             values[component]["image"].update(repository=repository, tag=tag, pullPolicy="Never")

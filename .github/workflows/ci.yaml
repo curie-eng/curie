@@ -3400,12 +3400,12 @@ jobs:
           install_only: true
       # This ubuntu-24.04 job owns a disposable hosted runner. The Android,
       # .NET and Haskell SDKs are unused here; remove only those preinstalled
-      # SDK trees before candidate builds and image imports.
-      - name: Free disk for the disposable factory cluster
+      # SDK trees before candidate builds and image imports. The removal runs
+      # in the background so it overlaps the artifact download and image load.
+      - name: Start freeing disk for the disposable factory cluster
         run: |
           set -euo pipefail
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
-          df -h /
+          nohup sudo bash -c 'rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup; echo $? > "$0"' "$RUNNER_TEMP/free-disk.status" >/dev/null 2>&1 &
       - name: Download the curie binary built by the Rust job
         uses: actions/download-artifact@v8
         with:
@@ -3417,12 +3417,29 @@ jobs:
         uses: ./.github/actions/load-ci-images
         with:
           images: "{api,worker,ui,runner}"
+      - name: Finish freeing disk for the disposable factory cluster
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 600); do
+            [ -e "$RUNNER_TEMP/free-disk.status" ] && break
+            sleep 1
+          done
+          if [ ! -e "$RUNNER_TEMP/free-disk.status" ]; then
+            echo "disk cleanup did not finish within 600 seconds" >&2
+            exit 1
+          fi
+          status="$(cat "$RUNNER_TEMP/free-disk.status")"
+          if [ "$status" != "0" ]; then
+            echo "disk cleanup exited with status $status" >&2
+            exit 1
+          fi
+          df -h /
       - name: Run admitted agent runtime regressions
         env:
           CASE_SHARD: ${{ matrix.shard }}/5
           CURIE_C4_CANDIDATE_CLI: ${{ github.workspace }}/cli/target/release/curie
           CURIE_C4_CANDIDATE_IMAGES: curie-ci/{component}:candidate
-        run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_admitted_agent.py --case-shard "$CASE_SHARD"
+        run: uv run pytest -q -n 0 --durations=0 tools/factory-e2e/tests/test_c4_admitted_agent.py --case-shard "$CASE_SHARD"
       - name: Upload the publication failure digest
         if: failure()
         uses: actions/upload-artifact@v7
