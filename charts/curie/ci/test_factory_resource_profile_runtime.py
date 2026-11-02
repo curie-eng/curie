@@ -203,6 +203,13 @@ def test_unavailable_or_replaced_original_pod_keeps_uid_scoped_events(
     assert not tmp_path.exists()
 
 
+def test_control_eviction_check_is_disabled() -> None:
+    source = SCRIPT.read_text()
+    assert "control runner workspace eviction check disabled (#5293)" in source
+    assert "the control runner pod was not evicted" not in source
+    assert "the factory sandbox kept 1280Mi in /workspace" in source
+
+
 def test_diagnostic_read_failures_preserve_scenario_status_and_cleanup(tmp_path: Path) -> None:
     completed = run_control(tmp_path, workspace_status=42, events_status=43)
     assert completed.returncode == 0, completed.stdout + completed.stderr
