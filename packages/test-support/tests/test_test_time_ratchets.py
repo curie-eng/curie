@@ -768,3 +768,21 @@ def test_deleted_statement_marks_its_owner_only(
     assert budget_targets(tmp_path, [file + "::test_changed", file + "::test_neighbor"]) == {
         file + "::test_changed"
     }
+
+
+def test_changed_nested_helper_cannot_select_an_unchanged_global_case(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_test_support.duration_budget import budget_targets
+
+    before = (
+        "def test_existing(): pass\n"
+        "def helper():\n"
+        "    def test_existing():\n"
+        "        return 1\n"
+        "    return test_existing\n"
+    )
+    file = duration_history(tmp_path, monkeypatch, before, before.replace("return 1", "return 2"))
+    targets = budget_targets(tmp_path, [file + "::test_existing"])
+    assert targets == set()
+    assert budget_failure(file + "::test_existing", 120, targets) is None
