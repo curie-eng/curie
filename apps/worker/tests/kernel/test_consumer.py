@@ -88,6 +88,7 @@ from ..eval.test_stream import (
 )
 from ..sandbox.test_admission_k8s import InventoryAPI
 from ..sandbox.test_k8s_claim import _chart_template_spec, _seed_chart
+from .test_work_item_workspace import _Binding, _DeferRecordingWorkItems, _turn, _Workspace
 
 # importlib import mode does not add the test root to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -1322,6 +1323,58 @@ def test_inventory_timeout_capacity_wait_preserves_delivery_bound(
                 assert api.created == []
                 assert api.secrets == {}
                 assert h.runner.opened == h.sink.completions == []
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("failure", ["sdk-timeout", "quota-timeout"])
+def test_factory_admission_unavailable_defers_without_capacity_accounting(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    client, api, admission = _inventory_timeout_client(
+        sync_redis,
+        names,
+        monkeypatch,
+        failure=failure,
+        restore=True,
+        failures=1,
+    )
+
+    async def go() -> None:
+        work_items = _DeferRecordingWorkItems()
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_items=work_items,
+            slack_no_edit_streaming=True,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            request_id = uuid.uuid4()
+            event = _turn(f"work-item-{request_id}-execute-1", "Implement the admitted change")
+            entry_id, fields = await _pending_local_entry(h, event)
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, fields)
+            assert len(work_items.defers) == 1
+            deferred_id, deferred = work_items.defers[0]
+            assert deferred_id == request_id
+            assert deferred["reason"] == "admission_unavailable"
+            assert deferred["capacity"] is False
+            assert deferred["start_failure_detail"] is None
+            assert "start" not in work_items.calls
+            assert work_items.finishes == h.runner.opened == []
+            assert api.created == [] and api.secrets == {}
+            assert h.sink.updates == []
+            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                "pending"
+            ] == 0
+            assert not await h.async_redis.exists(f"{h.config.stream}:dead")
 
     asyncio.run(go())
 
