@@ -19,6 +19,7 @@ TOOL = ROOT / "tools/preflight/preflight.py"
 TEST_ENV = ROOT / "tools/test-env/test_env.py"
 COMMIT_STEP = "Check the PR's commit messages"
 ALWAYS = {
+    ("python-static", "Test-time ratchets"),
     ("action-pins", "Require third party action SHA pins and version comments"),
     ("commit-messages", COMMIT_STEP),
     ("gitleaks", "Run gitleaks"),
@@ -91,6 +92,7 @@ def repo(tmp_path: Path) -> Path:
     git(root, "config", "user.name", "Example")
     git(root, "config", "user.email", "test@example.com")
     git(root, "config", "core.hooksPath", os.devnull)
+    run(root, sys.executable, "-m", "curie_test_support.test_ratchets", "--regenerate")
     git(root, "add", ".")
     git(root, "commit", "-qm", "Add clean baseline")
     git(root, "update-ref", "refs/remotes/origin/main", "HEAD")

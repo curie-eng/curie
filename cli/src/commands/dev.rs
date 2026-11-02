@@ -1237,3 +1237,28 @@ pub(super) async fn docker_image_exists(tag: &str) -> Result<bool> {
         .context("failed to invoke docker")?;
     Ok(status.success())
 }
+
+/// Run the generated test-time ratchets from the source checkout.
+pub async fn dev_test_ratchets(regenerate: bool, durations: &[PathBuf]) -> Result<()> {
+    let root = find_repo_root().ok_or_else(|| {
+        crate::exit::CliError::usage("Test-time ratchets require a Curie source checkout.")
+    })?;
+    let mut command = tokio::process::Command::new("uv");
+    command
+        .current_dir(root)
+        .args(["run", "python", "-m", "curie_test_support.test_ratchets"]);
+    if regenerate {
+        command.arg("--regenerate");
+    }
+    for artifact in durations {
+        command.arg("--durations").arg(artifact);
+    }
+    let status = command
+        .status()
+        .await
+        .context("Could not run the test-time ratchets")?;
+    if !status.success() {
+        anyhow::bail!("Test-time ratchets failed");
+    }
+    Ok(())
+}

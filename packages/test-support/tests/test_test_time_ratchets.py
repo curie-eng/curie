@@ -5,10 +5,11 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
-
-from curie_test_support.duration_budget import budget_failure, canonical_nodeid
+from curie_test_support.duration_budget import budget_failure
+from curie_test_support.test_ratchets import canonical_nodeid
 
 ROOT = Path(__file__).resolve().parents[3]
 BASELINE = "tests/baselines/test-time.json"
@@ -17,7 +18,9 @@ BASELINE = "tests/baselines/test-time.json"
 def command(root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "curie_test_support.test_ratchets", "--root", str(root), *arguments],
-        text=True, capture_output=True, check=False,
+        text=True,
+        capture_output=True,
+        check=False,
     )
 
 
@@ -27,17 +30,19 @@ def source(root: Path, path: str, text: str) -> None:
     target.write_text(text)
 
 
-def generate(root: Path) -> dict:
+def generate(root: Path) -> dict[str, Any]:
     result = command(root, "--regenerate")
     assert result.returncode == 0, result.stdout + result.stderr
-    return json.loads((root / BASELINE).read_text())
+    return cast(dict[str, Any], json.loads((root / BASELINE).read_text()))
 
 
 @pytest.mark.parametrize("argument", ["1", "delay", "-1", "seconds=1"])
 def test_sleep_new_violation_fails(tmp_path: Path, argument: str) -> None:
     source(tmp_path, "tests/test_case.py", "import time\ndef test_case(): pass\n")
     generate(tmp_path)
-    source(tmp_path, "tests/test_case.py", f"import time\ndef test_case(): time.sleep({argument})\n")
+    source(
+        tmp_path, "tests/test_case.py", f"import time\ndef test_case(): time.sleep({argument})\n"
+    )
     result = command(tmp_path)
     assert result.returncode == 1
     assert "sleeps" in result.stdout
@@ -55,13 +60,17 @@ def test_sleep_removed_baseline_entry_fails(tmp_path: Path) -> None:
 
 
 def test_unchanged_sleeps_and_zero_yields_pass(tmp_path: Path) -> None:
-    source(tmp_path, "tests/test_case.py", """import time as clock
+    source(
+        tmp_path,
+        "tests/test_case.py",
+        """import time as clock
 from asyncio import sleep as yield_for
 clock.sleep(0)
 yield_for(0.0)
 clock.sleep(0.1)
 yield_for(delay)
-""")
+""",
+    )
     assert generate(tmp_path)["sleeps"] == {"tests/test_case.py": 2}
     assert command(tmp_path).returncode == 0
 
@@ -104,16 +113,21 @@ def test_removed_fixture_baseline_entry_fails(tmp_path: Path, scope: str) -> Non
 
 
 def test_platform_install_and_fixture_dependency_are_detected(tmp_path: Path) -> None:
-    source(tmp_path, "tests/conftest.py", """from pytest import fixture as resource
+    source(
+        tmp_path,
+        "tests/conftest.py",
+        """from pytest import fixture as resource
 import subprocess
 @resource
 def install():
     subprocess.run([curie_binary, "cluster", "up", "--install-platform"])
 @resource
 def wrapper(install): return install
-""")
+""",
+    )
     assert generate(tmp_path)["fixtures"] == [
-        "tests/conftest.py::install", "tests/conftest.py::wrapper",
+        "tests/conftest.py::install",
+        "tests/conftest.py::wrapper",
     ]
 
 
@@ -148,17 +162,24 @@ def test_duration_baseline_uses_call_phase_and_normalizes_xdist(tmp_path: Path) 
 
 
 def test_duration_new_violation_fails() -> None:
-    assert "exceeds" in budget_failure("tests/test_case.py::test_slow", 20.01, set())
+    assert "exceeds" in (budget_failure("tests/test_case.py::test_slow", 20.01, set()) or "")
 
 
 def test_duration_removed_violation_fails() -> None:
-    assert "stale" in budget_failure("tests/test_case.py::test_slow", 20, {"tests/test_case.py::test_slow"})
+    assert "stale" in (
+        budget_failure("tests/test_case.py::test_slow", 20, {"tests/test_case.py::test_slow"}) or ""
+    )
 
 
 def test_duration_unchanged_state_passes() -> None:
-    assert budget_failure("tests/test_case.py::test_slow", 21, {"tests/test_case.py::test_slow"}) is None
+    assert (
+        budget_failure("tests/test_case.py::test_slow", 21, {"tests/test_case.py::test_slow"})
+        is None
+    )
     assert budget_failure("tests/test_case.py::test_fast", 20, set()) is None
-    assert canonical_nodeid("tests/test_case.py::test_slow@group") == "tests/test_case.py::test_slow"
+    assert (
+        canonical_nodeid("tests/test_case.py::test_slow@group") == "tests/test_case.py::test_slow"
+    )
 
 
 def test_regeneration_cannot_grow_existing_baseline(tmp_path: Path) -> None:
@@ -171,19 +192,117 @@ def test_regeneration_cannot_grow_existing_baseline(tmp_path: Path) -> None:
 
 
 def test_duration_plugin_drives_real_pytest_reports(tmp_path: Path) -> None:
-    source(tmp_path, "test_case.py", """import time
+    source(
+        tmp_path,
+        "test_case.py",
+        """import time
 import pytest
 @pytest.fixture
 def setup_delay(): time.sleep(0.01)
 def test_fast(setup_delay): pass
-""")
+""",
+    )
     source(tmp_path, "baseline.json", json.dumps({"sleeps": {}, "fixtures": [], "durations": []}))
-    argv = [sys.executable, "-m", "pytest", "-q", "-p", "curie_test_support.duration_budget",
-            "--test-duration-budget", "--test-time-baseline", str(tmp_path / "baseline.json")]
+    argv = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "curie_test_support.duration_budget",
+        "--test-duration-budget",
+        "--test-time-baseline",
+        str(tmp_path / "baseline.json"),
+    ]
     env = {key: value for key, value in os.environ.items() if key != "PYTEST_ADDOPTS"}
     result = subprocess.run(argv, cwd=tmp_path, env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    source(tmp_path, "baseline.json", json.dumps({"sleeps": {}, "fixtures": [], "durations": ["test_case.py::test_fast"]}))
+    source(
+        tmp_path,
+        "baseline.json",
+        json.dumps({"sleeps": {}, "fixtures": [], "durations": ["test_case.py::test_fast"]}),
+    )
     result = subprocess.run(argv, cwd=tmp_path, env=env, capture_output=True, text=True)
     assert result.returncode == 1, result.stdout + result.stderr
     assert "stale" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "invocation",
+    [
+        'run("kind", "create", "cluster")',
+        'argv = ["kind", "create", "cluster"]; run(argv)',
+        'run(curie, "cluster", "up")',
+    ],
+)
+def test_provisioning_command_shapes(tmp_path: Path, invocation: str) -> None:
+    source(
+        tmp_path,
+        "tests/test_case.py",
+        "import pytest\n@pytest.fixture\ndef cluster(): " + invocation + "\n",
+    )
+    assert generate(tmp_path)["fixtures"] == ["tests/test_case.py::cluster"]
+
+
+def test_duration_parameter_identity_is_preserved() -> None:
+    assert (
+        canonical_nodeid("tests/test_case.py::test_user[a@example.com]")
+        == "tests/test_case.py::test_user[a@example.com]"
+    )
+
+
+def test_complete_empty_duration_observation_removes_exemption(tmp_path: Path) -> None:
+    source(tmp_path, "durations.log", "test-time duration observations: 0 over budget\n")
+    assert (
+        command(tmp_path, "--regenerate", "--durations", str(tmp_path / "durations.log")).returncode
+        == 0
+    )
+    assert json.loads((tmp_path / BASELINE).read_text())["durations"] == []
+
+
+def test_deleted_duration_test_is_stale(tmp_path: Path) -> None:
+    source(tmp_path, "tests/test_case.py", "def test_case(): pass\n")
+    source(tmp_path, "durations.log", "21.0s call tests/test_case.py::test_case\n")
+    assert (
+        command(tmp_path, "--regenerate", "--durations", str(tmp_path / "durations.log")).returncode
+        == 0
+    )
+    assert command(tmp_path).returncode == 0
+    source(tmp_path, "tests/test_case.py", "def test_other(): pass\n")
+    result = command(tmp_path)
+    assert result.returncode == 1
+    assert "stale test identity" in result.stdout
+
+
+def test_removed_duration_parameter_is_rejected_at_collection(tmp_path: Path) -> None:
+    source(
+        tmp_path,
+        "test_case.py",
+        'import pytest\n@pytest.mark.parametrize("value", ["current"])\n'
+        'def test_case(value): pass\n',
+    )
+    source(
+        tmp_path,
+        "baseline.json",
+        json.dumps(
+            {"sleeps": {}, "fixtures": [], "durations": ["test_case.py::test_case[removed]"]}
+        ),
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "curie_test_support.duration_budget",
+            "--test-duration-budget",
+            "--test-time-baseline",
+            str(tmp_path / "baseline.json"),
+        ],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "stale collected identities" in result.stderr

@@ -149,6 +149,13 @@ CONTRACTS_SETUP = exact(
 )
 CHECKS = (
     exact(
+        "python-static",
+        "Test-time ratchets",
+        "uv run python -m curie_test_support.test_ratchets",
+        ".",
+        "always",
+    ),
+    exact(
         "action-pins",
         "Require third party action SHA pins and version comments",
         ACTION_PINS_COMMAND,
@@ -876,7 +883,11 @@ def execute_checks(root: Path, base: str, head: str, dry_run: bool, report: dict
             )
             command = f"{CONTRACTS_SETUP.command}\n{command}"
         try:
-            result = run_process(["bash", "-e", "-o", "pipefail", "-c", command], root / check.cwd)
+            result = run_process(
+                ["bash", "-e", "-o", "pipefail", "-c", command],
+                root / check.cwd,
+                {**os.environ, "GITHUB_BASE_REF": base},
+            )
             exit_code, output = result.returncode, result.stdout
         except OSError as error:
             exit_code, output = 127, str(error)

@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import pytest
 
+pytest_plugins = ["curie_test_support.duration_budget"]
+
 SHARED_LIVE_STATE_GROUP = "shared-live-state"
 PROTECTED_RUNNER_GROUP = "protected-source-runner-port"
 PROTECTED_RUNNER_FILES = frozenset(
