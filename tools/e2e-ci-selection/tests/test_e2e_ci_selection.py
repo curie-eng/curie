@@ -2413,6 +2413,47 @@ def test_revision_mode_reads_the_version_from_the_head_commit(tmp_path: Path) ->
     assert _outputs_of(output)["local"] == "true"
 
 
+def test_revision_mode_counts_registering_heads_schema_window_as_version_only(
+    tmp_path: Path,
+) -> None:
+    """ADR-0257: bump-version's window registration keeps the prep diff version-only."""
+    catalog_path = "cli/src/application_schema_windows.json"
+    candidate = {"schema_head": "0123", "schema_min": "0120"}
+
+    def catalog(windows: dict) -> str:
+        return json.dumps({"candidate": candidate, "revisions": ["0123"], "windows": windows})
+
+    repository = _new_repository(tmp_path)
+    base = _commit_files(
+        repository,
+        {"cli/Cargo.toml": _cargo_toml("1.2.2"), catalog_path: catalog({})},
+        "base",
+    )
+    version_files = {path: f"{path} bumped\n" for path in _version_only_paths("v1.2.3")}
+    version_files["cli/Cargo.toml"] = _cargo_toml("1.2.3")
+    head = _commit_files(
+        repository,
+        {**version_files, catalog_path: catalog({"1.2.3": candidate})},
+        "prepare v1.2.3",
+    )
+
+    completed, output = _invoke_selector(tmp_path, base=base, head=head, cwd=repository)
+    assert completed.returncode == 0, completed.stderr
+    outputs = _outputs_of(output)
+    assert outputs["version_only"] == "true"
+    assert outputs["pytest"] == "false"
+
+    # Negative control: a window for any other release is not version identity.
+    other = _commit_files(
+        repository,
+        {**version_files, catalog_path: catalog({"1.2.3": candidate, "1.2.4": candidate})},
+        "register a release that has not been cut",
+    )
+    completed, output = _invoke_selector(tmp_path, base=base, head=other, cwd=repository)
+    assert completed.returncode == 0, completed.stderr
+    assert _outputs_of(output)["version_only"] == "false"
+
+
 def test_revision_mode_without_a_cargo_manifest_is_not_version_only(
     tmp_path: Path,
 ) -> None:
