@@ -590,7 +590,10 @@ async def resolve_approval(
         )
         # @spec HTTP-APPROVAL-CONTINUITY-11: only after the acknowledged commit.
         out = ApprovalOut.model_validate(resolved)
-        await publish_answered_resume(session, resume_queue, resolved)
+        await publish_answered_resume(
+            session, resume_queue, resolved,
+            reconciler_enabled=get_settings().resume_reconciler_enabled,
+        )
         return out
 
     # The route binding is read fresh at resolve time (#420), so revoking an

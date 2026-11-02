@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import ssl
 import time
 import uuid
 from collections.abc import Iterator
@@ -21,7 +22,9 @@ from aci_protocol import QueuedTurn
 from curie_api import agent_role_policy, approval_principal
 from curie_api.config import get_settings
 from curie_api.identity.slack import SlackEvidence
+from curie_api.models import Agent
 from curie_api.resumequeue import resume_event_id
+from curie_api.resumereconciler import ResumeReconciler
 from curie_internal import identity_approval as wire
 from curie_internal import identity_context as codec
 from principal_adoption_support import ISSUER
@@ -359,7 +362,7 @@ def test_original_invoker_losing_invocation_authority_blocks_an_approver_answer(
     unchanged(case, before + 2)
 
 
-def current_actor_check(case: SimpleNamespace) -> int | str:
+def current_actor_check(case: SimpleNamespace, *, tls: Any = None) -> int | str:
     """@spec HTTP-APPROVAL-CONTINUITY-8: the exposed approver check, on this pass's own stores."""
     from curie_api.identity.http_approval_answer import check_http_approval_actor
     from curie_api.identity.http_transport import HttpIdentityClient
@@ -374,7 +377,9 @@ def current_actor_check(case: SimpleNamespace) -> int | str:
         state = SimpleNamespace(
             sessionmaker=factory, valkey=valkey,
             http_identity_runtime=case.client.app.state.http_identity_runtime,
-            http_identity_client=HttpIdentityClient(tls_context=case.provider.tls),
+            http_identity_client=HttpIdentityClient(
+                tls_context=case.provider.tls if tls is None else tls,
+            ),
         )
         try:
             await check_http_approval_actor(
@@ -406,3 +411,176 @@ def test_preserved_actor_check_repeats_fresh_approver_authority(
     assert rows(case.row["dedupe_key"]) == resolved
     case.provider.member = False
     assert current_actor_check(case) == "403 caller_not_allowed"
+
+
+ROUTE = "synthetic-restricted-route"
+OTHER_APPROVER = "U0EXAMPLEOTHER"
+
+
+def restrict_route(case: SimpleNamespace, approvers: list[str]) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-8: an explicit route restriction, read fresh per answer."""
+    channel = case.request["approval"]["card_channel"]
+
+    async def write(factory: async_sessionmaker[AsyncSession]) -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-8."""
+        async with factory() as session, session.begin():
+            agent = await session.get(Agent, uuid.UUID(case.scope["agent"]))
+            assert agent is not None
+            agent.approval_routes = {ROUTE: {
+                "resolution": {"kind": "slack", "address": channel},
+                "approvers": {"users": approvers},
+            }}
+
+    run(write)
+
+
+@pytest.fixture
+def routed_case(
+    creation_case: SimpleNamespace, valkey: redis.Redis, runs_stream: str,
+) -> Iterator[SimpleNamespace]:
+    """@spec HTTP-APPROVAL-CONTINUITY-8: a selected row on a route that admits the actor."""
+    case = creation_case
+    restrict_route(case, [SENDER])
+    case.request["approval"]["route"] = ROUTE
+    case.row = created(case)
+    assert case.row["route"] == ROUTE
+    approver_role(case)
+    case.stream_before = valkey.xrange(runs_stream)
+    yield case
+    for entry_id, fields in valkey.xrange(runs_stream)[len(case.stream_before):]:
+        assert QueuedTurn.model_validate_json(fields["payload"]).event_id == resume_event_id(
+            case.row["id"],
+        )
+        valkey.xdel(runs_stream, entry_id)
+
+
+def test_explicit_route_exclusion_is_a_definitive_refusal(routed_case: SimpleNamespace) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-8: a route denial raised beside lookups stays 403."""
+    case = routed_case
+    restrict_route(case, [OTHER_APPROVER])
+    response = resolve(case, *answer(case))
+    assert response.status_code == 403, response.text
+    assert response.json() == {"detail": "caller_not_allowed"}
+    assert rows(case.row["dedupe_key"]) == [case.row]
+    assert audits(case.row["id"]) == []
+
+
+def test_route_exclusion_survives_cancelling_a_pending_provider_lookup(
+    routed_case: SimpleNamespace,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-8/9: sibling cancellation never becomes unavailable."""
+    case = routed_case
+    restrict_route(case, [OTHER_APPROVER])
+    hold = 1.5
+    case.provider.during_lookup = lambda: time.sleep(hold)
+    try:
+        started = time.monotonic()
+        response = resolve(case, *answer(case))
+        elapsed = time.monotonic() - started
+    finally:
+        case.provider.during_lookup = None
+    assert response.status_code == 403, response.text
+    assert response.json() == {"detail": "caller_not_allowed"}
+    # The denial did not wait for the held lookups: they were cancelled.
+    assert elapsed < hold, elapsed
+    assert rows(case.row["dedupe_key"]) == [case.row]
+    assert audits(case.row["id"]) == []
+
+
+def test_route_admitted_answer_still_resolves(routed_case: SimpleNamespace) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-8: the restricted route admits its listed actor."""
+    case = routed_case
+    response = resolve(case, *answer(case))
+    assert response.status_code == 200, response.text
+    sealed_actor(case, "approved")
+
+
+def test_preserved_actor_check_refuses_a_route_exclusion_definitively(
+    routed_case: SimpleNamespace,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-8: the later boundary keeps the denial, not unavailable."""
+    case = routed_case
+    assert resolve(case, *answer(case)).status_code == 200
+    assert current_actor_check(case) == 200
+    restrict_route(case, [OTHER_APPROVER])
+    assert current_actor_check(case) == "403 caller_not_allowed"
+
+
+def test_provider_unavailability_beside_an_admitting_route_stays_retryable(
+    routed_case: SimpleNamespace,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-9: a lookup that cannot reach the provider stays 503."""
+    case = routed_case
+    assert resolve(case, *answer(case)).status_code == 200
+    # A client that does not trust the synthetic provider's certificate observes nothing.
+    untrusted = ssl.create_default_context()
+    assert current_actor_check(case, tls=untrusted) == "503 authority_unavailable"
+    assert current_actor_check(case) == 200
+
+
+RECONCILER_ENV = "RESUME_RECONCILER_ENABLED"
+
+
+def failing_publication(case: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """@spec HTTP-APPROVAL-CONTINUITY-11: the post-commit resume append fails once."""
+    failed: list[Any] = []
+
+    async def unreachable(approval_id: Any, **_kwargs: Any) -> str:
+        """@spec HTTP-APPROVAL-CONTINUITY-11."""
+        failed.append(approval_id)
+        raise RuntimeError("synthetic resume stream unreachable")
+
+    monkeypatch.setattr(case.client.app.state.resume_queue, "enqueue_approval", unreachable)
+    return failed
+
+
+def test_failed_resume_publication_surfaces_without_a_reconciler(
+    answer_case: SimpleNamespace, valkey: redis.Redis, runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-10/11: no backstop, so the owed wake is not hidden."""
+    case = answer_case
+    failed = failing_publication(case, monkeypatch)
+    monkeypatch.setenv(RECONCILER_ENV, "false")
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="synthetic resume stream unreachable"):
+            resolve(case, *answer(case))
+    finally:
+        monkeypatch.delenv(RECONCILER_ENV)
+        get_settings.cache_clear()
+    assert failed == [case.row["id"]]
+    # The answer committed and stays committed; only its wake is unpublished.
+    row, _ = sealed_actor(case, "approved")
+    assert row["resumed_at"] is None
+    assert [entry["action"] for entry in audits(row["id"])] == ["resolved"]
+    assert valkey.xrange(runs_stream) == case.stream_before
+    again = resolve(case, *answer(case))
+    assert again.status_code == 409, again.text
+
+
+def test_failed_resume_publication_with_a_reconciler_stays_recoverable(
+    answer_case: SimpleNamespace, valkey: redis.Redis, runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-10/11: a 200 is safe only with a backstop."""
+    case = answer_case
+    failed = failing_publication(case, monkeypatch)
+    assert get_settings().resume_reconciler_enabled is True
+    response = resolve(case, *answer(case))
+    assert response.status_code == 200, response.text
+    assert failed == [case.row["id"]]
+    row, _ = sealed_actor(case, "approved")
+    assert row["resumed_at"] is None
+    monkeypatch.undo()
+    state = case.client.app.state
+    reconciler = ResumeReconciler(
+        state.sessionmaker, state.resume_queue, interval_seconds=1, grace_seconds=0,
+        batch_limit=10,
+    )
+    portal = case.client.portal
+    assert portal is not None
+    assert portal.call(reconciler.reconcile_once) == 1
+    added = valkey.xrange(runs_stream)[len(case.stream_before):]
+    assert len(added) == 1 and "curie_identity_context_v1" in added[0][1]
+    assert rows(case.row["dedupe_key"])[0]["resumed_at"] is not None
