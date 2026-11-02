@@ -82,6 +82,7 @@ def _email_scope(endpoint: str) -> dict[str, Any]:
             "id": str(uuid.uuid4()), "authority": "", "kind": "email_domain", "key": DOMAIN,
         },
         "slack_binding": scope["binding"],
+        "slack": scope,
     }
 
     async def persist(factory: async_sessionmaker[AsyncSession]) -> None:
@@ -614,3 +615,119 @@ def test_operator_file_email_receiver_serves_a_signed_turn(
             assert synthetic_provider.requests[0]["scope"]["sender"]["native_id"] == SENDER
     finally:
         _cleanup(valkey, scope)
+
+
+# --- one runtime with trusted Slack partners and email receivers ----------------
+
+PARTNER = "T0EXAMPLEPARTNER"
+
+
+def _partner_entry() -> dict[str, Any]:
+    """@spec HTTP-INVOCATION-EXECUTION-24: an operator-declared partner workspace."""
+    return {"id": str(uuid.uuid4()), "authority": "", "kind": "slack_workspace", "key": PARTNER}
+
+
+def _combined_runtime(module: ModuleType, email: dict[str, Any], partner: dict[str, Any]) -> Any:
+    """@spec HTTP-INVOCATION-EXECUTION-24/29: a Slack receiver trusting a partner beside email."""
+    slack = email["slack"]
+    providers = build_provider_credential_registry(
+        ((slack["configuration"], ProviderBearer(membership.BEARER)),)
+    )
+    registration = module.ReceiverRegistrationV1.model_validate({
+        "schema_version": 1, "receiver_id": slack["receiver_id"], "generation": 1,
+        "tenant_id": slack["tenant"], "channel_identity_id": slack["identity"],
+        "channel_identity_name": slack["adapter"],
+        "provider_installation_id": slack["installation"], "namespace": slack["namespace"],
+        "installation_account": slack["account"], "bot_user_id": "U0EXAMPLEBOT",
+        "binding_ids": (slack["binding"],), "human_native_ids": (membership.SENDER,),
+        "trusted_namespaces": (partner,),
+    })
+    return module.build_http_invocation_runtime(
+        providers,
+        ((registration, slack["receiver_key"]),),
+        (("synthetic-context", 1, slack["context_key"]),),
+        signing_key=("synthetic-context", 1),
+        email_receivers=((_registration(module, email), EMAIL_KEY),),
+    )
+
+
+def _queued(valkey: redis.Redis, stream: str, context_key: bytes) -> SimpleNamespace:
+    """@spec HTTP-INVOCATION-EXECUTION-16: the newest queued turn and its sealed context."""
+    fields = valkey.xrange(stream)[-1][1]
+    ring = codec.build_identity_keyring("context", (("synthetic-context", 1, context_key),))
+    context = codec.open_invocation_context(fields["curie_identity_context_v1"], ring)
+    assert isinstance(context, codec.InvocationContextV1)
+    return SimpleNamespace(
+        capsule=fields["curie_identity_context_v1"], payload=fields["payload"], context=context,
+    )
+
+
+def test_trusted_partner_and_email_sender_share_one_runtime(
+    clean_db: None, valkey: redis.Redis, runs_stream: str,
+    synthetic_provider: SimpleNamespace,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-24/29: each source keeps its own capture rules.
+
+    A trusted partner's Connect mention is captured in the partner namespace
+    and an email sender in its domain namespace, through the same runtime, and
+    the worker current check continues for both.
+    """
+    provider = synthetic_provider
+    email = _email_scope(provider.url)
+    slack = email["slack"]
+    partner = _partner_entry()
+    try:
+        with TestClient(create_app(
+            http_identity_runtime=_combined_runtime(_email_api(), email, partner),
+            http_identity_client=HttpIdentityClient(tls_context=provider.tls),
+        )) as client:
+            mention = codec.ReceiverSlackEvidenceV1.model_validate({
+                "delivery": "app_mention", "user_id": membership.SENDER,
+                "event_user_team": PARTNER, "event_team": membership.ACCOUNT,
+                "interaction_user_team_id": None, "is_ext_shared_channel": True,
+                "enterprise_ids": (), "event_source_team": PARTNER,
+            })
+            token = membership._credential(client, slack)
+            accepted = membership._post(
+                client, token, *membership._submission(slack, slack=mention),
+            )
+            assert accepted.status_code == 200, accepted.text
+            partnered = _queued(valkey, runs_stream, slack["context_key"])
+            assert partnered.context.scope.provider == "slack"
+            assert partnered.context.scope.namespace.model_dump() == partner
+
+            body = _body()
+            mailed = _post(client, _email_credential(client, email), body, _proof(email, body))
+            assert mailed.status_code == 200, mailed.text
+            emailed = _queued(valkey, runs_stream, slack["context_key"])
+            assert emailed.context.scope.provider == "email"
+            assert emailed.context.scope.namespace.model_dump() == email["namespace"]
+            assert len(provider.requests) == 2
+
+            for invocation in (partnered, emailed):
+                check = authority.request_for(invocation)
+                authority.assert_response(
+                    authority.post_check(client, check), check,
+                    decision="continue", reason="current_authority",
+                )
+            assert len(provider.requests) == 4
+            assert [
+                request["scope"]["sender"]["namespace"] for request in provider.requests[2:]
+            ] == [partner, email["namespace"]]
+    finally:
+        _cleanup(valkey, email)
+
+
+def test_email_domain_ids_differ_from_trusted_slack_namespace_ids(tmp_path: Path) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-24/29: one namespace id names one namespace."""
+    module = initializer.api()
+    document = initializer.document(email_receivers=[email_entry()])
+    slack = document["receivers"][0]["registration"]
+    slack["trusted_namespaces"] = [{
+        "id": str(uuid.uuid4()), "authority": "", "kind": "slack_workspace", "key": PARTNER,
+    }]
+    initializer.write(tmp_path, document)
+    assert type(module.load_http_identity_runtime(str(tmp_path))) is HttpInvocationRuntime
+    slack["trusted_namespaces"][0]["id"] = EMAIL_NAMESPACE
+    initializer.write(tmp_path, document)
+    assert initializer.refused(module, tmp_path) == "invalid_runtime"
