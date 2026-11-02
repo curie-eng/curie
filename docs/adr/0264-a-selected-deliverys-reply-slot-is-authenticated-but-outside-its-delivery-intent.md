@@ -46,6 +46,11 @@ the API over the immutable delivery only: receiver, binding, native delivery
 id, sender evidence, text and attachments. It excludes `reply_ref`. A
 redelivery of the same event is therefore the same intent.
 
+The API carries a nonempty `reply_ref` into the queued turn as its reply
+placeholder, inside the sealed payload like every other field, so the worker
+edits the answer into it exactly as on the legacy path. An empty `reply_ref`
+keeps the fresh-reply path.
+
 ### 3. A duplicate names the accepted slot
 
 The receipt records the accepted turn's `reply_ref`. A duplicate response

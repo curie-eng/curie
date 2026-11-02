@@ -86,6 +86,21 @@ sender field `user.team_id` (ADR 0201) and resolves when it is the
 installation account or a trusted key, in the matching namespace, after the
 same enterprise checks as decision 3. Anything else is `namespace_conflict`.
 
+One answer shape on a Grid workspace registration may differ. A partner
+member's click on a card in a Connect channel hosted in the organisation is
+expected to carry the organisation's enterprise id, but the `view_submission`
+of a modal opened from that click is a separate payload whose team fields can
+describe the submitter rather than the channel, with no enterprise id at all.
+That shape must be confirmed by a capture before this ADR is accepted. If it
+holds, such a submission resolves in the trusted
+`slack_workspace` entry when all of these hold: it is a `view_submission`,
+the user id is present, no enterprise id is present, and `user.team_id` is a
+trusted workspace key. Every other Grid delivery without an enterprise id
+stays refused as `subject_unidentified`, including the same shape from the
+installation workspace or from an untrusted team, and every `block_actions`.
+The approver role, not this rule, still decides whether that person may
+answer.
+
 ### 5. Every later check uses the same set
 
 The worker's current check, a sealed answering actor and the original
