@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import sys
 import time
@@ -57,15 +58,22 @@ from curie_worker.kernel import constants as kernel_constants
 from curie_worker.kernel import routing as kernel_routing
 from curie_worker.runner_client import TurnStream
 from curie_worker.sandbox import QuotaRejection
+from curie_worker.sandbox import k8s as k8s_module
+from curie_worker.sandbox.k8s import KubernetesSandboxClient
 from curie_worker.stream_consumer import ConsumerLivenessExpired
 from curie_worker.threadlock import ThreadLock
 from curie_worker.workspace import WorkspacePreparationError
+from kubernetes.utils.quantity import parse_quantity
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind
 from redis.asyncio import Redis as AsyncRedis
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from urllib3.exceptions import MaxRetryError, ReadTimeoutError
+
+from ..sandbox.test_admission_k8s import InventoryAPI
+from ..sandbox.test_k8s_claim import _chart_template_spec, _seed_chart
 
 # importlib import mode does not add the test root to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -1105,6 +1113,163 @@ def test_interactive_capacity_wait_acks_without_completing_the_turn(make_harness
             finally:
                 consumer.request_stop()
                 await task
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("failure", ["sdk-timeout", "exhausted-budget"])
+@pytest.mark.parametrize("restore", [True, False], ids=["restored", "unavailable"])
+def test_inventory_timeout_capacity_wait_preserves_delivery_bound(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    restore: bool,
+) -> None:
+    class API(InventoryAPI):
+        failures_left = 2
+        delivery_counts: list[int]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.delivery_counts = []
+
+        def list_namespaced_custom_object(self, *args: Any, **kwargs: Any) -> Any:
+            plural = args[3]
+            if plural == "sandboxclaims":
+                pending = sync_redis.xpending_range(names["stream"], names["group"], "-", "+", 10)
+                self.delivery_counts.extend(row["times_delivered"] for row in pending)
+            if plural == "sandboxes" and failure == "exhausted-budget" and self.failures_left:
+                if restore:
+                    self.failures_left -= 1
+                time.sleep(kwargs["_request_timeout"] + 0.002)
+            return super().list_namespaced_custom_object(*args, **kwargs)
+
+        def list_namespaced_pod(self, namespace: str, **kwargs: Any) -> SimpleNamespace:
+            if failure == "sdk-timeout" and self.failures_left:
+                if restore:
+                    self.failures_left -= 1
+                # #5296 observed this SDK exception and its ReadTimeoutError cause.
+                cause = ReadTimeoutError(None, "/api/v1/namespaces/test-ns/pods", "read timed out")
+                raise MaxRetryError(None, cause.url, cause) from cause
+            return super().list_namespaced_pod(namespace, **kwargs)
+
+        def create_namespaced_custom_object(self, *args: Any, **kwargs: Any) -> Any:
+            obj = super().create_namespaced_custom_object(*args, **kwargs)
+            if args[3] == "sandboxclaims":
+                name = obj["metadata"]["name"]
+                sandbox = self.seed("sandboxes", name, {"operatingMode": "Running"})
+                sandbox["status"] = {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "serviceFQDN": "127.0.0.1",
+                }
+                self.objects[("sandboxclaims", name)]["status"] = {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "sandbox": {"name": name},
+                }
+            return obj
+
+    api = API()
+    spec = _chart_template_spec()
+    spec["podTemplate"]["spec"].pop("runtimeClassName", None)
+    _seed_chart(api, pool="test-pool", spec=spec)
+    monkeypatch.setattr(k8s_module.k8s_config, "load_incluster_config", lambda: None)
+    monkeypatch.setattr(k8s_module.k8s_client, "CustomObjectsApi", lambda _client: api)
+    monkeypatch.setattr(k8s_module.k8s_client, "CoreV1Api", lambda _client: api)
+    client = KubernetesSandboxClient("test-ns")
+    footprint = client.claim_resources(
+        pool="test-pool",
+        runner_resources=None,
+        agent_name=None,
+        executor_secret_names=None,
+    )
+    hard = {key: str(parse_quantity(value) * 4) for key, value in footprint.items()}
+    api.quota = SimpleNamespace(
+        metadata=SimpleNamespace(name="acme-sandbox-quota", namespace="test-ns"),
+        spec=SimpleNamespace(hard=hard),
+        status=SimpleNamespace(hard=hard, used=dict.fromkeys(hard, "0")),
+    )
+    admission = json.dumps(
+        {
+            "quota_name": "acme-sandbox-quota",
+            "priority_class": "acme-sandbox",
+            "ceiling": 4,
+            "hard": hard,
+        }
+    )
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            slack_no_edit_streaming=True,
+            reclaim_min_idle_ms=0,
+        ) as h:
+            h.runner.default_script = [Final(text="inventory restored", status=DONE)]
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event = _qevent("hello", thread="inventory-thread", event_id="inventory-turn")
+            entry_id, fields = await _pending_local_entry(h, event)
+            original_deadline = None
+            for attempt in range(3):
+                if attempt == 0:
+                    await consumer._sem.acquire()
+                    await consumer._handle(entry_id, fields)
+                else:
+                    record = await consumer._waits.get(event.event_id)
+                    if record is None:
+                        assert await consumer._reclaim_once() == 1
+                        await asyncio.gather(*list(consumer._inflight))
+                    else:
+                        assert record.state == "waiting"
+                        assert record.fields == to_stream_fields(event)
+                        if original_deadline is None:
+                            original_deadline = record.deadline_ms
+                        assert record.deadline_ms == original_deadline
+                        assert api.created == []
+                        assert api.secrets == {}
+                        assert h.runner.opened == []
+                        assert not await h.async_redis.exists(h.config.done_key(event.event_id))
+                        assert (
+                            await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+                        )["pending"] == 0
+                        consumer = _capacity_consumer(h)
+                        await h.async_redis.zadd(consumer._waits._due, {event.event_id: 0})
+                        assert await consumer._waits.wake_due() == 1
+                        rows = await h.async_redis.xreadgroup(
+                            h.config.consumer_group,
+                            h.config.consumer_name,
+                            {h.config.stream: ">"},
+                            count=1,
+                        )
+                        entry_id, fields = rows[0][1][0]
+                        await consumer._sem.acquire()
+                        await consumer._handle(entry_id, fields)
+            if restore:
+                assert h.runner.queried == ["hello"]
+                assert h.sink.last_text == "inventory restored"
+                assert len(h.sink.completions) == 1
+            assert max(api.delivery_counts) <= 2, api.delivery_counts
+            assert not await h.async_redis.exists(f"{h.config.stream}:dead")
+            record = await consumer._waits.get(event.event_id)
+            assert record is not None
+            assert record.deadline_ms == original_deadline
+            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                "pending"
+            ] == 0
+            if restore:
+                assert record.state == "done"
+                assert h.runner.queried == ["hello"]
+                assert h.sink.last_text == "inventory restored"
+                assert len(h.sink.completions) == 1
+                assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            else:
+                assert record.state == "waiting"
+                assert record.deferrals == 3
+                assert api.created == []
+                assert api.secrets == {}
+                assert h.runner.opened == h.sink.completions == []
 
     asyncio.run(go())
 
