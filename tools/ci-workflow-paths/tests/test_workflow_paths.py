@@ -56,11 +56,15 @@ the exemption narrow and reds when the message is reworded.
 from __future__ import annotations
 
 import functools
+import importlib.util
+import os
 import posixpath
 import re
 import subprocess
+import sys
 from collections.abc import Iterable, Iterator
 from pathlib import Path
+from types import ModuleType
 from typing import Any, NamedTuple
 
 import pytest
@@ -1296,6 +1300,37 @@ def _queue_job_runs(job: dict[str, Any], bindings: dict[str, Any], results: dict
     }))
 
 
+def _queue_decisions(
+    jobs: dict[str, Any], bindings: dict[str, Any], event: str, failed: bool = False,
+) -> dict[str, str]:
+    """Walk the job graph once for one event: each job runs, or is skipped."""
+    remaining = dict(jobs)
+    results: dict[str, str] = {}
+    while remaining:
+        ready = []
+        for name, job in remaining.items():
+            needs = job.get("needs", [])
+            needs = [needs] if isinstance(needs, str) else needs
+            if all(dependency in results for dependency in needs):
+                ready.append(name)
+        assert ready, "workflow job dependencies must be acyclic"
+        for name in ready:
+            job = remaining.pop(name)
+            context = {**bindings, "github.event_name": event,
+                       **{f"needs.{key}.result": value for key, value in results.items()}}
+            runs = _queue_job_runs(job, context, results)
+            results[name] = ("failure" if failed else "success") if runs else "skipped"
+    return results
+
+
+# Every deep output is "true" off pull requests, and on a ci:deep labeled one.
+DEEP_BINDINGS = {
+    "needs.changes.outputs.deep": "true",
+    "needs.rust-select.outputs.deep": "true",
+    "needs.chart-changes.outputs.deep": "true",
+}
+
+
 @pytest.mark.parametrize("selected", [False, True])
 @pytest.mark.parametrize("failed", [False, True])
 @pytest.mark.parametrize("filename", QUEUE_WORKFLOWS)
@@ -1315,26 +1350,13 @@ def test_every_job_condition_has_pr_equivalent_queue_behavior(
         "needs.chart-changes.outputs.chart": str(selected).lower(),
         "needs.rust-select.outputs.tests": str(selected).lower(),
         "inputs.nightly": False,
+        # A ci:deep labeled pull request: the PR judgment the queue must equal.
+        **DEEP_BINDINGS,
     }
-    decisions = {}
-    for event in ("pull_request", "merge_group"):
-        remaining = dict(jobs)
-        results: dict[str, str] = {}
-        while remaining:
-            ready = []
-            for name, job in remaining.items():
-                needs = job.get("needs", [])
-                needs = [needs] if isinstance(needs, str) else needs
-                if all(dependency in results for dependency in needs):
-                    ready.append(name)
-            assert ready, "workflow job dependencies must be acyclic"
-            for name in ready:
-                job = remaining.pop(name)
-                context = {**bindings, "github.event_name": event,
-                           **{f"needs.{key}.result": value for key, value in results.items()}}
-                runs = _queue_job_runs(job, context, results)
-                results[name] = ("failure" if failed else "success") if runs else "skipped"
-        decisions[event] = results
+    decisions = {
+        event: _queue_decisions(jobs, bindings, event, failed)
+        for event in ("pull_request", "merge_group")
+    }
     assert decisions["merge_group"] == decisions["pull_request"]
     required = {
         "ci.yaml": {"compose", "contracts-ts", "python", "rust", "ui", "e2e-required"},
@@ -1368,3 +1390,322 @@ def test_queue_metadata_jobs_acknowledge_the_pr_judgment(
     )
     assert result.returncode == 0, result.stderr
     assert "PR-event run already judged" in summary.read_text()
+
+
+# Pull requests run the fast tiers; the merge queue runs the deep tiers on the
+# exact merge combination. A pull request runs them too when labeled ci:deep.
+DEEP_LABEL_EXPRESSION = "${{ contains(github.event.pull_request.labels.*.name, 'ci:deep') }}"
+DEEP_JOBS = {
+    "ci.yaml": frozenset({
+        "e2e-ladder-cluster", "e2e-scripted-factory", "factory-admitted-agent",
+        "e2e-cluster-chart-regressions", "e2e-cluster-approval-resume-restarts",
+        "e2e-released-upgrade-negative", "e2e-cluster-upgrade-matrix", "rust-convergence",
+    }),
+    "helm-ci.yaml": frozenset({"reserved-env-upgrade", "automatic-thread-isolation"}),
+}
+# Build prerequisites that run on a pull request only for a non-deep consumer.
+DEEP_ONLY_PREREQUISITES = {
+    "rust-build": ("skill", "local", "local_release"),
+    "ci-images": ("images", "skill", "local", "local_release"),
+}
+REQUIRED_AGGREGATES = {
+    "ci.yaml": frozenset({"compose", "contracts-ts", "python", "rust", "ui", "e2e-required"}),
+    "helm-ci.yaml": frozenset({"helm"}),
+}
+# The pre-change conditions, frozen verbatim: what a pull request ran before
+# the deep tiers moved to the merge queue.
+OLD_PR_CONDITIONS = {
+    "ci.yaml": {
+        "rust-build": (
+            "${{ needs.changes.outputs.skill == 'true' || needs.changes.outputs.local == 'true' "
+            "|| needs.changes.outputs.local_release == 'true' || "
+            "needs.changes.outputs.cluster == 'true' || "
+            "needs.changes.outputs.released_upgrade == 'true' }}"
+        ),
+        "ci-images": (
+            "${{ needs.changes.outputs.images == 'true' || needs.changes.outputs.skill == 'true' "
+            "|| needs.changes.outputs.local == 'true' || "
+            "needs.changes.outputs.local_release == 'true' || "
+            "needs.changes.outputs.cluster == 'true' || "
+            "needs.changes.outputs.released_upgrade == 'true' }}"
+        ),
+        "rust-convergence": "${{ needs.rust-select.outputs.tests == 'true' }}",
+        "e2e-ladder-cluster": "${{ needs.changes.outputs.cluster == 'true' }}",
+        "e2e-scripted-factory": "${{ needs.changes.outputs.factory == 'true' }}",
+        "factory-admitted-agent": "${{ needs.changes.outputs.factory == 'true' }}",
+        "e2e-cluster-chart-regressions": "${{ needs.changes.outputs.chart_scenarios != '[]' }}",
+        "e2e-cluster-approval-resume-restarts": (
+            "${{ needs.changes.outputs.approval_resume == 'true' }}"
+        ),
+        "e2e-released-upgrade-negative": "${{ needs.changes.outputs.released_upgrade == 'true' }}",
+        "e2e-cluster-upgrade-matrix": "${{ needs.changes.outputs.released_upgrade == 'true' }}",
+    },
+    "helm-ci.yaml": {
+        "reserved-env-upgrade": "${{ needs.chart-changes.outputs.chart == 'true' }}",
+        "automatic-thread-isolation": "${{ needs.chart-changes.outputs.chart == 'true' }}",
+    },
+}
+# One diff per surface. Across the set every deep job is selected at least
+# once; the selector test asserts that, so a registry change cannot make it
+# vacuous.
+REPRESENTATIVE_DIFFS = (
+    ("README.md",),
+    ("cli/src/main.rs",),
+    ("charts/curie/templates/_helpers.tpl",),
+    ("tools/factory-e2e/scripted_kind.py",),
+    ("apps/worker/src/curie_worker/approvals.py",),
+    ("apps/api/alembic/versions/0140_execution_deadline_twelve_hours.py",),
+    ("charts/curie/ci/runtime/connector-readiness-runtime.sh",),
+)
+SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
+SELECTION_REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
+RUST_TEST_PATHS = REPO_ROOT / ".github" / "rust-test-paths.txt"
+HELM_DECIDE = REPO_ROOT / "tools" / "helm-ci-gate" / "decide.py"
+AGENTS_MD = REPO_ROOT / "AGENTS.md"
+
+
+def _deep_step(job: dict[str, Any]) -> dict[str, Any]:
+    steps = [step for step in job["steps"] if step.get("id") == "deep"]
+    assert len(steps) == 1, "the changes job needs exactly one `deep` step"
+    return steps[0]
+
+
+def _run_deep_step(tmp_path: Path, event: str, label: str) -> tuple[int, str]:
+    step = _deep_step(_load_workflows()["ci.yaml"]["jobs"]["changes"])
+    output = tmp_path / f"output-{event}-{label}"
+    result = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", step["run"]],
+        cwd=REPO_ROOT,
+        env={"PATH": os.environ["PATH"], "EVENT_NAME": event, "DEEP_LABEL": label,
+             "GITHUB_OUTPUT": str(output)},
+        capture_output=True, text=True, check=False,
+    )
+    return result.returncode, output.read_text() if output.exists() else ""
+
+
+def test_deep_label_step_reads_the_label_from_the_event() -> None:
+    jobs = _load_workflows()["ci.yaml"]["jobs"]
+    changes = jobs["changes"]
+    step = _deep_step(changes)
+    assert step["env"] == {
+        "EVENT_NAME": "${{ github.event_name }}",
+        "DEEP_LABEL": DEEP_LABEL_EXPRESSION,
+    }
+    ids = [entry.get("id") for entry in changes["steps"]]
+    assert ids.index("deep") < ids.index("filter")
+    assert changes["outputs"]["deep"] == "${{ steps.deep.outputs.deep }}"
+    assert jobs["rust-select"]["outputs"]["deep"] == "${{ needs.changes.outputs.deep }}"
+
+
+@pytest.mark.parametrize(
+    ("event", "label", "expected"),
+    [
+        ("pull_request", "false", "false"),
+        ("pull_request", "", "false"),
+        ("pull_request", "true", "true"),
+        ("merge_group", "false", "true"),
+        ("merge_group", "", "true"),
+        ("push", "false", "true"),
+        ("workflow_dispatch", "", "true"),
+    ],
+)
+def test_deep_label_step_decides_deep_per_event(
+    tmp_path: Path, event: str, label: str, expected: str,
+) -> None:
+    returncode, output = _run_deep_step(tmp_path, event, label)
+    assert returncode == 0
+    assert output.splitlines() == [f"deep={expected}"]
+
+
+@functools.cache
+def _helm_decide() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("ci_workflow_paths_helm_decide", HELM_DECIDE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    ("event", "label", "expected"),
+    [
+        ("pull_request", None, "false"),
+        ("pull_request", "false", "false"),
+        ("pull_request", "true", "true"),
+        ("merge_group", "false", "true"),
+        ("push", "false", "true"),
+    ],
+)
+def test_deep_label_helm_select_decides_deep_per_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    event: str, label: str | None, expected: str,
+) -> None:
+    decide = _helm_decide()
+    output = tmp_path / "output"
+    monkeypatch.setenv("EVENT_NAME", event)
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    if label is None:
+        monkeypatch.delenv("DEEP_LABEL", raising=False)
+    else:
+        monkeypatch.setenv("DEEP_LABEL", label)
+    # The diff itself is not under test here: a pull request and a queue
+    # group both see the same unrelated change.
+    monkeypatch.setattr(decide, "_changed_pull_request_paths", lambda: ["README.md"])
+    monkeypatch.setattr(decide, "_changed_merge_group_paths", lambda: ["README.md"])
+    decide.cmd_select()
+    lines = output.read_text().splitlines()
+    assert f"deep={expected}" in lines
+    assert sum(line.startswith("deep=") for line in lines) == 1
+
+
+def test_deep_label_is_documented_in_the_ci_gates_subsection() -> None:
+    text = AGENTS_MD.read_text()
+    verify = text.index("\n## Verify commands (per package)\n")
+    policy = text.index("\n## Test policy\n")
+    gates = text.find("\n### CI gates\n", verify, policy)
+    assert gates != -1, "AGENTS.md needs a `### CI gates` subsection before `## Test policy`"
+    following = text.find("\n## ", gates + 1)
+    section = text[gates:following]
+    assert "ci:deep" in section
+    assert "merge queue" in section
+
+
+def _select_outputs(tmp_path: Path, paths: tuple[str, ...]) -> dict[str, str]:
+    output = tmp_path / f"selection-{len(list(tmp_path.glob('selection-*')))}"
+    command = [sys.executable, str(SELECTOR), "--registry", str(SELECTION_REGISTRY)]
+    for path in paths:
+        command.extend(("--path", path))
+    result = subprocess.run(
+        command, cwd=REPO_ROOT, env={**os.environ, "GITHUB_OUTPUT": str(output)},
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return dict(line.split("=", 1) for line in output.read_text().splitlines())
+
+
+def _rust_tests_selected(paths: tuple[str, ...], version_only: str) -> bool:
+    # Mirrors rust-select: the same patterns file through the same grep -E.
+    if version_only == "true":
+        return False
+    patterns = [
+        line for line in RUST_TEST_PATHS.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    result = subprocess.run(
+        ["grep", "-E", *(argument for pattern in patterns for argument in ("-e", pattern))],
+        input="\n".join(paths) + "\n", capture_output=True, text=True, check=False,
+    )
+    assert result.returncode in {0, 1}, result.stderr
+    return result.returncode == 0
+
+
+def _diff_bindings(tmp_path: Path, paths: tuple[str, ...]) -> dict[str, Any]:
+    outputs = _select_outputs(tmp_path, paths)
+    for name in ("cluster", "factory", "approval_resume", "released_upgrade", "chart_scenarios"):
+        assert name in outputs, name
+    chart = _helm_decide().select_chart("pull_request", list(paths))
+    assert chart == _helm_decide().select_chart("merge_group", list(paths))
+    return {
+        **{f"needs.changes.outputs.{name}": value for name, value in outputs.items()},
+        "needs.rust-select.outputs.tests": str(
+            _rust_tests_selected(paths, outputs.get("version_only", "false"))
+        ).lower(),
+        "needs.chart-changes.outputs.chart": str(chart).lower(),
+        "inputs.nightly": False,
+    }
+
+
+def _ran(results: dict[str, str]) -> set[str]:
+    return {name for name, value in results.items() if value != "skipped"}
+
+
+def _deep_cases(
+    filename: str, bindings: dict[str, Any],
+) -> dict[str, dict[str, str]]:
+    jobs = _load_workflows()[filename]["jobs"]
+    old_jobs = {
+        name: {**job, "if": OLD_PR_CONDITIONS[filename][name]}
+        if name in OLD_PR_CONDITIONS[filename] else job
+        for name, job in jobs.items()
+    }
+    shallow = dict.fromkeys(DEEP_BINDINGS, "false")
+    deep = dict.fromkeys(DEEP_BINDINGS, "true")
+    return {
+        "old_pull_request": _queue_decisions(old_jobs, {**bindings, **shallow}, "pull_request"),
+        "merge_group": _queue_decisions(jobs, {**bindings, **deep}, "merge_group"),
+        "unlabeled_pull_request": _queue_decisions(jobs, {**bindings, **shallow}, "pull_request"),
+        "labeled_pull_request": _queue_decisions(jobs, {**bindings, **deep}, "pull_request"),
+    }
+
+
+def test_deep_old_conditions_are_the_current_ones_without_the_deep_clause() -> None:
+    # Keeps OLD_PR_CONDITIONS honest: each deep job's frozen condition is a
+    # real job, and the current condition adds the deep clause to it.
+    for filename, conditions in OLD_PR_CONDITIONS.items():
+        jobs = _load_workflows()[filename]["jobs"]
+        for name, old in conditions.items():
+            assert name in jobs, (filename, name)
+            current = str(jobs[name]["if"])
+            assert current != old, (filename, name)
+            assert "outputs.deep == 'true'" in current, (filename, name)
+        assert set(conditions) - set(DEEP_ONLY_PREREQUISITES) == DEEP_JOBS[filename]
+
+
+@pytest.mark.parametrize("paths", REPRESENTATIVE_DIFFS, ids=lambda paths: paths[0])
+def test_deep_tiers_defer_from_pull_requests_to_the_merge_queue(
+    tmp_path: Path, paths: tuple[str, ...],
+) -> None:
+    bindings = _diff_bindings(tmp_path, paths)
+    for filename in ("ci.yaml", "helm-ci.yaml"):
+        cases = _deep_cases(filename, bindings)
+        old = _ran(cases["old_pull_request"])
+        queue = _ran(cases["merge_group"])
+        unlabeled = _ran(cases["unlabeled_pull_request"])
+        # The queue runs everything the pull request used to run.
+        assert old <= queue, (filename, sorted(old - queue))
+        # An unlabeled pull request runs no deep tier.
+        assert not unlabeled & DEEP_JOBS[filename], (filename, sorted(unlabeled))
+        # A labeled pull request decides exactly what the queue decides.
+        assert cases["labeled_pull_request"] == cases["merge_group"], filename
+        # Every non-deep job the old pull request ran still runs, except a
+        # build prerequisite whose only selected consumers are deferred.
+        missing = old - unlabeled - DEEP_JOBS[filename]
+        for name in missing:
+            assert name in DEEP_ONLY_PREREQUISITES, (filename, name)
+            selectors = DEEP_ONLY_PREREQUISITES[name]
+            assert all(
+                bindings[f"needs.changes.outputs.{selector}"] == "false" for selector in selectors
+            ), (filename, name)
+        # And a prerequisite runs on the unlabeled pull request exactly when
+        # a non-deep consumer selected it.
+        if filename == "ci.yaml":
+            for name, selectors in DEEP_ONLY_PREREQUISITES.items():
+                wanted = any(
+                    bindings[f"needs.changes.outputs.{selector}"] == "true"
+                    for selector in selectors
+                )
+                assert (name in unlabeled) == wanted, (name, paths)
+        for case, results in cases.items():
+            for name in REQUIRED_AGGREGATES[filename]:
+                assert results[name] != "skipped", (filename, case, name)
+
+
+def test_deep_representative_diffs_select_every_deep_job_in_the_merge_queue(
+    tmp_path: Path,
+) -> None:
+    selected: dict[str, set[str]] = {filename: set() for filename in DEEP_JOBS}
+    deferred: dict[str, set[str]] = {filename: set() for filename in DEEP_JOBS}
+    for paths in REPRESENTATIVE_DIFFS:
+        bindings = _diff_bindings(tmp_path, paths)
+        for filename in DEEP_JOBS:
+            cases = _deep_cases(filename, bindings)
+            queue = _ran(cases["merge_group"])
+            selected[filename] |= queue & DEEP_JOBS[filename]
+            deferred[filename] |= (
+                _ran(cases["old_pull_request"]) - _ran(cases["unlabeled_pull_request"])
+            ) & DEEP_JOBS[filename]
+    for filename, jobs in DEEP_JOBS.items():
+        # Non-vacuous: each deep job is selected by some diff in the queue,
+        # and its deferral from the pull request is observed at least once.
+        assert selected[filename] == jobs, (filename, sorted(jobs - selected[filename]))
+        assert deferred[filename] == jobs, (filename, sorted(jobs - deferred[filename]))
