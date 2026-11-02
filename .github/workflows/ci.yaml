@@ -3405,7 +3405,11 @@ jobs:
       - name: Start freeing disk for the disposable factory cluster
         run: |
           set -euo pipefail
-          nohup sudo bash -c 'rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup; echo $? > "$0"' "$RUNNER_TEMP/free-disk.status" >/dev/null 2>&1 &
+          # The background removal inherits descriptor 9 and holds this lock
+          # until it exits, so the finish step can block on the lock.
+          exec 9>"$RUNNER_TEMP/free-disk.lock"
+          flock 9
+          nohup bash -c 'sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup; echo $? > "$1"' _ "$RUNNER_TEMP/free-disk.status" >/dev/null 2>&1 &
       - name: Download the curie binary built by the Rust job
         uses: actions/download-artifact@v8
         with:
@@ -3420,14 +3424,7 @@ jobs:
       - name: Finish freeing disk for the disposable factory cluster
         run: |
           set -euo pipefail
-          for _ in $(seq 1 600); do
-            [ -e "$RUNNER_TEMP/free-disk.status" ] && break
-            sleep 1
-          done
-          if [ ! -e "$RUNNER_TEMP/free-disk.status" ]; then
-            echo "disk cleanup did not finish within 600 seconds" >&2
-            exit 1
-          fi
+          timeout 600 flock "$RUNNER_TEMP/free-disk.lock" true
           status="$(cat "$RUNNER_TEMP/free-disk.status")"
           if [ "$status" != "0" ]; then
             echo "disk cleanup exited with status $status" >&2
