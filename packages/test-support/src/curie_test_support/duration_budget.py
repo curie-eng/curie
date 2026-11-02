@@ -37,8 +37,10 @@ def budget_failure(nodeid: str, duration: float, enforced: set[str]) -> str | No
     return None
 
 
-def function_nodes(source: str, filename: str) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
-    result: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+def function_nodes(
+    source: str, filename: str
+) -> dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]]:
+    result: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
 
     class Functions(ast.NodeVisitor):
         def __init__(self) -> None:
@@ -50,7 +52,7 @@ def function_nodes(source: str, filename: str) -> dict[str, ast.FunctionDef | as
             self.parents.pop()
 
         def record(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-            result["::".join([*self.parents, node.name])] = node
+            result.setdefault("::".join([*self.parents, node.name]), []).append(node)
             self.parents.append(node.name)
             self.generic_visit(node)
             self.parents.pop()
@@ -92,6 +94,7 @@ def budget_targets(root: Path, collected: list[str]) -> set[str]:
         ],
         cwd=root,
         text=True,
+        errors="replace",
         capture_output=True,
         check=True,
     ).stdout
@@ -121,27 +124,35 @@ def budget_targets(root: Path, collected: list[str]) -> set[str]:
         path = root / file
         if not path.is_file():
             continue
-        current = function_nodes(path.read_text(), file)
-        for name, node in current.items():
-            if any(overlaps(node, start, count) for _, _, start, count in hunks):
-                changed.add(file + "::" + name)
         deletions = [(start, count) for start, count, _, added in hunks if added == 0 and count > 0]
-        if deletions:
-            source = subprocess.run(
-                ["git", "show", f"{revision}:{file}"],
-                cwd=root,
-                text=True,
-                capture_output=True,
-                check=True,
-            ).stdout
-            for name, node in function_nodes(source, file).items():
-                if (
-                    name in current
-                    and any(overlaps(node, start, count) for start, count in deletions)
-                    and ast.dump(node, include_attributes=False)
-                    != ast.dump(current[name], include_attributes=False)
-                ):
-                    changed.add(file + "::" + name)
+        previous = {}
+        try:
+            current = function_nodes(path.read_text(), file)
+            if deletions:
+                source = subprocess.run(
+                    ["git", "show", f"{revision}:{file}"],
+                    cwd=root,
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                ).stdout
+                previous = function_nodes(source, file)
+        except (SyntaxError, UnicodeDecodeError):
+            new_files.discard(file)
+            continue
+        for name, nodes in current.items():
+            if any(overlaps(node, start, count) for node in nodes for _, _, start, count in hunks):
+                changed.add(file + "::" + name)
+        for name, nodes in previous.items():
+            if (
+                name in current
+                and any(
+                    overlaps(node, start, count) for node in nodes for start, count in deletions
+                )
+                and [ast.dump(node, include_attributes=False) for node in nodes]
+                != [ast.dump(node, include_attributes=False) for node in current[name]]
+            ):
+                changed.add(file + "::" + name)
     return {
         nodeid
         for nodeid in collected
