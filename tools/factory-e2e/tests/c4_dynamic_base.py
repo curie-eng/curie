@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 
 import scripted_kind as sk
 from aci_protocol import RUNS_STREAM_DEFAULT, STREAM_PAYLOAD_FIELD
-from c4_admitted_kind import REPOSITORY, AdmittedKind, Ticket
+from c4_admitted_kind import REPOSITORY, AdmittedKind, Ticket, configure_harness
 from channel_protocol.work_item_events import ci_event_id, ci_round_key
 from curie_internal.keyspace import (
     WORK_ITEM_CI_RERUN_PREFIX,
@@ -896,7 +896,8 @@ class DynamicKind(AdmittedKind):
 
 
 def configure_dynamic(monkeypatch: Any, run: DynamicKind) -> None:
-    load_module, values, mkdtemp = sk._module, sk.scripted_values, sk.tempfile.mkdtemp
+    configure_harness(monkeypatch, run)
+    load_module = sk._module
 
     def external(name: str, path: Path) -> Any:
         loaded = load_module(name, path)
@@ -907,14 +908,6 @@ def configure_dynamic(monkeypatch: Any, run: DynamicKind) -> None:
         return loaded
 
     monkeypatch.setattr(sk, "_module", external)
-    monkeypatch.setattr(sk, "scripted_values", lambda **kw: run.values(values, **kw))
-
-    def private_temp(*args: Any, **kwargs: Any) -> str:
-        if not args and "dir" not in kwargs:
-            kwargs["dir"] = run.root
-        return mkdtemp(*args, **kwargs)
-
-    monkeypatch.setattr(sk.tempfile, "mkdtemp", private_temp)
 
 
 def wait(predicate: Any, *, seconds: int = 240) -> Any:

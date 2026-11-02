@@ -32,6 +32,8 @@ from c4_admitted_http import gitlab, jira, marker_model_type, tracker_stub_type
 from c4_shared_install import CaseIsolationError, InstallSnapshot, leftover_state
 from curie_telemetry.redact import redact_text
 
+_SCRIPTED_INPUTS = (sk._module, sk.scripted_values, sk.tempfile.mkdtemp)
+
 ROOT = Path(__file__).resolve().parents[3]
 REPOSITORY = "acme-corp/acme-bot"
 LOCATIONS = {"github": REPOSITORY, "gitlab": REPOSITORY, "jira": "acme-jira"}
@@ -1786,9 +1788,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
 
 
 def configure_harness(monkeypatch: Any, run: AdmittedKind) -> None:
-    load_module = sk._module
-    values = sk.scripted_values
-    mkdtemp = sk.tempfile.mkdtemp
+    load_module, values, mkdtemp = _SCRIPTED_INPUTS
 
     def external_module(name: str, path: Path) -> Any:
         loaded = load_module(name, path)
