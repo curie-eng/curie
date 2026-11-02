@@ -2232,3 +2232,67 @@ def test_decision_steps_use_queue_sha_bounds(tmp_path: Path, job_id: str) -> Non
     assert "--base " + "a" * 40 in calls[0]
     assert "--head " + "b" * 40 in calls[0]
     assert "--push" not in calls[0]
+
+
+@pytest.mark.parametrize("train,other", [("main", "next"), ("next", "main")])
+def test_queue_cross_train_checks_the_other_train(
+    tmp_path: Path, train: str, other: str,
+) -> None:
+    step = _named_steps("python-static")["Alembic cross-train lineage"]
+    expression = step["env"]["BASE"].removeprefix("${{").removesuffix("}}").strip()
+    values = {
+        "github.event_name": "merge_group", "github.base_ref": "",
+        "github.ref_name": f"gh-readonly-queue/{train}/pr-1-example",
+        "github.event.merge_group.base_ref": f"refs/heads/{train}",
+    }
+    expression = re.sub(r"github\.[a-z_.]+", lambda match: repr(values[match[0]]), expression)
+    base = eval(expression.replace("&&", " and ").replace("||", " or "),
+                {"__builtins__": {}})
+    bin_dir, log = _recording_stubs(tmp_path, "git", "uv")
+    result = _run_bash(step["run"], {"BASE": base,
+                                   "PATH": f"{bin_dir}:{os.environ['PATH']}"}, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert log.read_text().splitlines() == [
+        f"git fetch --no-tags origin {other}",
+        "uv run python scripts/check-alembic-revisions.py "
+        f"--other-train-ref origin/{other}",
+    ]
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_queue_wire_lock_reads_immutable_event_base(tmp_path: Path, available: bool) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    def git(*args: str) -> str:
+        return subprocess.run(["git", *args], cwd=repo, check=True,
+                              capture_output=True, text=True).stdout.strip()
+    git("init", "-q")
+    git("config", "user.name", "Example Tester")
+    git("config", "user.email", "tester@example.com")
+    path = repo / "packages/aci-protocol/schema/wire.lock"
+    path.parent.mkdir(parents=True)
+    path.write_text("base lock\n")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD")
+    path.write_text("candidate lock\n")
+    git("commit", "-qam", "candidate")
+    step = _named_steps("python-static")["ACI wire-lock base gate"]
+    script = _substitute_expressions(step["run"], {
+        "${{ github.event_name }}": "merge_group",
+        "${{ github.event.merge_group.base_sha }}": base if available else "0" * 40,
+        "${{ github.base_ref || github.ref_name }}": "gh-readonly-queue/main/pr-1-example",
+    })
+    base_lock = tmp_path / "base-wire.lock"
+    script = script.replace("/tmp/base-wire.lock", str(base_lock))
+    bin_dir, log = _recording_stubs(tmp_path, "uv")
+    result = _run_bash(script, {"PATH": f"{bin_dir}:{os.environ['PATH']}"}, repo)
+    if available:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert base_lock.read_text() == "base lock\n"
+        assert log.read_text().strip() == (
+            "uv run python -m aci_protocol.wire_lock --check-base " + str(base_lock)
+        )
+    else:
+        assert result.returncode != 0
+        assert not log.exists(), "an unavailable queue base must not certify the candidate"
