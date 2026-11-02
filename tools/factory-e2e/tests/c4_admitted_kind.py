@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import hmac
 import json
@@ -16,6 +17,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlsplit
@@ -25,11 +27,24 @@ import httpx
 import scripted_kind as sk
 from aci_protocol import RUNS_STREAM_DEFAULT, STREAM_PAYLOAD_FIELD, QueuedTurn
 from c4_admitted_http import gitlab, jira, marker_model_type, tracker_stub_type
+from c4_shared_install import CaseIsolationError, InstallSnapshot, leftover_state
 from curie_telemetry.redact import redact_text
 
 ROOT = Path(__file__).resolve().parents[3]
 REPOSITORY = "acme-corp/acme-bot"
 LOCATIONS = {"github": REPOSITORY, "gitlab": REPOSITORY, "jira": "acme-jira"}
+AGENT_LETTERS = ("a", "b")
+CLAIM_RESOURCE = "sandboxclaims.extensions.agents.x-k8s.io"
+# CI builds the candidate CLI and images once per workflow run; the fixture
+# then tags those images instead of rebuilding them from the checkout.
+CANDIDATE_CLI_ENV = "CURIE_C4_CANDIDATE_CLI"
+CANDIDATE_IMAGES_ENV = "CURIE_C4_CANDIDATE_IMAGES"
+# ScriptedRun.execute labels this scenario issue `factory`; it is not a case ticket.
+SCENARIO_ISSUE = 3815
+# GitHub intake polls every 5 s, GitLab and Jira every 1 s. Retired labels
+# must be observed before the WorkItems that dedupe them are truncated.
+RETIRE_OBSERVE_SECONDS = 12
+VALUE_FROM_KINDS = frozenset({"secretKeyRef", "configMapKeyRef", "fieldRef", "resourceFieldRef"})
 
 
 @dataclass(frozen=True)
@@ -151,6 +166,10 @@ class AdmittedKind(sk.ScriptedRun):
         self.diagnostic_path = root / "diagnostics.sqlite3"
         self.infrastructure_errors: list[str] = []
         self.source_candidate: AdmittedKind | None = None
+        self.bundles: dict[str, Path] = {}
+        # Recorded once by the session fixture when the shared install is
+        # ready, the worker is at zero replicas and no agent exists.
+        self.baseline: InstallSnapshot | None = None
         self.secrets.extend((gitlab.TOKEN, jira.TOKEN))
 
     def record_failure(self, operation: str, exc: BaseException) -> None:
@@ -548,6 +567,22 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
                 if current != self.source_candidate.image_ids[name]:
                     raise RuntimeError("a session-owned source candidate image changed")
             return
+        prebuilt_cli = os.environ.get(CANDIDATE_CLI_ENV)
+        prebuilt_images = os.environ.get(CANDIDATE_IMAGES_ENV)
+        if prebuilt_cli and prebuilt_images:
+            if not os.access(prebuilt_cli, os.X_OK):
+                raise RuntimeError(f"{CANDIDATE_CLI_ENV} does not name an executable")
+            self.curie = prebuilt_cli
+            for name, tag in self.images.items():
+                self.command("docker", "tag", prebuilt_images.format(component=name), tag)
+        else:
+            self.build_source_candidate()
+        for name, tag in self.images.items():
+            self.image_ids[name] = json.loads(self.command("docker", "image", "inspect", tag))[0][
+                "Id"
+            ]
+
+    def build_source_candidate(self) -> None:
         self.command(
             "cargo",
             "build",
@@ -572,10 +607,6 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
                 timeout=1800,
             )
         self.command(self.curie, "build", "--tag", self.images["runner"], timeout=1800)
-        for name, tag in self.images.items():
-            self.image_ids[name] = json.loads(self.command("docker", "image", "inspect", tag))[0][
-                "Id"
-            ]
 
     def values(self, original: Any, **kwargs: Any) -> dict[str, Any]:
         values = original(**kwargs)
@@ -684,7 +715,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         self.worker_token = base64.b64decode(secret["data"]["internalWorkerToken"]).decode()
         self.secrets.extend([self.env["CURIE_API_KEY"], self.worker_token])
         self.forward_api()
-        self.deploy_agents(registry_ref)
+        self.build_agent_bundles(registry_ref)
 
     def forward_api(self) -> None:
         try:
@@ -728,13 +759,57 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         self.api_url = f"http://127.0.0.1:{port}"
         self.env["CURIE_API_URL"] = self.api_url
 
-    def deploy_agents(self, registry_ref: str) -> None:
+    def build_agent_bundles(self, registry_ref: str) -> None:
+        """Build the acme-a and acme-b bundles once for the session install."""
+
         if self.workdir is None:
             raise RuntimeError("kind workdir absent")
-        for letter in ("a", "b"):
+        for letter in AGENT_LETTERS:
+            name = f"acme-{letter}"
+            bundle = self.workdir / name
+            (bundle / ".claude-plugin").mkdir(parents=True)
+            manifest = {
+                "name": name,
+                "version": "0.1.0",
+                "description": "Exercise admitted-agent identity.",
+                "systemPrompt": "Use the supplied runtime marker and publish the candidate change.",
+            }
+            (bundle / ".claude-plugin/plugin.json").write_text(json.dumps(manifest))
+            (bundle / "c4-marker").write_text(self.agent_marker(letter) + "\n")
+            (bundle / "runner.Dockerfile").write_text(
+                "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\n"
+            )
+            self.command(
+                self.curie,
+                "build",
+                "--plugin-dir",
+                str(bundle),
+                "--registry",
+                registry_ref,
+                "--runner-image",
+                registry_ref + "/curie-runner:latest",
+                "--platform",
+                "linux/amd64",
+            )
+            self.bundles[letter] = bundle
+
+    def agent_marker(self, letter: str) -> str:
+        return f"c4-{letter}-{self.run_id}"
+
+    def deploy_case_agents(self) -> None:
+        """Create fresh acme-a and acme-b agents and deploy the session bundles.
+
+        The chart values key sandbox egress and resource profiles by these two
+        agent names, so every case reuses the names with new agent ids.
+        """
+
+        self.agents = []
+        for letter in AGENT_LETTERS:
             name = f"acme-{letter}"
             label = f"acme-{letter}-work"
-            marker = f"c4-{letter}-{self.run_id}"
+            bundle = self.bundles.get(letter)
+            if bundle is None:
+                raise RuntimeError(f"the session bundle for {name} was not built")
             agent = self.api(
                 "POST",
                 "/agents",
@@ -752,31 +827,6 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
                     self.binding(kind, label),
                     expected=201,
                 )
-            bundle = self.workdir / name
-            (bundle / ".claude-plugin").mkdir(parents=True)
-            manifest = {
-                "name": name,
-                "version": "0.1.0",
-                "description": "Exercise admitted-agent identity.",
-                "systemPrompt": "Use the supplied runtime marker and publish the candidate change.",
-            }
-            (bundle / ".claude-plugin/plugin.json").write_text(json.dumps(manifest))
-            (bundle / "c4-marker").write_text(marker + "\n")
-            (bundle / "runner.Dockerfile").write_text(
-                "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\n"
-            )
-            self.command(
-                self.curie,
-                "build",
-                "--plugin-dir",
-                str(bundle),
-                "--registry",
-                registry_ref,
-                "--runner-image",
-                registry_ref + "/curie-runner:latest",
-                "--platform",
-                "linux/amd64",
-            )
             self.command(
                 self.curie,
                 "cluster",
@@ -825,12 +875,237 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
                     agent["id"],
                     name,
                     label,
-                    marker,
+                    self.agent_marker(letter),
                     selected["deployment_id"],
                     selected["bundle_ref"],
                 )
             )
         self.started = True
+
+    def worker_container_env(self) -> list[dict[str, Any]]:
+        deployment = json.loads(
+            self.kubectl("-n", self.namespace, "get", "deployment/curie-worker", "-o", "json")
+        )
+        container = next(
+            c for c in deployment["spec"]["template"]["spec"]["containers"] if c["name"] == "worker"
+        )
+        env: list[dict[str, Any]] = container.get("env", [])
+        return env
+
+    @staticmethod
+    def env_pair(entry: dict[str, Any]) -> tuple[str, str]:
+        if "valueFrom" in entry:
+            return entry["name"], json.dumps(entry["valueFrom"], sort_keys=True)
+        return entry["name"], str(entry.get("value", ""))
+
+    def api_forges(self) -> Any:
+        deployment = json.loads(
+            self.kubectl("-n", self.namespace, "get", "deployment/curie-api", "-o", "json")
+        )
+        container = next(
+            c for c in deployment["spec"]["template"]["spec"]["containers"] if c["name"] == "api"
+        )
+        return json.loads(next(e["value"] for e in container["env"] if e["name"] == "CURIE_FORGES"))
+
+    def resource_names(self, namespace: str, resource: str, *selector: str) -> frozenset[str]:
+        items = json.loads(self.kubectl("-n", namespace, "get", resource, *selector, "-o", "json"))[
+            "items"
+        ]
+        return frozenset(item["metadata"]["name"] for item in items)
+
+    def stream_keys(self) -> frozenset[str]:
+        keys: set[str] = set()
+        cursor = "0"
+        while True:
+            cursor, batch = self.valkey("SCAN", cursor, "TYPE", "stream", "COUNT", "1000")
+            keys.update(str(key) for key in batch)
+            cursor = str(cursor)
+            if cursor == "0":
+                return frozenset(keys)
+
+    def install_snapshot(self) -> InstallSnapshot:
+        """Read every piece of shared install state a case can change."""
+
+        try:
+            rows = self.sql(
+                "SELECT json_build_object("
+                "'agents', (SELECT count(*) FROM curie.agents), "
+                "'work_items', (SELECT count(*) FROM curie.work_items), "
+                "'execution_requests', (SELECT count(*) FROM curie.execution_requests), "
+                "'tenants', (SELECT coalesce(json_agg(id::text), '[]'::json) "
+                "FROM curie.tenants))"
+            )
+            return InstallSnapshot(
+                agents=int(rows["agents"]),
+                work_items=int(rows["work_items"]),
+                execution_requests=int(rows["execution_requests"]),
+                tenants=frozenset(rows["tenants"]),
+                sandbox_claims=self.resource_names(self.namespace, CLAIM_RESOURCE),
+                publication_jobs=self.resource_names(self.publication_namespace(), "jobs"),
+                api_forges=self.api_forges(),
+                worker_env=tuple(sorted(self.env_pair(e) for e in self.worker_container_env())),
+                worker_pods=len(
+                    self.resource_names(
+                        self.namespace, "pods", "-l", "app.kubernetes.io/component=worker"
+                    )
+                ),
+                deployments=self.resource_names(self.namespace, "deployments"),
+                network_policies=self.resource_names(self.namespace, "networkpolicies"),
+                runs_stream_length=int(self.valkey("XLEN", RUNS_STREAM_DEFAULT)),
+                streams=self.stream_keys(),
+            )
+        except (KeyError, StopIteration, TypeError, ValueError) as exc:
+            self.record_failure("shared install snapshot", exc)
+            raise RuntimeError(
+                "shared install snapshot failed; private diagnostics retained"
+            ) from None
+
+    def require_baseline(self) -> InstallSnapshot:
+        if self.baseline is None:
+            raise RuntimeError("the shared install has no recorded baseline")
+        return self.baseline
+
+    def restore_worker_env(self, baseline: InstallSnapshot) -> None:
+        wanted = dict(baseline.worker_env)
+        current = {entry["name"]: entry for entry in self.worker_container_env()}
+        changes: list[str] = []
+        unrestorable: list[str] = []
+        for name, entry in current.items():
+            if name not in wanted:
+                changes.append(name + "-")
+                continue
+            if self.env_pair(entry)[1] == wanted[name]:
+                continue
+            if "valueFrom" in entry or self.is_value_from(wanted[name]):
+                unrestorable.append(name)
+            else:
+                changes.append(f"{name}={wanted[name]}")
+        for name, value in wanted.items():
+            if name in current:
+                continue
+            if self.is_value_from(value):
+                unrestorable.append(name)
+            else:
+                changes.append(f"{name}={value}")
+        if unrestorable:
+            raise CaseIsolationError(
+                "worker_env: valueFrom entries changed and are not restored: "
+                + ", ".join(sorted(unrestorable))
+            )
+        if changes:
+            self.kubectl(
+                "-n",
+                self.namespace,
+                "set",
+                "env",
+                "deployment/curie-worker",
+                "-c",
+                "worker",
+                *changes,
+            )
+
+    @staticmethod
+    def is_value_from(value: str) -> bool:
+        # A snapshot stores a valueFrom entry as its sorted JSON object.
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return False
+        return isinstance(parsed, dict) and len(parsed) == 1 and set(parsed) <= VALUE_FROM_KINDS
+
+    def retire_case_tickets(self) -> None:
+        """Remove every label from every stub ticket except the scenario issue.
+
+        Intake dedupes a labelled ticket against its WorkItem, which the reset
+        truncates. A ticket an earlier case left labelled could otherwise be
+        admitted again for the next case's same-named agents.
+        """
+
+        with self.stub.provider_lock:
+            for row in self.stub._rows("issue"):
+                number = row["number"]
+                if number == SCENARIO_ISSUE or not row.get("labels"):
+                    continue
+                removed = [label["name"] for label in row["labels"]]
+                row["labels"] = []
+                if "updated_at" in row:
+                    # Same shape as tools/github-stub/github_stub.py::_utc.
+                    row["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                self.stub._put("issue", number, row)
+                for name in removed:
+                    self.stub._label_event(number, name, "unlabeled", row["user"])
+            self.stub.sync_gitlab_clock()
+            for iid, issue in list(self.stub.gitlab.issues.items()):
+                for name in list(issue.labels):
+                    self.stub.gitlab.label(iid, name, gitlab.ROOT, add=False)
+            for jira_issue in list(self.stub.jira.issues.values()):
+                for name in list(jira_issue.labels):
+                    self.stub.jira.remove_label(jira_issue.id, name, self.stub.jira.reporter)
+
+    def reset_case(self) -> None:
+        """Return the shared install to its baseline, then verify it is clean."""
+
+        baseline = self.require_baseline()
+        self.worker_replicas(0)
+        self.retire_case_tickets()
+        retired_at = time.monotonic()
+        self.restore_worker_env(baseline)
+        if self.api_forges() != baseline.api_forges:
+
+            def restore(configuration: dict[str, Any]) -> None:
+                configuration.clear()
+                configuration.update(copy.deepcopy(baseline.api_forges))
+
+            self.change_forges(restore)
+        self.kubectl(
+            "-n",
+            self.namespace,
+            "delete",
+            CLAIM_RESOURCE,
+            "--all",
+            "--wait=true",
+            "--timeout=180s",
+            timeout=240,
+        )
+        deadline = time.monotonic() + 180
+        while self.resource_names(self.namespace, CLAIM_RESOURCE):
+            if time.monotonic() >= deadline:
+                raise CaseIsolationError("sandbox_claims: claims remain after deletion")
+            time.sleep(2)
+        self.kubectl(
+            "-n",
+            self.publication_namespace(),
+            "delete",
+            "jobs",
+            "--all",
+            "--cascade=foreground",
+            "--wait=true",
+            "--timeout=180s",
+            timeout=240,
+        )
+        # Every table that references curie.agents (channels, versions,
+        # deployments and their dependants) or curie.work_items is truncated
+        # with them, which releases the case-created tenants those rows named.
+        # The cascade also empties tables whose nullable foreign keys reference
+        # that set, such as credential_redemption_audit_entries and
+        # github_review_deliveries; no case asserts on them.
+        remaining = RETIRE_OBSERVE_SECONDS - (time.monotonic() - retired_at)
+        if remaining > 0:
+            time.sleep(remaining)
+        tenants = ", ".join(f"'{uuid.UUID(tenant)}'" for tenant in sorted(baseline.tenants))
+        self.write_sql(
+            "TRUNCATE curie.work_items, curie.agents CASCADE; "
+            "DELETE FROM curie.tenants" + (f" WHERE id NOT IN ({tenants})" if tenants else "")
+        )
+        self.valkey("XTRIM", RUNS_STREAM_DEFAULT, "MAXLEN", "0")
+        for stream in sorted(self.stream_keys() - baseline.streams):
+            self.valkey("DEL", stream)
+        time.sleep(3)
+        leftovers = leftover_state(baseline, self.install_snapshot())
+        if leftovers:
+            raise CaseIsolationError(
+                "the shared install kept case state after reset: " + "; ".join(leftovers)
+            )
 
     def binding(self, kind: str, label: str | None) -> dict[str, Any]:
         result = {"kind": kind, "address": LOCATIONS[kind], "trigger_label": label}
@@ -1084,7 +1359,10 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
                 "-n", self.namespace, "rollout", "status", "deployment/curie-worker",
                 "--timeout=300s",
             )
-        else:
+        elif self.resource_names(
+            self.namespace, "pods", "-l", "app.kubernetes.io/component=worker"
+        ):
+            # A paused case starts at zero replicas, so there may be no pod to await.
             self.kubectl(
                 "-n", self.namespace, "wait", "--for=delete", "pod",
                 "-l", "app.kubernetes.io/component=worker", "--timeout=180s",
