@@ -36,6 +36,7 @@ from curie_worker.slack_sink import SlackReplyAdapter
 from fastapi.testclient import TestClient
 from slack_sdk.web import WebClient
 
+from apps.api.tests import test_http_email_receivers as email_receivers
 from apps.api.tests import test_http_invocation_membership as membership
 from apps.api.tests.test_http_invocation_membership import synthetic_provider as synthetic_provider
 
@@ -357,3 +358,61 @@ def test_malformed_reply_ref_refuses_without_delivery_state(
         response = membership._post(rig.client, rig.credential, body, proof)
         assert response.status_code == 401, response.text
         assert valkey.xrange(runs_stream) == []
+
+
+def _email_body(
+    *, delivery_id: str, reply_ref: str, text: str = "Synthetic email request",
+) -> bytes:
+    """@spec HTTP-INVOCATION-EXECUTION-27/29: an email TurnIn whose adapter names a reply_ref."""
+    value = json.loads(email_receivers._body(delivery_id=delivery_id, text=text))
+    value["reply_ref"] = reply_ref
+    return json.dumps(value, separators=(",", ":")).encode()
+
+
+def test_email_turn_intent_binds_the_verified_email_delivery(
+    clean_db: None, valkey: redis.Redis, runs_stream: str, synthetic_provider: SimpleNamespace,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-27/29: an email turn has an intent but no reply slot.
+
+    The email proof's immutable fields and the whole parsed body, reply_ref
+    included, are its intent: the same message is a duplicate, any other body
+    under its Message-ID is a conflict, and no placeholder is queued.
+    """
+    scope = email_receivers._email_scope(synthetic_provider.url)
+    try:
+        with email_receivers._client(synthetic_provider, scope) as client:
+            token = email_receivers._email_credential(client, scope)
+            delivery = "<synthetic-" + uuid.uuid4().hex + "@example.com>"
+            body = _email_body(delivery_id=delivery, reply_ref="<parent@example.com>")
+            accepted = email_receivers._post(
+                client, token, body, email_receivers._proof(scope, body),
+            )
+            assert accepted.status_code == 200, accepted.text
+            assert accepted.json()["duplicate"] is False
+            entries = valkey.xrange(runs_stream)
+            assert len(entries) == 1
+            turn = QueuedTurn.model_validate_json(entries[0][1]["payload"])
+            assert turn.reply_handle is not None and turn.reply_handle.kind == "email"
+            assert turn.reply_handle.placeholder is None
+
+            again = email_receivers._post(
+                client, token, body, email_receivers._proof(scope, body),
+            )
+            assert again.status_code == 200, again.text
+            assert again.json() == {
+                "event_id": accepted.json()["event_id"],
+                "stream_id": accepted.json()["stream_id"], "duplicate": True,
+            }
+            for changed in (
+                _email_body(delivery_id=delivery, reply_ref="<other@example.com>"),
+                _email_body(delivery_id=delivery, reply_ref="<parent@example.com>",
+                            text="Synthetic changed request"),
+            ):
+                conflict = email_receivers._post(
+                    client, token, changed, email_receivers._proof(scope, changed),
+                )
+                assert conflict.status_code == 409, conflict.text
+                assert conflict.json() == {"detail": "delivery_intent_conflict"}
+            assert valkey.xrange(runs_stream) == entries
+    finally:
+        email_receivers._cleanup(valkey, scope)
