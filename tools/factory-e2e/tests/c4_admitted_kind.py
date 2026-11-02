@@ -35,6 +35,9 @@ REPOSITORY = "acme-corp/acme-bot"
 LOCATIONS = {"github": REPOSITORY, "gitlab": REPOSITORY, "jira": "acme-jira"}
 AGENT_LETTERS = ("a", "b")
 CLAIM_RESOURCE = "sandboxclaims.extensions.agents.x-k8s.io"
+SANDBOX_RESOURCE = "sandboxes.agents.x-k8s.io"
+# apps/worker/src/curie_worker/sandbox/k8s.py ADMISSION_CLAIM_LABEL
+ADMISSION_CLAIM_LABEL = "sandbox.users.io/curie-admission-claim"
 # CI builds the candidate CLI and images once per workflow run; the fixture
 # then tags those images instead of rebuilding them from the checkout.
 CANDIDATE_CLI_ENV = "CURIE_C4_CANDIDATE_CLI"
@@ -917,6 +920,28 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         ]
         return frozenset(item["metadata"]["name"] for item in items)
 
+    def claimed_sandbox_names(self) -> frozenset[str]:
+        """Sandboxes a SandboxClaim created; warm pool members are not counted."""
+
+        items = json.loads(
+            self.kubectl("-n", self.namespace, "get", SANDBOX_RESOURCE, "-o", "json")
+        )["items"]
+        return frozenset(
+            item["metadata"]["name"]
+            for item in items
+            if ADMISSION_CLAIM_LABEL in (item["metadata"].get("labels") or {})
+            or any(
+                owner.get("kind") == "SandboxClaim"
+                for owner in item["metadata"].get("ownerReferences") or []
+            )
+        )
+
+    def terminating_pod_names(self) -> frozenset[str]:
+        items = json.loads(self.kubectl("-n", self.namespace, "get", "pods", "-o", "json"))["items"]
+        return frozenset(
+            item["metadata"]["name"] for item in items if item["metadata"].get("deletionTimestamp")
+        )
+
     def stream_keys(self) -> frozenset[str]:
         keys: set[str] = set()
         cursor = "0"
@@ -957,6 +982,8 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
                 network_policies=self.resource_names(self.namespace, "networkpolicies"),
                 runs_stream_length=int(self.valkey("XLEN", RUNS_STREAM_DEFAULT)),
                 streams=self.stream_keys(),
+                claimed_sandboxes=self.claimed_sandbox_names(),
+                terminating_pods=self.terminating_pod_names(),
             )
         except (KeyError, StopIteration, TypeError, ValueError) as exc:
             self.record_failure("shared install snapshot", exc)
@@ -1075,6 +1102,25 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         while self.resource_names(self.namespace, CLAIM_RESOURCE):
             if time.monotonic() >= deadline:
                 raise CaseIsolationError("sandbox_claims: claims remain after deletion")
+            time.sleep(2)
+        # Claim deletion returns before the claimed Sandbox and its runner pod
+        # are garbage collected; both hold ResourceQuota until they are gone.
+        deadline = time.monotonic() + 180
+        while True:
+            remaining_names = {
+                "claimed_sandboxes": self.claimed_sandbox_names(),
+                "terminating_pods": self.terminating_pod_names(),
+            }
+            pending = {field: names for field, names in remaining_names.items() if names}
+            if not pending:
+                break
+            if time.monotonic() >= deadline:
+                raise CaseIsolationError(
+                    "; ".join(
+                        f"{field}: {', '.join(sorted(names))} remain after claim deletion"
+                        for field, names in pending.items()
+                    )
+                )
             time.sleep(2)
         self.kubectl(
             "-n",

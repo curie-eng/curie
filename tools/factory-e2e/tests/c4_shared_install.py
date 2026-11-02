@@ -32,12 +32,16 @@ class InstallSnapshot:
     network_policies: frozenset[str]
     runs_stream_length: int
     streams: frozenset[str]
+    claimed_sandboxes: frozenset[str]
+    terminating_pods: frozenset[str]
 
 
 _ZERO_FIELDS = frozenset(
     {"agents", "work_items", "execution_requests", "worker_pods", "runs_stream_length"}
 )
-_EMPTY_FIELDS = frozenset({"sandbox_claims", "publication_jobs"})
+_EMPTY_FIELDS = frozenset(
+    {"sandbox_claims", "publication_jobs", "claimed_sandboxes", "terminating_pods"}
+)
 _BASELINE_SET_FIELDS = frozenset({"tenants", "deployments", "network_policies", "streams"})
 
 
