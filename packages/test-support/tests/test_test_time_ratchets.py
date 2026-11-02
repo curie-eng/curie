@@ -795,3 +795,49 @@ def test_changed_nested_helper_cannot_select_an_unchanged_global_case(
     targets = budget_targets(tmp_path, [file + "::test_existing"])
     assert targets == set()
     assert budget_failure(file + "::test_existing", 120, targets) is None
+
+
+@pytest.mark.parametrize("invalid", [b"broken = (\n", b"# \xff\n"])
+@pytest.mark.parametrize("version", ["current", "base", "added"])
+def test_unparseable_changed_file_does_not_interrupt_other_budget_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: bytes, version: str
+) -> None:
+    from curie_test_support.duration_budget import budget_targets
+
+    valid = "def test_case(): pass\n"
+    file = duration_history(tmp_path, monkeypatch, valid, valid)
+    if version == "added":
+        file = "tests/test_added.py"
+    (tmp_path / file).write_bytes(valid.encode() + invalid)
+    git(tmp_path, "add", ".")
+    git(tmp_path, "commit", "-qm", "Add unparseable source")
+    if version == "base":
+        git(tmp_path, "update-ref", "refs/remotes/origin/main", "HEAD")
+        source(tmp_path, file, valid)
+    source(tmp_path, "tests/test_valid.py", "def test_valid(): pass\n")
+    git(tmp_path, "add", ".")
+    git(tmp_path, "commit", "-qm", "Add a valid test")
+    valid_nodeid = "tests/test_valid.py::test_valid"
+    assert budget_targets(tmp_path, [file + "::test_case", valid_nodeid]) == {valid_nodeid}
+
+
+@pytest.mark.parametrize("edit", ["replace", "delete"])
+def test_each_conditional_definition_can_select_the_same_test_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, edit: str
+) -> None:
+    from curie_test_support.duration_budget import budget_targets
+
+    before = (
+        "if True:\n"
+        "    def test_case():\n"
+        "        assert True\n"
+        "        assert 1\n"
+        "else:\n"
+        "    def test_case(): pass\n"
+    )
+    replacement = "        assert 2\n" if edit == "replace" else ""
+    file = duration_history(
+        tmp_path, monkeypatch, before, before.replace("        assert 1\n", replacement)
+    )
+    nodeid = file + "::test_case"
+    assert budget_targets(tmp_path, [nodeid]) == {nodeid}
