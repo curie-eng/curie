@@ -3316,19 +3316,18 @@ jobs:
           path: target/factory-e2e/scripted-*.json
           if-no-files-found: warn
 
-  # The module builds its own candidate binary and api, worker and runner
-  # images from the checkout, then creates and deletes up to four sequential
-  # kind clusters, so it needs none of the upstream build artifacts. It is
-  # selected exactly like the scripted factory scenario (#4620).
-  # The admitted agent runtime module (#4619) gives every case its own kind
-  # cluster through a function-scoped fixture, so its cases share no state
-  # across runners. Each leg runs one contiguous collection-order block, so a
-  # case still runs after the cases that precede it today. The legs partition
-  # the module exactly, and `E2E required` needs every leg.
+  # The admitted agent runtime module (#4619) loads the candidate CLI built by
+  # rust-build and the api, worker, ui and runner images built by ci-images,
+  # so it rebuilds nothing from the checkout. It is selected exactly like the
+  # scripted factory scenario (#4620). Each leg provisions one kind cluster and
+  # one platform install, and gives every case fresh agents on that install
+  # with a verified clean start. Each leg runs one contiguous collection-order
+  # block, so a case still runs after the cases that precede it. The legs
+  # partition the module exactly, and `E2E required` needs every leg.
   factory-admitted-agent:
     name: Admitted agent runtime regressions (kind, shard ${{ matrix.shard }}/5)
     runs-on: ubuntu-24.04
-    needs: [changes]
+    needs: [rust-build, changes, ci-images]
     if: ${{ needs.changes.outputs.factory == 'true' }}
     timeout-minutes: 120
     strategy:
@@ -3401,22 +3400,51 @@ jobs:
           install_only: true
       # This ubuntu-24.04 job owns a disposable hosted runner. The Android,
       # .NET and Haskell SDKs are unused here; remove only those preinstalled
-      # SDK trees before candidate builds and image imports.
-      - name: Free disk for the disposable factory cluster
+      # SDK trees before candidate builds and image imports. The removal runs
+      # in the background so it overlaps the artifact download and image load.
+      - name: Start freeing disk for the disposable factory cluster
         run: |
           set -euo pipefail
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          # The background removal inherits descriptor 9 and holds this lock
+          # until it exits, so the finish step can block on the lock.
+          exec 9>"$RUNNER_TEMP/free-disk.lock"
+          flock 9
+          nohup bash -c 'sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup; echo $? > "$1"' _ "$RUNNER_TEMP/free-disk.status" >/dev/null 2>&1 &
+      - name: Download the curie binary built by the Rust job
+        uses: actions/download-artifact@v8
+        with:
+          name: curie-x86_64-linux-${{ github.sha }}
+          path: cli/target/release
+      - name: Make the binary executable
+        run: chmod +x cli/target/release/curie
+      - name: Load the four images built by the ci-images job
+        uses: ./.github/actions/load-ci-images
+        with:
+          images: "{api,worker,ui,runner}"
+      - name: Finish freeing disk for the disposable factory cluster
+        run: |
+          set -euo pipefail
+          timeout 600 flock "$RUNNER_TEMP/free-disk.lock" true
+          status="$(cat "$RUNNER_TEMP/free-disk.status")"
+          if [ "$status" != "0" ]; then
+            echo "disk cleanup exited with status $status" >&2
+            exit 1
+          fi
           df -h /
       - name: Run admitted agent runtime regressions
         env:
           CASE_SHARD: ${{ matrix.shard }}/5
-        run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_admitted_agent.py --case-shard "$CASE_SHARD"
-      - name: Upload the publication failure digest
+          CURIE_C4_CANDIDATE_CLI: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_C4_CANDIDATE_IMAGES: curie-ci/{component}:candidate
+        run: uv run pytest -q -n 0 --durations=0 tools/factory-e2e/tests/test_c4_admitted_agent.py --case-shard "$CASE_SHARD"
+      - name: Upload the admitted agent failure digests
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: admitted-publication-digest-${{ github.sha }}-${{ matrix.shard }}
-          path: target/factory-e2e/admitted-publication-failure-*.json
+          path: |
+            target/factory-e2e/admitted-publication-failure-*.json
+            target/factory-e2e/admitted-isolation-failure-*.json
           if-no-files-found: ignore
 
   forge-instance-regression:
