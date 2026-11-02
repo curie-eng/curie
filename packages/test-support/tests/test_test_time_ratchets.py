@@ -1,5 +1,6 @@
 """Behavior checks for generated test-time baselines and the pytest budget."""
 
+import hashlib
 import json
 import os
 import subprocess
@@ -175,7 +176,10 @@ def test_duration_baseline_uses_call_phase_and_normalizes_xdist(tmp_path: Path) 
 
 
 def test_duration_new_violation_fails() -> None:
-    assert "exceeds" in (budget_failure("tests/test_case.py::test_slow", 30.01, set()) or "")
+    assert "exceeds" in (
+        budget_failure("tests/test_case.py::test_slow", 40.01, {"tests/test_case.py::test_slow"})
+        or ""
+    )
 
 
 def test_fast_exempt_duration_never_fails_ci() -> None:
@@ -429,7 +433,7 @@ def test_stale_sleep_is_written_to_step_summary(
     assert "stale tests/queue_fixtures.py" in summary.read_text()
 
 
-def test_new_exemption_cannot_bypass_merge_base_budget(tmp_path: Path) -> None:
+def test_slow_observations_can_be_recorded_without_growing_static_costs(tmp_path: Path) -> None:
     git(tmp_path, "init", "-q", "-b", "main")
     git(tmp_path, "config", "user.name", "Example")
     git(tmp_path, "config", "user.email", "test@example.com")
@@ -439,10 +443,11 @@ def test_new_exemption_cannot_bypass_merge_base_budget(tmp_path: Path) -> None:
     git(tmp_path, "add", ".")
     git(tmp_path, "commit", "-qm", "Initial budget")
     git(tmp_path, "update-ref", "refs/remotes/origin/main", "HEAD")
-    # Editing the working exemption file must not admit a larger baseline.
     result = command(tmp_path, "--regenerate", *duration_artifacts(tmp_path, 31, 32))
-    assert result.returncode == 1
-    assert "durations: new violation" in result.stdout
+    assert result.returncode == 0, result.stdout
+    assert json.loads((tmp_path / BASELINE).read_text())["durations"] == [
+        "tests/test_case.py::test_case"
+    ]
 
 
 def test_xdist_transports_duration_collection_observations(tmp_path: Path) -> None:
@@ -578,3 +583,79 @@ def test_removing_a_current_exemption_removes_runtime_grandfathering(tmp_path: P
     assert result.returncode == 0, result.stdout + result.stderr
     assert "1 passed" in result.stdout
     assert "s call tests/test_case.py::test_case" not in result.stdout
+
+
+@pytest.mark.parametrize("seconds", [31.462, 42.426, 34.827, 120])
+def test_unrelated_existing_slow_test_cannot_fail_the_shard(seconds: float) -> None:
+    assert budget_failure("tests/test_case.py::test_unrelated", seconds, set()) is None
+
+
+def test_changed_test_has_ten_seconds_of_budget_headroom() -> None:
+    nodeid = "tests/test_case.py::test_changed"
+    assert budget_failure(nodeid, 40, {nodeid}) is None
+    assert "exceeds" in (budget_failure(nodeid, 40.01, {nodeid}) or "")
+
+
+@pytest.mark.parametrize(
+    "nodeid", ["tests/test_case.py::test_case[a]", "tests/test_case.py::test_case[a@example.com]"]
+)
+def test_independent_xdist_group_is_removed_from_parameterized_nodeid(nodeid: str) -> None:
+    assert canonical_nodeid(nodeid + "@" + nodeid) == nodeid
+
+
+def test_budget_scope_uses_the_diff_and_base_inventory(tmp_path: Path) -> None:
+    from curie_test_support.duration_budget import budget_targets
+
+    git(tmp_path, "init", "-q", "-b", "main")
+    git(tmp_path, "config", "user.name", "Example")
+    git(tmp_path, "config", "user.email", "test@example.com")
+    git(tmp_path, "config", "core.hooksPath", os.devnull)
+    original = (
+        "def test_existing(): pass\n\n"
+        "def test_changed():\n    return 1\n\n"
+        "def test_untouched_in_same_file(): pass\n"
+    )
+    file = "tests/test_case.py"
+    source(tmp_path, file, original)
+    git(tmp_path, "add", ".")
+    git(tmp_path, "commit", "-qm", "Initial test cases")
+    git(tmp_path, "update-ref", "refs/remotes/origin/main", "HEAD")
+    known_ids = [
+        file + "::" + name
+        for name in ("test_existing", "test_changed", "test_untouched_in_same_file")
+    ]
+    known = {file: sorted(hashlib.sha256(nodeid.encode()).hexdigest() for nodeid in known_ids)}
+    source(tmp_path, file, original.replace("return 1", "return 2") + "\ndef test_added(): pass\n")
+    git(tmp_path, "commit", "-qam", "Change one test and add another")
+    collected = [*known_ids, file + "::test_added", file + "::test_existing[new]"]
+    enforced = budget_targets(tmp_path, collected, known)
+    assert enforced == {
+        file + "::test_changed",
+        file + "::test_added",
+        file + "::test_existing[new]",
+    }
+    assert budget_failure(file + "::test_untouched_in_same_file", 120, enforced) is None
+    assert budget_failure(file + "::test_existing", 120, enforced) is None
+    assert "exceeds" in (budget_failure(file + "::test_changed", 120, enforced) or "")
+    assert "exceeds" in (budget_failure(file + "::test_existing[new]", 120, enforced) or "")
+    assert budget_targets(tmp_path, collected, None) == {
+        file + "::test_changed",
+        file + "::test_added",
+    }
+
+
+def test_regeneration_records_hashed_known_case_inventory(tmp_path: Path) -> None:
+    source(tmp_path, "tests/test_case.py", "def test_case(): pass\n")
+    node_hash = hashlib.sha256(b"tests/test_case.py::test_case").hexdigest()
+    arguments = duration_artifacts(tmp_path, 31, 32)
+    for index in range(2):
+        path = tmp_path / f"run-{index}.log"
+        with path.open("a") as artifact:
+            artifact.write(
+                "test-time known: " + json.dumps({"tests/test_case.py": [node_hash]}) + "\n"
+            )
+    result = command(tmp_path, "--regenerate", *arguments)
+    assert result.returncode == 0, result.stdout
+    assert json.loads((tmp_path / BASELINE).read_text())["known_tests"] == {
+        "tests/test_case.py": [node_hash]
+    }
