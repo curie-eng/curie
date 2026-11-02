@@ -260,6 +260,10 @@ def observe_until(predicate: Callable[[], Any], *, seconds: int = 180) -> Any:
 
 def execution_observed(run: AdmittedKind, ticket: Ticket) -> dict[str, Any] | None:
     row = run.request(ticket)
+    if row and row["started_at"] is None and row["status"] == "waiting" and (
+        row["last_deferral_reason"] == "acquire_lost"
+    ):
+        return None
     if row and (row["started_at"] is not None or row["last_deferral_reason"] is not None):
         return row
     return None
