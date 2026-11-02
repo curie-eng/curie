@@ -101,7 +101,9 @@ def slack_evidence(body: dict[str, Any]) -> dict[str, Any] | None:
     sender's team. ``is_ext_shared_channel`` is kept only as a strict bool,
     because the API's mention path needs it to be exactly False. Every
     enterprise signal (an enterprise id anywhere, a ``context_enterprise_id``,
-    or ``is_enterprise_install: true``) goes into ``enterprise_ids``. None when the
+    or ``is_enterprise_install: true``) goes into ``enterprise_ids``. An event's
+    ``source_team`` is copied as ``event_source_team`` only when present (ADR
+    0261). None when the
     delivery names no user, so a bot message is skipped rather than guessed.
     """
     event = body.get("event")
@@ -138,6 +140,10 @@ def slack_evidence(body: dict[str, Any]) -> dict[str, Any] | None:
             "event_team": _text(event.get("team")),
             "is_ext_shared_channel": shared if isinstance(shared, bool) else None,
         }
+        # Copied only when present, so evidence without it keeps its exact
+        # signed bytes. @spec HTTP-INVOCATION-EXECUTION-24.
+        if (source_team := _text(event.get("source_team"))) is not None:
+            evidence["event_source_team"] = source_team
     else:
         user = _block(body.get("user"))
         user_id = _text(user.get("id"))
