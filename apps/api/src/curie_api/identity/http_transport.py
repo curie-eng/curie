@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import ssl
 import threading
@@ -257,6 +258,10 @@ def _valid_headers(response: httpx.Response) -> bool:
     )
 
 
+# Upper bound for one provider exchange; a caller's earlier deadline wins.
+_LOOKUP_SECONDS = 2.0
+
+
 class HttpIdentityClient:
     """@spec HTTP-IDENTITY-TRANSPORT-1 to HTTP-IDENTITY-TRANSPORT-5."""
 
@@ -291,11 +296,17 @@ class HttpIdentityClient:
 
     async def lookup(
         self, *, target: LookupTarget, bearer: ProviderBearer,
-        request: LookupRequestV1, limits: FreshnessLimits,
+        request: LookupRequestV1, limits: FreshnessLimits, deadline: float | None = None,
     ) -> Result:
-        """@spec HTTP-IDENTITY-TRANSPORT-1 to HTTP-IDENTITY-TRANSPORT-5."""
+        """One exchange within two seconds or the caller's earlier loop-time ``deadline``.
+
+        @spec HTTP-IDENTITY-TRANSPORT-1 to HTTP-IDENTITY-TRANSPORT-5.
+        """
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + 2.0
+        own = loop.time() + _LOOKUP_SECONDS
+        if deadline is not None and (type(deadline) is not float or not math.isfinite(deadline)):
+            raise ValueError("invalid_lookup_context") from None
+        deadline = own if deadline is None else min(own, deadline)
         unavailable = FactsRefusal(code="unavailable")
         if self._closing:
             return unavailable

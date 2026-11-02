@@ -14,6 +14,7 @@ from curie_internal.identity_approval import (
     ApprovalGrantAuthorityResponseV1,
 )
 from curie_internal.identity_authority import (
+    IDENTITY_CALLER_WAIT_SECONDS,
     BindingClassificationRequestV1,
     BindingClassificationResponseV1,
     TurnAuthorityRequestV1,
@@ -118,11 +119,11 @@ class HttpTurnAuthorityClient:
         except (ValueError, TypeError, AttributeError, RecursionError):
             raise ValueError("invalid_turn_authority_request") from None
         try:
-            async with asyncio.timeout(5.0):
+            async with asyncio.timeout(IDENTITY_CALLER_WAIT_SECONDS):
                 outgoing = self._client.build_request(
                     "POST", self._url,
                     headers={"X-Curie-Worker-Token": self._token},
-                    json=captured.model_dump(mode="json"), timeout=5.0,
+                    json=captured.model_dump(mode="json"), timeout=IDENTITY_CALLER_WAIT_SECONDS,
                 )
                 for header in ("Authorization", "X-API-Key", "Cookie"):
                     outgoing.headers.pop(header, None)
