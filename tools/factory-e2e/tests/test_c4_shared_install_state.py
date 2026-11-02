@@ -42,6 +42,8 @@ def clean_baseline() -> InstallSnapshot:
         network_policies=frozenset({"curie-runner-ingress"}),
         runs_stream_length=0,
         streams=frozenset({"curie:runs"}),
+        claimed_sandboxes=frozenset(),
+        terminating_pods=frozenset(),
     )
 
 
@@ -72,6 +74,8 @@ def test_separately_built_equal_snapshot_is_clean() -> None:
         network_policies=frozenset(["curie-runner-ingress"]),
         runs_stream_length=0,
         streams=frozenset(["curie:runs"]),
+        claimed_sandboxes=frozenset(),
+        terminating_pods=frozenset(),
     )
     assert leftover_state(baseline, current) == []
 
@@ -99,6 +103,8 @@ def test_separately_built_equal_snapshot_is_clean() -> None:
         ("network_policies", frozenset()),
         ("runs_stream_length", 4),
         ("streams", frozenset({"curie:runs", "curie:other"})),
+        ("claimed_sandboxes", frozenset({"sandbox-1"})),
+        ("terminating_pods", frozenset({"pod-1"})),
     ],
 )
 def test_single_violation_yields_one_message_naming_field(field: str, value: object) -> None:
@@ -110,12 +116,39 @@ def test_single_violation_yields_one_message_naming_field(field: str, value: obj
 
 
 def test_zero_rules_ignore_baseline() -> None:
-    baseline = replace(clean_baseline(), agents=2, worker_pods=1)
-    current = replace(baseline, agents=2, worker_pods=1)
+    baseline = replace(
+        clean_baseline(),
+        agents=2,
+        worker_pods=1,
+        claimed_sandboxes=frozenset({"sandbox-1"}),
+        terminating_pods=frozenset({"pod-1"}),
+    )
+    current = replace(baseline)
     messages = leftover_state(baseline, current)
-    assert len(messages) == 2
+    assert len(messages) == 4
     assert any("agents" in m for m in messages)
     assert any("worker_pods" in m for m in messages)
+    assert any("claimed_sandboxes" in m for m in messages)
+    assert any("terminating_pods" in m for m in messages)
+
+
+def test_leftover_claimed_sandbox_and_terminating_pod_are_named() -> None:
+    baseline = clean_baseline()
+    current = replace(
+        baseline,
+        claimed_sandboxes=frozenset({"acme-claimed-sandbox"}),
+        terminating_pods=frozenset({"acme-runner-pod"}),
+    )
+    messages = leftover_state(baseline, current)
+    assert len(messages) == 2
+    sandbox = [m for m in messages if "claimed_sandboxes" in m]
+    pod = [m for m in messages if "terminating_pods" in m]
+    assert len(sandbox) == 1
+    assert len(pod) == 1
+    assert "acme-claimed-sandbox" in sandbox[0]
+    assert "acme-runner-pod" not in sandbox[0]
+    assert "acme-runner-pod" in pod[0]
+    assert "acme-claimed-sandbox" not in pod[0]
 
 
 def test_extra_deployment_is_named() -> None:
