@@ -101,6 +101,18 @@ async def observe_pending_approvals(
     record_metric("curie.approval.pending.age", age, attributes=attributes)
 
 
+class SealedExpiryCursor:
+    """Round-robin keyset position over the sealed expiry lane.
+
+    Held by the caller across passes so rows the expiry owner keeps refusing
+    (an unverifiable capsule) cannot fill every batch and starve later rows.
+    @spec HTTP-APPROVAL-CONTINUITY-10.
+    """
+
+    def __init__(self) -> None:
+        self.after: tuple[datetime, uuid.UUID] | None = None
+
+
 async def sweep_expired_approvals(
     session: AsyncSession,
     resume_queue: ResumeQueue,
@@ -108,6 +120,7 @@ async def sweep_expired_approvals(
     now: datetime | None = None,
     limit: int = 100,
     http_expiry: Callable[[uuid.UUID], Awaitable[Approval | None]] | None = None,
+    sealed_cursor: SealedExpiryCursor | None = None,
 ) -> int:
     """One sweep pass: expire every lapsed pending approval and wake its session.
 
@@ -159,12 +172,22 @@ async def sweep_expired_approvals(
             break
     sealed_ids: list[uuid.UUID] = []
     if http_expiry is not None:
-        sealed_ids = [
-            record.id
-            for record in await crud_approvals.list_expired_pending_approvals(
+        # One page per pass from a round-robin cursor with wraparound, so rows
+        # the owner keeps refusing cannot fill every batch and starve later ones.
+        cursor = sealed_cursor if sealed_cursor is not None else SealedExpiryCursor()
+        sealed_page = await crud_approvals.list_expired_pending_approvals(
+            session, now=now, limit=limit, sealed=True, after=cursor.after
+        )
+        if not sealed_page and cursor.after is not None:
+            sealed_page = await crud_approvals.list_expired_pending_approvals(
                 session, now=now, limit=limit, sealed=True
             )
-        ]
+        cursor.after = (
+            (cast(datetime, sealed_page[-1].expires_at), sealed_page[-1].id)
+            if len(sealed_page) >= limit
+            else None
+        )
+        sealed_ids = [record.id for record in sealed_page]
     await session.commit()
     for approval_id in sealed_ids:
         assert http_expiry is not None
@@ -320,6 +343,7 @@ async def run_expiry_sweeper(
     """
 
     last_success_monotonic: float | None = None
+    sealed_cursor = SealedExpiryCursor()
     while not stop.is_set():
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval_s)
@@ -346,6 +370,7 @@ async def run_expiry_sweeper(
                     else:
                         await sweep_expired_approvals(
                             session, resume_queue, http_expiry=http_expiry,
+                            sealed_cursor=sealed_cursor,
                         )
                     await crud_publications.reap_terminal_publication_patches(
                         session,
