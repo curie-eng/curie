@@ -689,6 +689,13 @@ async def resolve_approval(
         # refresh re-acquires the fence and reads the current actor and policy.
         was_restricted = team_decision.restricted
         await lock_identity_reader(session)
+        # @spec HTTP-APPROVAL-CONTINUITY-14: a role change or adoption committed
+        # since the first classification (say, during the approver lookup) is
+        # seen here, under the lock the expiry and claim below commit under.
+        if await approval_is_selected(
+            session, approval, runtime=identity_runtime(request.app.state),
+        ):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "unsupported_approval")
         team_decision = await approval_team_decision(session, approval, principal)
         current_binding = await crud_approvals.get_approval_route_binding(session, approval)
         if (was_restricted != team_decision.restricted

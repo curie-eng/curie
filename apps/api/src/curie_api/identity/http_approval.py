@@ -160,7 +160,8 @@ async def _selected(
 
     A candidate in an adopted tenant selects when it requires HTTP identity
     (the one per-binding owner), or when it is not the approval agent's own
-    binding in the agent's tenant. An agent in an adopted tenant is selected
+    binding in the agent's tenant, which is every candidate of an agent-less
+    approval. An agent in an adopted tenant is selected
     unless its route resolves only to its own bindings there: only those show
     its approver role is legacy-evaluable. A tenant without HTTP selection keeps
     agent/route disagreement and ambiguity. @spec HTTP-APPROVAL-CONTINUITY-1/14.
@@ -187,7 +188,8 @@ async def _selected(
     for binding in candidates:
         if not await _http_tenant(session, binding.tenant_id):
             continue
-        if (agent is not None and not own(binding)) or await binding_requires_http_identity(
+        # Without an agent there is no approver role to read: any adopted candidate selects.
+        if not own(binding) or await binding_requires_http_identity(
             session, runtime, binding,
         ):
             return True

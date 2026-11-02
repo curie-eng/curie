@@ -41,6 +41,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from opentelemetry.trace import SpanKind
 from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import errors as crud_errors
@@ -69,6 +70,7 @@ from ..identity.http_approval_answer import (
     answer_http_approval,
     publish_answered_resume,
 )
+from ..identity_fence import lock_identity_reader
 from ..models import AgentChannel, Approval, ApprovalAuditEntry, ApprovalStatus
 from ..remediation_approvals import REMEDIATION_PURPOSE, settle_remediation_approval
 from ..resumequeue import ResumeQueue, approval_trace_context, build_resume_turn
@@ -305,6 +307,18 @@ async def recover_approval(
     # own, and a session already inside a transaction cannot begin another.
     await session.commit()
 
+    async def still_legacy(settling: AsyncSession) -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-14: classify again in the settling transaction.
+
+        A role change or adoption committed since the classification above
+        refuses as a selected row without an authenticated actor does.
+        """
+        await lock_identity_reader(settling)
+        if await approval_is_selected(
+            settling, approval, runtime=identity_runtime(request.app.state),
+        ):
+            raise HTTPException(status.HTTP_409_CONFLICT, "unsupported_approval")
+
     try:
         with operation_span(
             "curie.approval.recover",
@@ -321,6 +335,7 @@ async def recover_approval(
                 actor_channel=principal.actor_channel,
                 principal_kind=principal.kind,
                 facts=facts,
+                guard=still_legacy,
             )
     except crud_errors.PublicationSettlementConflict as exc:
         # The approval's publication moved between the read and the settlement.

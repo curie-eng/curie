@@ -61,6 +61,7 @@ from curie_api.crud import publications as crud_publications
 from .config import get_settings
 from .identity.http_approval import approval_is_selected
 from .identity.http_invocation import HttpInvocationRuntime
+from .identity_fence import lock_identity_reader
 from .models import Approval, ApprovalStatus
 from .remediation_approvals import (
     REMEDIATION_PURPOSE,
@@ -216,6 +217,21 @@ async def sweep_expired_approvals(
 
     flipped = 0
     for approval_id, stored_parent in approval_work:
+        # @spec HTTP-APPROVAL-CONTINUITY-14: classify again under the identity
+        # reader lock in the transaction the flip commits; a role change since
+        # the page read leaves a now-selected row to the sealing owner.
+        try:
+            await lock_identity_reader(session)
+            current = await session.get(Approval, approval_id, populate_existing=True)
+            still_legacy = current is not None and not await approval_is_selected(
+                session, current, runtime=identity_runtime,
+            )
+        except HTTPException:
+            still_legacy = False
+        if not still_legacy:
+            await session.rollback()
+            logger.warning("approval %s no longer legacy-expirable; left pending", approval_id)
+            continue
         try:
             with operation_span(
                 "curie.approval.expire",
