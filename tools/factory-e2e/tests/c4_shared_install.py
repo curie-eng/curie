@@ -34,6 +34,10 @@ class InstallSnapshot:
     streams: frozenset[str]
     claimed_sandboxes: frozenset[str]
     terminating_pods: frozenset[str]
+    # Exact row count of every inventoried table in the curie schema, sorted.
+    table_rows: tuple[tuple[str, int], ...]
+    # Valkey keys with no TTL, so state a case leaves behind cannot expire.
+    persistent_keys: frozenset[str]
 
 
 _ZERO_FIELDS = frozenset(
@@ -42,7 +46,9 @@ _ZERO_FIELDS = frozenset(
 _EMPTY_FIELDS = frozenset(
     {"sandbox_claims", "publication_jobs", "claimed_sandboxes", "terminating_pods"}
 )
-_BASELINE_SET_FIELDS = frozenset({"tenants", "deployments", "network_policies", "streams"})
+_BASELINE_SET_FIELDS = frozenset(
+    {"tenants", "deployments", "network_policies", "streams", "persistent_keys"}
+)
 
 
 def _names(values: frozenset[str] | set[str]) -> str:
@@ -81,6 +87,21 @@ def _env_difference(
     return "worker_env: " + "; ".join(parts)
 
 
+def _table_rows_difference(
+    baseline: tuple[tuple[str, int], ...], current: tuple[tuple[str, int], ...]
+) -> str | None:
+    before, after = dict(baseline), dict(current)
+    parts = []
+    for table in sorted(before.keys() | after.keys()):
+        if table not in after:
+            parts.append(f"{table} {before[table]} -> absent")
+        elif table not in before:
+            parts.append(f"{table} absent -> {after[table]}")
+        elif before[table] != after[table]:
+            parts.append(f"{table} {before[table]} -> {after[table]}")
+    return "table_rows: " + ", ".join(parts) if parts else None
+
+
 def leftover_state(baseline: InstallSnapshot, current: InstallSnapshot) -> list[str]:
     """One stable, secret-free message per leftover; [] means the install is clean."""
 
@@ -99,6 +120,8 @@ def leftover_state(baseline: InstallSnapshot, current: InstallSnapshot) -> list[
             message = _set_difference(name, before, after)
         elif name == "worker_env":
             message = _env_difference(before, after)
+        elif name == "table_rows":
+            message = _table_rows_difference(before, after)
         elif after != before:
             # api_forges: CURIE_FORGES content is not reported.
             message = f"{name}: differs from the baseline"

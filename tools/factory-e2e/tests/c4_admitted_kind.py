@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import selectors
 import shutil
 import sqlite3
@@ -17,6 +18,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -48,6 +50,29 @@ SCENARIO_ISSUE = 3815
 # WorkItems that dedupe them are truncated; 4 s allows several polls of each.
 RETIRE_OBSERVE_SECONDS = 4
 VALUE_FROM_KINDS = frozenset({"secretKeyRef", "configMapKeyRef", "fieldRef", "resourceFieldRef"})
+# Tables the install owns for its whole lifetime; they are not inventoried.
+# apps/api/alembic/env.py pins the version table into the curie schema.
+INSTALL_LIFETIME_TABLES = frozenset({"alembic_version"})
+# Truncated by the reset's existing statements rather than the generic sweep.
+RESET_COVERED_TABLES = frozenset({"work_items", "agents", "tenants"})
+TABLE_NAME = re.compile(r"[a-z_][a-z0-9_]*")
+TABLE_ROWS_QUERY = (
+    "SELECT coalesce(json_object_agg(t.table_name, (xpath('/row/c/text()', "
+    "query_to_xml(format('SELECT count(*) AS c FROM %I.%I', t.table_schema, t.table_name), "
+    "false, true, '')))[1]::text::bigint), '{}'::json) "
+    "FROM information_schema.tables t "
+    "WHERE t.table_schema = 'curie' AND t.table_type = 'BASE TABLE'"
+)
+# Every key with no TTL (TTL -1), read in one round trip.
+PERSISTENT_KEYS_SCRIPT = (
+    "local cursor = '0' local found = {} repeat "
+    "local reply = redis.call('SCAN', cursor, 'COUNT', 1000) cursor = reply[1] "
+    "for _, key in ipairs(reply[2]) do "
+    "if redis.call('TTL', key) == -1 then found[#found + 1] = key end end "
+    "until cursor == '0' return found"
+)
+EVIDENCE_LOG_LINES = 400
+EVIDENCE_TEXT_LIMIT = 32768
 
 
 @dataclass(frozen=True)
@@ -952,6 +977,19 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
             if cursor == "0":
                 return frozenset(keys)
 
+    def table_rows(self) -> tuple[tuple[str, int], ...]:
+        counts = self.sql(TABLE_ROWS_QUERY)
+        return tuple(
+            sorted(
+                (str(table), int(count))
+                for table, count in counts.items()
+                if table not in INSTALL_LIFETIME_TABLES
+            )
+        )
+
+    def persistent_keys(self) -> frozenset[str]:
+        return frozenset(str(key) for key in self.valkey("EVAL", PERSISTENT_KEYS_SCRIPT, "0"))
+
     def install_snapshot(self) -> InstallSnapshot:
         """Read every piece of shared install state a case can change."""
 
@@ -984,12 +1022,124 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
                 streams=self.stream_keys(),
                 claimed_sandboxes=self.claimed_sandbox_names(),
                 terminating_pods=self.terminating_pod_names(),
+                table_rows=self.table_rows(),
+                persistent_keys=self.persistent_keys(),
             )
-        except (KeyError, StopIteration, TypeError, ValueError) as exc:
+        except (AttributeError, KeyError, StopIteration, TypeError, ValueError) as exc:
             self.record_failure("shared install snapshot", exc)
             raise RuntimeError(
                 "shared install snapshot failed; private diagnostics retained"
             ) from None
+
+    def record_isolation_failure(
+        self,
+        phase: str,
+        leftovers: list[str],
+        snapshot: InstallSnapshot | None,
+        case: str | None = None,
+    ) -> None:
+        """Keep the evidence of an isolation failure before any further teardown.
+
+        Each read is guarded: collecting evidence must never mask the isolation
+        error the caller raises next.
+        """
+
+        def bounded(text: str) -> str:
+            return self.redact_model_evidence(text)[-EVIDENCE_TEXT_LIMIT:]
+
+        def unavailable(exc: BaseException) -> str:
+            return bounded(f"unavailable: {type(exc).__name__}: {exc}")
+
+        evidence: dict[str, Any] = {
+            "phase": phase,
+            "case": case,
+            "leftovers": [bounded(message) for message in leftovers],
+        }
+        try:
+            if snapshot is None:
+                snapshot = self.install_snapshot()
+            evidence["snapshot"] = self.snapshot_evidence(snapshot)
+        except Exception as exc:  # noqa: BLE001 - evidence must not mask the failure
+            evidence["snapshot"] = unavailable(exc)
+        try:
+            baseline = self.require_baseline()
+            evidence["baseline"] = {
+                "table_rows": [list(row) for row in baseline.table_rows],
+                "persistent_keys": sorted(baseline.persistent_keys),
+            }
+        except Exception as exc:  # noqa: BLE001
+            evidence["baseline"] = unavailable(exc)
+        tail = f"--tail={EVIDENCE_LOG_LINES}"
+        try:
+            evidence["api_logs"] = bounded(
+                self.kubectl(
+                    "-n", self.namespace, "logs", "deployment/curie-api", "--all-containers", tail
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            evidence["api_logs"] = unavailable(exc)
+        worker_logs: dict[str, str] = {}
+        try:
+            pods = self.resource_names(
+                self.namespace, "pods", "-l", "app.kubernetes.io/component=worker"
+            )
+        except Exception as exc:  # noqa: BLE001
+            pods = frozenset()
+            worker_logs["(pods)"] = unavailable(exc)
+        for pod in sorted(pods):
+            try:
+                worker_logs[pod] = bounded(
+                    self.kubectl("-n", self.namespace, "logs", pod, "--all-containers", tail)
+                )
+            except Exception as exc:  # noqa: BLE001
+                worker_logs[pod] = unavailable(exc)
+        evidence["worker_logs"] = worker_logs
+        try:
+            digest = json.dumps(
+                {"phase": phase, "case": case, "leftovers": evidence["leftovers"]},
+                sort_keys=True,
+            )
+            print(
+                "case isolation failure: " + bounded(digest)[: EVIDENCE_TEXT_LIMIT // 8],
+                file=sys.stderr,
+            )
+        except Exception:  # noqa: BLE001, S110
+            pass
+        try:
+            # CI uploads these files as an artifact when the job fails, after
+            # the session teardown has deleted the cluster.
+            artifacts = ROOT / "target/factory-e2e"
+            artifacts.mkdir(parents=True, exist_ok=True)
+            (artifacts / f"admitted-isolation-failure-{phase}-{uuid.uuid4()}.json").write_text(
+                json.dumps(evidence, sort_keys=True) + "\n"
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"case isolation evidence was not written: {type(exc).__name__}", file=sys.stderr)
+        try:
+            self.record_failure(f"case isolation {phase}", CaseIsolationError("; ".join(leftovers)))
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"case isolation diagnostics were not recorded: {type(exc).__name__}",
+                file=sys.stderr,
+            )
+
+    @staticmethod
+    def snapshot_evidence(snapshot: InstallSnapshot) -> dict[str, Any]:
+        """The snapshot as JSON data, without forge content or env values."""
+
+        result: dict[str, Any] = {}
+        for item in dataclass_fields(InstallSnapshot):
+            value = getattr(snapshot, item.name)
+            if item.name == "api_forges":
+                value = sorted(value) if isinstance(value, dict) else type(value).__name__
+            elif item.name == "worker_env":
+                value = [name for name, _ in value]
+            elif isinstance(value, frozenset):
+                value = sorted(value)
+            elif isinstance(value, tuple):
+                value = [list(row) for row in value]
+            result[item.name] = value
+        return result
 
     def require_baseline(self) -> InstallSnapshot:
         if self.baseline is None:
@@ -1073,14 +1223,23 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
                 for name in list(jira_issue.labels):
                     self.stub.jira.remove_label(jira_issue.id, name, self.stub.jira.reporter)
 
-    def reset_case(self) -> None:
+    def reset_case(self, case: str | None = None) -> None:
         """Return the shared install to its baseline, then verify it is clean."""
 
         baseline = self.require_baseline()
+
+        def isolation_failure(leftovers: list[str]) -> CaseIsolationError:
+            self.record_isolation_failure("reset", leftovers, None, case=case)
+            return CaseIsolationError("; ".join(leftovers))
+
         self.worker_replicas(0)
         self.retire_case_tickets()
         retired_at = time.monotonic()
-        self.restore_worker_env(baseline)
+        try:
+            self.restore_worker_env(baseline)
+        except CaseIsolationError as exc:
+            self.record_isolation_failure("reset", [str(exc)], None, case=case)
+            raise
         if self.api_forges() != baseline.api_forges:
 
             def restore(configuration: dict[str, Any]) -> None:
@@ -1101,7 +1260,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         deadline = time.monotonic() + 180
         while self.resource_names(self.namespace, CLAIM_RESOURCE):
             if time.monotonic() >= deadline:
-                raise CaseIsolationError("sandbox_claims: claims remain after deletion")
+                raise isolation_failure(["sandbox_claims: claims remain after deletion"])
             time.sleep(2)
         # Claim deletion returns before the claimed Sandbox and its runner pod
         # are garbage collected; both hold ResourceQuota until they are gone.
@@ -1115,11 +1274,11 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
             if not pending:
                 break
             if time.monotonic() >= deadline:
-                raise CaseIsolationError(
-                    "; ".join(
+                raise isolation_failure(
+                    [
                         f"{field}: {', '.join(sorted(names))} remain after claim deletion"
                         for field, names in pending.items()
-                    )
+                    ]
                 )
             time.sleep(2)
         self.kubectl(
@@ -1138,21 +1297,46 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         # with them, which releases the case-created tenants those rows named.
         # The cascade also empties tables whose nullable foreign keys reference
         # that set, such as credential_redemption_audit_entries and
-        # github_review_deliveries; no case asserts on them.
+        # github_review_deliveries; no case asserts on them. Every other
+        # table that was empty in the baseline is truncated too, so a row a
+        # case created anywhere else is removed. A table with baseline rows is
+        # not cleaned: the verification snapshot reports a changed count.
         remaining = RETIRE_OBSERVE_SECONDS - (time.monotonic() - retired_at)
         if remaining > 0:
             time.sleep(remaining)
         tenants = ", ".join(f"'{uuid.UUID(tenant)}'" for tenant in sorted(baseline.tenants))
+        empty_tables = sorted(
+            table
+            for table, count in baseline.table_rows
+            if count == 0 and table not in RESET_COVERED_TABLES
+        )
+        for table in empty_tables:
+            if not TABLE_NAME.fullmatch(table):
+                raise RuntimeError(f"unexpected curie table name {table!r}")
+        # One statement lets Postgres order the foreign keys among the swept
+        # tables. A baseline table the cascade reaches shows up as a changed
+        # count in the verification snapshot and fails the case.
+        swept = ["curie.work_items", "curie.agents"] + [
+            f'curie."{table}"' for table in empty_tables
+        ]
         self.write_sql(
-            "TRUNCATE curie.work_items, curie.agents CASCADE; "
-            "DELETE FROM curie.tenants" + (f" WHERE id NOT IN ({tenants})" if tenants else "")
+            "TRUNCATE " + ", ".join(swept) + " CASCADE; "
+            "DELETE FROM curie.tenants"
+            + (f" WHERE id NOT IN ({tenants})" if tenants else "")
         )
         self.valkey("XTRIM", RUNS_STREAM_DEFAULT, "MAXLEN", "0")
         for stream in sorted(self.stream_keys() - baseline.streams):
             self.valkey("DEL", stream)
+        # Persistent keys a case created, such as a kill switch flag
+        # (curie:kill:<agent_id>, no TTL), would otherwise outlive the case.
+        extra_keys = sorted(self.persistent_keys() - baseline.persistent_keys)
+        for start in range(0, len(extra_keys), 100):
+            self.valkey("DEL", *extra_keys[start : start + 100])
         time.sleep(3)
-        leftovers = leftover_state(baseline, self.install_snapshot())
+        snapshot = self.install_snapshot()
+        leftovers = leftover_state(baseline, snapshot)
         if leftovers:
+            self.record_isolation_failure("reset", leftovers, snapshot, case=case)
             raise CaseIsolationError(
                 "the shared install kept case state after reset: " + "; ".join(leftovers)
             )

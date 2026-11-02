@@ -194,10 +194,13 @@ def kind_factory(
     shared_install: AdmittedKind,
 ) -> AdmittedKind:
     run = shared_install
+    case = request.node.nodeid
     baseline = run.require_baseline()
     # Never clean at start: a leftover means an earlier case's reset failed.
-    leftovers = leftover_state(baseline, run.install_snapshot())
+    snapshot = run.install_snapshot()
+    leftovers = leftover_state(baseline, snapshot)
     if leftovers:
+        run.record_isolation_failure("case-start", leftovers, snapshot, case=case)
         raise CaseIsolationError(
             "the shared install is not clean at case start: " + "; ".join(leftovers)
         )
@@ -212,13 +215,27 @@ def kind_factory(
     run.infrastructure_errors = []
 
     def cleanup() -> None:
+        reset = False
         try:
-            run.reset_case()
+            try:
+                run.reset_case(case=case)
+            except CaseIsolationError:
+                # reset_case recorded its own evidence before raising.
+                raise
+            except Exception as exc:
+                detail = run.redact_model_evidence(str(exc))
+                run.record_isolation_failure(
+                    "reset", [f"{type(exc).__name__}: {detail}"], None, case=case
+                )
+                raise
+            reset = True
             if run.infrastructure_errors:
                 raise RuntimeError("runtime infrastructure failed; private diagnostics retained")
         finally:
             run.infrastructure_errors = []
-            remove_fixture_files(run)
+            # A failed reset keeps the case directory as evidence.
+            if reset:
+                remove_fixture_files(run)
             run.root = session_root
             run.diagnostic_path = session_root / "diagnostics.sqlite3"
 

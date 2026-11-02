@@ -3437,12 +3437,14 @@ jobs:
           CURIE_C4_CANDIDATE_CLI: ${{ github.workspace }}/cli/target/release/curie
           CURIE_C4_CANDIDATE_IMAGES: curie-ci/{component}:candidate
         run: uv run pytest -q -n 0 --durations=0 tools/factory-e2e/tests/test_c4_admitted_agent.py --case-shard "$CASE_SHARD"
-      - name: Upload the publication failure digest
+      - name: Upload the admitted agent failure digests
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: admitted-publication-digest-${{ github.sha }}-${{ matrix.shard }}
-          path: target/factory-e2e/admitted-publication-failure-*.json
+          path: |
+            target/factory-e2e/admitted-publication-failure-*.json
+            target/factory-e2e/admitted-isolation-failure-*.json
           if-no-files-found: ignore
 
   forge-instance-regression:
