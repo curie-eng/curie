@@ -118,6 +118,7 @@ tools/factory-e2e/tests/test_c4_forge_instances.py
 tools/factory-e2e/tests/test_c4_held_cancellation.py
 tools/factory-e2e/tests/test_c4_initial_binding.py
 tools/factory-e2e/tests/test_c4_reinstall_publication.py
+tools/factory-e2e/tests/test_c4_shared_install_state.py
 tools/factory-e2e/tests/test_c4_static_token_rotation.py
 tools/factory-e2e/tests/test_c4_tracker_scope.py
 tools/factory-e2e/tests/test_c4_upgrade_migration.py

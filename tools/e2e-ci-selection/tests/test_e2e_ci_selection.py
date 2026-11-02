@@ -5178,7 +5178,7 @@ def test_split_factory_jobs_are_gated_like_the_scripted_factory_and_required(
     assert job["runs-on"] == "ubuntu-24.04"
     assert job["timeout-minutes"] == 120
     assert job["if"] == jobs[SCRIPTED_FACTORY_JOB]["if"]
-    assert job["needs"] == ["changes"]
+    assert job["needs"] == jobs[SCRIPTED_FACTORY_JOB]["needs"]
     assert not job.get("continue-on-error")
     assert job_id in jobs["e2e-required"]["needs"]
     required = jobs["e2e-required"]["steps"][0]

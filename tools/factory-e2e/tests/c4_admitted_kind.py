@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import hmac
 import json
 import os
+import re
 import selectors
 import shutil
 import sqlite3
@@ -16,6 +18,8 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlsplit
@@ -25,11 +29,50 @@ import httpx
 import scripted_kind as sk
 from aci_protocol import RUNS_STREAM_DEFAULT, STREAM_PAYLOAD_FIELD, QueuedTurn
 from c4_admitted_http import gitlab, jira, marker_model_type, tracker_stub_type
+from c4_shared_install import CaseIsolationError, InstallSnapshot, leftover_state
 from curie_telemetry.redact import redact_text
 
 ROOT = Path(__file__).resolve().parents[3]
 REPOSITORY = "acme-corp/acme-bot"
 LOCATIONS = {"github": REPOSITORY, "gitlab": REPOSITORY, "jira": "acme-jira"}
+AGENT_LETTERS = ("a", "b")
+CLAIM_RESOURCE = "sandboxclaims.extensions.agents.x-k8s.io"
+SANDBOX_RESOURCE = "sandboxes.agents.x-k8s.io"
+# apps/worker/src/curie_worker/sandbox/k8s.py ADMISSION_CLAIM_LABEL
+ADMISSION_CLAIM_LABEL = "sandbox.users.io/curie-admission-claim"
+# CI builds the candidate CLI and images once per workflow run; the fixture
+# then tags those images instead of rebuilding them from the checkout.
+CANDIDATE_CLI_ENV = "CURIE_C4_CANDIDATE_CLI"
+CANDIDATE_IMAGES_ENV = "CURIE_C4_CANDIDATE_IMAGES"
+# ScriptedRun.execute labels this scenario issue `factory`; it is not a case ticket.
+SCENARIO_ISSUE = 3815
+# Every tracker polls every 1 s. Retired labels must be observed before the
+# WorkItems that dedupe them are truncated; 4 s allows several polls of each.
+RETIRE_OBSERVE_SECONDS = 4
+VALUE_FROM_KINDS = frozenset({"secretKeyRef", "configMapKeyRef", "fieldRef", "resourceFieldRef"})
+# Tables the install owns for its whole lifetime; they are not inventoried.
+# apps/api/alembic/env.py pins the version table into the curie schema.
+INSTALL_LIFETIME_TABLES = frozenset({"alembic_version"})
+# Truncated by the reset's existing statements rather than the generic sweep.
+RESET_COVERED_TABLES = frozenset({"work_items", "agents", "tenants"})
+TABLE_NAME = re.compile(r"[a-z_][a-z0-9_]*")
+TABLE_ROWS_QUERY = (
+    "SELECT coalesce(json_object_agg(t.table_name, (xpath('/row/c/text()', "
+    "query_to_xml(format('SELECT count(*) AS c FROM %I.%I', t.table_schema, t.table_name), "
+    "false, true, '')))[1]::text::bigint), '{}'::json) "
+    "FROM information_schema.tables t "
+    "WHERE t.table_schema = 'curie' AND t.table_type = 'BASE TABLE'"
+)
+# Every key with no TTL (TTL -1), read in one round trip.
+PERSISTENT_KEYS_SCRIPT = (
+    "local cursor = '0' local found = {} repeat "
+    "local reply = redis.call('SCAN', cursor, 'COUNT', 1000) cursor = reply[1] "
+    "for _, key in ipairs(reply[2]) do "
+    "if redis.call('TTL', key) == -1 then found[#found + 1] = key end end "
+    "until cursor == '0' return found"
+)
+EVIDENCE_LOG_LINES = 400
+EVIDENCE_TEXT_LIMIT = 32768
 
 
 @dataclass(frozen=True)
@@ -151,6 +194,10 @@ class AdmittedKind(sk.ScriptedRun):
         self.diagnostic_path = root / "diagnostics.sqlite3"
         self.infrastructure_errors: list[str] = []
         self.source_candidate: AdmittedKind | None = None
+        self.bundles: dict[str, Path] = {}
+        # Recorded once by the session fixture when the shared install is
+        # ready, the worker is at zero replicas and no agent exists.
+        self.baseline: InstallSnapshot | None = None
         self.secrets.extend((gitlab.TOKEN, jira.TOKEN))
 
     def record_failure(self, operation: str, exc: BaseException) -> None:
@@ -548,6 +595,22 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
                 if current != self.source_candidate.image_ids[name]:
                     raise RuntimeError("a session-owned source candidate image changed")
             return
+        prebuilt_cli = os.environ.get(CANDIDATE_CLI_ENV)
+        prebuilt_images = os.environ.get(CANDIDATE_IMAGES_ENV)
+        if prebuilt_cli and prebuilt_images:
+            if not os.access(prebuilt_cli, os.X_OK):
+                raise RuntimeError(f"{CANDIDATE_CLI_ENV} does not name an executable")
+            self.curie = prebuilt_cli
+            for name, tag in self.images.items():
+                self.command("docker", "tag", prebuilt_images.format(component=name), tag)
+        else:
+            self.build_source_candidate()
+        for name, tag in self.images.items():
+            self.image_ids[name] = json.loads(self.command("docker", "image", "inspect", tag))[0][
+                "Id"
+            ]
+
+    def build_source_candidate(self) -> None:
         self.command(
             "cargo",
             "build",
@@ -572,15 +635,15 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
                 timeout=1800,
             )
         self.command(self.curie, "build", "--tag", self.images["runner"], timeout=1800)
-        for name, tag in self.images.items():
-            self.image_ids[name] = json.loads(self.command("docker", "image", "inspect", tag))[0][
-                "Id"
-            ]
 
     def values(self, original: Any, **kwargs: Any) -> dict[str, Any]:
         values = original(**kwargs)
         host = urlsplit(self.stub.base_url).netloc
         factory = values["factory"]
+        # Matches the GitLab and Jira trackers below; shortens each case's admission and reset wait.
+        for tracker in factory["trackers"]:
+            if tracker.get("kind") == "github":
+                tracker["pollIntervalSeconds"] = 1
         for component in ("api", "worker", "ui"):
             repository, tag = self.images[component].rsplit(":", 1)
             values[component]["image"].update(repository=repository, tag=tag, pullPolicy="Never")
@@ -684,7 +747,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         self.worker_token = base64.b64decode(secret["data"]["internalWorkerToken"]).decode()
         self.secrets.extend([self.env["CURIE_API_KEY"], self.worker_token])
         self.forward_api()
-        self.deploy_agents(registry_ref)
+        self.build_agent_bundles(registry_ref)
 
     def forward_api(self) -> None:
         try:
@@ -728,13 +791,57 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         self.api_url = f"http://127.0.0.1:{port}"
         self.env["CURIE_API_URL"] = self.api_url
 
-    def deploy_agents(self, registry_ref: str) -> None:
+    def build_agent_bundles(self, registry_ref: str) -> None:
+        """Build the acme-a and acme-b bundles once for the session install."""
+
         if self.workdir is None:
             raise RuntimeError("kind workdir absent")
-        for letter in ("a", "b"):
+        for letter in AGENT_LETTERS:
+            name = f"acme-{letter}"
+            bundle = self.workdir / name
+            (bundle / ".claude-plugin").mkdir(parents=True)
+            manifest = {
+                "name": name,
+                "version": "0.1.0",
+                "description": "Exercise admitted-agent identity.",
+                "systemPrompt": "Use the supplied runtime marker and publish the candidate change.",
+            }
+            (bundle / ".claude-plugin/plugin.json").write_text(json.dumps(manifest))
+            (bundle / "c4-marker").write_text(self.agent_marker(letter) + "\n")
+            (bundle / "runner.Dockerfile").write_text(
+                "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\n"
+            )
+            self.command(
+                self.curie,
+                "build",
+                "--plugin-dir",
+                str(bundle),
+                "--registry",
+                registry_ref,
+                "--runner-image",
+                registry_ref + "/curie-runner:latest",
+                "--platform",
+                "linux/amd64",
+            )
+            self.bundles[letter] = bundle
+
+    def agent_marker(self, letter: str) -> str:
+        return f"c4-{letter}-{self.run_id}"
+
+    def deploy_case_agents(self) -> None:
+        """Create fresh acme-a and acme-b agents and deploy the session bundles.
+
+        The chart values key sandbox egress and resource profiles by these two
+        agent names, so every case reuses the names with new agent ids.
+        """
+
+        self.agents = []
+        for letter in AGENT_LETTERS:
             name = f"acme-{letter}"
             label = f"acme-{letter}-work"
-            marker = f"c4-{letter}-{self.run_id}"
+            bundle = self.bundles.get(letter)
+            if bundle is None:
+                raise RuntimeError(f"the session bundle for {name} was not built")
             agent = self.api(
                 "POST",
                 "/agents",
@@ -752,31 +859,6 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
                     self.binding(kind, label),
                     expected=201,
                 )
-            bundle = self.workdir / name
-            (bundle / ".claude-plugin").mkdir(parents=True)
-            manifest = {
-                "name": name,
-                "version": "0.1.0",
-                "description": "Exercise admitted-agent identity.",
-                "systemPrompt": "Use the supplied runtime marker and publish the candidate change.",
-            }
-            (bundle / ".claude-plugin/plugin.json").write_text(json.dumps(manifest))
-            (bundle / "c4-marker").write_text(marker + "\n")
-            (bundle / "runner.Dockerfile").write_text(
-                "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\n"
-            )
-            self.command(
-                self.curie,
-                "build",
-                "--plugin-dir",
-                str(bundle),
-                "--registry",
-                registry_ref,
-                "--runner-image",
-                registry_ref + "/curie-runner:latest",
-                "--platform",
-                "linux/amd64",
-            )
             self.command(
                 self.curie,
                 "cluster",
@@ -825,12 +907,439 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
                     agent["id"],
                     name,
                     label,
-                    marker,
+                    self.agent_marker(letter),
                     selected["deployment_id"],
                     selected["bundle_ref"],
                 )
             )
         self.started = True
+
+    def worker_container_env(self) -> list[dict[str, Any]]:
+        deployment = json.loads(
+            self.kubectl("-n", self.namespace, "get", "deployment/curie-worker", "-o", "json")
+        )
+        container = next(
+            c for c in deployment["spec"]["template"]["spec"]["containers"] if c["name"] == "worker"
+        )
+        env: list[dict[str, Any]] = container.get("env", [])
+        return env
+
+    @staticmethod
+    def env_pair(entry: dict[str, Any]) -> tuple[str, str]:
+        if "valueFrom" in entry:
+            return entry["name"], json.dumps(entry["valueFrom"], sort_keys=True)
+        return entry["name"], str(entry.get("value", ""))
+
+    def api_forges(self) -> Any:
+        deployment = json.loads(
+            self.kubectl("-n", self.namespace, "get", "deployment/curie-api", "-o", "json")
+        )
+        container = next(
+            c for c in deployment["spec"]["template"]["spec"]["containers"] if c["name"] == "api"
+        )
+        return json.loads(next(e["value"] for e in container["env"] if e["name"] == "CURIE_FORGES"))
+
+    def resource_names(self, namespace: str, resource: str, *selector: str) -> frozenset[str]:
+        items = json.loads(self.kubectl("-n", namespace, "get", resource, *selector, "-o", "json"))[
+            "items"
+        ]
+        return frozenset(item["metadata"]["name"] for item in items)
+
+    def claimed_sandbox_names(self) -> frozenset[str]:
+        """Sandboxes a SandboxClaim created; warm pool members are not counted."""
+
+        items = json.loads(
+            self.kubectl("-n", self.namespace, "get", SANDBOX_RESOURCE, "-o", "json")
+        )["items"]
+        return frozenset(
+            item["metadata"]["name"]
+            for item in items
+            if ADMISSION_CLAIM_LABEL in (item["metadata"].get("labels") or {})
+            or any(
+                owner.get("kind") == "SandboxClaim"
+                for owner in item["metadata"].get("ownerReferences") or []
+            )
+        )
+
+    def terminating_pod_names(self) -> frozenset[str]:
+        items = json.loads(self.kubectl("-n", self.namespace, "get", "pods", "-o", "json"))["items"]
+        return frozenset(
+            item["metadata"]["name"] for item in items if item["metadata"].get("deletionTimestamp")
+        )
+
+    def stream_keys(self) -> frozenset[str]:
+        keys: set[str] = set()
+        cursor = "0"
+        while True:
+            cursor, batch = self.valkey("SCAN", cursor, "TYPE", "stream", "COUNT", "1000")
+            keys.update(str(key) for key in batch)
+            cursor = str(cursor)
+            if cursor == "0":
+                return frozenset(keys)
+
+    def table_rows(self) -> tuple[tuple[str, int], ...]:
+        counts = self.sql(TABLE_ROWS_QUERY)
+        return tuple(
+            sorted(
+                (str(table), int(count))
+                for table, count in counts.items()
+                if table not in INSTALL_LIFETIME_TABLES
+            )
+        )
+
+    def persistent_keys(self) -> frozenset[str]:
+        return frozenset(str(key) for key in self.valkey("EVAL", PERSISTENT_KEYS_SCRIPT, "0"))
+
+    def install_snapshot(self) -> InstallSnapshot:
+        """Read every piece of shared install state a case can change."""
+
+        try:
+            rows = self.sql(
+                "SELECT json_build_object("
+                "'agents', (SELECT count(*) FROM curie.agents), "
+                "'work_items', (SELECT count(*) FROM curie.work_items), "
+                "'execution_requests', (SELECT count(*) FROM curie.execution_requests), "
+                "'tenants', (SELECT coalesce(json_agg(id::text), '[]'::json) "
+                "FROM curie.tenants))"
+            )
+            return InstallSnapshot(
+                agents=int(rows["agents"]),
+                work_items=int(rows["work_items"]),
+                execution_requests=int(rows["execution_requests"]),
+                tenants=frozenset(rows["tenants"]),
+                sandbox_claims=self.resource_names(self.namespace, CLAIM_RESOURCE),
+                publication_jobs=self.resource_names(self.publication_namespace(), "jobs"),
+                api_forges=self.api_forges(),
+                worker_env=tuple(sorted(self.env_pair(e) for e in self.worker_container_env())),
+                worker_pods=len(
+                    self.resource_names(
+                        self.namespace, "pods", "-l", "app.kubernetes.io/component=worker"
+                    )
+                ),
+                deployments=self.resource_names(self.namespace, "deployments"),
+                network_policies=self.resource_names(self.namespace, "networkpolicies"),
+                runs_stream_length=int(self.valkey("XLEN", RUNS_STREAM_DEFAULT)),
+                streams=self.stream_keys(),
+                claimed_sandboxes=self.claimed_sandbox_names(),
+                terminating_pods=self.terminating_pod_names(),
+                table_rows=self.table_rows(),
+                persistent_keys=self.persistent_keys(),
+            )
+        except (AttributeError, KeyError, StopIteration, TypeError, ValueError) as exc:
+            self.record_failure("shared install snapshot", exc)
+            raise RuntimeError(
+                "shared install snapshot failed; private diagnostics retained"
+            ) from None
+
+    def record_isolation_failure(
+        self,
+        phase: str,
+        leftovers: list[str],
+        snapshot: InstallSnapshot | None,
+        case: str | None = None,
+    ) -> None:
+        """Keep the evidence of an isolation failure before any further teardown.
+
+        Each read is guarded: collecting evidence must never mask the isolation
+        error the caller raises next.
+        """
+
+        def bounded(text: str) -> str:
+            return self.redact_model_evidence(text)[-EVIDENCE_TEXT_LIMIT:]
+
+        def unavailable(exc: BaseException) -> str:
+            return bounded(f"unavailable: {type(exc).__name__}: {exc}")
+
+        evidence: dict[str, Any] = {
+            "phase": phase,
+            "case": case,
+            "leftovers": [bounded(message) for message in leftovers],
+        }
+        try:
+            if snapshot is None:
+                snapshot = self.install_snapshot()
+            evidence["snapshot"] = self.snapshot_evidence(snapshot)
+        except Exception as exc:  # noqa: BLE001 - evidence must not mask the failure
+            evidence["snapshot"] = unavailable(exc)
+        try:
+            baseline = self.require_baseline()
+            evidence["baseline"] = {
+                "table_rows": [list(row) for row in baseline.table_rows],
+                "persistent_keys": sorted(baseline.persistent_keys),
+            }
+        except Exception as exc:  # noqa: BLE001
+            evidence["baseline"] = unavailable(exc)
+        tail = f"--tail={EVIDENCE_LOG_LINES}"
+        try:
+            evidence["api_logs"] = bounded(
+                self.kubectl(
+                    "-n", self.namespace, "logs", "deployment/curie-api", "--all-containers", tail
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            evidence["api_logs"] = unavailable(exc)
+        worker_logs: dict[str, str] = {}
+        try:
+            pods = self.resource_names(
+                self.namespace, "pods", "-l", "app.kubernetes.io/component=worker"
+            )
+        except Exception as exc:  # noqa: BLE001
+            pods = frozenset()
+            worker_logs["(pods)"] = unavailable(exc)
+        for pod in sorted(pods):
+            try:
+                worker_logs[pod] = bounded(
+                    self.kubectl("-n", self.namespace, "logs", pod, "--all-containers", tail)
+                )
+            except Exception as exc:  # noqa: BLE001
+                worker_logs[pod] = unavailable(exc)
+        evidence["worker_logs"] = worker_logs
+        try:
+            digest = json.dumps(
+                {"phase": phase, "case": case, "leftovers": evidence["leftovers"]},
+                sort_keys=True,
+            )
+            print(
+                "case isolation failure: " + bounded(digest)[: EVIDENCE_TEXT_LIMIT // 8],
+                file=sys.stderr,
+            )
+        except Exception:  # noqa: BLE001, S110
+            pass
+        try:
+            # CI uploads these files as an artifact when the job fails, after
+            # the session teardown has deleted the cluster.
+            artifacts = ROOT / "target/factory-e2e"
+            artifacts.mkdir(parents=True, exist_ok=True)
+            (artifacts / f"admitted-isolation-failure-{phase}-{uuid.uuid4()}.json").write_text(
+                json.dumps(evidence, sort_keys=True) + "\n"
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"case isolation evidence was not written: {type(exc).__name__}", file=sys.stderr)
+        try:
+            self.record_failure(f"case isolation {phase}", CaseIsolationError("; ".join(leftovers)))
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"case isolation diagnostics were not recorded: {type(exc).__name__}",
+                file=sys.stderr,
+            )
+
+    @staticmethod
+    def snapshot_evidence(snapshot: InstallSnapshot) -> dict[str, Any]:
+        """The snapshot as JSON data, without forge content or env values."""
+
+        result: dict[str, Any] = {}
+        for item in dataclass_fields(InstallSnapshot):
+            value = getattr(snapshot, item.name)
+            if item.name == "api_forges":
+                value = sorted(value) if isinstance(value, dict) else type(value).__name__
+            elif item.name == "worker_env":
+                value = [name for name, _ in value]
+            elif isinstance(value, frozenset):
+                value = sorted(value)
+            elif isinstance(value, tuple):
+                value = [list(row) for row in value]
+            result[item.name] = value
+        return result
+
+    def require_baseline(self) -> InstallSnapshot:
+        if self.baseline is None:
+            raise RuntimeError("the shared install has no recorded baseline")
+        return self.baseline
+
+    def restore_worker_env(self, baseline: InstallSnapshot) -> None:
+        wanted = dict(baseline.worker_env)
+        current = {entry["name"]: entry for entry in self.worker_container_env()}
+        changes: list[str] = []
+        unrestorable: list[str] = []
+        for name, entry in current.items():
+            if name not in wanted:
+                changes.append(name + "-")
+                continue
+            if self.env_pair(entry)[1] == wanted[name]:
+                continue
+            if "valueFrom" in entry or self.is_value_from(wanted[name]):
+                unrestorable.append(name)
+            else:
+                changes.append(f"{name}={wanted[name]}")
+        for name, value in wanted.items():
+            if name in current:
+                continue
+            if self.is_value_from(value):
+                unrestorable.append(name)
+            else:
+                changes.append(f"{name}={value}")
+        if unrestorable:
+            raise CaseIsolationError(
+                "worker_env: valueFrom entries changed and are not restored: "
+                + ", ".join(sorted(unrestorable))
+            )
+        if changes:
+            self.kubectl(
+                "-n",
+                self.namespace,
+                "set",
+                "env",
+                "deployment/curie-worker",
+                "-c",
+                "worker",
+                *changes,
+            )
+
+    @staticmethod
+    def is_value_from(value: str) -> bool:
+        # A snapshot stores a valueFrom entry as its sorted JSON object.
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return False
+        return isinstance(parsed, dict) and len(parsed) == 1 and set(parsed) <= VALUE_FROM_KINDS
+
+    def retire_case_tickets(self) -> None:
+        """Remove every label from every stub ticket except the scenario issue.
+
+        Intake dedupes a labelled ticket against its WorkItem, which the reset
+        truncates. A ticket an earlier case left labelled could otherwise be
+        admitted again for the next case's same-named agents.
+        """
+
+        with self.stub.provider_lock:
+            for row in self.stub._rows("issue"):
+                number = row["number"]
+                if number == SCENARIO_ISSUE or not row.get("labels"):
+                    continue
+                removed = [label["name"] for label in row["labels"]]
+                row["labels"] = []
+                if "updated_at" in row:
+                    # Same shape as tools/github-stub/github_stub.py::_utc.
+                    row["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                self.stub._put("issue", number, row)
+                for name in removed:
+                    self.stub._label_event(number, name, "unlabeled", row["user"])
+            self.stub.sync_gitlab_clock()
+            for iid, issue in list(self.stub.gitlab.issues.items()):
+                for name in list(issue.labels):
+                    self.stub.gitlab.label(iid, name, gitlab.ROOT, add=False)
+            for jira_issue in list(self.stub.jira.issues.values()):
+                for name in list(jira_issue.labels):
+                    self.stub.jira.remove_label(jira_issue.id, name, self.stub.jira.reporter)
+
+    def reset_case(self, case: str | None = None) -> None:
+        """Return the shared install to its baseline, then verify it is clean."""
+
+        baseline = self.require_baseline()
+
+        def isolation_failure(leftovers: list[str]) -> CaseIsolationError:
+            self.record_isolation_failure("reset", leftovers, None, case=case)
+            return CaseIsolationError("; ".join(leftovers))
+
+        self.worker_replicas(0)
+        self.retire_case_tickets()
+        retired_at = time.monotonic()
+        try:
+            self.restore_worker_env(baseline)
+        except CaseIsolationError as exc:
+            self.record_isolation_failure("reset", [str(exc)], None, case=case)
+            raise
+        if self.api_forges() != baseline.api_forges:
+
+            def restore(configuration: dict[str, Any]) -> None:
+                configuration.clear()
+                configuration.update(copy.deepcopy(baseline.api_forges))
+
+            self.change_forges(restore)
+        self.kubectl(
+            "-n",
+            self.namespace,
+            "delete",
+            CLAIM_RESOURCE,
+            "--all",
+            "--wait=true",
+            "--timeout=180s",
+            timeout=240,
+        )
+        deadline = time.monotonic() + 180
+        while self.resource_names(self.namespace, CLAIM_RESOURCE):
+            if time.monotonic() >= deadline:
+                raise isolation_failure(["sandbox_claims: claims remain after deletion"])
+            time.sleep(2)
+        # Claim deletion returns before the claimed Sandbox and its runner pod
+        # are garbage collected; both hold ResourceQuota until they are gone.
+        deadline = time.monotonic() + 180
+        while True:
+            remaining_names = {
+                "claimed_sandboxes": self.claimed_sandbox_names(),
+                "terminating_pods": self.terminating_pod_names(),
+            }
+            pending = {field: names for field, names in remaining_names.items() if names}
+            if not pending:
+                break
+            if time.monotonic() >= deadline:
+                raise isolation_failure(
+                    [
+                        f"{field}: {', '.join(sorted(names))} remain after claim deletion"
+                        for field, names in pending.items()
+                    ]
+                )
+            time.sleep(2)
+        self.kubectl(
+            "-n",
+            self.publication_namespace(),
+            "delete",
+            "jobs",
+            "--all",
+            "--cascade=foreground",
+            "--wait=true",
+            "--timeout=180s",
+            timeout=240,
+        )
+        # Every table that references curie.agents (channels, versions,
+        # deployments and their dependants) or curie.work_items is truncated
+        # with them, which releases the case-created tenants those rows named.
+        # The cascade also empties tables whose nullable foreign keys reference
+        # that set, such as credential_redemption_audit_entries and
+        # github_review_deliveries; no case asserts on them. Every other
+        # table that was empty in the baseline is truncated too, so a row a
+        # case created anywhere else is removed. A table with baseline rows is
+        # not cleaned: the verification snapshot reports a changed count.
+        remaining = RETIRE_OBSERVE_SECONDS - (time.monotonic() - retired_at)
+        if remaining > 0:
+            time.sleep(remaining)
+        tenants = ", ".join(f"'{uuid.UUID(tenant)}'" for tenant in sorted(baseline.tenants))
+        empty_tables = sorted(
+            table
+            for table, count in baseline.table_rows
+            if count == 0 and table not in RESET_COVERED_TABLES
+        )
+        for table in empty_tables:
+            if not TABLE_NAME.fullmatch(table):
+                raise RuntimeError(f"unexpected curie table name {table!r}")
+        # One statement lets Postgres order the foreign keys among the swept
+        # tables. A baseline table the cascade reaches shows up as a changed
+        # count in the verification snapshot and fails the case.
+        swept = ["curie.work_items", "curie.agents"] + [
+            f'curie."{table}"' for table in empty_tables
+        ]
+        self.write_sql(
+            "TRUNCATE " + ", ".join(swept) + " CASCADE; "
+            "DELETE FROM curie.tenants"
+            + (f" WHERE id NOT IN ({tenants})" if tenants else "")
+        )
+        self.valkey("XTRIM", RUNS_STREAM_DEFAULT, "MAXLEN", "0")
+        for stream in sorted(self.stream_keys() - baseline.streams):
+            self.valkey("DEL", stream)
+        # Persistent keys a case created, such as a kill switch flag
+        # (curie:kill:<agent_id>, no TTL), would otherwise outlive the case.
+        extra_keys = sorted(self.persistent_keys() - baseline.persistent_keys)
+        for start in range(0, len(extra_keys), 100):
+            self.valkey("DEL", *extra_keys[start : start + 100])
+        time.sleep(3)
+        snapshot = self.install_snapshot()
+        leftovers = leftover_state(baseline, snapshot)
+        if leftovers:
+            self.record_isolation_failure("reset", leftovers, snapshot, case=case)
+            raise CaseIsolationError(
+                "the shared install kept case state after reset: " + "; ".join(leftovers)
+            )
 
     def binding(self, kind: str, label: str | None) -> dict[str, Any]:
         result = {"kind": kind, "address": LOCATIONS[kind], "trigger_label": label}
@@ -1084,7 +1593,10 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
                 "-n", self.namespace, "rollout", "status", "deployment/curie-worker",
                 "--timeout=300s",
             )
-        else:
+        elif self.resource_names(
+            self.namespace, "pods", "-l", "app.kubernetes.io/component=worker"
+        ):
+            # A paused case starts at zero replicas, so there may be no pod to await.
             self.kubectl(
                 "-n", self.namespace, "wait", "--for=delete", "pod",
                 "-l", "app.kubernetes.io/component=worker", "--timeout=180s",
