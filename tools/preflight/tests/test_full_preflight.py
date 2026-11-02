@@ -587,7 +587,6 @@ def check_body(repository: Path, body_file: Path) -> list[dict]:
         repository,
         body_file,
         "Explain preflight",
-        ["docs/example.md"],
         "main",
         git(repository, "rev-parse", "HEAD"),
         "acme-corp/acme-bot",
@@ -649,60 +648,18 @@ def test_pr_body_without_file_reports_skipped(repository: Path, recorded_gh: Pat
     assert any("pin" in check["name"].lower() for check in skipped)
 
 
-def test_pr_body_open_discovery_waiver_uses_issue_graphql_snapshot(
-    repository: Path, recorded_gh: Path, tmp_path: Path
+def test_pr_body_needs_no_tier_metadata_or_waiver_lookup(
+    repository: Path, recorded_gh: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("PREFLIGHT_TEST_FORBID_GRAPHQL", "1")
     body = tmp_path / "body.md"
     body.write_text(
         "Explain API behavior.\n\n"
         "Discovery waiver: Local infrastructure unavailable; tracked in #77\n"
     )
-    checks = load_tool().check_pr_body(
-        repository,
-        body,
-        "Explain API behavior",
-        ["apps/api/src/curie_api/config.py"],
-        "main",
-        git(repository, "rev-parse", "HEAD"),
-        "acme-corp/acme-bot",
-    )
+    checks = check_body(repository, body)
     assert checks
     assert all(check["status"] != "failed" for check in checks), checks
-
-
-@pytest.mark.parametrize(
-    "hidden_waiver",
-    [
-        "<!-- Discovery waiver: Local infrastructure unavailable; tracked in #77 -->\n",
-        "```text\nDiscovery waiver: Local infrastructure unavailable; tracked in #77\n```\n",
-        "~~~text\nDiscovery waiver: Local infrastructure unavailable; tracked in #77\n~~~\n",
-        "    Discovery waiver: Local infrastructure unavailable; tracked in #77\n",
-    ],
-    ids=["html-comment", "backtick-fence", "tilde-fence", "indented-code"],
-)
-def test_pr_body_hidden_discovery_waiver_cannot_trigger_lookup_or_waive_tier(
-    repository: Path,
-    recorded_gh: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    hidden_waiver: str,
-) -> None:
-    monkeypatch.setenv("PREFLIGHT_TEST_FORBID_GRAPHQL", "1")
-    body = tmp_path / "body.md"
-    body.write_text("Explain API behavior.\n\n" + hidden_waiver)
-    checks = load_tool().check_pr_body(
-        repository,
-        body,
-        "Explain API behavior",
-        ["apps/api/src/curie_api/config.py"],
-        "main",
-        git(repository, "rev-parse", "HEAD"),
-        "acme-corp/acme-bot",
-    )
-    failed = [check for check in checks if check["status"] == "failed"]
-    assert failed
-    assert any("PR body check failed:" in check["detail"] for check in failed)
-    assert all("unexpected hidden waiver lookup" not in check["detail"] for check in checks)
 
 
 def test_ci_only_selector_reports_tiers_and_kind_jobs(repository: Path) -> None:
@@ -781,7 +738,11 @@ def test_ci_only_docs_change_has_no_tiers(repository: Path) -> None:
         ("charts/curie/ci/runtime/connector-readiness-runtime.sh", "main", True, True),
         ("charts/curie/ci/scenarios/controller-preflight-kind.sh", "main", True, True),
         ("scripts/check-runner-byo-egress.sh", "main", True, True),
-        ("charts/curie/ci/runtime/metrics-alerts-runtime.sh", "main", True, False),
+        ("charts/curie/ci/runtime/metrics-alerts-runtime.sh", "main", True, True),
+        ("cli/src/ops/up.rs", "main", True, True),
+        ("charts/curie/ci/scenarios/workload-install.sh", "main", True, True),
+        (".github/e2e-selection.yaml", "main", True, True),
+        ("tools/runtime-assertion-gate/run.sh", "main", True, True),
         ("examples/weather/evals/cases.json", "main", True, False),
         ("scripts/check-netpol-enforcement.sh", "main", True, False),
         ("docs/example.md", "main", False, False),

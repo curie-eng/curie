@@ -23,54 +23,19 @@ INPUTS = (
     "CURIE_SCENARIO_API_IMAGE",
     "CURIE_SCENARIO_WORKER_IMAGE",
     "CURIE_SCENARIO_RUNNER_IMAGE",
+    "CURIE_SCENARIO_NAMESPACE",
+    "CURIE_SCENARIO_RELEASE",
 )
-IMAGE_INPUTS = INPUTS[3:]
-SHARED_OBJECTS = (
-    "namespace/agent-sandbox-system",
-    "clusterrole/agent-sandbox-controller",
-    "clusterrole/agent-sandbox-controller-extensions",
-    "clusterrole/agent-sandbox-controller-networkpolicies-read",
-    "clusterrolebinding/agent-sandbox-controller",
-    "clusterrolebinding/agent-sandbox-controller-extensions",
-    "clusterrolebinding/agent-sandbox-controller-networkpolicies-read",
-    "priorityclass/curie-platform",
-    "priorityclass/curie-sandbox",
-)
-
-# Recording tools normally fail on their first call. Inventory mode returns
-# one occupied object or an empty cluster, then fails the candidate install.
-# Neither mode touches a cluster.
+IMAGE_INPUTS = INPUTS[3:6]
 TOOL_STUB = r"""
 import os
 import shlex
 import sys
 from pathlib import Path
 
-tool = Path(sys.argv[0]).name
-args = sys.argv[1:]
 with Path(os.environ["QUOTA_CALL_LOG"]).open("a") as log:
-    log.write(shlex.join([tool, *args]) + "\n")
-if os.environ.get("QUOTA_INVENTORY_MODE") != "1":
-    raise SystemExit(91)
-if tool == "kubectl":
-    if "get" in args:
-        tail = args[args.index("get") + 1:]
-        kind, separator, name = tail[0].partition("/")
-        if not separator:
-            name = tail[1] if len(tail) > 1 and not tail[1].startswith("-") else ""
-        if f"{kind}/{name}" == os.environ.get("QUOTA_OCCUPIED_OBJECT"):
-            print(f"{kind}/{name}")
-        raise SystemExit(0)
-    if any(command in args for command in ("delete", "wait", "logs")):
-        raise SystemExit(0)
-if tool == "curie":
-    assert not any(
-        argument.split("=", 1)[0] == "--set-string" for argument in args
-    )
-    raise SystemExit(93)
-if tool == "helm" and any(command in args for command in ("uninstall", "list")):
-    raise SystemExit(0)
-raise SystemExit(94)
+    log.write(shlex.join([Path(sys.argv[0]).name, *sys.argv[1:]]) + "\n")
+raise SystemExit(91)
 """
 
 
@@ -118,6 +83,8 @@ def scenario(tmp_path: Path) -> Scenario:
             "CURIE_BIN": str(tools / "curie"),
             "CURIE_SCENARIO_CONTEXT": "kind-acme-test",
             "CURIE_SCENARIO_RUN_ID": "12345-1",
+            "CURIE_SCENARIO_NAMESPACE": "test-workload-12345-1",
+            "CURIE_SCENARIO_RELEASE": "workload-12345-1",
             "CURIE_SCENARIO_API_IMAGE": "curie-api:wsdiag-acme",
             "CURIE_SCENARIO_WORKER_IMAGE": "curie-worker:wsdiag-acme",
             "CURIE_SCENARIO_RUNNER_IMAGE": "curie-runner:wsdiag-acme",
@@ -155,6 +122,12 @@ def test_empty_input_fails_before_any_tool_call(scenario: Scenario, variable: st
         ("CURIE_SCENARIO_CONTEXT", "kind-acme-test\t"),
         ("CURIE_SCENARIO_CONTEXT", "--context"),
         ("CURIE_SCENARIO_CONTEXT", "kind-absent"),
+        ("CURIE_SCENARIO_NAMESPACE", "Uppercase"),
+        ("CURIE_SCENARIO_NAMESPACE", "with/slash"),
+        ("CURIE_SCENARIO_NAMESPACE", "a" * 64),
+        ("CURIE_SCENARIO_RELEASE", "Uppercase"),
+        ("CURIE_SCENARIO_RELEASE", "with/slash"),
+        ("CURIE_SCENARIO_RELEASE", "a" * 54),
         ("CURIE_SCENARIO_RUN_ID", "Uppercase"),
         ("CURIE_SCENARIO_RUN_ID", "-leading"),
         ("CURIE_SCENARIO_RUN_ID", "with/slash"),
@@ -204,9 +177,9 @@ def test_invalid_binary_fails_before_any_tool_call(
 
 
 @pytest.mark.parametrize("run_id", ["a", "a" * 25, "12345-1"])
-def test_valid_run_id_reaches_cluster_inventory(scenario: Scenario, run_id: str) -> None:
+def test_valid_run_id_reaches_shared_install(scenario: Scenario, run_id: str) -> None:
     scenario.environment["CURIE_SCENARIO_RUN_ID"] = run_id
-    assert_reaches_cluster_inventory(scenario)
+    assert_reaches_shared_install(scenario)
 
 
 @pytest.mark.parametrize("variable", IMAGE_INPUTS)
@@ -219,161 +192,43 @@ def test_valid_run_id_reaches_cluster_inventory(scenario: Scenario, run_id: str)
         "curie-api:" + "a" * 128,
     ],
 )
-def test_valid_image_reaches_cluster_inventory(
+def test_valid_image_reaches_shared_install(
     scenario: Scenario, variable: str, image: str
 ) -> None:
     scenario.environment[variable] = image
-    assert_reaches_cluster_inventory(scenario)
+    assert_reaches_shared_install(scenario)
 
 
-def assert_reaches_cluster_inventory(scenario: Scenario) -> None:
+def assert_reaches_shared_install(scenario: Scenario) -> None:
     completed = scenario.run()
     output = completed.stdout + completed.stderr
-    assert completed.returncode != 0, "the cluster inventory stub must stop the scenario"
+    assert completed.returncode != 0, "the shared install boundary stub must stop the scenario"
     calls = scenario.calls()
-    assert len(calls) == 1, (output, calls)
-    assert calls[0][0] == "kubectl" and "get" in calls[0], (output, calls)
-    assert "--context" in calls[0] and "kind-acme-test" in calls[0], calls
-    assert not any(variable in output for variable in INPUTS), output
-
-
-@pytest.mark.parametrize(
-    "occupied_object", [*SHARED_OBJECTS, "namespace/test-4368-idle-capacity-12345-1"]
-)
-def test_occupied_shared_or_private_object_refuses_before_install_or_cleanup(
-    scenario: Scenario, occupied_object: str
-) -> None:
-    scenario.environment["QUOTA_INVENTORY_MODE"] = "1"
-    scenario.environment["QUOTA_OCCUPIED_OBJECT"] = occupied_object
-    completed = scenario.run()
-    output = completed.stdout + completed.stderr
-    assert completed.returncode != 0, output
-    name = occupied_object.split("/", maxsplit=1)[1]
-    assert any(
-        line.startswith("FAIL:") and name in line for line in output.splitlines()
-    ), output
-    calls = scenario.calls()
-    assert calls, output
-    assert all(call[0] == "kubectl" and "get" in call for call in calls), calls
+    assert calls, (output, calls)
+    assert all(call[0] == "kubectl" for call in calls), (output, calls)
     assert all("--context" in call and "kind-acme-test" in call for call in calls), calls
-    assert not any(
-        command in call for call in calls for command in ("delete", "apply", "uninstall", "wait")
-    ), calls
-
-
-@pytest.mark.parametrize(
-    "images",
-    [
-        ("curie-api:wsdiag-acme", "curie-worker:wsdiag-acme", "curie-runner:wsdiag-acme"),
-        (
-            "registry.example.com:5000/acme-corp/curie-api:12345",
-            "registry.example.com:5000/acme-corp/curie-worker:23456",
-            "registry.example.com:5000/acme-corp/curie-runner:34567",
-        ),
-    ],
-    ids=["ordinary-tags", "numeric-tags-and-registry-ports"],
-)
-def test_empty_inventory_advances_to_install_and_cleans_up_failed_install(
-    scenario: Scenario, images: tuple[str, str, str]
-) -> None:
-    scenario.environment["QUOTA_INVENTORY_MODE"] = "1"
-    for variable, image in zip(IMAGE_INPUTS, images, strict=True):
-        scenario.environment[variable] = image
-    completed = scenario.run()
-    output = completed.stdout + completed.stderr
-    assert completed.returncode != 0, "the failed candidate install must remain a failed scenario"
-    assert "candidate cluster install failed" in output, output
-    calls = scenario.calls()
-    installs = [call for call in calls if call[0] == "curie"]
-    assert len(installs) == 1, (output, calls)
-    install = installs[0]
-    assert "cluster" in install and "up" in install, install
-    assert "kind-acme-test" in install, install
-    assert "test-4368-idle-capacity-12345-1" in install, install
-    assert "idlecap-12345-1" in install, install
-    assert not any(
-        argument.split("=", 1)[0] == "--set-string" for argument in install
-    ), install
-    # This pins CLI argv preservation, including numeric tags and registry
-    # ports. It does not assert how Helm later interprets those tag strings.
-    sets = [
-        install[index + 1] for index, argument in enumerate(install) if argument == "--set"
-    ]
-    for image, repository_key, tag_key in zip(
-        images,
-        ("api.image.repository", "worker.image.repository", "agentSandbox.runner.image"),
-        ("api.image.tag", "worker.image.tag", "agentSandbox.runner.tag"),
-        strict=True,
-    ):
-        repository, tag = image.rsplit(":", 1)
-        for key, value in ((repository_key, repository), (tag_key, tag)):
-            assert [setting for setting in sets if setting.startswith(key + "=")] == [
-                f"{key}={value}"
-            ], install
-    install_index = calls.index(install)
-    assert all(
-        call[0] == "kubectl" and "get" in call for call in calls[:install_index]
-    ), calls
-    cleanup = calls[install_index + 1 :]
-    namespace = "test-4368-idle-capacity-12345-1"
-    claims = [
-        call
-        for call in cleanup
-        if call[0] == "kubectl" and "delete" in call
-        and "sandboxclaims" in call
-    ]
-    sandboxes = [
-        call
-        for call in cleanup
-        if call[0] == "kubectl" and "delete" in call
-        and "sandboxes" in call
-    ]
-    uninstalls = [call for call in cleanup if call[0] == "helm" and "uninstall" in call]
-    pods = [
-        call
-        for call in cleanup
-        if call[0] == "kubectl" and "delete" in call and "pods" in call
-    ]
-    namespace_deletions = [
-        call
-        for call in cleanup
-        if call[0] == "kubectl" and "delete" in call
-        and "namespace" in call and namespace in call
-    ]
-    assert len(claims) == len(sandboxes) == len(uninstalls) == 1, cleanup
-    assert len(pods) == len(namespace_deletions) == 1, cleanup
-    assert cleanup.index(claims[0]) < cleanup.index(sandboxes[0]), cleanup
-    assert cleanup.index(sandboxes[0]) < cleanup.index(uninstalls[0]), cleanup
-    assert cleanup.index(uninstalls[0]) < cleanup.index(pods[0]), cleanup
-    assert cleanup.index(pods[0]) < cleanup.index(namespace_deletions[0]), cleanup
-    for deletion in (claims[0], sandboxes[0]):
-        assert "--all" in deletion and "--wait=true" in deletion, deletion
-        assert "--timeout=90s" in deletion, deletion
-        assert "-n" in deletion, deletion
-        assert "test-4368-idle-capacity-12345-1" in deletion, deletion
-    for flag in ("--all", "--ignore-not-found", "--wait=true", "--timeout=60s"):
-        assert flag in pods[0], pods[0]
-    assert "-n" in pods[0] and namespace in pods[0], pods[0]
-    fullname = "idlecap-12345-1-curie"
-    publication_namespace = f"{namespace}-{fullname}-publication"[:63].rstrip("-")
-    for deleted_namespace in (namespace, "agent-sandbox-system", publication_namespace):
-        waits = [
-            call
-            for call in cleanup
-            if call[0] == "kubectl" and "wait" in call
-            and f"namespace/{deleted_namespace}" in call
+    assert all("test-workload-12345-1" in call for call in calls), calls
+    for call in calls:
+        assert not any(action in call for action in ("create", "apply")), call
+        assert "--all-namespaces" not in call and "-A" not in call, call
+        namespaces = [
+            call[index + 1] for index, argument in enumerate(call[:-1])
+            if argument in {"-n", "--namespace"}
         ]
-        assert len(waits) == 1, (deleted_namespace, cleanup)
-        assert cleanup.index(namespace_deletions[0]) < cleanup.index(waits[0]), cleanup
-        assert "--for=delete" in waits[0] and "--timeout=180s" in waits[0], waits[0]
-    for kind in ("validatingadmissionpolicy", "validatingadmissionpolicybinding"):
-        assert any(
-            call[0] == "kubectl"
-            and "get" in call
-            and f"{kind}/{fullname}-runner-resources" in call
-            for call in cleanup
-        ), (kind, cleanup)
-    assert all(call[0] not in {"kind", "docker", "cargo"} for call in calls), calls
+        assert namespaces and namespaces[-1] == "test-workload-12345-1", call
+        if "delete" not in call:
+            continue
+        targets = call[call.index("delete") + 1:]
+        assert targets[0] in {"sandboxclaims", "sandboxes", "pods"}, call
+        if targets[0] == "pods":
+            assert "--all" not in targets, call
+            assert "-l" in targets, call
+            assert targets[targets.index("-l") + 1] == (
+                "app.kubernetes.io/component=runner-sandbox"
+            ), call
+        else:
+            assert "--all" in targets and "--wait=true" in targets, call
+    assert not any(variable in output for variable in INPUTS), output
 
 
 def test_candidate_stack_provisioning_header_is_declared_once_in_first_twenty_lines() -> None:

@@ -31,7 +31,7 @@ _TEMPLATE_RULE = """
 A change that reaches runner MCP catalog projection, unscoped PreToolUse,
 in-process platform MCP tools, workspace publication, or
 built-in coding-tool session capability must record live-provider plus
-external-integration evidence, or leave those required-tier rows open.
+external-integration evidence, or leave that proof open.
 "No model routing change" is not a valid n/a reason.
 """
 
