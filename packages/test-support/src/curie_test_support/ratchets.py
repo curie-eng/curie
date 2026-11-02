@@ -29,18 +29,9 @@ def canonical_nodeid(nodeid: str) -> str:
     return nodeid.rsplit("@", 1)[0] if nodeid.rfind("@") > nodeid.rfind("]") else nodeid
 
 
-def nodeid_hash(nodeid: str) -> str:
-    return hashlib.sha256(canonical_nodeid(nodeid).encode()).hexdigest()
-
-
 def baseline_value(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != {
-        "sleeps",
-        "fixtures",
-        "durations",
-        "known_tests",
-    }:
-        raise ValueError("baseline must contain sleeps, fixtures, durations and known_tests")
+    if not isinstance(value, dict) or set(value) != {"sleeps", "fixtures", "durations"}:
+        raise ValueError("baseline must contain sleeps, fixtures and durations")
     if not isinstance(value["sleeps"], dict) or any(
         not isinstance(key, str) or type(count) is not int or count < 1
         for key, count in value["sleeps"].items()
@@ -52,20 +43,6 @@ def baseline_value(value: Any) -> dict[str, Any]:
             raise ValueError(f"{name} must be a list of identities")
         if entries != sorted(set(entries)):
             raise ValueError(f"{name} must be sorted and unique")
-    known = value["known_tests"]
-    if not isinstance(known, dict) or any(
-        not isinstance(file, str)
-        or Path(file).is_absolute()
-        or ".." in Path(file).parts
-        or not isinstance(entries, list)
-        or any(
-            not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{64}", item) is None
-            for item in entries
-        )
-        or entries != sorted(set(entries))
-        for file, entries in known.items()
-    ):
-        raise ValueError("known_tests must map relative files to sorted unique SHA256 identities")
     return value
 
 
@@ -380,7 +357,6 @@ def scan(root: Path) -> Inventory:
 class Durations:
     maxima: dict[str, float] = field(default_factory=dict)
     collected: dict[str, list[str]] = field(default_factory=dict)
-    known: dict[str, list[str]] = field(default_factory=dict)
 
 
 def duration_observations(paths: Sequence[Path]) -> Durations:
@@ -396,8 +372,6 @@ def duration_observations(paths: Sequence[Path]) -> Durations:
                 run_ids.add(run[1])
             if "test-time duration observations:" in line:
                 observed = True
-            if "test-time known: " in line:
-                result.known.update(json.loads(line.partition("test-time known: ")[2]))
             if "test-time collected: " in line:
                 result.collected.update(json.loads(line.partition("test-time collected: ")[2]))
             match = pattern.search(line)
@@ -487,20 +461,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if not missing_identity(name, inventory, observations)
                 and observations.maxima.get(name, PRUNE_SECONDS) >= PRUNE_SECONDS
             }
-        known = dict(previous["known_tests"]) if previous else {}
-        if args.regenerate:
-            known.update(observations.known)
-            known = {
-                file: sorted(set(entries))
-                for file, entries in known.items()
-                if (root / file).is_file()
-            }
         actual: dict[str, Any] = {
             "sleeps": inventory.sleeps,
             "fixtures": inventory.fixtures,
             "durations": sorted(durations),
-            "known_tests": known,
         }
+        baseline_value(actual)
         repository = subprocess.run(
             ["git", "rev-parse", "--git-dir"], cwd=root, capture_output=True
         )
