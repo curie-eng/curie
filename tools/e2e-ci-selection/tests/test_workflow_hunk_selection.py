@@ -458,9 +458,12 @@ def test_merge_group_payload_selects_the_same_diff_as_pull_request(
         selections.append(output.read_text())
     assert selections[0] == selections[1]
     outputs = dict(line.split("=", 1) for line in selections[1].splitlines())
-    if changed.startswith("tools/factory-e2e/"):
+    if changed == "tools/factory-e2e/queue-example.py":
         assert outputs["factory"] == outputs["cluster"] == "true"
-    if changed.startswith("charts/curie/") or changed.startswith("apps/api/migrations/"):
+    if changed in {
+        "charts/curie/templates/queue-example.yaml",
+        "apps/api/migrations/versions/queue_example.py",
+    }:
         assert "failed-first-install-retry" in json.loads(outputs["chart_scenarios"])
 
 
