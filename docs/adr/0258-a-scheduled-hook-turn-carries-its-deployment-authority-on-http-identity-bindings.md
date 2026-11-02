@@ -4,12 +4,13 @@ Date: 2026-11-02
 
 Status: Accepted
 
-Accepted 2026-11-02 with explicit maintainer approval from jw3329, including
-merging alongside its realizing code path under ADR 0102, recorded in the
-publishing pull request ([#5309](https://github.com/curie-eng/curie/pull/5309)).
+Accepted 2026-11-02 under ADR 0102 coordinated acceptance with explicit
+approval by Junwon Jung (jw3329), including merging alongside its realizing
+code path, recorded in the publishing pull request ([#5309](https://github.com/curie-eng/curie/pull/5309)).
 The realizing code path is `curie_worker.kernel.identity.prepare` and
 `curie_worker.kernel.identity.check`, with
-`curie_worker.hook_runs.HookRunRecorder.scheduled_authority`.
+`curie_worker.hook_runs.HookRunRecorder.scheduled_authority`. The CODEOWNERS
+approving review by TheConnMan was not obtained before merge.
 
 Tracked in [#5304](https://github.com/curie-eng/curie/issues/5304).
 
