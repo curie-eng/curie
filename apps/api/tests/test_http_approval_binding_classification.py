@@ -23,7 +23,7 @@ from curie_api.db import SCHEMA
 from curie_api.identity.http_approval import approval_is_selected
 from curie_api.identity.http_transport import HttpIdentityClient
 from curie_api.main import create_app
-from curie_api.models import Agent, Approval
+from curie_api.models import Agent, AgentChannel, Approval
 from curie_api.resumequeue import ResumeQueue
 from curie_api.sweeper import sweep_expired_approvals
 from fastapi import FastAPI
@@ -489,3 +489,49 @@ def test_approver_migration_during_a_sweep_leaves_the_row_pending(
     assert _status(approval_id) == "pending"
     assert audits(approval_id) == []
     assert valkey.xlen(runs_stream) == 0
+
+
+def _second_binding(binding: dict[str, Any]) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-14: the same agent, address and kind on a second adapter."""
+
+    async def write(factory: async_sessionmaker[AsyncSession]) -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-14: unregistered, and the agent has no role policy."""
+        async with factory() as session, session.begin():
+            session.add(AgentChannel(
+                tenant_id=uuid.UUID(binding["tenant"]), agent_id=uuid.UUID(binding["agent"]),
+                kind=binding["kind"], address=binding["address"], adapter="synthetic-mail-2",
+                endpoint="https://mail.example.test/reply-2", allowed_callers=None,
+            ))
+
+    run(write)
+
+
+def test_ambiguous_route_of_the_agents_own_legacy_bindings_is_refused_strictly(
+    synthetic_provider: SimpleNamespace,  # noqa: F811 - the reused fixture.
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-14: ADR 0259 decision 3, an ambiguous route refuses.
+
+    Both candidates are the agent's own unregistered bindings and neither
+    requires HTTP identity; the unqualified route still resolves to two.
+    """
+    scope = _scope(synthetic_provider.url)
+    sibling = _sibling(scope, kind="email")
+    _second_binding(sibling)
+    unqualified = {**sibling, "adapter": None}
+    with TestClient(_app(scope, synthetic_provider, initialized=True)) as client:
+        body = _body(unqualified, reply_endpoint=None)
+        refused = _create(client, body)
+        assert refused.status_code == 409, refused.text
+        assert refused.json() == {"detail": "unsupported_approval"}
+        assert _stored(body["dedupe_key"]) == []
+
+        approval_id = _insert(unqualified)
+        response = client.post(
+            f"/approvals/{approval_id}/resolve", json={"decision": "approved"},
+            headers=operator_headers(),
+        )
+        assert response.status_code == 403, response.text
+        assert response.json() == {"detail": "unsupported_approval"}
+        assert _status(approval_id) == "pending"
+        assert audits(approval_id) == []
+    assert synthetic_provider.requests == []
