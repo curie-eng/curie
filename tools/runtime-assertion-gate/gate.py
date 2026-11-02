@@ -1,6 +1,7 @@
 """Registration and execution gate for cluster runtime assertions (#3391).
 
-Every added or changed script under charts/curie/ci/runtime/ must be invoked,
+Every added or changed script under charts/curie/ci/runtime/, and the exact
+shared workload installation fixture, must be invoked,
 through tools/runtime-assertion-gate/run.sh, by a step of a CI job that:
 
 * is a dependency of the required `E2E required` job,
@@ -10,7 +11,8 @@ through tools/runtime-assertion-gate/run.sh, by a step of a CI job that:
   condition, with no continue-on-error.
 
 `E2E required` then refuses the verdict unless each such script left a pass
-receipt for its exact blob. The general cluster parity ladder is never taken as
+receipt for its exact blob. The installation fixture also requires phase up.
+The general cluster parity ladder is never taken as
 proof that a new assertion ran.
 
 Subcommands:
@@ -36,6 +38,7 @@ from typing import Any
 import yaml
 
 RUNTIME_DIR = "charts/curie/ci/runtime"
+WORKLOAD_INSTALL = "charts/curie/ci/scenarios/workload-install.sh"
 RUNNER = "tools/runtime-assertion-gate/run.sh"
 REQUIRED_JOB = "e2e-required"
 CLUSTER_SELECTOR = "${{ needs.changes.outputs.cluster == 'true' }}"
@@ -50,7 +53,7 @@ class GateError(Exception):
 
 def is_runtime_assertion(path: str) -> bool:
     parent, _, name = path.rpartition("/")
-    return parent == RUNTIME_DIR and name.endswith(".sh")
+    return path == WORKLOAD_INSTALL or parent == RUNTIME_DIR and name.endswith(".sh")
 
 
 def _git(*args: str) -> str:
@@ -90,6 +93,27 @@ def _load_chart_registry(workflow: Path) -> dict[str, Any]:
 def _registered_chart_step(
     registry: dict[str, Any], step: dict[str, Any], script: str
 ) -> bool:
+    if script == WORKLOAD_INSTALL:
+        command = ["bash", RUNNER, WORKLOAD_INSTALL, "up"]
+        if registry.get("fixtures", {}).get(step.get("name")) != command:
+            return False
+        lines = [words for words in _logical_lines(str(step.get("run", "")))
+                 if words[0] != "set"]
+        if lines != [command]:
+            return False
+        consumers = sorted(
+            scenario_id for scenario_id, entry in registry.get("scenarios", {}).items()
+            if isinstance(entry, dict) and entry.get("leg") == "workload"
+            and script in entry.get("inputs", [])
+        )
+        if not consumers:
+            return False
+        conditions = " || ".join(
+            "contains(fromJSON(needs.changes.outputs.chart_scenarios), '" + name + "')"
+            for name in consumers
+        )
+        expected = "${{ matrix.leg == 'workload' && (" + conditions + ") }}"
+        return step.get("if") == expected
     for scenario_id, entry in registry.get("scenarios", {}).items():
         if not isinstance(scenario_id, str) or not isinstance(entry, dict):
             continue
@@ -260,6 +284,8 @@ def check_receipts(receipts: Path, scripts: list[str]) -> None:
         blob = _git("hash-object", "--", script).strip()
         if data.get("script") != script or data.get("status") != "pass":
             errors.append(f"{script}: receipt does not record a pass for this script")
+        elif script == WORKLOAD_INSTALL and data.get("phase") != "up":
+            errors.append(f"{script}: receipt does not record the up phase")
         elif data.get("blob") != blob:
             errors.append(f"{script}: receipt is for blob {data.get('blob')}, not {blob}")
         else:

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
-import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -20,204 +20,35 @@ INPUTS = (
     "CURIE_SCENARIO_API_IMAGE",
     "CURIE_SCENARIO_WORKER_IMAGE",
     "CURIE_SCENARIO_RUNNER_IMAGE",
+    "CURIE_SCENARIO_NAMESPACE",
+    "CURIE_SCENARIO_RELEASE",
 )
-CRDS = (
-    "sandboxes.agents.x-k8s.io",
-    "sandboxclaims.extensions.agents.x-k8s.io",
-    "sandboxtemplates.extensions.agents.x-k8s.io",
-    "sandboxwarmpools.extensions.agents.x-k8s.io",
-)
-CLUSTER_OBJECTS = (
-    ("namespace", "agent-sandbox-system"),
-    ("clusterrole", "agent-sandbox-controller"),
-    ("clusterrole", "agent-sandbox-controller-extensions"),
-    ("clusterrole", "agent-sandbox-controller-networkpolicies-read"),
-    ("clusterrolebinding", "agent-sandbox-controller"),
-    ("clusterrolebinding", "agent-sandbox-controller-extensions"),
-    ("clusterrolebinding", "agent-sandbox-controller-networkpolicies-read"),
-    ("priorityclass", "curie-platform"),
-    ("priorityclass", "curie-sandbox"),
-)
-
-# These executables replace external tools only. Run the real scenario so its
-# validation, preflight, and EXIT trap remain the paths under test.
-# Observed Kubernetes API snapshots showed a terminating namespace retaining
-# its pods-remaining condition after all pods and PVCs had disappeared. The
-# stateful mode models the pod-grace estimate and delayed reconciliation in:
-# https://github.com/kubernetes/kubernetes/blob/v1.31.0/pkg/controller/namespace/deletion/namespaced_resources_deleter.go
-# https://github.com/kubernetes/kubernetes/blob/v1.31.0/pkg/controller/namespace/namespace_controller.go
 TOOL_STUB = r"""
+import json
 import os
 import shlex
-import sqlite3
 import sys
 from pathlib import Path
 
-tool = Path(sys.argv[0]).name
-args = sys.argv[1:]
 with Path(os.environ["WSDIAG_CALL_LOG"]).open("a") as log:
-    log.write(shlex.join([tool, *args]) + "\n")
-if os.environ.get("WSDIAG_MODE") != "cluster":
-    raise SystemExit(91)
-state = None
-if os.environ.get("WSDIAG_STATEFUL_CLEANUP") == "1":
-    state = sqlite3.connect(os.environ["WSDIAG_CLUSTER_STATE"])
-    state.executescript('''
-        CREATE TABLE IF NOT EXISTS namespaces (
-            name TEXT PRIMARY KEY,
-            namespace_present INTEGER,
-            pods_present INTEGER,
-            pod_delete_requested INTEGER,
-            namespace_delete_requested INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS events (
-            sequence INTEGER PRIMARY KEY,
-            action TEXT,
-            namespace TEXT,
-            pods_present INTEGER
-        );
-        INSERT OR IGNORE INTO namespaces VALUES ('acme-existing', 1, 1, 0, 0);
-    ''')
-    state.commit()
-
-
-def record(action, namespace, pods_present):
-    state.execute(
-        "INSERT INTO events(action, namespace, pods_present) VALUES (?, ?, ?)",
-        (action, namespace, pods_present),
-    )
-    state.commit()
-
-
-namespace = next(
-    (args[index + 1] for index, argument in enumerate(args[:-1])
-     if argument in {"-n", "--namespace"}),
-    "default",
-)
-if tool == "kubectl":
-    if "config" in args:
-        if "current-context" in args or "get-contexts" in args:
-            print(os.environ["CURIE_SCENARIO_CONTEXT"])
+    log.write(shlex.join([Path(sys.argv[0]).name, *sys.argv[1:]]) + "\n")
+if os.environ.get("CONNECTOR_CONFIG_TEST"):
+    tool, args = Path(sys.argv[0]).name, sys.argv[1:]
+    if tool == "helm" and "get" in args:
+        print(json.dumps({"worker": {"connectorReconciler": json.loads(
+            os.environ["CONNECTOR_ORIGINAL_SETTINGS"]
+        )}}))
         raise SystemExit(0)
-    if state is not None:
-        action = next((argument for argument in args if argument in {"get", "delete", "wait"}), "")
-        if action:
-            tail = args[args.index(action) + 1:]
-            target = next((argument for argument in tail if not argument.startswith("-")), "")
-            kind, separator, name = target.partition("/")
-            if not separator:
-                index = tail.index(target) if target else -1
-                name = (
-                    tail[index + 1]
-                    if index >= 0 and len(tail) > index + 1
-                    and not tail[index + 1].startswith("-") else ""
-                )
-            if kind in {"pod", "pods"} and action in {"delete", "wait"}:
-                targets = (
-                    [row[0] for row in state.execute("SELECT name FROM namespaces")]
-                    if "--all-namespaces" in args or "-A" in args else [namespace]
-                )
-                for target_namespace in targets:
-                    row = state.execute(
-                        "SELECT pods_present, pod_delete_requested FROM namespaces WHERE name = ?",
-                        (target_namespace,),
-                    ).fetchone()
-                    if row is None:
-                        continue
-                    if action == "wait" and row[0] and not row[1]:
-                        raise SystemExit(1)
-                    waits = action == "wait" or "--wait=false" not in args
-                    state.execute(
-                        "UPDATE namespaces SET pod_delete_requested = 1, pods_present = ? "
-                        "WHERE name = ?",
-                        (0 if waits else row[0], target_namespace),
-                    )
-                    if os.environ.get("WSDIAG_POD_DRAIN_FAILURE") == "1":
-                        # The API accepted deletion, but the client's watch failed.
-                        record("pod-drain-failed", target_namespace, 0 if waits else row[0])
-                        raise SystemExit(97)
-                    record(
-                        "pod-drained" if waits else "pod-delete-requested",
-                        target_namespace,
-                        0 if waits else row[0],
-                    )
-                raise SystemExit(0)
-            if kind in {"ns", "namespace", "namespaces"} and name:
-                row = state.execute(
-                    "SELECT namespace_present, pods_present, namespace_delete_requested "
-                    "FROM namespaces WHERE name = ?",
-                    (name,),
-                ).fetchone()
-                if row is not None:
-                    if action == "delete":
-                        # Content can disappear while the pod-grace estimate
-                        # still postpones the namespace's next reconciliation.
-                        state.execute(
-                            "UPDATE namespaces SET namespace_present = ?, pods_present = 0, "
-                            "namespace_delete_requested = 1 WHERE name = ?",
-                            (row[0] if row[2] else int(bool(row[1])), name),
-                        )
-                        record("namespace-delete", name, row[1])
-                        raise SystemExit(0)
-                    if action == "wait":
-                        record("namespace-wait", name, row[1])
-                        raise SystemExit(1 if row[0] else 0)
-                    if row[0]:
-                        print(f"namespace/{name}")
-                        raise SystemExit(0)
-                    ignore_missing = (
-                        "--ignore-not-found" in args or "--ignore-not-found=true" in args
-                    )
-                    raise SystemExit(0 if ignore_missing else 1)
-    if "get" in args:
-        tail = args[args.index("get") + 1:]
-        aliases = {
-            "ns": "namespace", "namespaces": "namespace",
-            "clusterroles": "clusterrole", "clusterrolebindings": "clusterrolebinding",
-            "priorityclasses": "priorityclass",
-            "crd": "customresourcedefinition", "crds": "customresourcedefinition",
-            "customresourcedefinitions": "customresourcedefinition",
-        }
-        kind, separator, name = tail[0].partition("/")
-        kind = aliases.get(kind, kind)
-        if not separator:
-            name = tail[1] if len(tail) > 1 and not tail[1].startswith("-") else ""
-        identity = f"{kind}/{name}"
-        occupied = os.environ.get("WSDIAG_OCCUPIED_OBJECT", "")
-        retained = os.environ.get("WSDIAG_EXISTING_CRDS", "").split(",")
-        remains = os.environ.get("WSDIAG_REMAINING_OBJECT", "")
-        installed = Path(os.environ["WSDIAG_INSTALL_MARKER"]).exists()
-        present = identity == occupied or (installed and identity == remains)
-        present |= kind == "customresourcedefinition" and name in retained
-        if present:
-            print(identity)
-            raise SystemExit(0)
-        ignore_missing = "--ignore-not-found" in args or "--ignore-not-found=true" in args
-        raise SystemExit(0 if ignore_missing else 1)
-    if "delete" in args or "wait" in args:
+    if tool == "helm" and "upgrade" in args:
+        if "--values" in args:
+            original = Path(args[args.index("--values") + 1]).read_text()
+            Path(os.environ["CONNECTOR_RESTORED_SETTINGS"]).write_text(original)
+        raise SystemExit(0 if "--no-hooks" in args else 92)
+    if tool == "kubectl" and "rollout" in args:
         raise SystemExit(0)
-    raise SystemExit(92)
-if tool == "curie":
-    Path(os.environ["WSDIAG_INSTALL_MARKER"]).touch()
-    if state is not None:
-        state.execute("INSERT OR REPLACE INTO namespaces VALUES (?, 1, 1, 0, 0)", (namespace,))
-        record("partial-install", namespace, 1)
-    raise SystemExit(93)
-if tool == "helm":
-    if "uninstall" in args:
-        if state is not None:
-            row = state.execute(
-                "SELECT pods_present FROM namespaces WHERE name = ?", (namespace,)
-            ).fetchone()
-            record("helm-uninstall", namespace, row[0] if row else 0)
-        raise SystemExit(0)
-    if "list" in args:
-        print("[]" if "json" in args or "-o=json" in args or "--output=json" in args else "")
-        raise SystemExit(0)
-    if "status" in args:
+    if tool == "kubectl" and "get" in args:
         raise SystemExit(1)
-    raise SystemExit(94)
-raise SystemExit(95)
+raise SystemExit(91)
 """
 
 
@@ -227,9 +58,9 @@ class Scenario:
     log: Path
     binary: Path
 
-    def run(self) -> subprocess.CompletedProcess[str]:
+    def run(self, script: Path = SCRIPT) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["bash", str(SCRIPT)],
+            ["bash", str(script)],
             env=self.environment,
             capture_output=True,
             text=True,
@@ -239,21 +70,6 @@ class Scenario:
 
     def calls(self) -> list[list[str]]:
         return [shlex.split(line) for line in self.log.read_text().splitlines()]
-
-    def cleanup_state(self) -> tuple[dict[str, tuple[int, int]], list[tuple[str, str, int]]]:
-        with sqlite3.connect(self.environment["WSDIAG_CLUSTER_STATE"]) as state:
-            resources = {
-                name: (namespace_present, pods_present)
-                for name, namespace_present, pods_present in state.execute(
-                    "SELECT name, namespace_present, pods_present FROM namespaces"
-                )
-            }
-            events = list(
-                state.execute(
-                    "SELECT action, namespace, pods_present FROM events ORDER BY sequence"
-                )
-            )
-        return resources, events
 
 
 @pytest.fixture
@@ -279,23 +95,16 @@ def scenario(tmp_path: Path) -> Scenario:
         "HOME": str(tmp_path),
         "KUBECONFIG": str(kubeconfig),
         "WSDIAG_CALL_LOG": str(log),
-        "WSDIAG_INSTALL_MARKER": str(tmp_path / "installed"),
         "CURIE_BIN": str(tools / "curie"),
         "CURIE_SCENARIO_CONTEXT": "kind-acme-test",
         "CURIE_SCENARIO_RUN_ID": "12345-1",
+        "CURIE_SCENARIO_NAMESPACE": "test-workload-12345-1",
+        "CURIE_SCENARIO_RELEASE": "workload-12345-1",
         "CURIE_SCENARIO_API_IMAGE": "curie-api:wsdiag-acme",
         "CURIE_SCENARIO_WORKER_IMAGE": "curie-worker:wsdiag-acme",
         "CURIE_SCENARIO_RUNNER_IMAGE": "curie-runner:wsdiag-acme",
     }
     return Scenario(environment, log, tools / "curie")
-
-
-@pytest.fixture
-def partial_install_with_pods(scenario: Scenario, tmp_path: Path) -> Scenario:
-    scenario.environment["WSDIAG_MODE"] = "cluster"
-    scenario.environment["WSDIAG_STATEFUL_CLEANUP"] = "1"
-    scenario.environment["WSDIAG_CLUSTER_STATE"] = str(tmp_path / "cluster-state.sqlite3")
-    return scenario
 
 
 def assert_input_rejected(scenario: Scenario, variable: str) -> None:
@@ -323,6 +132,12 @@ def test_empty_input_fails_before_any_tool_call(scenario: Scenario, variable: st
     [
         ("CURIE_SCENARIO_CONTEXT", "kind-acme-test\nother-context"),
         ("CURIE_SCENARIO_CONTEXT", "kind-absent"),
+        ("CURIE_SCENARIO_NAMESPACE", "Uppercase"),
+        ("CURIE_SCENARIO_NAMESPACE", "with/slash"),
+        ("CURIE_SCENARIO_NAMESPACE", "a" * 64),
+        ("CURIE_SCENARIO_RELEASE", "Uppercase"),
+        ("CURIE_SCENARIO_RELEASE", "with/slash"),
+        ("CURIE_SCENARIO_RELEASE", "a" * 54),
         ("CURIE_SCENARIO_RUN_ID", "Uppercase"),
         ("CURIE_SCENARIO_RUN_ID", "-leading"),
         ("CURIE_SCENARIO_RUN_ID", "with/slash"),
@@ -356,106 +171,99 @@ def test_invalid_binary_fails_before_any_tool_call(
     assert_input_rejected(scenario, "CURIE_BIN")
 
 
-@pytest.mark.parametrize(("kind", "name"), CLUSTER_OBJECTS)
-def test_occupied_controller_or_priority_class_fails_before_install(
-    scenario: Scenario, kind: str, name: str
+def test_valid_shared_install_reaches_workload_without_platform_mutation(
+    scenario: Scenario,
 ) -> None:
-    scenario.environment["WSDIAG_MODE"] = "cluster"
-    scenario.environment["WSDIAG_OCCUPIED_OBJECT"] = f"{kind}/{name}"
     completed = scenario.run()
+    assert completed.returncode != 0, "the workload boundary stub must stop the scenario"
+    calls = scenario.calls()
+    assert calls, completed.stdout + completed.stderr
+    assert all(call[0] == "kubectl" for call in calls), calls
+    assert all("--context" in call and "kind-acme-test" in call for call in calls), calls
+    assert all("test-workload-12345-1" in call for call in calls), calls
+    for call in calls:
+        assert not any(action in call for action in ("create", "apply")), call
+        assert "--all-namespaces" not in call and "-A" not in call, call
+        namespaces = [
+            call[index + 1] for index, argument in enumerate(call[:-1])
+            if argument in {"-n", "--namespace"}
+        ]
+        assert namespaces and namespaces[-1] == "test-workload-12345-1", call
+        if "delete" not in call:
+            continue
+        targets = call[call.index("delete") + 1:]
+        assert targets[0] in {"configmap", "sandboxclaims", "sandboxes", "pods"}, call
+        if targets[0] == "configmap":
+            assert targets[1] == "workspace-cold-start", call
+            assert all(argument.startswith("-") for argument in targets[2:]), call
+        elif targets[0] == "pods":
+            assert "--all" not in targets, call
+            assert "-l" in targets, call
+            assert targets[targets.index("-l") + 1] == (
+                "app.kubernetes.io/component=runner-sandbox"
+            ), call
+        else:
+            assert "--all" in targets and "--wait=true" in targets, call
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    [
+        "idle-capacity-reclamation-runtime.sh",
+        "workspace-dependency-diagnostic-runtime.sh",
+        "connector-secret-rotation-runtime.sh",
+        "connector-apply-race-runtime.sh",
+        "factory-resource-profile-runtime.sh",
+    ],
+)
+@pytest.mark.parametrize("variable", ["CURIE_SCENARIO_NAMESPACE", "CURIE_SCENARIO_RELEASE"])
+@pytest.mark.parametrize("value", [None, ""])
+def test_every_shared_consumer_requires_its_install_identity_before_tool_calls(
+    scenario: Scenario, script_name: str, variable: str, value: str | None
+) -> None:
+    if value is None:
+        del scenario.environment[variable]
+    else:
+        scenario.environment[variable] = value
+    completed = scenario.run(SCRIPT.with_name(script_name))
     output = completed.stdout + completed.stderr
     assert completed.returncode != 0, output
-    assert "FAIL:" in output and name in output, output
-    calls = scenario.calls()
-    assert calls and all(call[0] == "kubectl" for call in calls), calls
-    assert all("get" in call or "config" in call for call in calls), calls
-
-
-@pytest.mark.parametrize("existing_crd", [None, *CRDS])
-def test_failed_install_cleans_owned_objects_and_preserves_existing_crds(
-    scenario: Scenario, existing_crd: str | None
-) -> None:
-    scenario.environment["WSDIAG_MODE"] = "cluster"
-    scenario.environment["WSDIAG_EXISTING_CRDS"] = existing_crd or ""
-    completed = scenario.run()
-    output = completed.stdout + completed.stderr
-    assert completed.returncode != 0, "a failed install must remain a failed scenario"
-    assert "candidate cluster install failed" in output, output
-    calls = scenario.calls()
-    install_index = next(index for index, call in enumerate(calls) if call[0] == "curie")
-    install = calls[install_index]
-    assert "kind-acme-test" in install and "test-4367-wsdiag-12345-1" in install, install
-    assert "wsdiag-12345-1" in install, install
-    assert all(call[0] not in {"cargo", "docker", "kind"} for call in calls), calls
-    assert any(call[0] == "helm" and "uninstall" in call for call in calls), calls
-    assert any("delete" in call and "test-4367-wsdiag-12345-1" in call for call in calls), calls
-    assert any("wait" in call and "--for=delete" in call for call in calls), calls
-    for crd in CRDS:
-        inventory = [
-            index
-            for index, call in enumerate(calls)
-            if "get" in call and any(arg == crd or arg.endswith("/" + crd) for arg in call)
-        ]
-        assert any(index < install_index for index in inventory), (crd, calls)
-        deletions = [
-            call
-            for call in calls
-            if "delete" in call and any(arg == crd or arg.endswith("/" + crd) for arg in call)
-        ]
-        assert bool(deletions) == (crd != existing_crd), (crd, deletions)
-        if crd != existing_crd:
-            assert any(index > install_index for index in inventory), (crd, calls)
-
-
-def test_partial_install_drains_owned_pods_before_namespace_deletion(
-    partial_install_with_pods: Scenario,
-) -> None:
-    scenario = partial_install_with_pods
-    completed = scenario.run()
-    output = completed.stdout + completed.stderr
-    assert completed.returncode != 0, "the primary install failure must remain a failed scenario"
-    assert "candidate cluster install failed" in output, output
-    assert (
-        "OK: owned release, namespaces, controller resources, priority classes, "
-        "and new CRDs are gone"
-        in output
-    ), output
-    assert "owned namespace deletion did not complete" not in output, output
-    assert "PASS:" not in output, output
-    resources, events = scenario.cleanup_state()
-    owned_namespace = "test-4367-wsdiag-12345-1"
-    assert resources[owned_namespace] == (0, 0), resources
-    assert resources["acme-existing"] == (1, 1), resources
-    owned_events = [
-        (action, pods) for action, namespace, pods in events if namespace == owned_namespace
-    ]
-    assert ("partial-install", 1) in owned_events, events
-    assert ("namespace-delete", 0) in owned_events, events
-    assert ("namespace-wait", 0) in owned_events, events
-    uninstall_index = owned_events.index(("helm-uninstall", 1))
-    drained_index = owned_events.index(("pod-drained", 0))
-    namespace_delete_index = owned_events.index(("namespace-delete", 0))
-    assert uninstall_index < drained_index < namespace_delete_index, events
-
-
-def test_pod_drain_tool_failure_fails_cleanup_even_after_pods_disappear(
-    partial_install_with_pods: Scenario,
-) -> None:
-    scenario = partial_install_with_pods
-    scenario.environment["WSDIAG_POD_DRAIN_FAILURE"] = "1"
-    completed = scenario.run()
-    output = completed.stdout + completed.stderr
-    assert completed.returncode != 0, output
-    assert "candidate cluster install failed" in output, output
     assert any(
-        line.startswith("FAIL:") and "pod" in line.lower() for line in output.splitlines()
+        line.startswith("FAIL:") and variable in line for line in output.splitlines()
     ), output
-    assert "OK: owned release" not in output, output
-    assert "owned namespace deletion did not complete" not in output, output
-    assert "PASS:" not in output, output
-    resources, events = scenario.cleanup_state()
-    owned_namespace = "test-4367-wsdiag-12345-1"
-    assert resources[owned_namespace] == (0, 0), resources
-    assert resources["acme-existing"] == (1, 1), resources
-    assert ("pod-drain-failed", owned_namespace, 0) in events, events
-    assert ("namespace-delete", owned_namespace, 0) in events, events
+    assert scenario.calls() == [], "incomplete install identity must fail before tool calls"
+
+
+@pytest.mark.parametrize("script_name", [
+    "connector-secret-rotation-runtime.sh", "connector-apply-race-runtime.sh",
+])
+@pytest.mark.parametrize("original", [
+    {"enabled": False, "intervalSeconds": 60},
+    {"enabled": True, "intervalSeconds": 17},
+])
+def test_connector_configuration_and_failure_cleanup_avoid_platform_lifecycle_hooks(
+    scenario: Scenario, tmp_path: Path, script_name: str, original: dict[str, object],
+) -> None:
+    restored = tmp_path / "restored.json"
+    scenario.environment.update({
+        "CONNECTOR_CONFIG_TEST": "1",
+        "CONNECTOR_ORIGINAL_SETTINGS": json.dumps(original),
+        "CONNECTOR_RESTORED_SETTINGS": str(restored),
+    })
+    completed = scenario.run(SCRIPT.with_name(script_name))
+    calls = scenario.calls()
+    upgrades = [call for call in calls if call[0] == "helm" and "upgrade" in call]
+    assert len(upgrades) == 2, (completed.stdout, completed.stderr, calls)
+    # Helm documents hook suppression separately from the rollout wait:
+    # https://helm.sh/docs/helm/helm_upgrade/#options
+    assert all("--no-hooks" in call for call in upgrades), upgrades
+    assert all("--reuse-values" in call and "--wait" in call for call in upgrades)
+    assert all("--install" not in call and "install" not in call for call in upgrades)
+    assert "worker.connectorReconciler.enabled=true" in upgrades[0]
+    assert "worker.connectorReconciler.intervalSeconds=1" in upgrades[0]
+    assert json.loads(restored.read_text()) == {"worker": {"connectorReconciler": original}}
+    assert any(call[0] == "docker" for call in calls), "valid configuration must reach the body"
+    assert sum(call[0] == "kubectl" and "rollout" in call for call in calls) == 2
+    assert completed.returncode != 0, "the controlled image tool failure must remain a failure"
+    assert "could not configure the connector reconciler" not in completed.stderr
+    assert "could not restore" not in completed.stderr

@@ -14,6 +14,12 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def shared_install_identity(monkeypatch) -> None:
+    monkeypatch.setenv("CURIE_SCENARIO_NAMESPACE", "acme-shared-workload")
+    monkeypatch.setenv("CURIE_SCENARIO_RELEASE", "acme-shared")
+
+
 @pytest.fixture
 def helper() -> Any:
     path = Path(__file__).resolve().parents[1] / "run.py"
@@ -482,3 +488,43 @@ def test_completed_preflight_starts_inventory_and_worker_observation(preflight_b
     assert subject.observer.max_sandboxes == 2
     assert calls
     assert worker_calls == ["logs", "exec"]
+
+
+@pytest.mark.parametrize("variable", ["CURIE_SCENARIO_NAMESPACE", "CURIE_SCENARIO_RELEASE"])
+@pytest.mark.parametrize("value", [None, "", "Uppercase", "with/slash", "a" * 54])
+def test_main_rejects_invalid_shared_install_identity_before_starting_child(
+    helper, monkeypatch, capsys, variable: str, value: str | None
+) -> None:
+    monkeypatch.setenv("CURIE_SCENARIO_CONTEXT", "acme-context")
+    monkeypatch.setenv("CURIE_SCENARIO_RUN_ID", "acme-run")
+    if value is None:
+        monkeypatch.delenv(variable)
+    else:
+        monkeypatch.setenv(variable, value)
+
+    def unexpected_run(_self) -> int:
+        raise AssertionError("incomplete shared install identity started observation")
+
+    monkeypatch.setattr(helper._Collector, "run", unexpected_run)
+    assert helper.main(["--", sys.executable, "-c", "raise SystemExit(0)"]) == 2
+    assert variable in capsys.readouterr().err
+
+
+def test_collector_uses_shared_install_identity_for_kubernetes_observation(
+    helper, monkeypatch,
+) -> None:
+    calls = []
+
+    def kubectl(arguments, **_kwargs):
+        calls.append(arguments)
+        return helper.subprocess.CompletedProcess(arguments, 0, "{}", "")
+
+    monkeypatch.setattr(helper.subprocess, "run", kubectl)
+    subject = helper._Collector("acme-context", "acme-run", [])
+    subject._poll_startup()
+    assert calls == [[
+        "kubectl", "--context", "acme-context", "--namespace", "acme-shared-workload",
+        "get", "namespace", "acme-shared-workload", "--ignore-not-found", "-o", "json",
+        "--request-timeout=5s",
+    ]]
+    assert subject.fullname == "acme-shared-curie"

@@ -72,7 +72,8 @@ ci_policy_tests:
      tools/e2e-ci-selection/cli_pytest_files.txt]
   tools/runtime-assertion-gate/tests/test_runtime_assertion_gate.py:
     [.github, tools/runtime-assertion-gate, conftest.py, pyproject.toml, uv.lock,
-     charts/curie/ci/runtime, charts/curie/templates]
+     charts/curie/ci/runtime, charts/curie/templates,
+     charts/curie/ci/scenarios/workload-install.sh]
 pytest_scopes:
   cli:
     prefixes: [cli]
@@ -128,6 +129,9 @@ conditional_pytest_files:
     - .github/e2e-selection.yaml
     - tools/e2e-ci-selection
 chart_scenarios:
+  fixtures:
+    Install the shared workload platform: [bash, tools/runtime-assertion-gate/run.sh, charts/curie/ci/scenarios/workload-install.sh, up]
+    Remove the shared workload platform: [bash, charts/curie/ci/scenarios/workload-install.sh, down]
   job: e2e-cluster-chart-regressions
   shared_inputs:
     - charts/curie/templates
@@ -144,6 +148,13 @@ chart_scenarios:
     - cli/scripts/ensure-kind-registry.sh
   scenarios:
     failed-first-install-retry:
+      pr_inputs:
+        - charts/curie
+        - apps/api/migrations
+        - apps/api/src/curie_api/migrations
+        - cli/src/ops/up.rs
+        - charts/curie/ci/runtime/failed-first-install-retry-runtime.sh
+        - .github/workflows/ci.yaml
       step: Failed first install retry recreates data volumes
       leg: workload
       inputs:
@@ -183,6 +194,7 @@ chart_scenarios:
       step: Connector apply survives a concurrent reconciler create
       leg: workload
       inputs:
+        - charts/curie/ci/scenarios/workload-install.sh
         - charts/curie/ci/runtime/connector-apply-race-runtime.sh
         - cli
         - apps/api
@@ -194,6 +206,7 @@ chart_scenarios:
       step: Hosted connector credential rotation rolls only that connector
       leg: workload
       inputs:
+        - charts/curie/ci/scenarios/workload-install.sh
         - charts/curie/ci/runtime/connector-secret-rotation-runtime.sh
         - cli
         - apps/api
@@ -222,6 +235,7 @@ chart_scenarios:
       step: Workspace dependency failure reaches the terminal diagnostic
       leg: workload
       inputs:
+        - charts/curie/ci/scenarios/workload-install.sh
         - charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh
         - apps/api
         - apps/worker
@@ -234,6 +248,7 @@ chart_scenarios:
       step: Quota progress regression
       leg: workload
       inputs:
+        - charts/curie/ci/scenarios/workload-install.sh
         - charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh
         - apps/api
         - apps/worker
@@ -249,6 +264,7 @@ chart_scenarios:
       step: Factory resource profile runtime (#4889)
       leg: workload
       inputs:
+        - charts/curie/ci/scenarios/workload-install.sh
         - charts/curie/ci/runtime/factory-resource-profile-runtime.sh
         - charts/curie/values.yaml
         - charts/curie/values.schema.json
@@ -264,6 +280,8 @@ chart_scenarios:
         - uv.lock
 rules:
   exact:
+    .github/e2e-selection.yaml: [cluster]
+    .github/workflows/ci.yaml: [cluster]
     compose.dev.yaml: [local]
     .github/workflows/release.yaml: [local-release]
     pyproject.toml: [skill, local, local-release, cluster]
@@ -375,7 +393,8 @@ rules:
     scripts: []
     # The revision-based selector inspects ci.yaml hunks and selects the
     # released-upgrade smoke shard and negative control for upgrade job edits.
-    # Other workflow edits stay ignored; path-only requests cannot inspect hunks.
+    # The exact main CI rule above selects cluster proof for its shared scenario
+    # wiring. Other workflows stay ignored; path-only requests cannot inspect hunks.
     .github/workflows: []
     .github/e2e-selection.yaml: []
     tools: []

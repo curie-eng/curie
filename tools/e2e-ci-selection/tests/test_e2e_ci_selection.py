@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -16,7 +17,7 @@ import tomllib
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 import pytest
 import yaml
@@ -203,6 +204,16 @@ class _ChartScenario(TypedDict):
     step: str
     inputs: list[str]
     leg: str
+    pr_inputs: NotRequired[list[str]]
+
+
+WORKLOAD_INSTALL = "charts/curie/ci/scenarios/workload-install.sh"
+CHART_SETUP_FIXTURES = {
+    "Install the shared workload platform": [
+        "bash", "tools/runtime-assertion-gate/run.sh", WORKLOAD_INSTALL, "up"
+    ],
+    "Remove the shared workload platform": ["bash", WORKLOAD_INSTALL, "down"],
+}
 
 
 CHART_SCENARIOS: dict[str, _ChartScenario] = {
@@ -211,6 +222,14 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
         "inputs": [
             "charts/curie/ci/runtime/failed-first-install-retry-runtime.sh",
             "cli/src/ops/up.rs",
+        ],
+        "pr_inputs": [
+            "charts/curie",
+            "apps/api/migrations",
+            "apps/api/src/curie_api/migrations",
+            "cli/src/ops/up.rs",
+            "charts/curie/ci/runtime/failed-first-install-retry-runtime.sh",
+            ".github/workflows/ci.yaml",
         ],
         "leg": "workload",
     },
@@ -251,6 +270,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
     "connector-apply-race": {
         "step": "Connector apply survives a concurrent reconciler create",
         "inputs": [
+            WORKLOAD_INSTALL,
             "charts/curie/ci/runtime/connector-apply-race-runtime.sh",
             "cli",
             "apps/api",
@@ -264,6 +284,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
     "connector-secret-rotation": {
         "step": "Hosted connector credential rotation rolls only that connector",
         "inputs": [
+            WORKLOAD_INSTALL,
             "charts/curie/ci/runtime/connector-secret-rotation-runtime.sh",
             "cli",
             "apps/api",
@@ -296,6 +317,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
     "workspace-diagnostic": {
         "step": "Workspace dependency failure reaches the terminal diagnostic",
         "inputs": [
+            WORKLOAD_INSTALL,
             "charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh",
             *CHART_IMAGE_INPUTS,
         ],
@@ -304,6 +326,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
     "quota-progress": {
         "step": "Quota progress regression",
         "inputs": [
+            WORKLOAD_INSTALL,
             "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",
             *CHART_IMAGE_INPUTS,
         ],
@@ -312,6 +335,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
     "factory-resource-profile": {
         "step": "Factory resource profile runtime (#4889)",
         "inputs": [
+            WORKLOAD_INSTALL,
             "charts/curie/ci/runtime/factory-resource-profile-runtime.sh",
             "charts/curie/values.yaml",
             "charts/curie/values.schema.json",
@@ -369,12 +393,17 @@ def _matches_chart_input(path: str, value: str) -> bool:
 
 
 def _expected_chart_for_path(path: str) -> tuple[str, ...]:
-    if any(_matches_chart_input(path, value) for value in CHART_SHARED_INPUTS):
-        return CHART_IDS
     matched = tuple(
         scenario
         for scenario in CHART_IDS
-        if any(_matches_chart_input(path, value) for value in CHART_SCENARIOS[scenario]["inputs"])
+        if any(
+            _matches_chart_input(path, value)
+            for value in [
+                *CHART_SHARED_INPUTS,
+                *CHART_SCENARIOS[scenario]["inputs"],
+                *CHART_SCENARIOS[scenario].get("pr_inputs", []),
+            ]
+        )
     )
     if matched:
         return matched
@@ -900,15 +929,17 @@ def test_registry_maps_each_known_surface(
 
 
 @pytest.mark.parametrize(
-    "path",
+    ("path", "selected"),
     [
-        ".github/e2e-selection.yaml",
-        ".github/workflows/ci.yaml",
-        "tools/e2e-ci-selection/select_tiers.py",
+        (".github/e2e-selection.yaml", ("cluster",)),
+        (".github/workflows/ci.yaml", ("cluster",)),
+        ("tools/e2e-ci-selection/select_tiers.py", ()),
     ],
 )
-def test_selector_and_workflow_paths_do_not_boot_kind(tmp_path: Path, path: str) -> None:
-    _assert_selection(tmp_path, path, (), pytest_needed=True)
+def test_selector_and_workflow_paths_select_their_required_tiers(
+    tmp_path: Path, path: str, selected: tuple[str, ...],
+) -> None:
+    _assert_selection(tmp_path, path, selected, pytest_needed=True)
 
 
 @pytest.mark.parametrize(
@@ -1893,6 +1924,7 @@ def test_unknown_and_union_selection_are_deterministic(tmp_path: Path) -> None:
     assert unknown.returncode == 0, unknown.stderr
     assert unknown_output == _expected_output(
         *BASE_TIERS,
+        chart_scenarios=CHART_IDS,
         ci_policy_files=_expected_ci_policy_files("new-surface/module.py"),
     )
 
@@ -2063,6 +2095,7 @@ def test_revisions_select_changed_paths_and_unknown_fallback(tmp_path: Path) -> 
     assert unknown.returncode == 0, unknown.stderr
     assert unknown_output == _expected_output(
         *BASE_TIERS,
+        chart_scenarios=CHART_IDS,
         ci_policy_files=_expected_ci_policy_files("new-surface.txt"),
     )
 
@@ -2246,6 +2279,9 @@ ci_policy_tests:
 rules:
   exact:
     compose.dev.yaml: [local]
+    .github/workflows/ci.yaml: [cluster]
+    .github/e2e-selection.yaml: [cluster]
+    tools/runtime-assertion-gate/run.sh: [cluster]
     apps/worker/src/curie_worker/config.py: [released-upgrade]
   prefixes:
     charts: [cluster]
@@ -2260,6 +2296,7 @@ rules:
             "job": CHART_JOB,
             "shared_inputs": list(CHART_SHARED_INPUTS),
             "scenarios": CHART_SCENARIOS,
+            "fixtures": CHART_SETUP_FIXTURES,
         }
     },
     sort_keys=False,
@@ -2366,7 +2403,7 @@ def test_exact_ignore_under_selected_prefix_does_not_hide_siblings(tmp_path: Pat
     assert sibling_output == _expected_output(
         "cluster",
         "released-upgrade",
-        chart_scenarios=(),
+        chart_scenarios=("failed-first-install-retry",),
         ci_policy_files=_expected_ci_policy_files(
             "charts/curie/README.md/runtime-check.sh", registry=registry
         ),
@@ -5195,8 +5232,8 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
     step = steps[0]
     assert step["if"] == _chart_step_if("controller-preflight")
     assert "continue-on-error" not in step
-    # This scenario owns its kind cluster; the runtime receipt runner accepts
-    # only ci/runtime scripts and would refuse it before executing any proof.
+    # The controller proof runs directly on the caller's existing context.
+    # The runtime receipt runner accepts only ci/runtime scripts.
     assert "uv run bash charts/curie/ci/scenarios/controller-preflight-kind.sh" in step["run"]
     assert "tools/runtime-assertion-gate/run.sh" not in step["run"]
     assert "e2e-cluster-chart-regressions" in jobs["e2e-required"]["needs"]
@@ -5222,13 +5259,13 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
             ("charts/curie/ci/runtime/connector-readiness-runtime.sh",),
             False,
             False,
-            ("connector-readiness",),
+            ("connector-readiness", "failed-first-install-retry"),
         ),
         (
             ("charts/curie/ci/scenarios/controller-preflight-kind.sh",),
             False,
             False,
-            ("controller-preflight",),
+            ("controller-preflight", "failed-first-install-retry"),
         ),
         (
             ("packages/plugin-format/src/plugin_format/connector_render.py",),
@@ -5257,7 +5294,10 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
             ),
         ),
         (("docs/adr/AGENTS.md",), False, False, ()),
-        (("newtoplevel/file.txt",), False, False, CHART_IDS),
+        (
+            ("newtoplevel/file.txt",), False, False,
+            CHART_IDS,
+        ),
         ((), True, False, CHART_IDS),
         ((), True, True, ()),
         (("apps/api/src/curie_api/main.py",), False, True, ()),
@@ -5265,8 +5305,22 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
             ("charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh",),
             False,
             True,
-            ("langfuse-postgres-readiness",),
+            ("failed-first-install-retry", "langfuse-postgres-readiness"),
         ),
+        (
+            (WORKLOAD_INSTALL,),
+            False,
+            True,
+            (
+                "connector-apply-race",
+                "connector-secret-rotation",
+                "factory-resource-profile",
+                "failed-first-install-retry",
+                "quota-progress",
+                "workspace-diagnostic",
+            ),
+        ),
+        (("charts/curie/ci/scenarios/other-fixture.sh",), False, True, ()),
         (_version_only_paths(_repo_version()), False, False, ()),
     ],
     ids=(
@@ -5282,6 +5336,8 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
         "next-push",
         "next-api",
         "next-runtime-assertion",
+        "next-workload-install",
+        "next-unreceipted-fixture",
         "version-only",
     ),
 )
@@ -5307,13 +5363,24 @@ def test_chart_scenarios_follow_changed_inputs_and_final_tiers(
 
 @pytest.mark.parametrize(
     ("path", "expected"),
-    [(entry["inputs"][0], (scenario,)) for scenario, entry in CHART_SCENARIOS.items()]
+    [
+        (
+            path,
+            tuple(sorted({scenario, "failed-first-install-retry"}))
+            if path.startswith("charts/curie/") else (scenario,),
+        )
+        for scenario, entry in CHART_SCENARIOS.items()
+        for path in (next(value for value in entry["inputs"] if value != WORKLOAD_INSTALL),)
+    ]
     + [
         ("charts/curie/values.yaml", CHART_IDS),
         ("charts/curie/values-dev.yaml", CHART_IDS),
         ("charts/curie/values.schema.json", CHART_IDS),
         ("charts/curie/values-custom.yaml", CHART_IDS),
-        ("charts/curie/ci/postgres-readiness-delay.Dockerfile", ("langfuse-postgres-readiness",)),
+        (
+            "charts/curie/ci/postgres-readiness-delay.Dockerfile",
+            ("failed-first-install-retry", "langfuse-postgres-readiness"),
+        ),
         (
             "apps/worker/src/curie_worker/connector_k8s.py.bak",
             (
@@ -5324,8 +5391,14 @@ def test_chart_scenarios_follow_changed_inputs_and_final_tiers(
                 "workspace-diagnostic",
             ),
         ),
-        ("charts/curie/ci/runtime/connector-readiness-runtime.sh.bak", ()),
-        ("charts/curie/ci/runtime/connector-readiness-runtime.sh/child", ("connector-readiness",)),
+        (
+            "charts/curie/ci/runtime/connector-readiness-runtime.sh.bak",
+            ("failed-first-install-retry",),
+        ),
+        (
+            "charts/curie/ci/runtime/connector-readiness-runtime.sh/child",
+            ("connector-readiness", "failed-first-install-retry"),
+        ),
         ("examples/weather/skills/weather/SKILL.md", ()),
         ("scripts/check-netpol-enforcement.sh", ()),
     ],
@@ -5351,10 +5424,64 @@ def test_failed_first_install_retry_script_alone_selects_its_scenario(tmp_path: 
     assert json.loads(selected["chart_legs"]) == ["workload"]
 
 
-def test_failed_first_install_retry_tracks_the_production_discard_path(tmp_path: Path) -> None:
-    completed, output = _invoke_selector(tmp_path, "cli/src/ops/up.rs")
+@pytest.mark.parametrize(
+    ("path", "selected"),
+    [
+        ("charts/curie/templates/postgres.yaml", True),
+        ("charts/curie/values.yaml", True),
+        ("apps/api/migrations/versions/9999_example.py", True),
+        ("apps/api/src/curie_api/migrations/versions/9999_example.py", True),
+        ("apps/api/src/curie_api/main.py", False),
+        ("cli/src/ops/up.rs", True),
+        (".github/workflows/ci.yaml", True),
+        (".github/e2e-selection.yaml", True),
+        ("tools/runtime-assertion-gate/run.sh", True),
+        (".github/actions/load-ci-images/action.yml", True),
+        ("charts/curie/ci/runtime/failed-first-install-retry-runtime.sh", True),
+        ("new-surface/module.py", True),
+        ("docs/agents.md", False),
+    ],
+)
+def test_failed_first_install_retry_pr_selection_keeps_its_own_and_shared_inputs(
+    tmp_path: Path, path: str, selected: bool
+) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
     assert completed.returncode == 0, completed.stderr
-    assert "failed-first-install-retry" in json.loads(_outputs_of(output)["chart_scenarios"])
+    scenarios = json.loads(_outputs_of(output)["chart_scenarios"])
+    assert ("failed-first-install-retry" in scenarios) is selected
+
+
+@pytest.mark.parametrize(
+    "path",
+    [path for path in CHART_SHARED_INPUTS if path != "charts/curie/Chart.yaml"],
+)
+def test_every_shared_chart_input_selects_cluster_and_retry(tmp_path: Path, path: str) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    selected = _outputs_of(output)
+    assert selected["cluster"] == "true"
+    scenarios = json.loads(selected["chart_scenarios"])
+    assert "failed-first-install-retry" in scenarios
+    assert scenarios == list(CHART_IDS)
+
+
+def test_nightly_full_selection_keeps_failed_first_install_retry(tmp_path: Path) -> None:
+    completed, output = _invoke_selector(tmp_path, push=True)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(_outputs_of(output)["chart_scenarios"]) == list(CHART_IDS)
+
+
+def test_workload_install_change_selects_every_shared_consumer(tmp_path: Path) -> None:
+    completed, output = _invoke_selector(tmp_path, WORKLOAD_INSTALL)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(_outputs_of(output)["chart_scenarios"]) == [
+        "connector-apply-race",
+        "connector-secret-rotation",
+        "factory-resource-profile",
+        "failed-first-install-retry",
+        "quota-progress",
+        "workspace-diagnostic",
+    ]
 
 
 def test_chart_scenario_union_is_sorted_and_deduplicated(tmp_path: Path) -> None:
@@ -5372,6 +5499,7 @@ def test_chart_scenario_union_is_sorted_and_deduplicated(tmp_path: Path) -> None
         "connector-readiness",
         "connector-secret-rotation",
         "factory-resource-profile",
+        "failed-first-install-retry",
         "quota-progress",
         "workspace-diagnostic",
     ]
@@ -5390,7 +5518,15 @@ def _chart_consistency_problems(workflow: dict[str, Any], registry: dict[str, An
             str(step.get("run", "")),
         ):
             continue
-        if name not in by_step:
+        if name in section.get("fixtures", {}):
+            commands = [
+                shlex.split(line)
+                for line in str(step.get("run", "")).splitlines()
+                if line.strip() and line.strip() != "set -euo pipefail"
+            ]
+            if commands != [section["fixtures"][name]]:
+                problems.append(f"fixture command mismatch: {name}")
+        elif name not in by_step:
             problems.append(f"unregistered scenario step: {name}")
         elif scenarios[by_step[name]].get("leg") not in CHART_LEGS:
             problems.append(f"scenario without a leg: {by_step[name]}")
@@ -5408,6 +5544,7 @@ def test_chart_scenario_registry_and_real_workflow_are_consistent() -> None:
         "job": CHART_JOB,
         "shared_inputs": list(CHART_SHARED_INPUTS),
         "scenarios": CHART_SCENARIOS,
+        "fixtures": CHART_SETUP_FIXTURES,
     }
     _SELECTOR_MODULE._load_registry(REGISTRY)
     workflow = yaml.safe_load(WORKFLOW.read_text())
@@ -5463,14 +5600,14 @@ def test_every_chart_scenario_belongs_to_exactly_one_leg() -> None:
         (
             ("charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",),
             False,
-            ["quota-progress"],
+            ["failed-first-install-retry", "quota-progress"],
             ["workload"],
         ),
         (
             ("charts/curie/ci/runtime/connector-readiness-runtime.sh",),
             False,
-            ["connector-readiness"],
-            ["chart"],
+            ["connector-readiness", "failed-first-install-retry"],
+            ["chart", "workload"],
         ),
         ((), True, list(CHART_IDS), ["chart", "workload"]),
         (("docs/adr/AGENTS.md",), False, [], []),
@@ -5635,6 +5772,42 @@ def test_chart_scenario_registry_rejects_malformed_entries(tmp_path: Path, mutat
         _SELECTOR_MODULE._load_registry(path)
 
 
+@pytest.mark.parametrize("value", [[], "charts/curie", [""], ["/charts/curie"], ["charts/curie/"]])
+def test_chart_scenario_registry_rejects_malformed_pr_inputs(tmp_path: Path, value: object) -> None:
+    registry = yaml.safe_load(VALID_REGISTRY)
+    registry["chart_scenarios"]["scenarios"]["failed-first-install-retry"]["pr_inputs"] = value
+    path = tmp_path / "registry.yaml"
+    path.write_text(yaml.safe_dump(registry))
+    with pytest.raises(_SELECTOR_MODULE.RegistryError):
+        _SELECTOR_MODULE._load_registry(path)
+
+
+def test_chart_scenario_pr_inputs_add_to_own_and_shared_inputs_and_keep_full_selection(
+    tmp_path: Path,
+) -> None:
+    registry = yaml.safe_load(VALID_REGISTRY)
+    entry = registry["chart_scenarios"]["scenarios"]["connector-readiness"]
+    entry["pr_inputs"] = ["apps/api/migrations"]
+    path = tmp_path / "registry.yaml"
+    path.write_text(yaml.safe_dump(registry))
+    # Additional PR inputs retain the standard inputs and full nightly selection.
+    _SELECTOR_MODULE._load_registry(path)
+    for changed_path, expected in (
+        ("charts/curie/values.yaml", True),
+        ("charts/curie/ci/runtime/connector-readiness-runtime.sh", True),
+        (".github/workflows/ci.yaml", True),
+        ("apps/api/migrations/versions/9999_example.py", True),
+        ("docs/agents.md", False),
+    ):
+        completed, output = _invoke_selector(tmp_path, changed_path, registry=path)
+        assert completed.returncode == 0, completed.stderr
+        scenarios = json.loads(_outputs_of(output)["chart_scenarios"])
+        assert ("connector-readiness" in scenarios) is expected
+    completed, output = _invoke_selector(tmp_path, registry=path, push=True)
+    assert completed.returncode == 0, completed.stderr
+    assert "connector-readiness" in json.loads(_outputs_of(output)["chart_scenarios"])
+
+
 @pytest.mark.parametrize("mode", ["paths", "push", "revisions"])
 def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
     tmp_path: Path,
@@ -5671,7 +5844,9 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
     assert completed.returncode == 0, completed.stderr
     expected = (
         CHART_IDS
-        if mode in {"push", "revisions"}
+        if mode == "push"
+        else CHART_IDS
+        if mode == "revisions"
         else (
                 "connector-apply-race",
                 "connector-secret-rotation",
@@ -5797,3 +5972,75 @@ def test_connector_secret_rotation_selects_candidate_runtime(tmp_path: Path) -> 
 def test_namespace_cleanup_collector_source_selects_its_released_upgrade_owner() -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-4."""
     assert _selects_released_upgrade("tools/released-upgrade/namespace_cleanup_evidence.py")
+
+
+@pytest.mark.parametrize("mutation", [None, "action", "script", "extra-command"])
+def test_registered_fixture_commands_do_not_hide_an_unregistered_scenario(
+    tmp_path: Path, mutation: str | None
+) -> None:
+    repository = _new_repository(tmp_path)
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    steps = workflow["jobs"][CHART_JOB]["steps"]
+    steps[:] = [step for step in steps if step.get("name") not in CHART_SETUP_FIXTURES]
+    name = "Install the shared workload platform"
+    command = list(CHART_SETUP_FIXTURES[name])
+    if mutation == "action":
+        command[-1] = "unexpected"
+    elif mutation == "script":
+        command[2] = "charts/curie/ci/scenarios/unregistered-example.sh"
+    run = shlex.join(command) + "\n"
+    if mutation == "extra-command":
+        run += "bash charts/curie/ci/runtime/unregistered-example-runtime.sh\n"
+    steps.append({"name": name, "run": run})
+    target = repository / ".github/workflows/ci.yaml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(yaml.safe_dump(workflow, sort_keys=False))
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(VALID_REGISTRY)
+    completed, output = _invoke_selector(
+        tmp_path, "apps/api/src/curie_api/main.py", registry=registry, cwd=repository
+    )
+    assert completed.returncode == 0, completed.stderr
+    selected = json.loads(_outputs_of(output)["chart_scenarios"])
+    assert ("unregistered" in selected) is (mutation is not None)
+
+
+def test_chart_shared_workload_order_preserves_scenario_isolation() -> None:
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"][CHART_JOB]["steps"]
+    positions = {step.get("name"): index for index, step in enumerate(steps)}
+    scenario_names = {entry["step"] for entry in CHART_SCENARIOS.values()}
+    shared = [
+        step for step in steps
+        if step.get("name") in scenario_names
+        and step["name"] != CHART_SCENARIOS["failed-first-install-retry"]["step"]
+        and step.get("if", "").startswith("${{ matrix.leg == 'workload' && ")
+    ]
+    chart = [
+        step for step in steps
+        if step.get("name") in scenario_names
+        and step.get("if", "").startswith("${{ matrix.leg == 'chart' && ")
+    ]
+    assert {step["name"] for step in shared} == {
+        CHART_SCENARIOS[scenario]["step"]
+        for scenario in WORKLOAD_SCENARIOS - {"failed-first-install-retry"}
+    }
+    assert shared[0]["name"] == CHART_SCENARIOS["quota-progress"]["step"]
+    assert shared[-1]["name"] == CHART_SCENARIOS["workspace-diagnostic"]["step"]
+    assert chart[-1]["name"] == CHART_SCENARIOS["controller-preflight"]["step"]
+    install = positions["Install the shared workload platform"]
+    remove = positions["Remove the shared workload platform"]
+    assert install < positions[shared[0]["name"]]
+    assert all(install < positions[step["name"]] < remove for step in shared)
+    assert positions[chart[-1]["name"]] < positions["Delete the job-owned kind cluster"]
+    assert (
+        positions["Delete the job-owned kind cluster"]
+        < positions["Upload runtime assertion receipts"]
+    )
+    assert positions["Dump cluster diagnostics on failure"] < remove
+    cleanup = steps[remove]
+    assert cleanup["if"] == "${{ always() && matrix.leg == 'workload' }}"
+    assert "steps." not in cleanup["if"]
+    assert shlex.split(cleanup["run"]) == CHART_SETUP_FIXTURES[cleanup["name"]]
+    setup = steps[install]
+    assert shlex.split(setup["run"]) == CHART_SETUP_FIXTURES[setup["name"]]
+    assert "continue-on-error" not in setup and "continue-on-error" not in cleanup

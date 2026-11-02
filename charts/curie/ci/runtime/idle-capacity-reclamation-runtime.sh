@@ -3,8 +3,8 @@
 # fix-pin-provision: candidate-stack
 # The caller supplies the candidate CLI, context, run ID, and loaded images.
 # Each Fix pin phase provisions its own product before invoking this scenario.
-# This scenario owns only its release and the resources installed by it.
-# Prerequisites: kubectl, Helm, Python 3 with PyYAML, setsid, and network access
+# The caller owns the installed workload release; this scenario uses it.
+# Prerequisites: kubectl, Python 3 with PyYAML, setsid, and network access
 # to the chart backing-service images.
 set -euo pipefail
 umask 077
@@ -12,7 +12,8 @@ umask 077
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 for variable in CURIE_BIN CURIE_SCENARIO_CONTEXT CURIE_SCENARIO_RUN_ID \
-    CURIE_SCENARIO_API_IMAGE CURIE_SCENARIO_WORKER_IMAGE CURIE_SCENARIO_RUNNER_IMAGE; do
+    CURIE_SCENARIO_API_IMAGE CURIE_SCENARIO_WORKER_IMAGE CURIE_SCENARIO_RUNNER_IMAGE \
+    CURIE_SCENARIO_NAMESPACE CURIE_SCENARIO_RELEASE; do
     [[ -n "${!variable:-}" ]] || fail "$variable is required"
 done
 [[ -f "$CURIE_BIN" && -x "$CURIE_BIN" ]] || fail "CURIE_BIN must name an executable curie binary"
@@ -36,6 +37,10 @@ if re.search(r"[\s\x00-\x1f\x7f]", context) or context.startswith("-"):
     fail("CURIE_SCENARIO_CONTEXT", "must name one kubeconfig context")
 if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,24}", os.environ["CURIE_SCENARIO_RUN_ID"]):
     fail("CURIE_SCENARIO_RUN_ID", "must match ^[a-z0-9][a-z0-9-]{0,24}$")
+for variable, maximum in (("CURIE_SCENARIO_NAMESPACE", 63), ("CURIE_SCENARIO_RELEASE", 53)):
+    value = os.environ[variable]
+    if len(value) > maximum or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", value):
+        fail(variable, f"must be a DNS label of at most {maximum} characters")
 component = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
 host_component = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
 host = rf"(?:{host_component}(?:\.{host_component})*|\[[A-Fa-f0-9:]+\])(?::[0-9]+)?"
@@ -69,20 +74,16 @@ for filename in dict.fromkeys(path for path in kubeconfig.split(os.pathsep) if p
 if not isinstance(contexts.get(context), dict):
     fail("CURIE_SCENARIO_CONTEXT", "is absent from the caller's kubeconfig")
 PY
-for command in kubectl helm setsid; do
+for command in kubectl setsid; do
     command -v "$command" >/dev/null || fail "required executable is unavailable: $command"
 done
 BIN="$(python3 -c 'import os; print(os.path.abspath(os.environ["CURIE_BIN"]))')"
 RUN_ID="$CURIE_SCENARIO_RUN_ID"
 CONTEXT="$CURIE_SCENARIO_CONTEXT"
-NAMESPACE="test-4368-idle-capacity-$CURIE_SCENARIO_RUN_ID"
-RELEASE="idlecap-$CURIE_SCENARIO_RUN_ID"
+NAMESPACE="$CURIE_SCENARIO_NAMESPACE"
+RELEASE="$CURIE_SCENARIO_RELEASE"
 FULLNAME="$RELEASE-curie"
-PUBLICATION_NAMESPACE="${NAMESPACE}-${FULLNAME}-publication"
-PUBLICATION_NAMESPACE="${PUBLICATION_NAMESPACE:0:63}"
-PUBLICATION_NAMESPACE="${PUBLICATION_NAMESPACE%-}"
 AGENT="acme-capacity-bot"
-INSTALL_STARTED=0
 DRIVER_PID=""
 # Never forward the invoking shell's model, GitHub, Slack, or API credentials.
 # The fresh release uses only the published development defaults.
@@ -92,32 +93,10 @@ unset CURIE_API_URL CURIE_API_KEY CURIE_VALKEY_PASSWORD CURIE_NAMESPACE CURIE_ST
 unset CURIE_MODEL_BASE_URL CURIE_FAKE_MODEL CURIE_FAKE_SCRIPT CURIE_FAKE_SCRIPT_FILE
 
 kc() { kubectl --context "$CONTEXT" -n "$NAMESPACE" "$@"; }
-CLUSTER_OBJECTS=(
-    namespace/agent-sandbox-system
-    clusterrole/agent-sandbox-controller
-    clusterrole/agent-sandbox-controller-extensions
-    clusterrole/agent-sandbox-controller-networkpolicies-read
-    clusterrolebinding/agent-sandbox-controller
-    clusterrolebinding/agent-sandbox-controller-extensions
-    clusterrolebinding/agent-sandbox-controller-networkpolicies-read
-    priorityclass/curie-platform
-    priorityclass/curie-sandbox
-)
-# An occupied scenario namespace would make its release and data unowned too.
-for object in "namespace/$NAMESPACE" "${CLUSTER_OBJECTS[@]}"; do
-    existing="$(kc get "$object" --ignore-not-found -o name)" || fail "could not inventory $object"
-    [[ -z "$existing" ]] || fail "refusing to install while $object exists"
-done
-ABSENT_CRDS=()
-for crd in sandboxes.agents.x-k8s.io sandboxclaims.extensions.agents.x-k8s.io \
-    sandboxtemplates.extensions.agents.x-k8s.io sandboxwarmpools.extensions.agents.x-k8s.io; do
-    existing="$(kc get "crd/$crd" --ignore-not-found -o name)" || fail "could not inventory CRD $crd"
-    [[ -n "$existing" ]] || ABSENT_CRDS+=("$crd")
-done
 WORKDIR="$(python3 -c 'import tempfile; print(tempfile.mkdtemp(prefix="curie-idle-capacity-"))')"
 export CURIE_CONFIG_DIR="$WORKDIR/curie-config"
 cleanup() {
-    local status=$? cleanup_status=0 remaining object crd
+    local status=$? cleanup_status=0
     trap - EXIT INT TERM
     set +e
     if [[ -n "$DRIVER_PID" ]]; then
@@ -127,12 +106,10 @@ cleanup() {
         wait "$DRIVER_PID" 2>/dev/null || true
     fi
     if (( status != 0 )); then
-        if (( INSTALL_STARTED )); then
-            for component in worker api; do
-                kc logs "deployment/$FULLNAME-$component" --tail=250 --request-timeout=10s \
-                    >"$WORKDIR/failure-$component.log" 2>&1 || true
-            done
-        fi
+        for component in worker api; do
+            kc logs "deployment/$FULLNAME-$component" --tail=250 --request-timeout=10s \
+                >"$WORKDIR/failure-$component.log" 2>&1 || true
+        done
         if ! python3 - "$WORKDIR" "$REPO_ROOT" "$RUN_ID" <<'PY_DIAGNOSTIC'
 import getpass, os, pathlib, re, sys
 source = pathlib.Path(sys.argv[1])
@@ -153,61 +130,20 @@ PY_DIAGNOSTIC
             cleanup_status=1
         fi
     fi
-    if (( INSTALL_STARTED )); then
-        # Let the live controller release finalizers before Helm stops it.
-        kc delete sandboxclaims --all --ignore-not-found --wait=true --timeout=90s \
-            >"$WORKDIR/delete-claims.log" 2>&1 \
-            || { echo "FAIL: could not delete owned sandbox claims" >&2; cleanup_status=1; }
-        kc delete sandboxes --all --ignore-not-found --wait=true --timeout=90s \
-            >"$WORKDIR/delete-sandboxes.log" 2>&1 \
-            || { echo "FAIL: could not delete owned sandboxes" >&2; cleanup_status=1; }
-        helm --kube-context "$CONTEXT" uninstall "$RELEASE" -n "$NAMESPACE" \
-            --ignore-not-found --wait --timeout 60s >"$WORKDIR/uninstall.log" 2>&1 \
-            || { echo "FAIL: could not uninstall the owned release" >&2; cleanup_status=1; }
-        # Drain owned pods before namespace deletion so the namespace
-        # controller does not defer reconciliation for their termination grace.
-        kc delete pods --all --ignore-not-found --wait=true --timeout=60s >"$WORKDIR/delete-pods.log" 2>&1 \
-            || { echo "FAIL: could not drain pods in the owned namespace" >&2; cleanup_status=1; }
-        kc delete namespace "$NAMESPACE" --ignore-not-found --wait=false \
-            >"$WORKDIR/delete-namespace.log" 2>&1 \
-            || { echo "FAIL: could not delete the owned namespace" >&2; cleanup_status=1; }
-        kc wait --for=delete "namespace/$NAMESPACE" --timeout=180s >"$WORKDIR/wait-namespace.log" 2>&1 \
-            || { echo "FAIL: owned namespace deletion did not complete" >&2; cleanup_status=1; }
-        kc wait --for=delete namespace/agent-sandbox-system --timeout=180s >"$WORKDIR/wait-controller.log" 2>&1 \
-            || { echo "FAIL: controller namespace deletion did not complete" >&2; cleanup_status=1; }
-        kc wait --for=delete "namespace/$PUBLICATION_NAMESPACE" --timeout=180s >"$WORKDIR/wait-publication.log" 2>&1 \
-            || { echo "FAIL: publication namespace deletion did not complete" >&2; cleanup_status=1; }
-        for crd in "${ABSENT_CRDS[@]}"; do
-            kc delete "crd/$crd" --ignore-not-found --wait=false >"$WORKDIR/delete-crd.log" 2>&1 \
-                || { echo "FAIL: could not delete owned CRD $crd" >&2; cleanup_status=1; }
-            kc wait --for=delete "crd/$crd" --timeout=60s >"$WORKDIR/wait-crd.log" 2>&1 \
-                || { echo "FAIL: owned CRD $crd deletion did not complete" >&2; cleanup_status=1; }
-        done
-        for object in "namespace/$NAMESPACE" "namespace/$PUBLICATION_NAMESPACE" "${CLUSTER_OBJECTS[@]}" \
-            "validatingadmissionpolicy/$FULLNAME-runner-resources" \
-            "validatingadmissionpolicybinding/$FULLNAME-runner-resources" "${ABSENT_CRDS[@]/#/crd/}"; do
-            if ! remaining="$(kc get "$object" --ignore-not-found -o name 2>"$WORKDIR/verify-objects.log")"; then
-                echo "FAIL: could not verify teardown of $object" >&2
-                cleanup_status=1
-            elif [[ -n "$remaining" ]]; then
-                echo "FAIL: owned object $object remains" >&2
-                cleanup_status=1
-            fi
-        done
-        if ! remaining="$(helm --kube-context "$CONTEXT" list -n "$NAMESPACE" --all --short \
-            --filter "^$RELEASE$" 2>"$WORKDIR/verify-release.log")"; then
-            echo "FAIL: could not verify release teardown" >&2
-            cleanup_status=1
-        elif [[ -n "$remaining" ]]; then
-            echo "FAIL: owned release remains" >&2
-            cleanup_status=1
-        fi
-    fi
+    kc delete sandboxclaims --all --ignore-not-found --wait=true --timeout=90s \
+        >"$WORKDIR/delete-claims.log" 2>&1 \
+        || { echo "FAIL: could not delete scenario sandbox claims" >&2; cleanup_status=1; }
+    kc delete sandboxes --all --ignore-not-found --wait=true --timeout=90s \
+        >"$WORKDIR/delete-sandboxes.log" 2>&1 \
+        || { echo "FAIL: could not delete scenario sandboxes" >&2; cleanup_status=1; }
+    kc delete pods -l app.kubernetes.io/component=runner-sandbox --ignore-not-found --wait=true --timeout=90s \
+        >"$WORKDIR/delete-runner-pods.log" 2>&1 \
+        || { echo "FAIL: could not drain scenario runner pods" >&2; cleanup_status=1; }
     rm -rf -- "$WORKDIR" || cleanup_status=1
     if (( cleanup_status )); then
         exit 1
     fi
-    echo "OK: quota scenario release, namespaces, and cluster-scoped objects are gone"
+    echo "OK: quota scenario claims, sandboxes, and runner pods are gone"
     if (( status == 0 )); then
         echo "PASS: clean and stale-route six-turn bursts finalized under quota two; reclaimed history resumed"
     fi
@@ -217,30 +153,6 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Keep normal route retention and claim deadlines; only sandbox pod quota is reduced.
-sets=(
-    --set "fullnameOverride=$FULLNAME"
-    --set "api.image.repository=${CURIE_SCENARIO_API_IMAGE%:*}" \
-    --set "api.image.tag=${CURIE_SCENARIO_API_IMAGE##*:}" --set api.image.pullPolicy=Never
-    --set "worker.image.repository=${CURIE_SCENARIO_WORKER_IMAGE%:*}" \
-    --set "worker.image.tag=${CURIE_SCENARIO_WORKER_IMAGE##*:}" --set worker.image.pullPolicy=Never
-    --set "agentSandbox.runner.image=${CURIE_SCENARIO_RUNNER_IMAGE%:*}" \
-    --set "agentSandbox.runner.tag=${CURIE_SCENARIO_RUNNER_IMAGE##*:}"
-    --set agentSandbox.runner.imagePullPolicy=Never --set agentSandbox.runner.prewarm.imagePullPolicy=Never
-    --set agentSandbox.deploy=true --set agentSandbox.controller.deploy=true
-    --set agentSandbox.platformPool.replicas=0 --set agentSandbox.runner.fakeModel=true
-    --set worker.replicas=1 --set resourceQuota.hard.sandboxPodCount=2
-    --set security.gvisor.mode=off
-    --set langfuse.deploy=false --set langfuse.host=langfuse.example.com
-    --set clickhouse.deploy=false --set otelCollector.deploy=false --set otelCollector.telemetryDisabled=true
-    --set ui.deploy=false --set dispatcher.deploy=false --set mailAdapter.deploy=false
-)
-# Keep the caller's working directory so relative KUBECONFIG paths retain
-# their meaning. Register ownership before the CLI can partially install.
-INSTALL_STARTED=1
-"$BIN" cluster --context "$CONTEXT" up --namespace "$NAMESPACE" --release "$RELEASE" \
-    --chart "$REPO_ROOT/charts/curie" --dev --fake-model --no-expose "${sets[@]}" \
-    >"$WORKDIR/install.log" 2>&1 || fail "candidate cluster install failed"
 for component in api worker; do
     image_variable="CURIE_SCENARIO_${component^^}_IMAGE"
     kc rollout status "deployment/$FULLNAME-$component" --timeout=300s >/dev/null
@@ -570,7 +482,7 @@ def batch(phase, count, *, progress=True, stale=None, expect_pressure=False):
 
 
 def clear_owned_sandboxes():
-    # This fresh namespace contains only this selector's release and runners.
+    # Quota runs first on the job-owned shared release, before other workloads.
     # Keep Valkey affinity records intact to reproduce a preceding cleanup phase.
     run([*kube, "delete", "sandboxclaims", "--all", "--wait=true", "--timeout=90s"], timeout=100)
     run([*kube, "delete", "sandboxes", "--all", "--wait=true", "--timeout=90s"], timeout=100)
