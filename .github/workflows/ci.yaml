@@ -658,8 +658,9 @@ jobs:
         run: uv run python scripts/check-alembic-revisions.py
       - name: Alembic cross-train lineage
         env:
-          BASE: ${{ github.base_ref || github.ref_name }}
+          BASE: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_ref || github.base_ref || github.ref_name }}
         run: |
+          BASE="${BASE#refs/heads/}"
           case "$BASE" in
             main) other_train=next ;;
             next) other_train=main ;;
@@ -724,8 +725,12 @@ jobs:
       # unbumped wire change vs an existing base lock exits 1.
       - name: ACI wire-lock base gate
         run: |
-          git fetch --no-tags --depth=1 origin "${{ github.base_ref || github.ref_name }}" || true
-          git show "origin/${{ github.base_ref || github.ref_name }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock 2>/dev/null || true
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            git show "${{ github.event.merge_group.base_sha }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock
+          else
+            git fetch --no-tags --depth=1 origin "${{ github.base_ref || github.ref_name }}" || true
+            git show "origin/${{ github.base_ref || github.ref_name }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock 2>/dev/null || true
+          fi
           uv run python -m aci_protocol.wire_lock --check-base /tmp/base-wire.lock
 
   python:
