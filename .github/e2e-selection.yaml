@@ -280,6 +280,7 @@ chart_scenarios:
         - uv.lock
 rules:
   exact:
+    .github/e2e-selection.yaml: [cluster]
     .github/workflows/ci.yaml: [cluster]
     compose.dev.yaml: [local]
     .github/workflows/release.yaml: [local-release]
