@@ -75,91 +75,33 @@ Fix pin: <supported selector>
      reason:
 Fix pin: n/a - <reason>
 
-     The pin's tier is derived from the selector's location, not from prose:
-     unit tests, cli/tests/local/test_*.py (local), charts/curie/ci/* (cluster
-     helm-render), or other test_live.py selectors (live). If the closed issue
-     carries found:unit, found:local, found:cluster, or found:live and the pin
-     is below that surface, add:
-Fix pin waiver: <reason>
-
-     A unit pin for a found:live issue fails without that waiver.
+     A lower-tier pin that reproduces the defect is accepted without a waiver,
+     regardless of the issue's discovery label. The verifier still requires a
+     changed test that passes and fails when the fix is reversed.
 
      For a non fix pull request that does not close a bug-labeled issue, leave
      this section empty. -->
 
-## End-to-end verification
+## Verification
 
-<!-- Choose exactly one path.
-
-     Behavior-bearing: keep the tier table and three evidence checkboxes below.
-     Classify all seven tiers required or n/a with a concrete reason, and paste the
-     exact command plus what you observed for each required tier.
-
-     No runtime behavior: delete the tier table and three evidence checkboxes.
-     Replace them with one explanation and the scoped checks you ran:
-
-     This change does not alter runtime behavior because <reason>.
-     Scoped verification: `<command>` - <observed outcome>.
-
-     Documentation and ADR changes are not automatically exempt. If they alter
-     runtime behavior, use the behavior-bearing path. See "E2E verification is
-     mandatory" in AGENTS.md.
-
+<!-- State what you ran locally, with commands and observed outcomes.
+     Include any live or external proof CI cannot produce.
+     CI tier results are read from CI, not restated here.
      A change that reaches runner MCP catalog projection, unscoped PreToolUse,
      in-process platform MCP tools, workspace publication, or
      built-in coding-tool session capability must record live-provider plus
-     external-integration evidence, or leave those required-tier rows open.
-     "No model routing change" is not a valid n/a reason. Fake-model kind,
-     skill ladder, and helper-only tests are not sufficient.
+     external-integration evidence, or leave that proof open.
+     "No model routing change" is not a valid n/a reason.
+     Test at the cheapest boundary that proves the changed contract;
+     a higher tier needs a failure mode the lower tier cannot see. -->
 
-     Factory is required for API factory_runtime, factory_ci, factory_progress,
-     or routers/publications changes; runner verification preflight or factory
-     progress; examples/dark-factory; and worker work item execution. Run the
-     production factory scenario through the changed components. A canned
-     fixture or fake scenario does not close this tier. Run
-     `curie dev factory-e2e scripted`, the scenario the factory row names.
+Local checks:
 
-     The guard derives minimum required tiers from changed files. Body prose
-     cannot omit a required row or make it n/a. Skill and local may use fake
-     in the mode column when the row supplies its exact command and an observed
-     completed outcome. Live provider, external integration, and factory require
-     `live` in the mode column; a blank cell or any other mode leaves the row
-     unproved.
-
-     Evidence text saying blocked, not run, or fake leaves a required row
-     unproved at any tier. For a completed negative test, describe the observed
-     outcome as denied, refused, or returned 401; reserve blocked, not run,
-     and fake for unproved status requiring a waiver. To proceed as discovery,
-     include a visible
-     line of this exact form with a concrete reason and an open issue:
-Discovery waiver: <reason> #N
-
-     Keep the row required and state the missing proof. Table rows and waiver
-     lines must be visible. Text inside HTML comments, fenced code blocks, or
-     indented code blocks does not count as evidence. Any follow up named
-     in the tier table must include its issue number. -->
-
-| Tier | Required / n/a | Reason | Mode (fake / live) | Command and observed outcome |
-| --- | --- | --- | --- | --- |
-| skill | | | | |
-| local | | | | |
-| local-release | | | | |
-| cluster | | | | |
-| live provider | | | | |
-| external integration | | | | |
-| factory | | | | |
-
-1. [ ] Every proved required tier above names its exact command, the commit it ran
-      against, the mode it ran in, and the literal outcome observed.
-2. [ ] Each meaningful acceptance criterion has positive proof plus a falsifiable
-      negative or a second independent path.
-3. [ ] Every unproved required tier names its blocker in the table and has a
-      visible Discovery waiver naming an open issue. Any follow up in the
-      table includes its issue number.
+Live or external proof CI cannot produce:
 
 ## Checklist
 
-- [ ] Tests pass for the area I touched (see CONTRIBUTING.md for the commands).
-- [ ] Docs updated if behavior changed.
-- [ ] An ADR is added under `docs/adr/` if this is an architectural decision.
-- [ ] Reviewed the public title, body, commits, branch name, links, and attachments for customer and downstream information; used anonymous roles and placeholders throughout.
+1. [ ] Tests pass for the area I touched (see CONTRIBUTING.md for the commands).
+1. [ ] Docs updated if behavior changed.
+1. [ ] An ADR is added under `docs/adr/` if this is an architectural decision.
+1. [ ] Reviewed the public title, body, commits, branch name, links, and attachments for customer and downstream information; used anonymous roles and placeholders throughout.

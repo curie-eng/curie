@@ -24,19 +24,7 @@ def _check_body(
 ) -> subprocess.CompletedProcess[str]:
     body_path = tmp_path / "pull-request-body.md"
     body_path.write_text(body, encoding="utf-8")
-    changed_files_path = tmp_path / "changed-files.json"
-    changed_files_path.write_text("[]\n", encoding="utf-8")
-    open_issues_path = tmp_path / "open-issues.json"
-    open_issues_path.write_text("[]\n", encoding="utf-8")
-    command = [
-        "bash",
-        str(CHECKER),
-        str(body_path),
-        "--changed-files-file",
-        str(changed_files_path),
-        "--open-issues-file",
-        str(open_issues_path),
-    ]
+    command = ["bash", str(CHECKER), str(body_path)]
     if title is not None:
         title_path = tmp_path / "pull-request-title.txt"
         title_path.write_text(title, encoding="utf-8")
@@ -299,3 +287,12 @@ def test_pr_body_self_test_covers_the_patch_release_half() -> None:
     combined = f"{completed.stdout}\n{completed.stderr}"
     assert "Trigger" in combined, _diagnostics(completed)
     assert "Live proof" in combined, _diagnostics(completed)
+
+
+def test_pr_body_needs_no_tier_rows_or_path_metadata(tmp_path: Path) -> None:
+    completed = _check_body(
+        tmp_path,
+        "## Verification\n\nLocally: focused guard tests passed.\n"
+        "CI results are read from CI. No external proof is needed.\n",
+    )
+    assert completed.returncode == 0, _diagnostics(completed)
