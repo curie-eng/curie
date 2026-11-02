@@ -18,6 +18,8 @@ GATE_DIR = REPO_ROOT / "tools" / "runtime-assertion-gate"
 RUNNER = GATE_DIR / "run.sh"
 CI = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 SCRIPT = "charts/curie/ci/runtime/example-runtime.sh"
+WORKLOAD_INSTALL = "charts/curie/ci/scenarios/workload-install.sh"
+WORKLOAD_UP = f"bash tools/runtime-assertion-gate/run.sh {WORKLOAD_INSTALL} up"
 
 _spec = importlib.util.spec_from_file_location("runtime_assertion_gate", GATE_DIR / "gate.py")
 assert _spec and _spec.loader
@@ -144,26 +146,28 @@ def test_real_ci_does_not_register_an_assertion_the_parity_ladder_only_covers() 
         gate.check_registration(CI, ["charts/curie/ci/runtime/metrics-alerts-runtime.sh"])
 
 
-def _repo(tmp_path: Path, body: str) -> Path:
+def _repo(tmp_path: Path, body: str, script: str = SCRIPT) -> Path:
     repo = tmp_path / "repo"
-    (repo / "charts/curie/ci/runtime").mkdir(parents=True)
-    (repo / SCRIPT).write_text(body, encoding="utf-8")
+    (repo / script).parent.mkdir(parents=True)
+    (repo / script).write_text(body, encoding="utf-8")
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     return repo
 
 
-def _run(repo: Path, receipts: Path, script: str = SCRIPT) -> subprocess.CompletedProcess[str]:
+def _run(
+    repo: Path, receipts: Path, script: str = SCRIPT, args: tuple[str, ...] = ()
+) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "RUNTIME_ASSERTION_RECEIPTS": str(receipts)}
     return subprocess.run(
-        ["bash", str(RUNNER), script], cwd=repo, env=env, capture_output=True, text=True
+        ["bash", str(RUNNER), script, *args], cwd=repo, env=env, capture_output=True, text=True
     )
 
 
-def _receipts(repo: Path, receipts: Path) -> None:
+def _receipts(repo: Path, receipts: Path, script: str = SCRIPT) -> None:
     cwd = Path.cwd()
     os.chdir(repo)
     try:
-        gate.check_receipts(receipts, [SCRIPT])
+        gate.check_receipts(receipts, [script])
     finally:
         os.chdir(cwd)
 
@@ -218,6 +222,10 @@ def test_select_lists_added_and_modified_assertions_only(tmp_path: Path) -> None
     (repo / SCRIPT).write_text("echo two\n")
     (repo / "charts/curie/ci/runtime/new-runtime.sh").write_text("echo new\n")
     (repo / "charts/curie/ci/runtime/notes.md").write_text("not a script\n")
+    fixture = repo / WORKLOAD_INSTALL
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text("echo install\n")
+    (fixture.parent / "other-fixture.sh").write_text("echo unrelated\n")
     other.unlink()
     subprocess.run([*git, "add", "-A"], cwd=repo, check=True)
     subprocess.run([*git, "commit", "-qm", "head"], cwd=repo, check=True)
@@ -231,6 +239,7 @@ def test_select_lists_added_and_modified_assertions_only(tmp_path: Path) -> None
     assert json.loads(completed.stdout) == [
         SCRIPT,
         "charts/curie/ci/runtime/new-runtime.sh",
+        WORKLOAD_INSTALL,
     ]
 
 
@@ -449,7 +458,7 @@ def test_chart_scenario_registration_preserves_all_gate_requirements(
 
 
 def test_real_ci_registers_every_enabled_chart_runtime_script() -> None:
-    gate.check_registration(CI, list(CHART_RUNTIME_SCRIPTS))
+    gate.check_registration(CI, [*CHART_RUNTIME_SCRIPTS, WORKLOAD_INSTALL])
 
 
 def test_chart_legs_upload_distinct_receipts_the_required_verdict_merges() -> None:
@@ -488,3 +497,149 @@ def test_self_test_exercises_the_registry_omission_negative_control(
     output = capsys.readouterr().out
     assert "negative control rejected" in output
     assert "registry" in output.lower()
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (WORKLOAD_INSTALL, True),
+        ("charts/curie/ci/scenarios/other-fixture.sh", False),
+        (WORKLOAD_INSTALL + ".bak", False),
+        (WORKLOAD_INSTALL + "/child.sh", False),
+    ],
+)
+def test_only_the_exact_workload_fixture_joins_runtime_assertions(
+    path: str, expected: bool,
+) -> None:
+    assert gate.is_runtime_assertion(path) is expected
+
+
+def _workload_fixture_workflow(tmp_path: Path) -> Path:
+    workflow = tmp_path / ".github/workflows/ci.yaml"
+    workflow.parent.mkdir(parents=True)
+    document = yaml.safe_load(CI.read_text())
+    step = next(
+        step for step in document["jobs"][CHART_JOB]["steps"]
+        if step.get("name") == "Install the shared workload platform"
+    )
+    step["run"] = WORKLOAD_UP
+    registry = yaml.safe_load((REPO_ROOT / ".github/e2e-selection.yaml").read_text())
+    registry["chart_scenarios"]["fixtures"][step["name"]] = WORKLOAD_UP.split()
+    workflow.write_text(yaml.safe_dump(document, sort_keys=False))
+    (tmp_path / ".github/e2e-selection.yaml").write_text(
+        yaml.safe_dump(registry, sort_keys=False)
+    )
+    return workflow
+
+
+def test_workload_fixture_up_registers_as_a_dedicated_receipted_step(tmp_path: Path) -> None:
+    gate.check_registration(_workload_fixture_workflow(tmp_path), [WORKLOAD_INSTALL])
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["down", "missing-action", "extra-argument", "other-command", "suppressed",
+     "conditional-command", "conditional-step", "wrong-leg", "continue-on-error",
+     "unwrapped", "registry-down"],
+)
+def test_workload_fixture_registration_requires_unconditional_canonical_up(
+    tmp_path: Path, mutation: str,
+) -> None:
+    workflow = _workload_fixture_workflow(tmp_path)
+    document = yaml.safe_load(workflow.read_text())
+    step = next(
+        step for step in document["jobs"][CHART_JOB]["steps"]
+        if step.get("name") == "Install the shared workload platform"
+    )
+    if mutation == "down":
+        step["run"] = WORKLOAD_UP.removesuffix("up") + "down"
+    elif mutation == "missing-action":
+        step["run"] = WORKLOAD_UP.removesuffix(" up")
+    elif mutation == "extra-argument":
+        step["run"] += " extra"
+    elif mutation == "other-command":
+        step["run"] += "\necho unrelated command"
+    elif mutation == "suppressed":
+        step["run"] += " || true"
+    elif mutation == "conditional-command":
+        step["run"] = f"if false; then\n{WORKLOAD_UP}\nfi"
+    elif mutation == "conditional-step":
+        step["if"] += " && false"
+    elif mutation == "wrong-leg":
+        step["if"] = step["if"].replace("'workload'", "'chart'")
+    elif mutation == "continue-on-error":
+        step["continue-on-error"] = True
+    elif mutation == "unwrapped":
+        step["run"] = f"bash {WORKLOAD_INSTALL} up"
+    else:
+        registry_path = tmp_path / ".github/e2e-selection.yaml"
+        registry = yaml.safe_load(registry_path.read_text())
+        registry["chart_scenarios"]["fixtures"][step["name"]][-1] = "down"
+        registry_path.write_text(yaml.safe_dump(registry, sort_keys=False))
+    workflow.write_text(yaml.safe_dump(document, sort_keys=False))
+    with pytest.raises(gate.GateError):
+        gate.check_registration(workflow, [WORKLOAD_INSTALL])
+
+
+def test_workload_up_receipt_requires_the_executed_blob_and_phase(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, 'test "$1" = up\necho installed\n', WORKLOAD_INSTALL)
+    receipts = tmp_path / "receipts"
+    completed = _run(repo, receipts, WORKLOAD_INSTALL, ("up",))
+    assert completed.returncode == 0, completed.stderr
+    receipt = receipts / "workload-install.json"
+    data = json.loads(receipt.read_text())
+    assert data["script"] == WORKLOAD_INSTALL and data["status"] == "pass"
+    assert data["phase"] == "up"
+    _receipts(repo, receipts, WORKLOAD_INSTALL)
+    (repo / WORKLOAD_INSTALL).write_text("echo changed\n")
+    with pytest.raises(gate.GateError):
+        _receipts(repo, receipts, WORKLOAD_INSTALL)
+
+
+@pytest.mark.parametrize("phase", [None, "down", "unexpected"])
+def test_workload_receipt_without_up_phase_fails(tmp_path: Path, phase: str | None) -> None:
+    repo = _repo(tmp_path, "echo installed\n", WORKLOAD_INSTALL)
+    receipts = tmp_path / "receipts"
+    assert _run(repo, receipts, WORKLOAD_INSTALL, ("up",)).returncode == 0
+    receipt = receipts / "workload-install.json"
+    data = json.loads(receipt.read_text())
+    if phase is None:
+        data.pop("phase", None)
+    else:
+        data["phase"] = phase
+    receipt.write_text(json.dumps(data))
+    with pytest.raises(gate.GateError):
+        _receipts(repo, receipts, WORKLOAD_INSTALL)
+
+
+@pytest.mark.parametrize("args", [(), ("down",), ("unexpected",), ("up", "extra")])
+def test_workload_runner_refuses_non_up_invocations_without_minting_receipts(
+    tmp_path: Path, args: tuple[str, ...],
+) -> None:
+    repo = _repo(tmp_path, "echo ran > invoked\n", WORKLOAD_INSTALL)
+    receipts = tmp_path / "receipts"
+    completed = _run(repo, receipts, WORKLOAD_INSTALL, args)
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert not (repo / "invoked").exists()
+    assert not receipts.exists()
+
+
+def test_workload_down_cannot_overwrite_a_successful_up_receipt(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "echo installed\n", WORKLOAD_INSTALL)
+    receipts = tmp_path / "receipts"
+    assert _run(repo, receipts, WORKLOAD_INSTALL, ("up",)).returncode == 0
+    receipt = receipts / "workload-install.json"
+    before = receipt.read_bytes()
+    assert _run(repo, receipts, WORKLOAD_INSTALL, ("down",)).returncode != 0
+    assert receipt.read_bytes() == before
+    _receipts(repo, receipts, WORKLOAD_INSTALL)
+
+
+def test_failed_or_unrun_workload_up_has_no_acceptable_receipt(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "exit 7\n", WORKLOAD_INSTALL)
+    receipts = tmp_path / "receipts"
+    with pytest.raises(gate.GateError, match="no pass receipt"):
+        _receipts(repo, receipts, WORKLOAD_INSTALL)
+    assert _run(repo, receipts, WORKLOAD_INSTALL, ("up",)).returncode == 7
+    with pytest.raises(gate.GateError, match="no pass receipt"):
+        _receipts(repo, receipts, WORKLOAD_INSTALL)

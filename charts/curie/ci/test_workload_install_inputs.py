@@ -275,6 +275,8 @@ if tool == "kubectl":
         raise SystemExit(0)
     raise SystemExit(92)
 if tool == "curie":
+    if os.environ.get("WORKLOAD_TEST_INSTALL_OUTPUT"):
+        print(os.environ["WORKLOAD_TEST_INSTALL_OUTPUT"], file=sys.stderr)
     if "--values-file" in args:
         import json
         import yaml
@@ -674,3 +676,68 @@ def test_failed_install_drains_claims_and_checks_publication_namespace_and_admis
             "get" in call and f"{kind}/workload-12345-1-curie-runner-resources" in call
             for call in cleanup
         ), (kind, cleanup)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "worker.claimTimeoutSeconds",
+        "worker.routeTtlSeconds",
+        "api.readinessProbe.failureThreshold",
+        "api.livenessProbe.failureThreshold",
+        "agentSandbox.runner.workspace.enabled",
+        "worker.connectorReconciler.intervalSeconds",
+    ],
+)
+def test_shared_install_leaves_scenario_timing_and_workspace_at_chart_defaults(
+    scenario: Scenario, key: str,
+) -> None:
+    scenario.environment["WORKLOAD_TEST_MODE"] = "cluster"
+    completed = scenario.run()
+    assert completed.returncode != 0, "the install stub must stop at the owner boundary"
+    installs = [call for call in scenario.calls() if call[0] == "curie"]
+    assert len(installs) == 1, installs
+    install = installs[0]
+    settings = []
+    for index, argument in enumerate(install):
+        if argument in {"--set", "--set-string", "--set-json", "--set-file"}:
+            settings.extend(install[index + 1].split(","))
+        elif argument.startswith(("--set=", "--set-string=", "--set-json=", "--set-file=")):
+            settings.extend(argument.split("=", 1)[1].split(","))
+    assert not any(setting.partition("=")[0] == key for setting in settings), install
+    values = json.loads(Path(scenario.environment["WORKLOAD_TEST_VALUES"]).read_text())
+    value = values
+    for part in key.split("."):
+        if not isinstance(value, dict) or part not in value:
+            break
+        value = value[part]
+    else:
+        pytest.fail(f"shared installation overrides scenario-owned chart value {key}")
+
+
+def test_failed_install_shows_sanitized_diagnostics_and_still_cleans_owned_resources(
+    partial_install_with_pods: Scenario,
+) -> None:
+    scenario = partial_install_with_pods
+    credentials = (
+        "synthetic-api-credential",
+        "synthetic-bearer-credential",
+        "synthetic-database-credential",
+    )
+    scenario.environment["WORKLOAD_TEST_INSTALL_OUTPUT"] = (
+        "install diagnostic: waiting for API rollout exceeded the deadline\n"
+        f"CURIE_API_KEY={credentials[0]}\n"
+        f"Authorization: Bearer {credentials[1]}\n"
+        f"DATABASE_URL=postgresql://acme:{credentials[2]}@postgres.example.com/curie\n"
+    )
+    completed = scenario.run()
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0
+    assert "candidate cluster install failed" in output, output
+    assert "waiting for API rollout exceeded the deadline" in output, output
+    assert all(credential not in output for credential in credentials), output
+    resources, events = scenario.cleanup_state()
+    assert resources["test-workload-12345-1"] == (0, 0), resources
+    assert resources["acme-existing"] == (1, 1), resources
+    assert ("namespace-delete", "test-workload-12345-1", 0) in events, events
+    assert "OK: owned release" in output, output
