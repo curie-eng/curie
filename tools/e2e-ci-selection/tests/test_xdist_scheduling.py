@@ -11,6 +11,9 @@ ROOT = Path(__file__).resolve().parents[3]
 
 def _suite(pytester: pytest.Pytester, paths: list[str], *, independent: bool) -> None:
     pytester.makeconftest((ROOT / "conftest.py").read_text())
+    baseline = Path("tests/baselines/test-time.json")
+    (pytester.path / baseline).parent.mkdir(parents=True, exist_ok=True)
+    (pytester.path / baseline).write_bytes((ROOT / baseline).read_bytes())
     pytester.makeini("[pytest]\n")
     for index, relative in enumerate(paths):
         path = pytester.path / relative
