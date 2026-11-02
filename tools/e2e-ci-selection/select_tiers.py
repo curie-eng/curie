@@ -798,15 +798,25 @@ def _head_version(head: str | None) -> str | None:
     return version if isinstance(version, str) and version else None
 
 
-def _is_version_only(paths: list[str], head: str | None) -> bool:
-    """Does the diff change only version identity for the head's release (#3858)?"""
+def _is_version_only(paths: list[str], base: str | None, head: str | None) -> bool:
+    """Does the diff change only version identity for the head's release (#3858)?
+
+    With revisions, a schema-window catalog change that only registers the
+    head's release window is version identity too (ADR-0257). Path mode has no
+    revisions to compare, so it keeps the plain path set.
+    """
     if not paths:
         return False
     version = _head_version(head)
     if version is None:
         return False
-    allowed: frozenset[str] = _atlas.version_only_paths(f"v{version}")
-    return set(paths) <= allowed
+    tag = f"v{version}"
+    if base is None or head is None:
+        return set(paths) <= _atlas.version_only_paths(tag)
+    try:
+        return not _atlas.version_only_extra(paths, tag, base, head)
+    except _atlas.AtlasError:
+        return False
 
 
 def _render(
@@ -891,7 +901,11 @@ def _run() -> None:
         pytest_needed = _needs_pytest(registry, paths)
         images_needed = _needs_images(paths)
         cli_release_needed = _needs_cli_release(paths)
-        version_only = _is_version_only(paths, args.head if not args.path else None)
+        version_only = _is_version_only(
+            paths,
+            args.base if not args.path else None,
+            args.head if not args.path else None,
+        )
         factory_needed = _needs_factory(paths)
         if factory_needed:
             selected.add("cluster")
