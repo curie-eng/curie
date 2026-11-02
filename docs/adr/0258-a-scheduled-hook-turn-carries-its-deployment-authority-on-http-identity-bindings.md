@@ -45,50 +45,59 @@ contradict ADR 0220 section 9.
 ## Decision
 
 1. **A scheduled turn's invocation authority is its deployment authority.** On
-   a binding that requires HTTP identity, a turn whose source is the platform
-   scheduler needs no HTTP principal. It needs the deployment authority of ADR
-   0099, verified as decision 2 states. HTTP identity continues to govern every
-   turn a channel caller starts, and every approval a scheduled turn raises.
+   a binding that requires HTTP identity, a turn the platform started for a
+   declared cron hook needs no HTTP principal. It needs the deployment
+   authority of ADR 0099, verified as decision 2 states. HTTP identity continues
+   to govern every turn a channel caller starts.
 
-2. **The authority is verified, never read from payload fields.** The kernel
-   accepts a context-free `TurnSource.CRON` turn on an HTTP-required binding
-   only when all of these hold, read from the database at the time of the check:
+2. **The authority is verified from durable state, never read from payload
+   fields.** The kernel accepts a context-free `TurnSource.CRON` turn on an
+   HTTP-required binding only when all of these hold, read from the database at
+   the time of the check:
    1. its `HookRunRef` resolves to an open `hook_runs` row;
    2. the row's agent is the agent the binding classification resolved;
-   3. the row's version is the agent's active deployment version, and that
-      version declares the named hook as a cron hook;
-   4. the hook has no operator pause in `schedule_controls`;
-   5. the kill switch and budget admit the agent.
-   The `cron:<name>` author, the `source` field and the event id are routing
-   data. None of them alone, or together, satisfies this check. A turn that
-   fails it is a definitive refusal, and its run closes as `failed` with reason
-   `identity_refused`, as [#5305](https://github.com/curie-eng/curie/issues/5305)
-   already realized.
+   3. the row's version is the version of the agent's active deployment as the
+      scheduler and the binding resolver rank it (prod before dev, then the
+      most recent).
+   Only platform admission writes a `hook_runs` row: the scheduler, from the
+   current version's declared cron triggers, and the API key authenticated hook
+   fire route, after reading the same declaration. A writer that can append to
+   the turn stream cannot create one. The open row for the current version is
+   therefore the durable proof that the deployment declares the hook and that
+   the platform started this run. The `cron:<name>` author, the `source` field
+   and the event id are routing data; none of them alone, or together,
+   satisfies this check. A turn that fails it is a definitive refusal, and its
+   run closes as `failed` with reason `identity_refused`, as
+   [#5305](https://github.com/curie-eng/curie/issues/5305) already realized.
 
 3. **Revocation takes effect at every execution boundary.** The kernel repeats
-   the decision 2 check at each boundary where it checks an HTTP turn today
-   (`prepare`, `claim_or_resume`, `start`), together with the binding
-   generation the classification returned. Replacing the deployment, removing
-   the hook from the bundle, pausing it, killing the agent, exhausting its
-   budget or changing the binding between admission and any boundary refuses
-   the turn before the next effect. Missing, stale and out-of-scope authority
-   are refused the same way.
+   the decision 2 check at each later boundary where it checks an HTTP turn
+   (`claim_or_resume`, `start`, `steer`), and also classifies the route again:
+   the binding must keep the tenant, agent, binding id and generation it had at
+   `prepare`. Replacing the deployment, closing the run or changing the binding
+   between admission and any boundary refuses the turn before the next effect.
+   The operator pause, the kill switch and the budget keep their existing fail
+   closed guards on every hook turn; this decision neither relaxes nor
+   duplicates them.
 
-4. **The scheduler and the kernel share one predicate.** The cron loop applies
-   the same check before it inserts a run row, and records a refused slot with
-   reason `identity_refused` instead of enqueueing a turn it knows the kernel
-   will refuse. The kernel check remains the authority; the scheduler check
-   only avoids a doomed enqueue.
+4. **The scheduler and the kernel agree by construction.** The scheduler admits
+   a slot only from the current version and writes that version on the run row,
+   which is exactly what decision 2 checks. It enqueues no turn that the
+   predicate would refuse at admission, so it needs no separate check.
 
-5. **An operator manual fire uses the same authority.** A manual fire through
-   the API key authenticated hook fire route is a scheduled turn with source
-   `manual` in its run record. It is checked as in decisions 2 and 3; the
-   operator credential does not stand in for an HTTP principal.
+5. **An operator manual fire uses the same authority.** A fire through the API
+   key authenticated hook fire route enqueues the same `TurnSource.CRON` turn
+   with its own run row. It is checked as in decisions 2 and 3; the operator
+   credential does not stand in for an HTTP principal.
 
-6. **Approvals are unchanged.** A scheduled turn that reaches a gated tool on an
-   HTTP-selected binding raises an HTTP-selected approval. The answering actor
-   is resolved and checked as ADR 0246 requires. The deployment authority never
-   answers an approval.
+6. **A scheduled turn raises no HTTP-selected approval.** HTTP approval
+   continuity needs the original invocation context to seal the approval, and
+   a scheduled turn has none. When such a turn reaches a gated tool on an
+   HTTP-selected agent, the API refuses the legacy creation with
+   `unsupported_approval`, so the gate fails closed and the run records
+   `failed`, as ADR 0099 treats a hook that cannot pass a gate. The deployment
+   authority never answers or creates an approval. Approvals for scheduled
+   turns need their own continuity decision.
 
 ## Realizing work and acceptance evidence
 
@@ -99,10 +108,11 @@ are:
 1. `curie_worker.kernel.identity.prepare` and `curie_worker.kernel.identity.check`:
    the typed scheduled authority of decisions 1 to 3, read from durable state
    at `prepare`, `claim_or_resume` and `start`.
-2. `curie_worker.cron_loop.CronSchedulerLoop._admit`: the shared predicate of
-   decision 4 before a run row is inserted.
-3. `curie_api.routers.hook_fire`: the manual fire of decision 5 reaching the
-   same kernel check.
+2. `curie_worker.hook_runs.HookRunRecorder.scheduled_authority`: the decision
+   2 predicate as one read of the run row and the ranked active deployment.
+3. `curie_worker.cron_loop.CronSchedulerLoop._admit` and
+   `curie_api.routers.hook_fire`: the only writers of a run row, unchanged,
+   whose rows satisfy the predicate by construction (decisions 4 and 5).
 4. `curie_worker.kernel.hooks._close_hook_run_after_refusal`: the refusal
    closure, already realized by
    [#5307](https://github.com/curie-eng/curie/pull/5307) for
@@ -112,9 +122,10 @@ Acceptance evidence is a worker regression with real Postgres and Valkey and
 the production binding classifier: a valid scheduled turn on an HTTP-required
 binding runs once; each failed condition of decision 2 refuses before any
 claim; a deployment replaced, a pause, a kill and a binding change between
-admission and each boundary of decision 3 refuse before the next effect; and a
+admission and a later boundary of decision 3 refuse before the next effect; a
 context-free turn that only claims `TurnSource.CRON`, without an open run row
-for the bound agent, is refused.
+for the bound agent, is refused; and a context-free turn on a binding that does
+not require HTTP identity keeps its existing behavior.
 
 ## Consequences
 
@@ -123,7 +134,10 @@ for the bound agent, is refused.
   switch or binding withdraws it.
 - The kernel's HTTP identity gate gains a second, typed authority kind. Its
   tests must cover each failed condition of decision 2 and a revocation between
-  admission and each boundary of decision 3, with real Postgres and Valkey.
+  admission and a later boundary of decision 3, with real Postgres and Valkey.
+- A scheduled hook that relies on a gated tool keeps failing on an
+  HTTP-selected agent until approval continuity covers scheduled turns
+  (decision 6).
 - No scheduled turn is attributed to a person. Audit attributes it to the
   agent, hook, deployment version and slot, as the run record already does.
 - A deployment author can still make an agent act on an HTTP identity binding
