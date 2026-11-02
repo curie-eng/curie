@@ -893,7 +893,7 @@ def _without_shard_report_arguments(argv: list[str], *, tiers: str | None = None
 
     Every shard writes the JUnit report with xunit1 timings exactly once.
     ``--ci-shard-tiers`` must carry ``tiers`` exactly once, or be absent when
-    ``tiers`` is None (every event other than a pull request).
+    ``tiers`` is None (every event other than a pull request or the merge queue).
     """
     remaining: list[str] = []
     reports: list[str] = []
@@ -2771,20 +2771,22 @@ def test_shard_plan_flows_from_decision_through_steps_and_records_to_the_aggrega
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+# The merge queue selects exactly what the pull request did (#5262).
+@pytest.mark.parametrize("event", ["pull_request", "merge_group"])
 @pytest.mark.parametrize("scope", ["full", "cli", "impact"])
 def test_pull_request_pytest_passes_the_shard_count_and_tier_limits(
-    tmp_path: Path, scope: str
+    tmp_path: Path, scope: str, event: str
 ) -> None:
     targets, _ = _plan_targets(scope)
     argv = _run_pytest_step(
-        tmp_path, shard=2, deselect="", scope=scope, plan=(3, 2, 1), event="pull_request",
+        tmp_path, shard=2, deselect="", scope=scope, plan=(3, 2, 1), event=event,
         targets=targets if scope == "impact" else None,
     )
     argv = _without_shard_report_arguments(argv, tiers="2,1")
     assert argv[argv.index("--ci-shard") + 1] == "2/3"
 
 
-@pytest.mark.parametrize("event", ["push", "workflow_dispatch", "merge_group", "schedule"])
+@pytest.mark.parametrize("event", ["push", "workflow_dispatch", "schedule"])
 @pytest.mark.parametrize("scope", ["full", "cli"])
 def test_non_pull_request_pytest_omits_the_tier_limits(
     tmp_path: Path, event: str, scope: str
@@ -3119,8 +3121,8 @@ def test_decision_steps_use_queue_sha_bounds(tmp_path: Path, job_id: str) -> Non
     assert "--base " + "a" * 40 in calls[0]
     assert "--head " + "b" * 40 in calls[0]
     assert "--push" not in calls[0]
-    # The queue keeps pytest on its full scope and shard plan.
-    assert "--full-pytest" in calls[0].split()
+    # The queue runs the pull request's impact selection, so it needs the targets.
+    assert "--pytest-targets-out pytest-targets.txt" in calls[0]
 
 
 @pytest.mark.parametrize("train,other", [("main", "next"), ("next", "main")])
