@@ -662,6 +662,45 @@ def test_one_monotonic_deadline_includes_header_delay_plus_body_progress(
     run_transport(scenario)
 
 
+def test_earlier_caller_deadline_bounds_one_exchange(
+    support: Any, run_transport: Any
+) -> None:
+    """@spec HTTP-IDENTITY-TRANSPORT-3: a caller's remaining budget wins over two seconds."""
+    module = support.api()
+
+    async def scenario(rig: Any) -> None:
+        release = rig.event()
+
+        async def stall(reader: Any, writer: Any) -> None:
+            """@spec HTTP-IDENTITY-TRANSPORT-3: accept the request but never answer."""
+            await release.wait()
+
+        listener = await rig.listen(stall)
+        client = rig.client(module, allow_loopback_http=True)
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        result = await client.lookup(
+            target=support.target(module, listener.url),
+            bearer=module.ProviderBearer(support.token),
+            request=support.request(),
+            limits=support.limits(),
+            deadline=start + 0.4,
+        )
+        support.refusal(result, "unavailable")
+        elapsed = loop.time() - start
+        assert 0.35 <= elapsed < 0.75
+        with pytest.raises(ValueError, match="invalid_lookup_context"):
+            await client.lookup(
+                target=support.target(module, listener.url),
+                bearer=module.ProviderBearer(support.token),
+                request=support.request(),
+                limits=support.limits(),
+                deadline=float("nan"),
+            )
+
+    run_transport(scenario)
+
+
 def test_real_tls_handshake_stall_uses_same_result_deadline(
     support: Any, run_transport: Any
 ) -> None:
