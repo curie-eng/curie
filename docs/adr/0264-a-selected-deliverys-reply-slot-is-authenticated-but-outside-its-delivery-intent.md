@@ -69,8 +69,12 @@ On a duplicate, the dispatcher compares the returned slot with its own:
   unavailable, timeout): the placeholder is kept. A placeholder is never
   deleted without proof that another one owns the turn.
 
-A refusal replaces the placeholder with the fixed notice, as on the legacy
-path.
+A refused channel mention deletes its placeholder and shows the fixed
+notice only to the sender as an ephemeral message, as the selected lane did
+before it had a placeholder, so nobody else in the channel sees who was
+refused; a failed deletion is logged and never makes the notice public. A
+refused direct message, whose only other member is the sender, has its
+placeholder edited into the fixed notice.
 
 ## Consequences
 
