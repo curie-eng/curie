@@ -1843,7 +1843,9 @@ def test_genuine_documentation_only_selects_no_runtime_e2e_tiers(
     tmp_path: Path,
     path: str,
 ) -> None:
-    _assert_selection(tmp_path, path, (), pytest_needed=False)
+    # Pytest still runs on a pull request: the tests that read the file and the
+    # always-selected impact set join every diff.
+    _assert_selection(tmp_path, path, (), pytest_needed=True)
 
 
 @pytest.mark.parametrize(
@@ -1852,15 +1854,16 @@ def test_genuine_documentation_only_selects_no_runtime_e2e_tiers(
         ("apps/ui/package.json", True),
         ("apps/ui/pnpm-lock.yaml", True),
         ("apps/dispatcher/src/curie_dispatcher/app.py", True),
-        ("scripts/README.md", False),
-        ("scripts/check-docs.sh", False),
-        ("scripts/check-pr-body.sh", False),
+        # Rule-ignored paths still run their impact readers on a pull request.
+        ("scripts/README.md", True),
+        ("scripts/check-docs.sh", True),
+        ("scripts/check-pr-body.sh", True),
         ("tools/fix-pin-ci/check.py", True),
         (".github/workflows/pr-body.yaml", True),
         ("release/authorize.py", True),
         ("runner/tests/test_repo_toolchain_proof_ci.py", True),
         ("packages/test-support/src/curie_test_support/valkey.py", True),
-        ("examples/coder/evals/cases.json", False),
+        ("examples/coder/evals/cases.json", True),
     ],
 )
 def test_known_non_runtime_paths_select_no_e2e_tiers(
@@ -3861,7 +3864,8 @@ def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
     selected, output = _invoke_selector(tmp_path, "ARCHITECTURE.md")
     assert selected.returncode == 0, selected.stderr
     assert output == _expected_output(
-        pytest_needed=False,
+        pytest_needed=True,
+        pytest_deselect=_expected_conditional_deselect("ARCHITECTURE.md"),
         ci_policy_files=_expected_ci_policy_files("ARCHITECTURE.md"),
         paths=("ARCHITECTURE.md",),
     )

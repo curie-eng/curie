@@ -337,10 +337,12 @@ def test_python_job_sees_workflow_updates_and_isolates_mutations(
         "llms.txt",
     ],
 )
-def test_docs_only_path_skips_pytest(tmp_path: Path, path: str) -> None:
+def test_docs_only_path_runs_impact_readers(tmp_path: Path, path: str) -> None:
     completed, output = _invoke_selector(tmp_path, path)
     assert completed.returncode == 0, completed.stderr
-    assert _outputs(output)["pytest"] == "false"
+    outputs = _outputs(output)
+    assert outputs["pytest"] == "true"
+    assert outputs["pytest_scope"] == "impact"
 
 
 @pytest.mark.parametrize(
@@ -420,7 +422,7 @@ def test_empty_revision_diff_fails_closed_to_pytest(tmp_path: Path) -> None:
     assert _outputs(output)["pytest"] == "true"
 
 
-def test_deleting_a_docs_guides_sentence_does_not_select_pytest(tmp_path: Path) -> None:
+def test_deleting_a_docs_guides_sentence_runs_impact_readers(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
     subprocess.run(
@@ -467,7 +469,9 @@ def test_deleting_a_docs_guides_sentence_does_not_select_pytest(tmp_path: Path) 
         cwd=repository,
     )
     assert completed.returncode == 0, completed.stderr
-    assert _outputs(output)["pytest"] == "false"
+    outputs = _outputs(output)
+    assert outputs["pytest"] == "true"
+    assert outputs["pytest_scope"] == "impact"
 
 
 def test_required_python_job_keeps_ruleset_name_and_is_not_skippable() -> None:
@@ -1079,7 +1083,7 @@ def test_container_pytest_propagates_failure(tmp_path: Path, exit_code: int) -> 
 @pytest.mark.parametrize(("event", "paths", "scope", "files"), [
     ("pull_request", (".github/workflows/ci.yaml",), "full", CONTAINER_FILES),
     ("pull_request", ("cli/src/main.rs",), "cli", (CONTAINER_FILES[0],)),
-    ("pull_request", ("docs/guides/getting-started.md",), "full", ()),
+    ("pull_request", ("docs/guides/getting-started.md",), "impact", ()),
     ("push", (), "full", CONTAINER_FILES),
     ("workflow_dispatch", (), "full", CONTAINER_FILES),
 ])
@@ -1982,9 +1986,22 @@ def test_pytest_aggregator_rejects_shard_deselect_disagreement(tmp_path: Path) -
 
 
 @pytest.mark.parametrize("results_dir", [True, False])
-def test_pytest_aggregator_accepts_docs_only_skips(tmp_path: Path, results_dir: bool) -> None:
-    """#3858: an unselected run skips the shard job, so no shard reports."""
-    completed, output = _invoke_selector(tmp_path, "docs/guides/getting-started.md")
+def test_pytest_aggregator_accepts_unselected_skips(tmp_path: Path, results_dir: bool) -> None:
+    """#3858: an unselected run skips the shard job, so no shard reports.
+
+    A version-only diff is the pull request that leaves pytest unselected;
+    documentation still runs its impact readers.
+    """
+    cargo = tomllib.loads((REPO_ROOT / "cli" / "Cargo.toml").read_text())
+    version = f"v{cargo['package']['version']}"
+    completed, output = _invoke_selector(
+        tmp_path,
+        "charts/curie/Chart.yaml",
+        "cli/Cargo.toml",
+        "cli/Cargo.lock",
+        "docs/architecture-atlas/versions.json",
+        f"docs/architecture-atlas/snapshots/{version}.json",
+    )
     assert completed.returncode == 0, completed.stderr
     selected = _outputs(output)["pytest"]
     assert selected == "false"

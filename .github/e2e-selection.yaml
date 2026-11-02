@@ -130,11 +130,12 @@ pytest_impact:
     - tools/close-on-next
   always:
     - tests
-  # A changed path that no test file reaches runs the whole suite, unless it
-  # matches here: a path prefix, or `*.suffix` for a file name anywhere.
-  unclaimed_ignored:
+  # A changed path under these prefixes, or a root file in rules.ignored_exact,
+  # selects only the test files that read it, plus `always` and every test
+  # that can read any file. Any other changed path that no test file reaches
+  # runs the whole suite.
+  reader_only:
     - docs
-    - "*.md"
   min_shard_share: 24
   max_shards: 6
 conditional_pytest_files:

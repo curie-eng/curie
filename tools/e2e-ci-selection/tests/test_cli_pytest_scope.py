@@ -567,7 +567,8 @@ def test_cli_only_diff_selects_cli_scope(
         (("cli",), False, "true"),
         (("client/src/main.rs",), False, "true"),
         (("cli-other/src/main.rs",), False, "true"),
-        (("docs/guides/getting-started.md",), False, "false"),
+        # Documentation runs its impact readers, never the CLI list.
+        (("docs/guides/getting-started.md",), False, "true"),
         ((), True, "true"),
     ],
 )

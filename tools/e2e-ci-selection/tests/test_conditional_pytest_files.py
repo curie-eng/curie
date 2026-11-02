@@ -169,10 +169,13 @@ def test_empty_revision_diff_keeps_conditional_files(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("path", ["README.md", "docs/guides/getting-started.md"])
-def test_pytest_false_has_no_conditional_deselection(tmp_path: Path, path: str) -> None:
+def test_documentation_only_diff_deselects_every_heavy_file(tmp_path: Path, path: str) -> None:
+    # Documentation runs its impact readers on a pull request; it feeds no
+    # conditional heavy file, so all of them stay deselected.
+    registry = yaml.safe_load(REGISTRY.read_text())
     output = _selection(tmp_path, path)
-    assert output["pytest"] == "false"
-    assert output["pytest_deselect"] == ""
+    assert output["pytest"] == "true"
+    assert output["pytest_deselect"] == ",".join(sorted(registry["conditional_pytest_files"]))
 
 
 def test_version_only_prep_has_no_conditional_deselection(tmp_path: Path) -> None:

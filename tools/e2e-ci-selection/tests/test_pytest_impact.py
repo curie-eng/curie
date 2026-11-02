@@ -59,7 +59,7 @@ def _impact_section(**overrides: object) -> dict[str, object]:
         "workflow_jobs": ["python-pytest", "python", "changes"],
         "excluded": ["tools/policy/tests"],
         "always": ["tests"],
-        "unclaimed_ignored": ["docs", "*.md"],
+        "reader_only": ["docs"],
         "min_shard_share": 24,
         "max_shards": 6,
     }
@@ -356,7 +356,7 @@ def test_docstring_path_mentions_create_no_dependency(graph_repo: Any) -> None:
 
 
 def test_empty_impact_returns_everything(graph_repo: Any) -> None:
-    selection = _select(graph_repo, _config(), "notes/todo.md")
+    selection = _select(graph_repo, _config(), "docs/unread.md")
 
     assert selection.everything
     assert selection.reason == "empty impact"
@@ -712,7 +712,7 @@ def test_referenced_python_entry_points_contribute_their_imports(
     assert {path for path in targets if path.startswith("tools/contract/")} == selected
 
 
-UNCLAIMED_FILES = {
+UNCLAIMED_FILES: dict[str, str] = {
     "tests/test_always.py": "def test_always() -> None:\n    assert True\n",
     "packages/z/tests/test_data.py": (
         'DATA = "charts/demo/values.yaml"\n\n\ndef test_data() -> None:\n    assert DATA\n'
@@ -729,7 +729,9 @@ UNCLAIMED_FILES = {
     (
         ("new-dir/input.json", True),
         ("new-dir/nested/deeper/config.yaml", True),
-        ("notes/todo.md", False),
+        # Markdown outside docs/ is no longer exempt.
+        ("notes/todo.md", True),
+        ("new-dir/SKILL.md", True),
         ("docs/adr/0001-record.md", False),
         ("charts/demo/values.yaml", False),
     ),
@@ -945,6 +947,158 @@ def test_real_impact_selection_keeps_root_tests_and_drops_excluded(
     assert not any(_under_any(target, real_config.excluded) for target in targets)
 
 
+COMPUTED_ROOT_READERS = {
+    # The re-review shape: an anchored root joined with a runtime value.
+    "anchored-environ": (
+        ANCHOR_HEADER + "def test_reader() -> None:\n"
+        '    path = Path(__file__).resolve().parents[2] / os.environ.get("INPUT_DIR", "new-dir")'
+        ' / "SKILL.md"\n'
+        "    assert path\n"
+    ),
+    "anchored-name": (
+        ANCHOR_HEADER + "ROOT = Path(__file__).resolve().parents[2]\n\n\n"
+        "def test_reader(name: str = 'x') -> None:\n    assert (ROOT / name).name\n"
+    ),
+    "fixture-root": (
+        "def test_reader(repo_root, relative) -> None:\n    assert (repo_root / relative).name\n"
+    ),
+    "os-path-join": (
+        "import os\n\nREPO_ROOT = os.getcwd()\n\n\n"
+        "def test_reader(name: str = 'x') -> None:\n    assert os.path.join(REPO_ROOT, name)\n"
+    ),
+    "joinpath": (
+        "from pathlib import Path\n\nROOT = Path.cwd()\n\n\n"
+        "def test_reader(name: str = 'x') -> None:\n    assert ROOT.joinpath(name)\n"
+    ),
+}
+DOC_DIFFS = ("docs/adr/0001-record.md", "AGENTS.md", "docs/guide.md")
+
+
+def _reader_repo(root: Path, reader: str) -> Any:
+    files = _workspace({"packages/z": ("pkg-z", ())}, extra_testpaths=("examples/tests",))
+    files.update(
+        {
+            "examples/tests/test_reader.py": reader,
+            "examples/tests/test_bystander.py": "def test_bystander() -> None:\n    assert True\n",
+            "AGENTS.md": "# Agents\n",
+            "docs/guide.md": "# Guide\n",
+            "docs/adr/0001-record.md": "# Record\n",
+            "new-dir/SKILL.md": "# Skill\n",
+        }
+    )
+    return _build(root, files)
+
+
+@pytest.mark.parametrize(
+    "reader", tuple(COMPUTED_ROOT_READERS.values()), ids=tuple(COMPUTED_ROOT_READERS)
+)
+@pytest.mark.parametrize("changed", DOC_DIFFS)
+def test_computed_root_reader_is_selected_by_documentation_only_diffs(
+    tmp_path: Path, reader: str, changed: str
+) -> None:
+    graph = _reader_repo(tmp_path, reader)
+    config = _config(always=[])
+
+    selection = _select(graph, config, changed)
+
+    assert graph.repo_wide("examples/tests/test_reader.py")
+    assert not selection.everything
+    assert set(selection.targets) == {"examples/tests/test_reader.py"}
+    assert _impact().needs_pytest(
+        graph,
+        config,
+        [changed],
+        cli_files=[],
+        workflow_jobs_changed=None,
+        registry_pytest_changed=None,
+    )
+
+
+def test_computed_root_reader_of_an_unclaimed_path_runs_everything(tmp_path: Path) -> None:
+    graph = _reader_repo(tmp_path, COMPUTED_ROOT_READERS["anchored-environ"])
+
+    selection = _select(graph, _config(always=[]), "new-dir/SKILL.md")
+
+    assert selection.everything
+    assert selection.reason == "new-dir/SKILL.md unclaimed"
+
+
+DOC_READERS = {
+    "examples/tests/test_agents.py": (
+        PATH_ROOT.replace("parents[3]", "parents[2]")
+        + 'TEXT = (ROOT / "AGENTS.md").read_text()\n\n\n'
+        "def test_agents() -> None:\n    assert TEXT\n"
+    ),
+    "examples/tests/test_guide.py": (
+        PATH_ROOT.replace("parents[3]", "parents[2]") + 'GUIDE = ROOT / "docs" / "guide.md"\n\n\n'
+        "def test_guide() -> None:\n    assert GUIDE\n"
+    ),
+    "examples/tests/test_docs_tree.py": (
+        PATH_ROOT.replace("parents[3]", "parents[2]")
+        + 'PAGES = sorted((ROOT / "docs").glob("*.md"))\n\n\n'
+        "def test_pages() -> None:\n    assert PAGES is not None\n"
+    ),
+    "examples/tests/test_bystander.py": "def test_bystander() -> None:\n    assert True\n",
+}
+
+
+@pytest.mark.parametrize(
+    ("changed", "readers"),
+    (
+        ("AGENTS.md", {"examples/tests/test_agents.py"}),
+        ("docs/guide.md", {"examples/tests/test_guide.py", "examples/tests/test_docs_tree.py"}),
+        ("docs/adr/0001-record.md", {"examples/tests/test_docs_tree.py"}),
+        ("docs/unread/page.md", {"examples/tests/test_docs_tree.py"}),
+        ("README.md", set()),
+    ),
+)
+def test_documentation_a_test_reads_selects_its_readers(
+    tmp_path: Path, changed: str, readers: set[str]
+) -> None:
+    files = _workspace({"packages/z": ("pkg-z", ())}, extra_testpaths=("examples/tests",))
+    files.update(DOC_READERS)
+    files.update(
+        {
+            "AGENTS.md": "# Agents\n",
+            "README.md": "# Readme\n",
+            "docs/guide.md": "# Guide\n",
+            "docs/adr/0001-record.md": "# Record\n",
+        }
+    )
+    graph = _build(tmp_path, files)
+    config = _config(always=[])
+
+    selection = _select(graph, config, changed)
+    needed = _impact().needs_pytest(
+        graph,
+        config,
+        [changed],
+        cli_files=[],
+        workflow_jobs_changed=None,
+        registry_pytest_changed=None,
+    )
+
+    assert not graph.repo_wide("examples/tests/test_docs_tree.py")
+    assert needed is bool(readers)
+    if readers:
+        assert not selection.everything
+        assert set(selection.targets) == readers
+    else:
+        assert selection.reason == "empty impact"
+
+
+def test_agents_md_only_pull_request_runs_its_readers(tmp_path: Path) -> None:
+    targets = tmp_path / "targets.txt"
+
+    completed, output = _run_selector(tmp_path, "--path", "AGENTS.md", targets_out=targets)
+
+    assert completed.returncode == 0, completed.stderr
+    assert output["pytest"] == "true"
+    assert output["pytest_scope"] == "impact"
+    selected = set(targets.read_text(encoding="utf-8").split())
+    assert "apps/api/tests/test_alembic_revision_gate.py" in selected
+
+
 @pytest.mark.parametrize(
     ("changed", "required"),
     (
@@ -978,6 +1132,7 @@ def test_real_review_regressions_select_the_reaching_tests(
     ("changed", "everything"),
     (
         ("new-dir/input.json", True),
+        ("new-dir/SKILL.md", True),
         ("docs/adr/0001-record-architecture-decisions.md", False),
     ),
 )

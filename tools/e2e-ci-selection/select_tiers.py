@@ -877,6 +877,40 @@ def _cli_list_files(registry: Registry) -> list[str]:
     ]
 
 
+@lru_cache(maxsize=1)
+def _impact_graph() -> Any:
+    # The graph is always this checkout's, wherever the selector runs from.
+    return _impact().ImpactGraph.build(REPO_ROOT)
+
+
+def _pytest_needed(
+    registry: Registry,
+    paths: list[str],
+    *,
+    pull_request: bool,
+    workflow_jobs_changed: frozenset[str] | None,
+    registry_pytest_changed: bool | None,
+) -> bool:
+    """The path rules' answer, widened on a pull request by impact readers.
+
+    A pull request whose paths the rules skip (documentation, root docs) still
+    runs pytest when a test reads one of them or the always-selected set is
+    not empty.
+    """
+    if _needs_pytest(registry, paths):
+        return True
+    if not pull_request or registry.pytest_impact is None:
+        return False
+    return _impact().needs_pytest(
+        _impact_graph(),
+        registry.pytest_impact,
+        paths,
+        cli_files=_cli_list_files(registry),
+        workflow_jobs_changed=workflow_jobs_changed,
+        registry_pytest_changed=registry_pytest_changed,
+    )
+
+
 def _pytest_plan(
     registry: Registry,
     paths: list[str],
@@ -904,8 +938,7 @@ def _pytest_plan(
     if reason:
         return PytestPlan(scope, reason, (), PYTEST_SHARDS, PYTEST_SHARDS, PYTEST_SHARDS)
     impact = _impact()
-    # The graph is always this checkout's, wherever the selector runs from.
-    graph = impact.ImpactGraph.build(REPO_ROOT)
+    graph = _impact_graph()
     cli_files = _cli_list_files(registry)
     targets: tuple[str, ...] = ()
     if scope == "cli":
@@ -1033,7 +1066,13 @@ def _run() -> None:
         else:
             raise RegistryError("provide paths, push, or both base and head revisions")
         selected = set().union(*(_select_path(registry, path) for path in paths))
-        pytest_needed = _needs_pytest(registry, paths)
+        pytest_needed = _pytest_needed(
+            registry,
+            paths,
+            pull_request=True,
+            workflow_jobs_changed=workflow_jobs_changed,
+            registry_pytest_changed=registry_pytest_changed,
+        )
         images_needed = _needs_images(paths)
         cli_release_needed = _needs_cli_release(paths)
         version_only = _is_version_only(paths, args.head if not args.path else None)

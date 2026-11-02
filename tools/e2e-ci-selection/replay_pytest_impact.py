@@ -308,7 +308,14 @@ class Selector:
                 base, head
             )
 
-        pytest_needed = st._needs_pytest(registry, paths)
+        with self._reuse_graph():
+            pytest_needed = st._pytest_needed(
+                registry,
+                paths,
+                pull_request=True,
+                workflow_jobs_changed=workflow_jobs_changed,
+                registry_pytest_changed=registry_pytest_changed,
+            )
         version_only = st._is_version_only(paths, head if revision else None)
         if version_only:
             pytest_needed = False

@@ -31,12 +31,26 @@ WORKFLOW_PATH = ".github/workflows/ci.yaml"
 REGISTRY_PATH = ".github/e2e-selection.yaml"
 WORKFLOW_HEADER = "<header>"
 ROOT_CONFTEST = "conftest.py"
+EMPTY_IMPACT = "empty impact"
 SHARED_LIVE_STATE_GROUP = "shared-live-state"
 PROTECTED_RUNNER_GROUP = "protected-source-runner-port"
 # Paths under these roots form a region from their first two segments.
 TWO_SEGMENT_ROOTS = frozenset({"apps", "packages", "tools", "examples", "adapters"})
 # Names a test uses for the repository root when it scans the whole tree.
-REPO_ROOT_NAMES = frozenset({"ROOT", "REPO_ROOT", "REPO", "REPOSITORY_ROOT", "WORKSPACE_ROOT"})
+# Lowercase `root` and `repo` usually name temporary directories, so only the
+# unambiguous lowercase spellings (fixtures, locals) count.
+REPO_ROOT_NAMES = frozenset(
+    {
+        "ROOT",
+        "REPO_ROOT",
+        "REPO",
+        "REPOSITORY_ROOT",
+        "WORKSPACE_ROOT",
+        "repo_root",
+        "repository_root",
+        "workspace_root",
+    }
+)
 # Imports whose application lifespan needs the object store.
 STORAGE_IMPORTS = frozenset({"curie_api", "curie_worker"})
 CONFIG_KEYS = (
@@ -45,7 +59,7 @@ CONFIG_KEYS = (
     "workflow_jobs",
     "excluded",
     "always",
-    "unclaimed_ignored",
+    "reader_only",
     "min_shard_share",
     "max_shards",
 )
@@ -462,6 +476,10 @@ class _Anchors:
             ):
                 result = self.evaluate(node)  # type: ignore[arg-type]
                 if result is not None:
+                    if ((), False) in result:
+                        # The repository root joined with a runtime value
+                        # can name any file.
+                        raise _Unresolved("computed path under the repository root")
                     covered.update(id(child) for child in ast.walk(node))
                     if ((), True) in result:
                         roots.add(id(node))
@@ -527,6 +545,17 @@ def _scans_repository(node: ast.Call, roots: set[int]) -> bool:
         texts[index] == "-C" and _is_repo_root(words[index + 1], roots)
         for index in range(len(words) - 1)
     )
+
+
+def _computed_root_join(node: ast.Call, roots: set[int]) -> bool:
+    """`os.path.join(ROOT, value)` or `ROOT.joinpath(value)` with a runtime value."""
+    if _callable_name(node.func) == "joinpath" and isinstance(node.func, ast.Attribute):
+        base, rest = node.func.value, list(node.args)
+    elif node.args:
+        base, rest = node.args[0], list(node.args[1:])
+    else:
+        return False
+    return bool(rest) and _is_repo_root(base, roots) and _string(rest[0]) is None
 
 
 def _scan_tree(tree: ast.Module, top: frozenset[str], path: str = "") -> _FileScan:
@@ -608,6 +637,9 @@ def _scan_tree(tree: ast.Module, top: frozenset[str], path: str = "") -> _FileSc
                 continue
             operands = _division_operands(node)
             base = operands[0]
+            if _is_repo_root(base, roots) and _string(operands[1]) is None:
+                # The repository root joined with a runtime value can name any file.
+                repo_wide = True
             if _string(base) is None:
                 base_name = (
                     _callable_name(base) if isinstance(base, ast.Name | ast.Attribute) else ""
@@ -638,6 +670,12 @@ def _scan_tree(tree: ast.Module, top: frozenset[str], path: str = "") -> _FileSc
                 arguments = list(node.args[:1])
             elif name == "spec_from_file_location":
                 arguments = list(node.args[1:2])
+            if (
+                id(node) not in covered
+                and name in {"join", "joinpath"}
+                and _computed_root_join(node, roots)
+            ):
+                repo_wide = True
             strings = [text for text in (_string(argument) for argument in arguments) if text]
             if strings and id(node) not in covered:
                 reference(_joined(strings))
@@ -943,6 +981,7 @@ class ImpactGraph:
         self._reference_cache: dict[str, frozenset[str]] = {}
         self._hop_cache: dict[str, frozenset[str]] = {}
         self._reach_cache: dict[str, tuple[frozenset[str], frozenset[str]]] = {}
+        self._packages_cache: dict[str, frozenset[str]] = {}
         self._known_regions = sorted(
             {*scanner.members, *(self.region_of(path) for path in tracked)}
         )
@@ -1144,19 +1183,34 @@ class ImpactGraph:
         self._reach_cache[test_file] = result
         return result
 
+    def _expanded_packages(self, test_file: str, files: Iterable[str]) -> frozenset[str]:
+        """Workspace members a test's reach imports, with their dependencies."""
+        cached = self._packages_cache.get(test_file)
+        if cached is not None:
+            return cached
+        files = tuple(files)
+        # A file inside a workspace member reaches that member's dependencies.
+        packages = {
+            region
+            for region in (self.region_of(path) for path in files)
+            if region in self._dependencies
+        }
+        for path in files:
+            packages.update(self._packages_named(self._scanner.scan(path)))
+        expanded: set[str] = set()
+        for member in packages:
+            expanded.update(self._closure(member))
+        result = frozenset(expanded)
+        self._packages_cache[test_file] = result
+        return result
+
     def file_regions(self, test_file: str) -> frozenset[str]:
         cached = self._regions_cache.get(test_file)
         if cached is not None:
             return cached
         files, references = self._reach(test_file)
         regions = {self.region_of(path) for path in files}
-        # A file inside a workspace member reaches that member's dependencies.
-        packages = {region for region in regions if region in self._dependencies}
-        for path in files:
-            packages.update(self._packages_named(self._scanner.scan(path)))
-        expanded: set[str] = set()
-        for member in packages:
-            expanded.update(self._closure(member))
+        expanded = self._expanded_packages(test_file, files)
         regions.update(expanded)
         for reference in references:
             regions.update(self._reference_regions(reference))
@@ -1166,6 +1220,38 @@ class ImpactGraph:
         result = frozenset(regions)
         self._regions_cache[test_file] = result
         return result
+
+    @cached_property
+    def _readers_index(self) -> dict[str, frozenset[str]]:
+        """Referenced path -> test files whose reach refers to it.
+
+        A test's references include those of the workspace package sources it
+        reaches, since a package may read a repository file on its behalf.
+        """
+        member_references: dict[str, set[str]] = {}
+        for member, paths in self._member_files.items():
+            found: set[str] = set()
+            for path in paths:
+                found.update(self._scanner.scan(path).references)
+            member_references[member] = found
+        index: dict[str, set[str]] = {}
+        for test_file in self.test_files:
+            files, references = self._reach(test_file)
+            every = set(references)
+            for member in self._expanded_packages(test_file, files):
+                every.update(member_references.get(member, ()))
+            for reference in every:
+                index.setdefault(reference, set()).add(test_file)
+        return {reference: frozenset(tests) for reference, tests in index.items()}
+
+    def readers(self, path: str) -> frozenset[str]:
+        """Test files that refer to `path` itself or to a directory above it."""
+        index = self._readers_index
+        found: set[str] = set(index.get(path, ()))
+        parts = path.split("/")
+        for length in range(1, len(parts)):
+            found.update(index.get("/".join(parts[:length]), ()))
+        return frozenset(found)
 
     @cached_property
     def claimed_regions(self) -> frozenset[str]:
@@ -1199,7 +1285,7 @@ class ImpactConfig:
     workflow_jobs: tuple[str, ...]
     excluded: tuple[str, ...]
     always: tuple[str, ...]
-    unclaimed_ignored: tuple[str, ...]
+    reader_only: tuple[str, ...]
     min_shard_share: int
     max_shards: int
     cli_list: str = ""
@@ -1258,7 +1344,7 @@ def load_config(registry_document: Mapping[str, object]) -> ImpactConfig:
         workflow_jobs=tuple(workflow_jobs),
         excluded=_config_paths(section["excluded"], "excluded"),
         always=_config_paths(section["always"], "always"),
-        unclaimed_ignored=_config_paths(section["unclaimed_ignored"], "unclaimed_ignored"),
+        reader_only=_config_paths(section["reader_only"], "reader_only"),
         min_shard_share=_config_count(section["min_shard_share"], "min_shard_share"),
         max_shards=_config_count(section["max_shards"], "max_shards"),
         cli_list=cli if isinstance(cli, str) else "",
@@ -1275,17 +1361,6 @@ class Selection:
 
 def _everything(reason: str) -> Selection:
     return Selection(True, reason, ())
-
-
-def _matches_ignored(path: str, patterns: Iterable[str]) -> bool:
-    """A path prefix, or `*.suffix` for a file name ending anywhere in the tree."""
-    for pattern in patterns:
-        if pattern.startswith("*."):
-            if path.endswith(pattern[1:]):
-                return True
-        elif _under(path, pattern):
-            return True
-    return False
 
 
 def select(
@@ -1319,14 +1394,16 @@ def select(
             if registry_pytest_changed is None or registry_pytest_changed:
                 return _everything(path)
             continue
-        ignored = path in config.ignored_exact or _matches_ignored(path, config.unclaimed_ignored)
-        if "/" not in path and path not in config.ignored_exact:
+        if path in config.ignored_exact or _under_any(path, config.reader_only):
+            # Documentation: only the tests known to read it, plus the
+            # always-selected set below.
+            contributed.update(graph.readers(path))
+            continue
+        if "/" not in path:
             return _everything(path)
         region = graph.region_of(path)
         if region not in graph.claimed_regions:
             # No test reaches this path, so impact cannot say what it affects.
-            if ignored:
-                continue
             return _everything(f"{path} unclaimed")
         changed.add(region)
         if _under(path, "cli"):
@@ -1341,8 +1418,33 @@ def select(
             selected.add(test_file)
     targets = tuple(sorted(path for path in selected if not _under_any(path, config.excluded)))
     if not targets:
-        return _everything("empty impact")
+        return _everything(EMPTY_IMPACT)
     return Selection(False, "impact", targets)
+
+
+def needs_pytest(
+    graph: ImpactGraph,
+    config: ImpactConfig,
+    paths: Sequence[str],
+    *,
+    cli_files: Sequence[str],
+    workflow_jobs_changed: frozenset[str] | None,
+    registry_pytest_changed: bool | None,
+) -> bool:
+    """Does a pull request diff the path rules skip still reach a test file?
+
+    Documentation a test reads selects that reader, and the always-selected
+    set (`always` plus every test that can read any file) joins every diff.
+    """
+    selection = select(
+        graph,
+        config,
+        paths,
+        cli_files=cli_files,
+        workflow_jobs_changed=workflow_jobs_changed,
+        registry_pytest_changed=registry_pytest_changed,
+    )
+    return not (selection.everything and selection.reason == EMPTY_IMPACT)
 
 
 @dataclass(frozen=True)
