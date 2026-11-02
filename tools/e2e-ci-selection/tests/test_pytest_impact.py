@@ -59,6 +59,7 @@ def _impact_section(**overrides: object) -> dict[str, object]:
         "workflow_jobs": ["python-pytest", "python", "changes"],
         "excluded": ["tools/policy/tests"],
         "always": ["tests"],
+        "unclaimed_ignored": ["docs", "*.md"],
         "min_shard_share": 24,
         "max_shards": 6,
     }
@@ -536,6 +537,221 @@ def test_repo_wide_scanners_are_selected_by_every_impact_selection(
     assert targets == {"packages/c/tests/test_scan.py", "packages/z/tests/test_z.py"}
 
 
+# Regressions: __file__ anchors, referenced entry points, unclaimed paths ----
+
+ANCHOR_HEADER = "import os\nfrom pathlib import Path\n\n"
+ANCHOR_TESTS = {
+    # The turn canary shape: a directory beside tests/, then files in it.
+    "examples/tests/test_profile_module.py": (
+        ANCHOR_HEADER + 'SOURCE = Path(__file__).resolve().parents[1] / "turn-canary"\n'
+        'HELPER = SOURCE / "probe_profiles.py"\n\n\n'
+        "def test_helper() -> None:\n    assert HELPER\n"
+    ),
+    "examples/tests/test_runtime.py": (
+        ANCHOR_HEADER
+        + 'CANARY = Path(__file__).resolve().parents[1] / "turn-canary" / "turn_canary.py"\n\n\n'
+        "def test_runtime() -> None:\n    assert CANARY\n"
+    ),
+    "examples/tests/test_dirname.py": (
+        ANCHOR_HEADER + "HERE = os.path.dirname(os.path.abspath(__file__))\n"
+        'DATA = os.path.join(HERE, "..", "turn-canary", "probe_profiles.py")\n\n\n'
+        "def test_dirname() -> None:\n    assert DATA\n"
+    ),
+    "examples/tests/test_parent_chain.py": (
+        ANCHOR_HEADER + "def test_parent_chain() -> None:\n"
+        '    assert (Path(__file__).parent.parent / "turn-canary").joinpath("turn_canary.py")\n'
+    ),
+    "examples/tests/test_unrelated.py": "def test_unrelated() -> None:\n    assert True\n",
+}
+UNRESOLVED_ANCHORS = {
+    "computed-index": "DEPTH = int(os.environ.get('DEPTH', '1'))\n"
+    "BASE = Path(__file__).resolve().parents[DEPTH]\n",
+    "above-root": 'BASE = Path(__file__).resolve().parents[7] / "elsewhere"\n',
+    "dotdot-above-root": 'BASE = os.path.join(os.path.dirname(__file__), "..", "..", "..", "x")\n',
+}
+
+
+def _anchor_repo(root: Path, extra: Mapping[str, str] | None = None) -> Any:
+    files = _workspace({"packages/z": ("pkg-z", ())}, extra_testpaths=("examples/tests",))
+    files.update(ANCHOR_TESTS)
+    files["examples/turn-canary/probe_profiles.py"] = "class ProbeProfile:\n    pass\n"
+    files["examples/turn-canary/turn_canary.py"] = "VALUE = 1\n"
+    files.update(extra or {})
+    return _build(root, files)
+
+
+@pytest.mark.parametrize(
+    ("changed", "selected"),
+    (
+        (
+            "examples/turn-canary/probe_profiles.py",
+            {
+                "examples/tests/test_profile_module.py",
+                "examples/tests/test_runtime.py",
+                "examples/tests/test_dirname.py",
+                "examples/tests/test_parent_chain.py",
+            },
+        ),
+        (
+            "examples/turn-canary/turn_canary.py",
+            {
+                "examples/tests/test_profile_module.py",
+                "examples/tests/test_runtime.py",
+                "examples/tests/test_dirname.py",
+                "examples/tests/test_parent_chain.py",
+            },
+        ),
+    ),
+)
+def test_file_relative_references_resolve_against_the_test_location(
+    tmp_path: Path, changed: str, selected: set[str]
+) -> None:
+    graph = _anchor_repo(tmp_path)
+
+    selection = _select(graph, _config(), changed)
+
+    assert not selection.everything
+    assert set(selection.targets) == selected
+
+
+@pytest.mark.parametrize("body", tuple(UNRESOLVED_ANCHORS.values()), ids=tuple(UNRESOLVED_ANCHORS))
+def test_unresolvable_file_relative_reference_is_selected_by_every_diff(
+    tmp_path: Path, body: str
+) -> None:
+    graph = _anchor_repo(
+        tmp_path,
+        {
+            "examples/tests/test_opaque.py": ANCHOR_HEADER
+            + body
+            + "\n\ndef test_opaque() -> None:\n    assert BASE\n"
+        },
+    )
+
+    targets = set(_select(graph, _config(), "packages/z/src/pkg_z/core.py").targets)
+
+    assert graph.repo_wide("examples/tests/test_opaque.py")
+    assert targets == {"examples/tests/test_opaque.py", "packages/z/tests/test_z.py"}
+
+
+def test_anchored_repository_root_scan_counts_as_repo_wide(tmp_path: Path) -> None:
+    graph = _anchor_repo(
+        tmp_path,
+        {
+            "examples/tests/test_scan_anchor.py": ANCHOR_HEADER
+            + 'FILES = sorted(Path(__file__).resolve().parents[2].rglob("*.py"))\n\n\n'
+            "def test_scan() -> None:\n    assert FILES is not None\n"
+        },
+    )
+
+    assert graph.repo_wide("examples/tests/test_scan_anchor.py")
+    assert not graph.repo_wide("examples/tests/test_profile_module.py")
+
+
+ENTRY_MEMBERS: dict[str, tuple[str, Sequence[str]]] = {
+    "packages/c": ("pkg-c", ()),
+    # The plugin-format shape: the script imports this package, which depends on pkg-c.
+    "packages/f": ("pkg-f", ("pkg-c",)),
+    "packages/z": ("pkg-z", ()),
+}
+ENTRY_FILES = {
+    "packages/f/src/pkg_f/tool_policy.py": "def classify_tool() -> str:\n    return 'allow'\n",
+    # A checker script that imports a workspace package and a sibling helper.
+    "tools/contract/check.py": (
+        "import sys\n\nfrom pkg_f import tool_policy\nfrom rules import RULES\n\n"
+        "print(tool_policy, RULES, file=sys.stderr)\n"
+    ),
+    "tools/contract/rules.py": "import pkg_z\n\nRULES = pkg_z\n",
+    "tools/contract/tests/test_shipped_policy.py": (
+        "import subprocess\nimport sys\nfrom pathlib import Path\n\n"
+        "ROOT = Path(__file__).resolve().parents[3]\n\n\n"
+        "def test_shipped_policy() -> None:\n"
+        '    subprocess.run([sys.executable, str(ROOT / "tools/contract/check.py")], check=False)\n'
+    ),
+    # A shell wrapper that runs another Python entry point.
+    "scripts/run-entry.sh": '#!/bin/sh\nexec python3 tools/entry/main.py "$@"\n',
+    "tools/entry/main.py": "import pkg_f\n\nprint(pkg_f)\n",
+    "tools/contract/tests/test_shell_entry.py": (
+        "import subprocess\n\n\ndef test_shell_entry() -> None:\n"
+        '    subprocess.run(["sh", "scripts/run-entry.sh"], check=False)\n'
+    ),
+    "tools/contract/tests/test_unrelated.py": "def test_unrelated() -> None:\n    assert True\n",
+}
+
+
+@pytest.mark.parametrize(
+    ("changed", "selected"),
+    (
+        (
+            "packages/f/src/pkg_f/tool_policy.py",
+            {
+                "tools/contract/tests/test_shipped_policy.py",
+                "tools/contract/tests/test_shell_entry.py",
+            },
+        ),
+        # pkg-f depends on pkg-c, so the entry point reaches pkg-c too.
+        (
+            "packages/c/src/pkg_c/core.py",
+            {
+                "tools/contract/tests/test_shipped_policy.py",
+                "tools/contract/tests/test_shell_entry.py",
+            },
+        ),
+        # The script's sibling helper imports pkg_z.
+        ("packages/z/src/pkg_z/core.py", {"tools/contract/tests/test_shipped_policy.py"}),
+    ),
+)
+def test_referenced_python_entry_points_contribute_their_imports(
+    tmp_path: Path, changed: str, selected: set[str]
+) -> None:
+    files = _workspace(ENTRY_MEMBERS, extra_testpaths=("tools/contract/tests",))
+    files.update(ENTRY_FILES)
+    graph = _build(tmp_path, files)
+
+    targets = set(_select(graph, _config(), changed).targets)
+
+    assert {path for path in targets if path.startswith("tools/contract/")} == selected
+
+
+UNCLAIMED_FILES = {
+    "tests/test_always.py": "def test_always() -> None:\n    assert True\n",
+    "packages/z/tests/test_data.py": (
+        'DATA = "charts/demo/values.yaml"\n\n\ndef test_data() -> None:\n    assert DATA\n'
+    ),
+    "charts/demo/values.yaml": "demo: true\n",
+    "new-dir/input.json": "{}\n",
+    "notes/todo.md": "nothing reads this\n",
+    "docs/adr/0001-record.md": "# Record\n",
+}
+
+
+@pytest.mark.parametrize(
+    ("changed", "everything"),
+    (
+        ("new-dir/input.json", True),
+        ("new-dir/nested/deeper/config.yaml", True),
+        ("notes/todo.md", False),
+        ("docs/adr/0001-record.md", False),
+        ("charts/demo/values.yaml", False),
+    ),
+)
+def test_a_path_no_test_region_claims_selects_everything_unless_ignored(
+    tmp_path: Path, changed: str, everything: bool
+) -> None:
+    files = _workspace({"packages/z": ("pkg-z", ())}, extra_testpaths=("tests",))
+    files.update(UNCLAIMED_FILES)
+    graph = _build(tmp_path, files)
+
+    selection = _select(graph, _config(), changed)
+
+    assert selection.everything is everything
+    if everything:
+        assert selection.reason == f"{changed} unclaimed"
+    else:
+        assert "tests/test_always.py" in selection.targets
+    if changed == "charts/demo/values.yaml":
+        assert "packages/z/tests/test_data.py" in selection.targets
+
+
 # select() on the real registry and repository -------------------------------
 
 
@@ -727,6 +943,50 @@ def test_real_impact_selection_keeps_root_tests_and_drops_excluded(
     assert "tests/test_repository_facts.py" in real_graph.test_files
     assert _root_tests(real_graph, real_config) <= targets
     assert not any(_under_any(target, real_config.excluded) for target in targets)
+
+
+@pytest.mark.parametrize(
+    ("changed", "required"),
+    (
+        (
+            "examples/turn-canary/probe_profiles.py",
+            {"examples/tests/test_turn_canary_profile_module.py"},
+        ),
+        (
+            "examples/turn-canary/turn_canary.py",
+            {
+                "examples/tests/test_turn_canary_profile_module.py",
+                "examples/tests/test_turn_canary.py",
+            },
+        ),
+        (
+            "packages/plugin-format/src/plugin_format/tool_policy.py",
+            {"tools/sre-contract/tests/test_shipped_policy.py"},
+        ),
+    ),
+)
+def test_real_review_regressions_select_the_reaching_tests(
+    real_graph: Any, real_config: Any, changed: str, required: set[str]
+) -> None:
+    selection = _select(real_graph, real_config, changed)
+
+    assert not selection.everything
+    assert required <= set(selection.targets)
+
+
+@pytest.mark.parametrize(
+    ("changed", "everything"),
+    (
+        ("new-dir/input.json", True),
+        ("docs/adr/0001-record-architecture-decisions.md", False),
+    ),
+)
+def test_real_unclaimed_path_selects_everything_unless_ignored(
+    real_graph: Any, real_config: Any, changed: str, everything: bool
+) -> None:
+    selection = _select(real_graph, real_config, changed)
+
+    assert selection.everything is everything
 
 
 # plan_shards and conftest groups --------------------------------------------

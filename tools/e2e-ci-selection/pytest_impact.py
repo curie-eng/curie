@@ -45,6 +45,7 @@ CONFIG_KEYS = (
     "workflow_jobs",
     "excluded",
     "always",
+    "unclaimed_ignored",
     "min_shard_share",
     "max_shards",
 )
@@ -186,9 +187,11 @@ def _callable_name(node: ast.expr) -> str | None:
     return None
 
 
-def _is_repo_root(node: ast.expr) -> bool:
+def _is_repo_root(node: ast.expr, roots: frozenset[int] | set[int] = frozenset()) -> bool:
+    if id(node) in roots:
+        return True
     if isinstance(node, ast.Call) and _callable_name(node.func) == "str" and node.args:
-        return _is_repo_root(node.args[0])
+        return _is_repo_root(node.args[0], roots)
     return isinstance(node, ast.Name | ast.Attribute) and _callable_name(node) in REPO_ROOT_NAMES
 
 
@@ -217,7 +220,12 @@ def _clean_reference(value: str) -> str:
 
 @dataclass(frozen=True)
 class _FileScan:
-    """What one Python file contributes, docstrings excluded."""
+    """What one Python file contributes, docstrings excluded.
+
+    `repo_wide` is set when the file scans the whole tree, and also when it
+    builds a path from `__file__` that cannot be resolved statically: either
+    way the file can read anything, so it is selected on every diff.
+    """
 
     imports: frozenset[str]
     relative: tuple[tuple[int, str, tuple[str, ...]], ...]
@@ -229,6 +237,240 @@ class _FileScan:
 
 
 _EMPTY_SCAN = _FileScan(frozenset(), (), frozenset(), frozenset(), 0, False, 0)
+
+
+class _Unresolved(Exception):
+    """A path built from `__file__` that static evaluation cannot follow."""
+
+
+# A statically evaluated path: repository relative parts, and whether it is
+# exact. An inexact path stands for something at or below it (a directory
+# joined with a runtime value), so it cannot be extended further.
+_AnchoredPath = tuple[tuple[str, ...], bool]
+_IDENTITY_CALLS = frozenset(
+    {
+        "str",
+        "fspath",
+        "abspath",
+        "realpath",
+        "normpath",
+        "Path",
+        "PurePath",
+        "PurePosixPath",
+        "PosixPath",
+    }
+)
+_IDENTITY_METHODS = frozenset({"resolve", "absolute", "expanduser", "as_posix"})
+
+
+def _join_parts(base: tuple[str, ...], text: str) -> tuple[str, ...]:
+    parts = list(base)
+    if text.startswith("/"):
+        raise _Unresolved(text)
+    for part in text.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if not parts:
+                raise _Unresolved(text)
+            parts.pop()
+        else:
+            parts.append(part)
+    return tuple(parts)
+
+
+class _Anchors:
+    """Evaluates path expressions rooted at `__file__` to repository paths.
+
+    Returns None for an expression that does not involve `__file__`, a set of
+    anchored paths for one it can follow, and raises `_Unresolved` for one it
+    cannot (a computed `parents` index, a path above the repository root).
+    """
+
+    def __init__(self, tree: ast.Module, path: str) -> None:
+        self.file = tuple(part for part in path.split("/") if part)
+        self.assigned: dict[str, list[ast.expr]] = {}
+        for node in _walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self.assigned.setdefault(target.id, []).append(node.value)
+            elif isinstance(node, ast.AnnAssign | ast.NamedExpr) and node.value is not None:
+                if isinstance(node.target, ast.Name):
+                    self.assigned.setdefault(node.target.id, []).append(node.value)
+        self._names: dict[str, frozenset[_AnchoredPath] | None] = {}
+        self._active: set[str] = set()
+
+    def text(self, node: ast.expr) -> str | None:
+        value = _string(node)
+        if value is not None:
+            return value
+        if isinstance(node, ast.Name) and node.id not in self._active:
+            values = self.assigned.get(node.id, [])
+            if len(values) == 1:
+                self._active.add(node.id)
+                try:
+                    return self.text(values[0])
+                finally:
+                    self._active.discard(node.id)
+        return None
+
+    def name(self, identifier: str) -> frozenset[_AnchoredPath] | None:
+        if identifier == "__file__":
+            return frozenset({(self.file, True)})
+        if identifier in self._names:
+            return self._names[identifier]
+        if identifier in self._active:
+            return None
+        self._active.add(identifier)
+        try:
+            found: set[_AnchoredPath] = set()
+            anchored = False
+            for value in self.assigned.get(identifier, ()):
+                result = self.evaluate(value)
+                if result is not None:
+                    anchored = True
+                    found.update(result)
+        finally:
+            self._active.discard(identifier)
+        resolved = frozenset(found) if anchored else None
+        self._names[identifier] = resolved
+        return resolved
+
+    def _join(
+        self, base: frozenset[_AnchoredPath], components: Sequence[ast.expr]
+    ) -> frozenset[_AnchoredPath]:
+        texts = [self.text(component) for component in components]
+        joined: set[_AnchoredPath] = set()
+        for parts, exact in base:
+            if not exact:
+                joined.add((parts, False))
+                continue
+            current = parts
+            for text in texts:
+                if text is None:
+                    joined.add((current, False))
+                    break
+                current = _join_parts(current, text)
+            else:
+                joined.add((current, True))
+        return frozenset(joined)
+
+    @staticmethod
+    def _parent(base: frozenset[_AnchoredPath], levels: int) -> frozenset[_AnchoredPath]:
+        result: set[_AnchoredPath] = set()
+        for parts, exact in base:
+            if not exact:
+                result.add((parts, False))
+                continue
+            if levels > len(parts):
+                raise _Unresolved("above the repository root")
+            result.add((parts[: len(parts) - levels], True))
+        return frozenset(result)
+
+    def evaluate(self, node: ast.expr) -> frozenset[_AnchoredPath] | None:
+        if isinstance(node, ast.Name):
+            return self.name(node.id)
+        if isinstance(node, ast.Attribute):
+            if node.attr == "parent":
+                base = self.evaluate(node.value)
+                return None if base is None else self._parent(base, 1)
+            return None
+        if isinstance(node, ast.Subscript):
+            if isinstance(node.value, ast.Attribute) and node.value.attr == "parents":
+                base = self.evaluate(node.value.value)
+                if base is None:
+                    return None
+                index = node.slice
+                if (
+                    isinstance(index, ast.Constant)
+                    and type(index.value) is int
+                    and index.value >= 0
+                ):
+                    return self._parent(base, index.value + 1)
+                raise _Unresolved("computed parents index")
+            return None
+        if isinstance(node, ast.BinOp):
+            base = self.evaluate(node.left)
+            if base is None:
+                return None
+            if isinstance(node.op, ast.Div):
+                return self._join(base, [node.right])
+            if isinstance(node.op, ast.Add):
+                text = self.text(node.right)
+                if text is not None and text.startswith("/"):
+                    return self._join(base, [ast.Constant(text.lstrip("/"))])
+                return frozenset((parts, False) for parts, _ in base)
+            return None
+        if isinstance(node, ast.JoinedStr) and node.values:
+            first = node.values[0]
+            if not isinstance(first, ast.FormattedValue):
+                return None
+            base = self.evaluate(first.value)
+            if base is None:
+                return None
+            rest: list[ast.expr] = []
+            for value in node.values[1:]:
+                text = _string(value) if isinstance(value, ast.Constant) else None
+                rest.append(ast.Constant(text.lstrip("/")) if text is not None else value)
+            return self._join(base, rest)
+        if isinstance(node, ast.Call):
+            name = _callable_name(node.func)
+            method = isinstance(node.func, ast.Attribute)
+            if method and name in _IDENTITY_METHODS and not node.args:
+                return self.evaluate(node.func.value)  # type: ignore[union-attr]
+            if method and name == "joinpath":
+                base = self.evaluate(node.func.value)  # type: ignore[union-attr]
+                return None if base is None else self._join(base, node.args)
+            if method and name in {"with_name", "with_suffix", "with_stem"}:
+                base = self.evaluate(node.func.value)  # type: ignore[union-attr]
+                if base is None:
+                    return None
+                parent = self._parent(base, 1)
+                text = self.text(node.args[0]) if node.args else None
+                if name == "with_name" and text is not None:
+                    return self._join(parent, [ast.Constant(text)])
+                # Another suffix or stem is a sibling: anything in that directory.
+                return frozenset((parts, False) for parts, _ in parent)
+            if name == "dirname" and node.args:
+                base = self.evaluate(node.args[0])
+                return None if base is None else self._parent(base, 1)
+            if name == "join" and method and node.args:
+                base = self.evaluate(node.args[0])
+                return None if base is None else self._join(base, node.args[1:])
+            if name in _IDENTITY_CALLS and node.args:
+                base = self.evaluate(node.args[0])
+                if base is None or name not in _JOIN_CALLS | {"PosixPath"}:
+                    return base
+                return self._join(base, node.args[1:])
+        return None
+
+    def references(self, tree: ast.Module) -> tuple[set[str], set[int], set[int]]:
+        """Anchored references, the ids of the nodes they cover, and of root nodes.
+
+        Raises `_Unresolved` when any anchored expression cannot be followed.
+        """
+        found: set[str] = set()
+        covered: set[int] = set()
+        roots: set[int] = set()
+        stack: list[ast.AST] = [tree]
+        while stack:
+            node = stack.pop()
+            if isinstance(
+                node,
+                ast.Name | ast.Attribute | ast.Subscript | ast.BinOp | ast.Call | ast.JoinedStr,
+            ):
+                result = self.evaluate(node)  # type: ignore[arg-type]
+                if result is not None:
+                    covered.update(id(child) for child in ast.walk(node))
+                    if ((), True) in result:
+                        roots.add(id(node))
+                    for parts, _exact in result:
+                        if parts:
+                            found.add("/".join(parts))
+                    continue
+            stack.extend(ast.iter_child_nodes(node))
+        return found, covered, roots
 
 
 def _is_test_class(node: ast.ClassDef) -> bool:
@@ -256,17 +498,17 @@ def _weight(tree: ast.Module) -> int:
     return count
 
 
-def _scans_repository(node: ast.Call) -> bool:
+def _scans_repository(node: ast.Call, roots: set[int]) -> bool:
     name = _callable_name(node.func)
     if isinstance(node.func, ast.Attribute):
         base = node.func.value
-        if name == "rglob" and _is_repo_root(base):
+        if name == "rglob" and _is_repo_root(base, roots):
             return True
-        if name == "glob" and _is_repo_root(base) and node.args:
+        if name == "glob" and _is_repo_root(base, roots) and node.args:
             pattern = _string(node.args[0])
             if pattern is not None and pattern.startswith("**"):
                 return True
-    if name == "walk" and node.args and _is_repo_root(node.args[0]):
+    if name == "walk" and node.args and _is_repo_root(node.args[0], roots):
         return True
     words: list[ast.expr] = []
     for argument in node.args:
@@ -277,14 +519,17 @@ def _scans_repository(node: ast.Call) -> bool:
     texts = [_string(word) or "" for word in words]
     if not any("ls-files" in text for text in texts):
         return False
-    if any(keyword.arg == "cwd" and _is_repo_root(keyword.value) for keyword in node.keywords):
+    if any(
+        keyword.arg == "cwd" and _is_repo_root(keyword.value, roots) for keyword in node.keywords
+    ):
         return True
     return any(
-        texts[index] == "-C" and _is_repo_root(words[index + 1]) for index in range(len(words) - 1)
+        texts[index] == "-C" and _is_repo_root(words[index + 1], roots)
+        for index in range(len(words) - 1)
     )
 
 
-def _scan_tree(tree: ast.Module, top: frozenset[str]) -> _FileScan:
+def _scan_tree(tree: ast.Module, top: frozenset[str], path: str = "") -> _FileScan:
     docstrings: set[int] = set()
     imports: set[str] = set()
     relative: list[tuple[int, str, tuple[str, ...]]] = []
@@ -294,6 +539,17 @@ def _scan_tree(tree: ast.Module, top: frozenset[str]) -> _FileScan:
     identifiers: list[str] = []
     repo_wide = False
     nested_divisions: set[int] = set()
+    covered: set[int] = set()
+    roots: set[int] = set()
+    if path and any(isinstance(node, ast.Name) and node.id == "__file__" for node in _walk(tree)):
+        try:
+            anchored, covered, roots = _Anchors(tree, path).references(tree)
+        except _Unresolved:
+            # A path built from this file's location that cannot be followed
+            # could name anything, so the file is selected on every diff.
+            repo_wide = True
+        else:
+            references.update(anchored)
 
     def reference(value: str) -> None:
         cleaned = _clean_reference(value)
@@ -344,6 +600,8 @@ def _scan_tree(tree: ast.Module, top: frozenset[str]) -> _FileScan:
         elif isinstance(node, ast.keyword) and node.arg:
             identifiers.append(node.arg)
         elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            if id(node) in covered:
+                continue
             if isinstance(node.left, ast.BinOp) and isinstance(node.left.op, ast.Div):
                 nested_divisions.add(id(node.left))
             if id(node) in nested_divisions:
@@ -381,9 +639,9 @@ def _scan_tree(tree: ast.Module, top: frozenset[str]) -> _FileScan:
             elif name == "spec_from_file_location":
                 arguments = list(node.args[1:2])
             strings = [text for text in (_string(argument) for argument in arguments) if text]
-            if strings:
+            if strings and id(node) not in covered:
                 reference(_joined(strings))
-            if not repo_wide and _scans_repository(node):
+            if not repo_wide and _scans_repository(node, roots):
                 repo_wide = True
 
     text_blob = "\n".join(texts)
@@ -478,7 +736,7 @@ class _Scanner:
                 # An unreadable file cannot be classified; assume it needs every service.
                 result = _FileScan(frozenset(), (), frozenset(), frozenset(), 2, False, 0)
             else:
-                result = _scan_tree(tree, self.top)
+                result = _scan_tree(tree, self.top, path)
             self._stored[path] = (stamp, result)
         self._scans[path] = result
         return result
@@ -684,6 +942,7 @@ class ImpactGraph:
         self._regions_cache: dict[str, frozenset[str]] = {}
         self._reference_cache: dict[str, frozenset[str]] = {}
         self._hop_cache: dict[str, frozenset[str]] = {}
+        self._reach_cache: dict[str, tuple[frozenset[str], frozenset[str]]] = {}
         self._known_regions = sorted(
             {*scanner.members, *(self.region_of(path) for path in tracked)}
         )
@@ -803,12 +1062,12 @@ class ImpactGraph:
         self._reference_cache[reference] = result
         return result
 
-    def _hop_regions(self, path: str) -> frozenset[str]:
-        """Regions a referenced script names in its own text (one hop)."""
+    def _hop_references(self, path: str) -> frozenset[str]:
+        """Repository paths a referenced script names anywhere in its text."""
         cached = self._hop_cache.get(path)
         if cached is not None:
             return cached
-        regions: set[str] = set()
+        found: set[str] = set()
         try:
             text = (self.root / path).read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -816,8 +1075,8 @@ class ImpactGraph:
         for match in _PATH_TOKEN.finditer(text):
             cleaned = _clean_reference(match.group(0).rstrip("."))
             if cleaned and cleaned.split("/", 1)[0] in self._scanner.top:
-                regions.update(self._reference_regions(cleaned))
-        result = frozenset(regions)
+                found.add(cleaned)
+        result = frozenset(found)
         self._hop_cache[path] = result
         return result
 
@@ -846,35 +1105,79 @@ class ImpactGraph:
                 members.add(owner)
         return members
 
+    def _reach(self, test_file: str) -> tuple[frozenset[str], frozenset[str]]:
+        """Files a test runs or imports, and the paths they refer to.
+
+        A referenced Python entry point (a script the test executes or loads
+        by path) is followed like an import: its own local helpers, imports
+        and references join the reach, transitively. A referenced shell
+        script contributes the paths in its text, and any Python script among
+        those is followed the same way.
+        """
+        cached = self._reach_cache.get(test_file)
+        if cached is not None:
+            return cached
+        files: dict[str, None] = {}
+        references: set[str] = set()
+        pending = [test_file]
+        entered: set[str] = set()
+        while pending:
+            entry = pending.pop()
+            if entry in entered:
+                continue
+            entered.add(entry)
+            for path in self._scanner.local_closure(entry):
+                files[path] = None
+                for reference in self._scanner.scan(path).references:
+                    references.add(reference)
+                    if reference not in self.tracked:
+                        continue
+                    if reference.endswith(".py"):
+                        pending.append(reference)
+                        references.update(self._hop_references(reference))
+                    elif reference.endswith(".sh"):
+                        for named in self._hop_references(reference):
+                            references.add(named)
+                            if named.endswith(".py") and named in self.tracked:
+                                pending.append(named)
+        result = (frozenset(files), frozenset(references))
+        self._reach_cache[test_file] = result
+        return result
+
     def file_regions(self, test_file: str) -> frozenset[str]:
         cached = self._regions_cache.get(test_file)
         if cached is not None:
             return cached
-        closure = self._scanner.local_closure(test_file)
-        regions = {self.region_of(path) for path in closure}
-        packages: set[str] = set()
-        own = self.region_of(test_file)
-        if own in self._dependencies:
-            packages.add(own)
-        references: set[str] = set()
-        for path in closure:
-            scan = self._scanner.scan(path)
-            packages.update(self._packages_named(scan))
-            references.update(scan.references)
+        files, references = self._reach(test_file)
+        regions = {self.region_of(path) for path in files}
+        # A file inside a workspace member reaches that member's dependencies.
+        packages = {region for region in regions if region in self._dependencies}
+        for path in files:
+            packages.update(self._packages_named(self._scanner.scan(path)))
         expanded: set[str] = set()
         for member in packages:
             expanded.update(self._closure(member))
         regions.update(expanded)
         for reference in references:
             regions.update(self._reference_regions(reference))
-            if reference.endswith((".sh", ".py")) and reference in self.tracked:
-                regions.update(self._hop_regions(reference))
         data = self._package_data_regions
         for member in expanded:
             regions.update(data.get(member, ()))
         result = frozenset(regions)
         self._regions_cache[test_file] = result
         return result
+
+    @cached_property
+    def claimed_regions(self) -> frozenset[str]:
+        """Every region some test file in the universe reaches.
+
+        Excluded test files count: they run in another job, so a change they
+        claim is still covered.
+        """
+        claimed: set[str] = set()
+        for test_file in self.test_files:
+            claimed.update(self.file_regions(test_file))
+        return frozenset(claimed)
 
     def service_tier(self, test_file: str) -> int:
         return self._scanner.tier(test_file)
@@ -883,7 +1186,8 @@ class ImpactGraph:
         return self._scanner.scan(test_file).weight
 
     def repo_wide(self, test_file: str) -> bool:
-        return self._scanner.repo_wide(test_file)
+        files, _ = self._reach(test_file)
+        return any(self._scanner.scan(path).repo_wide for path in files)
 
 
 @dataclass(frozen=True)
@@ -895,6 +1199,7 @@ class ImpactConfig:
     workflow_jobs: tuple[str, ...]
     excluded: tuple[str, ...]
     always: tuple[str, ...]
+    unclaimed_ignored: tuple[str, ...]
     min_shard_share: int
     max_shards: int
     cli_list: str = ""
@@ -953,6 +1258,7 @@ def load_config(registry_document: Mapping[str, object]) -> ImpactConfig:
         workflow_jobs=tuple(workflow_jobs),
         excluded=_config_paths(section["excluded"], "excluded"),
         always=_config_paths(section["always"], "always"),
+        unclaimed_ignored=_config_paths(section["unclaimed_ignored"], "unclaimed_ignored"),
         min_shard_share=_config_count(section["min_shard_share"], "min_shard_share"),
         max_shards=_config_count(section["max_shards"], "max_shards"),
         cli_list=cli if isinstance(cli, str) else "",
@@ -969,6 +1275,17 @@ class Selection:
 
 def _everything(reason: str) -> Selection:
     return Selection(True, reason, ())
+
+
+def _matches_ignored(path: str, patterns: Iterable[str]) -> bool:
+    """A path prefix, or `*.suffix` for a file name ending anywhere in the tree."""
+    for pattern in patterns:
+        if pattern.startswith("*."):
+            if path.endswith(pattern[1:]):
+                return True
+        elif _under(path, pattern):
+            return True
+    return False
 
 
 def select(
@@ -1002,9 +1319,16 @@ def select(
             if registry_pytest_changed is None or registry_pytest_changed:
                 return _everything(path)
             continue
+        ignored = path in config.ignored_exact or _matches_ignored(path, config.unclaimed_ignored)
         if "/" not in path and path not in config.ignored_exact:
             return _everything(path)
-        changed.add(graph.region_of(path))
+        region = graph.region_of(path)
+        if region not in graph.claimed_regions:
+            # No test reaches this path, so impact cannot say what it affects.
+            if ignored:
+                continue
+            return _everything(f"{path} unclaimed")
+        changed.add(region)
         if _under(path, "cli"):
             contributed.update(cli_files)
     selected: set[str] = {path for path in contributed if path in graph.tracked}
