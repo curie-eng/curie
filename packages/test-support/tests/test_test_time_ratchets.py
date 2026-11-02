@@ -1,6 +1,5 @@
 """Behavior checks for generated test-time baselines and the pytest budget."""
 
-import hashlib
 import json
 import os
 import subprocess
@@ -19,6 +18,12 @@ BASELINE = "tests/baselines/test-time.json"
 @pytest.fixture(autouse=True)
 def private_step_summary(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+
+def pin_main_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("GITHUB_BASE_REF", "main")
+    monkeypatch.setenv("GITHUB_REF_NAME", "task/example")
 
 
 def command(root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -223,7 +228,7 @@ def test_fast(setup_delay): pass
     source(
         tmp_path,
         "baseline.json",
-        json.dumps({"sleeps": {}, "fixtures": [], "durations": [], "known_tests": {}}),
+        json.dumps({"sleeps": {}, "fixtures": [], "durations": []}),
     )
     argv = [
         sys.executable,
@@ -248,7 +253,6 @@ def test_fast(setup_delay): pass
                 "sleeps": {},
                 "fixtures": [],
                 "durations": ["test_case.py::test_fast"],
-                "known_tests": {},
             }
         ),
     )
@@ -334,7 +338,6 @@ def test_removed_duration_parameter_is_ignored_at_collection(tmp_path: Path) -> 
                 "sleeps": {},
                 "fixtures": [],
                 "durations": ["test_case.py::test_case[removed]"],
-                "known_tests": {},
             }
         ),
     )
@@ -392,7 +395,10 @@ def git(root: Path, *argv: str) -> str:
     return result.stdout.strip()
 
 
-def test_ci_ratchets_compare_merge_base_not_advanced_tip(tmp_path: Path) -> None:
+def test_ci_ratchets_compare_merge_base_not_advanced_tip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pin_main_pr(monkeypatch)
     git(tmp_path, "init", "-q", "-b", "main")
     git(tmp_path, "config", "user.name", "Example")
     git(tmp_path, "config", "user.email", "test@example.com")
@@ -449,7 +455,10 @@ def test_stale_sleep_is_written_to_step_summary(
     assert "stale tests/queue_fixtures.py" in summary.read_text()
 
 
-def test_slow_observations_can_be_recorded_without_growing_static_costs(tmp_path: Path) -> None:
+def test_slow_observations_can_be_recorded_without_growing_static_costs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pin_main_pr(monkeypatch)
     git(tmp_path, "init", "-q", "-b", "main")
     git(tmp_path, "config", "user.name", "Example")
     git(tmp_path, "config", "user.email", "test@example.com")
@@ -476,7 +485,6 @@ def test_xdist_transports_duration_collection_observations(tmp_path: Path) -> No
                 "sleeps": {},
                 "fixtures": [],
                 "durations": ["test_case.py::test_case"],
-                "known_tests": {},
             }
         ),
     )
@@ -500,13 +508,14 @@ def test_xdist_transports_duration_collection_observations(tmp_path: Path) -> No
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'test-time collected: {"test_case.py": ["test_case.py::test_case"]}' in result.stdout
-    expected = hashlib.sha256(b"test_case.py::test_case").hexdigest()
-    assert "test-time known: " + json.dumps({"test_case.py": [expected]}) in result.stdout
     assert "s call test_case.py::test_case" in result.stdout
 
 
 @pytest.mark.parametrize("kind", ["sleeps", "fixtures"])
-def test_committed_baseline_cannot_undercount_the_scan(tmp_path: Path, kind: str) -> None:
+def test_committed_baseline_cannot_undercount_the_scan(
+    tmp_path: Path, kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pin_main_pr(monkeypatch)
     git(tmp_path, "init", "-q", "-b", "main")
     git(tmp_path, "config", "user.name", "Example")
     git(tmp_path, "config", "user.email", "test@example.com")
@@ -579,7 +588,10 @@ def test_combined_artifact_with_two_ci_run_ids_is_accepted(tmp_path: Path) -> No
     ]
 
 
-def test_removing_a_current_observation_stops_reporting_it_when_fast(tmp_path: Path) -> None:
+def test_removing_a_current_observation_stops_reporting_it_when_fast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pin_main_pr(monkeypatch)
     git(tmp_path, "init", "-q", "-b", "main")
     git(tmp_path, "config", "user.name", "Example")
     git(tmp_path, "config", "user.email", "test@example.com")
@@ -628,91 +640,131 @@ def test_independent_xdist_group_is_removed_from_parameterized_nodeid(nodeid: st
     assert canonical_nodeid(nodeid + "@" + nodeid) == nodeid
 
 
-def test_budget_scope_uses_the_diff_and_base_inventory(tmp_path: Path) -> None:
+def duration_history(root: Path, monkeypatch: pytest.MonkeyPatch, before: str, after: str) -> str:
+    pin_main_pr(monkeypatch)
+    git(root, "init", "-q", "-b", "main")
+    git(root, "config", "user.name", "Example")
+    git(root, "config", "user.email", "test@example.com")
+    git(root, "config", "core.hooksPath", os.devnull)
+    file = "tests/test_case.py"
+    source(root, file, before)
+    git(root, "add", ".")
+    git(root, "commit", "-qm", "Initial test cases")
+    git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
+    source(root, file, after)
+    source(root, "README.md", "Changed example documentation\n")
+    git(root, "add", ".")
+    git(root, "commit", "-qm", "Update test inputs")
+    return file
+
+
+def test_budget_scope_uses_changed_definition_ranges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from curie_test_support.duration_budget import budget_targets
 
-    git(tmp_path, "init", "-q", "-b", "main")
-    git(tmp_path, "config", "user.name", "Example")
-    git(tmp_path, "config", "user.email", "test@example.com")
-    git(tmp_path, "config", "core.hooksPath", os.devnull)
     original = (
         "def test_existing(): pass\n\n"
         "def test_changed():\n    return 1\n\n"
-        "def test_untouched_in_same_file(): pass\n"
+        "def test_neighbor(): pass\n"
     )
-    file = "tests/test_case.py"
-    source(tmp_path, file, original)
+    file = duration_history(
+        tmp_path, monkeypatch, original, original.replace("return 1", "return 2")
+    )
+    source(tmp_path, "tests/test_added.py", "if True:\n    def test_added(): pass\n")
     git(tmp_path, "add", ".")
-    git(tmp_path, "commit", "-qm", "Initial test cases")
-    git(tmp_path, "update-ref", "refs/remotes/origin/main", "HEAD")
-    known_ids = [
-        file + "::" + name
-        for name in ("test_existing", "test_changed", "test_untouched_in_same_file")
-    ]
-    known = {file: sorted(hashlib.sha256(nodeid.encode()).hexdigest() for nodeid in known_ids)}
-    source(tmp_path, file, original.replace("return 1", "return 2") + "\ndef test_added(): pass\n")
-    git(tmp_path, "commit", "-qam", "Change one test and add another")
-    collected = [*known_ids, file + "::test_added", file + "::test_existing[new]"]
-    enforced = budget_targets(tmp_path, collected, known, known)
-    assert enforced == {
-        file + "::test_changed",
-        file + "::test_added",
+    git(tmp_path, "commit", "-qm", "Add a test file")
+    collected = [
+        file + "::test_existing",
         file + "::test_existing[new]",
-    }
-    assert budget_failure(file + "::test_untouched_in_same_file", 120, enforced) is None
-    assert budget_failure(file + "::test_existing", 120, enforced) is None
-    with pytest.raises(ValueError, match="dropped collected base identities"):
-        budget_targets(tmp_path, collected, known, {})
-    remaining = [nodeid for nodeid in collected if nodeid != file + "::test_existing"]
-    retained = {
-        file: [
-            entry
-            for entry in known[file]
-            if entry != hashlib.sha256((file + "::test_existing").encode()).hexdigest()
-        ]
-    }
-    assert budget_targets(tmp_path, remaining, known, retained) == enforced
-    assert "exceeds" in (budget_failure(file + "::test_changed", 120, enforced) or "")
-    assert "exceeds" in (budget_failure(file + "::test_existing[new]", 120, enforced) or "")
-    assert budget_targets(tmp_path, collected, None, known) == {
         file + "::test_changed",
-        file + "::test_added",
-    }
-
-
-def test_regeneration_records_hashed_known_case_inventory(tmp_path: Path) -> None:
-    source(tmp_path, "tests/test_case.py", "def test_case(): pass\n")
-    node_hash = hashlib.sha256(b"tests/test_case.py::test_case").hexdigest()
-    arguments = duration_artifacts(tmp_path, 31, 32)
-    for index in range(2):
-        path = tmp_path / f"run-{index}.log"
-        with path.open("a") as artifact:
-            artifact.write(
-                "test-time known: " + json.dumps({"tests/test_case.py": [node_hash]}) + "\n"
-            )
-    result = command(tmp_path, "--regenerate", *arguments)
-    assert result.returncode == 0, result.stdout
-    assert json.loads((tmp_path / BASELINE).read_text())["known_tests"] == {
-        "tests/test_case.py": [node_hash]
-    }
-    saved = (tmp_path / BASELINE).read_text()
-    for index in range(2):
-        artifact = tmp_path / f"run-{index}.log"
-        artifact.write_text(artifact.read_text().replace(node_hash, "malformed"))
-    invalid = command(tmp_path, "--regenerate", *arguments)
-    assert invalid.returncode == 2
-    assert (tmp_path / BASELINE).read_text() == saved
+        file + "::test_neighbor",
+        "tests/test_added.py::test_added",
+    ]
+    enforced = budget_targets(tmp_path, collected)
+    assert enforced == {file + "::test_changed", "tests/test_added.py::test_added"}
+    assert budget_failure(file + "::test_existing", 120, enforced) is None
+    assert budget_failure(file + "::test_existing[new]", 120, enforced) is None
+    assert budget_failure(file + "::test_neighbor", 120, enforced) is None
+    assert "exceeds" in (budget_failure(file + "::test_changed", 120, enforced) or "")
 
 
 @pytest.mark.parametrize(
-    "known", [[], {"tests/test_case.py": ["not-a-hash"]}, {"../outside.py": []}]
+    "event", ["pull_request", "push", "workflow_dispatch", "schedule", "merge_group", ""]
 )
-def test_malformed_known_case_inventory_fails_closed(tmp_path: Path, known: Any) -> None:
-    source(
-        tmp_path,
-        BASELINE,
-        json.dumps({"sleeps": {}, "fixtures": [], "durations": [], "known_tests": known}),
+def test_unchanged_slow_case_never_fails_any_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event: str
+) -> None:
+    from curie_test_support.duration_budget import budget_targets
+
+    file = duration_history(
+        tmp_path, monkeypatch, "def test_existing(): pass\n", "def test_existing(): pass\n"
     )
-    result = command(tmp_path)
-    assert result.returncode == 2
-    assert "known_tests" in result.stdout
+    monkeypatch.setenv("GITHUB_EVENT_NAME", event)
+    monkeypatch.setenv("GITHUB_REF_NAME", "next")
+    nodeid = file + "::test_existing"
+    assert budget_targets(tmp_path, [nodeid]) == set()
+    assert budget_failure(nodeid, 120, budget_targets(tmp_path, [nodeid])) is None
+
+
+@pytest.mark.parametrize("event", ["push", "workflow_dispatch", "schedule", "merge_group"])
+def test_non_pr_events_never_enforce_even_with_changed_tests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event: str
+) -> None:
+    from curie_test_support.duration_budget import budget_targets
+
+    file = duration_history(
+        tmp_path, monkeypatch, "def test_case(): return 1\n", "def test_case(): return 2\n"
+    )
+    monkeypatch.setenv("GITHUB_EVENT_NAME", event)
+    monkeypatch.setenv("GITHUB_REF_NAME", "next")
+    assert budget_targets(tmp_path, [file + "::test_case"]) == set()
+
+
+def test_new_parametrize_decorator_case_is_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_test_support.duration_budget import budget_targets
+
+    before = (
+        'import pytest\n@pytest.mark.parametrize("value", ["old"])\ndef test_case(value): pass\n'
+    )
+    file = duration_history(
+        tmp_path, monkeypatch, before, before.replace('["old"]', '["old", "new"]')
+    )
+    collected = [file + "::test_case[old]", file + "::test_case[new]"]
+    assert budget_targets(tmp_path, collected) == set(collected)
+
+
+def test_changed_function_under_if_is_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_test_support.duration_budget import budget_targets
+
+    before = "if True:\n    def test_case():\n        return 1\n"
+    file = duration_history(tmp_path, monkeypatch, before, before.replace("return 1", "return 2"))
+    assert budget_targets(tmp_path, [file + "::test_case"]) == {file + "::test_case"}
+
+
+@pytest.mark.parametrize("removed", ["\n", "# removed comment\n"])
+def test_deleting_trivia_does_not_mark_neighbor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, removed: str
+) -> None:
+    from curie_test_support.duration_budget import budget_targets
+
+    before = "# header\ndef test_neighbor(): pass\n" + removed + "def test_later(): pass\n"
+    after = "# header\ndef test_neighbor(): pass\ndef test_later(): pass\n"
+    file = duration_history(tmp_path, monkeypatch, before, after)
+    assert budget_targets(tmp_path, [file + "::test_neighbor", file + "::test_later"]) == set()
+
+
+def test_deleted_statement_marks_its_owner_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_test_support.duration_budget import budget_targets
+
+    before = "def test_changed():\n    assert True\n    assert 1\ndef test_neighbor(): pass\n"
+    file = duration_history(tmp_path, monkeypatch, before, before.replace("    assert 1\n", ""))
+    assert budget_targets(tmp_path, [file + "::test_changed", file + "::test_neighbor"]) == {
+        file + "::test_changed"
+    }
