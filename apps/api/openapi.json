@@ -7615,7 +7615,8 @@
                   "hook_paused",
                   "live_session",
                   "enqueue_failed",
-                  "claim_expired"
+                  "claim_expired",
+                  "identity_refused"
                 ],
                 "type": "string"
               },
@@ -13432,7 +13433,8 @@
                   "hook_paused",
                   "live_session",
                   "enqueue_failed",
-                  "claim_expired"
+                  "claim_expired",
+                  "identity_refused"
                 ],
                 "type": "string"
               },
@@ -13479,7 +13481,8 @@
                   "hook_paused",
                   "live_session",
                   "enqueue_failed",
-                  "claim_expired"
+                  "claim_expired",
+                  "identity_refused"
                 ],
                 "type": "string"
               },

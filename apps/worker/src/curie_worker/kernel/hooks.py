@@ -10,10 +10,11 @@ from aci_protocol import (
     Event,
     HookRunRef,
     QueuedTurn,
+    TurnSource,
 )
 
 from ..delivery_lease import DeliveryLease
-from ..hook_runs import HookRunOutcome, HookRunRecorder, HookRunState
+from ..hook_runs import HookRunOutcome, HookRunRecorder, HookRunRecorderError, HookRunState
 from ..runner_client import (
     TurnStream,
 )
@@ -152,6 +153,29 @@ async def _close_hook_run_after_error(
             type(original).__name__,
             exc_info=True,
         )
+
+
+async def _close_hook_run_after_refusal(self: Kernel, qevent: QueuedTurn) -> None:
+    """Close the cron run of a definitively identity-refused delivery (#5305).
+
+    The refusal can precede the run's validation in ``_process_event``, so
+    this reads the reference from the event rather than the carry, and it
+    needs no started attempt. A missing or malformed reference has no run to
+    close. A run already terminal keeps its outcome. A backend failure
+    propagates so the caller leaves the delivery pending. No notice or reply
+    follows: the refusal permits no further side effect.
+    """
+    if qevent.source is not TurnSource.CRON or self._hook_runs is None or qevent.hook_run is None:
+        return
+    carry = constants._HOOK_RUN_CARRY.get()
+    if carry is not None and carry.successor_maybe_published:
+        # A sweep's next slice may exist; its run stays open (#2878).
+        return
+    try:
+        await self._hook_runs.close(qevent.hook_run, "failed", "identity_refused")
+    except HookRunRecorderError as exc:
+        if exc.code not in {"invalid_ref", "missing"}:
+            raise
 
 
 async def _post_notice_after_error(self: Kernel, qevent: QueuedTurn, carry: _HookRunCarry) -> None:
