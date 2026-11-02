@@ -562,6 +562,7 @@ self_test() {
     local case_name expected body_text files_text issues_text status index
     local mode indent indented_body fenced_examples
     local path missing_tier complete_rows refusal_rows follow_text unreadable_metadata_file
+    local otel_files otel_row
     local -a metadata_args patch_release_cases discovery_cases mapping_cases
 
     temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/curie-pr-body-check.XXXXXX")"
@@ -827,6 +828,16 @@ self_test() {
         "factory row waiver cannot waive missing local" 1 "$discovery_header"$'\n| factory | required | Discovery waiver: Disposable infrastructure unavailable; tracked in #123 | live | blocked |' "$factory_files" '[123]'
         "changed files must be a JSON filename array" 1 'Document wording changed.' '[123]' '[]'
         "open issues must be a JSON integer array" 1 'Document wording changed.' "$docs_files" '["123"]'
+    )
+    otel_files='["runner/src/curie_runner/otel.py"]'
+    otel_row='| skill | required | Runner telemetry tests changed | fake | `uv run pytest -q runner/tests/test_otel.py -k reviewer` exited 0; the reviewer row passed |'
+    discovery_cases+=(
+        "otel pytest skill evidence passes" 0 "$discovery_header"$'\n'"$otel_row" "$otel_files" '[]'
+        "otel missing skill row is refused" 1 'Runner telemetry tests changed.' "$otel_files" '[]'
+        "otel not run evidence is refused" 1 "$discovery_header"$'\n| skill | required | Runner telemetry tests changed | fake | `uv run pytest -q runner/tests/test_otel.py -k reviewer` was not run |' "$otel_files" '[]'
+        "otel blocked evidence is refused" 1 "$discovery_header"$'\n| skill | required | Runner telemetry tests changed | blocked | `uv run pytest -q runner/tests/test_otel.py -k reviewer` exited 0; the reviewer row passed |' "$otel_files" '[]'
+        "otel fake outcome is refused" 1 "$discovery_header"$'\n| skill | required | Runner telemetry tests changed | fake | `uv run pytest -q runner/tests/test_otel.py -k reviewer` fake |' "$otel_files" '[]'
+        "runner test only path needs no runtime row" 0 'Runner test wording changed.' '["runner/tests/test_otel.py"]' '[]'
     )
 
     for status in blocked 'not run' fake; do

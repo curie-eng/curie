@@ -168,7 +168,10 @@ impl Fixture {
                     .parent()
                     .unwrap(),
             )
-            .env("PATH", format!("{}:/usr/bin:/bin", self.0.path().display()))
+            .env(
+                "PATH",
+                crate::support::executable::isolated_fixture_path(self.0.path()),
+            )
             .env("KUBECONFIG", self.0.path().join("kubeconfig"))
             .env("UPGRADE_DRIVER_ROOT", self.0.path())
             .env("UPGRADE_DRIVER_SCENARIO", scenario);
@@ -209,7 +212,10 @@ impl Fixture {
             ])
             .args(extra)
             .current_dir(current_dir)
-            .env("PATH", format!("{}:/usr/bin:/bin", self.0.path().display()))
+            .env(
+                "PATH",
+                crate::support::executable::isolated_fixture_path(self.0.path()),
+            )
             .env("KUBECONFIG", self.0.path().join("kubeconfig"))
             .env("UPGRADE_DRIVER_ROOT", self.0.path())
             .env("UPGRADE_DRIVER_SCENARIO", scenario)
@@ -251,7 +257,10 @@ impl Fixture {
                 "--yes",
             ])
             .current_dir(self.0.path())
-            .env("PATH", format!("{}:/usr/bin:/bin", self.0.path().display()))
+            .env(
+                "PATH",
+                crate::support::executable::isolated_fixture_path(self.0.path()),
+            )
             .env("KUBECONFIG", self.0.path().join("kubeconfig"))
             .env("UPGRADE_DRIVER_ROOT", self.0.path())
             .env("UPGRADE_DRIVER_SCENARIO", scenario)
@@ -327,7 +336,10 @@ exec "$UPGRADE_DRIVER_ROOT/recorder/helm" "$@"
                     .parent()
                     .unwrap(),
             )
-            .env("PATH", format!("{}:/usr/bin:/bin", self.0.path().display()))
+            .env(
+                "PATH",
+                crate::support::executable::isolated_fixture_path(self.0.path()),
+            )
             .env("KUBECONFIG", self.0.path().join("kubeconfig"))
             .env("UPGRADE_DRIVER_ROOT", self.0.path())
             .env("UPGRADE_DRIVER_SCENARIO", scenario)
@@ -5647,7 +5659,7 @@ fn fail_at_apply_against_soak_namespace_is_refused_without_helm() {
         )
         .env(
             "PATH",
-            format!("{}:/usr/bin:/bin", fixture.0.path().display()),
+            crate::support::executable::isolated_fixture_path(fixture.0.path()),
         )
         .env("KUBECONFIG", fixture.0.path().join("kubeconfig"))
         .env("UPGRADE_DRIVER_ROOT", fixture.0.path())
@@ -7233,8 +7245,9 @@ fn repository_runner_upgrade_retained_target_keeps_same_base_without_docker() {
     });
     let fixture = repository_runner_upgrade_fixture(&before);
     fs::remove_file(fixture.0.path().join("docker")).unwrap();
-    let path = fixture.0.path().to_str().unwrap();
-    let output = fixture.local_env("healthy", &[("PATH", path)]);
+    let path = crate::support::executable::fixture_python_path(fixture.0.path());
+    let path = path.to_str().expect("fixture PATH is utf-8").to_string();
+    let output = fixture.local_env("healthy", &[("PATH", &path)]);
     assert!(output.status.success(), "{}", visible(&output));
     assert_eq!(json(&output)["status"], "succeeded", "{}", visible(&output));
     assert_eq!(fixture.helm_upgrades().len(), 1, "{:?}", fixture.argv());
@@ -7932,7 +7945,9 @@ fn repository_runner_upgrade_invalid_build_inputs_refuse_before_apply() {
         let installed_before = repository_runner_installed_values(&fixture);
         let output = if fault == "docker" {
             fs::remove_file(fixture.0.path().join("docker")).unwrap();
-            fixture.local_env("healthy", &[("PATH", fixture.0.path().to_str().unwrap())])
+            let path = crate::support::executable::fixture_python_path(fixture.0.path());
+            let path = path.to_str().expect("fixture PATH is utf-8").to_string();
+            fixture.local_env("healthy", &[("PATH", &path)])
         } else {
             fixture.local("healthy")
         };

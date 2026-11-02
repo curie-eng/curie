@@ -94,7 +94,7 @@ fn candidate_runner_registry() -> OciRegistryStub {
 
 // The driver answers explicit external commands and rejects unknown ones.
 // State lives inside the owned temporary fixture, never in a real cluster.
-const TOOL_DRIVER: &str = r#"#!/usr/bin/python3
+const TOOL_DRIVER: &str = r#"#!/usr/bin/env python3
 import base64, json, os, re, sys, time
 from pathlib import Path
 root = Path(os.environ['QUICKSTART_FIXTURE'])
@@ -563,7 +563,7 @@ impl Fixture {
             .args(extra)
             .env(
                 "PATH",
-                format!("{}:/usr/bin:/bin", self.dir.path().join("bin").display()),
+                crate::support::executable::isolated_fixture_path(&self.dir.path().join("bin")),
             )
             .env("QUICKSTART_FIXTURE", self.dir.path())
             .env("QUICKSTART_VERSION", env!("CARGO_PKG_VERSION"))

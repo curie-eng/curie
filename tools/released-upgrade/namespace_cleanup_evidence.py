@@ -14,7 +14,7 @@ _NAMESPACE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z", re.ASCII)
 _RESOURCE = re.compile(r"[a-z][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*\Z", re.ASCII)
 _SYMBOL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}\Z", re.ASCII)
 _PROJECTION = (
-    '[{{range $i,$item := .items}}{{if $i}},{{end}}'
+    "[{{range $i,$item := .items}}{{if $i}},{{end}}"
     '{"finalizers":[{{range $j,$f := $item.metadata.finalizers}}'
     '{{if $j}},{{end}}{{printf "%q" $f}}{{end}}],'
     '"deleting":{{if $item.metadata.deletionTimestamp}}true{{else}}false{{end}},'
@@ -26,8 +26,13 @@ _PROJECTION = (
 def _run(command: list[str], timeout_s: float) -> subprocess.CompletedProcess[str]:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-1 NAMESPACE-CLEANUP-EVIDENCE-3."""
     return subprocess.run(
-        command, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=timeout_s, check=False,
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout_s,
+        check=False,
     )
 
 
@@ -81,8 +86,9 @@ def _namespace(value: Any, result: dict[str, Any]) -> None:
     if timestamp is not None and not isinstance(timestamp, str):
         raise ValueError("invalid_projection")
     deleting = timestamp is not None
-    result.update(phase=phase, deleting=deleting, finalizers=sorted(set(finalizers)),
-                  conditions=conditions)
+    result.update(
+        phase=phase, deleting=deleting, finalizers=sorted(set(finalizers)), conditions=conditions
+    )
 
 
 def _resources(value: Any, kind: str) -> dict[str, Any] | None:
@@ -104,8 +110,11 @@ def _resources(value: Any, kind: str) -> dict[str, Any] | None:
     if not items:
         return None
     return dict(
-        kind=kind, count=len(items), deleting=deleting,
-        finalizers=dict(sorted(finalizers.items())), owner_kinds=dict(sorted(owners.items())),
+        kind=kind,
+        count=len(items),
+        deleting=deleting,
+        finalizers=dict(sorted(finalizers.items())),
+        owner_kinds=dict(sorted(owners.items())),
     )
 
 
@@ -139,7 +148,11 @@ class _Collector:
         self.context = context
         self.deadline = time.monotonic() + budget_s
         self.report: dict[str, Any] = dict(
-            schema_version=1, complete=True, namespaces=[], api_services=[], errors=[],
+            schema_version=1,
+            complete=True,
+            namespaces=[],
+            api_services=[],
+            errors=[],
         )
 
     def error(self, errors: list[Any], operation: str, reason: str) -> None:
@@ -149,8 +162,9 @@ class _Collector:
         if error not in errors:
             errors.append(error)
 
-    def query(self, arguments: list[str], errors: list[Any], operation: str,
-              *, raw: bool = False) -> Any:
+    def query(
+        self, arguments: list[str], errors: list[Any], operation: str, *, raw: bool = False
+    ) -> Any:
         """@spec NAMESPACE-CLEANUP-EVIDENCE-1 to NAMESPACE-CLEANUP-EVIDENCE-3."""
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
@@ -187,7 +201,9 @@ class _Collector:
         errors = self.report["errors"]
         output = self.query(
             ["api-resources", "--namespaced=true", "--verbs=list", "-o", "name"],
-            errors, "discovery", raw=True,
+            errors,
+            "discovery",
+            raw=True,
         )
         if output is None:
             return []
@@ -205,8 +221,13 @@ class _Collector:
     def namespace(self, name: str, kinds: list[str]) -> None:
         """@spec NAMESPACE-CLEANUP-EVIDENCE-1 to NAMESPACE-CLEANUP-EVIDENCE-3."""
         result: dict[str, Any] = dict(
-            namespace=name, phase="Unknown", deleting=None, finalizers=[],
-            conditions=[], resources=[], errors=[],
+            namespace=name,
+            phase="Unknown",
+            deleting=None,
+            finalizers=[],
+            conditions=[],
+            resources=[],
+            errors=[],
         )
         self.report["namespaces"].append(result)
         errors = result["errors"]
@@ -221,7 +242,9 @@ class _Collector:
                 self.error(errors, "resources", "budget_exhausted")
                 break
             value = self.query(
-                ["get", kind, "-n", name, "-o", "go-template=" + _PROJECTION], errors, "resources",
+                ["get", kind, "-n", name, "-o", "go-template=" + _PROJECTION],
+                errors,
+                "resources",
             )
             if value is not None:
                 try:
@@ -233,12 +256,17 @@ class _Collector:
 
 
 def collect_cleanup_evidence(
-    context: str, namespaces: list[str], *, budget_s: float = 40,
+    context: str,
+    namespaces: list[str],
+    *,
+    budget_s: float = 40,
 ) -> dict[str, Any]:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-1 to NAMESPACE-CLEANUP-EVIDENCE-3."""
     if (
-        not isinstance(context, str) or not context.strip()
-        or not isinstance(namespaces, (list, tuple)) or not 1 <= len(namespaces) <= 4
+        not isinstance(context, str)
+        or not context.strip()
+        or not isinstance(namespaces, (list, tuple))
+        or not 1 <= len(namespaces) <= 4
         or any(not isinstance(name, str) or not _NAMESPACE.fullmatch(name) for name in namespaces)
         or len(set(namespaces)) != len(namespaces)
         or type(budget_s) not in (int, float)
@@ -276,11 +304,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         arguments = parser.parse_args(argv)
         report = collect_cleanup_evidence(
-            arguments.context, arguments.namespace, budget_s=arguments.budget_seconds,
+            arguments.context,
+            arguments.namespace,
+            budget_s=arguments.budget_seconds,
         )
     except ValueError:
-        report = dict(schema_version=1, complete=False, namespaces=[], api_services=[],
-                      errors=[dict(operation="input", reason="invalid_cleanup_evidence_input")])
+        report = dict(
+            schema_version=1,
+            complete=False,
+            namespaces=[],
+            api_services=[],
+            errors=[dict(operation="input", reason="invalid_cleanup_evidence_input")],
+        )
     print(json.dumps(report, sort_keys=True))
     return 0 if report["complete"] else 1
 

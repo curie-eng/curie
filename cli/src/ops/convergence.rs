@@ -2,6 +2,7 @@
 //! Shared by up/apply and status; this does not perform transactional recovery.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -9,8 +10,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use tokio::io::AsyncReadExt;
+use tokio::time::Instant;
 
-use super::{plain, run_capture, CommonOpts, OpsCommand, UpInvocation};
+use super::command::command_io_error;
+use super::{plain, CommonOpts, OpsCommand, UpInvocation};
 
 /// Which convergence property an observed issue actually disproves.
 ///
@@ -172,10 +176,73 @@ fn hook_job_predates_revision(job: &Value, last_deployed: Option<OffsetDateTime>
     }
 }
 
-async fn capture(command: OpsCommand, description: &str) -> Result<String> {
-    let (ok, out, _) = tokio::time::timeout(Duration::from_secs(10), run_capture(&command))
-        .await
-        .with_context(|| format!("{description} timed out after 10 seconds"))?
+#[derive(Clone, Copy)]
+struct Deadlines {
+    observation: Instant,
+    convergence: Option<Instant>,
+}
+
+impl Deadlines {
+    fn outer(self) -> (Instant, &'static str) {
+        match self.convergence {
+            Some(deadline) if deadline <= self.observation => (
+                deadline,
+                "post-Helm convergence timed out after 300 seconds",
+            ),
+            _ => (
+                self.observation,
+                "convergence observation timed out after 30 seconds",
+            ),
+        }
+    }
+}
+
+async fn capture(command: OpsCommand, description: &str, deadlines: Deadlines) -> Result<String> {
+    let inner = Instant::now() + Duration::from_secs(10);
+    let (outer, message) = deadlines.outer();
+    let (deadline, message) = if outer <= inner {
+        (outer, message.to_owned())
+    } else {
+        (inner, format!("{description} timed out after 10 seconds"))
+    };
+    let (command, _secret_files) = command
+        .materialize_secret_files()
+        .with_context(|| format!("could not {description}"))?;
+    let mut child = command
+        .tokio_command()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| command_io_error(&command.program, error))
+        .with_context(|| format!("could not {description}"))?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let result = tokio::time::timeout_at(deadline, async {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let (status, _, _) = tokio::try_join!(
+            child.wait(),
+            stdout.read_to_end(&mut out),
+            stderr.read_to_end(&mut err),
+        )?;
+        Ok::<_, std::io::Error>((status.success(), String::from_utf8_lossy(&out).into_owned()))
+    })
+    .await;
+    if !matches!(&result, Ok(Ok(_))) {
+        let stopped = child.start_kill();
+        let reaped = child.wait().await;
+        stopped
+            .and(reaped.map(|_| ()))
+            .map_err(|error| command_io_error(&command.program, error))
+            .with_context(|| {
+                format!("could not stop and reap child while attempting to {description}")
+            })?;
+    }
+    let (ok, out) = result
+        .context(message)?
+        .map_err(|error| command_io_error(&command.program, error))
         .with_context(|| format!("could not {description}"))?;
     if !ok {
         bail!("could not {description}; inspect Helm/Kubernetes access and retry");
@@ -253,8 +320,13 @@ pub(super) fn dry_run_commands(opts: &CommonOpts) -> Vec<OpsCommand> {
     ]
 }
 
-async fn helm_status(opts: &CommonOpts) -> Result<Value> {
-    let raw = capture(helm_status_command(opts), "read Helm release state").await?;
+async fn helm_status(opts: &CommonOpts, deadlines: Deadlines) -> Result<Value> {
+    let raw = capture(
+        helm_status_command(opts),
+        "read Helm release state",
+        deadlines,
+    )
+    .await?;
     serde_json::from_str(&raw).context("Helm release state is malformed")
 }
 
@@ -774,8 +846,12 @@ const UNOBSERVED: [Facet; 8] = [
 /// waiter adopted from its first sample; a different latest revision is a
 /// replacement, refused before its manifest is read. A pending status on the
 /// target revision is retryable; every other non-deployed status is terminal.
-async fn observe_inner(opts: &CommonOpts, pinned: Option<u64>) -> Result<Observation> {
-    let status = helm_status(opts).await?;
+async fn observe_inner(
+    opts: &CommonOpts,
+    pinned: Option<u64>,
+    deadlines: Deadlines,
+) -> Result<Observation> {
+    let status = helm_status(opts, deadlines).await?;
     let (revision, state) = helm_identity(&status)?;
     let mut result = Observation {
         revision: Some(revision),
@@ -810,6 +886,7 @@ async fn observe_inner(opts: &CommonOpts, pinned: Option<u64>) -> Result<Observa
     let manifest = capture(
         manifest_command(opts, &revision.to_string()),
         "read target release manifest",
+        deadlines,
     )
     .await?;
     let mut expected = Vec::new();
@@ -862,6 +939,7 @@ async fn observe_inner(opts: &CommonOpts, pinned: Option<u64>) -> Result<Observa
         let raw = capture(
             workloads_command(namespace),
             "read target workloads and pods",
+            deadlines,
         )
         .await?;
         let value: Value =
@@ -901,7 +979,7 @@ async fn observe_inner(opts: &CommonOpts, pinned: Option<u64>) -> Result<Observa
     }
     let mut nodes = BTreeMap::new();
     for name in needed_nodes {
-        let raw = capture(node_images_command(&name), "read serving Node image inventory").await
+        let raw = capture(node_images_command(&name), "read serving Node image inventory", deadlines).await
             .map_err(|error| crate::exit::CliError::failure(format!(
                 "tagged image alias requires get-node read access for the serving Pod; inspect that access or select a digest-pinned target image: {error}"
             )).with_fix("allow read access to the serving Node or select a digest-pinned target image, then rerun the same cluster command"))?;
@@ -957,7 +1035,7 @@ async fn observe_inner(opts: &CommonOpts, pinned: Option<u64>) -> Result<Observa
             }
         }
     }
-    let final_status = helm_status(opts).await?;
+    let final_status = helm_status(opts, deadlines).await?;
     let (final_revision, final_state) = helm_identity(&final_status)?;
     if final_revision != revision {
         let expected = pinned.unwrap_or(revision);
@@ -985,15 +1063,28 @@ async fn observe_inner(opts: &CommonOpts, pinned: Option<u64>) -> Result<Observa
     Ok(result)
 }
 
-async fn observe_pinned(opts: &CommonOpts, expected: Option<u64>) -> Result<Observation> {
-    tokio::time::timeout(Duration::from_secs(30), observe_inner(opts, expected))
-        .await
-        .context("convergence observation timed out after 30 seconds")?
+async fn observe_pinned(
+    opts: &CommonOpts,
+    expected: Option<u64>,
+    convergence: Option<Instant>,
+) -> Result<Observation> {
+    let deadlines = Deadlines {
+        observation: Instant::now() + Duration::from_secs(30),
+        convergence,
+    };
+    let result = observe_inner(opts, expected, deadlines).await;
+    let (deadline, message) = deadlines.outer();
+    if Instant::now() >= deadline {
+        return tokio::time::timeout_at(deadline, std::future::pending())
+            .await
+            .context(message);
+    }
+    result
 }
 
 /// One unpinned sample of whatever revision Helm currently reports.
 pub(super) async fn observe(opts: &CommonOpts) -> Result<Observation> {
-    observe_pinned(opts, None).await
+    observe_pinned(opts, None, None).await
 }
 
 pub(super) async fn installation_failure(
@@ -1034,10 +1125,7 @@ pub(super) async fn wait(opts: &CommonOpts, invocation: UpInvocation) -> Result<
     };
     let mut expected = None;
     loop {
-        let observation = tokio::time::timeout_at(deadline, observe_pinned(opts, expected))
-            .await
-            .context("post-Helm convergence timed out after 300 seconds")
-            .and_then(|result| result);
+        let observation = observe_pinned(opts, expected, Some(deadline)).await;
         let result = match observation {
             Ok(result) => result,
             Err(error) if last_issues.is_empty() => return Err(error),
@@ -1087,10 +1175,7 @@ pub(super) async fn wait_for_observation(opts: &CommonOpts) -> Observation {
     let mut carried = Observation::default();
     let mut expected = None;
     loop {
-        let observed = tokio::time::timeout_at(deadline, observe_pinned(opts, expected))
-            .await
-            .context("post-Helm convergence timed out after 300 seconds")
-            .and_then(|result| result);
+        let observed = observe_pinned(opts, expected, Some(deadline)).await;
         let result = match observed {
             Ok(result) => result,
             Err(error) => {

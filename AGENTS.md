@@ -974,6 +974,14 @@ the row supplies its exact command and an observed completed outcome. Live
 provider, external integration, and factory require `live` in the mode column;
 a blank cell or any other mode leaves the row unproved.
 
+When the required body tiers are only skill, the prepublication skill row
+records the sandbox command that runs the changed tests and its observed
+result. The skill, local, local-release and cluster jobs selected for a runner
+path remain required on the PR head. They are not additional sandbox commands
+before publication. A missing `curie`, `docker` or `kind` binary is a missing
+binary dependency, not an absent service, and does not authorize delegation of
+that skill row.
+
 Evidence text saying blocked, not run, or fake leaves a required row unproved
 at any tier. For a completed negative test, describe the observed outcome as
 denied, refused, or returned 401; reserve blocked, not run, and fake for
