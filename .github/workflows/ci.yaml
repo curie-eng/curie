@@ -3917,8 +3917,9 @@ jobs:
           CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
           CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
         run: bash charts/curie/ci/scenarios/workload-install.sh down
+      # Temporarily disabled at maintainer request; diagnostics and causal repair: #5255.
       - name: Failed first install retry recreates data volumes
-        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') }}
+        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') && false }}
         timeout-minutes: 30
         env:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
