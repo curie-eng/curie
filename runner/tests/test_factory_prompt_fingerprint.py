@@ -38,11 +38,6 @@ if capture:
     if case in ("interrupt_hook", "kill_hook"):
         os.kill(os.getppid(), signal.SIGTERM if case == "interrupt_hook" else signal.SIGKILL)
         sys.exit(1)
-    if case == "delayed" and attempt == 1:
-        time.sleep(2)
-        sys.exit(1)
-elif case == "delayed":
-    time.sleep(2)
 os.execv(os.environ["FACTORY_FINGERPRINT_REAL_GIT"], ["git", *args])
 """
 

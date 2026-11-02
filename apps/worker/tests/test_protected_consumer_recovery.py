@@ -81,7 +81,7 @@ class AdmittedExternalWorkload(actual.ExternalProofWorkload):
         "capacity-reply-ref",
     ],
 )
-def test_actual_consumer_capacity_copy_or_live_peer_fence(
+def test_actual_consumer_capacity_terminal_schedule_and_reply_ref(
     owned_worker,
     tmp_path,
     primary_postgres,
