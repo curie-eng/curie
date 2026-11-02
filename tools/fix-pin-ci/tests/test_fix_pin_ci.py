@@ -1329,17 +1329,30 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         lambda step: "docker compose -f compose.dev.yaml logs" in _string(step, "run"),
         "failure stack diagnostic",
     )
-    diagnostic_if = _string(steps[diagnostic_index], "if")
+    diagnostic_if = _pull_request_condition(steps[diagnostic_index])
     assert "failure()" in diagnostic_if
     assert "steps.python-runtime.outputs.pytest == 'true'" in diagnostic_if
     assert pytest_index < diagnostic_index
+
+
+def _pull_request_condition(step: dict[str, Any]) -> str:
+    condition = _string(step, "if")
+    if condition == "github.event_name != 'merge_group'":
+        return ""
+    prefix = "${{ github.event_name != 'merge_group' && ("
+    if condition.startswith(prefix):
+        assert condition.endswith(") }}")
+        return condition.removeprefix(prefix).removesuffix(") }}")
+    return condition
 
 
 def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
     """Everything the gate needs must be in the job that now runs it."""
     job, steps = _fix_pin_job()
     assert "needs" not in job, "the required fix pin check must not be skippable"
-    assert not _string(job, "if"), "the job must run for every configured pull request event"
+    assert not _pull_request_condition(job), (
+        "the job must run for every configured pull request event"
+    )
     trigger = _workflow_trigger(_load_workflow(FIX_PIN_WORKFLOW))["pull_request"]
     assert set(trigger["types"]) == {"opened", "synchronize", "reopened", "edited"}
 
@@ -1370,7 +1383,7 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
 
     probe = steps[probe_index]
     assert probe.get("id") == "fix-pin-curie"
-    assert not _string(probe, "if"), (
+    assert not _pull_request_condition(probe), (
         "the probe must run for every pull request, including bodies with no "
         "live selector; gating it on its own output would skip the decision"
     )
@@ -1425,7 +1438,7 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
     cache_action = "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
     assert cache.get("name") == "Cargo cache"
     assert cache.get("uses") == cache_action
-    assert _string(cache, "if") == CARGO_NEEDED_GUARD
+    assert _pull_request_condition(cache) == CARGO_NEEDED_GUARD
     assert cache.get("with") == {
         "workspaces": "cli",
         "shared-key": "curie-cli-release",
@@ -1477,7 +1490,7 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
     assert sync_index < probe_index
     assert helm_index < stack_index < migration_index < gate_index
     for index in (stack_index, migration_index):
-        assert STACK_NEEDED_GUARD in _string(steps[index], "if"), (
+        assert STACK_NEEDED_GUARD in _pull_request_condition(steps[index]), (
             "a body with no live selector never reaches the verifier, so it "
             "must not pay for a compose stack either"
         )
@@ -1487,7 +1500,7 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
         lambda step: "compose.dev.yaml logs" in _string(step, "run"),
         "failure stack diagnostic",
     )
-    diagnostic_if = _string(steps[diagnostic_index], "if")
+    diagnostic_if = _pull_request_condition(steps[diagnostic_index])
     assert "failure()" in diagnostic_if
     assert STACK_NEEDED_GUARD in diagnostic_if
     assert gate_index < diagnostic_index
@@ -1497,13 +1510,13 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
         lambda step: _string(step, "run").strip() == "python3 scripts/wait-for-langfuse.py",
         "dev stack readiness",
     )
-    assert STACK_NEEDED_GUARD in _string(steps[readiness_index], "if")
+    assert STACK_NEEDED_GUARD in _pull_request_condition(steps[readiness_index])
     assert stack_index < readiness_index < migration_index
     kind_index = _single_step_index(
         steps,
         lambda step: (
             _string(step, "uses").startswith("helm/kind-action@")
-            and _string(step, "if") == KIND_NEEDED_GUARD
+            and _pull_request_condition(step) == KIND_NEEDED_GUARD
         ),
         "kind tools installation for the isolated registration pin",
     )
@@ -1514,7 +1527,7 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
         lambda step: "/usr/local/lib/android" in _string(step, "run"),
         "disk reclaim for the four candidate images",
     )
-    assert _string(steps[disk_index], "if") == KIND_NEEDED_GUARD
+    assert _pull_request_condition(steps[disk_index]) == KIND_NEEDED_GUARD
     assert probe_index < disk_index < kind_index
 
 
@@ -1588,9 +1601,11 @@ def test_factory_upgrade_workflow_prepares_assets_before_verification() -> None:
     assert probe_index < prepare_index < download_index < gate_index
     for index in (prepare_index, download_index):
         step = steps[index]
-        assert _string(step, "if") == FACTORY_UPGRADE_NEEDED_GUARD
+        assert _pull_request_condition(step) == FACTORY_UPGRADE_NEEDED_GUARD
         assert step.get("continue-on-error", False) is False
-    assert not _string(steps[gate_index], "if"), "every declaration must reach the policy gate"
+    assert not _pull_request_condition(steps[gate_index]), (
+        "every declaration must reach the policy gate"
+    )
 
 
 def test_factory_upgrade_setup_exports_source_local_paths(tmp_path: Path) -> None:
@@ -1741,10 +1756,9 @@ def test_selector_tooling_builds_only_when_the_parser_would_invoke_curie() -> No
         ),
     ):
         step = steps[_single_step_index(steps, predicate, description)]
-        condition = _string(step, "if")
-        # The workflow runs only for pull requests, so these steps need only
-        # the parser's answer.
-        assert not _string(job, "if"), f"{description} must run on edited pull requests"
+        condition = _pull_request_condition(step)
+        # On PR events, these steps still depend only on the parser's answer.
+        assert not _pull_request_condition(job), f"{description} must run on edited pull requests"
         assert CARGO_NEEDED_GUARD in condition, (
             f"{description} must build only when the parser says the binary "
             f"is needed: {condition!r}"
@@ -1758,11 +1772,11 @@ def test_selector_tooling_builds_only_when_the_parser_would_invoke_curie() -> No
     # would turn the "closes a bug with no declaration" rejection into a
     # skipped step.
     gate = steps[_single_step_index(steps, _is_fix_pin_gate, "fix pin caller")]
-    assert CARGO_NEEDED_GUARD not in _string(gate, "if"), (
+    assert CARGO_NEEDED_GUARD not in _pull_request_condition(gate), (
         "the gate must still run for a body with no declaration, or the "
         "bug-without-declaration rejection can never fire"
     )
-    assert SUBSTRING_GUARD not in _string(gate, "if")
+    assert SUBSTRING_GUARD not in _pull_request_condition(gate)
 
 
 def test_default_template_body_does_not_need_curie(tmp_path: Path) -> None:

@@ -6,6 +6,8 @@ name: P0 Closes spec-vs-impl reminder
 # raise GitHub required reviews. Keep it out of ci.yaml so it cannot join the
 # required Python check.
 on:
+  merge_group:
+    types: [checks_requested]
   pull_request:
     branches: [main, next]
     # A closing keyword can appear or disappear in a body-only edit. Re-run so
@@ -13,8 +15,8 @@ on:
     types: [opened, synchronize, reopened, edited]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -31,10 +33,15 @@ jobs:
       issues: read
       pull-requests: write
     steps:
+      - name: Acknowledge the PR metadata judgment
+        if: github.event_name == 'merge_group'
+        run: echo 'PR-event run already judged this metadata; merge groups reuse that judgment.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@v7
+        if: github.event_name != 'merge_group'
         with:
           persist-credentials: false
       - name: Decide whether this Closes a trigger-labeled issue
+        if: github.event_name != 'merge_group'
         env:
           COMMENT_FILE: ${{ runner.temp }}/curie-p0-closes-comment.md
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -43,6 +50,7 @@ jobs:
           --event "$GITHUB_EVENT_PATH"
           --comment-file "$COMMENT_FILE"
       - name: Upsert or remove the spec-vs-impl reminder comment
+        if: github.event_name != 'merge_group'
         uses: actions/github-script@v9
         env:
           COMMENT_FILE: ${{ runner.temp }}/curie-p0-closes-comment.md
