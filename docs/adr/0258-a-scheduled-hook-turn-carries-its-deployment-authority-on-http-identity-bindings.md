@@ -2,10 +2,16 @@
 
 Date: 2026-11-02
 
-Status: Draft
+Status: Accepted
 
-Tracked in [#5304](https://github.com/curie-eng/curie/issues/5304). This Draft
-does not authorize implementation.
+Accepted 2026-11-02 with explicit maintainer approval from jw3329, including
+merging alongside its realizing code path under ADR 0102, recorded in the
+publishing pull request ([#5309](https://github.com/curie-eng/curie/pull/5309)).
+The realizing code path is `curie_worker.kernel.identity.prepare` and
+`curie_worker.kernel.identity.check`, with
+`curie_worker.hook_runs.HookRunRecorder.scheduled_authority`.
+
+Tracked in [#5304](https://github.com/curie-eng/curie/issues/5304).
 
 ## Context
 
@@ -102,7 +108,7 @@ contradict ADR 0220 section 9.
 ## Realizing work and acceptance evidence
 
 [#5304](https://github.com/curie-eng/curie/issues/5304) tracks the
-implementation, which begins only after acceptance. The realizing code paths
+implementation, which lands with this decision. The realizing code paths
 are:
 
 1. `curie_worker.kernel.identity.prepare` and `curie_worker.kernel.identity.check`:
