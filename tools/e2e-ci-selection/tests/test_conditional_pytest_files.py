@@ -263,12 +263,14 @@ def test_pytest_step_appends_deselect_only_when_selected(
     if deselect:
         expected += ["--deselect", "examples/tests/test_sre_bot_observability_runtime.py"]
     arguments = _run_pytest_step(tmp_path, shard=shard, deselect=deselect)
+    arguments = PYTEST_TESTS._without_shard_report_arguments(arguments)
     assert PYTEST_TESTS._without_owned_runtime_exclusions(arguments) == expected
 
 
 def test_pytest_step_preserves_each_deselect_argument(tmp_path: Path) -> None:
     paths = ["examples/tests/test_additional file.py", SRE_RUNTIME]
     argv = _run_pytest_step(tmp_path, shard=2, deselect=",".join(paths))
+    argv = PYTEST_TESTS._without_shard_report_arguments(argv)
     argv = PYTEST_TESTS._without_owned_runtime_exclusions(argv)
     assert argv[-4:] == ["--deselect", paths[0], "--deselect", paths[1]]
 

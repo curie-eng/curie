@@ -577,7 +577,12 @@ def test_other_diffs_select_full_scope(
 ) -> None:
     output = _selection(tmp_path, *paths, push=push, omit_kind=omit_kind)
     assert output["pytest"] == pytest_needed
-    assert output["pytest_scope"] == "full"
+    if push or pytest_needed == "false":
+        assert output["pytest_scope"] == "full"
+    else:
+        # A selected pull request outside the CLI scope runs the full suite or,
+        # when the impact graph narrows it, the impact targets; never the CLI list.
+        assert output["pytest_scope"] in {"full", "impact"}
 
 
 def test_version_only_diff_selects_full_scope(tmp_path: Path) -> None:
@@ -613,7 +618,7 @@ def test_revision_scope_uses_all_changed_paths_and_nonempty_diff(
     head = _git(root, "rev-parse", "HEAD")
     mixed = _selection(tmp_path, base=base, head=head, cwd=root, omit_kind=omit_kind)
     assert mixed["pytest"] == "true"
-    assert mixed["pytest_scope"] == "full"
+    assert mixed["pytest_scope"] in {"full", "impact"}
 
 
 def _selector_repository(tmp_path: Path) -> Path:
@@ -841,7 +846,7 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
             )
         )
     arguments = PYTEST_TESTS._run_pytest_step(tmp_path, shard=shard, deselect=deselect, scope=scope)
-    assert arguments == expected
+    assert PYTEST_TESTS._without_shard_report_arguments(arguments) == expected
 
 
 @pytest.mark.parametrize("scope", ["cli", "full"])
@@ -865,7 +870,7 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
     files.append("tools/factory-e2e/tests/test_c4_cluster_up.py")
     _write(tmp_path, LIST_PATH, "\n".join(sorted(set(files))) + "\n")
     deselect = SELECTION_TESTS.SRE_RUNTIME
-    state = {"shard": "2", "pytest_deselect": deselect, "pytest_scope": scope}
+    state = PYTEST_TESTS._pytest_step_state(shard=2, deselect=deselect, scope=scope)
     result = PYTEST_TESTS._run_bash(
         PYTEST_TESTS._string(step, "run"),
         {
@@ -918,30 +923,45 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
                 path.startswith(directory + "/") for directory in PYTEST_TESTS.CI_POLICY_DIRS
             )
         )
-    assert recorded["argv"] == expected
+    assert PYTEST_TESTS._without_shard_report_arguments(recorded["argv"]) == expected
 
 
-@pytest.mark.parametrize("scope", ["cli", "full"])
-def test_pytest_aggregator_accepts_matching_scope(tmp_path: Path, scope: str) -> None:
+@pytest.mark.parametrize(("scope", "plan"), [
+    ("cli", PYTEST_TESTS.FULL_PLAN),
+    ("full", PYTEST_TESTS.FULL_PLAN),
+    ("cli", (3, 2, 1)),
+    ("impact", (2, 1, 1)),
+])
+def test_pytest_aggregator_accepts_matching_scope(
+    tmp_path: Path, scope: str, plan: tuple[int, int, int]
+) -> None:
     deselect = SELECTION_TESTS.SRE_RUNTIME
+    targets = PYTEST_TESTS.IMPACT_DIGEST if scope == "impact" else ""
     result = PYTEST_TESTS._run_pytest_aggregate(
         tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
         container_result="success",
         selected="true",
         scope=scope,
         deselect=deselect,
-        shards=PYTEST_TESTS._all_shards("true", "success", deselect, scope),
+        plan=plan,
+        targets=targets,
+        shards=PYTEST_TESTS._all_shards(
+            "true", "success", deselect, scope, plan=plan, targets=targets
+        ),
     )
     assert result.returncode == 0, result.stdout + result.stderr
     download = PYTEST_TESTS._named_steps()["Download shard results"]["with"]["path"]
     for shard in range(1, PYTEST_TESTS.SHARD_COUNT + 1):
+        tier = PYTEST_TESTS._expected_tier(shard, plan)
+        outcome = "skipped" if tier == "none" else "success"
         assert (tmp_path / download / f"shard-{shard}.txt").read_text() == (
-            f"shard={shard} selected=true pytest=success stack=success "
-            f"deselect={deselect} scope={scope}\n"
+            f"shard={shard} selected=true pytest={outcome} stack={outcome} "
+            f"deselect={deselect} scope={scope} shards={plan[0]} tier={tier} "
+            f"targets={targets}\n"
         )
 
 
-@pytest.mark.parametrize("scope", ["cli", "full"])
+@pytest.mark.parametrize("scope", ["cli", "full", "impact"])
 @pytest.mark.parametrize("selected", ["true", "false"])
 @pytest.mark.parametrize("results_dir", [False, True])
 def test_pytest_aggregator_rejects_independent_scope_disagreement(
@@ -955,7 +975,7 @@ def test_pytest_aggregator_rejects_independent_scope_disagreement(
         scope=scope,
         shards=(
             PYTEST_TESTS._all_shards("true", "success", scope=other) if selected == "true"
-            else {1: ("false", "skipped", "skipped", "", other)}
+            else {1: ("false", "skipped", "skipped", "", other, "6", "none", "")}
         ),
         shards_result="success" if selected == "true" else "skipped",
         results_dir=results_dir,
@@ -966,13 +986,15 @@ def test_pytest_aggregator_rejects_independent_scope_disagreement(
         assert "scope" in result.stderr
 
 
-@pytest.mark.parametrize("scope", ["cli", "full"])
+@pytest.mark.parametrize("scope", ["cli", "full", "impact"])
 @pytest.mark.parametrize("shard", range(1, PYTEST_TESTS.SHARD_COUNT + 1))
 def test_pytest_aggregator_rejects_shard_scope_disagreement(
     tmp_path: Path, scope: str, shard: int
 ) -> None:
     shards = PYTEST_TESTS._all_shards("true", "success", scope=scope)
-    shards[shard] = ("true", "success", "success", "", "full" if scope == "cli" else "cli")
+    shards[shard] = (
+        "true", "success", "success", "", "full" if scope == "cli" else "cli", "6", "full", "",
+    )
     result = PYTEST_TESTS._run_pytest_aggregate(
         tmp_path,
         ci_policy_selected="false",

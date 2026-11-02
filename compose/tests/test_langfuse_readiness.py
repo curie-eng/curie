@@ -52,6 +52,12 @@ if fail_argv and current == json.loads(fail_argv):
     sys.stderr.write(os.environ.get("FAKE_DOCKER_FAIL_STDERR", ""))
     raise SystemExit(int(os.environ.get("FAKE_DOCKER_FAIL_CODE", "1")))
 backing = ["postgres", "valkey", "clickhouse", "rustfs"]
+tier = os.environ.get("FAKE_DOCKER_TIER", "full")
+# A reduced tier may start only its own services, in any up form.
+allowed = {
+    "core": {"postgres", "valkey"},
+    "storage": {"postgres", "valkey", "rustfs", "rustfs-init"},
+}.get(tier)
 if current == ["config", "--services"]:
     for name in [
         "postgres", "valkey", "clickhouse", "rustfs", "rustfs-init", "rustfs-perms",
@@ -63,7 +69,32 @@ if current == ["config", "--services"]:
 elif current == ["wait", "rustfs-init"]:
     # Compose 2.24.4 includes wait; it propagates the container exit status:
     # https://github.com/docker/compose/blob/v2.24.4/cmd/compose/wait.go
+    if tier == "core":
+        raise SystemExit(97)
+    if not any(call[:1] == ["up"] and "rustfs-init" in call for call in prior):
+        # Nothing depends on rustfs-init, so it exists only once started by name.
+        raise SystemExit(98)
     raise SystemExit(23 if scenario == "bucket-failure" else 0)
+elif current and current[0] == "up" and allowed is not None:
+    services = []
+    index = 1
+    while index < len(current):
+        token = current[index]
+        if token == "--wait-timeout":
+            value = current[index + 1] if index + 1 < len(current) else ""
+            if not value.isdigit() or int(value) <= 0:
+                raise SystemExit(97)
+            index += 2
+            continue
+        if token in {"-d", "--wait", "--no-deps"}:
+            index += 1
+            continue
+        if token.startswith("-"):
+            raise SystemExit(97)
+        services.append(token)
+        index += 1
+    if not services or not set(services) <= allowed:
+        raise SystemExit(97)
 elif current and current[0] == "up":
     if current == ["up", "-d", *backing, "rustfs-init"]:
         pass
@@ -158,7 +189,7 @@ def web(request: pytest.FixtureRequest) -> Iterator[tuple[str, list[tuple[str, s
 def _run(
     tmp_path: Path, web_url: str, *, scenario: str, worker_ready_after: int = 1,
     start: bool = True, timeout: float = 10, fail_argv: list[str] | None = None,
-    fail_stderr: str = "", fail_code: int = 1,
+    fail_stderr: str = "", fail_code: int = 1, tier: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[list[str]], list[str]]:
     fake_docker = tmp_path / "docker"
     fake_docker.write_text(FAKE_DOCKER)
@@ -173,6 +204,7 @@ def _run(
         "LANGFUSE_PUBLIC_KEY": "example-public", "LANGFUSE_SECRET_KEY": "example-secret",
         "FAKE_DOCKER_STATE": str(state), "FAKE_DOCKER_SCENARIO": scenario,
         "FAKE_WORKER_READY_AFTER": str(worker_ready_after),
+        "FAKE_DOCKER_TIER": tier or "full",
     }
     if fail_argv is not None:
         environment["FAKE_DOCKER_FAIL_ARGV"] = json.dumps(fail_argv)
@@ -182,6 +214,8 @@ def _run(
                "--timeout-seconds", str(timeout), "--poll-interval-seconds", "0.01"]
     if start:
         command.append("--start")
+    if tier is not None:
+        command.extend(("--tier", tier))
     result = subprocess.run(command, env=environment, text=True, capture_output=True,
                             check=False, timeout=30)
     calls: list[list[str]] = []
@@ -334,6 +368,100 @@ def test_readiness_failed_bucket_initialization_stops_web_and_worker_startup(
         "Langfuse readiness Compose command failed "
         "(phase=bucket initialization, exit code=23, cause=unclassified)"
     )
+
+
+_FULL_ONLY_SERVICES = {"clickhouse", "langfuse-web", "langfuse-worker", "otel-collector"}
+
+
+def _compose_commands(calls: list[list[str]]) -> list[list[str]]:
+    """Strip the project and file prefix and the deadline-derived wait timeout."""
+    commands: list[list[str]] = []
+    for call in calls:
+        assert call[0] == "compose"
+        index = 1
+        while index < len(call) and call[index] in {"-p", "-f"}:
+            index += 2
+        command = call[index:]
+        commands.append([
+            "<timeout>" if position and command[position - 1] == "--wait-timeout" else token
+            for position, token in enumerate(command)
+        ])
+    return commands
+
+
+def _started_services(commands: list[list[str]]) -> set[str]:
+    return {
+        token for command in commands if command[0] == "up"
+        for token in command[1:] if not token.startswith("-") and token != "<timeout>"
+    }
+
+
+def test_readiness_core_tier_starts_only_postgres_and_valkey(
+    tmp_path: Path, web: tuple[str, list[tuple[str, str | None]]],
+) -> None:
+    result, calls, _ = _run(tmp_path, web[0], scenario="healthy", tier="core")
+
+    assert result.returncode == 0, result.stderr
+    commands = _compose_commands(calls)
+    assert _started_services(commands) == {"postgres", "valkey"}
+    assert any(
+        command[0] == "up" and "--wait" in command and {"postgres", "valkey"} <= set(command)
+        for command in commands
+    ), commands
+    assert not any(command[0] in {"wait", "ps", "logs", "exec"} for command in commands)
+    assert not any(
+        (_FULL_ONLY_SERVICES | {"rustfs", "rustfs-init"}) & set(command) for command in commands
+    ), commands
+    assert web[1] == []
+
+
+def test_readiness_storage_tier_waits_for_bucket_without_langfuse(
+    tmp_path: Path, web: tuple[str, list[tuple[str, str | None]]],
+) -> None:
+    result, calls, _ = _run(tmp_path, web[0], scenario="healthy", tier="storage")
+
+    assert result.returncode == 0, result.stderr
+    commands = _compose_commands(calls)
+    assert _started_services(commands) == {"postgres", "valkey", "rustfs", "rustfs-init"}
+    assert commands.count(["wait", "rustfs-init"]) == 1
+    bucket_wait = commands.index(["wait", "rustfs-init"])
+    assert any(
+        command[0] == "up" and "--wait" in command
+        and {"postgres", "valkey", "rustfs"} <= set(command)
+        for command in commands[:bucket_wait]
+    ), commands
+    assert not any(command[0] in {"ps", "logs", "exec"} for command in commands)
+    assert not any(_FULL_ONLY_SERVICES & set(command) for command in commands), commands
+    assert web[1] == []
+
+
+def test_readiness_storage_tier_failed_bucket_initialization_fails(
+    tmp_path: Path, web: tuple[str, list[tuple[str, str | None]]],
+) -> None:
+    result, calls, _ = _run(tmp_path, web[0], scenario="bucket-failure", tier="storage")
+
+    assert result.returncode == 1
+    assert result.stderr.strip() == (
+        "Langfuse readiness Compose command failed "
+        "(phase=bucket initialization, exit code=23, cause=unclassified)"
+    )
+    assert not any(_FULL_ONLY_SERVICES & set(command) for command in _compose_commands(calls))
+
+
+def test_readiness_default_tier_is_the_full_sequence(
+    tmp_path: Path, web: tuple[str, list[tuple[str, str | None]]],
+) -> None:
+    (tmp_path / "default").mkdir()
+    (tmp_path / "full").mkdir()
+    default, default_calls, _ = _run(tmp_path / "default", web[0], scenario="healthy")
+    full, full_calls, _ = _run(tmp_path / "full", web[0], scenario="healthy", tier="full")
+
+    assert default.returncode == 0, default.stderr
+    assert full.returncode == 0, full.stderr
+    default_commands = _compose_commands(default_calls)
+    assert default_commands == _compose_commands(full_calls)
+    assert _FULL_ONLY_SERVICES <= _started_services(default_commands)
+    assert ["wait", "rustfs-init"] in default_commands
 
 
 _STARTUP_UP = ["up", "-d", "postgres", "valkey", "clickhouse", "rustfs", "rustfs-init"]
