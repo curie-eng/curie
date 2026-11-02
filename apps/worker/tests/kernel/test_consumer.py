@@ -1255,6 +1255,7 @@ def test_inventory_timeout_capacity_wait_preserves_delivery_bound(
             record = await consumer._waits.get(event.event_id)
             assert record is not None
             assert record.deadline_ms == original_deadline
+            assert record.deferrals == (2 if restore else 3)
             assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
                 "pending"
             ] == 0
