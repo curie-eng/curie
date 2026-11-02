@@ -13645,6 +13645,18 @@
             "title": "Enterprise Ids",
             "type": "array"
           },
+          "event_source_team": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Source Team"
+          },
           "event_team": {
             "anyOf": [
               {
