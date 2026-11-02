@@ -142,31 +142,38 @@ def test_loads_and_builds_only_the_selected_admitted_identity(tmp_path: Path) ->
         built.append(identity.name)
         return qualified_client()
 
-    receivers = module.build_selected_receivers(
+    selection = module.build_selected_receivers(
         config(), admitted("default", NAME), registrations, web_client_factory=factory,
+        logger=logging.getLogger("synthetic-initializer"),
     )
-    assert built == [NAME]
+    receivers = selection.receivers
+    assert built == [NAME] and selection.excluded == frozenset()
     assert type(receivers) is tuple and len(receivers) == 1
     assert type(receivers[0]) is HttpReceiverRuntime and receivers[0].identity_name == NAME
 
 
-def test_unadmitted_or_unqualified_selection_refuses_startup(tmp_path: Path) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-19/20: a selection never falls back to legacy."""
+def test_unadmitted_or_unqualified_selection_is_excluded_not_fatal(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-25: a failed receiver is excluded, never legacy."""
     module = api()
     write(tmp_path, {"schema_version": 1, "receivers": [entry()]})
     registrations = module.load_http_receiver_registrations(str(tmp_path))
-    assert refused(module, lambda: module.build_selected_receivers(
-        config(), admitted("default"), registrations,
-        web_client_factory=lambda *_: qualified_client(),
-    )) == "invalid_runtime"
-    assert refused(module, lambda: module.build_selected_receivers(
-        config(), admitted(NAME), registrations,
-        web_client_factory=lambda *_: qualified_client(team_id="T0EXAMPLE2"),
-    )) == "invalid_runtime"
-    assert refused(module, lambda: module.build_selected_receivers(
-        config(), admitted(NAME), registrations,
-        web_client_factory=lambda *_: qualified_client(enterprise_id="E0EXAMPLE1"),
-    )) == "invalid_runtime"
+    log = logging.getLogger("synthetic-initializer")
+    cases = [
+        (admitted("default"), {}, "registration"),
+        (admitted(NAME), {"team_id": "T0EXAMPLE2"}, "auth_test"),
+        (admitted(NAME), {"enterprise_id": "E0EXAMPLE1"}, "auth_test"),
+    ]
+    for identities, changes, stage in cases:
+        caplog.clear()
+        with caplog.at_level(logging.ERROR):
+            selection = module.build_selected_receivers(
+                config(), identities, registrations, logger=log,
+                web_client_factory=lambda *_, changes=changes: qualified_client(**changes),
+            )
+        assert selection.receivers == () and selection.excluded == frozenset({NAME})
+        assert f"identity={NAME} stage={stage}" in caplog.text
 
 
 def mutate(path: str, value: Any) -> dict[str, Any]:
@@ -295,14 +302,27 @@ def test_main_without_selection_keeps_the_legacy_supervisor_call(
     assert set(seen["kwargs"]) == {"logger", "identities", "declared_count"}
 
 
-def test_main_refuses_to_start_on_a_failed_selection(
+def test_main_excludes_a_failed_receiver_instead_of_stopping(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-19/20: no socket starts after a selected failure."""
+    """@spec HTTP-INVOCATION-EXECUTION-25: the supervisor gets the exclusion, not a stop."""
     api()
     write(tmp_path, {"schema_version": 1, "receivers": [entry()]})
     with caplog.at_level(logging.ERROR):
         seen = _run_main(monkeypatch, tmp_path, auth={"user_id": "U0EXAMPLEOTHER"})
-    assert seen == {"exit": 1}
-    assert "http receiver initialization refused: invalid_runtime" in caplog.text
+    assert seen.get("ran") is True and seen["kwargs"]["http_receivers"] == ()
+    assert seen["kwargs"]["excluded_identities"] == frozenset({NAME})
+    assert f"identity={NAME} stage=auth_test" in caplog.text
     assert CREDENTIAL not in caplog.text and key(MATERIAL) not in caplog.text
+
+
+def test_main_refuses_to_start_on_a_defective_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-25: no entry of an untrusted file is started."""
+    api()
+    write(tmp_path, {"schema_version": 1, "receivers": [entry(), entry()]})
+    with caplog.at_level(logging.ERROR):
+        seen = _run_main(monkeypatch, tmp_path)
+    assert seen == {"exit": 1}
+    assert "http receiver initialization refused: invalid_document" in caplog.text
