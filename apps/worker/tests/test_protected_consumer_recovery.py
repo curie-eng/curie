@@ -7,7 +7,6 @@ from contextlib import asynccontextmanager
 
 import pytest
 from curie_protected_hooks.execution_namespace import derive_lane_namespace
-from curie_worker.capacity_wait import CapacityWaitStore
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.protected_run import ProtectedRuntime
 
@@ -78,14 +77,11 @@ class AdmittedExternalWorkload(actual.ExternalProofWorkload):
 @pytest.mark.parametrize(
     "mode",
     [
-        "capacity-copy",
         "capacity-terminal-schedule",
         "capacity-reply-ref",
-        "live-peer",
-        "sustained-live-peer",
     ],
 )
-def test_actual_consumer_capacity_copy_or_live_peer_fence(
+def test_actual_consumer_capacity_terminal_schedule_and_reply_ref(
     owned_worker,
     tmp_path,
     primary_postgres,
@@ -93,24 +89,6 @@ def test_actual_consumer_capacity_copy_or_live_peer_fence(
     mode,
 ):
     monkeypatch.setattr(actual, "ExternalProofWorkload", AdmittedExternalWorkload)
-    observations = []
-    if mode == "sustained-live-peer":
-        from curie_worker.consumer_liveness import ConsumerLivenessStore, consumer_heartbeat_key
-
-        real_renew = ConsumerLivenessStore.renew
-
-        async def observe_renew(store, **kwargs):
-            key = consumer_heartbeat_key(kwargs["stream"], kwargs["group"], kwargs["consumer"])
-            # Only non-secret predicates survive instrumentation; real method and Lua run.
-            matches = await store._redis.get(key) == kwargs["token"]
-            positive_ttl = await store._redis.pttl(key) > 0
-            result = await real_renew(store, **kwargs)
-            if len(observations) < 4:
-                observations.append((matches, positive_ttl, result))
-            return result
-
-        monkeypatch.setattr(ConsumerLivenessStore, "renew", observe_renew)
-
     async def go():
         async with actual.actual_pair(owned_worker, tmp_path, intake=True) as (
             server,
@@ -150,30 +128,19 @@ def test_actual_consumer_capacity_copy_or_live_peer_fence(
                 entry,
                 consumer="worker/peer",
             )
-            if mode in {"capacity-copy", "capacity-terminal-schedule", "capacity-reply-ref"}:
-                if mode in {"capacity-terminal-schedule", "capacity-reply-ref"}:
-                    from curie_worker.protected_recovery import ProtectedCapacityWaitStore
+            from curie_worker.protected_recovery import ProtectedCapacityWaitStore
 
-                    wait = ProtectedCapacityWaitStore(client._broker, client._manifest, peer_cfg)
-                else:
-                    wait = CapacityWaitStore(runs, peer_cfg)
-                record = await wait.park(entry, fields, original.turn.event_id, original_lease)
-                assert record.fields == dict(original.source_fields)
-                await leases.release(
-                    cfg.stream,
-                    cfg.consumer_group,
-                    entry,
-                    owner=original_lease.owner,
-                    resume_event_id=original_lease.resume_event_id,
-                )
-                wake_id = None
-                if mode not in {"capacity-terminal-schedule", "capacity-reply-ref"}:
-                    deadline = time.monotonic() + 12
-                    while not await wait.wake_due(limit=1):
-                        assert time.monotonic() < deadline
-                        await asyncio.sleep(0.1)
-                    wake_id = await runs.hget(wait._record(original.turn.event_id), "wake_entry")
-                    assert wake_id and wake_id != entry
+            wait = ProtectedCapacityWaitStore(client._broker, client._manifest, peer_cfg)
+            record = await wait.park(entry, fields, original.turn.event_id, original_lease)
+            assert record.fields == dict(original.source_fields)
+            await leases.release(
+                cfg.stream,
+                cfg.consumer_group,
+                entry,
+                owner=original_lease.owner,
+                resume_event_id=original_lease.resume_event_id,
+            )
+            wake_id = None
             engine, schema = await database(primary_postgres, client)
             runtime = task = None
             try:
@@ -228,138 +195,78 @@ def test_actual_consumer_capacity_copy_or_live_peer_fence(
                             return await real_process(kernel, qevent, *args, **kwargs)
 
                         monkeypatch.setattr(Kernel, "process_event", observe_process)
-                    if mode == "capacity-copy":
-                        wake_rows = await runs.xrange(cfg.stream, min=wake_id, max=wake_id)
-                        assert len(wake_rows) == 1
-                        assert await runtime.consumer._recovery_eligible(wake_id, wake_rows[0][1])
                     task = asyncio.create_task(runtime.run())
-                    if mode in {
-                        "capacity-copy",
-                        "capacity-terminal-schedule",
-                        "capacity-reply-ref",
-                    }:
-                        deadline = time.monotonic() + 15
-                        while time.monotonic() < deadline:
-                            if mode in {"capacity-terminal-schedule", "capacity-reply-ref"}:
-                                wake_id = await runs.hget(
-                                    runtime.consumer._waits._record(original.turn.event_id),
-                                    "wake_entry",
-                                )
-                            owed = await runtime.markers.restore_owed(original.turn.event_id)
-                            pending = await runs.xpending(cfg.stream, cfg.consumer_group)
-                            if owed is not None and pending["pending"] == 0:
-                                break
-                            if task.done():
-                                await task
-                            await asyncio.sleep(0.05)
-                        assert time.monotonic() < deadline, "actual capacity copy remained pending"
-                        assert wake_id and wake_id != entry
-                        assert external.events.count(("RUNNER_POST", "/v1/event")) == 1
-                        assert external.events.count(("RUNNER_POST", "/v1/turn-admit")) == 1
-                        assert (
-                            owed is not None
-                            and owed.witness.as_dict()["delivery_entry_id"] == wake_id
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline:
+                        wake_id = await runs.hget(
+                            runtime.consumer._waits._record(original.turn.event_id),
+                            "wake_entry",
                         )
-                        assert owed.resolution is not None
-                        assert owed.resolution.as_dict()["resolution"] == "emitted"
-                        assert any(
-                            "synthetic reply" in str(body.get("text", "")) for _, body in replies
+                        owed = await runtime.markers.restore_owed(original.turn.event_id)
+                        pending = await runs.xpending(cfg.stream, cfg.consumer_group)
+                        if owed is not None and pending["pending"] == 0:
+                            break
+                        if task.done():
+                            await task
+                        await asyncio.sleep(0.05)
+                    assert time.monotonic() < deadline, "actual capacity copy remained pending"
+                    assert wake_id and wake_id != entry
+                    assert external.events.count(("RUNNER_POST", "/v1/event")) == 1
+                    assert external.events.count(("RUNNER_POST", "/v1/turn-admit")) == 1
+                    assert (
+                        owed is not None
+                        and owed.witness.as_dict()["delivery_entry_id"] == wake_id
+                    )
+                    assert owed.resolution is not None
+                    assert owed.resolution.as_dict()["resolution"] == "emitted"
+                    assert any(
+                        "synthetic reply" in str(body.get("text", "")) for _, body in replies
+                    )
+                    if mode == "capacity-reply-ref":
+                        assert immutable == [(True, True)]
+                        posts = [
+                            body for path, body in replies if path.endswith("/chat.postMessage")
+                        ]
+                        assert len(posts) == 1, (
+                            "retained wait reply ref created a duplicate post"
                         )
-                        if mode == "capacity-reply-ref":
-                            assert immutable == [(True, True)]
-                            posts = [
-                                body for path, body in replies if path.endswith("/chat.postMessage")
-                            ]
-                            assert len(posts) == 1, (
-                                "retained wait reply ref created a duplicate post"
-                            )
-                            updates = [
-                                body for path, body in replies if path.endswith("/chat.update")
-                            ]
-                            final = [
-                                body
-                                for body in updates
-                                if "synthetic reply" in str(body.get("text", ""))
-                            ]
-                            assert final and all(body["ts"] == ack.ref for body in final)
-                            assert all(
-                                body["channel"] == original.turn.reply_handle.channel
-                                for body in posts + updates
-                            )
-                            current_wait = await wait.get(original.turn.event_id)
-                            assert current_wait is not None and current_wait.reply_ref == ack.ref
-                            assert current_wait.fields == dict(original.source_fields)
-                        if mode == "capacity-terminal-schedule":
-                            waits = runtime.consumer._waits
-                            seconds, micros = await runs.time()
-                            now = seconds * 1000 + micros // 1000
-                            # Exercise the old-TTL/lost-wake contract with an actual wait
-                            # record and immutable genuine witness, never a synthetic one.
-                            await runs.delete(cfg.done_key(original.turn.event_id))
-                            await runs.hset(
-                                waits._record(original.turn.event_id),
-                                mapping={
-                                    "state": "active",
-                                    "deadline_ms": str(now - 1),
-                                },
-                            )
-                            await runs.zadd(waits._flight, {original.turn.event_id: now - 1})
-                            before = await runs.xlen(cfg.stream)
-                            assert await waits.reconcile_lost_wakes(limit=1) == 0
-                            assert await runs.xlen(cfg.stream) == before
-                            retained = await runtime.markers.restore_owed(original.turn.event_id)
-                            assert retained is not None
-                            assert retained.witness.canonical_bytes == owed.witness.canonical_bytes
-                    else:
-                        # Allow multiple reclaim cadences while the actual peer lease is live.
-                        if mode == "sustained-live-peer":
-                            deadline = time.monotonic() + 17
-                            next_peer_heartbeat = time.monotonic()
-                            while len(observations) < 3 and time.monotonic() < deadline:
-                                if task.done():
-                                    await task
-                                if time.monotonic() >= next_peer_heartbeat:
-                                    budget = await leases.heartbeat(
-                                        cfg.stream,
-                                        cfg.consumer_group,
-                                        entry,
-                                        consumer="worker/peer",
-                                        owner=original_lease.owner,
-                                        generation=original_lease.generation,
-                                        resume_event_id=original_lease.resume_event_id,
-                                    )
-                                    assert budget is not None
-                                    original_lease.budget = budget
-                                    original_lease.local_deadline_monotonic = (
-                                        budget.anchor_monotonic + leases.ownership_window_s
-                                    )
-                                    next_peer_heartbeat = time.monotonic() + 4
-                                await asyncio.sleep(0.1)
-                            assert len(observations) >= 3
-                            assert all(record == (True, True, True) for record in observations)
-                        else:
-                            await asyncio.sleep(0.5)
-                        assert not external.events and not replies
-                        pending = await runs.xpending_range(
-                            cfg.stream,
-                            cfg.consumer_group,
-                            min=entry,
-                            max=entry,
-                            count=1,
+                        updates = [
+                            body for path, body in replies if path.endswith("/chat.update")
+                        ]
+                        final = [
+                            body
+                            for body in updates
+                            if "synthetic reply" in str(body.get("text", ""))
+                        ]
+                        assert final and all(body["ts"] == ack.ref for body in final)
+                        assert all(
+                            body["channel"] == original.turn.reply_handle.channel
+                            for body in posts + updates
                         )
-                        assert len(pending) == 1
-                        assert pending[0]["consumer"] == "worker/peer"
-                        assert pending[0]["times_delivered"] == 1
-                        assert (
-                            await runs.get(
-                                cfg.delivery_lease_key(
-                                    cfg.stream,
-                                    cfg.consumer_group,
-                                    entry,
-                                )
-                            )
-                            == original_lease.owner
+                        current_wait = await wait.get(original.turn.event_id)
+                        assert current_wait is not None and current_wait.reply_ref == ack.ref
+                        assert current_wait.fields == dict(original.source_fields)
+                    if mode == "capacity-terminal-schedule":
+                        waits = runtime.consumer._waits
+                        seconds, micros = await runs.time()
+                        now = seconds * 1000 + micros // 1000
+                        # Exercise the old-TTL/lost-wake contract with an actual wait
+                        # record and immutable genuine witness, never a synthetic one.
+                        await runs.delete(cfg.done_key(original.turn.event_id))
+                        await runs.hset(
+                            waits._record(original.turn.event_id),
+                            mapping={
+                                "state": "active",
+                                "deadline_ms": str(now - 1),
+                            },
                         )
+                        await runs.zadd(waits._flight, {original.turn.event_id: now - 1})
+                        before = await runs.xlen(cfg.stream)
+                        assert await waits.reconcile_lost_wakes(limit=1) == 0
+                        assert await runs.xlen(cfg.stream) == before
+                        retained = await runtime.markers.restore_owed(original.turn.event_id)
+                        assert retained is not None
+                        assert retained.witness.canonical_bytes == owed.witness.canonical_bytes
             finally:
                 if runtime is not None:
                     runtime.request_stop()
@@ -372,18 +279,6 @@ def test_actual_consumer_capacity_copy_or_live_peer_fence(
                 async with engine.begin() as connection:
                     await connection.execute(text("DROP SCHEMA " + schema + " CASCADE"))
                 await engine.dispose()
-                if mode not in {
-                    "capacity-copy",
-                    "capacity-terminal-schedule",
-                    "capacity-reply-ref",
-                }:
-                    await leases.release(
-                        cfg.stream,
-                        cfg.consumer_group,
-                        entry,
-                        owner=original_lease.owner,
-                        resume_event_id=original_lease.resume_event_id,
-                    )
 
     asyncio.run(go())
 

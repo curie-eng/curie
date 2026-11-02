@@ -63,6 +63,9 @@ ci_policy_tests:
   tools/e2e-ci-selection/tests/test_workflow_hunk_selection.py:
     [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
      charts/curie/values.yaml, cli/Cargo.toml, release/atlas.py]
+  tools/e2e-ci-selection/tests/test_xdist_scheduling.py:
+    [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
+     apps]
   tools/fix-pin-ci/tests/test_fix_pin_ci.py:
     [.github, tools/fix-pin-ci, conftest.py, pyproject.toml, uv.lock,
      AGENTS.md, apps/api/tests, charts/curie/ci, cli/scripts/verify-fix-pin.sh,

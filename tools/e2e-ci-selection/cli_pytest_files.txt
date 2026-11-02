@@ -109,6 +109,7 @@ tools/e2e-ci-selection/tests/test_pytest_shard_services.py
 tools/e2e-ci-selection/tests/test_python_pytest_selection.py
 tools/e2e-ci-selection/tests/test_upgrade_matrix_budget.py
 tools/e2e-ci-selection/tests/test_workflow_hunk_selection.py
+tools/e2e-ci-selection/tests/test_xdist_scheduling.py
 tools/factory-e2e/tests/test_acceptance.py
 tools/factory-e2e/tests/test_bitbucket_dc_fixture_tool.py
 tools/factory-e2e/tests/test_bitbucket_dc_live.py
