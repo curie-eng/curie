@@ -403,6 +403,13 @@ stale-version conflict test (match the CAS pattern in
 bounded delivery + dead-letter from the shared transport; a lane without a
 delivery cap is a bug.
 
+### CI gates
+
+Pull requests run the fast tiers and defer the kind, upgrade and convergence
+tiers to the merge queue, which runs them on the exact merge combination before
+anything lands; add the `ci:deep` label (then push) to run the deep tiers on the
+pull request too.
+
 ## Test policy
 
 1. Test behavior through the nearest executable boundary. Assert outcomes and state transitions rather than source names, syntax or implementation structure.

@@ -2548,8 +2548,9 @@ class TestLegitimateSkips:
                 "needs.changes.outputs.skill == 'true' || "
                 "needs.changes.outputs.local == 'true' || "
                 "needs.changes.outputs.local_release == 'true' || "
-                "needs.changes.outputs.cluster == 'true' || "
-                "needs.changes.outputs.released_upgrade == 'true' }}"
+                "(needs.changes.outputs.deep == 'true' && "
+                "(needs.changes.outputs.cluster == 'true' || "
+                "needs.changes.outputs.released_upgrade == 'true')) }}"
             ),
             "image-proofs": (
                 "${{ !cancelled() && needs.changes.result == 'success' && "
@@ -2587,22 +2588,29 @@ class TestHelmCiJobsCarryNoJobLevelIf:
     if fails the test.
     """
 
-    GATED = (
-        "chart-lint-and-assertions-1",
-        "chart-assertions-2",
-        "chart-assertions-retained-values",
-        "reserved-env-upgrade",
-        "automatic-thread-isolation",
-    )
-    GATED_IF = "${{ needs.chart-changes.outputs.chart == 'true' }}"
+    # Push runs always select the chart and the deep tiers, so these
+    # conditions never skip the required chart check on a release train.
+    GATED = {
+        "chart-lint-and-assertions-1": "${{ needs.chart-changes.outputs.chart == 'true' }}",
+        "chart-assertions-2": "${{ needs.chart-changes.outputs.chart == 'true' }}",
+        "chart-assertions-retained-values": "${{ needs.chart-changes.outputs.chart == 'true' }}",
+        "reserved-env-upgrade": (
+            "${{ needs.chart-changes.outputs.chart == 'true' && "
+            "needs.chart-changes.outputs.deep == 'true' }}"
+        ),
+        "automatic-thread-isolation": (
+            "${{ needs.chart-changes.outputs.chart == 'true' && "
+            "needs.chart-changes.outputs.deep == 'true' }}"
+        ),
+    }
 
     def test_only_the_chart_gate_ifs_are_allowed(self):
         jobs = yaml.safe_load(HELM_CI_YAML.read_text())["jobs"]
 
         assert "if" not in jobs["chart-changes"]
         assert jobs["helm"]["if"] == "${{ !cancelled() }}"
-        for job_id in self.GATED:
-            assert jobs[job_id]["if"] == self.GATED_IF
+        for job_id, condition in self.GATED.items():
+            assert jobs[job_id]["if"] == condition
         extra = sorted(
             job_id
             for job_id, job in jobs.items()

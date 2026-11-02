@@ -528,8 +528,10 @@ def test_e2e_required_runs_the_wall_clock_helper() -> None:
     run = budget["run"]
     assert "tools/e2e-ci-selection/assert_upgrade_matrix_budget.py" in run
     assert "continue-on-error" not in budget
+    # A deferred matrix leaves no jobs to time, so the budget defers with it.
     assert budget.get("if") == (
-        "${{ !cancelled() && needs.changes.outputs.released_upgrade == 'true' }}"
+        "${{ !cancelled() && needs.changes.outputs.released_upgrade == 'true' && "
+        "needs.changes.outputs.deep == 'true' }}"
     )
     # Outcome matching stays the gate for selected results; wall clock is a
     # later step so a budget miss cannot skip the selected-outcome negative

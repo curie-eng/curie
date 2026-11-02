@@ -31,6 +31,11 @@ CALICO = (
     "kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s"
 )
 INVOKE = f"bash tools/runtime-assertion-gate/run.sh {SCRIPT}"
+# Cluster jobs defer to the merge queue on an unlabeled pull request, so the
+# registered condition ANDs the selection with the `deep` output.
+DEEP_CLAUSE = "needs.changes.outputs.deep == 'true'"
+PRE_DEEP_CLUSTER_IF = "${{ needs.changes.outputs.cluster == 'true' }}"
+CLUSTER_JOB_IF = "${{ needs.changes.outputs.cluster == 'true' && " + DEEP_CLAUSE + " }}"
 
 
 def _workflow(tmp_path: Path, **overrides: object) -> Path:
@@ -40,7 +45,7 @@ def _workflow(tmp_path: Path, **overrides: object) -> Path:
         {"name": "Run it", "run": INVOKE},
     ]
     job: dict[str, object] = {
-        "if": "${{ needs.changes.outputs.cluster == 'true' }}",
+        "if": CLUSTER_JOB_IF,
         "needs": ["changes"],
         "steps": steps,
     }
@@ -85,6 +90,8 @@ def test_unregistered_assertion_fails_with_path_and_missing_step(tmp_path: Path)
         ({"calico_after": True}, "does not install Calico"),
         ({"if": "${{ always() }}"}, "is not selected by"),
         ({"if": "${{ needs.changes.outputs.cluster == 'true' && false }}"}, "is not selected by"),
+        # The pre-deep condition would run the job on an unlabeled pull request.
+        ({"if": PRE_DEEP_CLUSTER_IF}, "is not selected by"),
         (
             {"step": {"run": f"if false; then\n  {INVOKE}\nfi"}},
             "runs other commands",
@@ -326,7 +333,8 @@ def test_self_test_refuses_an_unregistered_anchor() -> None:
 
 
 CHART_JOB = "e2e-cluster-chart-regressions"
-CHART_JOB_IF = "${{ needs.changes.outputs.chart_scenarios != '[]' }}"
+PRE_DEEP_CHART_JOB_IF = "${{ needs.changes.outputs.chart_scenarios != '[]' }}"
+CHART_JOB_IF = "${{ needs.changes.outputs.chart_scenarios != '[]' && " + DEEP_CLAUSE + " }}"
 CHART_STEP_IF = (
     "${{ matrix.leg == 'chart' && "
     "contains(fromJSON(needs.changes.outputs.chart_scenarios), 'example-runtime') }}"
@@ -376,7 +384,8 @@ def test_chart_assertion_registers_with_its_own_scenario_condition(tmp_path: Pat
 
 @pytest.mark.parametrize(
     "mutation",
-    ["old-job-if", "wrong-job-if", "wrong-step-if", "wrong-scenario-id", "missing-step-if",
+    ["old-job-if", "pre-deep-job-if", "wrong-job-if", "wrong-step-if", "wrong-scenario-id",
+     "missing-step-if",
      "missing-entry", "wrong-step-name", "script-only-shared", "script-only-other-scenario",
      "no-calico", "late-calico", "conditional-calico", "step-continue", "job-continue",
      "other-command", "not-required", "different-job", "missing-leg-clause", "wrong-leg",
@@ -393,7 +402,9 @@ def test_chart_scenario_registration_preserves_all_gate_requirements(
     section = registry["chart_scenarios"]
     entry = section["scenarios"]["example-runtime"]
     if mutation == "old-job-if":
-        job["if"] = "${{ needs.changes.outputs.cluster == 'true' }}"
+        job["if"] = PRE_DEEP_CLUSTER_IF
+    elif mutation == "pre-deep-job-if":
+        job["if"] = PRE_DEEP_CHART_JOB_IF
     elif mutation == "wrong-job-if":
         job["if"] = "${{ needs.changes.outputs.chart_scenarios != '[]' && false }}"
     elif mutation == "wrong-step-if":
@@ -488,3 +499,27 @@ def test_self_test_exercises_the_registry_omission_negative_control(
     output = capsys.readouterr().out
     assert "negative control rejected" in output
     assert "registry" in output.lower()
+
+
+RECEIPT_STEPS_IF = (
+    "${{ !cancelled() && needs.changes.outputs.runtime_assertions != '[]' && "
+    + DEEP_CLAUSE
+    + " }}"
+)
+
+
+def test_receipt_steps_defer_with_the_cluster_jobs_and_registration_does_not() -> None:
+    jobs = yaml.safe_load(CI.read_text())["jobs"]
+    steps = {step.get("name"): step for step in jobs["e2e-required"]["steps"]}
+    # The receipts come from deep cluster jobs, so they are required only when
+    # those jobs run; an unlabeled pull request defers both.
+    receipt_steps = (
+        "Download runtime assertion receipts",
+        "Changed runtime assertions executed and passed",
+    )
+    for name in receipt_steps:
+        assert steps[name]["if"] == RECEIPT_STEPS_IF, name
+    # Registration is static and still runs on every pull request.
+    registration = jobs["runtime-assertion-registration"]
+    assert "if" not in registration
+    assert all("deep" not in str(step.get("if", "")) for step in registration["steps"])

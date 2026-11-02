@@ -1007,7 +1007,10 @@ def _admitted_agent_runtime_owner() -> tuple[dict[str, Any], dict[str, Any]]:
 
 def test_admitted_agent_runtime_has_one_required_provisioned_factory_owner() -> None:
     job, step = _admitted_agent_runtime_owner()
-    assert job["if"] == "${{ needs.changes.outputs.factory == 'true' }}"
+    # Deferred to the merge queue on an unlabeled pull request.
+    assert job["if"] == (
+        "${{ needs.changes.outputs.factory == 'true' && needs.changes.outputs.deep == 'true' }}"
+    )
     assert "changes" in set(_needs(job))
     assert not job.get("continue-on-error", False)
     # Every leg must run to completion: one red leg cannot cancel the others,

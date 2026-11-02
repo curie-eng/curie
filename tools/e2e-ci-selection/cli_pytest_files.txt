@@ -100,6 +100,7 @@ tools/doclint/tests/test_sre_demo_runbook.py
 tools/doclint/tests/test_symbols.py
 tools/e2e-ci-selection/tests/test_cli_pytest_scope.py
 tools/e2e-ci-selection/tests/test_conditional_pytest_files.py
+tools/e2e-ci-selection/tests/test_deep_tier_aggregates.py
 tools/e2e-ci-selection/tests/test_e2e_ci_selection.py
 tools/e2e-ci-selection/tests/test_factory_upgrade_selection.py
 tools/e2e-ci-selection/tests/test_live_manifest_parity.py

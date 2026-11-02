@@ -173,7 +173,20 @@ APPROVED_ROOT_DOCS = (
     "llms.txt",
 )
 CHART_JOB = "e2e-cluster-chart-regressions"
-CHART_JOB_IF = "${{ needs.changes.outputs.chart_scenarios != '[]' }}"
+# Deep tiers defer to the merge queue on an unlabeled pull request: every deep
+# job's condition ANDs its selection with the `deep` output of `changes`.
+DEEP_CLAUSE = "needs.changes.outputs.deep == 'true'"
+
+
+def _deep_if(selection: str) -> str:
+    return "${{ " + selection + " && " + DEEP_CLAUSE + " }}"
+
+
+CHART_JOB_IF = _deep_if("needs.changes.outputs.chart_scenarios != '[]'")
+CLUSTER_JOB_IF = _deep_if("needs.changes.outputs.cluster == 'true'")
+FACTORY_JOB_IF = _deep_if("needs.changes.outputs.factory == 'true'")
+APPROVAL_RESUME_JOB_IF = _deep_if("needs.changes.outputs.approval_resume == 'true'")
+RELEASED_UPGRADE_JOB_IF = _deep_if("needs.changes.outputs.released_upgrade == 'true'")
 CHART_SHARED_INPUTS = (
     "charts/curie/templates",
     "charts/curie/values",
@@ -2408,6 +2421,7 @@ AGGREGATE_EXPRESSIONS = {
     "released_upgrade_full": "${{ needs.changes.outputs.released_upgrade_full }}",
     "approval_resume_selected": "${{ needs.changes.outputs.approval_resume }}",
     "factory_selected": "${{ needs.changes.outputs.factory }}",
+    "deep": "${{ needs.changes.outputs.deep }}",
     "skill_local_result": "${{ needs.e2e-ladder.result }}",
     "oidc_result": "${{ needs.e2e-oidc.result }}",
     "local_release_result": "${{ needs.e2e-ladder-release.result }}",
@@ -2422,6 +2436,11 @@ AGGREGATE_EXPRESSIONS = {
     "released_upgrade_negative_result": ("${{ needs.e2e-released-upgrade-negative.result }}"),
     "upgrade_matrix_shards_result": ("${{ needs.e2e-cluster-upgrade-matrix-shards.result }}"),
     "upgrade_matrix_result": "${{ needs.e2e-cluster-upgrade-matrix.result }}",
+}
+# The deferral summary may read the changed runtime assertions; bound to "[]"
+# (none changed) when the aggregate step declares it.
+OPTIONAL_AGGREGATE_EXPRESSIONS = {
+    "runtime_assertions": "${{ needs.changes.outputs.runtime_assertions }}",
 }
 
 
@@ -2819,7 +2838,7 @@ def _assert_upgrade_job_gates(workflow: dict[str, Any]) -> None:
     positive = jobs["e2e-released-upgrade"]["if"]
     assert positive == _nightly_if("needs.changes.outputs.released_upgrade_full == 'true'")
     negative = jobs["e2e-released-upgrade-negative"]["if"]
-    assert negative == "${{ needs.changes.outputs.released_upgrade == 'true' }}"
+    assert negative == RELEASED_UPGRADE_JOB_IF
     assert NIGHTLY_DISPATCH not in negative
 
 
@@ -2863,6 +2882,7 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         "factory": "${{ steps.filter.outputs.factory }}",
         "approval_resume": "${{ steps.filter.outputs.approval_resume }}",
         "runtime_assertions": "${{ steps.runtime.outputs.runtime_assertions }}",
+        "deep": "${{ steps.deep.outputs.deep }}",
     }
 
     skill_local = jobs["e2e-ladder"]
@@ -2880,14 +2900,12 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
     assert jobs["e2e-ladder-release"]["if"] == (
         "${{ needs.changes.outputs.local_release == 'true' }}"
     )
-    assert jobs["e2e-ladder-cluster"]["if"] == ("${{ needs.changes.outputs.cluster == 'true' }}")
+    assert jobs["e2e-ladder-cluster"]["if"] == CLUSTER_JOB_IF
     _assert_upgrade_job_gates(workflow)
     assert set(jobs["e2e-released-upgrade-negative"]["needs"]) == set(
         jobs["e2e-released-upgrade"]["needs"]
     )
-    assert jobs["e2e-cluster-upgrade-matrix"]["if"] == (
-        "${{ needs.changes.outputs.released_upgrade == 'true' }}"
-    )
+    assert jobs["e2e-cluster-upgrade-matrix"]["if"] == RELEASED_UPGRADE_JOB_IF
     assert "if" not in jobs["e2e-cluster-upgrade-matrix-shards"]
     assert jobs["images"]["if"] == "${{ needs.changes.outputs.images == 'true' }}"
     assert "worker-local-image" not in jobs
@@ -3119,7 +3137,7 @@ def test_upgrade_matrix_workflow_runs_one_job_per_shard() -> None:
         "e2e-cluster-upgrade-matrix-shards",
         "ci-images",
     }
-    assert job["if"] == "${{ needs.changes.outputs.released_upgrade == 'true' }}"
+    assert job["if"] == RELEASED_UPGRADE_JOB_IF
     assert job["timeout-minutes"] == 45
     assert job["strategy"]["fail-fast"] is False
     # 14 shards run in one wave on push and dispatch; 7 took two waves.
@@ -3302,7 +3320,7 @@ def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
         "E2E released chart upgrade negative control (nil unsafe helpers)"
     )
     assert negative_job["runs-on"] == "ubuntu-24.04"
-    assert negative_job["if"] == "${{ needs.changes.outputs.released_upgrade == 'true' }}"
+    assert negative_job["if"] == RELEASED_UPGRADE_JOB_IF
     assert job["if"] == _nightly_if("needs.changes.outputs.released_upgrade_full == 'true'")
     assert set(negative_job["needs"]) == set(job["needs"])
     negative_steps = {
@@ -3579,6 +3597,11 @@ def _aggregate_contract() -> tuple[str, dict[str, str]]:
         environment_names = [name for name, value in step["env"].items() if value == expression]
         assert len(environment_names) == 1, expression
         bindings[semantic_name] = environment_names[0]
+    for semantic_name, expression in OPTIONAL_AGGREGATE_EXPRESSIONS.items():
+        environment_names = [name for name, value in step["env"].items() if value == expression]
+        assert len(environment_names) <= 1, expression
+        if environment_names:
+            bindings[semantic_name] = environment_names[0]
     return step["run"], bindings
 
 
@@ -3596,6 +3619,8 @@ class _AggregateOverrides(TypedDict, total=False):
     released_upgrade_full: str
     approval_resume_selected: str
     factory_selected: str
+    deep: str
+    runtime_assertions: str
     skill_local_result: str
     oidc_result: str
     local_release_result: str
@@ -3634,6 +3659,9 @@ def _run_aggregate(
         "released_upgrade_full": "false",
         "approval_resume_selected": "false",
         "factory_selected": "false",
+        # Deep tiers run unless a test is about pull request deferral.
+        "deep": "true",
+        "runtime_assertions": "[]",
         "skill_local_result": "skipped",
         "oidc_result": "skipped",
         "local_release_result": "skipped",
@@ -3665,7 +3693,14 @@ def _run_aggregate(
     if "chart_scenarios" not in overrides and state["cluster_selected"] == "true":
         state["chart_scenarios"] = '["workspace-diagnostic"]'
     environment = os.environ.copy()
-    environment.update({bindings[name]: value for name, value in state.items()})
+    environment.update(
+        {
+            bindings[name]: value
+            for name, value in state.items()
+            if name in bindings or name not in OPTIONAL_AGGREGATE_EXPRESSIONS
+        }
+    )
+    environment["GITHUB_STEP_SUMMARY"] = os.devnull
     return subprocess.run(
         ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
         cwd=REPO_ROOT,
@@ -4467,7 +4502,7 @@ def test_approval_resume_job_runs_on_pull_requests_and_gates_e2e_required() -> N
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
     job = jobs[APPROVAL_RESUME_JOB]
     assert job["name"] == "E2E approval resume after worker and store restarts (kind)"
-    assert job["if"] == "${{ needs.changes.outputs.approval_resume == 'true' }}"
+    assert job["if"] == APPROVAL_RESUME_JOB_IF
     assert "pull_request" not in job["if"]
     assert job["needs"] == ["rust-build", "changes", "ci-images"]
     assert APPROVAL_RESUME_JOB in jobs["e2e-required"]["needs"]
@@ -4842,7 +4877,7 @@ def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required(tmp_p
     job = jobs[SCRIPTED_FACTORY_JOB]
     assert job["name"] == "E2E scripted factory (kind, scripted model, ${{ matrix.suite }})"
     _assert_scripted_factory_legs_map_one_to_one(job)
-    assert job["if"] == "${{ needs.changes.outputs.factory == 'true' }}"
+    assert job["if"] == FACTORY_JOB_IF
     assert "pull_request" not in job["if"]
     assert job["needs"] == ["rust-build", "changes", "ci-images"]
     assert SCRIPTED_FACTORY_JOB in jobs["e2e-required"]["needs"]
