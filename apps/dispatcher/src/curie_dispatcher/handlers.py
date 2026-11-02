@@ -394,7 +394,7 @@ class _SelectedNotices:
         self, *, body: dict[str, Any], event: dict[str, Any], bot_user_id: Any,
         channel: str, placeholder: str,
     ) -> None:
-        """Turn this attempt's placeholder into the fixed refusal; never raises.
+        """Turn a direct message attempt's placeholder into the fixed refusal; never raises.
 
         A repeated native event_id, or a sender owed no notice, gets its
         placeholder deleted instead. @spec HTTP-INVOCATION-EXECUTION-27.
@@ -1213,17 +1213,24 @@ def register_handlers(
             event_id=str(body.get("event_id") or ""),
         )
         assert selected_notices is not None
+        channel = str(event.get("channel"))
         if result.status == "refused" and delivery.placeholder is not None:
-            # @spec HTTP-INVOCATION-EXECUTION-27: the placeholder becomes the notice.
-            selected_notices.replace(
-                body=body, event=event, bot_user_id=context.get("bot_user_id"),
-                channel=str(event.get("channel")), placeholder=delivery.placeholder,
-            )
-        else:
-            selected_notices.send(
-                status=result.status, body=body, event=event,
-                bot_user_id=context.get("bot_user_id"),
-            )
+            if channel.startswith("D") or is_plain_direct_message(event):
+                # @spec HTTP-INVOCATION-EXECUTION-26/27: only the sender is in a
+                # direct message, so its placeholder becomes the notice.
+                selected_notices.replace(
+                    body=body, event=event, bot_user_id=context.get("bot_user_id"),
+                    channel=channel, placeholder=delivery.placeholder,
+                )
+                return
+            # @spec HTTP-INVOCATION-EXECUTION-27: a channel never sees who was
+            # refused. The placeholder goes, even if its delete fails, and the
+            # notice below stays ephemeral to the sender.
+            _delete_placeholder(web_client, log, channel=channel, ts=delivery.placeholder)
+        selected_notices.send(
+            status=result.status, body=body, event=event,
+            bot_user_id=context.get("bot_user_id"),
+        )
 
     @app.event("app_mention", middleware=[_driver_approval_owner])
     def _on_app_mention(
