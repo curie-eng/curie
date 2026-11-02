@@ -341,7 +341,11 @@ def _email_registrations(
         value for registration in slack.values()
         for value in (registration.channel_identity_id, registration.provider_installation_id)
     }
-    slack_namespaces = {registration.namespace.id for registration in slack.values()}
+    # Own and trusted Slack namespaces alike. @spec HTTP-INVOCATION-EXECUTION-24/29.
+    slack_namespaces = {
+        namespace.id for registration in slack.values()
+        for namespace in (registration.namespace, *registration.trusted_namespaces)
+    }
     slack_bindings = {
         binding for registration in slack.values() for binding in registration.binding_ids
     }
