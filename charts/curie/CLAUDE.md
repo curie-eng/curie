@@ -66,7 +66,7 @@ component and rail detail in `charts/curie/README.md`.
     `timeoutSeconds` explicitly; the kubelet's 1s default is invisible in the
     manifest and each timed-out probe counts as a failure. Both rules are pinned
     for *every* rendered container, with no allowlist, by
-    `ci/probe-window-assertions.sh`. The remaining hardcoded probe blocks
+    policy P3 in `ci/policy/`. The remaining hardcoded probe blocks
     (`ui.yaml`, `clickhouse.yaml`, `valkey.yaml`, `rustfs.yaml`,
     `otel-collector.yaml`, `mail-adapter.yaml`, `inference.yaml`, and the
     `curie.heartbeatProbes` helper used by `worker.yaml` and `dispatcher.yaml`)
@@ -85,7 +85,7 @@ component and rail detail in `charts/curie/README.md`.
   at the time of writing it selects `api.yaml`, `dispatcher.yaml`, `worker.yaml`,
   `agent-sandbox.yaml` (the runner) and `mail-adapter.yaml`. Adding a workload
   means adding the include. The CI half is
-  `ci/instrumented-workload-assertions.sh` (#2360): it enumerates first-party
+  policy P5 in `ci/policy/` (#2360): it enumerates first-party
   workloads from rendered chart-owned images (`ghcr.io/curie-eng/curie-*` and
   single-component `curie-*` names), includes the runner SandboxTemplate,
   classifies bootstrap/hooks/prewarm/UI as exemptions rather than skipping
