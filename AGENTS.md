@@ -1,6 +1,6 @@
 # AGENTS.md - Curie
 
-**Public information boundary ,  applies before every publication.** Never put
+**Public information boundary: applies before every publication.** Never put
 real customer or downstream deployment information into this public upstream
 repository or its public records. This includes files, commit messages, branch
 and tag names, PRs, issues, comments, releases, and CI logs or artifacts. Use

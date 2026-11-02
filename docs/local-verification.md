@@ -261,7 +261,7 @@ docker compose -f compose.dev.yaml down      # stop, KEEP volumes (fast restart)
 docker compose -f compose.dev.yaml down -v   # stop and WIPE volumes (throwaway)
 ```
 
-**Clean up after yourself ,  this is not optional.** If you bring the local
+**Clean up after yourself: this is not optional.** If you bring the local
 stack up, you MUST take it down when you are done. This box does not have the
 RAM to leave the full stack idling, and this keeps happening: stacks get left
 running across sessions and starve the machine. Before you end a session in
@@ -271,7 +271,7 @@ down` (or `docker compose -f compose.dev.yaml down`) and confirm with
 project and overrides used for startup. Also remove stray runner containers this
 run spawned, identified by recorded IDs or ownership labels; preserve other
 jobs' containers. The thread that brought the
-stack up owns tearing it down ,  a blocked or crashed test agent never cleans up
+stack up owns tearing it down; a blocked or crashed test agent never cleans up
 after itself, so do not assume someone else will.
 
 **Do stack testing from a worktree, not the main checkout.** If a local test

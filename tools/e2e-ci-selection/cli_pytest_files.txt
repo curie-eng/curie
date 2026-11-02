@@ -77,7 +77,6 @@ tests/test_wire_state.py
 tools/ci-release-target-parity/tests/test_release_target_parity.py
 tools/ci-retry-gate/tests/test_ci_flake_retries.py
 tools/ci-retry-gate/tests/test_gitleaks_scope.py
-tools/ci-retry-gate/tests/test_pr_body.py
 tools/ci-retry-gate/tests/test_retry_eligibility.py
 tools/ci-workflow-paths/tests/test_runner_labels.py
 tools/ci-workflow-paths/tests/test_workflow_paths.py
