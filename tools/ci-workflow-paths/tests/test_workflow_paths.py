@@ -1332,10 +1332,11 @@ DEEP_BINDINGS = {
 
 
 @pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("images_selected", [False, True])
 @pytest.mark.parametrize("failed", [False, True])
 @pytest.mark.parametrize("filename", QUEUE_WORKFLOWS)
 def test_every_job_condition_has_pr_equivalent_queue_behavior(
-    filename: str, selected: bool, failed: bool,
+    filename: str, selected: bool, images_selected: bool, failed: bool,
 ) -> None:
     jobs = _load_workflows()[filename]["jobs"]
     outputs = {
@@ -1345,6 +1346,7 @@ def test_every_job_condition_has_pr_equivalent_queue_behavior(
     }
     bindings: dict[str, Any] = {
         **{f"needs.changes.outputs.{name}": str(selected).lower() for name in outputs},
+        "needs.changes.outputs.images": str(images_selected).lower(),
         "needs.changes.outputs.chart_scenarios": '["example"]' if selected else "[]",
         "needs.changes.outputs.pytest_deselect": "",
         "needs.chart-changes.outputs.chart": str(selected).lower(),

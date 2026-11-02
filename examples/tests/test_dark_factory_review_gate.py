@@ -42,6 +42,8 @@ from curie_runner.verification import (
     preflight_workspace_verification,
 )
 
+pytestmark = pytest.mark.xdist_independent
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = REPO_ROOT / "examples" / "dark-factory"
 HOOK = BUNDLE / "hooks" / "review_gate.py"

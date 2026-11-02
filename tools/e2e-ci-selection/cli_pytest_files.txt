@@ -29,7 +29,9 @@ charts/curie/ci/runtime/test_docker_daemon_fixture.py
 charts/curie/ci/runtime/test_quota_observation_clock.py
 charts/curie/ci/test_cron_approval_receipt.py
 charts/curie/ci/test_factory_resource_profile_runtime.py
+charts/curie/ci/test_failed_first_install_diagnostics.py
 charts/curie/ci/test_quota_progress_inputs.py
+charts/curie/ci/test_workload_install_inputs.py
 charts/curie/ci/test_workspace_diagnostic_inputs.py
 compose/tests/test_cluster_recovery_template.py
 compose/tests/test_ensure_release_images.py
@@ -77,7 +79,6 @@ tests/test_wire_state.py
 tools/ci-release-target-parity/tests/test_release_target_parity.py
 tools/ci-retry-gate/tests/test_ci_flake_retries.py
 tools/ci-retry-gate/tests/test_gitleaks_scope.py
-tools/ci-retry-gate/tests/test_pr_body.py
 tools/ci-retry-gate/tests/test_retry_eligibility.py
 tools/ci-workflow-paths/tests/test_runner_labels.py
 tools/ci-workflow-paths/tests/test_workflow_paths.py
@@ -107,6 +108,7 @@ tools/e2e-ci-selection/tests/test_live_manifest_parity.py
 tools/e2e-ci-selection/tests/test_python_pytest_selection.py
 tools/e2e-ci-selection/tests/test_upgrade_matrix_budget.py
 tools/e2e-ci-selection/tests/test_workflow_hunk_selection.py
+tools/e2e-ci-selection/tests/test_xdist_scheduling.py
 tools/factory-e2e/tests/test_acceptance.py
 tools/factory-e2e/tests/test_bitbucket_dc_fixture_tool.py
 tools/factory-e2e/tests/test_bitbucket_dc_live.py
@@ -118,6 +120,7 @@ tools/factory-e2e/tests/test_c4_forge_instances.py
 tools/factory-e2e/tests/test_c4_held_cancellation.py
 tools/factory-e2e/tests/test_c4_initial_binding.py
 tools/factory-e2e/tests/test_c4_reinstall_publication.py
+tools/factory-e2e/tests/test_c4_shared_install_state.py
 tools/factory-e2e/tests/test_c4_static_token_rotation.py
 tools/factory-e2e/tests/test_c4_tracker_scope.py
 tools/factory-e2e/tests/test_c4_upgrade_migration.py
