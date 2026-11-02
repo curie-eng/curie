@@ -19,7 +19,11 @@ import inspect
 import json
 import os
 import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import anyio
 import httpx
@@ -571,3 +575,356 @@ def test_its_reply_refuses_to_imply_a_rollback(tmp_path, monkeypatch):
     result = json.loads(srv.upgrade_platform())
     assert result["prior"] is None
     assert "no undo" in result["summary"]
+
+
+# --- the concurrency read, against a local stand-in API --------------------
+#
+# The tests above drive the operation through a fake client, which is the
+# right tool for the shapes a fake can represent. The concurrency read is
+# different: the defect is what the connector does when the read FAILS, and a
+# fake that always answers cannot fail. So these drive the REAL `_client` --
+# a real httpx client built from a real kubeconfig -- against a local stand-in
+# for the Kubernetes API. The stand-in records every request it receives and
+# creates no cluster object; it is the whole cluster for one test.
+
+
+# A second template, deliberately different in every field the connector
+# copies, so a test can tell WHICH CronJob's template a verb posted.
+PLATFORM_JOB_TEMPLATE = {
+    "metadata": {"labels": {"app": "sre-bot-platform-upgrade"}},
+    "spec": {
+        "backoffLimit": 0,
+        "template": {
+            "spec": {
+                "restartPolicy": "Never",
+                "serviceAccountName": "platform-upgrader",
+                "containers": [
+                    {
+                        "name": "upgrade",
+                        "image": "ghcr.io/curie-eng/curie-helm:0.7.2",
+                        "command": ["helm", "upgrade", "--reset-values"],
+                    }
+                ],
+            }
+        },
+    },
+}
+
+
+class _ExternalAPI:
+    """A local stand-in Kubernetes API server, owned by one test at a time.
+
+    `jobs` is called with the request handler when the connector reads the
+    Jobs list, and shapes that one read into whatever the test is about: a
+    healthy list, or the failure under test. Everything else behaves as a
+    healthy cluster -- the CronJob read returns that CronJob's template, and a
+    Job-creation POST succeeds -- so a recorded POST means the connector chose
+    to start a Job, and an absent POST means it chose not to.
+    """
+
+    TEMPLATES = {
+        "sre-bot-self-upgrade": JOB_TEMPLATE,
+        "platform-upgrade": PLATFORM_JOB_TEMPLATE,
+    }
+
+    def __init__(self, jobs):
+        self.jobs = jobs
+        self.requests = []
+
+    def __enter__(self):
+        fixture = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass  # keep pytest output clean
+
+            def respond(self, status, payload):
+                self._send(status, json.dumps(payload).encode("utf-8"))
+
+            def raw(self, status, body):
+                self._send(status, body.encode("utf-8"))
+
+            def _send(self, status, body):
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def selected(self, items):
+                """`items`, filtered by this request's labelSelector.
+
+                FILTER, like the API server: the Jobs a verb receives are the
+                selection its own selector made, not every Job on the cluster.
+                Without this a test cannot tell a verb that respects its scope
+                from one that does not.
+                """
+                query = parse_qs(urlsplit(self.path).query)
+                selector = (query.get("labelSelector") or [""])[0]
+                key, _, value = selector.partition("=")
+                return [
+                    item
+                    for item in items
+                    if ((item.get("metadata") or {}).get("labels") or {}).get(key)
+                    == value
+                ]
+
+            def record(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else None
+                fixture.requests.append(
+                    {
+                        "method": self.command,
+                        "path": self.path,
+                        "authorization": self.headers.get("Authorization"),
+                        "body": json.loads(body) if body else None,
+                    }
+                )
+
+            def do_GET(self):
+                self.record()
+                if "/cronjobs/" in self.path:
+                    cronjob = self.path.rstrip("/").rpartition("/")[2]
+                    self.respond(
+                        200, {"spec": {"jobTemplate": fixture.TEMPLATES[cronjob]}}
+                    )
+                    return
+                try:
+                    fixture.jobs(self)
+                except OSError:
+                    # A read that outlives the client's timeout answers a
+                    # socket the client has already given up on. That is the
+                    # timeout case finishing, not a failure the test means.
+                    pass
+
+            def do_POST(self):
+                self.record()
+                self.respond(201, {"metadata": {"name": "sre-bot-self-upgrade-abc12"}})
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+        return False
+
+    @property
+    def url(self):
+        host, port = self.server.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def posts(self):
+        return [r for r in self.requests if r["method"] == "POST"]
+
+
+def _stand_in_kubeconfig(url):
+    """A kubeconfig that points the REAL `_client` at the stand-in API."""
+    return {
+        "clusters": [{"cluster": {"server": url}}],
+        "users": [{"user": {"token": "upgrade-token"}}],
+    }
+
+
+def _hang_up(handler):
+    """A closed connection: the socket dies before any response byte."""
+    handler.connection.close()
+
+
+def _stall(handler):
+    """A read that outlives the client's timeout: the reply is never seen."""
+    time.sleep(4.0)
+    handler.respond(200, {"items": []})
+
+
+def _misframe_with_the_token(handler):
+    """Malformed chunk framing that names the credential.
+
+    Transport exceptions can quote peer-supplied bytes verbatim -- this frame
+    names the token, so a refusal that interpolated the exception message
+    would echo it back into the channel.
+    """
+    handler.send_response(200)
+    handler.send_header("Transfer-Encoding", "chunked")
+    handler.end_headers()
+    handler.wfile.write(b"upgrade-token: definitely not a chunk length\r\n\r\n")
+
+
+# Every way the running-Jobs read can fail, each of which must refuse the
+# call: a connector that cannot know whether an upgrade is running must not
+# start one on top of that not-knowing.
+CONCURRENCY_READ_FAILURES = [
+    ("http_401", lambda handler: handler.respond(401, {})),
+    ("http_403", lambda handler: handler.respond(403, {})),
+    ("http_503", lambda handler: handler.respond(503, {})),
+    ("closed_connection", _hang_up),
+    ("read_timeout", _stall),
+    ("reflected_chunk_framing", _misframe_with_the_token),
+    ("malformed_json", lambda handler: handler.raw(200, "not a jobs list {")),
+    ("non_object_payload", lambda handler: handler.respond(200, ["not", "an", "object"])),
+    ("missing_items", lambda handler: handler.respond(200, {})),
+    ("non_list_items", lambda handler: handler.respond(200, {"items": "not a list"})),
+]
+
+# Both verbs: each one carries its own `_start_job_from` call site, so each
+# failure is exercised through each verb rather than assumed shared.
+VERBS = [
+    ("upgrade_self", "sre-bot-self-upgrade", JOB_TEMPLATE),
+    ("upgrade_platform", "platform-upgrade", PLATFORM_JOB_TEMPLATE),
+]
+
+
+@pytest.mark.parametrize("verb", ["upgrade_self", "upgrade_platform"])
+@pytest.mark.parametrize("case,respond_with", CONCURRENCY_READ_FAILURES)
+def test_a_failed_concurrency_read_refuses_rather_than_starting_a_job(
+    tmp_path, monkeypatch, verb, case, respond_with
+):
+    """The race this guard exists for is one Job started on an unknown list.
+
+    A concurrency read that fails is not an empty list. An HTTP refusal, a
+    transport failure and a malformed list all mean the connector cannot know
+    whether an upgrade is already running -- and starting one anyway is
+    exactly the overlapping run the guard exists to prevent. These drive the
+    real `_client` and the real `_start_job_from`, so the path that refuses is
+    the path production takes, and the stand-in records every request, so a
+    refusal is provable by the absence of a Job-creation POST.
+    """
+    # Short enough that `read_timeout` is a timeout, not a wait; long enough
+    # that every other case answers well inside it under load.
+    monkeypatch.setenv("K8S_TIMEOUT_SECONDS", "2.0")
+    with _ExternalAPI(respond_with) as api:
+        srv = _load(tmp_path, kubeconfig=_stand_in_kubeconfig(api.url))
+        with pytest.raises(ToolError) as excinfo:
+            getattr(srv, verb)()
+        # A refusal is reported back into the channel. It carries the generic
+        # status or transport cause -- never the credential, never the raw body
+        # the API sent.
+        refusal = str(excinfo.value)
+        assert "upgrade-token" not in refusal
+        if case == "malformed_json":
+            assert "not a jobs list" not in refusal
+        if case == "reflected_chunk_framing":
+            assert "definitely not a chunk length" not in refusal
+        assert api.posts() == [], f"{verb} must not start a Job when {case}"
+
+
+@pytest.mark.parametrize("verb,cronjob,template", VERBS)
+def test_a_well_formed_concurrency_read_permits_exactly_one_job_post(
+    tmp_path, monkeypatch, verb, cronjob, template
+):
+    """Only a well-formed empty list means "no upgrade is running."
+
+    The permit has to be earned by the read: the verb reads its OWN CronJob,
+    then one Job-creation POST, carrying that template verbatim -- the
+    property the namespace-wide jobs grant rests on -- with the bearer token
+    from the mounted kubeconfig, through the real client.
+    """
+
+    def nothing_running(handler):
+        handler.respond(200, {"items": handler.selected([])})
+
+    with _ExternalAPI(nothing_running) as api:
+        srv = _load(tmp_path, kubeconfig=_stand_in_kubeconfig(api.url))
+        result = json.loads(getattr(srv, verb)())
+        assert result["ok"] is True
+        reads = [
+            r["path"]
+            for r in api.requests
+            if r["method"] == "GET" and "/cronjobs/" in r["path"]
+        ]
+        assert reads == [f"/apis/batch/v1/namespaces/curie/cronjobs/{cronjob}"]
+        posts = api.posts()
+        assert len(posts) == 1
+        assert posts[0]["path"] == "/apis/batch/v1/namespaces/curie/jobs"
+        assert posts[0]["authorization"] == "Bearer upgrade-token"
+        assert posts[0]["body"]["spec"] == template["spec"]
+        assert posts[0]["body"]["metadata"]["generateName"] == f"{cronjob}-"
+
+
+@pytest.mark.parametrize("verb,cronjob", [(v, c) for v, c, _ in VERBS])
+def test_an_active_matching_job_refuses_through_the_real_client(
+    tmp_path, monkeypatch, verb, cronjob
+):
+    """Two overlapping runs race on creating the version; the read stops one."""
+
+    def running(handler):
+        job = {
+            "metadata": {
+                "name": "in-flight",
+                "labels": {"curie.dev/self-upgrade-of": cronjob},
+            },
+            "status": {"active": 1},
+        }
+        handler.respond(200, {"items": handler.selected([job])})
+
+    with _ExternalAPI(running) as api:
+        srv = _load(tmp_path, kubeconfig=_stand_in_kubeconfig(api.url))
+        with pytest.raises(ToolError) as excinfo:
+            getattr(srv, verb)()
+        assert "in-flight" in str(excinfo.value)
+        assert api.posts() == []
+
+
+def test_a_completed_job_in_the_concurrency_read_does_not_block(tmp_path, monkeypatch):
+    """A finished upgrade is not a running one: the list may name it and still permit."""
+
+    def finished(handler):
+        job = {
+            "metadata": {
+                "name": "old",
+                "labels": {"curie.dev/self-upgrade-of": "sre-bot-self-upgrade"},
+            },
+            "status": {"succeeded": 1},
+        }
+        handler.respond(200, {"items": handler.selected([job])})
+
+    with _ExternalAPI(finished) as api:
+        srv = _load(tmp_path, kubeconfig=_stand_in_kubeconfig(api.url))
+        assert json.loads(srv.upgrade_self())["ok"] is True
+        assert len(api.posts()) == 1
+
+
+def test_the_other_verbs_concurrency_read_stays_independent(tmp_path, monkeypatch):
+    """A running bundle redeploy must not refuse a platform upgrade.
+
+    The two verbs run different templates against different CronJobs and are
+    independent; the guard is scoped to the CronJob being started. The
+    stand-in filters by the request's labelSelector exactly as the API server
+    does, so what reaches the platform verb is the empty selection its own
+    selector made -- not the other verb's in-flight Job.
+    """
+
+    def running_for_the_bundle(handler):
+        job = {
+            "metadata": {
+                "name": "in-flight",
+                "labels": {"curie.dev/self-upgrade-of": "sre-bot-self-upgrade"},
+            },
+            "status": {"active": 1},
+        }
+        handler.respond(200, {"items": handler.selected([job])})
+
+    with _ExternalAPI(running_for_the_bundle) as api:
+        srv = _load(tmp_path, kubeconfig=_stand_in_kubeconfig(api.url))
+        result = json.loads(srv.upgrade_platform())
+        assert result["ok"] is True
+        posts = api.posts()
+        assert len(posts) == 1
+        assert posts[0]["body"]["metadata"]["generateName"] == "platform-upgrade-"
+        assert posts[0]["body"]["spec"] == PLATFORM_JOB_TEMPLATE["spec"]
+
+
+def test_both_verbs_still_declare_gated_destructive_writes(tmp_path):
+    """The approval gate reads these declarations off the MCP surface.
+
+    A refusal must not quietly become an ungated path: both verbs stay
+    destructive, non-idempotent writes, and the read stays a read.
+    """
+    srv = _load(tmp_path)
+    tools = {tool.name: tool for tool in anyio.run(srv.mcp.list_tools)}
+    for verb in ("upgrade_self", "upgrade_platform"):
+        assert tools[verb].annotations.destructive_hint is True
+        assert tools[verb].annotations.read_only_hint is False
+        assert tools[verb].annotations.idempotent_hint is False
+    assert tools["latest_release"].annotations.read_only_hint is True
