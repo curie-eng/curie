@@ -695,6 +695,13 @@ def test_regeneration_records_hashed_known_case_inventory(tmp_path: Path) -> Non
     assert json.loads((tmp_path / BASELINE).read_text())["known_tests"] == {
         "tests/test_case.py": [node_hash]
     }
+    saved = (tmp_path / BASELINE).read_text()
+    for index in range(2):
+        artifact = tmp_path / f"run-{index}.log"
+        artifact.write_text(artifact.read_text().replace(node_hash, "malformed"))
+    invalid = command(tmp_path, "--regenerate", *arguments)
+    assert invalid.returncode == 2
+    assert (tmp_path / BASELINE).read_text() == saved
 
 
 @pytest.mark.parametrize(
