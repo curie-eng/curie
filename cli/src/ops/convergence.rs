@@ -1292,11 +1292,9 @@ mod tests {
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Output, Stdio};
-    use std::sync::Mutex;
     use std::thread::{self, JoinHandle};
     use std::time::Instant;
 
-    static CLUSTER_PACING: Mutex<()> = Mutex::new(());
     const CHILD: &str = "CURIE_CONVERGENCE_TEST_CHILD";
     const IMAGE: &str = "docker.io/library/busybox:1.36.1";
     const NODE_IMAGE: &str = "kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93";
@@ -1340,6 +1338,7 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      terminationGracePeriodSeconds: 0
       containers:
         - name: gate
           image: {{ .Values.image }}
@@ -1580,6 +1579,7 @@ sys.exit(result.returncode)
         context: String,
         image: String,
         image_built: bool,
+        release_prefix: String,
         releases: Vec<String>,
         processes: Vec<Process>,
         cluster_requested: bool,
@@ -1609,6 +1609,7 @@ sys.exit(result.returncode)
                 root,
                 programs,
                 original_path: std::env::var_os("PATH").context("PATH is required")?,
+                release_prefix: cluster.clone(),
                 cluster,
                 context,
                 image,
@@ -1687,6 +1688,7 @@ sys.exit(result.returncode)
                 ],
                 Duration::from_secs(180),
             )?;
+            println!("convergence cluster created: {}", self.cluster);
             let contexts: Value = serde_json::from_str(&self.invoke(
                 "kubectl",
                 &["config", "view", "-o", "json"],
@@ -1715,6 +1717,23 @@ sys.exit(result.returncode)
                 &["load", "docker-image", &self.image, "--name", &self.cluster],
                 Duration::from_secs(90),
             )?;
+            self.configure_case()
+        }
+
+        fn for_case(shared: &Self) -> Result<Self> {
+            let mut fixture = Self::new()?;
+            fixture.cluster.clone_from(&shared.cluster);
+            fixture.context.clone_from(&shared.context);
+            fixture.image.clone_from(&shared.image);
+            std::fs::copy(
+                shared.root.path().join("kubeconfig"),
+                fixture.root.path().join("kubeconfig"),
+            )?;
+            fixture.configure_case()?;
+            Ok(fixture)
+        }
+
+        fn configure_case(&self) -> Result<()> {
             let chart = self.root.path().join("chart");
             std::fs::create_dir_all(chart.join("templates"))?;
             std::fs::write(
@@ -1740,7 +1759,7 @@ sys.exit(result.returncode)
         }
 
         fn release(&mut self) -> Result<String> {
-            let release = format!("acme-{}", self.releases.len());
+            let release = format!("{}-{}", self.release_prefix, self.releases.len());
             self.releases.push(release.clone());
             self.invoke(
                 "kubectl",
@@ -1809,7 +1828,8 @@ sys.exit(result.returncode)
                 "unexpected real Helm fixture status"
             );
             println!(
-                "UTC={} elapsed={:.3}s release={} revision={} status={}",
+                "case={} UTC={} elapsed={:.3}s release={} revision={} status={}",
+                self.release_prefix,
                 OffsetDateTime::now_utc().format(&Rfc3339)?,
                 self.started.elapsed().as_secs_f64(),
                 release,
@@ -1994,10 +2014,10 @@ sys.exit(result.returncode)
             revision: u64,
             gate: Option<&Barrier>,
         ) -> Result<usize> {
-            let full_name = format!("ops::convergence::tests::{test}");
+            let full_name = "ops::convergence::tests::shared_cluster_convergence_cases";
             let mut command = Command::new(std::env::current_exe()?);
             command
-                .args(["--exact", &full_name, "--nocapture", "--test-threads=1"])
+                .args(["--exact", full_name, "--nocapture", "--test-threads=1"])
                 .env(CHILD, test)
                 .env("CURIE_CONVERGENCE_RELEASE", release)
                 .env("CURIE_CONVERGENCE_CONTRACT", contract)
@@ -2042,8 +2062,12 @@ sys.exit(result.returncode)
             }
             let output =
                 self.processes[process].wait(deadline.saturating_duration_since(Instant::now()))?;
-            print!("{}", String::from_utf8_lossy(&output.stdout));
-            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                println!("case={} {line}", self.release_prefix);
+            }
+            for line in String::from_utf8_lossy(&output.stderr).lines() {
+                eprintln!("case={} {line}", self.release_prefix);
+            }
             anyhow::ensure!(output.status.success(), "private convergence child failed");
             Ok(())
         }
@@ -2076,6 +2100,48 @@ sys.exit(result.returncode)
                 "unexpected final Helm identity"
             );
             Ok(())
+        }
+
+        fn diagnostic(&self, case: &str, program: &str, args: &[&str]) {
+            match self.invoke(program, args, Duration::from_secs(10)) {
+                Ok(output) => {
+                    for line in output.lines() {
+                        eprintln!(
+                            "case={} scenario={case} {program}: {line}",
+                            self.release_prefix
+                        );
+                    }
+                }
+                Err(error) => {
+                    for line in format!("{error:#}").lines() {
+                        eprintln!(
+                            "case={} scenario={case} diagnostics failed: {line}",
+                            self.release_prefix
+                        );
+                    }
+                }
+            }
+        }
+
+        fn diagnostics(&self, case: &str) {
+            self.diagnostic(case, "kubectl", &["get", "nodes", "-o", "yaml"]);
+            self.diagnostic(
+                case,
+                "kubectl",
+                &["get", "events", "-n", "kube-system", "-o", "yaml"],
+            );
+            for release in &self.releases {
+                self.diagnostic(
+                    case,
+                    "kubectl",
+                    &["get", "all,events", "-n", release, "-o", "yaml"],
+                );
+                self.diagnostic(
+                    case,
+                    "helm",
+                    &["status", release, "-n", release, "--show-desc"],
+                );
+            }
         }
 
         fn cleanup(&mut self) -> Result<()> {
@@ -2187,7 +2253,7 @@ sys.exit(result.returncode)
                 "fixture cleanup failed: {}",
                 errors.join("; ")
             );
-            println!("fixture cleanup verified");
+            println!("case={} fixture cleanup verified", self.release_prefix);
             Ok(())
         }
     }
@@ -2195,7 +2261,10 @@ sys.exit(result.returncode)
     impl Drop for Fixture {
         fn drop(&mut self) {
             if !self.cleaned && self.cleanup().is_err() {
-                eprintln!("fixture cleanup guard could not verify teardown");
+                eprintln!(
+                    "case={} fixture cleanup guard could not verify teardown",
+                    self.release_prefix
+                );
             }
         }
     }
@@ -2443,29 +2512,89 @@ sys.exit(result.returncode)
         })
     }
 
-    fn fixture_test(name: &str, scenario: impl FnOnce(&mut Fixture) -> Result<()>) -> Result<()> {
-        if std::env::var(CHILD).as_deref() == Ok(name) {
+    fn fixture_test(
+        name: &str,
+        shared: &Fixture,
+        scenario: impl FnOnce(&mut Fixture) -> Result<()>,
+    ) -> Result<()> {
+        let mut fixture = Fixture::for_case(shared)?;
+        println!(
+            "case={} scenario={name} started cluster={}",
+            fixture.release_prefix, fixture.cluster
+        );
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scenario(&mut fixture)))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("case {name} panicked")));
+        if outcome.is_err() {
+            fixture.diagnostics(name);
+        }
+        let cleanup = fixture.cleanup();
+        println!(
+            "case={} scenario={name} completed elapsed={:.3}s",
+            fixture.release_prefix,
+            fixture.started.elapsed().as_secs_f64()
+        );
+        match (outcome, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error.context(name.to_owned())),
+            (Err(error), Err(cleanup)) => {
+                Err(error.context(format!("case {name}: teardown also failed: {cleanup:#}")))
+            }
+        }
+    }
+
+    #[test]
+    fn shared_cluster_convergence_cases() -> Result<()> {
+        if std::env::var_os(CHILD).is_some() {
             return child_scenario();
         }
-        let _pacing = CLUSTER_PACING
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Other CLI tests temporarily replace PATH with fixture executables.
-        // Pin the real tool inventory and child environment while those
-        // mutations are excluded, just like every other process-env consumer.
         let _environment = crate::PROCESS_ENV_LOCK.blocking_lock();
         if executable("docker").is_err() && std::env::var_os("CI_REQUIRE_DOCKER_TESTS").is_none() {
-            eprintln!("skipping {name}: docker executable is unavailable");
+            eprintln!("skipping convergence cases: docker executable is unavailable");
             return Ok(());
         }
-        let mut fixture = Fixture::new()?;
-        let outcome = fixture.start().and_then(|()| scenario(&mut fixture));
-        let cleanup = fixture.cleanup();
+        let mut shared = Fixture::new()?;
+        let outcome = shared.start().and_then(|()| {
+            type Case = fn(&Fixture) -> Result<()>;
+            let cases: [Case; 6] = [
+                pending_states_exhaust_the_original_budget,
+                same_revision_pending_install_converges,
+                same_revision_pending_upgrade_and_rollback_converge,
+                status_only_transition_discards_the_sample,
+                stable_hook_failure_and_uninstalled_release_are_terminal,
+                replacement_revision_is_refused_within_and_between_samples,
+            ];
+            let barrier = std::sync::Barrier::new(cases.len());
+            thread::scope(|scope| {
+                let handles: Vec<_> = cases
+                    .into_iter()
+                    .map(|case| {
+                        let shared = &shared;
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            case(shared)
+                        })
+                    })
+                    .collect();
+                let mut errors = Vec::new();
+                for handle in handles {
+                    match handle.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => errors.push(format!("{error:#}")),
+                        Err(_) => errors.push("convergence case thread panicked".to_owned()),
+                    }
+                }
+                anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
+                Ok(())
+            })
+        });
+        let cleanup = shared.cleanup();
         match (outcome, cleanup) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
             (Err(error), Err(cleanup)) => {
-                Err(error.context(format!("teardown also failed: {cleanup:#}")))
+                Err(error.context(format!("shared cluster teardown also failed: {cleanup:#}")))
             }
         }
     }
@@ -2500,25 +2629,28 @@ sys.exit(result.returncode)
         fixture.history(&target)
     }
 
-    #[test]
-    fn same_revision_pending_install_converges() -> Result<()> {
-        fixture_test("same_revision_pending_install_converges", |fixture| {
-            for contract in ["wait", "structured"] {
-                pending_success(
-                    fixture,
-                    "same_revision_pending_install_converges",
-                    Operation::Install,
-                    contract,
-                )?;
-            }
-            Ok(())
-        })
+    fn same_revision_pending_install_converges(shared: &Fixture) -> Result<()> {
+        fixture_test(
+            "same_revision_pending_install_converges",
+            shared,
+            |fixture| {
+                for contract in ["wait", "structured"] {
+                    pending_success(
+                        fixture,
+                        "same_revision_pending_install_converges",
+                        Operation::Install,
+                        contract,
+                    )?;
+                }
+                Ok(())
+            },
+        )
     }
 
-    #[test]
-    fn same_revision_pending_upgrade_and_rollback_converge() -> Result<()> {
+    fn same_revision_pending_upgrade_and_rollback_converge(shared: &Fixture) -> Result<()> {
         fixture_test(
             "same_revision_pending_upgrade_and_rollback_converge",
+            shared,
             |fixture| {
                 for operation in [Operation::Upgrade, Operation::Rollback] {
                     for contract in ["wait", "structured"] {
@@ -2535,43 +2667,46 @@ sys.exit(result.returncode)
         )
     }
 
-    #[test]
-    fn status_only_transition_discards_the_sample() -> Result<()> {
-        fixture_test("status_only_transition_discards_the_sample", |fixture| {
-            for (contract, expectation) in [
-                ("wait", "discard"),
-                ("wait", "discard-wait"),
-                ("structured", "discard-wait"),
-            ] {
-                let target =
-                    fixture.prepare_pending(Operation::Install, false, "schema-migrate", 0)?;
-                let mut barrier = Barrier::new()?;
-                let child = fixture.child(
-                    "status_only_transition_discards_the_sample",
-                    &target.release,
-                    contract,
-                    expectation,
-                    1,
-                    Some(&barrier),
-                )?;
-                // Capture a genuine unready workload, then finish the same
-                // Helm operation before the final status read.
-                let permit = barrier.pause("workloads", 1, "after")?;
-                release_at_barrier(fixture, &target, permit)?;
-                let permit = barrier.pause("workloads", 2, "before")?;
-                fixture.open_workload(&target.release, permit.remaining())?;
-                permit.resume()?;
-                fixture.finish_child(child, Some(&mut barrier), Duration::from_secs(45))?;
-                fixture.history(&target)?;
-            }
-            Ok(())
-        })
+    fn status_only_transition_discards_the_sample(shared: &Fixture) -> Result<()> {
+        fixture_test(
+            "status_only_transition_discards_the_sample",
+            shared,
+            |fixture| {
+                for (contract, expectation) in [
+                    ("wait", "discard"),
+                    ("wait", "discard-wait"),
+                    ("structured", "discard-wait"),
+                ] {
+                    let target =
+                        fixture.prepare_pending(Operation::Install, false, "schema-migrate", 0)?;
+                    let mut barrier = Barrier::new()?;
+                    let child = fixture.child(
+                        "status_only_transition_discards_the_sample",
+                        &target.release,
+                        contract,
+                        expectation,
+                        1,
+                        Some(&barrier),
+                    )?;
+                    // Capture a genuine unready workload, then finish the same
+                    // Helm operation before the final status read.
+                    let permit = barrier.pause("workloads", 1, "after")?;
+                    release_at_barrier(fixture, &target, permit)?;
+                    let permit = barrier.pause("workloads", 2, "before")?;
+                    fixture.open_workload(&target.release, permit.remaining())?;
+                    permit.resume()?;
+                    fixture.finish_child(child, Some(&mut barrier), Duration::from_secs(45))?;
+                    fixture.history(&target)?;
+                }
+                Ok(())
+            },
+        )
     }
 
-    #[test]
-    fn stable_hook_failure_and_uninstalled_release_are_terminal() -> Result<()> {
+    fn stable_hook_failure_and_uninstalled_release_are_terminal(shared: &Fixture) -> Result<()> {
         fixture_test(
             "stable_hook_failure_and_uninstalled_release_are_terminal",
+            shared,
             |fixture| {
                 for (hook, expectation) in [
                     ("schema-migrate", "terminal-hook"),
@@ -2678,10 +2813,10 @@ sys.exit(result.returncode)
         permit.resume()
     }
 
-    #[test]
-    fn replacement_revision_is_refused_within_and_between_samples() -> Result<()> {
+    fn replacement_revision_is_refused_within_and_between_samples(shared: &Fixture) -> Result<()> {
         fixture_test(
             "replacement_revision_is_refused_within_and_between_samples",
+            shared,
             |fixture| {
                 for contract in ["wait", "structured"] {
                     for expectation in ["within", "between", "discard-then-replace"] {
@@ -2746,50 +2881,54 @@ sys.exit(result.returncode)
         )
     }
 
-    #[test]
-    fn pending_states_exhaust_the_original_budget() -> Result<()> {
-        fixture_test("pending_states_exhaust_the_original_budget", |fixture| {
-            let mut cases = Vec::new();
-            for operation in [Operation::Install, Operation::Upgrade, Operation::Rollback] {
-                for contract in ["wait", "structured"] {
-                    let target = fixture.prepare_pending(operation, true, "schema-migrate", 0)?;
-                    cases.push((target, contract));
+    fn pending_states_exhaust_the_original_budget(shared: &Fixture) -> Result<()> {
+        fixture_test(
+            "pending_states_exhaust_the_original_budget",
+            shared,
+            |fixture| {
+                let mut cases = Vec::new();
+                for operation in [Operation::Install, Operation::Upgrade, Operation::Rollback] {
+                    for contract in ["wait", "structured"] {
+                        let target =
+                            fixture.prepare_pending(operation, true, "schema-migrate", 0)?;
+                        cases.push((target, contract));
+                    }
                 }
-            }
-            let mut children = Vec::new();
-            for (target, contract) in &cases {
-                children.push(fixture.child(
-                    "pending_states_exhaust_the_original_budget",
-                    &target.release,
-                    contract,
-                    "budget",
-                    target.revision,
-                    None,
-                )?);
-            }
-            let deadline = Instant::now() + Duration::from_secs(315);
-            for child in children {
-                fixture.finish_child(
-                    child,
-                    None,
-                    deadline.saturating_duration_since(Instant::now()),
-                )?;
-            }
-            for ((target, _), operation) in cases.iter().zip([
-                Operation::Install,
-                Operation::Install,
-                Operation::Upgrade,
-                Operation::Upgrade,
-                Operation::Rollback,
-                Operation::Rollback,
-            ]) {
-                anyhow::ensure!(
-                    fixture.status(&target.release)?
-                        == (target.revision, operation.pending().to_owned()),
-                    "closed gate must remain at its original pending revision"
-                );
-            }
-            Ok(())
-        })
+                let mut children = Vec::new();
+                for (target, contract) in &cases {
+                    children.push(fixture.child(
+                        "pending_states_exhaust_the_original_budget",
+                        &target.release,
+                        contract,
+                        "budget",
+                        target.revision,
+                        None,
+                    )?);
+                }
+                let deadline = Instant::now() + Duration::from_secs(315);
+                for child in children {
+                    fixture.finish_child(
+                        child,
+                        None,
+                        deadline.saturating_duration_since(Instant::now()),
+                    )?;
+                }
+                for ((target, _), operation) in cases.iter().zip([
+                    Operation::Install,
+                    Operation::Install,
+                    Operation::Upgrade,
+                    Operation::Upgrade,
+                    Operation::Rollback,
+                    Operation::Rollback,
+                ]) {
+                    anyhow::ensure!(
+                        fixture.status(&target.release)?
+                            == (target.revision, operation.pending().to_owned()),
+                        "closed gate must remain at its original pending revision"
+                    );
+                }
+                Ok(())
+            },
+        )
     }
 }
