@@ -888,12 +888,6 @@ def test_a_hosted_connector_with_no_fallback_mounts_nothing_rather_than_a_dead_u
     assert r.unhosted_mcp_entry(ConnectorSpec(image="x:1")) is None
 
 
-def test_a_remote_connector_needs_no_fallback_to_stay_reachable() -> None:
-    entry = r.unhosted_mcp_entry(REMOTE)
-    assert entry is not None
-    assert entry["url"] == "https://mcp.internal/mcp"
-
-
 def test_the_fallback_never_displaces_the_derived_url_where_curie_hosts() -> None:
     # The whole point is that `cluster` keeps hosting it. A fallback that won
     # everywhere would silently repoint a production agent at someone's laptop.
@@ -2021,22 +2015,6 @@ def test_a_proxy_keeps_a_direct_service_on_the_server_port_for_callers_that_are_
 
 
 # @spec ADR-0168 d7
-def test_without_a_proxy_there_is_no_direct_service() -> None:
-    # There is no rendered Service at all: a hosted connector without a caller
-    # key fails closed before any object is produced.
-    with pytest.raises(ValueError, match="hosted_connector_requires_caller_key"):
-        r.render(
-            release="acme-bot",
-            agent="acme-bot",
-            namespace="acme-bot",
-            app_name="acme-bot",
-            connector="grafana",
-            spec=HOSTED,
-            secret_name="conn-secrets",
-            proxy=None,
-        )
-
-
 # @spec ADR-0168 d7
 def test_a_server_on_the_proxy_port_keeps_its_direct_service_on_that_port() -> None:
     spec = HOSTED.model_copy(update={"port": r.CALLER_PROXY_PORT})

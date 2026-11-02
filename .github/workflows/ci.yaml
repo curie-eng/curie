@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, next]
   pull_request:
@@ -186,10 +188,14 @@ jobs:
           uv run pytest -q -n 4 -rsR "${ci_policy_files[@]}"
 
   # The suite runs as six parallel shards, each with its own runner and dev
-  # stack. Container fixtures run in `python-container-fixtures`, the kind dry
-  # run regression in `python-dry-run-fixture`, static gates in `python-static`,
-  # and workflow meta-tests in `ci-policy`. The required Python job below
-  # aggregates all of them.
+  # stack. On a pull request the selector's shard plan may narrow the run to
+  # the test files the diff can affect (impact scope), use fewer active shards,
+  # and boot only the stack tier each shard's tests need; an inactive shard
+  # records a skip. Every other event runs the whole suite on six shards with
+  # the full stack. Container fixtures run in `python-container-fixtures`, the
+  # kind dry run regression in `python-dry-run-fixture`, static gates in
+  # `python-static`, and workflow meta-tests in `ci-policy`. The required
+  # Python job below aggregates all of them.
   python-pytest:
     name: Python pytest (shard ${{ matrix.shard }}/6)
     # Job-level gate (#3858): an unselected run (docs-only or version-only)
@@ -246,12 +252,23 @@ jobs:
       # not select pytest. The shard still recomputes the selection itself and
       # records it, so the required job can cross-check that every shard agreed
       # with its own decision. Every event other than a pull request selects
-      # everything, as `changes` does (#3858).
+      # everything on six full tier shards, as `changes` does (#3858). From the
+      # shard plan the selector writes, this shard derives whether it is active
+      # and which stack tier it boots; a pull request also writes the impact
+      # targets file the Pytest step reads.
       - name: Decide whether compose and pytest are needed
         id: python-runtime
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            uv run python tools/e2e-ci-selection/select_tiers.py \
+              --registry .github/e2e-selection.yaml \
+              --base "${{ github.event.merge_group.base_sha }}" \
+              --head "${{ github.event.merge_group.head_sha }}" \
+              --pytest-targets-out pytest-targets.txt
+          elif [ "${{ github.event_name }}" != "pull_request" ]; then
             uv run python tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --push
@@ -261,28 +278,68 @@ jobs:
             uv run python tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --base "origin/$base" \
-              --head HEAD
+              --head HEAD \
+              --pytest-targets-out pytest-targets.txt
           fi
+          # The last line written for a name wins, as it does in GitHub.
+          selection() {
+            local line value=""
+            while IFS= read -r line || [[ -n "$line" ]]; do
+              if [[ "$line" == "$1="* ]]; then
+                value="${line#*=}"
+              fi
+            done < "$GITHUB_OUTPUT"
+            printf '%s' "$value"
+          }
+          active=false
+          stack_tier=none
+          if [[ "$(selection pytest)" == "true" ]]; then
+            shards="$(selection pytest_shards)"
+            storage_shards="$(selection pytest_storage_shards)"
+            full_shards="$(selection pytest_full_shards)"
+            for count in "$shards" "$storage_shards" "$full_shards"; do
+              if [[ ! "$count" =~ ^(0|[1-9][0-9]*)$ ]]; then
+                echo "invalid shard plan '$shards/$storage_shards/$full_shards' from the selector" >&2
+                exit 1
+              fi
+            done
+            if (( SHARD <= shards )); then
+              active=true
+              if (( SHARD <= full_shards )); then
+                stack_tier=full
+              elif (( SHARD <= storage_shards )); then
+                stack_tier=storage
+              else
+                stack_tier=core
+              fi
+            fi
+          fi
+          echo "active=$active" >> "$GITHUB_OUTPUT"
+          echo "stack_tier=$stack_tier" >> "$GITHUB_OUTPUT"
+          echo "shard $SHARD: active=$active stack_tier=$stack_tier"
       # Integration tests dial the real dev stack (Postgres 25432, Valkey 26379,
-      # RustFS 29000, Langfuse 23000 + ClickHouse + OTel Collector). Boot it after
-      # ruff/mypy so cheap failures stay fast. The readiness helper waits for
-      # backing services and bucket creation, then starts Langfuse web before
-      # its worker so migrations and bootstrap cannot race worker startup.
+      # RustFS 29000, Langfuse 23000 + ClickHouse + OTel Collector). The shard
+      # boots only its plan's tier: core is Postgres and Valkey, storage adds
+      # RustFS and its bucket, full is the whole stack, where the readiness
+      # helper starts Langfuse web before its worker so migrations and bootstrap
+      # cannot race worker startup.
       # The app services (curie-api, curie-migrate) are deliberately NOT
       # started: the suite runs the app in-process via uv and migrates the shared
       # DB with alembic below, so their image is never needed here -- and it lives
       # in a private registry, so a bare `up` that pulled it failed the job.
       - name: Start dev stack
         id: dev-stack
-        if: steps.python-runtime.outputs.pytest == 'true'
-        run: python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480
+        if: steps.python-runtime.outputs.pytest == 'true' && steps.python-runtime.outputs.active == 'true'
+        env:
+          STACK_TIER: ${{ steps.python-runtime.outputs.stack_tier }}
+        run: python3 scripts/wait-for-langfuse.py --start --tier "$STACK_TIER" --timeout-seconds 480
       # Recheck authenticated web reads and worker readiness at the test
       # boundary. A running container alone does not prove usable Langfuse.
       - name: Wait for Langfuse to serve
-        if: steps.python-runtime.outputs.pytest == 'true'
+        if: steps.python-runtime.outputs.pytest == 'true' && steps.python-runtime.outputs.active == 'true' && steps.python-runtime.outputs.stack_tier == 'full'
         run: python3 scripts/wait-for-langfuse.py
       - name: Released database upgrade gate
-        if: steps.python-runtime.outputs.pytest == 'true' && matrix.shard == 1
+        if: steps.python-runtime.outputs.pytest == 'true' && steps.python-runtime.outputs.active == 'true' && matrix.shard == 1
         run: |
           uv run python scripts/check-released-upgrade.py --self-test
           uv run python scripts/check-released-upgrade.py
@@ -292,7 +349,7 @@ jobs:
       # Apply the real migrations to it so those tests run against a real
       # schema; this also exercises the alembic upgrade path on virgin Postgres.
       - name: Migrate the shared database
-        if: steps.python-runtime.outputs.pytest == 'true'
+        if: steps.python-runtime.outputs.pytest == 'true' && steps.python-runtime.outputs.active == 'true'
         working-directory: apps/api
         run: uv run alembic upgrade head
       # --durations is why this line is not a bare `-q`: it prints the real
@@ -302,8 +359,13 @@ jobs:
       # `-n 4 --dist loadgroup` runs this shard on the runner's four cores. The
       # root conftest.py groups every test by its file, pins the files sharing
       # unnamespaced Valkey keys or the Langfuse project to one group, and
-      # `--ci-shard` cuts the suite along those groups, so a group never
-      # straddles two shards and the shards together are the unfiltered suite.
+      # `--ci-shard` cuts the suite along those groups over the plan's active
+      # shards, so a group never straddles two shards and the shards together
+      # are the selected suite. On a pull request `--ci-shard-tiers` keeps each
+      # group on a shard whose stack tier serves it, and CURIE_CI_STACK_TIER
+      # makes a skip that blames a service this tier did not boot fail. In
+      # impact scope the selector's target files are passed explicitly. The
+      # xunit1 JUnit report carries per test durations for the replay tool.
       #
       # `--reruns 1` gives a failed test exactly one more attempt: 37% of
       # commits with a pytest failure passed on a plain rerun of the same
@@ -314,13 +376,30 @@ jobs:
       # because pytest keeps only the last `-r` option.
       - name: Pytest
         id: pytest
-        if: steps.python-runtime.outputs.pytest == 'true'
+        if: steps.python-runtime.outputs.pytest == 'true' && steps.python-runtime.outputs.active == 'true'
         env:
           SHARD: ${{ matrix.shard }}
           PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
           PYTEST_SCOPE: ${{ steps.python-runtime.outputs.pytest_scope }}
+          PYTEST_SHARDS: ${{ steps.python-runtime.outputs.pytest_shards }}
+          PYTEST_STORAGE_SHARDS: ${{ steps.python-runtime.outputs.pytest_storage_shards }}
+          PYTEST_FULL_SHARDS: ${{ steps.python-runtime.outputs.pytest_full_shards }}
+          STACK_TIER: ${{ steps.python-runtime.outputs.stack_tier }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          pytest_args=(-q -n 4 --dist loadgroup --ci-shard "$SHARD/6" --reruns 1 -rsR --durations=25 --ignore=tools/factory-e2e/tests/test_c4_initial_binding.py --ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py --ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py --ignore=tools/factory-e2e/tests/test_c4_forge_instances.py)
+          case "$STACK_TIER" in
+            core|storage|full) ;;
+            *)
+              echo "an active shard needs a stack tier of core, storage or full, got ${STACK_TIER:-<empty>}" >&2
+              exit 1
+              ;;
+          esac
+          pytest_args=(-q -n 4 --dist loadgroup --ci-shard "$SHARD/$PYTEST_SHARDS" --reruns 1 -rsR --durations=25 --ignore=tools/factory-e2e/tests/test_c4_initial_binding.py --ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py --ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py --ignore=tools/factory-e2e/tests/test_c4_forge_instances.py)
+          pytest_args+=(--junitxml shard-result-durations/junit.xml -o junit_family=xunit1)
+          # The merge queue selects exactly what the pull request did (#5262).
+          if [[ "$EVENT_NAME" == "pull_request" || "$EVENT_NAME" == "merge_group" ]]; then
+            pytest_args+=(--ci-shard-tiers "$PYTEST_STORAGE_SHARDS,$PYTEST_FULL_SHARDS")
+          fi
           pytest_args+=(--deselect=tools/factory-e2e/tests/test_c4_admitted_agent.py)
           pytest_args+=(--ignore tools/factory-e2e/tests/test_c4_upgrade_migration.py)
           pytest_args+=(--ignore tools/factory-e2e/tests/test_c4_cluster_up.py)
@@ -366,7 +445,23 @@ jobs:
               fi
             done
           fi
+          if [[ "$PYTEST_SCOPE" == "impact" ]]; then
+            impact_targets=()
+            if [[ -f pytest-targets.txt ]]; then
+              while IFS= read -r path || [[ -n "$path" ]]; do
+                if [[ -n "$path" ]]; then
+                  impact_targets+=("$path")
+                fi
+              done < pytest-targets.txt
+            fi
+            if (( ${#impact_targets[@]} == 0 )); then
+              echo "impact scope needs target files, but pytest-targets.txt is missing or empty" >&2
+              exit 1
+            fi
+            pytest_args+=("${impact_targets[@]}")
+          fi
           unset PYTEST_SCOPE
+          export CURIE_CI_STACK_TIER="$STACK_TIER"
           uv run pytest "${pytest_args[@]}"
       # Record what this shard decided and did, for the required job to check.
       # Written on every outcome, so a failed shard still reports.
@@ -379,11 +474,15 @@ jobs:
           STACK_RESULT: ${{ steps.dev-stack.outcome }}
           PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
           PYTEST_SCOPE: ${{ steps.python-runtime.outputs.pytest_scope }}
+          PYTEST_SHARDS: ${{ steps.python-runtime.outputs.pytest_shards }}
+          STACK_TIER: ${{ steps.python-runtime.outputs.stack_tier }}
+          PYTEST_TARGETS: ${{ steps.python-runtime.outputs.pytest_targets }}
         run: |
           mkdir -p shard-result
-          printf 'shard=%s selected=%s pytest=%s stack=%s deselect=%s scope=%s\n' \
+          printf 'shard=%s selected=%s pytest=%s stack=%s deselect=%s scope=%s shards=%s tier=%s targets=%s\n' \
             "$SHARD" "${PYTEST_SELECTED:-}" "${PYTEST_RESULT:-}" "${STACK_RESULT:-}" \
-            "${PYTEST_DESELECT:-}" "$PYTEST_SCOPE" \
+            "${PYTEST_DESELECT:-}" "$PYTEST_SCOPE" "${PYTEST_SHARDS:-}" "${STACK_TIER:-}" \
+            "${PYTEST_TARGETS:-}" \
             > "shard-result/shard-${SHARD}.txt"
           cat "shard-result/shard-${SHARD}.txt"
       - name: Upload shard result
@@ -392,8 +491,17 @@ jobs:
         with:
           name: python-pytest-shard-${{ matrix.shard }}
           path: shard-result/
+      # Per test durations for shard planning. The name stays outside the
+      # required job's `python-pytest-shard-*` download.
+      - name: Upload pytest durations
+        if: always() && steps.python-runtime.outputs.pytest == 'true' && steps.python-runtime.outputs.active == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-pytest-durations-${{ matrix.shard }}
+          path: shard-result-durations/
+          retention-days: 7
       - name: Dump dev stack logs on failure
-        if: ${{ failure() && steps.python-runtime.outputs.pytest == 'true' }}
+        if: ${{ failure() && steps.python-runtime.outputs.pytest == 'true' && steps.python-runtime.outputs.active == 'true' }}
         run: docker compose -f compose.dev.yaml logs --no-color --tail=200
 
   python-container-fixtures:
@@ -477,9 +585,9 @@ jobs:
         run: |
           set -euo pipefail
           case "$PYTEST_SCOPE" in
-            full|cli) ;;
+            full|cli|impact) ;;
             *)
-              echo "pytest scope must be full or cli, got ${PYTEST_SCOPE:-<empty>}" >&2
+              echo "pytest scope must be full, cli or impact, got ${PYTEST_SCOPE:-<empty>}" >&2
               exit 1
               ;;
           esac
@@ -590,9 +698,9 @@ jobs:
         run: |
           set -euo pipefail
           case "$PYTEST_SCOPE" in
-            full|cli) ;;
+            full|cli|impact) ;;
             *)
-              echo "pytest scope must be full or cli, got ${PYTEST_SCOPE:-<empty>}" >&2
+              echo "pytest scope must be full, cli or impact, got ${PYTEST_SCOPE:-<empty>}" >&2
               exit 1
               ;;
           esac
@@ -651,8 +759,9 @@ jobs:
         run: uv run python scripts/check-alembic-revisions.py
       - name: Alembic cross-train lineage
         env:
-          BASE: ${{ github.base_ref || github.ref_name }}
+          BASE: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_ref || github.base_ref || github.ref_name }}
         run: |
+          BASE="${BASE#refs/heads/}"
           case "$BASE" in
             main) other_train=next ;;
             next) other_train=main ;;
@@ -717,8 +826,12 @@ jobs:
       # unbumped wire change vs an existing base lock exits 1.
       - name: ACI wire-lock base gate
         run: |
-          git fetch --no-tags --depth=1 origin "${{ github.base_ref || github.ref_name }}" || true
-          git show "origin/${{ github.base_ref || github.ref_name }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock 2>/dev/null || true
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            git show "${{ github.event.merge_group.base_sha }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock
+          else
+            git fetch --no-tags --depth=1 origin "${{ github.base_ref || github.ref_name }}" || true
+            git show "origin/${{ github.base_ref || github.ref_name }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock 2>/dev/null || true
+          fi
           uv run python -m aci_protocol.wire_lock --check-base /tmp/base-wire.lock
 
   python:
@@ -763,18 +876,23 @@ jobs:
           path: shard-results
           merge-multiple: true
       # Keep the required Python check honest. When `changes` selected pytest,
-      # every shard must have reported, agreed with that selection, and run it,
-      # and the shard jobs themselves must have succeeded, so a real test
-      # failure in any shard fails this check. When it did not, the shard job
-      # must have been skipped by its job-level gate and left no shard record
-      # (#3858); a shard job that ran, or any record, means the two selections
-      # disagreed.
+      # every shard must have reported and agreed with that selection and its
+      # shard plan: the plan's active shards ran pytest on their planned stack
+      # tier, the rest skipped with tier none, and the shard jobs themselves
+      # succeeded, so a real test failure in any shard fails this check. When
+      # it did not, the shard job must have been skipped by its job-level gate
+      # and left no shard record (#3858); a shard job that ran, or any record,
+      # means the two selections disagreed.
       - name: Require pytest outcome to match selection
         if: success()
         env:
           PYTEST_SELECTED: ${{ needs.changes.outputs.pytest }}
           PYTEST_DESELECT: ${{ needs.changes.outputs.pytest_deselect }}
           PYTEST_SCOPE: ${{ needs.changes.outputs.pytest_scope }}
+          PYTEST_TARGETS: ${{ needs.changes.outputs.pytest_targets }}
+          PYTEST_SHARDS: ${{ needs.changes.outputs.pytest_shards }}
+          PYTEST_STORAGE_SHARDS: ${{ needs.changes.outputs.pytest_storage_shards }}
+          PYTEST_FULL_SHARDS: ${{ needs.changes.outputs.pytest_full_shards }}
           SHARDS_RESULT: ${{ needs.python-pytest.result }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           CONTAINER_RESULT: ${{ needs.python-container-fixtures.result }}
@@ -813,9 +931,9 @@ jobs:
             exit 1
           fi
           case "$PYTEST_SCOPE" in
-            full|cli) ;;
+            full|cli|impact) ;;
             *)
-              echo "pytest scope must be full or cli, got ${PYTEST_SCOPE:-<empty>}" >&2
+              echo "pytest scope must be full, cli or impact, got ${PYTEST_SCOPE:-<empty>}" >&2
               exit 1
               ;;
           esac
@@ -848,7 +966,18 @@ jobs:
             echo "Python pytest not selected; the shard job was skipped"
             exit 0
           fi
-          expected=success
+          for count in "$PYTEST_SHARDS" "$PYTEST_STORAGE_SHARDS" "$PYTEST_FULL_SHARDS"; do
+            if [[ ! "$count" =~ ^(0|[1-9][0-9]*)$ ]]; then
+              echo "pytest shard plan must be three non-negative integers, got '$PYTEST_SHARDS/$PYTEST_STORAGE_SHARDS/$PYTEST_FULL_SHARDS'" >&2
+              exit 1
+            fi
+          done
+          if (( PYTEST_SHARDS < 1 || PYTEST_SHARDS > SHARD_COUNT
+                || PYTEST_STORAGE_SHARDS > PYTEST_SHARDS
+                || PYTEST_FULL_SHARDS > PYTEST_STORAGE_SHARDS )); then
+            echo "pytest shard plan $PYTEST_SHARDS/$PYTEST_STORAGE_SHARDS/$PYTEST_FULL_SHARDS needs 1 <= shards <= $SHARD_COUNT and full <= storage <= shards" >&2
+            exit 1
+          fi
           if [[ "$SHARDS_RESULT" != "success" ]]; then
             echo "pytest shards finished $SHARDS_RESULT" >&2
             exit 1
@@ -859,14 +988,25 @@ jobs:
               echo "pytest shard $shard reported no result" >&2
               exit 1
             fi
-            want="shard=$shard selected=$PYTEST_SELECTED pytest=$expected stack=$expected deselect=$PYTEST_DESELECT scope=$PYTEST_SCOPE"
+            outcome=success
+            if (( shard > PYTEST_SHARDS )); then
+              outcome=skipped
+              tier=none
+            elif (( shard <= PYTEST_FULL_SHARDS )); then
+              tier=full
+            elif (( shard <= PYTEST_STORAGE_SHARDS )); then
+              tier=storage
+            else
+              tier=core
+            fi
+            want="shard=$shard selected=$PYTEST_SELECTED pytest=$outcome stack=$outcome deselect=$PYTEST_DESELECT scope=$PYTEST_SCOPE shards=$PYTEST_SHARDS tier=$tier targets=$PYTEST_TARGETS"
             got="$(cat "$record")"
             if [[ "$got" != "$want" ]]; then
               echo "pytest shard $shard: expected '$want', got '$got'" >&2
               exit 1
             fi
           done
-          echo "Python pytest selection matched $expected on $SHARD_COUNT shards"
+          echo "Python pytest selection matched on $PYTEST_SHARDS active of $SHARD_COUNT shards (scope $PYTEST_SCOPE)"
 
   # The Rust quality gate is five jobs so the test suite runs in parallel
   # partitions beside fmt and clippy instead of one 14.5 minute serial step.
@@ -955,10 +1095,12 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
           VERSION_ONLY: ${{ needs.changes.outputs.version_only }}
         run: |
           set -euo pipefail
-          if [ "$EVENT" != "pull_request" ]; then
+          if [ "$EVENT" != "pull_request" ] && [ "$EVENT" != "merge_group" ]; then
             echo "tests=true ($EVENT always runs the Rust tests)"
             echo "tests=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -970,9 +1112,14 @@ jobs:
             echo "tests=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git fetch --quiet origin "$BASE_REF"
+          if [ "$EVENT" = "merge_group" ]; then
+            diff_range="$BASE_SHA..$HEAD_SHA"
+          else
+            git fetch --quiet origin "$BASE_REF"
+            diff_range="origin/$BASE_REF...HEAD"
+          fi
           grep -vE '^[[:space:]]*(#|$)' .github/rust-test-paths.txt > "$RUNNER_TEMP/patterns"
-          git diff --name-only "origin/$BASE_REF...HEAD" > "$RUNNER_TEMP/changed"
+          git diff --name-only "$diff_range" > "$RUNNER_TEMP/changed"
           # grep exits 1 for "no match" and 2 for a broken pattern; only the
           # first may skip the tests, so a bad regex fails this job closed.
           status=0
@@ -1204,7 +1351,7 @@ jobs:
           cargo nextest run
           --archive-file "$RUNNER_TEMP/nextest/nextest-archive.tar.zst"
           --workspace-remap . --extract-to .
-          --profile ci
+          --profile ci --success-output final
           -E 'test(/^ops::convergence::tests::/)'
 
   rust:
@@ -1296,7 +1443,7 @@ jobs:
     # on every push to main and next (so every releasable commit is proven, and
     # the per-commit portable binaries below still publish for both branches)
     # and on the nightly workflow_dispatch of the full suite.
-    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.cli_release == 'true' }}
+    if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && needs.changes.outputs.cli_release == 'true' }}
     # The release cross-compile path was never exercised before a tag, so a
     # regression in it was undiscoverable until someone tried the artifact on a
     # real host. #1341 shipped exactly that way: both Linux targets inherited
@@ -1383,7 +1530,7 @@ jobs:
     needs: [changes]
     # Same trigger as `cli-portability`: push to main and next plus the nightly
     # dispatch, never a pull request.
-    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.cli_release == 'true' }}
+    if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && needs.changes.outputs.cli_release == 'true' }}
     # `aarch64-apple-darwin` ships in the release matrix (release.yaml) and was
     # compiled for the FIRST TIME when a tag was pushed. Anything that breaks it
     # -- a dependency that does not build on macOS, a `cfg(unix)` assumption that
@@ -1679,15 +1826,14 @@ jobs:
       - name: Write the CI image bake definition
         run: |
           cat > ci-images-bake.json <<'EOF'
-          {"group": {"default": {"targets": ["api", "dispatcher", "worker", "ui", "runner", "mail-adapter", "postgres-readiness"]}},
+          {"group": {"default": {"targets": ["api", "dispatcher", "worker", "ui", "runner", "mail-adapter"]}},
           "target": {
             "api": {"context": ".", "dockerfile": "apps/api/Dockerfile", "tags": ["curie-ci/api:candidate"], "cache-from": ["type=gha,scope=ladder-api"], "cache-to": ["type=gha,mode=max,scope=ladder-api"]},
             "dispatcher": {"context": ".", "dockerfile": "apps/dispatcher/Dockerfile", "tags": ["curie-ci/dispatcher:candidate"], "cache-from": ["type=gha,scope=ladder-dispatcher"], "cache-to": ["type=gha,mode=max,scope=ladder-dispatcher"]},
             "worker": {"context": ".", "dockerfile": "apps/worker/Dockerfile", "tags": ["curie-ci/worker:candidate", "ghcr.io/curie-eng/curie-worker:ci-local"], "cache-from": ["type=gha,scope=ladder-worker"], "cache-to": ["type=gha,mode=max,scope=ladder-worker"]},
             "ui": {"context": ".", "dockerfile": "apps/ui/Dockerfile", "tags": ["curie-ci/ui:candidate"], "cache-from": ["type=gha,scope=ladder-ui"], "cache-to": ["type=gha,mode=max,scope=ladder-ui"]},
             "runner": {"context": ".", "dockerfile": "runner/Dockerfile", "tags": ["curie-ci/runner:candidate"], "cache-from": ["type=gha,scope=ladder-runner"], "cache-to": ["type=gha,mode=max,scope=ladder-runner"]},
-            "mail-adapter": {"context": ".", "dockerfile": "apps/mail-adapter/Dockerfile", "tags": ["curie-ci/mail-adapter:candidate"], "cache-from": ["type=gha,scope=mail-adapter"], "cache-to": ["type=gha,mode=max,scope=mail-adapter"]},
-            "postgres-readiness": {"context": "charts/curie/ci", "dockerfile": "postgres-readiness-delay.Dockerfile", "tags": ["curie-ci/postgres-readiness:candidate"], "cache-from": ["type=gha,scope=langfuse-postgres-readiness"], "cache-to": ["type=gha,mode=max,scope=langfuse-postgres-readiness"]}
+            "mail-adapter": {"context": ".", "dockerfile": "apps/mail-adapter/Dockerfile", "tags": ["curie-ci/mail-adapter:candidate"], "cache-from": ["type=gha,scope=mail-adapter"], "cache-to": ["type=gha,mode=max,scope=mail-adapter"]}
           }}
           EOF
       - name: Build the CI images in parallel
@@ -1705,7 +1851,7 @@ jobs:
           set -euo pipefail
           out="$RUNNER_TEMP/ci-images"
           mkdir -p "$out"
-          for name in api dispatcher worker ui runner mail-adapter postgres-readiness worker-local; do
+          for name in api dispatcher worker ui runner mail-adapter worker-local; do
             docker save "curie-ci/$name:candidate" | zstd -T0 -3 -q -o "$out/$name.tar.zst"
           done
           ls -la "$out"
@@ -1754,14 +1900,6 @@ jobs:
         with:
           name: ci-image-mail-adapter
           path: ${{ runner.temp }}/ci-images/mail-adapter.tar.zst
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
-      - name: Upload the postgres-readiness image
-        uses: actions/upload-artifact@v7
-        with:
-          name: ci-image-postgres-readiness
-          path: ${{ runner.temp }}/ci-images/postgres-readiness.tar.zst
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
@@ -1904,13 +2042,20 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
         run: |
-          if [ "$EVENT_NAME" != pull_request ]; then
+          if [ "$EVENT_NAME" != pull_request ] && [ "$EVENT_NAME" != merge_group ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git fetch --no-tags origin "$BASE_REF"
-          if git diff --quiet "origin/${BASE_REF}...HEAD" -- apps/docker-daemon .github/workflows/ci.yaml; then
+          if [ "$EVENT_NAME" = merge_group ]; then
+            diff_range="$BASE_SHA..$HEAD_SHA"
+          else
+            git fetch --no-tags origin "$BASE_REF"
+            diff_range="origin/${BASE_REF}...HEAD"
+          fi
+          if git diff --quiet "$diff_range" -- apps/docker-daemon .github/workflows/ci.yaml; then
             echo "No change under apps/docker-daemon or ci.yaml; skipping"
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
@@ -2550,9 +2695,13 @@ jobs:
   commit-messages:
     name: Commit messages (no AI attribution)
     runs-on: ubuntu-24.04
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     steps:
+      - name: Acknowledge the PR metadata judgment
+        if: github.event_name == 'merge_group'
+        run: echo 'PR-event run already judged this metadata; merge groups reuse that judgment.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request'
         with:
           persist-credentials: false
           # The range needs both endpoints present locally.
@@ -2560,8 +2709,10 @@ jobs:
       # Prove the matcher still distinguishes attribution from mention before
       # trusting its verdict; a gate that cannot fail is not a gate.
       - name: Gate self-test (negative control)
+        if: github.event_name == 'pull_request'
         run: bash scripts/check-commit-messages.sh --self-test
       - name: Check the PR's commit messages
+        if: github.event_name == 'pull_request'
         run: |
           bash scripts/check-commit-messages.sh \
             "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
@@ -2791,6 +2942,10 @@ jobs:
       pytest: ${{ steps.filter.outputs.pytest }}
       pytest_deselect: ${{ steps.filter.outputs.pytest_deselect }}
       pytest_scope: ${{ steps.filter.outputs.pytest_scope }}
+      pytest_targets: ${{ steps.filter.outputs.pytest_targets }}
+      pytest_shards: ${{ steps.filter.outputs.pytest_shards }}
+      pytest_storage_shards: ${{ steps.filter.outputs.pytest_storage_shards }}
+      pytest_full_shards: ${{ steps.filter.outputs.pytest_full_shards }}
       ci_policy: ${{ steps.filter.outputs.ci_policy }}
       ci_policy_files: ${{ steps.filter.outputs.ci_policy_files }}
       version_only: ${{ steps.filter.outputs.version_only }}
@@ -2831,6 +2986,12 @@ jobs:
               --registry .github/e2e-selection.yaml \
               --base "origin/$base_ref" \
               --head HEAD
+          elif [ "$event" = "merge_group" ]; then
+            uv run --no-project --with pyyaml==6.0.3 python \
+              tools/e2e-ci-selection/select_tiers.py \
+              --registry .github/e2e-selection.yaml \
+              --base "${{ github.event.merge_group.base_sha }}" \
+              --head "${{ github.event.merge_group.head_sha }}"
           elif [ "$event" = "push" ]; then
             uv run --no-project --with pyyaml==6.0.3 python \
               tools/e2e-ci-selection/select_tiers.py \
@@ -2854,7 +3015,12 @@ jobs:
         run: |
           set -euo pipefail
           scripts='[]'
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            scripts="$(uv run --no-project --with pyyaml==6.0.3 python \
+              tools/runtime-assertion-gate/gate.py select \
+              --base "${{ github.event.merge_group.base_sha }}" \
+              --head "${{ github.event.merge_group.head_sha }}")"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
             scripts="$(uv run --no-project --with pyyaml==6.0.3 python \
               tools/runtime-assertion-gate/gate.py select \
               --base "origin/${{ github.base_ref }}" --head HEAD)"
@@ -3316,19 +3482,18 @@ jobs:
           path: target/factory-e2e/scripted-*.json
           if-no-files-found: warn
 
-  # The module builds its own candidate binary and api, worker and runner
-  # images from the checkout, then creates and deletes up to four sequential
-  # kind clusters, so it needs none of the upstream build artifacts. It is
-  # selected exactly like the scripted factory scenario (#4620).
-  # The admitted agent runtime module (#4619) gives every case its own kind
-  # cluster through a function-scoped fixture, so its cases share no state
-  # across runners. Each leg runs one contiguous collection-order block, so a
-  # case still runs after the cases that precede it today. The legs partition
-  # the module exactly, and `E2E required` needs every leg.
+  # The admitted agent runtime module (#4619) loads the candidate CLI built by
+  # rust-build and the api, worker, ui and runner images built by ci-images,
+  # so it rebuilds nothing from the checkout. It is selected exactly like the
+  # scripted factory scenario (#4620). Each leg provisions one kind cluster and
+  # one platform install, and gives every case fresh agents on that install
+  # with a verified clean start. Each leg runs one contiguous collection-order
+  # block, so a case still runs after the cases that precede it. The legs
+  # partition the module exactly, and `E2E required` needs every leg.
   factory-admitted-agent:
     name: Admitted agent runtime regressions (kind, shard ${{ matrix.shard }}/5)
     runs-on: ubuntu-24.04
-    needs: [changes]
+    needs: [rust-build, changes, ci-images]
     if: ${{ needs.changes.outputs.factory == 'true' }}
     timeout-minutes: 120
     strategy:
@@ -3401,22 +3566,51 @@ jobs:
           install_only: true
       # This ubuntu-24.04 job owns a disposable hosted runner. The Android,
       # .NET and Haskell SDKs are unused here; remove only those preinstalled
-      # SDK trees before candidate builds and image imports.
-      - name: Free disk for the disposable factory cluster
+      # SDK trees before candidate builds and image imports. The removal runs
+      # in the background so it overlaps the artifact download and image load.
+      - name: Start freeing disk for the disposable factory cluster
         run: |
           set -euo pipefail
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          # The background removal inherits descriptor 9 and holds this lock
+          # until it exits, so the finish step can block on the lock.
+          exec 9>"$RUNNER_TEMP/free-disk.lock"
+          flock 9
+          nohup bash -c 'sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup; echo $? > "$1"' _ "$RUNNER_TEMP/free-disk.status" >/dev/null 2>&1 &
+      - name: Download the curie binary built by the Rust job
+        uses: actions/download-artifact@v8
+        with:
+          name: curie-x86_64-linux-${{ github.sha }}
+          path: cli/target/release
+      - name: Make the binary executable
+        run: chmod +x cli/target/release/curie
+      - name: Load the four images built by the ci-images job
+        uses: ./.github/actions/load-ci-images
+        with:
+          images: "{api,worker,ui,runner}"
+      - name: Finish freeing disk for the disposable factory cluster
+        run: |
+          set -euo pipefail
+          timeout 600 flock "$RUNNER_TEMP/free-disk.lock" true
+          status="$(cat "$RUNNER_TEMP/free-disk.status")"
+          if [ "$status" != "0" ]; then
+            echo "disk cleanup exited with status $status" >&2
+            exit 1
+          fi
           df -h /
       - name: Run admitted agent runtime regressions
         env:
           CASE_SHARD: ${{ matrix.shard }}/5
-        run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_admitted_agent.py --case-shard "$CASE_SHARD"
-      - name: Upload the publication failure digest
+          CURIE_C4_CANDIDATE_CLI: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_C4_CANDIDATE_IMAGES: curie-ci/{component}:candidate
+        run: uv run pytest -q -n 0 --durations=0 tools/factory-e2e/tests/test_c4_admitted_agent.py --case-shard "$CASE_SHARD"
+      - name: Upload the admitted agent failure digests
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: admitted-publication-digest-${{ github.sha }}-${{ matrix.shard }}
-          path: target/factory-e2e/admitted-publication-failure-*.json
+          path: |
+            target/factory-e2e/admitted-publication-failure-*.json
+            target/factory-e2e/admitted-isolation-failure-*.json
           if-no-files-found: ignore
 
   forge-instance-regression:
@@ -3530,6 +3724,9 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
     if: ${{ needs.changes.outputs.chart_scenarios != '[]' }}
+    env:
+      CURIE_SCENARIO_NAMESPACE: test-workload-${{ github.run_id }}-${{ github.run_attempt }}
+      CURIE_SCENARIO_RELEASE: workload-${{ github.run_id }}-${{ github.run_attempt }}
     strategy:
       fail-fast: false
       matrix:
@@ -3546,7 +3743,6 @@ jobs:
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
-      # The fixture image delays Postgres for the Langfuse startup regression.
       - name: Back off before retrying Install Helm
         if: steps.install_helm.outcome == 'failure'
         run: |
@@ -3557,15 +3753,6 @@ jobs:
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
-      # The fixture image delays Postgres for the Langfuse startup regression.
-      - name: Load the Postgres readiness fixture built by the ci-images job
-        if: ${{ matrix.leg == 'chart' }}
-        uses: ./.github/actions/load-ci-images
-        with:
-          images: postgres-readiness
-      - name: Tag the Postgres readiness fixture
-        if: ${{ matrix.leg == 'chart' }}
-        run: docker tag curie-ci/postgres-readiness:candidate "curie-postgres-readiness:${GITHUB_SHA}"
       # disableDefaultCNI is load-bearing (#1153). kind's default kindnet
       # implements NO NetworkPolicy controller, so every policy the chart ships
       # -- including Rail 1's default-deny egress for runner sandboxes
@@ -3688,22 +3875,6 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/runner-template-admission-runtime.sh
-      - name: Load the Postgres readiness fixture into the kind cluster
-        if: ${{ matrix.leg == 'chart' }}
-        run: kind load docker-image "curie-postgres-readiness:${GITHUB_SHA}" --name curie-e2e
-      - name: Langfuse web waits for delayed Postgres without restarting
-        if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'langfuse-postgres-readiness') }}
-        env:
-          READINESS_NAMESPACE: curie-1853-${{ github.run_id }}-${{ github.run_attempt }}
-          READINESS_RELEASE: curie-1853-${{ github.run_id }}-${{ github.run_attempt }}
-          READINESS_POSTGRES_IMAGE: curie-postgres-readiness:${{ github.sha }}
-        run: |
-          set -euo pipefail
-          bash tools/runtime-assertion-gate/run.sh \
-            charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh \
-            --namespace "$READINESS_NAMESPACE" \
-            --release "$READINESS_RELEASE" \
-            --postgres-image "$READINESS_POSTGRES_IMAGE"
       # The connector render needs the workspace. Kept out of the assertion
       # step so that step is only the receipt runner (#3391).
       - name: Install uv for the connector readiness render
@@ -3747,11 +3918,12 @@ jobs:
         if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-byo-egress') }}
         run: bash scripts/check-runner-byo-egress.sh charts/curie
       # The actual packaged-chart hooks must judge a no-restart upgrade and
-      # still reject an informer RBAC failure (#4197). The scenario owns and
-      # tears down its separate kind cluster; render assertions alone cannot
-      # prove Helm leaves a serving release deployed.
+      # still reject an informer RBAC failure (#4197). Its lifecycle release
+      # uses this job's cluster; render assertions cannot prove hook behavior.
       - name: Controller preflight accepts a serving upgrade and refuses broken RBAC
         if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'controller-preflight') }}
+        env:
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
         run: |
           set -euo pipefail
           uv run bash charts/curie/ci/scenarios/controller-preflight-kind.sh
@@ -3778,8 +3950,19 @@ jobs:
             curie-api:wsdiag-${{ github.sha }} \
             curie-worker:wsdiag-${{ github.sha }} \
             curie-runner:wsdiag-${{ github.sha }} --name curie-e2e
-      - name: Workspace dependency failure reaches the terminal diagnostic
-        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') }}
+      - name: Install the shared workload platform
+        id: workload_install
+        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic')) }}
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
+          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+        run: bash tools/runtime-assertion-gate/run.sh charts/curie/ci/scenarios/workload-install.sh up
+      - name: Quota progress regression
+        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
         timeout-minutes: 30
         env:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
@@ -3788,10 +3971,11 @@ jobs:
           CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
           CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
           CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+        shell: uv run python tools/sandbox-admission-observer/run.py -- bash {0}
         run: |
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
-            charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh
+            charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh
       - name: Hosted connector credential rotation rolls only that connector
         if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') }}
         timeout-minutes: 45
@@ -3820,35 +4004,6 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/connector-apply-race-runtime.sh
-      - name: Quota progress regression
-        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
-        timeout-minutes: 30
-        env:
-          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
-          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
-          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
-        shell: uv run python tools/sandbox-admission-observer/run.py -- bash {0}
-        run: |
-          set -euo pipefail
-          bash tools/runtime-assertion-gate/run.sh \
-            charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh
-      - name: Failed first install retry recreates data volumes
-        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') }}
-        timeout-minutes: 30
-        env:
-          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
-          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
-          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
-        run: |
-          set -euo pipefail
-          bash tools/runtime-assertion-gate/run.sh \
-            charts/curie/ci/runtime/failed-first-install-retry-runtime.sh
       # #4889: a factory agent's real sandbox holds a 1280Mi workspace write for
       # at least 90 seconds, and the standard envelope evicts the same write.
       - name: Factory resource profile runtime (#4889)
@@ -3865,11 +4020,62 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/factory-resource-profile-runtime.sh
+      - name: Workspace dependency failure reaches the terminal diagnostic
+        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') }}
+        timeout-minutes: 30
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
+          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh
       - name: Dump cluster diagnostics on failure
         if: failure()
         run: |
           kubectl get pods -A -o wide || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true
+      - name: Remove the shared workload platform
+        if: ${{ always() && matrix.leg == 'workload' }}
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
+          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+        run: bash charts/curie/ci/scenarios/workload-install.sh down
+      # Temporarily disabled at maintainer request; diagnostics and causal repair: #5255.
+      - name: Failed first install retry recreates data volumes
+        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') && false }}
+        timeout-minutes: 30
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
+          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/failed-first-install-retry-runtime.sh
+      - name: Dump cluster diagnostics after lifecycle retry failure
+        if: failure()
+        run: |
+          kubectl --context kind-curie-e2e get pods -A -o wide || true
+          kubectl --context kind-curie-e2e get events -A --sort-by=.lastTimestamp | tail -50 || true
+      - name: Delete the job-owned kind cluster
+        if: always()
+        run: |
+          set -euo pipefail
+          kind delete cluster --name curie-e2e
+          remaining="$(docker ps -aq --filter label=io.x-k8s.kind.cluster=curie-e2e)"
+          test -z "$remaining"
       # Pass receipts written by tools/runtime-assertion-gate/run.sh. A script
       # that was skipped, never started, or failed leaves none, and
       # `E2E required` then fails for any added or changed one (#3391).

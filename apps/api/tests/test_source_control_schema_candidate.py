@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tomllib
 import uuid
 from pathlib import Path
@@ -51,7 +52,7 @@ def test_current_release_fields_match_cli_version(field: str) -> None:
     else:
         chart = yaml.safe_load((ROOT / "charts/curie/Chart.yaml").read_text())
         value = chart["version" if field == "chart" else "appVersion"]
-    assert value == "0.14.3"
+    assert value == expected
     assert value in catalog()["windows"]
 
 
@@ -111,10 +112,19 @@ def test_every_prior_registered_window_is_exactly_preserved() -> None:
     actual = catalog()["windows"]
     assert {name: actual[name] for name in expected} == expected
     assert actual["0.12.1"] == {"schema_min": "0076", "schema_head": "0076"}
-    assert set(actual) - set(expected) <= {
-        "0.12.1", "0.12.2", "0.12.3", "0.12.4", "0.12.5", "0.13.0", "0.13.1", "0.13.2",
-        "0.14.0", "0.14.1", "0.14.2", "0.14.3", "0.14.4"
-    }
+    # `curie dev bump-version` registers a window at the cut, so no window may
+    # name a release newer than the in-tree one (ADR-0257).
+    cargo = tomllib.loads((ROOT / "cli/Cargo.toml").read_text())
+    current = _release_key(cargo["package"]["version"])
+    assert [name for name in actual if _release_key(name) > current] == []
+
+
+def _release_key(version: str) -> tuple[int, int, int, int, int]:
+    """Order X.Y.Z and X.Y.Z-rc.N release names; an rc sorts before its release."""
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?", version)
+    assert match is not None, f"not a release name: {version!r}"
+    major, minor, patch, rc = match.groups()
+    return int(major), int(minor), int(patch), int(rc is None), int(rc or 0)
 
 
 def test_released_0076_startup_refuses_without_migrating_then_0101_starts(

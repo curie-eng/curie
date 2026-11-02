@@ -312,6 +312,11 @@ def _assert_ci_excludes_commenter(workflow: dict[str, Any]) -> None:
                 "SHARD": "1",
                 "PYTEST_DESELECT": "",
                 "PYTEST_SCOPE": pytest_scope,
+                "PYTEST_SHARDS": "6",
+                "PYTEST_STORAGE_SHARDS": "6",
+                "PYTEST_FULL_SHARDS": "6",
+                "STACK_TIER": "full",
+                "EVENT_NAME": "push",
             },
             capture_output=True,
             text=True,
@@ -337,7 +342,9 @@ def test_commenter_is_not_wired_into_the_required_python_job() -> None:
 def test_ci_commenter_guard_rejects_calls_posts_and_gates(job_id: str) -> None:
     commenter_steps = _load_workflow(WORKFLOW)["jobs"]["remind"]["steps"]
     mutations = [
-        *commenter_steps[1:],
+        *(step for step in commenter_steps
+          if "tools/p0-closes-ci/check.py" in step.get("run", "")
+          or step.get("uses", "").startswith("actions/github-script@")),
         {"uses": "./.github/workflows/p0-closes.yaml"},
         {"if": "needs.p0-closes.result == 'success'", "run": "true"},
     ]
