@@ -206,12 +206,12 @@ def _connect_home_team(evidence: SlackEvidence, installation_account: str) -> st
 
 def _ordinary_namespace(
     evidence: SlackEvidence, home: str, *, installation_account: str,
-    workspaces: Collection[str], organisations: Collection[str], answer: bool,
+    workspaces: Collection[str], organisations: Collection[str],
 ) -> str:
     """The namespace key for an established home team, or the refusal reason.
 
-    ADR 0261 decisions 3 and 4 on an ordinary workspace registration. An
-    answer's ``user.team_id`` must itself be the trusted organisation's key.
+    ADR 0261 decisions 3 and 4 on an ordinary workspace registration; the home
+    team is a mention's established team or an answer's ``user.team_id``.
     @spec HTTP-INVOCATION-EXECUTION-24.
     """
     signals = evidence.enterprise_ids
@@ -224,7 +224,10 @@ def _ordinary_namespace(
     organisation = signals[0]
     if any(signal != organisation for signal in signals) or organisation not in organisations:
         return NAMESPACE_CONFLICT
-    if home == installation_account or (answer and home != organisation):
+    # A member's user.team_id names their own workspace in the organisation,
+    # never the organisation id, so any home team other than the installation
+    # qualifies for a mention and an answer alike (ADR 0261 decision 4).
+    if home == installation_account:
         return NAMESPACE_CONFLICT
     return organisation
 
@@ -251,7 +254,7 @@ def _derive_ordinary(
             return home
         key = _ordinary_namespace(
             evidence, home, installation_account=installation_account,
-            workspaces=workspaces, organisations=organisations, answer=not connect,
+            workspaces=workspaces, organisations=organisations,
         )
         return key if key in _REASONS else (key, user_id)
     result = derive(
