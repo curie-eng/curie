@@ -79,6 +79,8 @@ _EVIDENCE_FIELDS = {
     "is_ext_shared_channel": None,
     "enterprise_ids": [],
 }
+# @spec HTTP-INVOCATION-EXECUTION-24: copied only when the event names one.
+_OPTIONAL_EVIDENCE_FIELDS = {"event_source_team"}
 
 
 @pytest.fixture(autouse=True)
@@ -158,8 +160,10 @@ def _norm(evidence: dict[str, Any]) -> dict[str, Any]:
     422 there; an omitted optional key is the same as its default.
     """
 
-    assert set(evidence) <= set(_EVIDENCE_FIELDS), sorted(set(evidence) - set(_EVIDENCE_FIELDS))
+    allowed = set(_EVIDENCE_FIELDS) | _OPTIONAL_EVIDENCE_FIELDS
+    assert set(evidence) <= allowed, sorted(set(evidence) - allowed)
     filled = {key: evidence.get(key, default) for key, default in _EVIDENCE_FIELDS.items()}
+    filled.update({key: evidence[key] for key in _OPTIONAL_EVIDENCE_FIELDS if key in evidence})
     filled["enterprise_ids"] = sorted(filled["enterprise_ids"] or [])
     return filled
 
@@ -237,9 +241,22 @@ def test_a_shared_channel_event_carries_the_senders_user_team() -> None:
         "interaction_user_team_id": None,
         "is_ext_shared_channel": True,
         "enterprise_ids": [],
+        # Copied, never interpreted (ADR 0261 decision 6).
+        "event_source_team": "TPARTNER1",
     }
-    # source_team is not one of the mapped fields (ADR 0201).
-    assert "TPARTNER1" not in [v for k, v in evidence.items() if k != "event_user_team"]
+
+
+def test_an_event_without_a_source_team_carries_no_source_team_key() -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-24: absent stays absent, so signed bytes are unchanged."""
+    for event in (
+        _mention(), _mention(source_team=None), _mention(source_team=""),
+        _mention(source_team=["TPARTNER1"]),
+    ):
+        evidence = slack_evidence(_event_body(event, is_ext_shared_channel=True))
+        assert evidence is not None
+        assert "event_source_team" not in evidence
+    answer = slack_evidence(_interaction_body("block_actions", source_team="TPARTNER1"))
+    assert answer is not None and "event_source_team" not in answer
 
 
 def test_every_enterprise_id_in_an_event_envelope_is_collected() -> None:

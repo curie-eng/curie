@@ -57,8 +57,7 @@ ORDINARY_CASES = [
      "is_ext_shared_channel": False},
     {"delivery": "app_mention", "user_id": "U0EXAMPLEONE", "event_team": "T0EXAMPLEOTHER",
      "is_ext_shared_channel": False},
-    {"delivery": "app_mention", "user_id": "U0EXAMPLEONE", "event_team": "T0EXAMPLEONE",
-     "is_ext_shared_channel": True},
+    # A Connect mention (is_ext_shared_channel True) is criterion 24's, not derive's.
     {"delivery": "app_mention", "user_id": "U0EXAMPLEONE", "event_team": "T0EXAMPLEONE"},
     {"delivery": "app_mention", "user_id": "U0EXAMPLEONE", "event_user_team": "T0EXAMPLEONE",
      "event_team": "T0EXAMPLEOTHER"},
@@ -127,7 +126,8 @@ def test_grid_answer_resolves_from_the_registered_workspace() -> None:
 
 
 @pytest.mark.parametrize(("evidence", "reason"), [
-    (mention(is_ext_shared_channel=True), "subject_unidentified"),
+    # A Connect mention from a sibling workspace (criterion 24 owns the shared flag).
+    (mention(is_ext_shared_channel=True, event_user_team=SIBLING), "namespace_conflict"),
     (mention(is_ext_shared_channel=None), "subject_unidentified"),
     (mention(enterprise_ids=[]), "subject_unidentified"),
     (mention(enterprise_ids=["is_enterprise_install"]), "subject_unidentified"),
