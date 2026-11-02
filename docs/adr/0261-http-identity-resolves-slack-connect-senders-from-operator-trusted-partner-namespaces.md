@@ -82,9 +82,18 @@ Connect channel.
 ### 4. Answers follow the same set
 
 Interaction payloads carry no shared flag. An answer keeps the documented
-sender field `user.team_id` (ADR 0201) and resolves when it is the
-installation account or a trusted key, in the matching namespace, after the
-same enterprise checks as decision 3. Anything else is `namespace_conflict`.
+sender field `user.team_id` (ADR 0201) as its home team. Without an
+enterprise id it resolves when that team is the installation account or a
+trusted workspace key, in the matching namespace. On an ordinary registration
+that trusts an organisation, an answer carrying any enterprise id resolves in
+that organisation's entry, with the organisation-wide user id unchanged, when
+every enterprise id is the same trusted organisation, the organisation-wide
+install signal is absent, and `user.team_id` is present and is not the
+installation account. A member's `user.team_id` names their own workspace in
+the organisation, never the organisation id, so any workspace of that
+organisation qualifies. A missing `user.team_id`, the organisation-wide
+install signal, or any enterprise id on a registration that trusts no
+organisation is `subject_unidentified`; anything else is `namespace_conflict`.
 
 One answer shape on a Grid workspace registration may differ. A partner
 member's click on a card in a Connect channel hosted in the organisation is
