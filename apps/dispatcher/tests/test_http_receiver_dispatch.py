@@ -442,10 +442,14 @@ def test_selected_repeated_refused_delivery_posts_one_notice(
         config, redis_client, rig, first, again, placeholders=(PLACEHOLDER_TS, "556.000"),
     )
     assert len(rig.requests) == 2
-    web.chat_update.assert_called_once_with(
-        channel=CHANNEL, ts=PLACEHOLDER_TS, text=REFUSED_TEXT,
-    )
-    web.chat_delete.assert_called_once_with(channel=CHANNEL, ts="556.000")
+    # Bolt's listener pool may run the two deliveries in either order: whichever
+    # is first turns its placeholder into the notice, the other is deleted.
+    web.chat_update.assert_called_once()
+    web.chat_delete.assert_called_once()
+    updated, deleted = web.chat_update.call_args.kwargs, web.chat_delete.call_args.kwargs
+    assert updated["channel"] == deleted["channel"] == CHANNEL
+    assert updated["text"] == REFUSED_TEXT
+    assert {updated["ts"], deleted["ts"]} == {PLACEHOLDER_TS, "556.000"}
     web.chat_postEphemeral.assert_not_called()
 
 
