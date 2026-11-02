@@ -1338,6 +1338,7 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      terminationGracePeriodSeconds: 0
       containers:
         - name: gate
           image: {{ .Values.image }}
@@ -1827,7 +1828,8 @@ sys.exit(result.returncode)
                 "unexpected real Helm fixture status"
             );
             println!(
-                "UTC={} elapsed={:.3}s release={} revision={} status={}",
+                "case={} UTC={} elapsed={:.3}s release={} revision={} status={}",
+                self.release_prefix,
                 OffsetDateTime::now_utc().format(&Rfc3339)?,
                 self.started.elapsed().as_secs_f64(),
                 release,
@@ -2060,8 +2062,12 @@ sys.exit(result.returncode)
             }
             let output =
                 self.processes[process].wait(deadline.saturating_duration_since(Instant::now()))?;
-            print!("{}", String::from_utf8_lossy(&output.stdout));
-            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                println!("case={} {line}", self.release_prefix);
+            }
+            for line in String::from_utf8_lossy(&output.stderr).lines() {
+                eprintln!("case={} {line}", self.release_prefix);
+            }
             anyhow::ensure!(output.status.success(), "private convergence child failed");
             Ok(())
         }
@@ -2096,23 +2102,45 @@ sys.exit(result.returncode)
             Ok(())
         }
 
-        fn diagnostics(&self, case: &str) {
-            for release in &self.releases {
-                for (program, args) in [
-                    (
-                        "kubectl",
-                        vec!["get", "all,events", "-n", release, "-o", "yaml"],
-                    ),
-                    (
-                        "helm",
-                        vec!["status", release, "-n", release, "--show-desc"],
-                    ),
-                ] {
-                    match self.invoke(program, &args, Duration::from_secs(10)) {
-                        Ok(output) => eprintln!("case={case} {program} diagnostics: {output}"),
-                        Err(error) => eprintln!("case={case} diagnostics failed: {error:#}"),
+        fn diagnostic(&self, case: &str, program: &str, args: &[&str]) {
+            match self.invoke(program, args, Duration::from_secs(10)) {
+                Ok(output) => {
+                    for line in output.lines() {
+                        eprintln!(
+                            "case={} scenario={case} {program}: {line}",
+                            self.release_prefix
+                        );
                     }
                 }
+                Err(error) => {
+                    for line in format!("{error:#}").lines() {
+                        eprintln!(
+                            "case={} scenario={case} diagnostics failed: {line}",
+                            self.release_prefix
+                        );
+                    }
+                }
+            }
+        }
+
+        fn diagnostics(&self, case: &str) {
+            self.diagnostic(case, "kubectl", &["get", "nodes", "-o", "yaml"]);
+            self.diagnostic(
+                case,
+                "kubectl",
+                &["get", "events", "-n", "kube-system", "-o", "yaml"],
+            );
+            for release in &self.releases {
+                self.diagnostic(
+                    case,
+                    "kubectl",
+                    &["get", "all,events", "-n", release, "-o", "yaml"],
+                );
+                self.diagnostic(
+                    case,
+                    "helm",
+                    &["status", release, "-n", release, "--show-desc"],
+                );
             }
         }
 
@@ -2225,7 +2253,7 @@ sys.exit(result.returncode)
                 "fixture cleanup failed: {}",
                 errors.join("; ")
             );
-            println!("fixture cleanup verified");
+            println!("case={} fixture cleanup verified", self.release_prefix);
             Ok(())
         }
     }
@@ -2233,7 +2261,10 @@ sys.exit(result.returncode)
     impl Drop for Fixture {
         fn drop(&mut self) {
             if !self.cleaned && self.cleanup().is_err() {
-                eprintln!("fixture cleanup guard could not verify teardown");
+                eprintln!(
+                    "case={} fixture cleanup guard could not verify teardown",
+                    self.release_prefix
+                );
             }
         }
     }
@@ -2487,7 +2518,10 @@ sys.exit(result.returncode)
         scenario: impl FnOnce(&mut Fixture) -> Result<()>,
     ) -> Result<()> {
         let mut fixture = Fixture::for_case(shared)?;
-        println!("case={name} started cluster={}", fixture.cluster);
+        println!(
+            "case={} scenario={name} started cluster={}",
+            fixture.release_prefix, fixture.cluster
+        );
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scenario(&mut fixture)))
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("case {name} panicked")));
@@ -2496,7 +2530,8 @@ sys.exit(result.returncode)
         }
         let cleanup = fixture.cleanup();
         println!(
-            "case={name} completed elapsed={:.3}s",
+            "case={} scenario={name} completed elapsed={:.3}s",
+            fixture.release_prefix,
             fixture.started.elapsed().as_secs_f64()
         );
         match (outcome, cleanup) {
