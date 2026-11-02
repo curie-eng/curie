@@ -131,9 +131,10 @@ def _input_problems(values: dict[str, dict[str, Any]], compose: dict[str, Any]) 
         for where, image in _image_values(data, filename):
             if reason := _image_problem(image):
                 errors.append(f"P1 {where}: {reason}")
-        image = (data.get("postgres") or {}).get("image")
-        if image and (
-            not isinstance(image, str) or not re.fullmatch(r".+@sha256:[0-9a-fA-F]{64}", image)
+        postgres_image = (data.get("postgres") or {}).get("image")
+        if postgres_image and (
+            not isinstance(postgres_image, str)
+            or not re.fullmatch(r".+@sha256:[0-9a-fA-F]{64}", postgres_image)
         ):
             errors.append(
                 f"P1 {filename} postgres.image must be digest-pinned for fsGroup identity"
@@ -146,10 +147,10 @@ def _input_problems(values: dict[str, dict[str, Any]], compose: dict[str, Any]) 
         if not isinstance(service, dict):
             errors.append(f"P1 compose.dev.yaml services.{name} must be a mapping")
             continue
-        image = service.get("image")
-        if not image or FIRST_PARTY_PREFIX in str(image):
+        compose_image = service.get("image")
+        if not compose_image or FIRST_PARTY_PREFIX in str(compose_image):
             continue
-        if reason := _image_problem(str(image).strip()):
+        if reason := _image_problem(str(compose_image).strip()):
             errors.append(f"P1 compose.dev.yaml services.{name}: {reason}")
     return errors
 
@@ -423,7 +424,9 @@ def audit_chart(
             documents = [doc for doc in yaml.safe_load_all(rendered.stdout) if doc is not None]
             if not documents or any(not isinstance(doc, dict) for doc in documents):
                 raise ValueError("enumeration: render must contain YAML objects")
-            settings = _settings(values["values.yaml"], values.get(profile, {}), helm_args)
+            settings = _settings(
+                values["values.yaml"], values[profile] if profile is not None else {}, helm_args
+            )
             endpoint = _endpoint(documents, settings)
         except (OSError, subprocess.TimeoutExpired, ValueError, yaml.YAMLError) as exc:
             errors.append(f"enumeration [{label}]: {exc}")
