@@ -10446,6 +10446,8 @@ export interface components {
             duplicate: boolean;
             /** Event Id */
             event_id: string;
+            /** Reply Ref */
+            reply_ref?: string | null;
             /** Stream Id */
             stream_id: string | null;
         };

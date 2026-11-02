@@ -14704,6 +14704,17 @@
             "title": "Event Id",
             "type": "string"
           },
+          "reply_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Ref"
+          },
           "stream_id": {
             "anyOf": [
               {
