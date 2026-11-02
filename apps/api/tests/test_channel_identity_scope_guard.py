@@ -33,8 +33,8 @@ PASTED = [
     "rk_live_abc123",
     "lin_api_abc123",
     "AIzaSyA1b2c3D4e5F6g7",
-    "AKIA1234567890ABCDEF",
-    "ASIA1234567890ABCDEF",
+    "AKIAIOSFODNN7EXAMPLE",
+    "ASIAIOSFODNN7EXAMPLE",
     "0123456789abcdef" * 2,
     "eyJhbGciOiJIUzI1NiJ9.e30.sig",
 ]
