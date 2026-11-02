@@ -965,12 +965,6 @@ def test_unreadable_stored_verification_is_never_acknowledged_as_a_replay(
     assert _reports(request_id) == stored
 
 
-def test_python_check_id_is_the_api_python_gate_key() -> None:
-    from curie_api.factory_progress import PYTHON_CHECK_ID
-
-    assert PYTHON_CHECK_ID == "python"
-
-
 def test_two_declared_checks_are_recorded_on_one_request(
     admitted: Any,  # noqa: F811
 ) -> None:

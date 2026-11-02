@@ -44,6 +44,8 @@ from curie_worker.publication_validation import (
 )
 from curie_worker.runner_client import RunnerClient
 
+pytestmark = pytest.mark.xdist_independent
+
 
 def _load_gate_helpers() -> Any:
     """The review gate test module, loaded by path: ``examples/tests`` is no package."""
