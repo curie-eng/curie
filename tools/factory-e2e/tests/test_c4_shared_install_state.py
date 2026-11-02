@@ -44,6 +44,13 @@ def clean_baseline() -> InstallSnapshot:
         streams=frozenset({"curie:runs"}),
         claimed_sandboxes=frozenset(),
         terminating_pods=frozenset(),
+        table_rows=(
+            ("agents", 0),
+            ("factory_poll_cursors", 2),
+            ("tenants", 1),
+            ("work_items", 0),
+        ),
+        persistent_keys=frozenset({"curie:runs"}),
     )
 
 
@@ -76,6 +83,17 @@ def test_separately_built_equal_snapshot_is_clean() -> None:
         streams=frozenset(["curie:runs"]),
         claimed_sandboxes=frozenset(),
         terminating_pods=frozenset(),
+        table_rows=tuple(
+            sorted(
+                [
+                    ("work_items", 0),
+                    ("tenants", 1),
+                    ("factory_poll_cursors", 2),
+                    ("agents", 0),
+                ]
+            )
+        ),
+        persistent_keys=frozenset(["curie:runs"]),
     )
     assert leftover_state(baseline, current) == []
 
@@ -105,6 +123,16 @@ def test_separately_built_equal_snapshot_is_clean() -> None:
         ("streams", frozenset({"curie:runs", "curie:other"})),
         ("claimed_sandboxes", frozenset({"sandbox-1"})),
         ("terminating_pods", frozenset({"pod-1"})),
+        (
+            "table_rows",
+            (
+                ("agents", 1),
+                ("factory_poll_cursors", 2),
+                ("tenants", 1),
+                ("work_items", 0),
+            ),
+        ),
+        ("persistent_keys", frozenset({"curie:runs", "curie:other"})),
     ],
 )
 def test_single_violation_yields_one_message_naming_field(field: str, value: object) -> None:
@@ -274,6 +302,79 @@ def test_two_violations_give_two_messages() -> None:
     assert len(messages) == 2
     assert any("agents" in m for m in messages)
     assert any("deployments" in m for m in messages)
+
+
+def test_leftover_and_changed_table_rows_are_named_with_counts() -> None:
+    baseline = replace(
+        clean_baseline(),
+        table_rows=(
+            ("agents", 0),
+            ("factory_poll_cursors", 2),
+            ("factory_terminal_notices", 0),
+            ("tenants", 1),
+            ("work_items", 0),
+        ),
+    )
+    current = replace(
+        baseline,
+        table_rows=(
+            ("agents", 0),
+            ("factory_poll_cursors", 3),
+            ("factory_terminal_notices", 3),
+            ("tenants", 1),
+            ("work_items", 0),
+        ),
+    )
+    messages = leftover_state(baseline, current)
+    assert len(messages) == 1
+    assert "table_rows" in messages[0]
+    assert "factory_terminal_notices 0 -> 3" in messages[0]
+    assert "factory_poll_cursors 2 -> 3" in messages[0]
+    assert "tenants" not in messages[0]
+    assert "work_items" not in messages[0]
+
+
+def test_table_present_only_in_current_is_named() -> None:
+    baseline = clean_baseline()
+    current = replace(
+        baseline,
+        table_rows=tuple(sorted([*baseline.table_rows, ("factory_extra_rows", 4)])),
+    )
+    messages = leftover_state(baseline, current)
+    assert len(messages) == 1
+    assert "table_rows" in messages[0]
+    assert "factory_extra_rows" in messages[0]
+
+
+def test_table_present_only_in_baseline_is_named() -> None:
+    baseline = clean_baseline()
+    current = replace(
+        baseline,
+        table_rows=tuple(row for row in baseline.table_rows if row[0] != "tenants"),
+    )
+    messages = leftover_state(baseline, current)
+    assert len(messages) == 1
+    assert "table_rows" in messages[0]
+    assert "tenants" in messages[0]
+
+
+def test_extra_kill_flag_is_named() -> None:
+    baseline = clean_baseline()
+    kill_flag = "curie:kill:00000000-0000-0000-0000-000000000001"
+    current = replace(baseline, persistent_keys=baseline.persistent_keys | {kill_flag})
+    messages = leftover_state(baseline, current)
+    assert len(messages) == 1
+    assert "persistent_keys" in messages[0]
+    assert kill_flag in messages[0]
+
+
+def test_missing_persistent_key_is_named() -> None:
+    baseline = clean_baseline()
+    current = replace(baseline, persistent_keys=frozenset())
+    messages = leftover_state(baseline, current)
+    assert len(messages) == 1
+    assert "persistent_keys" in messages[0]
+    assert "curie:runs" in messages[0]
 
 
 def test_case_isolation_error_is_runtime_error() -> None:
