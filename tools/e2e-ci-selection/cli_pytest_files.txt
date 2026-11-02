@@ -31,6 +31,7 @@ charts/curie/ci/test_cron_approval_receipt.py
 charts/curie/ci/test_factory_resource_profile_runtime.py
 charts/curie/ci/test_failed_first_install_diagnostics.py
 charts/curie/ci/test_quota_progress_inputs.py
+charts/curie/ci/test_workload_install_inputs.py
 charts/curie/ci/test_workspace_diagnostic_inputs.py
 compose/tests/test_cluster_recovery_template.py
 compose/tests/test_ensure_release_images.py

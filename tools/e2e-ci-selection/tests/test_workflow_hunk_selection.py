@@ -339,7 +339,7 @@ def test_relevant_workflow_edit_runs_upgrade_smoke_before_merge(
     assert result.returncode == 0, result.stderr
     assert output["released_upgrade"] == "true"
     assert output["released_upgrade_full"] == "false"
-    assert output["cluster"] == "false"
+    assert output["cluster"] == str(not omit_kind).lower()
     SELECTION_TESTS._assert_upgrade_smoke_shards(tmp_path, output)
 
 
