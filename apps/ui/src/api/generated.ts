@@ -10021,6 +10021,8 @@ export interface components {
          *     mapping does not use cannot be sent as if it were evidence.
          */
         SlackEvidence: {
+            /** Channel Type */
+            channel_type?: string | null;
             /** Delivery */
             delivery: string;
             /** Enterprise Ids */
