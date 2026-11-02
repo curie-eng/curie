@@ -430,7 +430,7 @@ def _delete_placeholder(
 
 
 class SelectedMention:
-    """What one selected mention submission ended with.
+    """What one selected mention or direct message submission ended with.
 
     ``placeholder`` is this attempt's placeholder ts while it still stands: None
     when none was posted or it was deleted. @spec HTTP-INVOCATION-EXECUTION-27.
@@ -455,6 +455,9 @@ def submit_selected_mention(
     bot_user_id: str | None,
 ) -> SelectedMention:
     """Prepare, post the legacy placeholder, submit its slot, settle the placeholder.
+
+    Serves the selected mention and plain direct message lanes alike
+    (criterion 26); ``prepare`` decides which events are submitted.
 
     The placeholder is posted only for a submission that passed every local
     check, and is deleted only on proof that another slot owns the turn: a
@@ -1188,6 +1191,40 @@ def register_handlers(
             return BoltResponse(status=status, body="")
         return next()
 
+    def _selected_delivery(
+        runtime: HttpReceiverRuntime, body: dict[str, Any], event: dict[str, Any],
+        context: dict[str, Any], *, lane: str,
+    ) -> None:
+        """Submit one selected mention or direct message and settle its placeholder.
+
+        @spec HTTP-INVOCATION-EXECUTION-19/26/27.
+        """
+        delivery = submit_selected_mention(
+            runtime, web_client=web_client, config=config, log=log, body=body,
+            event=event, slack_identity=slack_identity,
+            bot_user_id=context.get("bot_user_id"),
+        )
+        result = delivery.result
+        if result.status not in {"refused", "unavailable"}:
+            return
+        drop(
+            log, DropReason.CALLER_NOT_ALLOWED if result.status == "refused"
+            else DropReason.ADMISSION_UNAVAILABLE, lane=lane,
+            event_id=str(body.get("event_id") or ""),
+        )
+        assert selected_notices is not None
+        if result.status == "refused" and delivery.placeholder is not None:
+            # @spec HTTP-INVOCATION-EXECUTION-27: the placeholder becomes the notice.
+            selected_notices.replace(
+                body=body, event=event, bot_user_id=context.get("bot_user_id"),
+                channel=str(event.get("channel")), placeholder=delivery.placeholder,
+            )
+        else:
+            selected_notices.send(
+                status=result.status, body=body, event=event,
+                bot_user_id=context.get("bot_user_id"),
+            )
+
     @app.event("app_mention", middleware=[_driver_approval_owner])
     def _on_app_mention(
         body: dict[str, Any], event: dict[str, Any], context: dict[str, Any]
@@ -1200,30 +1237,7 @@ def register_handlers(
                 slack_identity=slack_identity, log=log,
             ):
                 return
-            mention = submit_selected_mention(
-                http_receiver, web_client=web_client, config=config, log=log, body=body,
-                event=event, slack_identity=slack_identity,
-                bot_user_id=context.get("bot_user_id"),
-            )
-            result = mention.result
-            if result.status in {"refused", "unavailable"}:
-                drop(
-                    log, DropReason.CALLER_NOT_ALLOWED if result.status == "refused"
-                    else DropReason.ADMISSION_UNAVAILABLE, lane="mention",
-                    event_id=str(body.get("event_id") or ""),
-                )
-                assert selected_notices is not None
-                if result.status == "refused" and mention.placeholder is not None:
-                    # @spec HTTP-INVOCATION-EXECUTION-27: the placeholder becomes the notice.
-                    selected_notices.replace(
-                        body=body, event=event, bot_user_id=context.get("bot_user_id"),
-                        channel=str(event.get("channel")), placeholder=mention.placeholder,
-                    )
-                else:
-                    selected_notices.send(
-                        status=result.status, body=body, event=event,
-                        bot_user_id=context.get("bot_user_id"),
-                    )
+            _selected_delivery(http_receiver, body, event, context, lane="mention")
             return
         process_event(
             body=body,
@@ -1250,21 +1264,8 @@ def register_handlers(
                 # Every other message event stays silent.
                 drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="", lane="im")
                 return
-            result = http_receiver.submit(
-                body=body, event=event, slack_identity=slack_identity,
-                bot_user_id=context.get("bot_user_id"),
-            )
-            if result.status in {"refused", "unavailable"}:
-                drop(
-                    log, DropReason.CALLER_NOT_ALLOWED if result.status == "refused"
-                    else DropReason.ADMISSION_UNAVAILABLE, lane="im",
-                    event_id=str(body.get("event_id") or ""),
-                )
-                assert selected_notices is not None
-                selected_notices.send(
-                    status=result.status, body=body, event=event,
-                    bot_user_id=context.get("bot_user_id"),
-                )
+            # @spec HTTP-INVOCATION-EXECUTION-27: the same placeholder and slot flow.
+            _selected_delivery(http_receiver, body, event, context, lane="im")
             return
         # ENVELOPE VALIDATION, not a relevance decision (#2006). The manifest at
         # `apps/dispatcher/slack-app-manifest.yaml` subscribes bot_events to
