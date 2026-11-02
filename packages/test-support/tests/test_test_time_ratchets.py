@@ -671,7 +671,11 @@ def test_budget_scope_uses_changed_definition_ranges(
     file = duration_history(
         tmp_path, monkeypatch, original, original.replace("return 1", "return 2")
     )
-    source(tmp_path, "tests/test_added.py", "if True:\n    def test_added(): pass\n")
+    source(
+        tmp_path,
+        "tests/test_added.py",
+        "if True:\n    def test_added(): pass\ndef helper(): pass\ntest_alias = helper\n",
+    )
     git(tmp_path, "add", ".")
     git(tmp_path, "commit", "-qm", "Add a test file")
     collected = [
@@ -680,9 +684,14 @@ def test_budget_scope_uses_changed_definition_ranges(
         file + "::test_changed",
         file + "::test_neighbor",
         "tests/test_added.py::test_added",
+        "tests/test_added.py::test_alias",
     ]
     enforced = budget_targets(tmp_path, collected)
-    assert enforced == {file + "::test_changed", "tests/test_added.py::test_added"}
+    assert enforced == {
+        file + "::test_changed",
+        "tests/test_added.py::test_added",
+        "tests/test_added.py::test_alias",
+    }
     assert budget_failure(file + "::test_existing", 120, enforced) is None
     assert budget_failure(file + "::test_existing[new]", 120, enforced) is None
     assert budget_failure(file + "::test_neighbor", 120, enforced) is None
