@@ -277,4 +277,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0255 | [Claim-backed sandbox scratch is bounded by its storage request](0255-claim-backed-sandbox-scratch-is-bounded-by-its-storage-request.md) | Draft |
 | 0256 | [Publication validates and pushes a Git object overlay](0256-publication-validates-and-pushes-a-git-object-overlay.md) | Draft |
 | 0257 | [A release registers its schema window only at the cut](0257-a-release-registers-its-schema-window-only-at-the-cut.md) | Accepted |
+| 0262 | [The dispatcher qualifies each HTTP receiver once behind its own failure boundary](0262-the-dispatcher-qualifies-each-http-receiver-once-behind-its-own-failure-boundary.md) | Draft |
 <!-- END GENERATED: adr-index -->
