@@ -165,6 +165,95 @@ def main():
     environment["CURIE_CONFIG_DIR"] = str(workdir / "curie-config")
     namespace_owned = False
 
+    def diagnostics():
+        reasons = frozenset((
+            "ProgressDeadlineExceeded BackoffLimitExceeded DeadlineExceeded CrashLoopBackOff "
+            "ImagePullBackOff ErrImagePull InvalidImageName CreateContainerConfigError "
+            "CreateContainerError RunContainerError OOMKilled Error Evicted ContainerCannotRun "
+            "Unschedulable Completed ErrImageNeverPull ContainerCreating PodInitializing "
+            "FailedScheduling FailedMount FailedAttachVolume FailedCreatePodSandBox BackOff "
+            "Unhealthy Failed MinimumReplicasUnavailable ReplicaSetUpdated NewReplicaSetAvailable"
+        ).split())
+        roles = frozenset((
+            "api worker runner init delay postgres valkey clickhouse rustfs langfuse-web "
+            "langfuse-worker langfuse-model-pricing wait-for-postgres wait-for-valkey "
+            "wait-for-clickhouse wait-for-rustfs"
+        ).split())
+
+        def code(value, allowed, default="UnrecognizedReason"):
+            return value if isinstance(value, str) and value in allowed else default
+
+        def count(value):
+            return min(999999, max(0, value)) if type(value) is int else 0
+
+        def rows(value):
+            if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+                raise ValueError
+            return value[:12]
+
+        def conditions(status, allowed):
+            for condition in rows(status.get("conditions", []))[:8]:
+                kind = code(condition.get("type"), allowed, "UnknownCondition")
+                state = code(condition.get("status"), {"True", "False", "Unknown"}, "Unknown")
+                emit(f"condition={kind} status={state} reason={code(condition.get('reason'), reasons)}")
+
+        for resource in ("pods", "deployments", "events", "nodes"):
+            printed = 0
+
+            def emit(line, *, force=False):
+                nonlocal printed
+                line = f"DIAG: {resource} {line}"
+                if force or printed + len(line) < 1600:
+                    try:
+                        print(line)
+                    except (OSError, ValueError):
+                        pass
+                    printed += len(line) + 1
+
+            try:
+                options = ("--field-selector=type=Warning",) if resource == "events" else ()
+                result = kc("get", resource, *options, "-o", "json", timeout=10, check=False)
+                if result.returncode != 0:
+                    raise ValueError
+                items = rows(json.loads(result.stdout)["items"])
+                for item in items:
+                    status = item.get("status", {})
+                    if resource == "pods":
+                        phase = code(status.get("phase"),
+                                     {"Pending", "Running", "Succeeded", "Failed", "Unknown"}, "Unknown")
+                        emit(f"phase={phase} reason={code(status.get('reason'), reasons)}")
+                        conditions(status, {"PodScheduled", "Initialized", "ContainersReady", "Ready",
+                                            "PodReadyToStartContainers", "DisruptionTarget"})
+                        for field, group in (("initContainerStatuses", "init"), ("containerStatuses", "app")):
+                            for container in rows(status.get(field, []))[:8]:
+                                role = code(container.get("name"), roles, "unknown")
+                                prefix = f"container={group} role={role} restarts={count(container.get('restartCount'))}"
+                                emit(prefix)
+                                for state_field, age in (("state", "current"), ("lastState", "previous")):
+                                    state = container.get(state_field, {})
+                                    for kind in ("waiting", "running", "terminated"):
+                                        if kind not in state:
+                                            continue
+                                        detail = state[kind]
+                                        line = f"{prefix} {age}={kind}"
+                                        if kind != "running":
+                                            line += f" reason={code(detail.get('reason'), reasons)}"
+                                        if kind == "terminated":
+                                            line += f" exit={count(detail.get('exitCode'))}"
+                                        emit(line)
+                    elif resource == "deployments":
+                        conditions(status, {"Available", "Progressing", "ReplicaFailure"})
+                    elif resource == "events" and item.get("type") == "Warning":
+                        kind = code(item.get("involvedObject", {}).get("kind"),
+                                    {"Pod", "Deployment", "ReplicaSet", "StatefulSet", "DaemonSet", "Job",
+                                     "Node", "PersistentVolumeClaim", "PersistentVolume"}, "UnknownKind")
+                        emit(f"Warning kind={kind} reason={code(item.get('reason'), reasons)}")
+                    elif resource == "nodes":
+                        conditions(status, {"Ready", "MemoryPressure", "DiskPressure", "PIDPressure",
+                                            "NetworkUnavailable"})
+            except Exception:
+                emit("unavailable", force=True)
+
     def cleanup():
         failures = []
 
@@ -425,6 +514,10 @@ except Exception:
 ''', stdin=json.dumps(authentication), timeout=30)
         require(probe.stdout.strip() == "200", "generated chart credentials did not authenticate to Langfuse projects")
         print("OK: Langfuse model-pricing hook succeeded and authenticated projects API returned 200")
+    except Exception:
+        if namespace_owned:
+            diagnostics()
+        raise
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         signal.signal(signal.SIGINT, signal.SIG_IGN)

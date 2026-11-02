@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -339,7 +340,7 @@ def test_relevant_workflow_edit_runs_upgrade_smoke_before_merge(
     assert result.returncode == 0, result.stderr
     assert output["released_upgrade"] == "true"
     assert output["released_upgrade_full"] == "false"
-    assert output["cluster"] == "false"
+    assert output["cluster"] == str(not omit_kind).lower()
     SELECTION_TESTS._assert_upgrade_smoke_shards(tmp_path, output)
 
 
@@ -404,13 +405,18 @@ def test_ordinary_next_pr_still_omits_kind(
 
 
 @pytest.mark.parametrize(
-    "changed", ["README.md", "cli/src/queue-example.rs", "apps/worker/src/queue_example.py"],
+    "changed", [
+        "README.md", "cli/src/queue-example.rs", "apps/worker/src/queue_example.py",
+        "tools/factory-e2e/queue-example.py", "charts/curie/templates/queue-example.yaml",
+        "apps/api/migrations/versions/queue_example.py",
+    ],
 )
+@pytest.mark.parametrize("train", ["main", "next"])
 def test_merge_group_payload_selects_the_same_diff_as_pull_request(
-    git_repo: tuple[Path, str], tmp_path: Path, changed: str,
+    git_repo: tuple[Path, str], tmp_path: Path, changed: str, train: str,
 ) -> None:
     repo, base = git_repo
-    _git(repo, "branch", "-M", "main")
+    _git(repo, "branch", "-M", train)
     _git(repo, "remote", "add", "origin", str(repo))
     _git(repo, "checkout", "-qb", "candidate")
     path = repo / changed
@@ -421,8 +427,8 @@ def test_merge_group_payload_selects_the_same_diff_as_pull_request(
     head = _git(repo, "rev-parse", "HEAD")
     # Payload schema: https://docs.github.com/en/webhooks/webhook-events-and-payloads#merge_group
     payload = {"action": "checks_requested", "merge_group": {
-        "base_sha": base, "head_sha": head, "base_ref": "refs/heads/main",
-        "head_ref": f"refs/heads/gh-readonly-queue/main/pr-1-{head}",
+        "base_sha": base, "head_sha": head, "base_ref": f"refs/heads/{train}",
+        "head_ref": f"refs/heads/gh-readonly-queue/{train}/pr-1-{head}",
     }}
     workflow = yaml.safe_load((REPO_ROOT / WORKFLOW_PATH).read_text())
     script = next(step["run"] for step in workflow["jobs"]["changes"]["steps"]
@@ -432,7 +438,7 @@ def test_merge_group_payload_selects_the_same_diff_as_pull_request(
         rendered = script
         for expression, value in {
             "github.event_name": event,
-            "github.base_ref": "main" if event == "pull_request" else "",
+            "github.base_ref": train if event == "pull_request" else "",
             "github.event.merge_group.base_sha": payload["merge_group"]["base_sha"],
             "github.event.merge_group.head_sha": payload["merge_group"]["head_sha"],
         }.items():
@@ -451,6 +457,11 @@ def test_merge_group_payload_selects_the_same_diff_as_pull_request(
         assert result.returncode == 0, result.stdout + result.stderr
         selections.append(output.read_text())
     assert selections[0] == selections[1]
+    outputs = dict(line.split("=", 1) for line in selections[1].splitlines())
+    if changed.startswith("tools/factory-e2e/"):
+        assert outputs["factory"] == outputs["cluster"] == "true"
+    if changed.startswith("charts/curie/") or changed.startswith("apps/api/migrations/"):
+        assert "failed-first-install-retry" in json.loads(outputs["chart_scenarios"])
 
 
 @pytest.mark.parametrize(

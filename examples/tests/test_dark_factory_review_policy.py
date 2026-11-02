@@ -30,6 +30,8 @@ import pytest
 from curie_api import factory_ci
 from curie_runner.sender_frame import frame_user_turn
 
+pytestmark = pytest.mark.xdist_independent
+
 
 def _load_gate_helpers() -> Any:
     """The review gate test module, loaded by path: ``examples/tests`` is no package."""

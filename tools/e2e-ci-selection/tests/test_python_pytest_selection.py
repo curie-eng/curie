@@ -1041,8 +1041,8 @@ def test_admitted_agent_factory_step_runs_whole_module_and_propagates_failure(
     assert arguments[arguments.index("-n") + 1] == "0"
     assert all(
         argument in {
-            "run", "pytest", "-q", "-v", "-vv", "-n", "0", "--case-shard", "3/5",
-            ADMITTED_AGENT_RUNTIME,
+            "run", "pytest", "-q", "-v", "-vv", "-n", "0", "--durations=0",
+            "--case-shard", "3/5", ADMITTED_AGENT_RUNTIME,
         }
         for argument in arguments
     ), arguments
