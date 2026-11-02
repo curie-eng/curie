@@ -99,29 +99,42 @@ end
 
 _IDENTITY_RECEIPT_LUA = """
 -- @spec HTTP-INVOCATION-EXECUTION-7, HTTP-INVOCATION-EXECUTION-14.
+-- @spec HTTP-INVOCATION-EXECUTION-27: the third result is the accepted turn's
+-- reply slot, or '' when its receipt names none.
+local function reply_slot(raw)
+  if type(raw) ~= 'string' then return false end
+  local whole, fraction = string.match(raw, '^([0-9]+)%.([0-9]+)$')
+  return whole ~= nil and #whole <= 20 and #fraction <= 20
+end
 local function identity_receipt(cur, metadata, intent)
   if not cur then
-    if metadata then return -6, '' end
-    return 0, ''
+    if metadata then return -6, '', '' end
+    return 0, '', ''
   end
   if #cur == 40 and string.match(cur, '^pending:[0-9a-f]+$') then
-    if metadata then return -6, '' end
-    return 0, cur
+    if metadata then return -6, '', '' end
+    return 0, cur, ''
   end
   if not string.match(cur, '^[0-9]+%-[0-9]+$')
-     or not metadata or #metadata > 512 then return -6, '' end
+     or not metadata or #metadata > 512 then return -6, '', '' end
+  local slot = ''
   local context, saved_intent, stream = string.match(metadata,
     '^{"context_digest":"([0-9a-f]+)","intent_digest":"([0-9a-f]+)","schema_version":1,"stream_id":"([0-9]+%-[0-9]+)"}$')
-  if not context or #context ~= 64 or #saved_intent ~= 64
-     or saved_intent ~= intent or stream ~= cur then return -6, '' end
-  return 1, cur
+  if not context then
+    context, saved_intent, slot, stream = string.match(metadata,
+      '^{"context_digest":"([0-9a-f]+)","intent_digest":"([0-9a-f]+)","reply_ref":"([0-9.]+)","schema_version":1,"stream_id":"([0-9]+%-[0-9]+)"}$')
+    if not context or not reply_slot(slot) then return -6, '', '' end
+  end
+  if #context ~= 64 or #saved_intent ~= 64
+     or saved_intent ~= intent or stream ~= cur then return -6, '', '' end
+  return 1, cur, slot
 end
 """
 
 _IDENTITY_RECEIPT_READ = _IDENTITY_RECEIPT_LUA + """
-local status, value = identity_receipt(
+local status, value, slot = identity_receipt(
   redis.call('GET', KEYS[1]), redis.call('GET', KEYS[2]), ARGV[1])
-return {status, value}
+return {status, value, slot}
 """
 
 _ENQUEUE_SCRIPT = _DELIVERY_WINDOW_LUA + _IDENTITY_RECEIPT_LUA + """
@@ -136,7 +149,7 @@ end
 local bounds = nil
 if guarded then
   local key_count = identity and 5 or 4
-  local arg_count = identity and 17 or 14
+  local arg_count = identity and 18 or 14
   if #KEYS ~= key_count or #ARGV ~= arg_count or ARGV[7] ~= '' then
     return invalid_protocol()
   end
@@ -165,7 +178,8 @@ if guarded then
        or (ARGV[5] ~= '' and ARGV[5] ~= 'traceparent')
        or (ARGV[5] == '') ~= (ARGV[6] == '')
        or ARGV[3] == '' or ARGV[3] == 'curie_identity_context_v1'
-       or ARGV[3] == ARGV[5] then
+       or ARGV[3] == ARGV[5]
+       or (ARGV[18] ~= '' and not reply_slot(ARGV[18])) then
       return invalid_protocol()
     end
   end
@@ -217,8 +231,11 @@ if cur == ARGV[1] or not cur then
   if not cur then redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[4]) end
   local id = append()
   if identity then
+    -- @spec HTTP-INVOCATION-EXECUTION-27: a slot is retained only when named.
+    local slot = ''
+    if ARGV[18] ~= '' then slot = '","reply_ref":"' .. ARGV[18] end
     local metadata = '{"context_digest":"' .. ARGV[17]
-      .. '","intent_digest":"' .. ARGV[16]
+      .. '","intent_digest":"' .. ARGV[16] .. slot
       .. '","schema_version":1,"stream_id":"' .. id .. '"}'
     redis.call('MSET', KEYS[1], id, KEYS[5], metadata)
   elseif with_receipt then
@@ -406,10 +423,17 @@ class DeliveryIdentityContext:
     capsule: str = field(repr=False)
     intent_digest: str = field(repr=False)
     receipt_key: str = field(repr=False)
+    # @spec HTTP-INVOCATION-EXECUTION-27: authenticated, retained, never intent.
+    reply_ref: str = field(default="", repr=False)
 
     def __post_init__(self) -> None:
-        """@spec HTTP-INVOCATION-EXECUTION-14."""
+        """@spec HTTP-INVOCATION-EXECUTION-14 HTTP-INVOCATION-EXECUTION-27."""
         try:
+            if (
+                type(self.reply_ref) is not str
+                or (self.reply_ref and not is_reply_slot(self.reply_ref))
+            ):
+                raise ValueError
             if (
                 type(self.capsule) is not str or len(self.capsule) > 16_384
                 or re.fullmatch(
@@ -432,10 +456,34 @@ class DeliveryIdentityContext:
         return hashlib.sha256(self.capsule.encode("ascii")).hexdigest()
 
 
+_REPLY_SLOT = re.compile(r"[0-9]{1,20}\.[0-9]{1,20}")
+
+
+def is_reply_slot(value: object) -> bool:
+    """A Slack message timestamp, the only reply slot an identity receipt retains.
+
+    @spec HTTP-INVOCATION-EXECUTION-27.
+    """
+    return type(value) is str and _REPLY_SLOT.fullmatch(value) is not None
+
+
 async def read_identity_delivery_receipt(
     client: redis.Redis, *, key: str, receipt_key: str, intent_digest: str,
 ) -> str | None:
     """@spec HTTP-INVOCATION-EXECUTION-14."""
+    current, _slot = await read_identity_delivery_receipt_with_slot(
+        client, key=key, receipt_key=receipt_key, intent_digest=intent_digest,
+    )
+    return current
+
+
+async def read_identity_delivery_receipt_with_slot(
+    client: redis.Redis, *, key: str, receipt_key: str, intent_digest: str,
+) -> tuple[str | None, str]:
+    """The current owner and the accepted turn's retained reply slot ('' when none).
+
+    @spec HTTP-INVOCATION-EXECUTION-14 HTTP-INVOCATION-EXECUTION-27.
+    """
     try:
         if (
             any(type(value) is not str or not value for value in (key, receipt_key))
@@ -448,23 +496,25 @@ async def read_identity_delivery_receipt(
     except (ValueError, TypeError, AttributeError):
         raise ValueError("invalid_delivery_context") from None
     result = await client.eval_ro(_IDENTITY_RECEIPT_READ, 2, key, receipt_key, intent_digest)
-    if type(result) not in (list, tuple) or len(result) != 2 or type(result[0]) is not int:
+    if type(result) not in (list, tuple) or len(result) != 3 or type(result[0]) is not int:
         raise RuntimeError("invalid_identity_receipt_result")
     if result[0] == -6:
         raise DeliveryGuardRefusal("intent_conflict")
-    if not isinstance(result[1], (str, bytes, bytearray)):
+    if not all(isinstance(value, (str, bytes, bytearray)) for value in result[1:]):
         raise RuntimeError("invalid_identity_receipt_result")
     try:
-        current = text(result[1])
+        current, slot = text(result[1]), text(result[2])
     except UnicodeError:
         raise RuntimeError("invalid_identity_receipt_result") from None
+    if slot and (result[0] != 1 or not is_reply_slot(slot)):
+        raise RuntimeError("invalid_identity_receipt_result")
     if result[0] == 0 and not current:
-        return None
+        return None, ""
     if (
         result[0] == 0 and re.fullmatch(r"pending:[0-9a-f]{32}", current)
         or result[0] == 1 and re.fullmatch(r"[0-9]+-[0-9]+", current)
     ):
-        return current
+        return current, slot
     raise RuntimeError("invalid_identity_receipt_result")
 
 
@@ -651,7 +701,7 @@ async def enqueue_owned(
         guarded_arguments[0] = "identity_guard_v2"
         guarded_arguments.extend([
             identity_context.capsule, identity_context.intent_digest,
-            identity_context.context_digest,
+            identity_context.context_digest, identity_context.reply_ref,
         ])
     # @spec HOOK-RECEIPT-1, HOOK-RECEIPT-5. The hook codec validates and bounds this prefix
     # before claiming. Lua only appends the server's canonical stream ID.
