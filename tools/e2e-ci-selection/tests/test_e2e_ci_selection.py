@@ -6037,6 +6037,17 @@ def test_chart_shared_workload_order_preserves_scenario_isolation() -> None:
         < positions["Upload runtime assertion receipts"]
     )
     assert positions["Dump cluster diagnostics on failure"] < remove
+    retry = positions[CHART_SCENARIOS["failed-first-install-retry"]["step"]]
+    retry_diagnostics = positions["Dump cluster diagnostics after lifecycle retry failure"]
+    assert remove < retry < retry_diagnostics < positions["Delete the job-owned kind cluster"]
+    for name in (
+        "Dump cluster diagnostics on failure",
+        "Dump cluster diagnostics after lifecycle retry failure",
+    ):
+        diagnostics = steps[positions[name]]
+        assert diagnostics["if"] == "failure()"
+        assert "get pods -A -o wide" in diagnostics["run"]
+        assert "get events -A --sort-by=.lastTimestamp" in diagnostics["run"]
     cleanup = steps[remove]
     assert cleanup["if"] == "${{ always() && matrix.leg == 'workload' }}"
     assert "steps." not in cleanup["if"]
