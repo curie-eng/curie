@@ -288,7 +288,9 @@ def test_pending_and_unavailable_outcomes_keep_the_placeholder(
         assert rig.turns(valkey, runs_stream) == []
 
 
-def _submission(scope: dict[str, Any], reply_ref: str) -> tuple[bytes, str]:
+def _submission(
+    scope: dict[str, Any], reply_ref: str, *, slack: codec.ReceiverSlackEvidenceV1 | None = None,
+) -> tuple[bytes, str]:
     """@spec HTTP-INVOCATION-EXECUTION-27: a receiver proof over a body carrying reply_ref."""
     body = json.dumps({
         "kind": "slack", "address": scope["address"], "adapter": scope["adapter"],
@@ -303,7 +305,7 @@ def _submission(scope: dict[str, Any], reply_ref: str) -> tuple[bytes, str]:
         binding_id=scope["binding"], binding_generation=scope["generation"],
         delivery_id=parsed["delivery_id"], native_channel_id=scope["address"],
         conversation_id=PARENT_TS, body_sha256=hashlib.sha256(body).hexdigest(),
-        slack=codec.ReceiverSlackEvidenceV1(
+        slack=slack if slack is not None else codec.ReceiverSlackEvidenceV1(
             delivery="app_mention", user_id=membership.SENDER, event_user_team=None,
             event_team=membership.ACCOUNT, interaction_user_team_id=None,
             is_ext_shared_channel=False, enterprise_ids=(),
@@ -416,3 +418,25 @@ def test_email_turn_intent_binds_the_verified_email_delivery(
             assert valkey.xrange(runs_stream) == entries
     finally:
         email_receivers._cleanup(valkey, scope)
+
+
+def test_direct_message_reply_ref_is_queued_as_the_sealed_reply_placeholder(
+    clean_db: None, valkey: redis.Redis, runs_stream: str, synthetic_provider: SimpleNamespace,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-26/27: a DM's placeholder is its reply slot too."""
+    direct = codec.ReceiverSlackEvidenceV1.model_validate({
+        "delivery": "message", "user_id": membership.SENDER,
+        "event_user_team": membership.ACCOUNT, "event_team": membership.ACCOUNT,
+        "interaction_user_team_id": None, "is_ext_shared_channel": False,
+        "enterprise_ids": (), "channel_type": "im",
+    })
+    with _rig(valkey, synthetic_provider) as rig:
+        body, proof = _submission(rig.scope, FIRST_SLOT, slack=direct)
+        response = membership._post(rig.client, rig.credential, body, proof)
+        assert response.status_code == 200, response.text
+        (entry,) = valkey.xrange(runs_stream)
+        turn = QueuedTurn.model_validate_json(entry[1]["payload"])
+        assert turn.reply_handle is not None and turn.reply_handle.placeholder == FIRST_SLOT
+        captured = _edit_placeholder(turn)
+        assert [method for method, _body in captured] == ["chat.update"]
+        assert captured[0][1]["ts"] == FIRST_SLOT
