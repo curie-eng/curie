@@ -101,6 +101,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from curie_api.crud import approvals as crud_approvals
 from curie_api.identity.http_approval import approval_is_selected
+from curie_api.identity.http_invocation import HttpInvocationRuntime
 
 from .resumequeue import (
     ApprovalResumeRefused,
@@ -176,8 +177,12 @@ class ResumeReconciler:
         grace_seconds: int,
         batch_limit: int,
         dead_letter_scan_limit: int = 1000,
+        identity_runtime: HttpInvocationRuntime | None = None,
     ) -> None:
         self._sessionmaker = sessionmaker
+        # The app's HTTP invocation runtime: owed wakes are classified by binding
+        # with its registrations. @spec HTTP-APPROVAL-CONTINUITY-14.
+        self._identity_runtime = identity_runtime
         self._resume_queue = resume_queue
         self._interval_seconds = interval_seconds
         self._grace_seconds = grace_seconds
@@ -365,7 +370,9 @@ class ResumeReconciler:
                     # @spec HTTP-APPROVAL-CONTINUITY-1/11: a selected row is
                     # published by the core owner, whose lookups never run under
                     # this claim, so the claim transaction ends first.
-                    selected = await approval_is_selected(session, approval)
+                    selected = await approval_is_selected(
+                        session, approval, runtime=self._identity_runtime,
+                    )
                     if not selected:
                         turn = resume_turn_for(approval)
                         await self._resume_queue.enqueue(

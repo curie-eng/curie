@@ -100,6 +100,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .action_forward import ForwardRefused
 from .action_undoable import sealing_custody
+from .identity.http_invocation import HttpInvocationRuntime
 from .identity.writer_selection import http_selected_scope
 from .killswitch import KillSwitch
 from .models import (
@@ -683,6 +684,7 @@ async def raise_approval(
     *,
     observed: Any = None,
     store: ObjectStore | None = None,
+    identity_runtime: HttpInvocationRuntime | None = None,
 ) -> uuid.UUID | None:
     """Raise (or attach to) the approval of a nomination already sent to approval.
 
@@ -721,6 +723,7 @@ async def raise_approval(
             check=nomination.approval_reason,
             observed=observed,
             store=store,
+            identity_runtime=identity_runtime,
         )
     except (RemediationApprovalUnavailable, SQLAlchemyError, ValueError) as error:
         await session.rollback()
@@ -778,6 +781,7 @@ async def _to_approval(
     from_state: str,
     observed: Any = None,
     store: ObjectStore | None = None,
+    identity_runtime: HttpInvocationRuntime | None = None,
 ) -> None:
     await session.rollback()
     moved = await return_to_approval(
@@ -794,7 +798,10 @@ async def _to_approval(
             nomination_id,
             failed.reason,
         )
-        await raise_approval(session, nomination_id, observed=observed, store=store)
+        await raise_approval(
+            session, nomination_id, observed=observed, store=store,
+            identity_runtime=identity_runtime,
+        )
 
 
 async def _stop(session: AsyncSession, nomination_id: uuid.UUID, *, from_state: str) -> None:
@@ -820,7 +827,8 @@ async def _stop(session: AsyncSession, nomination_id: uuid.UUID, *, from_state: 
 
 
 async def _admit_one(
-    session: AsyncSession, store: ObjectStore, kill_switch: KillSwitch, nomination_id: uuid.UUID
+    session: AsyncSession, store: ObjectStore, kill_switch: KillSwitch, nomination_id: uuid.UUID,
+    *, identity_runtime: HttpInvocationRuntime | None = None,
 ) -> None:
     current = await session.scalar(
         select(RemediationNomination.agent_id).where(
@@ -856,7 +864,10 @@ async def _admit_one(
             return
     except SQLAlchemyError:
         failed = _Failed(ADMISSION_UNREADABLE)
-    await _to_approval(session, nomination_id, failed, from_state=RECEIVED, store=store)
+    await _to_approval(
+        session, nomination_id, failed, from_state=RECEIVED, store=store,
+        identity_runtime=identity_runtime,
+    )
 
 
 async def admit_nominations(
@@ -864,6 +875,8 @@ async def admit_nominations(
     store: ObjectStore,
     kill_switch: KillSwitch,
     nomination_ids: Sequence[uuid.UUID],
+    *,
+    identity_runtime: HttpInvocationRuntime | None = None,
 ) -> None:
     """Admit each ``received`` nomination of a submission, in block order.
 
@@ -874,7 +887,9 @@ async def admit_nominations(
     """
 
     for nomination_id in nomination_ids:
-        await _admit_one(session, store, kill_switch, nomination_id)
+        await _admit_one(
+            session, store, kill_switch, nomination_id, identity_runtime=identity_runtime,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -927,6 +942,8 @@ async def precondition_ended(
     store: ObjectStore,
     kill_switch: KillSwitch,
     read_id: uuid.UUID,
+    *,
+    identity_runtime: HttpInvocationRuntime | None = None,
 ) -> None:
     """Decide check 12 for the nomination whose precondition read ended.
 
@@ -965,6 +982,7 @@ async def precondition_ended(
             _Failed(PRECONDITION_UNAVAILABLE),
             from_state=PRECONDITION_PENDING,
             store=store,
+            identity_runtime=identity_runtime,
         )
         return
     try:
@@ -979,6 +997,7 @@ async def precondition_ended(
             from_state=PRECONDITION_PENDING,
             observed=observed,
             store=store,
+            identity_runtime=identity_runtime,
         )
 
 
@@ -987,12 +1006,16 @@ async def preconditions_ended(
     store: ObjectStore,
     kill_switch: KillSwitch,
     executions: Iterable[ActionExecution | uuid.UUID],
+    *,
+    identity_runtime: HttpInvocationRuntime | None = None,
 ) -> None:
     """``precondition_ended`` for each precondition read among ``executions``."""
 
     for item in executions:
         read_id = item if isinstance(item, uuid.UUID) else item.id
-        await precondition_ended(session, store, kill_switch, read_id)
+        await precondition_ended(
+            session, store, kill_switch, read_id, identity_runtime=identity_runtime,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1077,10 +1100,12 @@ def _owed_approval() -> Any:
     )
 
 
-async def _end_http_selected(session: AsyncSession) -> None:
+async def _end_http_selected(
+    session: AsyncSession, *, identity_runtime: HttpInvocationRuntime | None,
+) -> None:
     """End every owed approval whose scope is positively HTTP-selected. Commits nothing.
 
-    @spec AUTOMATED-REMEDIATION-15 @spec HTTP-APPROVAL-CONTINUITY-1. The
+    @spec AUTOMATED-REMEDIATION-15 @spec HTTP-APPROVAL-CONTINUITY-1/14. The
     internal writer refuses a selected scope before insertion, so no pass could
     raise it. The scope is classified once per distinct agent and recorded reply
     surface, by the owner ``request_remediation_approval`` classifies with
@@ -1121,6 +1146,7 @@ async def _end_http_selected(session: AsyncSession) -> None:
                         reply_channel=channel,
                         reply_adapter=adapter,
                     ),
+                    runtime=identity_runtime,
                 ):
                     continue
                 ended = (
@@ -1161,7 +1187,9 @@ async def _end_http_selected(session: AsyncSession) -> None:
             )
 
 
-async def _end_unraisable(session: AsyncSession) -> None:
+async def _end_unraisable(
+    session: AsyncSession, *, identity_runtime: HttpInvocationRuntime | None,
+) -> None:
     """End every owed approval request that no pass could ever raise. Commits nothing."""
 
     surface = (
@@ -1210,11 +1238,12 @@ async def _end_unraisable(session: AsyncSession) -> None:
             await release_reservation(session, nomination_id)
         if ended:
             logger.warning("remediation nominations refused count=%d code=%s", len(ended), code)
-    await _end_http_selected(session)
+    await _end_http_selected(session, identity_runtime=identity_runtime)
 
 
 async def reconcile_admissions(
-    session: AsyncSession, store: ObjectStore, kill_switch: KillSwitch, *, limit: int = 100
+    session: AsyncSession, store: ObjectStore, kill_switch: KillSwitch, *, limit: int = 100,
+    identity_runtime: HttpInvocationRuntime | None = None,
 ) -> int:
     """Finish admission work a crash or an unreadable store left undone.
 
@@ -1235,7 +1264,7 @@ async def reconcile_admissions(
     surface is pruned once its submission copied it.
     """
 
-    await _end_unraisable(session)
+    await _end_unraisable(session, identity_runtime=identity_runtime)
     # A delivery's surface is needed until its submission copies it; the
     # binding it shadows keeps no expiry, so an unsubmitted one stays too.
     await session.execute(
@@ -1300,11 +1329,17 @@ async def reconcile_admissions(
         for item in ids:
             try:
                 if step == "admit":
-                    await _admit_one(session, store, kill_switch, item)
+                    await _admit_one(
+                        session, store, kill_switch, item, identity_runtime=identity_runtime,
+                    )
                 elif step == "precondition":
-                    await precondition_ended(session, store, kill_switch, item)
+                    await precondition_ended(
+                        session, store, kill_switch, item, identity_runtime=identity_runtime,
+                    )
                 else:
-                    await raise_approval(session, item, store=store)
+                    await raise_approval(
+                        session, item, store=store, identity_runtime=identity_runtime,
+                    )
                 handled += 1
             except Exception:  # noqa: BLE001 - one nomination must not stop the pass
                 await session.rollback()

@@ -40,7 +40,12 @@ from curie_api.resumequeue import (
     resume_turn_for,
 )
 
-from .http_approval import approval_is_selected, approval_record_digest, verified_capsule
+from .http_approval import (
+    approval_is_selected,
+    approval_record_digest,
+    identity_runtime,
+    verified_capsule,
+)
 from .http_invocation import HttpInvocationRuntime, current_http_approval_caller
 
 Role = Literal["invocation", "approver"]
@@ -167,7 +172,9 @@ class HttpResumeOwner:
                 row = await session.get(Approval, approval_id)
                 if row is None:
                     return None
-                return row, await approval_is_selected(session, row)
+                return row, await approval_is_selected(
+                    session, row, runtime=identity_runtime(self._state),
+                )
         except Exception as error:  # noqa: BLE001 - classification failure is a refusal.
             raise _refusal(error) from None
 
@@ -220,7 +227,7 @@ class HttpResumeOwner:
                 row = await session.get(Approval, approval_id, populate_existing=True)
                 saved = self._resumable(runtime, row)
                 assert row is not None
-                if not await approval_is_selected(session, row):
+                if not await approval_is_selected(session, row, runtime=runtime):
                     raise ApprovalResumeRefused("unsupported_resume")
                 snapshot = approval_record_digest(row)
             required: frozenset[Role]

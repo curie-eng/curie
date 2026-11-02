@@ -61,7 +61,7 @@ from ..approvers import ApproverSetSelector
 from ..auth import require_platform_key
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep
-from ..identity.http_approval import approval_is_selected
+from ..identity.http_approval import approval_is_selected, identity_runtime
 from ..identity.http_approval_answer import (
     PROOF_HEADER,
     ApprovalAnswer,
@@ -290,7 +290,9 @@ async def recover_approval(
     # @spec HTTP-APPROVAL-CONTINUITY-7/10: a selected row additionally needs an
     # authenticated Slack actor with current approver and original-invoker
     # authority; platform-key-only recovery refuses before any mutation.
-    if await approval_is_selected(session, approval):
+    if await approval_is_selected(
+        session, approval, runtime=identity_runtime(request.app.state),
+    ):
         return await _recover_selected(
             approval, data, session, principal, request, approver_sets, resume_queue,
         )

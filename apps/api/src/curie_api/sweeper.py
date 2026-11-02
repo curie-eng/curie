@@ -60,6 +60,7 @@ from curie_api.crud import publications as crud_publications
 
 from .config import get_settings
 from .identity.http_approval import approval_is_selected
+from .identity.http_invocation import HttpInvocationRuntime
 from .models import Approval, ApprovalStatus
 from .remediation_approvals import (
     REMEDIATION_PURPOSE,
@@ -121,6 +122,7 @@ async def sweep_expired_approvals(
     limit: int = 100,
     http_expiry: Callable[[uuid.UUID], Awaitable[Approval | None]] | None = None,
     sealed_cursor: SealedExpiryCursor | None = None,
+    identity_runtime: HttpInvocationRuntime | None = None,
 ) -> int:
     """One sweep pass: expire every lapsed pending approval and wake its session.
 
@@ -159,7 +161,9 @@ async def sweep_expired_approvals(
         after = (cast(datetime, page[-1].expires_at), page[-1].id)
         for record in page:
             try:
-                selected = await approval_is_selected(session, record)
+                selected = await approval_is_selected(
+                    session, record, runtime=identity_runtime,
+                )
             except HTTPException:
                 logger.warning(
                     "approval %s identity classification unavailable; left pending",
@@ -321,8 +325,12 @@ async def run_expiry_sweeper(
     publication_patch_retention_seconds: int = 3600,
     remediation_admissions: Callable[[AsyncSession], Awaitable[int]] | None = None,
     http_expiry: Callable[[uuid.UUID], Awaitable[Approval | None]] | None = None,
+    identity_runtime: HttpInvocationRuntime | None = None,
 ) -> None:
     """Periodic loop driving ``sweep_expired_approvals`` until ``stop`` is set.
+
+    ``identity_runtime`` is the app's HTTP invocation runtime; each legacy row is
+    classified by binding with its registrations (HTTP-APPROVAL-CONTINUITY-14).
 
     ``remediation_admissions``, when given, runs each pass after the sweep: it
     finishes remediation admission work a crash or an unreadable store left
@@ -364,14 +372,13 @@ async def run_expiry_sweeper(
         ) as span:
             try:
                 async with sessionmaker() as session:
-                    # Without an owner the pass keeps its exact call shape.
-                    if http_expiry is None:
-                        await sweep_expired_approvals(session, resume_queue)
-                    else:
-                        await sweep_expired_approvals(
-                            session, resume_queue, http_expiry=http_expiry,
-                            sealed_cursor=sealed_cursor,
-                        )
+                    # Without an owner or runtime the pass keeps its exact call shape.
+                    options: dict[str, Any] = {}
+                    if http_expiry is not None:
+                        options.update(http_expiry=http_expiry, sealed_cursor=sealed_cursor)
+                    if identity_runtime is not None:
+                        options.update(identity_runtime=identity_runtime)
+                    await sweep_expired_approvals(session, resume_queue, **options)
                     await crud_publications.reap_terminal_publication_patches(
                         session,
                         terminal_before=datetime.now(UTC).replace(tzinfo=None)

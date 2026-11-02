@@ -64,7 +64,11 @@ from ..auth import require_api_key, require_platform_key
 from ..authorizer import AuthzDecision, authorize_approval
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep, get_store
-from ..identity.http_approval import approval_is_selected, require_legacy_approval_creation
+from ..identity.http_approval import (
+    approval_is_selected,
+    identity_runtime,
+    require_legacy_approval_creation,
+)
 from ..identity.http_approval_answer import (
     PROOF_HEADER,
     ApprovalAnswer,
@@ -289,7 +293,9 @@ async def create_approval(
     runner, so a sandbox cannot talk its way past it.
     """
 
-    await require_legacy_approval_creation(session, data)
+    await require_legacy_approval_creation(
+        session, data, runtime=identity_runtime(request.app.state),
+    )
     traceparent = canonicalize_traceparent(
         request.headers.get(TRACEPARENT_STREAM_FIELD)
     )
@@ -540,7 +546,9 @@ async def resolve_approval(
     # admission, team lookup or CAS. Its deadline expiry goes through the sealing
     # owner, and an authenticated Slack answer through the approval commit owner;
     # either way its wake stays owed rather than context-free.
-    if await approval_is_selected(session, approval):
+    if await approval_is_selected(
+        session, approval, runtime=identity_runtime(request.app.state),
+    ):
         await session.commit()
         gone: Approval | None = approval if approval.status == ApprovalStatus.expired else None
         if approval.status == ApprovalStatus.pending and _expired(approval):
