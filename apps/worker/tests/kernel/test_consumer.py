@@ -1227,6 +1227,7 @@ def _inventory_timeout_client(
 
 @pytest.mark.parametrize("failure", ["sdk-timeout", "exhausted-budget", "quota-timeout"])
 @pytest.mark.parametrize("restore", [True, False], ids=["restored", "unavailable"])
+@pytest.mark.parametrize("placeholder", ["p-1", None], ids=["placeholder", "no-placeholder"])
 def test_inventory_timeout_capacity_wait_preserves_delivery_bound(
     make_harness,
     sync_redis,
@@ -1234,6 +1235,7 @@ def test_inventory_timeout_capacity_wait_preserves_delivery_bound(
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
     restore: bool,
+    placeholder: str | None,
 ) -> None:
     client, api, admission = _inventory_timeout_client(
         sync_redis,
@@ -1253,7 +1255,12 @@ def test_inventory_timeout_capacity_wait_preserves_delivery_bound(
             h.runner.default_script = [Final(text="inventory restored", status=DONE)]
             consumer = _capacity_consumer(h)
             await consumer.ensure_group()
-            event = _qevent("hello", thread="inventory-thread", event_id="inventory-turn")
+            event = _qevent(
+                "hello",
+                thread="inventory-thread",
+                event_id="inventory-turn",
+                placeholder=placeholder,
+            )
             entry_id, fields = await _pending_local_entry(h, event)
             original_deadline = None
             for attempt in range(3):
@@ -1319,14 +1326,14 @@ def test_inventory_timeout_capacity_wait_preserves_delivery_bound(
     asyncio.run(go())
 
 
-@pytest.mark.parametrize("source", [TurnSource.WEBHOOK, TurnSource.CRON, TurnSource.SLACK])
+@pytest.mark.parametrize("lane", ["webhook", "approval-resume"])
 @pytest.mark.parametrize("failure", ["sdk-timeout", "quota-timeout"])
 def test_inventory_timeout_without_durable_wait_stays_pending_then_completes(
     make_harness,
     sync_redis,
     names,
     monkeypatch: pytest.MonkeyPatch,
-    source: TurnSource,
+    lane: str,
     failure: str,
 ) -> None:
     client, api, admission = _inventory_timeout_client(
@@ -1348,9 +1355,15 @@ def test_inventory_timeout_without_durable_wait_stays_pending_then_completes(
             h.runner.default_script = [Final(text="inventory restored", status=DONE)]
             consumer = _capacity_consumer(h)
             await consumer.ensure_group()
-            event = _qevent("hello", event_id="headless-inventory", source=source)
-            if source is TurnSource.SLACK:
-                event = event.model_copy(update={"reply_handle": None})
+            event = _qevent(
+                "hello",
+                event_id=(
+                    "approval-inventory-resolved"
+                    if lane == "approval-resume"
+                    else "headless-inventory"
+                ),
+                source=(TurnSource.SLACK if lane == "approval-resume" else TurnSource.WEBHOOK),
+            )
             entry_id, fields = await _pending_local_entry(h, event)
             await consumer._sem.acquire()
             await consumer._handle(entry_id, fields)
@@ -1378,6 +1391,43 @@ def test_inventory_timeout_without_durable_wait_stays_pending_then_completes(
                 "pending"
             ] == 0
             assert not await h.async_redis.exists(f"{h.config.stream}:dead")
+
+    asyncio.run(go())
+
+
+def test_slack_without_reply_handle_is_refused_before_admission(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, api, admission = _inventory_timeout_client(
+        sync_redis,
+        names,
+        monkeypatch,
+        failure="sdk-timeout",
+        restore=True,
+        failures=1,
+    )
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event = _qevent("hello").model_copy(update={"reply_handle": None})
+            entry_id, fields = await _pending_local_entry(h, event)
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, fields)
+            assert api.delivery_counts == []
+            assert api.created == [] and api.secrets == {}
+            assert h.runner.opened == h.sink.updates == h.sink.completions == []
+            dead = await h.async_redis.xrange(f"{h.config.stream}:dead")
+            assert len(dead) == 1
+            assert dead[0][1]["dl_reason"] == "unparseable"
+            assert dead[0][1]["dl_original_id"] == entry_id
 
     asyncio.run(go())
 

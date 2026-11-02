@@ -355,13 +355,13 @@ class SandboxSubstrate:
             raise ValueError("sandbox admission footprint is incomplete")
         try:
             inventory = self._reconcile_admission()
+            quota = self._k8s.read_quota(config.quota_name, request_timeout_seconds=1.0)
         except (TimeoutError, HTTPTimeoutError) as exc:
             raise AdmissionUnavailableError("sandbox admission inventory unavailable") from exc
         except MaxRetryError as exc:
             if not isinstance(exc.reason, HTTPTimeoutError):
                 raise
             raise AdmissionUnavailableError("sandbox admission inventory unavailable") from exc
-        quota = self._k8s.read_quota(config.quota_name, request_timeout_seconds=1.0)
         live_headroom = admission_quota_headroom(config, self._config.namespace, requested, quota)
         hard = resource_vector(config.hard)
         if config.ceiling == 0:

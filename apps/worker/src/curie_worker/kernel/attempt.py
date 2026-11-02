@@ -498,7 +498,15 @@ async def _attempt_turn(
             return await capacity_response()
 
         if rejection is None:
-            return await capacity_refusal()
+            release_order()
+            if (
+                qevent.source is TurnSource.SLACK
+                and handle is not None
+                and not self._is_approval_resume(qevent.event_id)
+                and (parsed_execute is None or not parsed_execute.is_ci_fix)
+            ):
+                raise CapacityWaitRequested() from None
+            raise
 
         if pressure_retried:
             self._record_pressure_outcome("reclaimed-retry-refused")

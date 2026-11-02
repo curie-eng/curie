@@ -157,7 +157,7 @@ def _cause(
     if state == "expired":
         if cause == "capacity_wait_expired":
             return (
-                "expired: capacity_wait_expired, no sandbox capacity before the "
+                "expired: capacity_wait_expired, sandbox admission did not complete before the "
                 "waiting deadline"
             ) + _previous_start_failure(req)
         return (
