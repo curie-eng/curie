@@ -277,6 +277,26 @@ with sqlite3.connect(os.environ["REPRO_STATE"], isolation_level=None) as db:
             db.commit()
             os.kill(os.getppid(), signal.SIGTERM)
     elif tool == "bash":
+        run_id = os.environ["CURIE_SCENARIO_RUN_ID"]
+        namespace = "test-workload-" + run_id
+        release = "workload-" + run_id
+        assert os.environ["CURIE_SCENARIO_NAMESPACE"] == namespace
+        assert os.environ["CURIE_SCENARIO_RELEASE"] == release
+        if len(args) == 2 and args[0].endswith("/scenarios/workload-install.sh"):
+            assert args[1] in {"up", "down"}
+            if args[1] == "up":
+                db.execute("INSERT INTO resources VALUES ('fixture', ?)", (release,))
+                if failure == "fixture-first-up" and run_id.endswith("-1"):
+                    db.commit()
+                    raise SystemExit(91)
+            else:
+                assert db.execute(
+                    "SELECT name FROM resources WHERE kind = 'fixture' AND name = ?",
+                    (release,),
+                ).fetchone() == (release,)
+                db.execute("DELETE FROM resources WHERE kind = 'fixture' AND name = ?", (release,))
+            db.commit()
+            raise SystemExit(0)
         assert len(args) == 1 and args[0].endswith(
             "/runtime/workspace-dependency-diagnostic-runtime.sh"
         )
@@ -291,7 +311,7 @@ with sqlite3.connect(os.environ["REPRO_STATE"], isolation_level=None) as db:
         (scenario_workdir / "diagnostic.log").write_text("scenario diagnostics\n")
         db.execute("INSERT INTO scenario_temps VALUES (?, ?)",
                    (os.environ["CURIE_SCENARIO_RUN_ID"], str(scenario_workdir)))
-        number = db.execute("SELECT COUNT(*) FROM calls WHERE tool = 'bash'").fetchone()[0]
+        number = int(run_id.rsplit("-", 1)[1])
         outcome = os.environ.get("REPRO_OUTCOMES", "pass").split(",")[number - 1]
         print("scenario-stderr", file=sys.stderr, flush=True)
         print(os.environ["REPRO_OUTPUT_" + outcome.upper()], flush=True)
@@ -333,6 +353,27 @@ class Harness:
     def resources(self) -> set[tuple[str, str]]:
         with sqlite3.connect(self.state) as db:
             return set(db.execute("SELECT kind, name FROM resources"))
+
+    def scenario_run_ids(self) -> list[str]:
+        return [
+            run_id for tool, args, _, _, run_id in self.calls()
+            if tool == "bash" and len(args) == 1
+            and args[0].endswith("/runtime/workspace-dependency-diagnostic-runtime.sh")
+        ]
+
+    def assert_complete_iterations(self, count: int) -> None:
+        calls = [(args, run_id) for tool, args, _, _, run_id in self.calls() if tool == "bash"]
+        assert len(calls) == count * 3
+        installer = str(self.root / "charts/curie/ci/scenarios/workload-install.sh")
+        scenario = str(
+            self.root / "charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh"
+        )
+        for index in range(count):
+            up, body, down = calls[index * 3 : index * 3 + 3]
+            assert up[0] == [installer, "up"]
+            assert body[0] == [scenario]
+            assert down[0] == [installer, "down"]
+            assert up[1] == body[1] == down[1]
 
     def occupy(self, kind: str, name: str) -> None:
         with sqlite3.connect(self.state) as db:
@@ -534,7 +575,8 @@ def test_invocation_from_repro_directory_without_a_slash_reaches_the_scenario(
     assert result.returncode == 0, result.stdout + result.stderr
     assert "summary iterations=1 pass=1 recovery_500=0 other_fail=0\n" in result.stdout
     calls = harness.calls()
-    assert sum(tool == "bash" for tool, *_ in calls) == 1
+    assert len(harness.scenario_run_ids()) == 1
+    harness.assert_complete_iterations(1)
     assert all(cwd == str(harness.root) for _, _, cwd, _, _ in calls)
     assert harness.resources() == before
 
@@ -556,8 +598,9 @@ def test_caller_build_targets_and_scenario_temps_remain_owned(harness: Harness) 
     assert (harness.root / "cli/target/release/curie").is_file()
     assert not caller_target.exists()
     calls = harness.calls()
-    run_ids = [run_id for tool, *_, run_id in calls if tool == "bash"]
+    run_ids = harness.scenario_run_ids()
     assert len(run_ids) == 2
+    harness.assert_complete_iterations(2)
     private_workdirs = {
         Path(config).parent
         for _, _, _, config, _ in calls
@@ -589,8 +632,9 @@ def test_all_classes_continue_with_combined_output_and_owned_cleanup(harness: Ha
         assert recorded + "\n" in result.stdout
     assert result.stdout.count("scenario-stderr\n") == 4
     calls = harness.calls()
-    run_ids = [run_id for tool, *_, run_id in calls if tool == "bash"]
+    run_ids = harness.scenario_run_ids()
     assert len(run_ids) == len(set(run_ids)) == 4
+    harness.assert_complete_iterations(4)
     assert all(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,24}", run_id) for run_id in run_ids)
     kubectl = [args for tool, args, *_ in calls if tool == "kubectl"]
     assert [args[2:] for args in kubectl] == [
@@ -631,8 +675,29 @@ def test_cleanup_failure_changes_a_completed_measurement_to_exit_one(
     result = harness.run()
     assert result.returncode == 1, result.stdout + result.stderr
     assert "summary iterations=1 pass=1 recovery_500=0 other_fail=0\n" in result.stdout
+    harness.assert_complete_iterations(1)
     assert "FAIL:" in result.stderr
     assert ("cluster", "acme-existing") in harness.resources()
     assert ("image", "curie-api:wsdiag-repro-acme-existing") in harness.resources()
     removals = [args for tool, args, *_ in harness.calls() if tool == "docker" and args[1] == "rm"]
     assert len(removals) == 3, "cleanup must attempt every owned tag despite an earlier failure"
+
+
+def test_failed_install_is_cleaned_before_the_next_measured_iteration(harness: Harness) -> None:
+    harness.environment.update(
+        CURIE_REPRO_ITERATIONS="2", REPRO_OUTCOMES="other,pass",
+        REPRO_FAILURE="fixture-first-up",
+    )
+    before = harness.resources()
+    result = harness.run()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "summary iterations=2 pass=1 recovery_500=0 other_fail=1\n" in result.stdout
+    calls = [(args, run_id) for tool, args, _, _, run_id in harness.calls() if tool == "bash"]
+    assert [args[1] if len(args) == 2 else "scenario" for args, _ in calls] == [
+        "up", "down", "up", "scenario", "down",
+    ]
+    assert calls[0][1] == calls[1][1]
+    assert calls[2][1] == calls[3][1] == calls[4][1]
+    assert calls[0][1] != calls[2][1]
+    assert harness.scenario_run_ids() == [calls[3][1]]
+    assert harness.resources() == before

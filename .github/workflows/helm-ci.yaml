@@ -606,6 +606,25 @@ jobs:
             -s templates/api-ingress.yaml \
             | kubeconform -strict -summary -kubernetes-version "$KUBE_VERSION"
 
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.13"
+      - name: Sync workspace
+        run: uv sync
+
       # Prove the GitHub App credential (ADR-0092): the App ID reaches the API
       # as digits (a float renders as "4.47597e+06" and 401s every call), and a
       # BYO existingSecret is REFERENCED rather than copied into helm's stored
@@ -982,31 +1001,6 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/worker-turn-receipt-assertions.sh
-
-      # This otherwise Python-free chart job needs the workspace because the
-      # web-identity gate below does not stop at the rendered YAML: it builds
-      # the real API and worker BundleStore objects under each rendered
-      # workload's env and asks the constructed boto3 client which credential
-      # provider won. Reading the manifests alone cannot tell an omitted
-      # credential apart from one the SDK signs as an empty identity.
-      - name: Install uv
-        id: install_uv
-        continue-on-error: true
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
-        with:
-          python-version: "3.13"
-      - name: Back off before retrying Install uv
-        if: steps.install_uv.outcome == 'failure'
-        run: |
-          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
-          sleep 15
-      - name: Install uv (retry)
-        if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
-        with:
-          python-version: "3.13"
-      - name: Sync workspace
-        run: uv sync
 
       # Prove the key-free object store path (#1325, #2211). Pointing the bundle
       # store at a real cloud object store used to REQUIRE static access keys:

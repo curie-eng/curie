@@ -163,8 +163,8 @@ def _condition_rows(document: Any) -> list[Any]:
 
 class _Collector:
     def __init__(self, context: str, run_id: str, command: list[str]) -> None:
-        self.namespace = f"test-4368-idle-capacity-{run_id}"
-        self.fullname = f"idlecap-{run_id}-curie"
+        self.namespace = os.environ["CURIE_SCENARIO_NAMESPACE"]
+        self.fullname = os.environ["CURIE_SCENARIO_RELEASE"] + "-curie"
         self.kube = ["kubectl", "--context", context, "--namespace", self.namespace]
         self.command = command
         self.observer = AdmissionObserver()
@@ -503,6 +503,11 @@ def main(arguments: list[str] | None = None) -> int:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,24}", run_id):
         print("FAIL: a valid scenario run ID is required", file=sys.stderr)
         return 2
+    for variable in ("CURIE_SCENARIO_NAMESPACE", "CURIE_SCENARIO_RELEASE"):
+        value = os.environ.get(variable, "")
+        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,51}[a-z0-9])?", value):
+            print(f"FAIL: a valid {variable} is required", file=sys.stderr)
+            return 2
     collector = _Collector(context, run_id, arguments[1:])
 
     def interrupted(_number: int, _frame: Any) -> None:

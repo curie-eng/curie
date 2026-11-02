@@ -1,6 +1,6 @@
 """Suite-wide xdist scheduling for the required CI run.
 
-CI runs `pytest -n 4 --dist loadgroup`. Every test is grouped by its own file,
+CI runs `pytest -n 4 --dist loadgroup`. By default tests are grouped by file,
 which schedules exactly like `--dist loadfile`, except the files below. They
 share process-external state that no fixture namespaces, so they are pinned to
 one group and never overlap each other on different workers:
@@ -13,6 +13,11 @@ one group and never overlap each other on different workers:
   so those files share a separate scheduling group.
 
 A serial run is unaffected: without xdist the marker is inert.
+
+Files whose cases own all process-external state may opt into per-test groups
+with ``pytestmark = pytest.mark.xdist_independent``. This also distributes their
+cases across CI shards. The shared-state file lists above take precedence over
+the marker. Unmarked files keep their file group.
 
 CI also splits the suite across parallel jobs with `--ci-shard INDEX/COUNT`.
 Shards are cut along the same groups, so a group never straddles two jobs, and
@@ -111,6 +116,8 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         group = SHARED_LIVE_STATE_GROUP if path in SHARED_LIVE_STATE_FILES else path
         if path in PROTECTED_RUNNER_FILES:
             group = PROTECTED_RUNNER_GROUP
+        elif path not in SHARED_LIVE_STATE_FILES and item.get_closest_marker("xdist_independent"):
+            group = item.nodeid
         item.add_marker(pytest.mark.xdist_group(group))
         groups.setdefault(group, []).append(item)
 
@@ -163,4 +170,11 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         type=_parse_shard,
         metavar="INDEX/COUNT",
         help="Run only this shard of the suite, split along xdist groups.",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "xdist_independent: cases own their external state and may run on separate workers/shards",
     )
