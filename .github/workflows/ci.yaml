@@ -3895,6 +3895,11 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/failed-first-install-retry-runtime.sh
+      - name: Dump cluster diagnostics after lifecycle retry failure
+        if: failure()
+        run: |
+          kubectl --context kind-curie-e2e get pods -A -o wide || true
+          kubectl --context kind-curie-e2e get events -A --sort-by=.lastTimestamp | tail -50 || true
       - name: Delete the job-owned kind cluster
         if: always()
         run: |
