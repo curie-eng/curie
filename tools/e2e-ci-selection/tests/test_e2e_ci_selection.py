@@ -931,7 +931,7 @@ def test_registry_maps_each_known_surface(
 @pytest.mark.parametrize(
     ("path", "selected"),
     [
-        (".github/e2e-selection.yaml", ()),
+        (".github/e2e-selection.yaml", ("cluster",)),
         (".github/workflows/ci.yaml", ("cluster",)),
         ("tools/e2e-ci-selection/select_tiers.py", ()),
     ],
@@ -2280,6 +2280,8 @@ rules:
   exact:
     compose.dev.yaml: [local]
     .github/workflows/ci.yaml: [cluster]
+    .github/e2e-selection.yaml: [cluster]
+    tools/runtime-assertion-gate/run.sh: [cluster]
     apps/worker/src/curie_worker/config.py: [released-upgrade]
   prefixes:
     charts: [cluster]
@@ -5432,6 +5434,8 @@ def test_failed_first_install_retry_script_alone_selects_its_scenario(tmp_path: 
         ("apps/api/src/curie_api/main.py", False),
         ("cli/src/ops/up.rs", True),
         (".github/workflows/ci.yaml", True),
+        (".github/e2e-selection.yaml", True),
+        ("tools/runtime-assertion-gate/run.sh", True),
         (".github/actions/load-ci-images/action.yml", True),
         ("charts/curie/ci/runtime/failed-first-install-retry-runtime.sh", True),
         ("new-surface/module.py", True),
@@ -5445,6 +5449,20 @@ def test_failed_first_install_retry_pr_selection_keeps_its_own_and_shared_inputs
     assert completed.returncode == 0, completed.stderr
     scenarios = json.loads(_outputs_of(output)["chart_scenarios"])
     assert ("failed-first-install-retry" in scenarios) is selected
+
+
+@pytest.mark.parametrize(
+    "path",
+    [path for path in CHART_SHARED_INPUTS if path != "charts/curie/Chart.yaml"],
+)
+def test_every_shared_chart_input_selects_cluster_and_retry(tmp_path: Path, path: str) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    selected = _outputs_of(output)
+    assert selected["cluster"] == "true"
+    scenarios = json.loads(selected["chart_scenarios"])
+    assert "failed-first-install-retry" in scenarios
+    assert scenarios == list(CHART_IDS)
 
 
 def test_nightly_full_selection_keeps_failed_first_install_retry(tmp_path: Path) -> None:
