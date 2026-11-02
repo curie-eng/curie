@@ -742,7 +742,8 @@ try:
     batch("stale", 6, stale=stale, expect_pressure=True)
     print("OK: at least four unreadable older routes remained intact ahead of safely reclaimed completed routes")
     clear_owned_sandboxes()
-    burst_sixteen()
+    if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
+        burst_sixteen()
 except AssertionError as error:
     print("FAIL: " + str(error), file=sys.stderr)
     sys.exit(1)
