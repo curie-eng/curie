@@ -92,7 +92,7 @@ def repo(tmp_path: Path) -> Path:
     git(root, "config", "user.name", "Example")
     git(root, "config", "user.email", "test@example.com")
     git(root, "config", "core.hooksPath", os.devnull)
-    run(root, sys.executable, "-m", "curie_test_support.test_ratchets", "--regenerate")
+    run(root, sys.executable, "-m", "curie_test_support.ratchets", "--regenerate")
     git(root, "add", ".")
     git(root, "commit", "-qm", "Add clean baseline")
     git(root, "update-ref", "refs/remotes/origin/main", "HEAD")

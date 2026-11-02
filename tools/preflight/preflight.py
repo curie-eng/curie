@@ -151,7 +151,7 @@ CHECKS = (
     exact(
         "python-static",
         "Test-time ratchets",
-        "uv run python -m curie_test_support.test_ratchets",
+        "uv run python -m curie_test_support.ratchets",
         ".",
         "always",
     ),

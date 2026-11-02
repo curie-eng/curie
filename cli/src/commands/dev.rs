@@ -1246,7 +1246,7 @@ pub async fn dev_test_ratchets(regenerate: bool, durations: &[PathBuf]) -> Resul
     let mut command = tokio::process::Command::new("uv");
     command
         .current_dir(root)
-        .args(["run", "python", "-m", "curie_test_support.test_ratchets"]);
+        .args(["run", "python", "-m", "curie_test_support.ratchets"]);
     if regenerate {
         command.arg("--regenerate");
     }

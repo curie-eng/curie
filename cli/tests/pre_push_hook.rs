@@ -145,7 +145,7 @@ impl Fixture {
             "cli/Cargo.toml",
             "packages/test-support/pyproject.toml",
             "packages/test-support/src/curie_test_support/__init__.py",
-            "packages/test-support/src/curie_test_support/test_ratchets.py",
+            "packages/test-support/src/curie_test_support/ratchets.py",
             "tests/baselines/test-time.json",
         ] {
             let destination = self.root.join(relative);

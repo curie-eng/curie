@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from _pytest.terminal import TerminalReporter
 
-from curie_test_support.test_ratchets import (
+from curie_test_support.ratchets import (
     BASELINE,
     BUDGET_SECONDS,
     PRUNE_SECONDS,

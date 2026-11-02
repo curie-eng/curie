@@ -9,7 +9,7 @@ from typing import Any, cast
 
 import pytest
 from curie_test_support.duration_budget import budget_failure
-from curie_test_support.test_ratchets import canonical_nodeid
+from curie_test_support.ratchets import canonical_nodeid
 
 ROOT = Path(__file__).resolve().parents[3]
 BASELINE = "tests/baselines/test-time.json"
@@ -22,7 +22,7 @@ def private_step_summary(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def command(root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "curie_test_support.test_ratchets", "--root", str(root), *arguments],
+        [sys.executable, "-m", "curie_test_support.ratchets", "--root", str(root), *arguments],
         text=True,
         capture_output=True,
         check=False,
@@ -401,7 +401,7 @@ def test_ci_ratchets_compare_merge_base_not_advanced_tip(tmp_path: Path) -> None
 def test_ci_event_base_resolution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event: str, base: str, ref: str, expected: str
 ) -> None:
-    from curie_test_support.test_ratchets import base_reference
+    from curie_test_support.ratchets import base_reference
 
     monkeypatch.setenv("GITHUB_EVENT_NAME", event)
     monkeypatch.setenv("GITHUB_BASE_REF", base)
