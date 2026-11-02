@@ -137,6 +137,7 @@ class ChartScenario:
     step: str
     inputs: tuple[str, ...]
     leg: str
+    pr_inputs: tuple[str, ...] | None
 
 
 @dataclass(frozen=True)
@@ -144,6 +145,7 @@ class ChartScenarios:
     job: str
     shared_inputs: tuple[str, ...]
     scenarios: dict[str, ChartScenario]
+    fixtures: dict[str, tuple[str, ...]]
 
 
 @dataclass(frozen=True)
@@ -219,8 +221,10 @@ def _inputs(value: object, label: str) -> tuple[str, ...]:
 
 def _chart_registry(value: object) -> ChartScenarios:
     section = _mapping(value, "chart_scenarios")
-    if set(section) != {"job", "shared_inputs", "scenarios"}:
-        raise RegistryError("chart_scenarios must define job, shared_inputs, and scenarios")
+    if set(section) != {"job", "shared_inputs", "scenarios", "fixtures"}:
+        raise RegistryError(
+            "chart_scenarios must define job, shared_inputs, scenarios, and fixtures"
+        )
     if section["job"] != CHART_JOB:
         raise RegistryError(f"chart_scenarios.job must be {CHART_JOB}")
     shared_inputs = _inputs(section["shared_inputs"], "chart_scenarios.shared_inputs")
@@ -234,8 +238,8 @@ def _chart_registry(value: object) -> ChartScenarios:
             raise RegistryError("chart_scenarios contains an invalid scenario id")
         label = f"chart_scenarios.scenarios.{scenario_id}"
         entry = _mapping(value, label)
-        if set(entry) != {"step", "inputs", "leg"}:
-            raise RegistryError(f"{label} must define step, inputs, and leg")
+        if set(entry) not in ({"step", "inputs", "leg"}, {"step", "inputs", "leg", "pr_inputs"}):
+            raise RegistryError(f"{label} must define step, inputs, and leg; pr_inputs is optional")
         step = entry["step"]
         if not isinstance(step, str) or not step:
             raise RegistryError(f"{label}.step must be a nonempty string")
@@ -246,9 +250,30 @@ def _chart_registry(value: object) -> ChartScenarios:
             raise RegistryError(f"duplicate chart scenario step: {step}")
         step_names.add(step)
         scenarios[scenario_id] = ChartScenario(
-            step, _inputs(entry["inputs"], f"{label}.inputs"), leg
+            step, _inputs(entry["inputs"], f"{label}.inputs"), leg,
+            _inputs(entry["pr_inputs"], f"{label}.pr_inputs") if "pr_inputs" in entry else None,
         )
-    return ChartScenarios(CHART_JOB, shared_inputs, scenarios)
+    fixtures = _mapping(section["fixtures"], "chart_scenarios.fixtures")
+    commands: dict[str, tuple[str, ...]] = {}
+    for step, command in fixtures.items():
+        if not isinstance(step, str) or not step.strip() or step in step_names:
+            raise RegistryError("chart fixture step must be nonempty and distinct from scenarios")
+        if not isinstance(command, list) or any(not isinstance(word, str) for word in command):
+            raise RegistryError("chart fixture command must be a list of strings")
+        if len(command) == 4 and command[:2] == ["bash", "tools/runtime-assertion-gate/run.sh"]:
+            script, phase = command[2:]
+            valid = phase == "up"
+        elif len(command) == 3 and command[0] == "bash":
+            script, phase = command[1:]
+            valid = phase == "down"
+        else:
+            raise RegistryError("chart fixture must receipt up or invoke down directly")
+        if not valid or not SCENARIO_SCRIPT.fullmatch(script):
+            raise RegistryError("chart fixture must name a scenario script and the correct phase")
+        if not any(script in scenario.inputs for scenario in scenarios.values()):
+            raise RegistryError("chart fixture must be registered as a scenario input")
+        commands[step] = tuple(command)
+    return ChartScenarios(CHART_JOB, shared_inputs, scenarios, commands)
 
 
 def _scope_path(value: object, label: str) -> str:
@@ -390,7 +415,8 @@ RUNTIME_ASSERTION_DIR = "charts/curie/ci/runtime"
 
 def _is_runtime_assertion(path: str) -> bool:
     parent, _, name = path.rpartition("/")
-    return parent == RUNTIME_ASSERTION_DIR and name.endswith(".sh")
+    return (path == "charts/curie/ci/scenarios/workload-install.sh"
+            or parent == RUNTIME_ASSERTION_DIR and name.endswith(".sh"))
 
 
 def _matches_scenario(path: str, prefixes: tuple[str, ...]) -> bool:
@@ -567,19 +593,29 @@ def _select_chart_scenarios(
         and not any(_matches_prefix(path, prefix) for prefix in registry.prefixes)
         for path in paths
     )
-    if push or fallback:
-        selected = set(chart.scenarios)
-    else:
-        selected = {
-            scenario_id
-            for scenario_id, scenario in chart.scenarios.items()
-            if any(
-                _matches_scenario(path, (*chart.shared_inputs, *scenario.inputs)) for path in paths
-            )
-        }
+    selected = {
+        scenario_id
+        for scenario_id, scenario in chart.scenarios.items()
+        if push or fallback or any(
+            _matches_scenario(
+                path, (*chart.shared_inputs, *scenario.inputs, *(scenario.pr_inputs or ()))
+            ) for path in paths
+        )
+    }
     registered_steps = {scenario.step for scenario in chart.scenarios.values()}
+    def registered_fixture(step: dict[str, object]) -> bool:
+        command = chart.fixtures.get(str(step.get("name")))
+        run = step.get("run")
+        if command is None or not isinstance(run, str):
+            return False
+        try:
+            return tuple(shlex.split(run, comments=True)) == command
+        except ValueError:
+            return False
+
     if any(
         _is_scenario_step(step) and step.get("name") not in registered_steps
+        and not registered_fixture(step)
         for step in _chart_steps(chart.job, head)
     ):
         selected.add("unregistered")

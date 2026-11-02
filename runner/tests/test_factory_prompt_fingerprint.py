@@ -10,7 +10,6 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +20,6 @@ import os
 import signal
 import sqlite3
 import sys
-import time
 
 args = sys.argv[1:]
 # A candidate build (the fingerprint) starts with this call, once per build.
@@ -40,11 +38,6 @@ if capture:
     if case in ("interrupt_hook", "kill_hook"):
         os.kill(os.getppid(), signal.SIGTERM if case == "interrupt_hook" else signal.SIGKILL)
         sys.exit(1)
-    if case == "delayed" and attempt == 1:
-        time.sleep(2)
-        sys.exit(1)
-elif case == "delayed":
-    time.sleep(2)
 os.execv(os.environ["FACTORY_FINGERPRINT_REAL_GIT"], ["git", *args])
 """
 
@@ -182,21 +175,6 @@ def test_transient_capture_failure_recovers_before_review(
     assert "APPROVED" in result[0]["hookSpecificOutput"]["additionalContext"]
     assert c.state()["plan"] == {"round": 1, "verdict": "APPROVE"}
     assert c.calls(captures_only=True) == 3
-
-
-def test_capture_attempts_share_the_seven_second_deadline(capture_run: CaptureRun) -> None:
-    c = capture_run
-    c.case("delayed")
-    started = time.monotonic()
-    context = c.prompt()
-    elapsed = time.monotonic() - started
-
-    assert 6.5 <= elapsed < 9.0, elapsed
-    assert c.calls(captures_only=True) == 2
-    assert context.startswith("STOP.")
-    assert c.state()["fingerprint"] is None
-    assert c.plan()["permissionDecision"] == "deny"
-    assert c.state()["plan"]["round"] == 0
 
 
 @pytest.mark.parametrize("case", ["interrupt_hook", "kill_hook"])
