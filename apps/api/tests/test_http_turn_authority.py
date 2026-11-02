@@ -217,3 +217,39 @@ def test_initial_current_check_refuses_unsupported_approval_resume_before_lookup
         )
         assert len(provider.requests) == 1
         assert delivery_state(valkey, runs_stream, invocation.scope["binding"]) == before
+
+
+_NESTED = b"[" * 4096 + b"0" + b"]" * 4096
+
+
+def _assert_fixed_refusal_like_malformed_json(path: str, detail: str) -> None:
+    """A deeply nested body gets the same fixed 422 as ordinary malformed JSON."""
+    headers = {"Content-Type": "application/json"}
+    with TestClient(create_app(), raise_server_exceptions=False) as client:
+        malformed = client.post(path, content=b"{", headers=headers)
+        deep = client.post(path, content=_NESTED, headers=headers)
+    assert (malformed.status_code, malformed.json()) == (422, {"detail": detail})
+    assert (deep.status_code, deep.json()) == (422, {"detail": detail})
+    assert deep.headers["cache-control"] == malformed.headers["cache-control"] == "no-store"
+
+
+def test_deeply_nested_unauthenticated_turn_authority_body_gets_the_fixed_refusal() -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-16: depth must not become a 500 before authentication."""
+    _assert_fixed_refusal_like_malformed_json(PATH, "invalid_turn_authority_request")
+
+
+@pytest.mark.parametrize(
+    ("path", "detail"),
+    [
+        ("/v1/internal/identity/approval-grant/check", "invalid_approval_grant_request"),
+        (
+            "/v1/internal/identity/binding-classification/check",
+            "invalid_binding_classification_request",
+        ),
+    ],
+)
+def test_deeply_nested_sibling_route_bodies_keep_their_fixed_refusals(
+    path: str, detail: str,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-16: the shared wrapper keeps each route's refusal."""
+    _assert_fixed_refusal_like_malformed_json(path, detail)
