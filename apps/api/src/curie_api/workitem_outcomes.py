@@ -129,7 +129,9 @@ def _cause(
         if deadline is None:
             raise ValueError("a waiting request has no capacity deadline")
         text = "waiting for sandbox capacity"
-        if req.capacity_deferrals:
+        if req.last_deferral_reason == "admission_unavailable":
+            text = "waiting for sandbox admission observations"
+        elif req.capacity_deferrals:
             text += (
                 f"; deferred {req.capacity_deferrals} time(s) for capacity, "
                 f"last reason: {req.last_deferral_reason or 'unknown'}"

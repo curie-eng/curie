@@ -475,10 +475,14 @@ async def _attempt_turn(
             if run is not None and not run.started:
                 release_order()
                 try:
-                    await run.defer("capacity", capacity=True, start_failure_detail=None)
+                    await run.defer(
+                        "admission_unavailable" if rejection is None else "capacity",
+                        capacity=rejection is not None,
+                        start_failure_detail=None,
+                    )
                 except WorkItemConflict as exc:
                     logger.info(
-                        "work-item capacity defer refused for %s: %s",
+                        "work-item admission defer refused for %s: %s",
                         qevent.event_id,
                         exc.code,
                     )
