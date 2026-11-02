@@ -162,8 +162,9 @@ async def _selected(
     (the one per-binding owner), or when it is not the approval agent's own
     binding in the agent's tenant, which is every candidate of an agent-less
     approval. An agent in an adopted tenant is selected
-    unless its route resolves only to its own bindings there: only those show
-    its approver role is legacy-evaluable. A tenant without HTTP selection keeps
+    unless its route resolves to exactly one binding, its own there: only that
+    shows its approver role is legacy-evaluable, and an ambiguous route is
+    refused strictly. A tenant without HTTP selection keeps
     agent/route disagreement and ambiguity. @spec HTTP-APPROVAL-CONTINUITY-1/14.
     """
     if isinstance(source, Approval) and source.identity_context is not None:
@@ -195,7 +196,8 @@ async def _selected(
             return True
     if agent is None or not await _http_tenant(session, agent.tenant_id):
         return False
-    return not candidates or not all(own(binding) for binding in candidates)
+    # Strict: an ambiguous route refuses even when no candidate needs HTTP facts.
+    return len(candidates) != 1 or not own(candidates[0])
 
 
 async def approval_is_selected(
