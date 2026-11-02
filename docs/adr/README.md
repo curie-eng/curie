@@ -277,4 +277,10 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0255 | [Claim-backed sandbox scratch is bounded by its storage request](0255-claim-backed-sandbox-scratch-is-bounded-by-its-storage-request.md) | Draft |
 | 0256 | [Publication validates and pushes a Git object overlay](0256-publication-validates-and-pushes-a-git-object-overlay.md) | Draft |
 | 0257 | [A release registers its schema window only at the cut](0257-a-release-registers-its-schema-window-only-at-the-cut.md) | Accepted |
+| 0259 | [A binding requires HTTP identity when its invocation or approver role needs HTTP facts](0259-a-binding-requires-http-identity-when-its-invocation-or-approver-role-needs-http-facts.md) | Draft |
+| 0260 | [HTTP identity admits an email sender only on a signed email receiver proof](0260-http-identity-admits-an-email-sender-only-on-a-signed-email-receiver-proof.md) | Draft |
+| 0261 | [HTTP identity resolves Slack Connect senders from operator-trusted partner namespaces](0261-http-identity-resolves-slack-connect-senders-from-operator-trusted-partner-namespaces.md) | Draft |
+| 0262 | [The dispatcher qualifies each HTTP receiver once behind its own failure boundary](0262-the-dispatcher-qualifies-each-http-receiver-once-behind-its-own-failure-boundary.md) | Draft |
+| 0263 | [HTTP identity accepts a one-to-one direct message to a registered receiver's bot](0263-http-identity-accepts-a-one-to-one-direct-message-to-a-registered-receivers-bot.md) | Draft |
+| 0264 | [A selected delivery's reply slot is authenticated but outside its delivery intent](0264-a-selected-deliverys-reply-slot-is-authenticated-but-outside-its-delivery-intent.md) | Draft |
 <!-- END GENERATED: adr-index -->
