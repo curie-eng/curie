@@ -1587,6 +1587,23 @@ sys.exit(result.returncode)
         started: Instant,
     }
 
+    // Lines are `name\tphase\tdeletionTimestamp` from the hook pod listing.
+    // The seed hook keeps this job name until before-hook-creation deletes it.
+    // That completed pod is not the gated hook, and neither is a pod already
+    // being deleted.
+    fn active_hook_pod(listing: &str) -> Option<&str> {
+        listing.lines().find_map(|line| {
+            let mut fields = line.split('\t');
+            let name = fields.next()?.trim();
+            let phase = fields.next()?.trim();
+            let deletion = fields.next().map(str::trim).unwrap_or("");
+            if name.is_empty() || !deletion.is_empty() || !matches!(phase, "Pending" | "Running") {
+                return None;
+            }
+            Some(name)
+        })
+    }
+
     impl Fixture {
         fn new() -> Result<Self> {
             let mut programs = BTreeMap::new();
@@ -1853,9 +1870,15 @@ sys.exit(result.returncode)
                 );
                 thread::sleep(Duration::from_millis(100));
             }
-            let deadline = Instant::now() + Duration::from_secs(45);
+            self.hook_pod_ready(target)
+        }
+
+        fn hook_pod_ready(&self, target: &Target) -> Result<()> {
+            let created_deadline = Instant::now() + Duration::from_secs(45);
+            let mut ready_deadline = None;
+            let selector = format!("job-name={}", target.hook);
             loop {
-                let pods = self.invoke(
+                let listing = self.invoke(
                     "kubectl",
                     &[
                         "get",
@@ -1863,33 +1886,44 @@ sys.exit(result.returncode)
                         "-n",
                         &target.release,
                         "-l",
-                        &format!("job-name={}", target.hook),
+                        &selector,
                         "-o",
-                        "name",
+                        "jsonpath={range .items[*]}{.metadata.name}{\"\\t\"}{.status.phase}{\"\\t\"}{.metadata.deletionTimestamp}{\"\\n\"}{end}",
                     ],
                     Duration::from_secs(8),
                 )?;
-                if !pods.trim().is_empty() {
-                    break;
+                if let Some(name) = active_hook_pod(&listing) {
+                    let ready_by = *ready_deadline
+                        .get_or_insert_with(|| Instant::now() + Duration::from_secs(60));
+                    let remaining = ready_by.saturating_duration_since(Instant::now());
+                    let seconds = remaining.as_secs();
+                    anyhow::ensure!(seconds > 0, "real hook Pod was not ready");
+                    match self.invoke(
+                        "kubectl",
+                        &[
+                            "wait",
+                            &format!("pod/{name}"),
+                            "-n",
+                            &target.release,
+                            "--for=condition=Ready",
+                            &format!("--timeout={seconds}s"),
+                        ],
+                        remaining + Duration::from_secs(10),
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(_) if Instant::now() < ready_by => {}
+                        Err(error) => return Err(error),
+                    }
+                } else if let Some(ready_by) = ready_deadline {
+                    anyhow::ensure!(Instant::now() < ready_by, "real hook Pod was not ready");
+                } else {
+                    anyhow::ensure!(
+                        Instant::now() < created_deadline,
+                        "real hook Pod was not created"
+                    );
                 }
-                anyhow::ensure!(Instant::now() < deadline, "real hook Pod was not created");
                 thread::sleep(Duration::from_millis(100));
             }
-            self.invoke(
-                "kubectl",
-                &[
-                    "wait",
-                    "pod",
-                    "-n",
-                    &target.release,
-                    "-l",
-                    &format!("job-name={}", target.hook),
-                    "--for=condition=Ready",
-                    "--timeout=60s",
-                ],
-                Duration::from_secs(70),
-            )?;
-            Ok(())
         }
 
         fn workload_ready(&self, release: &str, budget: Duration) -> Result<()> {
@@ -2359,6 +2393,19 @@ sys.exit(result.returncode)
                 thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+
+    #[test]
+    fn active_hook_pod_ignores_a_completed_or_deleting_predecessor() {
+        let listing = "\
+old\tSucceeded\t\n\
+gone\tRunning\t2026-11-02T14:31:32Z\n\
+live\tPending\t\n";
+        assert_eq!(active_hook_pod(listing), Some("live"));
+        assert_eq!(active_hook_pod("old\tSucceeded\t\n"), None);
+        assert_eq!(active_hook_pod("dead\tFailed\t\n"), None);
+        assert_eq!(active_hook_pod("live\tRunning\t\n"), Some("live"));
+        assert_eq!(active_hook_pod(""), None);
     }
 
     #[test]
