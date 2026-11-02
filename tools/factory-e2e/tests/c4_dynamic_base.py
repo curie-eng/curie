@@ -22,7 +22,6 @@ from urllib.parse import urlsplit
 
 import scripted_kind as sk
 from aci_protocol import RUNS_STREAM_DEFAULT, STREAM_PAYLOAD_FIELD
-from c4_admitted_http import tracker_stub_type
 from c4_admitted_kind import REPOSITORY, AdmittedKind, Ticket
 from channel_protocol.work_item_events import ci_event_id, ci_round_key
 from curie_internal.keyspace import (
@@ -38,7 +37,7 @@ TERMINAL = {"completed", "failed", "cancelled", "expired"}
 
 
 def dynamic_stub_type(module: Any, *, redact: Any) -> type:
-    class DynamicGitHub(tracker_stub_type(module, redact=redact)):
+    class DynamicGitHub(module.GithubStub):
         def start(self) -> None:
             super().start()
             with sqlite3.connect(self._database) as db:

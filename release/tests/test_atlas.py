@@ -94,6 +94,96 @@ def test_refuses_runtime_changes_after_the_snapshot_pin(tmp_path):
         )
 
 
+SCHEMA_WINDOWS_PATH = "cli/src/application_schema_windows.json"
+CANDIDATE = {"schema_head": "0123", "schema_min": "0120"}
+
+
+def git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def commit_files(repo: Path, files: dict[str, str], message: str) -> str:
+    for path, content in files.items():
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    git(repo, "add", "--", *files)
+    git(repo, "commit", "-q", "-m", message)
+    return git(repo, "rev-parse", "HEAD")
+
+
+def catalog_text(windows: dict[str, dict[str, str]]) -> str:
+    return json.dumps(
+        {"candidate": CANDIDATE, "revisions": ["0120", "0123"], "windows": windows},
+        indent=2,
+    ) + "\n"
+
+
+def prepared_release(tmp_path: Path, registered: dict[str, dict[str, str]]) -> tuple[Path, str]:
+    """A repo whose atlas pin is the base and whose tag adds `bump-version`'s edits.
+
+    The base names no unreleased version anywhere. The tagged preparation
+    commit sets the version, adds the atlas entry and snapshot pinned to the
+    base, and registers `registered` in the schema-window catalog.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "--initial-branch", "main")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test User")
+    released = {"1.2.2": {"schema_head": "0120", "schema_min": "0120"}}
+    pin = commit_files(
+        repo,
+        {"cli/Cargo.toml": 'version = "1.2.2"\n', SCHEMA_WINDOWS_PATH: catalog_text(released)},
+        "base",
+    )
+    atlas_dir = write_atlas(repo, commit=pin)
+    tagged = commit_files(
+        repo,
+        {
+            "cli/Cargo.toml": 'version = "1.2.3"\n',
+            SCHEMA_WINDOWS_PATH: catalog_text({**released, **registered}),
+            "docs/architecture-atlas/versions.json": (atlas_dir / "versions.json").read_text(),
+            "docs/architecture-atlas/snapshots/v1.2.3.json": (
+                atlas_dir / "snapshots" / "v1.2.3.json"
+            ).read_text(),
+        },
+        "prepare v1.2.3",
+    )
+    return atlas_dir, tagged
+
+
+def test_registering_the_releases_window_after_the_pin_is_version_only(tmp_path, capsys):
+    """ADR-0257: the cut registers its window; nothing names it before the pin."""
+    module = load_module()
+    atlas_dir, tagged = prepared_release(tmp_path, {"1.2.3": dict(CANDIDATE)})
+
+    argv = ["--atlas-dir", str(atlas_dir), "--version", "v1.2.3", "--commit", tagged]
+    assert module.main(argv) == 0
+    assert "OK: architecture atlas v1.2.3" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "registered",
+    [
+        {"1.2.4": dict(CANDIDATE)},
+        {"1.2.3": {"schema_head": "0123", "schema_min": "0123"}},
+        {"1.2.3": dict(CANDIDATE), "1.2.4": dict(CANDIDATE)},
+    ],
+    ids=["another-release", "not-the-candidate", "an-extra-window"],
+)
+def test_any_other_catalog_change_after_the_pin_is_refused(tmp_path, capsys, registered):
+    """ADR-0257: only this release's own candidate window is version identity."""
+    module = load_module()
+    atlas_dir, tagged = prepared_release(tmp_path, registered)
+
+    argv = ["--atlas-dir", str(atlas_dir), "--version", "v1.2.3", "--commit", tagged]
+    assert module.main(argv) == 1
+    assert SCHEMA_WINDOWS_PATH in capsys.readouterr().err
+
+
 def test_version_only_paths_are_the_shared_set_plus_that_releases_snapshot():
     """#3858: the selector and the tag gate share this one definition."""
     module = load_module()

@@ -587,7 +587,7 @@ def test_local_commits_cannot_be_mistaken_for_an_unchanged_publication(
 ) -> None:
     async def go() -> None:
         repo, head = workspace
-        (repo / "README.md").write_text("Local commit which is outside the working tree patch.\n")
+        (repo / "README.md").write_text("Local commit on top of the prepared head.\n")
         _git(repo, "add", "README.md")
         _git(
             repo,
@@ -606,11 +606,13 @@ def test_local_commits_cannot_be_mistaken_for_an_unchanged_publication(
             assert gate is not None
             model = _PublicationModel(gate, [("localcommit", {"title": TITLE, "body": BODY})])
             frames = await _run(runner, model, _event(_context(head, url)))
-            assert model.permissions[0].interrupt is False
-            assert "head" in model.permissions[0].message.casefold()
-            assert frames[-1]["status"] == "done"
-            assert gate.pending_summary is None
-            assert gate.pending_halt is False
+            # #5230: the commit on top of the prepared head is the publication
+            # candidate, so it reaches approval without a metadata comparison.
+            assert "head_changed" not in model.permissions[0].message
+            assert model.permissions[0].interrupt is True
+            assert frames[-1]["status"] == "awaiting-approval"
+            assert gate.publication_title == TITLE
+            assert gate.publication_body == BODY
             assert calls == []
 
     anyio.run(go)

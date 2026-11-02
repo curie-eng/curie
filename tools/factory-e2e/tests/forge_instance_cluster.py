@@ -27,6 +27,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+import kind_images
 import yaml
 
 TESTS = Path(__file__).resolve().parent
@@ -883,10 +884,10 @@ class Cluster:
             self.volumes.update(
                 m["Name"] for m in inspect.get("Mounts", []) if m["Type"] == "volume"
             )
-        self.run(
-            ["kind", "load", "docker-image", "--name", self.name, *self.candidate.images.values()],
-            timeout=600,
-        )
+        def image_command(*argv: str, timeout: float = 300) -> str:
+            return self.run(argv, timeout=timeout).stdout
+
+        kind_images.load_images(image_command, self.name, list(self.candidate.images.values()))
         self.api_port = self.reserve_port()
         self.kubectl("create", "namespace", self.namespace)
         self.prepare_peers()

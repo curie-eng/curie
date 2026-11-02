@@ -11,6 +11,7 @@ import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -21,8 +22,8 @@ import pytest  # noqa: E402
 from c4_dynamic_base import (  # noqa: E402
     CHANGE,
     assert_ci_still_owns_request,
+    configure_dynamic,
     dynamic_model_type,
-    dynamic_stub_type,
 )
 
 
@@ -336,18 +337,20 @@ def test_unissued_output_does_not_claim_a_checkout_observation(model: Any) -> No
 
 
 @pytest.fixture
-def dynamic_github(tmp_path: Path) -> Iterator[Any]:
+def dynamic_github(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     from curie_telemetry.redact import redact_text
 
     tools = Path(__file__).resolve().parents[2]
     source = tools / "github-stub/github_stub.py"
-    spec = importlib.util.spec_from_file_location("dynamic_github_selftest", source)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    import scripted_kind as sk
+    from c4_admitted_kind import configure_harness
+
+    run = SimpleNamespace(root=tmp_path, redact_model_evidence=redact_text)
+    configure_harness(monkeypatch, run)
+    configure_dynamic(monkeypatch, run)
+    module = sk._module("dynamic_github_selftest", source)
     recording = json.loads((tools / "github-stub/recordings/curie-pr-3400.json").read_text())
-    stub = dynamic_stub_type(module, redact=redact_text)(
+    stub = module.GithubStub(
         tmp_path / "github",
         recording,
         seed_tree=tools / "factory-e2e/fixtures/unitconv",

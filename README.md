@@ -25,6 +25,25 @@ agent's instructions and tools to the same platform.
 | [SRE co-worker](#sre-co-worker-on-your-laptop) | Ask about your local cluster in Slack; approve configured mutations. |
 | [Bring your existing agent](#make-your-existing-agent-a-co-worker) | Reuse its instructions and tools, then connect it to a workspace. |
 
+## Platform capabilities
+
+Curie connects agents to supported external workspaces and work systems.
+Four capabilities let a team delegate work, share appropriate context, and
+control what happens:
+
+| Capability | What it provides |
+| --- | --- |
+| Workspace adaptors | Connect supported conversation channels, issue trackers, and code hosts to Curie. |
+| Authentication, authorization, and synchronization | Verify incoming authority, connect workspace accounts to people where supported, and sync identity and team data from an enterprise IdP. |
+| Memory and context | Supply scoped agent and channel facts alongside the work state an agent needs. |
+| Controls | Set tool permissions, approvals, model choices, execution bounds, and inspectable results. |
+
+This is a capability map. Each integration has its own supported path and
+limits. Read [platform capabilities and boundaries](docs/platform-capabilities.md)
+for how these capabilities interact, and
+[capabilities and release status](docs/capabilities.md) for what is
+available in a supported deployment.
+
 ### See the Software Factory
 
 <a href="https://vimeo.com/1231115133/eadc6eb936">
@@ -85,6 +104,18 @@ Choose where your issues and code live:
 
 Create a GitHub repository with an initial commit, or use a small existing
 repository. Write a bounded issue with clear acceptance criteria.
+
+Before starting, check that you have a supported released CLI, Docker and kind,
+`kubectl`, Helm, a model credential with available credit, and permission to
+create and install a GitHub App on the repository. For the default local kind
+trial, plan for **at least 16 GiB allocated to Docker Desktop**: the factory
+trial. Larger repositories may need more. If you use an existing Kubernetes
+cluster, check its available capacity instead. See the
+[capacity and recovery details](docs/guides/dark-factory-quickstart.md#local-kind-capacity-and-recovery).
+Expect a reviewable PR or a stated failure reason, then inspect the final
+issue status after CI handling. Allow variable setup time plus about 190
+minutes of configured waiting windows; this is not a measured completion
+time. Provider credit and actual spend are separate from that time allowance.
 
 **1. Start the local factory setup.** A dedicated kubeconfig keeps this trial
 separate from your other clusters.
@@ -157,25 +188,33 @@ changing a repository's sandbox image or configuration.
 You can also prepare the issue yourself and add `curie-factory` in GitHub. The
 account adding the label needs write or admin access to the repository.
 
-The issue status comment shows progress through planning, implementation, review,
-publication, and CI. Inspect the resulting PR and its verification information.
-A failed or ambiguous task reports its reason. Mention the configured App in a
-new comment to request a revision.
+| Checkpoint | What you should see | If it stops here |
+| --- | --- | --- |
+| First command | `Kubernetes context:` names the trial cluster, then a prefilled App registration link. | Check the [install and context steps](docs/guides/dark-factory-quickstart.md#choose-the-target-and-run-the-command). |
+| App setup and second command | `Factory quickstart ready` names the same context, repository, intake label, and deployed runner. | Check [App setup and troubleshooting](docs/guides/dark-factory-quickstart.md#rerun-with-the-app). |
+| Issue admission | The App posts a status comment; `curie-factory:queued` then `curie-factory:running` mark progress. | Check [label authority and sandbox capacity](docs/guides/dark-factory-quickstart.md#troubleshooting). |
+| PR and final result | A PR opens under the App identity. Read its diff and verification, then check whether the issue says `Completed:` or `Could not complete:` after CI handling. | Follow the [status-comment reason](docs/guides/dark-factory-quickstart.md#what-a-repository-with-no-ci-sees); an open PR alone is not a completed run. |
+
+Mention the configured App in a new comment to request a revision. The
+[complete factory quickstart](docs/guides/dark-factory-quickstart.md) has the
+canonical commands, recovery steps, and cleanup.
 
 The trial enables automatic initial PR publication. Curie does not merge the PR;
 your team accepts the result. Production agents default to human publication
 approval. Configure implementation and reviewer models explicitly, then use
 usage estimates and your accepted outcomes to evaluate costs.
 
-See the [complete factory quickstart](docs/guides/dark-factory-quickstart.md)
-for checkpoints, troubleshooting, timing and cost guidance, and cleanup.
 The [factory overview](docs/software-factory.md) explains review and CI limits.
 
 When finished with the trial, delete its local cluster:
 
 ```bash
 kind delete cluster --name "$CURIE_FACTORY_CLUSTER"
+rm -f -- "$CURIE_FACTORY_KUBECONFIG"
 ```
+
+If you created an App only for this trial, remove it and its downloaded key
+when finished; keep an App and key that other repositories or runs still use.
 
 ### SRE co-worker on your laptop
 

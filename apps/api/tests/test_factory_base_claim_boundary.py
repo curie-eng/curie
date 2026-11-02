@@ -384,6 +384,7 @@ def test_an_empty_lineage_is_rechecked_after_the_external_branch_read(
     before_lineage = _lineage(number)
     github.labels = [LABEL, "base:next"]
     branch_reads: list[str] = []
+    matching_reads: list[str] = []
 
     async def forge(request: httpx.Request) -> httpx.Response:
         if request.url.path == f"/repos/{REPO}/git/ref/heads/{before_lineage['branch']}":
@@ -403,12 +404,16 @@ def test_an_empty_lineage_is_rechecked_after_the_external_branch_read(
                     await engine.dispose()
             # https://docs.github.com/en/rest/git/refs#get-a-reference
             return httpx.Response(404, json={"message": "Not Found"})
+        if request.url.path == f"/repos/{REPO}/git/matching-refs/heads/{before_lineage['branch']}":
+            # https://docs.github.com/en/rest/git/refs#list-matching-references
+            matching_reads.append(request.url.path)
+            return httpx.Response(200, json=[])
         return github.handle(request)
 
     changed = _observe_base_label(client, number, forge)
 
     assert changed.status_code == 200, changed.text
-    assert len(branch_reads) == 1
+    assert len(branch_reads) == len(matching_reads) == 1
     assert _item(number)["base_commit"] == item["base_commit"]
     after_lineage = _lineage(number)
     if publication_wins:
@@ -423,7 +428,10 @@ def test_an_empty_lineage_is_rechecked_after_the_external_branch_read(
         assert after_lineage == before_lineage
 
 
-@pytest.mark.parametrize("hold", ["approved_publication", "remote_head", "outage_then_absence"])
+@pytest.mark.parametrize(
+    "hold",
+    ["approved_publication", "remote_head", "outage_then_absence", "contents_denied_then_absence"],
+)
 def test_headless_publication_or_uncertain_remote_state_prevents_a_base_restart(
     admitted: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -468,8 +476,11 @@ def test_headless_publication_or_uncertain_remote_state_prevents_a_base_restart(
         "approved_publication": 404,
         "remote_head": 200,
         "outage_then_absence": 503,
+        "contents_denied_then_absence": 404,
     }[hold]
     branch_reads: list[int] = []
+    matching_status = 404 if hold == "contents_denied_then_absence" else 200
+    matching_reads: list[int] = []
 
     def forge(request: httpx.Request) -> httpx.Response:
         if request.url.path == f"/repos/{REPO}/git/ref/heads/{before_lineage['branch']}":
@@ -485,12 +496,18 @@ def test_headless_publication_or_uncertain_remote_state_prevents_a_base_restart(
                 )
             message = "Not Found" if branch_status == 404 else "Service Unavailable"
             return httpx.Response(branch_status, json={"message": message})
+        if request.url.path == f"/repos/{REPO}/git/matching-refs/heads/{before_lineage['branch']}":
+            # https://docs.github.com/en/rest/git/refs#list-matching-references
+            matching_reads.append(matching_status)
+            payload: Any = [] if matching_status == 200 else {"message": "Not Found"}
+            return httpx.Response(matching_status, json=payload)
         return github.handle(request)
 
     changed = _observe_base_label(client, number, forge)
 
     assert changed.status_code == 200, changed.text
     assert branch_reads == [branch_status]
+    assert matching_reads == ([matching_status] if branch_status == 404 else [])
     assert _requests(number) == [{"id": request_id, "status": "running"}]
     after_item = _item(number)
     assert tuple(after_item[key] for key in ("base_branch", "base_source", "base_commit")) == tuple(
@@ -498,13 +515,16 @@ def test_headless_publication_or_uncertain_remote_state_prevents_a_base_restart(
     )
     assert _lineage(number) == before_lineage
     assert _rows(authority_sql, {"id": request_id}) == authority
-    if hold == "outage_then_absence":
-        branch_status = 404
+    if hold in {"outage_then_absence", "contents_denied_then_absence"}:
+        first_branch_status = branch_status
+        first_matching_reads = matching_reads.copy()
+        branch_status, matching_status = 404, 200
 
         healthy = _observe_base_label(client, number, forge)
 
         assert healthy.status_code == 200, healthy.text
-        assert branch_reads == [503, 404]
+        assert branch_reads == [first_branch_status, 404]
+        assert matching_reads == [*first_matching_reads, 200]
         assert _requests(number) == [{"id": request_id, "status": "cancellation_requested"}]
         assert (_item(number)["base_branch"], _item(number)["base_commit"]) == (
             item["base_branch"],
