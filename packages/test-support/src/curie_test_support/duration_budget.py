@@ -42,16 +42,18 @@ def function_nodes(source: str, filename: str) -> dict[str, ast.FunctionDef | as
 
     class Functions(ast.NodeVisitor):
         def __init__(self) -> None:
-            self.classes: list[str] = []
+            self.parents: list[str] = []
 
         def visit_ClassDef(self, node: ast.ClassDef) -> None:
-            self.classes.append(node.name)
+            self.parents.append(node.name)
             self.generic_visit(node)
-            self.classes.pop()
+            self.parents.pop()
 
         def record(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-            result["::".join([*self.classes, node.name])] = node
+            result["::".join([*self.parents, node.name])] = node
+            self.parents.append(node.name)
             self.generic_visit(node)
+            self.parents.pop()
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
             self.record(node)
@@ -95,9 +97,15 @@ def budget_targets(root: Path, collected: list[str]) -> set[str]:
     ).stdout
     ranges: dict[str, list[tuple[int, int, int, int]]] = {}
     file = ""
+    added = False
+    new_files: set[str] = set()
     for line in diff.splitlines():
+        if line.startswith("--- "):
+            added = line == "--- /dev/null"
         if line.startswith("+++ "):
             file = line[6:] if line.startswith("+++ b/") else ""
+            if file and added:
+                new_files.add(file)
         match = re.match(r"@@ -([0-9]+)(?:,([0-9]+))? \+([0-9]+)(?:,([0-9]+))? @@", line)
         if match and file:
             ranges.setdefault(file, []).append(
@@ -134,7 +142,11 @@ def budget_targets(root: Path, collected: list[str]) -> set[str]:
                     != ast.dump(current[name], include_attributes=False)
                 ):
                     changed.add(file + "::" + name)
-    return {nodeid for nodeid in collected if nodeid.split("[", 1)[0] in changed}
+    return {
+        nodeid
+        for nodeid in collected
+        if nodeid.split("::", 1)[0] in new_files or nodeid.split("[", 1)[0] in changed
+    }
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
