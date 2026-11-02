@@ -59,10 +59,10 @@ pub(crate) enum TestEnvAction {
 pub(crate) enum DevAction {
     /// Check or regenerate the shrinking test-time baselines.
     TestRatchets {
-        /// Regenerate baselines, refusing to add new exemptions.
+        /// Regenerate baselines and prune stale entries.
         #[arg(long)]
         regenerate: bool,
-        /// Pytest --durations output containing call-phase measurements.
+        /// Pytest call-phase artifacts from at least two CI runs.
         #[arg(long, requires = "regenerate")]
         durations: Vec<PathBuf>,
     },

@@ -10367,7 +10367,7 @@ export const commandManifest = {
           "args": [
             {
               "global": false,
-              "help": "Regenerate baselines, refusing to add new exemptions",
+              "help": "Regenerate baselines and prune stale entries",
               "id": "regenerate",
               "long": "regenerate",
               "positional": false,
@@ -10379,7 +10379,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Pytest --durations output containing call-phase measurements",
+              "help": "Pytest call-phase artifacts from at least two CI runs",
               "id": "durations",
               "long": "durations",
               "positional": false,

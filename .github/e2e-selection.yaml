@@ -43,7 +43,7 @@ ci_policy_tests:
   tools/e2e-ci-selection/tests/test_factory_upgrade_selection.py:
     [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
      apps/api, charts/curie, cli, release/atlas.py, tools/factory-e2e,
-     tools/github-stub]
+     tools/github-stub, tests/baselines/test-time.json]
   tools/e2e-ci-selection/tests/test_live_manifest_parity.py:
     [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
      charts/curie]

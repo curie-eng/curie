@@ -796,6 +796,8 @@ def check_pr_body(
 
 def render_command(root: Path, check: Check, base: str, head: str) -> str:
     command = check.command
+    if check.step == "Test-time ratchets":
+        command += " --base-ref " + shlex.quote(f"origin/{base}")
     range_ = f"origin/{base}..{head}"
     command = command.replace(
         '"${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"',

@@ -15,6 +15,11 @@ ROOT = Path(__file__).resolve().parents[3]
 BASELINE = "tests/baselines/test-time.json"
 
 
+@pytest.fixture(autouse=True)
+def private_step_summary(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+
 def command(root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "curie_test_support.test_ratchets", "--root", str(root), *arguments],
@@ -181,10 +186,10 @@ def test_fast_exempt_duration_never_fails_ci() -> None:
 
 def test_duration_unchanged_state_passes() -> None:
     assert (
-        budget_failure("tests/test_case.py::test_slow", 21, {"tests/test_case.py::test_slow"})
+        budget_failure("tests/test_case.py::test_slow", 31, {"tests/test_case.py::test_slow"})
         is None
     )
-    assert budget_failure("tests/test_case.py::test_fast", 20, set()) is None
+    assert budget_failure("tests/test_case.py::test_fast", 30, set()) is None
     assert (
         canonical_nodeid("tests/test_case.py::test_slow@group") == "tests/test_case.py::test_slow"
     )
@@ -223,6 +228,7 @@ def test_fast(setup_delay): pass
         str(tmp_path / "baseline.json"),
     ]
     env = {key: value for key, value in os.environ.items() if key != "PYTEST_ADDOPTS"}
+    env["GITHUB_STEP_SUMMARY"] = str(tmp_path / "summary.md")
     result = subprocess.run(argv, cwd=tmp_path, env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
     source(
@@ -232,6 +238,7 @@ def test_fast(setup_delay): pass
     )
     result = subprocess.run(argv, cwd=tmp_path, env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
+    assert "test_case.py::test_fast: maximum call" in (tmp_path / "summary.md").read_text()
 
 
 @pytest.mark.parametrize(
@@ -324,6 +331,19 @@ def test_removed_duration_parameter_is_ignored_at_collection(tmp_path: Path) -> 
         capture_output=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    source(tmp_path, BASELINE, (tmp_path / "baseline.json").read_text())
+    for index in range(2):
+        source(tmp_path, f"run-{index}.log", result.stdout)
+    regenerated = command(
+        tmp_path,
+        "--regenerate",
+        "--durations",
+        str(tmp_path / "run-0.log"),
+        "--durations",
+        str(tmp_path / "run-1.log"),
+    )
+    assert regenerated.returncode == 0, regenerated.stdout + regenerated.stderr
+    assert json.loads((tmp_path / BASELINE).read_text())["durations"] == []
 
 
 @pytest.mark.parametrize(
@@ -390,3 +410,61 @@ def test_ci_event_base_resolution(
     payload.write_text(json.dumps({"merge_group": {"base_ref": "refs/heads/next"}}))
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(payload))
     assert base_reference() == expected
+
+
+def test_stale_sleep_is_written_to_step_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source(tmp_path, "tests/queue_fixtures.py", "import time\ntime.sleep(1)\n")
+    generate(tmp_path)
+    source(tmp_path, "tests/queue_fixtures.py", "import time\ntime.sleep(0)\n")
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    assert command(tmp_path).returncode == 0
+    assert "stale tests/queue_fixtures.py" in summary.read_text()
+
+
+def test_new_exemption_cannot_bypass_merge_base_budget(tmp_path: Path) -> None:
+    git(tmp_path, "init", "-q", "-b", "main")
+    git(tmp_path, "config", "user.name", "Example")
+    git(tmp_path, "config", "user.email", "test@example.com")
+    git(tmp_path, "config", "core.hooksPath", os.devnull)
+    source(tmp_path, "tests/test_case.py", "def test_case(): pass\n")
+    generate(tmp_path)
+    git(tmp_path, "add", ".")
+    git(tmp_path, "commit", "-qm", "Initial budget")
+    git(tmp_path, "update-ref", "refs/remotes/origin/main", "HEAD")
+    # Editing the working exemption file must not admit a larger baseline.
+    result = command(tmp_path, "--regenerate", *duration_artifacts(tmp_path, 31, 32))
+    assert result.returncode == 1
+    assert "durations: new violation" in result.stdout
+
+
+def test_xdist_transports_duration_collection_observations(tmp_path: Path) -> None:
+    source(tmp_path, "test_case.py", "def test_case(): pass\n")
+    source(
+        tmp_path,
+        "baseline.json",
+        json.dumps({"sleeps": {}, "fixtures": [], "durations": ["test_case.py::test_case"]}),
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-n",
+            "2",
+            "-p",
+            "curie_test_support.duration_budget",
+            "--test-duration-budget",
+            "--test-time-baseline",
+            str(tmp_path / "baseline.json"),
+        ],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'test-time collected: {"test_case.py": ["test_case.py::test_case"]}' in result.stdout
+    assert "s call test_case.py::test_case" in result.stdout
