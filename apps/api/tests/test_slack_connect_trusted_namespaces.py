@@ -163,14 +163,33 @@ def test_ordinary_answers_resolve_from_the_installation_or_a_trusted_key(deliver
     )) == (PARTNER_ORG, USER)
 
 
+@pytest.mark.parametrize("delivery", ["block_actions", "view_submission"])
+@pytest.mark.parametrize("team", [PARTNER_MEMBER_WORKSPACE, SIBLING, PARTNER])
+def test_trusted_organisation_member_answers_from_their_own_workspace(
+    delivery: str, team: str,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-24: user.team_id names the member's workspace.
+
+    Any workspace of the trusted organisation, a sibling included, resolves in
+    that organisation with the unchanged native id (ADR 0261 decision 4).
+    """
+    value = answer(delivery, interaction_user_team_id=team, enterprise_ids=[PARTNER_ORG])
+    assert ordinary(value) == (PARTNER_ORG, USER)
+    assert ordinary({**value, "enterprise_ids": [PARTNER_ORG, PARTNER_ORG]}) == (
+        PARTNER_ORG, USER,
+    )
+
+
 @pytest.mark.parametrize(("value", "reason"), [
     (answer(interaction_user_team_id=STRANGER), "namespace_conflict"),
     (answer(interaction_user_team_id=PARTNER_ORG), "namespace_conflict"),
     (answer(interaction_user_team_id=None), "subject_unidentified"),
     (answer(user_id=None), "subject_unidentified"),
-    (answer(interaction_user_team_id=PARTNER_MEMBER_WORKSPACE, enterprise_ids=[PARTNER_ORG]),
+    (answer(interaction_user_team_id=None, enterprise_ids=[PARTNER_ORG]), "subject_unidentified"),
+    (answer(interaction_user_team_id=PARTNER_MEMBER_WORKSPACE, enterprise_ids=[OTHER_ORG]),
      "namespace_conflict"),
-    (answer(interaction_user_team_id=PARTNER, enterprise_ids=[PARTNER_ORG]), "namespace_conflict"),
+    (answer(interaction_user_team_id=PARTNER_MEMBER_WORKSPACE,
+            enterprise_ids=[PARTNER_ORG, OTHER_ORG]), "namespace_conflict"),
     (answer(interaction_user_team_id=HOME, enterprise_ids=[PARTNER_ORG]), "namespace_conflict"),
     (answer(interaction_user_team_id=OTHER_ORG, enterprise_ids=[OTHER_ORG]), "namespace_conflict"),
     (answer(interaction_user_team_id=PARTNER_ORG, enterprise_ids=[PARTNER_ORG, INSTALL]),

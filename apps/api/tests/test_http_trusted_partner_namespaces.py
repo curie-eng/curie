@@ -246,3 +246,28 @@ def test_grid_partner_answers_follow_the_trusted_set(
         _, capsule = sealed_actor(case, "approved")
         assert capsule.actor_scope is not None
         assert capsule.actor_scope.namespace.model_dump() == trusted.model_dump()
+
+
+@pytest.mark.parametrize("delivery", ["block_actions", "view_submission"])
+def test_trusted_organisation_member_answer_seals_the_organisation(
+    delivery: str,
+    clean_db: None, valkey: redis.Redis, runs_stream: str, synthetic_provider: SimpleNamespace,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-7 HTTP-INVOCATION-EXECUTION-24: ADR 0261 decision 4.
+
+    A Grid member's user.team_id names their own workspace, never the organisation.
+    """
+    organisation = NamespaceV1(
+        id=str(uuid.uuid4()), authority="", kind="slack_enterprise", key="E0EXAMPLEPARTNER",
+    )
+    with approval_case(
+        synthetic_provider, valkey, runs_stream, trusted=(organisation,),
+    ) as case:
+        response = resolve(case, *answered(
+            case, delivery=delivery, interaction_user_team_id="T0EXAMPLEPARTNERWS",
+            enterprise_ids=["E0EXAMPLEPARTNER"],
+        ))
+        assert response.status_code == 200, response.text
+        _, capsule = sealed_actor(case, "approved")
+        assert capsule.actor_scope is not None
+        assert capsule.actor_scope.namespace.model_dump() == organisation.model_dump()
