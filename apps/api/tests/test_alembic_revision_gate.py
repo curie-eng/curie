@@ -285,9 +285,10 @@ def test_baseline_fetch_selects_the_branch_when_a_tag_has_the_same_name(tmp_path
     git(seed, "push", str(remote), "refs/heads/main", "refs/tags/main")
     git(consumer, "init")
     git(consumer, "remote", "add", "origin", str(remote))
+    recipe = (REPO_ROOT / "docs/local-verification.md").read_text(encoding="utf-8")
     command = next(
         line.strip()
-        for line in (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8").splitlines()
+        for line in recipe.splitlines()
         if line.strip().startswith("git fetch") and "refs/remotes/origin/main" in line
     )
     git(consumer, *shlex.split(command)[1:])

@@ -576,75 +576,6 @@ def run_check(
     }
 
 
-def waiver_issues(body: str) -> list[int]:
-    # Match the workflow's comment, fence, indented-code and inline-code rules.
-    uncommented = re.sub(r"<!--.*?(?:-->|$)", "", body, flags=re.S)
-    visible = []
-    fence: tuple[str, int] | None = None
-    for line in uncommented.splitlines():
-        if fence:
-            if re.fullmatch(r" {0,3}" + re.escape(fence[0]) + "{" + str(fence[1]) + r",}\s*", line):
-                fence = None
-            continue
-        opening = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
-        if opening:
-            fence = (opening[1][0], len(opening[1]))
-        elif not re.match(r"^(?: {4}| {0,3}\t)", line):
-            visible.append(line)
-    numbers: set[int] = set()
-    for line in visible:
-        for cell in re.split(r"(?<!\\)\|", line):
-            text = re.sub(r"(`+).*?\1", "", cell)
-            waiver = re.search(r"(?:^|\s)Discovery waiver:\s*(.+)$", text, flags=re.I)
-            if waiver:
-                references = re.sub(r"\[[^\]]*\]\([^)]*\)", "", waiver[1])
-                numbers.update(
-                    int(number) for number in re.findall(r"(?<![\w/])#([1-9][0-9]*)\b", references)
-                )
-    if len(numbers) > 100:
-        raise ValueError("Too many waiver issue references")
-    return sorted(numbers)
-
-
-def open_waiver_issues(root: Path, repository: str, body: str) -> list[int]:
-    numbers = waiver_issues(body)
-    owner, name = repository.split("/", 1)
-    opened = []
-    for offset in range(0, len(numbers), 50):
-        batch = numbers[offset : offset + 50]
-        fields = "\n".join(
-            f"issue{number}: issueOrPullRequest(number: {number}) "
-            "{ __typename ... on Issue { number state } }"
-            for number in batch
-        )
-        query = (
-            "query($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { "
-            + fields
-            + " } }"
-        )
-        result = gh_json(
-            root, "graphql", "-f", f"query={query}", "-f", f"owner={owner}", "-f", f"repo={name}"
-        )
-        if result.get("errors"):
-            raise ValueError("GitHub waiver issue lookup failed")
-        records = result.get("data", {}).get("repository")
-        if not isinstance(records, dict):
-            raise ValueError("GitHub waiver issue repository lookup failed")
-        for number in batch:
-            key = f"issue{number}"
-            if key not in records:
-                raise ValueError("GitHub waiver issue lookup was incomplete")
-            record = records[key]
-            if (
-                record
-                and record.get("__typename") == "Issue"
-                and record.get("state") == "OPEN"
-                and record.get("number") == number
-            ):
-                opened.append(number)
-    return opened
-
-
 def fix_pin_requirements(root: Path, event: Path, directory: Path) -> dict[str, bool]:
     output = directory / "fix-pin-output"
     check = run_check(
@@ -671,7 +602,6 @@ def check_pr_body(
     root: Path,
     body_file: Path,
     title: str,
-    paths: list[str],
     base: str,
     head: str,
     repository: str,
@@ -686,8 +616,6 @@ def check_pr_body(
         inputs = {
             "body.md": body,
             "title.txt": title,
-            "changed-files.json": json.dumps(paths),
-            "open-issues.json": json.dumps(open_waiver_issues(root, repository, body)),
             "event.json": json.dumps(
                 {
                     "repository": {"full_name": repository},
@@ -718,10 +646,6 @@ def check_pr_body(
                     str(temporary / "body.md"),
                     "--title-file",
                     str(temporary / "title.txt"),
-                    "--changed-files-file",
-                    str(temporary / "changed-files.json"),
-                    "--open-issues-file",
-                    str(temporary / "open-issues.json"),
                 ],
                 environment,
             )
@@ -920,8 +844,7 @@ def execute_full(
     report: dict[str, Any],
 ) -> None:
     execute_checks(root, base, head, dry_run, report)
-    # Disabling rename detection includes both old and new filenames, matching
-    # the PR workflow's changed-file set and both affected ownership boundaries.
+    # Include both filenames so test selection covers each affected ownership boundary.
     paths = changed_paths(root, base, head)
     tests = select_python_tests(root, paths)
     report["ci_only"] = select_ci_only(root, paths, base, head)
@@ -958,7 +881,7 @@ def execute_full(
     with services as environment:
         if body_file is not None:
             for check in check_pr_body(
-                root, body_file, title, paths, base, head, repository, environment=environment
+                root, body_file, title, base, head, repository, environment=environment
             ):
                 record_check(report, check)
         if tests:
