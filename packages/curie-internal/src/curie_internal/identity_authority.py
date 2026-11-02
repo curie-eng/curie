@@ -16,6 +16,11 @@ from curie_internal.identity_context import (
 
 Stage = Literal["prepare", "claim_or_resume", "start", "steer"]
 
+# How long the dispatcher receiver and the worker turn-authority client wait for
+# the API's current-authority answer. The API derives its composition deadline
+# from this value so that it always gives up before its callers do.
+IDENTITY_CALLER_WAIT_SECONDS = 5.0
+
 
 def _ascii_context(value: object) -> str:
     """@spec HTTP-INVOCATION-EXECUTION-16."""
