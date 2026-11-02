@@ -468,3 +468,91 @@ def test_xdist_transports_duration_collection_observations(tmp_path: Path) -> No
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'test-time collected: {"test_case.py": ["test_case.py::test_case"]}' in result.stdout
     assert "s call test_case.py::test_case" in result.stdout
+
+
+@pytest.mark.parametrize("kind", ["sleeps", "fixtures"])
+def test_committed_baseline_cannot_undercount_the_scan(tmp_path: Path, kind: str) -> None:
+    git(tmp_path, "init", "-q", "-b", "main")
+    git(tmp_path, "config", "user.name", "Example")
+    git(tmp_path, "config", "user.email", "test@example.com")
+    git(tmp_path, "config", "core.hooksPath", os.devnull)
+    code = "import time\nimport pytest\n@pytest.fixture\ndef cluster(): run('kind', 'create', 'cluster')\ndef test_case(): time.sleep(1); time.sleep(2)\n"
+    source(tmp_path, "tests/test_case.py", code)
+    baseline = generate(tmp_path)
+    git(tmp_path, "add", ".")
+    git(tmp_path, "commit", "-qm", "Initial test costs")
+    git(tmp_path, "update-ref", "refs/remotes/origin/main", "HEAD")
+    assert command(tmp_path).returncode == 0
+    if kind == "sleeps":
+        baseline[kind]["tests/test_case.py"] -= 1
+    else:
+        baseline[kind] = []
+    source(tmp_path, BASELINE, json.dumps(baseline))
+    git(tmp_path, "commit", "-qam", "Undercount the committed baseline")
+    before_merge = command(tmp_path)
+    git(tmp_path, "update-ref", "refs/remotes/origin/main", "HEAD")
+    after_merge = command(tmp_path)
+    assert before_merge.returncode == after_merge.returncode == 1, before_merge.stdout
+    fixed = (
+        code.replace("; time.sleep(2)", "")
+        if kind == "sleeps"
+        else code.replace("@pytest.fixture", '@pytest.fixture(scope="session")')
+    )
+    source(tmp_path, "tests/test_case.py", fixed)
+    assert command(tmp_path).returncode == 0
+
+
+def test_six_shards_from_one_ci_run_do_not_satisfy_two_run_rule(tmp_path: Path) -> None:
+    source(tmp_path, "tests/test_case.py", "def test_case(): pass\n")
+    arguments = []
+    for shard in range(6):
+        path = tmp_path / f"shard-{shard}.log"
+        path.write_text("test-time source run: 12345\n31s call tests/test_case.py::test_case\n")
+        arguments.extend(["--durations", str(path)])
+    result = command(tmp_path, "--regenerate", *arguments)
+    assert result.returncode == 2, result.stdout
+    assert "two" in result.stdout
+
+
+def test_combined_artifact_with_two_ci_run_ids_is_accepted(tmp_path: Path) -> None:
+    source(tmp_path, "tests/test_case.py", "def test_case(): pass\n")
+    path = tmp_path / "combined.log"
+    path.write_text(
+        "test-time source run: 12345\n31s call tests/test_case.py::test_case\ntest-time source run: 12346\n32s call tests/test_case.py::test_case\n"
+    )
+    result = command(tmp_path, "--regenerate", "--durations", str(path))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads((tmp_path / BASELINE).read_text())["durations"] == [
+        "tests/test_case.py::test_case"
+    ]
+
+
+def test_removing_a_current_exemption_removes_runtime_grandfathering(tmp_path: Path) -> None:
+    git(tmp_path, "init", "-q", "-b", "main")
+    git(tmp_path, "config", "user.name", "Example")
+    git(tmp_path, "config", "user.email", "test@example.com")
+    git(tmp_path, "config", "core.hooksPath", os.devnull)
+    source(tmp_path, "tests/test_case.py", "def test_case(): pass\n")
+    source(tmp_path, "conftest.py", (ROOT / "conftest.py").read_text())
+    assert command(tmp_path, "--regenerate", *duration_artifacts(tmp_path, 31, 32)).returncode == 0
+    git(tmp_path, "add", ".")
+    git(tmp_path, "commit", "-qm", "Initial duration exemption")
+    git(tmp_path, "update-ref", "refs/remotes/origin/main", "HEAD")
+    baseline = json.loads((tmp_path / BASELINE).read_text())
+    baseline["durations"] = []
+    source(tmp_path, BASELINE, json.dumps(baseline))
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"PYTEST_ADDOPTS", "GITHUB_EVENT_NAME", "GITHUB_BASE_REF"}
+    }
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "--ci-shard", "1/1"],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+    assert "s call tests/test_case.py::test_case" not in result.stdout
