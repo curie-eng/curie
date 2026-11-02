@@ -277,4 +277,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0255 | [Claim-backed sandbox scratch is bounded by its storage request](0255-claim-backed-sandbox-scratch-is-bounded-by-its-storage-request.md) | Draft |
 | 0256 | [Publication validates and pushes a Git object overlay](0256-publication-validates-and-pushes-a-git-object-overlay.md) | Draft |
 | 0257 | [A release registers its schema window only at the cut](0257-a-release-registers-its-schema-window-only-at-the-cut.md) | Accepted |
+| 0259 | [A binding requires HTTP identity when its invocation or approver role needs HTTP facts](0259-a-binding-requires-http-identity-when-its-invocation-or-approver-role-needs-http-facts.md) | Draft |
 <!-- END GENERATED: adr-index -->
