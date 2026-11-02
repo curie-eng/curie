@@ -299,3 +299,24 @@ def test_pr_body_self_test_covers_the_patch_release_half() -> None:
     combined = f"{completed.stdout}\n{completed.stderr}"
     assert "Trigger" in combined, _diagnostics(completed)
     assert "Live proof" in combined, _diagnostics(completed)
+
+
+@pytest.mark.parametrize("path", [
+    "apps/api/src/curie_api/routers/publications.py",
+    "runner/src/curie_runner/verification_preflight.py",
+    "charts/curie/templates/deployment.yaml",
+    "apps/worker/src/curie_worker/workitem_execution.py",
+])
+def test_protected_paths_need_no_tier_rows(tmp_path: Path, path: str) -> None:
+    body = tmp_path / "body.md"
+    body.write_text("## Verification\n\nLocally: focused guard tests passed.\n", encoding="utf-8")
+    files = tmp_path / "changed-files.json"
+    files.write_text(__import__("json").dumps([path]), encoding="utf-8")
+    issues = tmp_path / "open-issues.json"
+    issues.write_text("[]", encoding="utf-8")
+    completed = subprocess.run(
+        ["bash", str(CHECKER), str(body), "--changed-files-file", str(files),
+         "--open-issues-file", str(issues)],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, _diagnostics(completed)

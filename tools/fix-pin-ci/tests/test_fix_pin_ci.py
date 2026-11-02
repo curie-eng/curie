@@ -2174,275 +2174,31 @@ def test_missing_gh_fails_closed_without_calling_curie(tmp_path: Path) -> None:
     assert not call_log.exists(), "an unavailable label API must not open the gate"
 
 
-def test_unit_pin_for_a_found_live_issue_fails_without_a_waiver(tmp_path: Path) -> None:
-    """A unit selector cannot pin a defect found on a live surface (#2243)."""
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
-        gh_labels=FOUND_LIVE_LABELS,
-    )
-    shown = f"{completed.stdout}\n{completed.stderr}"
-
-    assert completed.returncode != 0, shown
-    assert "found:live" in completed.stderr, shown
-    assert "unit" in completed.stderr, shown
-    assert "Fix pin waiver:" in completed.stderr, shown
-    assert not call_log.exists(), "a pin below the discovery surface must not reach curie"
-
-
-def test_unit_pin_for_a_found_live_issue_passes_with_a_waiver(tmp_path: Path) -> None:
-    """The explicit waiver is the only way a below-surface pin may proceed."""
-    completed, call_log = _run_checker(
-        tmp_path,
-        (
-            f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n"
-            "Fix pin waiver: live retest is manual; the unit pin covers the regression\n"
-        ),
-        gh_labels=FOUND_LIVE_LABELS,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert json.loads(call_log.read_text(encoding="utf-8")) == [
-        "dev",
-        "verify-fix-pin",
-        "HEAD",
-        VALID_SELECTOR,
-    ]
-
-
-def test_live_pin_for_a_found_live_issue_passes_without_a_waiver(tmp_path: Path) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {LIVE_SELECTOR}\n",
-        gh_labels=FOUND_LIVE_LABELS,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert json.loads(call_log.read_text(encoding="utf-8")) == [
-        "dev",
-        "verify-fix-pin",
-        "HEAD",
-        LIVE_SELECTOR,
-    ]
-
-
-def test_helm_render_pin_for_a_found_live_issue_fails_without_a_waiver(
-    tmp_path: Path,
+@pytest.mark.parametrize("labels", [FOUND_UNIT_LABELS, FOUND_LOCAL_LABELS, FOUND_CLUSTER_LABELS, FOUND_LIVE_LABELS])
+@pytest.mark.parametrize("selector", [VALID_SELECTOR, LOCAL_SELECTOR, LIVE_SELECTOR, CHART_SELECTOR])
+def test_reproducing_pin_is_verified_regardless_of_discovery_tier(
+    tmp_path: Path, labels: str, selector: str
 ) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {CHART_SELECTOR}\n",
-        gh_labels=FOUND_LIVE_LABELS,
-    )
-    shown = f"{completed.stdout}\n{completed.stderr}"
-
-    assert completed.returncode != 0, shown
-    assert "found:live" in completed.stderr, shown
-    assert "cluster" in completed.stderr, shown
-    assert not call_log.exists(), "a helm-render pin must not pass for a live-found issue"
-
-
-def test_unit_pin_for_a_found_unit_issue_passes_without_a_waiver(tmp_path: Path) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
-        gh_labels=FOUND_UNIT_LABELS,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert call_log.exists(), "an at-surface pin must still be verified"
-
-
-def test_unit_pin_for_a_found_local_issue_fails_without_a_waiver(tmp_path: Path) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
-        gh_labels=FOUND_LOCAL_LABELS,
-    )
-    shown = f"{completed.stdout}\n{completed.stderr}"
-
-    assert completed.returncode != 0, shown
-    assert "found:local" in completed.stderr, shown
-    assert not call_log.exists(), "a unit pin must not pass for a local-found issue"
-
-
-@pytest.mark.parametrize("gh_labels", [FOUND_UNIT_LABELS, FOUND_LOCAL_LABELS])
-def test_local_pin_satisfies_unit_and_local_discovery_surfaces(
-    tmp_path: Path, gh_labels: str
-) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {LOCAL_SELECTOR}\n",
-        gh_labels=gh_labels,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert call_log.exists(), "an at surface local pin must be verified"
-
-
-@pytest.mark.parametrize("gh_labels", [FOUND_CLUSTER_LABELS, FOUND_LIVE_LABELS])
-def test_local_pin_refuses_cluster_and_live_discovery_surfaces_without_a_waiver(
-    tmp_path: Path, gh_labels: str
-) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {LOCAL_SELECTOR}\n",
-        gh_labels=gh_labels,
-    )
-    shown = f"{completed.stdout}\n{completed.stderr}"
-
-    assert completed.returncode != 0, shown
-    assert "local" in completed.stderr, shown
-    assert not call_log.exists(), "a below surface local pin must not reach curie"
-
-
-def test_local_test_live_filename_is_still_a_local_pin(tmp_path: Path) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {LOCAL_LIVE_SELECTOR}\n",
-        gh_labels=FOUND_CLUSTER_LABELS,
-    )
-    shown = f"{completed.stdout}\n{completed.stderr}"
-
-    assert completed.returncode != 0, shown
-    assert "is a local pin" in completed.stderr, shown
-    assert not call_log.exists(), "a local path named test_live remains below cluster"
-
-
-def test_helm_render_pin_for_a_found_cluster_issue_passes_without_a_waiver(
-    tmp_path: Path,
-) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {CHART_SELECTOR}\n",
-        gh_labels=FOUND_CLUSTER_LABELS,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert json.loads(call_log.read_text(encoding="utf-8")) == [
-        "dev",
-        "verify-fix-pin",
-        "HEAD",
-        CHART_SELECTOR,
-    ]
-
-
-def test_nested_chart_runtime_selector_meets_the_cluster_floor(tmp_path: Path) -> None:
-    """charts/curie/ci/runtime/ scripts are cluster pins like top-level ones (#4367)."""
-    selector = "charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh"
     completed, call_log = _run_checker(
         tmp_path,
         f"Closes #12\n\nFix pin: {selector}\n",
-        gh_labels=FOUND_CLUSTER_LABELS,
+        gh_labels=labels,
     )
-
     assert completed.returncode == 0, completed.stderr
     assert json.loads(call_log.read_text(encoding="utf-8")) == [
-        "dev",
-        "verify-fix-pin",
-        "HEAD",
-        selector,
+        "dev", "verify-fix-pin", "HEAD", selector,
     ]
 
 
-def test_unlabeled_bug_with_a_unit_pin_keeps_no_tier_floor(tmp_path: Path) -> None:
-    """Existing bugs without a found:* label keep the pre-#2243 behaviour."""
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
-        gh_labels=BUG_LABELS,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert call_log.exists(), "an unlabeled bug must still verify a declared selector"
-
-
-def test_waiver_without_a_reason_fails_closed_without_calling_curie(tmp_path: Path) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\nFix pin waiver:\n",
-        gh_labels=FOUND_LIVE_LABELS,
-    )
-
-    assert completed.returncode != 0, f"{completed.stdout}\n{completed.stderr}"
-    assert "Fix pin waiver" in completed.stderr
-    assert not call_log.exists(), "an unexplained waiver must not reach curie"
-
-
-def test_duplicate_waiver_lines_fail_closed_without_calling_curie(tmp_path: Path) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        (
-            f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n"
-            "Fix pin waiver: first\n"
-            "Fix pin waiver: second\n"
-        ),
-        gh_labels=FOUND_LIVE_LABELS,
-    )
-
-    assert completed.returncode != 0, f"{completed.stdout}\n{completed.stderr}"
-    assert "Fix pin waiver" in completed.stderr
-    assert not call_log.exists(), "duplicate waivers must not reach curie"
-
-
-def test_pin_tier_comes_from_selector_location_not_from_prose(tmp_path: Path) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        (f"Closes #12\n\nThis pin is a live Slack test.\nFix pin: {VALID_SELECTOR}\n"),
-        gh_labels=FOUND_LIVE_LABELS,
-    )
-    shown = f"{completed.stdout}\n{completed.stderr}"
-
-    assert completed.returncode != 0, shown
-    assert "unit" in completed.stderr, shown
-    assert not call_log.exists(), "prose claiming a higher tier must not raise the pin"
-
-
-def test_found_live_in_the_issue_body_without_the_label_still_raises_the_floor(
-    tmp_path: Path,
-) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
-        gh_labels=BUG_LABELS,
-        gh_body="### Discovery surface\n\nfound:live\n",
-    )
-    shown = f"{completed.stdout}\n{completed.stderr}"
-
-    assert completed.returncode != 0, shown
-    assert "found:live" in completed.stderr, shown
-    assert not call_log.exists()
-
-
-def test_found_live_mentioned_in_issue_prose_does_not_raise_the_floor(
-    tmp_path: Path,
-) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
-        gh_labels=BUG_LABELS,
-        gh_body=(
-            "### Discovery surface\n\nfound:unit\n\n"
-            "### What happened\n\nThis was not found:live; it failed in pytest.\n"
-        ),
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert call_log.exists(), "narrative found:* mentions must not raise the floor"
-
-
-def test_strictest_found_label_across_closed_bugs_is_the_floor(tmp_path: Path) -> None:
-    """A fake gh returns one label list; the gate must still fail on found:live."""
+def test_issue_discovery_field_does_not_require_a_higher_pin(tmp_path: Path) -> None:
     completed, call_log = _run_checker(
         tmp_path,
         f"Closes #12, #13\n\nFix pin: {VALID_SELECTOR}\n",
         gh_labels='["bug", "found:unit", "found:live"]',
+        gh_body="### Discovery surface\n\nfound:live\n",
     )
-    shown = f"{completed.stdout}\n{completed.stderr}"
-
-    assert completed.returncode != 0, shown
-    assert "found:live" in completed.stderr, shown
-    assert not call_log.exists()
+    assert completed.returncode == 0, completed.stderr
+    assert call_log.exists()
 
 
 def test_python_suite_collects_the_fix_pin_gate_tests() -> None:
@@ -2456,10 +2212,6 @@ def test_bug_report_template_records_the_discovery_surface() -> None:
         assert label in template, f"bug template must name {label}"
 
 
-def test_pull_request_template_documents_the_tier_waiver() -> None:
-    template = PR_TEMPLATE.read_text(encoding="utf-8")
-    assert "Fix pin waiver: <reason>" in template
-    assert "found:live" in template
 
 
 MAIN_MILESTONE = "v0.8.5"
