@@ -254,6 +254,8 @@ def test_connector_configuration_and_failure_cleanup_avoid_platform_lifecycle_ho
     calls = scenario.calls()
     upgrades = [call for call in calls if call[0] == "helm" and "upgrade" in call]
     assert len(upgrades) == 2, (completed.stdout, completed.stderr, calls)
+    # Helm documents hook suppression separately from the rollout wait:
+    # https://helm.sh/docs/helm/helm_upgrade/#options
     assert all("--no-hooks" in call for call in upgrades), upgrades
     assert all("--reuse-values" in call and "--wait" in call for call in upgrades)
     assert all("--install" not in call and "install" not in call for call in upgrades)

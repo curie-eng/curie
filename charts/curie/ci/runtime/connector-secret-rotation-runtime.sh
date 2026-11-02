@@ -87,6 +87,7 @@ CONNECTOR_IMAGE="busybox:1.36.1"
 API_PID=""
 AGENT_TOUCHED=0
 RECONCILER_TOUCHED=0
+BODY_STARTED=
 
 kc() { kubectl --context "$CONTEXT" "$@"; }
 kcn() { kubectl --context "$CONTEXT" -n "$NAMESPACE" "$@"; }
@@ -110,18 +111,24 @@ PY
 
 restore_reconciler() {
     (( RECONCILER_TOUCHED )) || return 0
-    helm --kube-context "$CONTEXT" upgrade "$RELEASE" "$CHART" -n "$NAMESPACE" --reuse-values \
+    local started=$SECONDS
+    helm --kube-context "$CONTEXT" upgrade "$RELEASE" "$CHART" -n "$NAMESPACE" --reuse-values --no-hooks \
         --values "$WORKDIR/reconciler-original.json" --wait --timeout 300s \
         >"$WORKDIR/restore-reconciler.log" 2>&1 || return 1
     kcn rollout status "deploy/${FULLNAME}-worker" --timeout=300s >/dev/null || return 1
+    printf 'TIMING: reconciler_restore_seconds=%s\n' "$((SECONDS - started))"
     RECONCILER_TOUCHED=0
 }
 
 cleanup() {
     local status=$?
+    if [[ -n "$BODY_STARTED" ]]; then
+        printf 'TIMING: scenario_body_seconds=%s\n' "$((SECONDS - BODY_STARTED))"
+    fi
     trap - EXIT INT TERM
     set +e
     if (( AGENT_TOUCHED )); then
+        local agent_cleanup_started=$SECONDS
         env CURIE_API_KEY="$API_KEY" "$CURIE_BIN" cluster --context "$CONTEXT" delete "$AGENT" --yes \
             --namespace "$NAMESPACE" --release "$RELEASE" --api-url "http://127.0.0.1:$API_PORT" \
             >"$WORKDIR/delete-agent.out" 2>"$WORKDIR/delete-agent.err" \
@@ -129,6 +136,7 @@ cleanup() {
         kcn delete deployment,service,networkpolicy,secret -l "curie.dev/connector-owner=$AGENT" \
             --ignore-not-found --wait=true --timeout=90s >"$WORKDIR/delete-connectors.out" 2>"$WORKDIR/delete-connectors.err" \
             || { echo "FAIL: could not remove the scenario connector objects" >&2; status=1; }
+        printf 'TIMING: agent_cleanup_seconds=%s\n' "$((SECONDS - agent_cleanup_started))"
     fi
     restore_reconciler || { echo "FAIL: could not restore the recorded connector reconciler settings" >&2; status=1; }
     if [[ -n "$API_PID" ]]; then
@@ -156,11 +164,14 @@ pathlib.Path(sys.argv[2]).write_text(json.dumps({"worker": {"connectorReconciler
 }}}))
 PY
 RECONCILER_TOUCHED=1
-helm --kube-context "$CONTEXT" upgrade "$RELEASE" "$CHART" -n "$NAMESPACE" --reuse-values \
+configuration_started=$SECONDS
+helm --kube-context "$CONTEXT" upgrade "$RELEASE" "$CHART" -n "$NAMESPACE" --reuse-values --no-hooks \
     --set worker.connectorReconciler.enabled=true --set worker.connectorReconciler.intervalSeconds=1 \
     --wait --timeout 300s >"$WORKDIR/configure-reconciler.log" 2>&1 \
     || fail "could not configure the connector reconciler for the rotation scenario"
 kcn rollout status "deploy/${FULLNAME}-worker" --timeout=300s >/dev/null
+printf 'TIMING: reconciler_configure_seconds=%s\n' "$((SECONDS - configuration_started))"
+BODY_STARTED=$SECONDS
 
 export CONNECTOR_IMAGE
 python3 - "$WORKDIR" <<PY
