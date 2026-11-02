@@ -1711,3 +1711,38 @@ def test_deep_representative_diffs_select_every_deep_job_in_the_merge_queue(
         # and its deferral from the pull request is observed at least once.
         assert selected[filename] == jobs, (filename, sorted(jobs - selected[filename]))
         assert deferred[filename] == jobs, (filename, sorted(jobs - deferred[filename]))
+
+
+def _event_branch(script: str, opener: str) -> str:
+    """The shell text of one `if`/`elif` branch, up to the next branch keyword."""
+    start = script.index(opener) + len(opener)
+    end = re.compile(r"\n\s*(?:elif\b|else\b|fi\b)").search(script, start)
+    assert end is not None, opener
+    return script[start:end.start()]
+
+
+def test_merge_queue_runs_full_pytest_while_pull_requests_stay_impact_selected() -> None:
+    # The queue is the deep lane: it runs the whole pytest suite on its full
+    # shard plan so an impact-selection miss fails before main, not after.
+    jobs = _load_workflows()["ci.yaml"]["jobs"]
+    decide = next(step["run"] for step in jobs["python-pytest"]["steps"]
+                  if step.get("id") == "python-runtime")
+    queue = _event_branch(decide, 'if [ "${{ github.event_name }}" = "merge_group" ]; then')
+    assert "--full-pytest" in queue.split()
+    assert "--pytest-targets-out" not in queue
+    pull_request = decide[re.search(r"\n\s*else\n", decide).end():]
+    assert "--full-pytest" not in pull_request
+    assert "--pytest-targets-out pytest-targets.txt" in pull_request
+
+    tiers = next(step["run"] for step in jobs["changes"]["steps"] if step.get("id") == "filter")
+    queue = _event_branch(tiers, 'elif [ "$event" = "merge_group" ]; then')
+    assert "--full-pytest" in queue.split()
+    pull_request = _event_branch(tiers, 'if [ "$event" = "pull_request" ]; then')
+    assert "--full-pytest" not in pull_request
+
+    # Shard tier limits narrow a pull request's plan only; the queue keeps all six.
+    pytest_step = next(step["run"] for step in jobs["python-pytest"]["steps"]
+                       if "--ci-shard-tiers" in str(step.get("run", "")))
+    guard = pytest_step[:pytest_step.index("--ci-shard-tiers")].rsplit("\n", 2)[-2]
+    assert guard.strip() == 'if [[ "$EVENT_NAME" == "pull_request" ]]; then'
+    assert "merge_group" not in guard

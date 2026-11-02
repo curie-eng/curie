@@ -267,7 +267,7 @@ jobs:
               --registry .github/e2e-selection.yaml \
               --base "${{ github.event.merge_group.base_sha }}" \
               --head "${{ github.event.merge_group.head_sha }}" \
-              --pytest-targets-out pytest-targets.txt
+              --full-pytest
           elif [ "${{ github.event_name }}" != "pull_request" ]; then
             uv run python tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
@@ -396,8 +396,7 @@ jobs:
           esac
           pytest_args=(-q -n 4 --dist loadgroup --ci-shard "$SHARD/$PYTEST_SHARDS" --reruns 1 -rsR --durations=25 --ignore=tools/factory-e2e/tests/test_c4_initial_binding.py --ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py --ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py --ignore=tools/factory-e2e/tests/test_c4_forge_instances.py)
           pytest_args+=(--junitxml shard-result-durations/junit.xml -o junit_family=xunit1)
-          # The merge queue selects exactly what the pull request did (#5262).
-          if [[ "$EVENT_NAME" == "pull_request" || "$EVENT_NAME" == "merge_group" ]]; then
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
             pytest_args+=(--ci-shard-tiers "$PYTEST_STORAGE_SHARDS,$PYTEST_FULL_SHARDS")
           fi
           pytest_args+=(--deselect=tools/factory-e2e/tests/test_c4_admitted_agent.py)
@@ -3031,7 +3030,8 @@ jobs:
               tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --base "${{ github.event.merge_group.base_sha }}" \
-              --head "${{ github.event.merge_group.head_sha }}"
+              --head "${{ github.event.merge_group.head_sha }}" \
+              --full-pytest
           elif [ "$event" = "push" ]; then
             uv run --no-project --with pyyaml==6.0.3 python \
               tools/e2e-ci-selection/select_tiers.py \
