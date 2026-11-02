@@ -182,7 +182,7 @@ def test_duration_new_violation_fails() -> None:
     )
 
 
-def test_fast_exempt_duration_never_fails_ci() -> None:
+def test_under_budget_duration_never_fails_ci() -> None:
     assert (
         budget_failure("tests/test_case.py::test_slow", 0.1, {"tests/test_case.py::test_slow"})
         is None
@@ -220,7 +220,11 @@ def setup_delay(): time.sleep(0.01)
 def test_fast(setup_delay): pass
 """,
     )
-    source(tmp_path, "baseline.json", json.dumps({"sleeps": {}, "fixtures": [], "durations": []}))
+    source(
+        tmp_path,
+        "baseline.json",
+        json.dumps({"sleeps": {}, "fixtures": [], "durations": [], "known_tests": {}}),
+    )
     argv = [
         sys.executable,
         "-m",
@@ -239,7 +243,14 @@ def test_fast(setup_delay): pass
     source(
         tmp_path,
         "baseline.json",
-        json.dumps({"sleeps": {}, "fixtures": [], "durations": ["test_case.py::test_fast"]}),
+        json.dumps(
+            {
+                "sleeps": {},
+                "fixtures": [],
+                "durations": ["test_case.py::test_fast"],
+                "known_tests": {},
+            }
+        ),
     )
     result = subprocess.run(argv, cwd=tmp_path, env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -319,7 +330,12 @@ def test_removed_duration_parameter_is_ignored_at_collection(tmp_path: Path) -> 
         tmp_path,
         "baseline.json",
         json.dumps(
-            {"sleeps": {}, "fixtures": [], "durations": ["test_case.py::test_case[removed]"]}
+            {
+                "sleeps": {},
+                "fixtures": [],
+                "durations": ["test_case.py::test_case[removed]"],
+                "known_tests": {},
+            }
         ),
     )
     for index in range(2):
@@ -455,7 +471,14 @@ def test_xdist_transports_duration_collection_observations(tmp_path: Path) -> No
     source(
         tmp_path,
         "baseline.json",
-        json.dumps({"sleeps": {}, "fixtures": [], "durations": ["test_case.py::test_case"]}),
+        json.dumps(
+            {
+                "sleeps": {},
+                "fixtures": [],
+                "durations": ["test_case.py::test_case"],
+                "known_tests": {},
+            }
+        ),
     )
     result = subprocess.run(
         [
@@ -477,6 +500,8 @@ def test_xdist_transports_duration_collection_observations(tmp_path: Path) -> No
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'test-time collected: {"test_case.py": ["test_case.py::test_case"]}' in result.stdout
+    expected = hashlib.sha256(b"test_case.py::test_case").hexdigest()
+    assert "test-time known: " + json.dumps({"test_case.py": [expected]}) in result.stdout
     assert "s call test_case.py::test_case" in result.stdout
 
 
@@ -554,7 +579,7 @@ def test_combined_artifact_with_two_ci_run_ids_is_accepted(tmp_path: Path) -> No
     ]
 
 
-def test_removing_a_current_exemption_removes_runtime_grandfathering(tmp_path: Path) -> None:
+def test_removing_a_current_observation_stops_reporting_it_when_fast(tmp_path: Path) -> None:
     git(tmp_path, "init", "-q", "-b", "main")
     git(tmp_path, "config", "user.name", "Example")
     git(tmp_path, "config", "user.email", "test@example.com")
@@ -659,3 +684,17 @@ def test_regeneration_records_hashed_known_case_inventory(tmp_path: Path) -> Non
     assert json.loads((tmp_path / BASELINE).read_text())["known_tests"] == {
         "tests/test_case.py": [node_hash]
     }
+
+
+@pytest.mark.parametrize(
+    "known", [[], {"tests/test_case.py": ["not-a-hash"]}, {"../outside.py": []}]
+)
+def test_malformed_known_case_inventory_fails_closed(tmp_path: Path, known: Any) -> None:
+    source(
+        tmp_path,
+        BASELINE,
+        json.dumps({"sleeps": {}, "fixtures": [], "durations": [], "known_tests": known}),
+    )
+    result = command(tmp_path)
+    assert result.returncode == 2
+    assert "known_tests" in result.stdout

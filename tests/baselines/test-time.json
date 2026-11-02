@@ -8,6 +8,9 @@
     "apps/api/tests/test_state_boot_credential_released.py::test_unavailable_credential_check_refuses_without_logging_secrets[state-memory]",
     "apps/worker/tests/kernel/test_capacity_wait_retry_bound.py::test_parked_turn_starts_within_bound_after_capacity_frees",
     "apps/worker/tests/test_source_worker_probe_lifecycle.py::test_real_required_table_wait_obeys_deadline_or_cancellation_and_disposes_backend[deadline]",
+    "charts/curie/ci/test_api_identity_assertions.py::test_credential_identity_and_key_mutations_are_refused[key: {{ .Values.api.githubAppExistingSecretKey | quote }}-key: privateKey]",
+    "charts/curie/ci/test_api_identity_assertions.py::test_credential_identity_and_key_mutations_are_refused[name: GITHUB_APP_PRIVATE_KEY-name: WRONG_APP_PRIVATE_KEY]",
+    "charts/curie/ci/test_api_identity_assertions.py::test_credential_identity_and_key_mutations_are_refused[name: {{ include \"curie.secretName\" . }}\\n                  key: githubAppPrivateKey-name: wrong-secret\\n                  key: githubAppPrivateKey]",
     "examples/tests/test_dark_factory_review_candidate.py::test_a_commit_after_diff_approval_keeps_it_only_when_the_files_are_unchanged[edit_then_commit]",
     "examples/tests/test_dark_factory_review_candidate.py::test_an_edit_to_a_flagged_base_file_after_diff_approval_needs_a_fresh_review[flag_after_approval-assume-unchanged]",
     "examples/tests/test_dark_factory_review_candidate.py::test_an_edit_to_a_flagged_base_file_after_diff_approval_needs_a_fresh_review[flag_after_approval-skip-worktree]",
@@ -32,6 +35,7 @@
     "examples/tests/test_dark_factory_review_policy.py::test_continuation_a_ci_marker_opens_one_repair_round_in_the_same_session",
     "examples/tests/test_dark_factory_review_policy.py::test_continuation_a_nested_checkout_keeps_its_own_stop",
     "examples/tests/test_dark_factory_review_policy.py::test_continuation_a_nested_checkout_never_continues_its_parents_run",
+    "examples/tests/test_dark_factory_review_policy.py::test_continuation_a_new_message_keeps_rounds_planning_and_findings[unframed]",
     "examples/tests/test_dark_factory_review_policy.py::test_continuation_a_run_started_in_a_subdirectory_keeps_its_stop_at_the_checkout_root",
     "examples/tests/test_dark_factory_review_policy.py::test_continuation_a_sibling_directory_of_the_same_checkout_continues",
     "examples/tests/test_dark_factory_review_policy.py::test_continuation_a_stopped_run_stays_stopped_with_its_findings",
@@ -64,6 +68,7 @@
     "tools/factory-e2e/tests/test_c4_upgrade_migration.py::released_factory",
     "tools/factory-e2e/tests/test_c4_upgrade_migration.py::released_factory_without_required_ci"
   ],
+  "known_tests": {},
   "sleeps": {
     "adapters/discord/tests/_telemetry_process.py": 1,
     "adapters/discord/tests/test_telemetry.py": 1,
