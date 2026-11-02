@@ -80,6 +80,7 @@ from .progress import (
     sweep_pending_progress,
     sweep_pending_progress_inboxes,
 )
+from .sandbox.types import AdmissionUnavailableError
 from .stream_consumer import DeliverySpec, ReadLoopSpec, StreamConsumer
 from .upgrade_drain import UpgradeDrainGate
 
@@ -794,7 +795,9 @@ class Consumer(StreamConsumer):
                                 # consumer still notifies.
                                 lease.raise_if_lost()
                                 wait_record = await self._waits.get(qevent.event_id)
-                                if wait_record is None:
+                                if wait_record is None and not isinstance(
+                                    exc, AdmissionUnavailableError
+                                ):
                                     await self._kernel.notify_turn_not_started(qevent, lease=lease)
                             except LeaseLostError:
                                 logger.warning(

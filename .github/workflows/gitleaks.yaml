@@ -1,6 +1,8 @@
 name: Secret Scan
 
 on:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, next]
   pull_request:
@@ -14,8 +16,8 @@ on:
 # Supersede an in-flight run when the same ref is pushed again so runs stop
 # stacking (scheduled/dispatch runs each key on their own ref).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -75,6 +77,10 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           echo "GITLEAKS_LOG_OPTS=--log-opts=${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" >> "$GITHUB_ENV"
+      - name: Scope gitleaks to merge group commits
+        if: github.event_name == 'merge_group'
+        run: |
+          echo "GITLEAKS_LOG_OPTS=--log-opts=${{ github.event.merge_group.base_sha }}..${{ github.event.merge_group.head_sha }}" >> "$GITHUB_ENV"
       # Without a log range gitleaks scans every ref the `fetch-depth: 0`
       # checkout pulled down, so a push to a release branch also scanned every
       # unmerged feature branch and a finding on one of them reddened the

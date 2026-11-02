@@ -788,6 +788,10 @@ class RepoRunnerPoolRefused(MissingAgentPoolError):
         SandboxError.__init__(self, message)
 
 
+class AdmissionUnavailableError(SandboxError):
+    """Admission cannot observe inventory within its bounded read budget."""
+
+
 class CapacityExhaustedError(SandboxError):
     """A sandbox claim was refused by admission or an observed quota limit."""
 

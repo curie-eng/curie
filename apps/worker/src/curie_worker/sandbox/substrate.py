@@ -36,6 +36,8 @@ from aci_protocol import BootEnv
 from curie_telemetry import operation_span, record_metric
 from curie_telemetry.redact import redact_text
 from opentelemetry.trace import SpanKind, StatusCode
+from urllib3.exceptions import MaxRetryError
+from urllib3.exceptions import TimeoutError as HTTPTimeoutError
 
 from ..binding import (
     BUNDLE_REF_ENV,
@@ -61,6 +63,7 @@ from .types import (
     TURN_PROGRESS_ELIGIBILITY_ENV,
     AdmissionRejection,
     AdmissionReservation,
+    AdmissionUnavailableError,
     CapacityExhaustedError,
     CapacityInventory,
     CapacityRejection,
@@ -350,8 +353,15 @@ class SandboxSubstrate:
         ))
         if set(requested) != set(config.hard):
             raise ValueError("sandbox admission footprint is incomplete")
-        inventory = self._reconcile_admission()
-        quota = self._k8s.read_quota(config.quota_name, request_timeout_seconds=1.0)
+        try:
+            inventory = self._reconcile_admission()
+            quota = self._k8s.read_quota(config.quota_name, request_timeout_seconds=1.0)
+        except (TimeoutError, HTTPTimeoutError) as exc:
+            raise AdmissionUnavailableError("sandbox admission inventory unavailable") from exc
+        except MaxRetryError as exc:
+            if not isinstance(exc.reason, HTTPTimeoutError):
+                raise
+            raise AdmissionUnavailableError("sandbox admission inventory unavailable") from exc
         live_headroom = admission_quota_headroom(config, self._config.namespace, requested, quota)
         hard = resource_vector(config.hard)
         if config.ceiling == 0:

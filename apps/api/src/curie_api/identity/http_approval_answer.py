@@ -88,6 +88,23 @@ def _unavailable() -> NoReturn:
     _refuse(503, "authority_unavailable")
 
 
+def _definitive_refusal(group: BaseExceptionGroup[Any]) -> HTTPException | None:
+    """The first definitive refusal raised inside a TaskGroup, if any.
+
+    A domain refusal (any non-5xx ``HTTPException``) decides the outcome even when
+    a sibling failed or was cancelled because of it; only a group without one
+    stays unavailable. @spec HTTP-APPROVAL-CONTINUITY-8/9.
+    """
+    for error in group.exceptions:
+        if isinstance(error, BaseExceptionGroup):
+            nested = _definitive_refusal(error)
+            if nested is not None:
+                return nested
+        elif isinstance(error, HTTPException) and error.status_code < 500:
+            return error
+    return None
+
+
 def _sha256(data: bytes) -> str:
     """@spec HTTP-APPROVAL-CONTINUITY-7."""
     return hashlib.sha256(data).hexdigest()
@@ -438,12 +455,21 @@ class _Composition:
         if len({subject.capture.authority for subject in self.subjects}) != 1:
             _unavailable()
         actor = next((item for item in self.subjects if item.role == "approver"), None)
-        async with asyncio.TaskGroup() as group:
-            tasks = [group.create_task(self._observe(subject)) for subject in self.subjects]
-            route = None if actor is None else group.create_task(_route_decision(
-                self.row, self.route_binding, actor, self.approver_sets,
-                self.actor_native, self.actor_channel,
-            ))
+        try:
+            async with asyncio.TaskGroup() as group:
+                tasks = [group.create_task(self._observe(subject)) for subject in self.subjects]
+                route = None if actor is None else group.create_task(_route_decision(
+                    self.row, self.route_binding, actor, self.approver_sets,
+                    self.actor_native, self.actor_channel,
+                ))
+        except BaseExceptionGroup as group_error:
+            # The group wraps a route denial and cancels pending lookups; the
+            # denial keeps its own status and reason rather than reading as
+            # unavailable. Anything else stays unavailable at the boundary.
+            refusal = _definitive_refusal(group_error)
+            if refusal is not None:
+                raise refusal from None
+            raise
         self.subjects = [task.result() for task in tasks]
         self.route_evidence = None if route is None else route.result()
         async with identity_fence.mutation(self.factory, self.valkey) as writer:
@@ -806,31 +832,44 @@ def approved_resume_authority(state: Any) -> ApprovedResumeAuthority:
 
 
 async def publish_answered_resume(
-    session: AsyncSession, resume_queue: Any, row: Approval,
+    session: AsyncSession, resume_queue: Any, row: Approval, *, reconciler_enabled: bool,
 ) -> None:
     """Publish the wake a committed selected answer owes, after its commit.
 
     Called only once the commit owner has positively acknowledged the
     resolution: never inside the mutation or under a row lock. A refusal
-    appends nothing and leaves the wake owed for the reconciler; any other
-    failure is not marked either, and the committed resolution still stands.
-    @spec HTTP-APPROVAL-CONTINUITY-10/11.
+    appends nothing and leaves the wake owed; any other failure is not marked
+    either, and the committed resolution still stands. Leaving it owed is safe
+    only when ``reconciler_enabled`` names a backstop that will retry it;
+    without one the failure is re-raised so the caller sees it, matching the
+    legacy resolver. @spec HTTP-APPROVAL-CONTINUITY-10/11.
     """
     try:
         await resume_queue.enqueue_approval(row.id, parent=approval_trace_context(row))
     except ApprovalResumeRefused as refused:
         logger.warning(
-            "approval %s resolved; selected resume refused (%s), the wake stays owed",
-            row.id, refused.code,
+            "approval %s resolved; selected resume refused (%s), %s",
+            row.id, refused.code, _owed(reconciler_enabled),
         )
+        if not reconciler_enabled:
+            raise
         return
-    except Exception:  # noqa: BLE001 - the resolution committed; the wake stays owed.
+    except Exception:  # the resolution committed; the wake stays owed.
         logger.warning(
-            "approval %s resolved; selected resume enqueue failed, the wake stays owed",
-            row.id,
+            "approval %s resolved; selected resume enqueue failed, %s",
+            row.id, _owed(reconciler_enabled),
         )
+        if not reconciler_enabled:
+            raise
         return
     try:
         await approvals_crud.mark_approval_resumed(session, row.id)
     except Exception:  # noqa: BLE001 - a duplicate wake is absorbed by the done-marker.
         logger.warning("approval %s resume appended; marking it resumed failed", row.id)
+
+
+def _owed(reconciler_enabled: bool) -> str:
+    """@spec HTTP-APPROVAL-CONTINUITY-11."""
+    if reconciler_enabled:
+        return "the wake stays owed to the resume reconciler"
+    return "nothing will retry it (resume reconciler disabled)"

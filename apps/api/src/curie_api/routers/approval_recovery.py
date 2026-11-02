@@ -412,7 +412,10 @@ async def _recover_selected(
     )
     # @spec HTTP-APPROVAL-CONTINUITY-10/11: the wake publishes only after the commit.
     out = _recovery_out(recovered, data.recovery_key)
-    await publish_answered_resume(session, resume_queue, recovered)
+    await publish_answered_resume(
+        session, resume_queue, recovered,
+        reconciler_enabled=get_settings().resume_reconciler_enabled,
+    )
     return out
 
 

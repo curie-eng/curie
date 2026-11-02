@@ -2,6 +2,7 @@
 //! Shared by up/apply and status; this does not perform transactional recovery.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -9,8 +10,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use tokio::io::AsyncReadExt;
+use tokio::time::Instant;
 
-use super::{plain, run_capture, CommonOpts, OpsCommand, UpInvocation};
+use super::command::command_io_error;
+use super::{plain, CommonOpts, OpsCommand, UpInvocation};
 
 /// Which convergence property an observed issue actually disproves.
 ///
@@ -172,10 +176,73 @@ fn hook_job_predates_revision(job: &Value, last_deployed: Option<OffsetDateTime>
     }
 }
 
-async fn capture(command: OpsCommand, description: &str) -> Result<String> {
-    let (ok, out, _) = tokio::time::timeout(Duration::from_secs(10), run_capture(&command))
-        .await
-        .with_context(|| format!("{description} timed out after 10 seconds"))?
+#[derive(Clone, Copy)]
+struct Deadlines {
+    observation: Instant,
+    convergence: Option<Instant>,
+}
+
+impl Deadlines {
+    fn outer(self) -> (Instant, &'static str) {
+        match self.convergence {
+            Some(deadline) if deadline <= self.observation => (
+                deadline,
+                "post-Helm convergence timed out after 300 seconds",
+            ),
+            _ => (
+                self.observation,
+                "convergence observation timed out after 30 seconds",
+            ),
+        }
+    }
+}
+
+async fn capture(command: OpsCommand, description: &str, deadlines: Deadlines) -> Result<String> {
+    let inner = Instant::now() + Duration::from_secs(10);
+    let (outer, message) = deadlines.outer();
+    let (deadline, message) = if outer <= inner {
+        (outer, message.to_owned())
+    } else {
+        (inner, format!("{description} timed out after 10 seconds"))
+    };
+    let (command, _secret_files) = command
+        .materialize_secret_files()
+        .with_context(|| format!("could not {description}"))?;
+    let mut child = command
+        .tokio_command()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| command_io_error(&command.program, error))
+        .with_context(|| format!("could not {description}"))?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let result = tokio::time::timeout_at(deadline, async {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let (status, _, _) = tokio::try_join!(
+            child.wait(),
+            stdout.read_to_end(&mut out),
+            stderr.read_to_end(&mut err),
+        )?;
+        Ok::<_, std::io::Error>((status.success(), String::from_utf8_lossy(&out).into_owned()))
+    })
+    .await;
+    if !matches!(&result, Ok(Ok(_))) {
+        let stopped = child.start_kill();
+        let reaped = child.wait().await;
+        stopped
+            .and(reaped.map(|_| ()))
+            .map_err(|error| command_io_error(&command.program, error))
+            .with_context(|| {
+                format!("could not stop and reap child while attempting to {description}")
+            })?;
+    }
+    let (ok, out) = result
+        .context(message)?
+        .map_err(|error| command_io_error(&command.program, error))
         .with_context(|| format!("could not {description}"))?;
     if !ok {
         bail!("could not {description}; inspect Helm/Kubernetes access and retry");
@@ -253,8 +320,13 @@ pub(super) fn dry_run_commands(opts: &CommonOpts) -> Vec<OpsCommand> {
     ]
 }
 
-async fn helm_status(opts: &CommonOpts) -> Result<Value> {
-    let raw = capture(helm_status_command(opts), "read Helm release state").await?;
+async fn helm_status(opts: &CommonOpts, deadlines: Deadlines) -> Result<Value> {
+    let raw = capture(
+        helm_status_command(opts),
+        "read Helm release state",
+        deadlines,
+    )
+    .await?;
     serde_json::from_str(&raw).context("Helm release state is malformed")
 }
 
@@ -774,8 +846,12 @@ const UNOBSERVED: [Facet; 8] = [
 /// waiter adopted from its first sample; a different latest revision is a
 /// replacement, refused before its manifest is read. A pending status on the
 /// target revision is retryable; every other non-deployed status is terminal.
-async fn observe_inner(opts: &CommonOpts, pinned: Option<u64>) -> Result<Observation> {
-    let status = helm_status(opts).await?;
+async fn observe_inner(
+    opts: &CommonOpts,
+    pinned: Option<u64>,
+    deadlines: Deadlines,
+) -> Result<Observation> {
+    let status = helm_status(opts, deadlines).await?;
     let (revision, state) = helm_identity(&status)?;
     let mut result = Observation {
         revision: Some(revision),
@@ -810,6 +886,7 @@ async fn observe_inner(opts: &CommonOpts, pinned: Option<u64>) -> Result<Observa
     let manifest = capture(
         manifest_command(opts, &revision.to_string()),
         "read target release manifest",
+        deadlines,
     )
     .await?;
     let mut expected = Vec::new();
@@ -862,6 +939,7 @@ async fn observe_inner(opts: &CommonOpts, pinned: Option<u64>) -> Result<Observa
         let raw = capture(
             workloads_command(namespace),
             "read target workloads and pods",
+            deadlines,
         )
         .await?;
         let value: Value =
@@ -901,7 +979,7 @@ async fn observe_inner(opts: &CommonOpts, pinned: Option<u64>) -> Result<Observa
     }
     let mut nodes = BTreeMap::new();
     for name in needed_nodes {
-        let raw = capture(node_images_command(&name), "read serving Node image inventory").await
+        let raw = capture(node_images_command(&name), "read serving Node image inventory", deadlines).await
             .map_err(|error| crate::exit::CliError::failure(format!(
                 "tagged image alias requires get-node read access for the serving Pod; inspect that access or select a digest-pinned target image: {error}"
             )).with_fix("allow read access to the serving Node or select a digest-pinned target image, then rerun the same cluster command"))?;
@@ -957,7 +1035,7 @@ async fn observe_inner(opts: &CommonOpts, pinned: Option<u64>) -> Result<Observa
             }
         }
     }
-    let final_status = helm_status(opts).await?;
+    let final_status = helm_status(opts, deadlines).await?;
     let (final_revision, final_state) = helm_identity(&final_status)?;
     if final_revision != revision {
         let expected = pinned.unwrap_or(revision);
@@ -985,15 +1063,28 @@ async fn observe_inner(opts: &CommonOpts, pinned: Option<u64>) -> Result<Observa
     Ok(result)
 }
 
-async fn observe_pinned(opts: &CommonOpts, expected: Option<u64>) -> Result<Observation> {
-    tokio::time::timeout(Duration::from_secs(30), observe_inner(opts, expected))
-        .await
-        .context("convergence observation timed out after 30 seconds")?
+async fn observe_pinned(
+    opts: &CommonOpts,
+    expected: Option<u64>,
+    convergence: Option<Instant>,
+) -> Result<Observation> {
+    let deadlines = Deadlines {
+        observation: Instant::now() + Duration::from_secs(30),
+        convergence,
+    };
+    let result = observe_inner(opts, expected, deadlines).await;
+    let (deadline, message) = deadlines.outer();
+    if Instant::now() >= deadline {
+        return tokio::time::timeout_at(deadline, std::future::pending())
+            .await
+            .context(message);
+    }
+    result
 }
 
 /// One unpinned sample of whatever revision Helm currently reports.
 pub(super) async fn observe(opts: &CommonOpts) -> Result<Observation> {
-    observe_pinned(opts, None).await
+    observe_pinned(opts, None, None).await
 }
 
 pub(super) async fn installation_failure(
@@ -1034,10 +1125,7 @@ pub(super) async fn wait(opts: &CommonOpts, invocation: UpInvocation) -> Result<
     };
     let mut expected = None;
     loop {
-        let observation = tokio::time::timeout_at(deadline, observe_pinned(opts, expected))
-            .await
-            .context("post-Helm convergence timed out after 300 seconds")
-            .and_then(|result| result);
+        let observation = observe_pinned(opts, expected, Some(deadline)).await;
         let result = match observation {
             Ok(result) => result,
             Err(error) if last_issues.is_empty() => return Err(error),
@@ -1087,10 +1175,7 @@ pub(super) async fn wait_for_observation(opts: &CommonOpts) -> Observation {
     let mut carried = Observation::default();
     let mut expected = None;
     loop {
-        let observed = tokio::time::timeout_at(deadline, observe_pinned(opts, expected))
-            .await
-            .context("post-Helm convergence timed out after 300 seconds")
-            .and_then(|result| result);
+        let observed = observe_pinned(opts, expected, Some(deadline)).await;
         let result = match observed {
             Ok(result) => result,
             Err(error) => {
@@ -1207,11 +1292,9 @@ mod tests {
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Output, Stdio};
-    use std::sync::Mutex;
     use std::thread::{self, JoinHandle};
     use std::time::Instant;
 
-    static CLUSTER_PACING: Mutex<()> = Mutex::new(());
     const CHILD: &str = "CURIE_CONVERGENCE_TEST_CHILD";
     const IMAGE: &str = "docker.io/library/busybox:1.36.1";
     const NODE_IMAGE: &str = "kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93";
@@ -1255,6 +1338,7 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      terminationGracePeriodSeconds: 0
       containers:
         - name: gate
           image: {{ .Values.image }}
@@ -1495,11 +1579,29 @@ sys.exit(result.returncode)
         context: String,
         image: String,
         image_built: bool,
+        release_prefix: String,
         releases: Vec<String>,
         processes: Vec<Process>,
         cluster_requested: bool,
         cleaned: bool,
         started: Instant,
+    }
+
+    // Lines are `name\tphase\tdeletionTimestamp` from the hook pod listing.
+    // The seed hook keeps this job name until before-hook-creation deletes it.
+    // That completed pod is not the gated hook, and neither is a pod already
+    // being deleted.
+    fn active_hook_pod(listing: &str) -> Option<&str> {
+        listing.lines().find_map(|line| {
+            let mut fields = line.split('\t');
+            let name = fields.next()?.trim();
+            let phase = fields.next()?.trim();
+            let deletion = fields.next().map(str::trim).unwrap_or("");
+            if name.is_empty() || !deletion.is_empty() || !matches!(phase, "Pending" | "Running") {
+                return None;
+            }
+            Some(name)
+        })
     }
 
     impl Fixture {
@@ -1524,6 +1626,7 @@ sys.exit(result.returncode)
                 root,
                 programs,
                 original_path: std::env::var_os("PATH").context("PATH is required")?,
+                release_prefix: cluster.clone(),
                 cluster,
                 context,
                 image,
@@ -1602,6 +1705,7 @@ sys.exit(result.returncode)
                 ],
                 Duration::from_secs(180),
             )?;
+            println!("convergence cluster created: {}", self.cluster);
             let contexts: Value = serde_json::from_str(&self.invoke(
                 "kubectl",
                 &["config", "view", "-o", "json"],
@@ -1630,6 +1734,23 @@ sys.exit(result.returncode)
                 &["load", "docker-image", &self.image, "--name", &self.cluster],
                 Duration::from_secs(90),
             )?;
+            self.configure_case()
+        }
+
+        fn for_case(shared: &Self) -> Result<Self> {
+            let mut fixture = Self::new()?;
+            fixture.cluster.clone_from(&shared.cluster);
+            fixture.context.clone_from(&shared.context);
+            fixture.image.clone_from(&shared.image);
+            std::fs::copy(
+                shared.root.path().join("kubeconfig"),
+                fixture.root.path().join("kubeconfig"),
+            )?;
+            fixture.configure_case()?;
+            Ok(fixture)
+        }
+
+        fn configure_case(&self) -> Result<()> {
             let chart = self.root.path().join("chart");
             std::fs::create_dir_all(chart.join("templates"))?;
             std::fs::write(
@@ -1655,7 +1776,7 @@ sys.exit(result.returncode)
         }
 
         fn release(&mut self) -> Result<String> {
-            let release = format!("acme-{}", self.releases.len());
+            let release = format!("{}-{}", self.release_prefix, self.releases.len());
             self.releases.push(release.clone());
             self.invoke(
                 "kubectl",
@@ -1724,7 +1845,8 @@ sys.exit(result.returncode)
                 "unexpected real Helm fixture status"
             );
             println!(
-                "UTC={} elapsed={:.3}s release={} revision={} status={}",
+                "case={} UTC={} elapsed={:.3}s release={} revision={} status={}",
+                self.release_prefix,
                 OffsetDateTime::now_utc().format(&Rfc3339)?,
                 self.started.elapsed().as_secs_f64(),
                 release,
@@ -1748,9 +1870,15 @@ sys.exit(result.returncode)
                 );
                 thread::sleep(Duration::from_millis(100));
             }
-            let deadline = Instant::now() + Duration::from_secs(45);
+            self.hook_pod_ready(target)
+        }
+
+        fn hook_pod_ready(&self, target: &Target) -> Result<()> {
+            let created_deadline = Instant::now() + Duration::from_secs(45);
+            let mut ready_deadline = None;
+            let selector = format!("job-name={}", target.hook);
             loop {
-                let pods = self.invoke(
+                let listing = self.invoke(
                     "kubectl",
                     &[
                         "get",
@@ -1758,33 +1886,44 @@ sys.exit(result.returncode)
                         "-n",
                         &target.release,
                         "-l",
-                        &format!("job-name={}", target.hook),
+                        &selector,
                         "-o",
-                        "name",
+                        "jsonpath={range .items[*]}{.metadata.name}{\"\\t\"}{.status.phase}{\"\\t\"}{.metadata.deletionTimestamp}{\"\\n\"}{end}",
                     ],
                     Duration::from_secs(8),
                 )?;
-                if !pods.trim().is_empty() {
-                    break;
+                if let Some(name) = active_hook_pod(&listing) {
+                    let ready_by = *ready_deadline
+                        .get_or_insert_with(|| Instant::now() + Duration::from_secs(60));
+                    let remaining = ready_by.saturating_duration_since(Instant::now());
+                    let seconds = remaining.as_secs();
+                    anyhow::ensure!(seconds > 0, "real hook Pod was not ready");
+                    match self.invoke(
+                        "kubectl",
+                        &[
+                            "wait",
+                            &format!("pod/{name}"),
+                            "-n",
+                            &target.release,
+                            "--for=condition=Ready",
+                            &format!("--timeout={seconds}s"),
+                        ],
+                        remaining + Duration::from_secs(10),
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(_) if Instant::now() < ready_by => {}
+                        Err(error) => return Err(error),
+                    }
+                } else if let Some(ready_by) = ready_deadline {
+                    anyhow::ensure!(Instant::now() < ready_by, "real hook Pod was not ready");
+                } else {
+                    anyhow::ensure!(
+                        Instant::now() < created_deadline,
+                        "real hook Pod was not created"
+                    );
                 }
-                anyhow::ensure!(Instant::now() < deadline, "real hook Pod was not created");
                 thread::sleep(Duration::from_millis(100));
             }
-            self.invoke(
-                "kubectl",
-                &[
-                    "wait",
-                    "pod",
-                    "-n",
-                    &target.release,
-                    "-l",
-                    &format!("job-name={}", target.hook),
-                    "--for=condition=Ready",
-                    "--timeout=60s",
-                ],
-                Duration::from_secs(70),
-            )?;
-            Ok(())
         }
 
         fn workload_ready(&self, release: &str, budget: Duration) -> Result<()> {
@@ -1909,10 +2048,10 @@ sys.exit(result.returncode)
             revision: u64,
             gate: Option<&Barrier>,
         ) -> Result<usize> {
-            let full_name = format!("ops::convergence::tests::{test}");
+            let full_name = "ops::convergence::tests::shared_cluster_convergence_cases";
             let mut command = Command::new(std::env::current_exe()?);
             command
-                .args(["--exact", &full_name, "--nocapture", "--test-threads=1"])
+                .args(["--exact", full_name, "--nocapture", "--test-threads=1"])
                 .env(CHILD, test)
                 .env("CURIE_CONVERGENCE_RELEASE", release)
                 .env("CURIE_CONVERGENCE_CONTRACT", contract)
@@ -1957,8 +2096,12 @@ sys.exit(result.returncode)
             }
             let output =
                 self.processes[process].wait(deadline.saturating_duration_since(Instant::now()))?;
-            print!("{}", String::from_utf8_lossy(&output.stdout));
-            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                println!("case={} {line}", self.release_prefix);
+            }
+            for line in String::from_utf8_lossy(&output.stderr).lines() {
+                eprintln!("case={} {line}", self.release_prefix);
+            }
             anyhow::ensure!(output.status.success(), "private convergence child failed");
             Ok(())
         }
@@ -1991,6 +2134,48 @@ sys.exit(result.returncode)
                 "unexpected final Helm identity"
             );
             Ok(())
+        }
+
+        fn diagnostic(&self, case: &str, program: &str, args: &[&str]) {
+            match self.invoke(program, args, Duration::from_secs(10)) {
+                Ok(output) => {
+                    for line in output.lines() {
+                        eprintln!(
+                            "case={} scenario={case} {program}: {line}",
+                            self.release_prefix
+                        );
+                    }
+                }
+                Err(error) => {
+                    for line in format!("{error:#}").lines() {
+                        eprintln!(
+                            "case={} scenario={case} diagnostics failed: {line}",
+                            self.release_prefix
+                        );
+                    }
+                }
+            }
+        }
+
+        fn diagnostics(&self, case: &str) {
+            self.diagnostic(case, "kubectl", &["get", "nodes", "-o", "yaml"]);
+            self.diagnostic(
+                case,
+                "kubectl",
+                &["get", "events", "-n", "kube-system", "-o", "yaml"],
+            );
+            for release in &self.releases {
+                self.diagnostic(
+                    case,
+                    "kubectl",
+                    &["get", "all,events", "-n", release, "-o", "yaml"],
+                );
+                self.diagnostic(
+                    case,
+                    "helm",
+                    &["status", release, "-n", release, "--show-desc"],
+                );
+            }
         }
 
         fn cleanup(&mut self) -> Result<()> {
@@ -2102,7 +2287,7 @@ sys.exit(result.returncode)
                 "fixture cleanup failed: {}",
                 errors.join("; ")
             );
-            println!("fixture cleanup verified");
+            println!("case={} fixture cleanup verified", self.release_prefix);
             Ok(())
         }
     }
@@ -2110,7 +2295,10 @@ sys.exit(result.returncode)
     impl Drop for Fixture {
         fn drop(&mut self) {
             if !self.cleaned && self.cleanup().is_err() {
-                eprintln!("fixture cleanup guard could not verify teardown");
+                eprintln!(
+                    "case={} fixture cleanup guard could not verify teardown",
+                    self.release_prefix
+                );
             }
         }
     }
@@ -2205,6 +2393,19 @@ sys.exit(result.returncode)
                 thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+
+    #[test]
+    fn active_hook_pod_ignores_a_completed_or_deleting_predecessor() {
+        let listing = "\
+old\tSucceeded\t\n\
+gone\tRunning\t2026-11-02T14:31:32Z\n\
+live\tPending\t\n";
+        assert_eq!(active_hook_pod(listing), Some("live"));
+        assert_eq!(active_hook_pod("old\tSucceeded\t\n"), None);
+        assert_eq!(active_hook_pod("dead\tFailed\t\n"), None);
+        assert_eq!(active_hook_pod("live\tRunning\t\n"), Some("live"));
+        assert_eq!(active_hook_pod(""), None);
     }
 
     #[test]
@@ -2358,29 +2559,89 @@ sys.exit(result.returncode)
         })
     }
 
-    fn fixture_test(name: &str, scenario: impl FnOnce(&mut Fixture) -> Result<()>) -> Result<()> {
-        if std::env::var(CHILD).as_deref() == Ok(name) {
+    fn fixture_test(
+        name: &str,
+        shared: &Fixture,
+        scenario: impl FnOnce(&mut Fixture) -> Result<()>,
+    ) -> Result<()> {
+        let mut fixture = Fixture::for_case(shared)?;
+        println!(
+            "case={} scenario={name} started cluster={}",
+            fixture.release_prefix, fixture.cluster
+        );
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scenario(&mut fixture)))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("case {name} panicked")));
+        if outcome.is_err() {
+            fixture.diagnostics(name);
+        }
+        let cleanup = fixture.cleanup();
+        println!(
+            "case={} scenario={name} completed elapsed={:.3}s",
+            fixture.release_prefix,
+            fixture.started.elapsed().as_secs_f64()
+        );
+        match (outcome, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error.context(name.to_owned())),
+            (Err(error), Err(cleanup)) => {
+                Err(error.context(format!("case {name}: teardown also failed: {cleanup:#}")))
+            }
+        }
+    }
+
+    #[test]
+    fn shared_cluster_convergence_cases() -> Result<()> {
+        if std::env::var_os(CHILD).is_some() {
             return child_scenario();
         }
-        let _pacing = CLUSTER_PACING
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Other CLI tests temporarily replace PATH with fixture executables.
-        // Pin the real tool inventory and child environment while those
-        // mutations are excluded, just like every other process-env consumer.
         let _environment = crate::PROCESS_ENV_LOCK.blocking_lock();
         if executable("docker").is_err() && std::env::var_os("CI_REQUIRE_DOCKER_TESTS").is_none() {
-            eprintln!("skipping {name}: docker executable is unavailable");
+            eprintln!("skipping convergence cases: docker executable is unavailable");
             return Ok(());
         }
-        let mut fixture = Fixture::new()?;
-        let outcome = fixture.start().and_then(|()| scenario(&mut fixture));
-        let cleanup = fixture.cleanup();
+        let mut shared = Fixture::new()?;
+        let outcome = shared.start().and_then(|()| {
+            type Case = fn(&Fixture) -> Result<()>;
+            let cases: [Case; 6] = [
+                pending_states_exhaust_the_original_budget,
+                same_revision_pending_install_converges,
+                same_revision_pending_upgrade_and_rollback_converge,
+                status_only_transition_discards_the_sample,
+                stable_hook_failure_and_uninstalled_release_are_terminal,
+                replacement_revision_is_refused_within_and_between_samples,
+            ];
+            let barrier = std::sync::Barrier::new(cases.len());
+            thread::scope(|scope| {
+                let handles: Vec<_> = cases
+                    .into_iter()
+                    .map(|case| {
+                        let shared = &shared;
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            case(shared)
+                        })
+                    })
+                    .collect();
+                let mut errors = Vec::new();
+                for handle in handles {
+                    match handle.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => errors.push(format!("{error:#}")),
+                        Err(_) => errors.push("convergence case thread panicked".to_owned()),
+                    }
+                }
+                anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
+                Ok(())
+            })
+        });
+        let cleanup = shared.cleanup();
         match (outcome, cleanup) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
             (Err(error), Err(cleanup)) => {
-                Err(error.context(format!("teardown also failed: {cleanup:#}")))
+                Err(error.context(format!("shared cluster teardown also failed: {cleanup:#}")))
             }
         }
     }
@@ -2415,25 +2676,28 @@ sys.exit(result.returncode)
         fixture.history(&target)
     }
 
-    #[test]
-    fn same_revision_pending_install_converges() -> Result<()> {
-        fixture_test("same_revision_pending_install_converges", |fixture| {
-            for contract in ["wait", "structured"] {
-                pending_success(
-                    fixture,
-                    "same_revision_pending_install_converges",
-                    Operation::Install,
-                    contract,
-                )?;
-            }
-            Ok(())
-        })
+    fn same_revision_pending_install_converges(shared: &Fixture) -> Result<()> {
+        fixture_test(
+            "same_revision_pending_install_converges",
+            shared,
+            |fixture| {
+                for contract in ["wait", "structured"] {
+                    pending_success(
+                        fixture,
+                        "same_revision_pending_install_converges",
+                        Operation::Install,
+                        contract,
+                    )?;
+                }
+                Ok(())
+            },
+        )
     }
 
-    #[test]
-    fn same_revision_pending_upgrade_and_rollback_converge() -> Result<()> {
+    fn same_revision_pending_upgrade_and_rollback_converge(shared: &Fixture) -> Result<()> {
         fixture_test(
             "same_revision_pending_upgrade_and_rollback_converge",
+            shared,
             |fixture| {
                 for operation in [Operation::Upgrade, Operation::Rollback] {
                     for contract in ["wait", "structured"] {
@@ -2450,43 +2714,46 @@ sys.exit(result.returncode)
         )
     }
 
-    #[test]
-    fn status_only_transition_discards_the_sample() -> Result<()> {
-        fixture_test("status_only_transition_discards_the_sample", |fixture| {
-            for (contract, expectation) in [
-                ("wait", "discard"),
-                ("wait", "discard-wait"),
-                ("structured", "discard-wait"),
-            ] {
-                let target =
-                    fixture.prepare_pending(Operation::Install, false, "schema-migrate", 0)?;
-                let mut barrier = Barrier::new()?;
-                let child = fixture.child(
-                    "status_only_transition_discards_the_sample",
-                    &target.release,
-                    contract,
-                    expectation,
-                    1,
-                    Some(&barrier),
-                )?;
-                // Capture a genuine unready workload, then finish the same
-                // Helm operation before the final status read.
-                let permit = barrier.pause("workloads", 1, "after")?;
-                release_at_barrier(fixture, &target, permit)?;
-                let permit = barrier.pause("workloads", 2, "before")?;
-                fixture.open_workload(&target.release, permit.remaining())?;
-                permit.resume()?;
-                fixture.finish_child(child, Some(&mut barrier), Duration::from_secs(45))?;
-                fixture.history(&target)?;
-            }
-            Ok(())
-        })
+    fn status_only_transition_discards_the_sample(shared: &Fixture) -> Result<()> {
+        fixture_test(
+            "status_only_transition_discards_the_sample",
+            shared,
+            |fixture| {
+                for (contract, expectation) in [
+                    ("wait", "discard"),
+                    ("wait", "discard-wait"),
+                    ("structured", "discard-wait"),
+                ] {
+                    let target =
+                        fixture.prepare_pending(Operation::Install, false, "schema-migrate", 0)?;
+                    let mut barrier = Barrier::new()?;
+                    let child = fixture.child(
+                        "status_only_transition_discards_the_sample",
+                        &target.release,
+                        contract,
+                        expectation,
+                        1,
+                        Some(&barrier),
+                    )?;
+                    // Capture a genuine unready workload, then finish the same
+                    // Helm operation before the final status read.
+                    let permit = barrier.pause("workloads", 1, "after")?;
+                    release_at_barrier(fixture, &target, permit)?;
+                    let permit = barrier.pause("workloads", 2, "before")?;
+                    fixture.open_workload(&target.release, permit.remaining())?;
+                    permit.resume()?;
+                    fixture.finish_child(child, Some(&mut barrier), Duration::from_secs(45))?;
+                    fixture.history(&target)?;
+                }
+                Ok(())
+            },
+        )
     }
 
-    #[test]
-    fn stable_hook_failure_and_uninstalled_release_are_terminal() -> Result<()> {
+    fn stable_hook_failure_and_uninstalled_release_are_terminal(shared: &Fixture) -> Result<()> {
         fixture_test(
             "stable_hook_failure_and_uninstalled_release_are_terminal",
+            shared,
             |fixture| {
                 for (hook, expectation) in [
                     ("schema-migrate", "terminal-hook"),
@@ -2593,10 +2860,10 @@ sys.exit(result.returncode)
         permit.resume()
     }
 
-    #[test]
-    fn replacement_revision_is_refused_within_and_between_samples() -> Result<()> {
+    fn replacement_revision_is_refused_within_and_between_samples(shared: &Fixture) -> Result<()> {
         fixture_test(
             "replacement_revision_is_refused_within_and_between_samples",
+            shared,
             |fixture| {
                 for contract in ["wait", "structured"] {
                     for expectation in ["within", "between", "discard-then-replace"] {
@@ -2661,50 +2928,54 @@ sys.exit(result.returncode)
         )
     }
 
-    #[test]
-    fn pending_states_exhaust_the_original_budget() -> Result<()> {
-        fixture_test("pending_states_exhaust_the_original_budget", |fixture| {
-            let mut cases = Vec::new();
-            for operation in [Operation::Install, Operation::Upgrade, Operation::Rollback] {
-                for contract in ["wait", "structured"] {
-                    let target = fixture.prepare_pending(operation, true, "schema-migrate", 0)?;
-                    cases.push((target, contract));
+    fn pending_states_exhaust_the_original_budget(shared: &Fixture) -> Result<()> {
+        fixture_test(
+            "pending_states_exhaust_the_original_budget",
+            shared,
+            |fixture| {
+                let mut cases = Vec::new();
+                for operation in [Operation::Install, Operation::Upgrade, Operation::Rollback] {
+                    for contract in ["wait", "structured"] {
+                        let target =
+                            fixture.prepare_pending(operation, true, "schema-migrate", 0)?;
+                        cases.push((target, contract));
+                    }
                 }
-            }
-            let mut children = Vec::new();
-            for (target, contract) in &cases {
-                children.push(fixture.child(
-                    "pending_states_exhaust_the_original_budget",
-                    &target.release,
-                    contract,
-                    "budget",
-                    target.revision,
-                    None,
-                )?);
-            }
-            let deadline = Instant::now() + Duration::from_secs(315);
-            for child in children {
-                fixture.finish_child(
-                    child,
-                    None,
-                    deadline.saturating_duration_since(Instant::now()),
-                )?;
-            }
-            for ((target, _), operation) in cases.iter().zip([
-                Operation::Install,
-                Operation::Install,
-                Operation::Upgrade,
-                Operation::Upgrade,
-                Operation::Rollback,
-                Operation::Rollback,
-            ]) {
-                anyhow::ensure!(
-                    fixture.status(&target.release)?
-                        == (target.revision, operation.pending().to_owned()),
-                    "closed gate must remain at its original pending revision"
-                );
-            }
-            Ok(())
-        })
+                let mut children = Vec::new();
+                for (target, contract) in &cases {
+                    children.push(fixture.child(
+                        "pending_states_exhaust_the_original_budget",
+                        &target.release,
+                        contract,
+                        "budget",
+                        target.revision,
+                        None,
+                    )?);
+                }
+                let deadline = Instant::now() + Duration::from_secs(315);
+                for child in children {
+                    fixture.finish_child(
+                        child,
+                        None,
+                        deadline.saturating_duration_since(Instant::now()),
+                    )?;
+                }
+                for ((target, _), operation) in cases.iter().zip([
+                    Operation::Install,
+                    Operation::Install,
+                    Operation::Upgrade,
+                    Operation::Upgrade,
+                    Operation::Rollback,
+                    Operation::Rollback,
+                ]) {
+                    anyhow::ensure!(
+                        fixture.status(&target.release)?
+                            == (target.revision, operation.pending().to_owned()),
+                        "closed gate must remain at its original pending revision"
+                    );
+                }
+                Ok(())
+            },
+        )
     }
 }

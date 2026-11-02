@@ -38,6 +38,7 @@ HookRunReason = Literal[
     "live_session",
     "enqueue_failed",
     "claim_expired",
+    "identity_refused",
 ]
 
 logger = logging.getLogger(__name__)

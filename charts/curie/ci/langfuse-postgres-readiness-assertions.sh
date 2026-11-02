@@ -35,8 +35,8 @@
 # applies on the worker. policy P4 covers the web and worker identities; these
 # two renders cover the helper context selection.
 #
-# The executable live delayed-start regression is nested under ci/runtime so
-# chart-check keeps discovering only the fast top-level assertion scripts.
+# The live delayed-start cluster scenario was removed. This render contract
+# is what still checks that both Langfuse Deployments carry the gate.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

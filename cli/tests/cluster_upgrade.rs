@@ -18,7 +18,7 @@ use curie::ops::{
 use curie::ui::CliOutput;
 use serde_json::{json, Value};
 
-pub(super) const FACTORY_READ_WRAPPER: &str = r#"#!/usr/bin/python3
+pub(super) const FACTORY_READ_WRAPPER: &str = r#"#!/usr/bin/env python3
 import json
 import os
 import sys
@@ -266,7 +266,7 @@ impl FactoryResolverFixture {
             .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
             .env(
                 "PATH",
-                format!("{}:/usr/bin:/bin", self.dir.path().display()),
+                crate::support::executable::isolated_fixture_path(self.dir.path()),
             )
             .env("UPGRADE_DRIVER_ROOT", self.dir.path())
             .env("UPGRADE_DRIVER_SCENARIO", "healthy")
@@ -712,7 +712,7 @@ fn upgrade_release_not_found_preserves_supplied_values_in_admission_and_apply() 
     }
     crate::support::executable::install(
         &dir.path().join("helm"),
-        r#"#!/usr/bin/python3
+        r#"#!/usr/bin/env python3
 import json
 import os
 import sys
@@ -758,7 +758,10 @@ os.execv(str(delegate), [str(delegate), *args])
         ])
         .arg(&file)
         .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
-        .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+        .env(
+            "PATH",
+            crate::support::executable::isolated_fixture_path(dir.path()),
+        )
         .env("UPGRADE_DRIVER_ROOT", dir.path())
         .env("UPGRADE_DRIVER_SCENARIO", "healthy")
         .env("VALUES_FILES_REAL_HELM", helm.trim())

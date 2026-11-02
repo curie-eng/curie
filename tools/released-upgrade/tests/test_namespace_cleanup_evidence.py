@@ -49,17 +49,24 @@ def test_original_upgrade_assertions_wait_and_required_cleanup_remain() -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-4: a diagnostic must never waive failure."""
     job = workflow_job()
     steps = job["steps"]
-    plain = next(step for step in steps if step.get("name", "").startswith(
-        "Factory resource profile survives a plain retained-values upgrade"
-    ))
+    plain = next(
+        step
+        for step in steps
+        if step.get("name", "").startswith(
+            "Factory resource profile survives a plain retained-values upgrade"
+        )
+    )
     commands = plain["run"]
     assert "set -euo pipefail" in commands
     assert "released-upgrade-resource-profile-assertions.sh" in commands
     assert "--reset-then-reuse-values --timeout 15m" in commands
     assert 'helm uninstall "$release" -n "$ns" --wait --timeout 5m' in commands
     assert 'kubectl delete namespace "$ns" --wait=true --timeout=300s' in commands
-    teardown = next(step for step in steps if step.get("name") ==
-                    "Tear down the disposable negative control cluster")
+    teardown = next(
+        step
+        for step in steps
+        if step.get("name") == "Tear down the disposable negative control cluster"
+    )
     assert teardown["if"] == "always()"
     assert "kind delete cluster --name curie-upgrade-negative" in teardown["run"]
     assert "--ignore-not-found --wait=false" in teardown["run"]
@@ -70,8 +77,11 @@ def test_original_upgrade_assertions_wait_and_required_cleanup_remain() -> None:
 def test_failure_only_safe_report_and_artifact_precede_owned_cluster_teardown() -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-4."""
     steps = workflow_job()["steps"]
-    collectors = [(i, step) for i, step in enumerate(steps)
-                  if "namespace_cleanup_evidence" in step.get("run", "")]
+    collectors = [
+        (i, step)
+        for i, step in enumerate(steps)
+        if "namespace_cleanup_evidence" in step.get("run", "")
+    ]
     assert len(collectors) == 1, "failure diagnostics do not collect namespace evidence"
     position, collector = collectors[0]
     assert "failure()" in collector.get("if", "")
@@ -79,9 +89,12 @@ def test_failure_only_safe_report_and_artifact_precede_owned_cluster_teardown() 
     assert "--context" in run and "kind-curie-upgrade-negative" in run
     assert "--namespace" in run and "curie-negative" in run and "curie-profile" in run
     assert "current-context" not in run
-    artifacts = [(i, step) for i, step in enumerate(steps)
-                 if "actions/upload-artifact@" in step.get("uses", "")
-                 and "cleanup" in step.get("with", {}).get("name", "")]
+    artifacts = [
+        (i, step)
+        for i, step in enumerate(steps)
+        if "actions/upload-artifact@" in step.get("uses", "")
+        and "cleanup" in step.get("with", {}).get("name", "")
+    ]
     assert len(artifacts) == 1, "safe cleanup report has no dedicated artifact"
     artifact_position, artifact = artifacts[0]
     assert "failure()" in artifact.get("if", "")
@@ -89,26 +102,44 @@ def test_failure_only_safe_report_and_artifact_precede_owned_cluster_teardown() 
     assert path.endswith(".json") and "\n" not in path
     assert not any(character in path for character in "*?[]")
     assert Path(path).name in run
-    teardown = next(i for i, step in enumerate(steps) if step.get("name") ==
-                    "Tear down the disposable negative control cluster")
+    teardown = next(
+        i
+        for i, step in enumerate(steps)
+        if step.get("name") == "Tear down the disposable negative control cluster"
+    )
     assert position < artifact_position < teardown
 
 
-@pytest.mark.parametrize(("context", "namespaces", "budget"), [
-    ("", [NAMESPACE], 40), (None, [NAMESPACE], 40),
-    (b"secret-context", [NAMESPACE], 40), (True, [NAMESPACE], 40),
-    (CONTEXT, [], 40), (CONTEXT, ["--all"], 40),
-    (CONTEXT, ["Uppercase"], 40), (CONTEXT, ["a.b"], 40),
-    (CONTEXT, ["-leading"], 40), (CONTEXT, ["trailing-"], 40),
-    (CONTEXT, ["a" * 64], 40), (CONTEXT, [None], 40),
-    (CONTEXT, [NAMESPACE, NAMESPACE], 40),
-    (CONTEXT, ["one", "two", "three", "four", "five"], 40),
-    (CONTEXT, [NAMESPACE], True), (CONTEXT, [NAMESPACE], 0),
-    (CONTEXT, [NAMESPACE], 61), (CONTEXT, [NAMESPACE], float("nan")),
-    (CONTEXT, [NAMESPACE], float("inf")), (CONTEXT, [NAMESPACE], "40"),
-])
+@pytest.mark.parametrize(
+    ("context", "namespaces", "budget"),
+    [
+        ("", [NAMESPACE], 40),
+        (None, [NAMESPACE], 40),
+        (b"secret-context", [NAMESPACE], 40),
+        (True, [NAMESPACE], 40),
+        (CONTEXT, [], 40),
+        (CONTEXT, ["--all"], 40),
+        (CONTEXT, ["Uppercase"], 40),
+        (CONTEXT, ["a.b"], 40),
+        (CONTEXT, ["-leading"], 40),
+        (CONTEXT, ["trailing-"], 40),
+        (CONTEXT, ["a" * 64], 40),
+        (CONTEXT, [None], 40),
+        (CONTEXT, [NAMESPACE, NAMESPACE], 40),
+        (CONTEXT, ["one", "two", "three", "four", "five"], 40),
+        (CONTEXT, [NAMESPACE], True),
+        (CONTEXT, [NAMESPACE], 0),
+        (CONTEXT, [NAMESPACE], 61),
+        (CONTEXT, [NAMESPACE], float("nan")),
+        (CONTEXT, [NAMESPACE], float("inf")),
+        (CONTEXT, [NAMESPACE], "40"),
+    ],
+)
 def test_invalid_inputs_refuse_before_any_command_with_fixed_safe_error(
-    context: Any, namespaces: Any, budget: Any, monkeypatch: pytest.MonkeyPatch,
+    context: Any,
+    namespaces: Any,
+    budget: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-1."""
     module = load()
@@ -145,29 +176,75 @@ class Kubernetes:
         """@spec NAMESPACE-CLEANUP-EVIDENCE-2."""
         self.discovery = ["secrets", "pods"]
         self.namespace = {
-            "apiVersion": "v1", "kind": "Namespace",
-            "metadata": {"name": NAMESPACE, "deletionTimestamp": "2030-01-01T00:00:00Z",
-                         "finalizers": ["example.test/metadata"],
-                         "annotations": {"secret": SECRET}},
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": NAMESPACE,
+                "deletionTimestamp": "2030-01-01T00:00:00Z",
+                "finalizers": ["example.test/metadata"],
+                "annotations": {"secret": SECRET},
+            },
             "spec": {"finalizers": ["kubernetes"], "secret": SECRET},
-            "status": {"phase": "Terminating", "conditions": [
-                {"type": "NamespaceContentRemaining", "status": "True",
-                 "reason": "SomeResourcesRemain", "message": SECRET},
-            ]},
+            "status": {
+                "phase": "Terminating",
+                "conditions": [
+                    {
+                        "type": "NamespaceContentRemaining",
+                        "status": "True",
+                        "reason": "SomeResourcesRemain",
+                        "message": SECRET,
+                    },
+                ],
+            },
         }
         self.services = {
-            "apiVersion": "apiregistration.k8s.io/v1", "kind": "APIServiceList",
+            "apiVersion": "apiregistration.k8s.io/v1",
+            "kind": "APIServiceList",
             "items": [
-                {"metadata": {"name": "v1.available.example.test"}, "spec": {"secret": SECRET},
-                 "status": {"conditions": [{"type": "Available", "status": "True",
-                                           "reason": "Passed", "message": SECRET}]}},
-                {"metadata": {"name": "v1.unavailable.example.test", "annotations": {"x": SECRET}},
-                 "spec": {"secret": SECRET},
-                 "status": {"conditions": [{"type": "Available", "status": "False",
-                                           "reason": "MissingEndpoints", "message": SECRET}]}},
-                {"metadata": {"name": "v1.unknown.example.test"},
-                 "status": {"conditions": [{"type": "Available", "status": "Unknown",
-                                           "reason": "UnavailableProbe", "message": SECRET}]}},
+                {
+                    "metadata": {"name": "v1.available.example.test"},
+                    "spec": {"secret": SECRET},
+                    "status": {
+                        "conditions": [
+                            {
+                                "type": "Available",
+                                "status": "True",
+                                "reason": "Passed",
+                                "message": SECRET,
+                            }
+                        ]
+                    },
+                },
+                {
+                    "metadata": {
+                        "name": "v1.unavailable.example.test",
+                        "annotations": {"x": SECRET},
+                    },
+                    "spec": {"secret": SECRET},
+                    "status": {
+                        "conditions": [
+                            {
+                                "type": "Available",
+                                "status": "False",
+                                "reason": "MissingEndpoints",
+                                "message": SECRET,
+                            }
+                        ]
+                    },
+                },
+                {
+                    "metadata": {"name": "v1.unknown.example.test"},
+                    "status": {
+                        "conditions": [
+                            {
+                                "type": "Available",
+                                "status": "Unknown",
+                                "reason": "UnavailableProbe",
+                                "message": SECRET,
+                            }
+                        ]
+                    },
+                },
             ],
         }
         self.projections = {
@@ -189,9 +266,14 @@ class Kubernetes:
         assert "get" in command, "collector requested a non-read kubectl operation"
         if any(value in command for value in ("namespace", "namespaces", "ns")):
             return "namespace"
-        if any(value in command for value in (
-            "apiservice", "apiservices", "apiservices.apiregistration.k8s.io",
-        )):
+        if any(
+            value in command
+            for value in (
+                "apiservice",
+                "apiservices",
+                "apiservices.apiregistration.k8s.io",
+            )
+        ):
             return "api_services"
         resource = next((name for name in self.discovery if name in command), None)
         assert resource is not None, "collector used an undiscovered resource argument"
@@ -202,14 +284,29 @@ class Kubernetes:
         assert isinstance(command, list) and all(isinstance(value, str) for value in command)
         assert Path(command[0]).name == "kubectl"
         assert flag(command, "--context") == CONTEXT
-        assert not any(value in command for value in (
-            "config", "current-context", "patch", "delete", "create", "apply", "replace", "edit",
-        ))
+        assert not any(
+            value in command
+            for value in (
+                "config",
+                "current-context",
+                "patch",
+                "delete",
+                "create",
+                "apply",
+                "replace",
+                "edit",
+            )
+        )
         assert 0 < timeout_s <= 5
         operation = self.operation(command)
-        self.calls.append({"command": command[:], "timeout": timeout_s,
-                           "operation": operation,
-                           "started": self.clock.value if self.clock else 0.0})
+        self.calls.append(
+            {
+                "command": command[:],
+                "timeout": timeout_s,
+                "operation": operation,
+                "started": self.clock.value if self.clock else 0.0,
+            }
+        )
         if self.clock:
             self.clock.value += min(self.consume, timeout_s)
         value = self.overrides.get(operation)
@@ -266,7 +363,13 @@ def safe(report: dict[str, Any]) -> None:
     assert "synthetic-owner-name" not in rendered
     for namespace in report["namespaces"]:
         assert set(namespace) == {
-            "namespace", "phase", "deleting", "finalizers", "conditions", "resources", "errors",
+            "namespace",
+            "phase",
+            "deleting",
+            "finalizers",
+            "conditions",
+            "resources",
+            "errors",
         }
         for condition in namespace["conditions"]:
             assert set(condition) == {"type", "status", "reason"}
@@ -294,13 +397,22 @@ def test_selected_namespace_resource_and_unavailable_api_metadata_are_safe(
     assert namespace["namespace"] == NAMESPACE
     assert namespace["phase"] == "Terminating" and namespace["deleting"] is True
     assert set(namespace["finalizers"]) == {"kubernetes", "example.test/metadata"}
-    assert namespace["conditions"] == [{
-        "type": "NamespaceContentRemaining", "status": "True", "reason": "SomeResourcesRemain",
-    }]
-    assert namespace["resources"] == [{
-        "kind": "secrets", "count": 2, "deleting": 1,
-        "finalizers": {"example.test/retain": 2}, "owner_kinds": {"Job": 2},
-    }]
+    assert namespace["conditions"] == [
+        {
+            "type": "NamespaceContentRemaining",
+            "status": "True",
+            "reason": "SomeResourcesRemain",
+        }
+    ]
+    assert namespace["resources"] == [
+        {
+            "kind": "secrets",
+            "count": 2,
+            "deleting": 1,
+            "finalizers": {"example.test/retain": 2},
+            "owner_kinds": {"Job": 2},
+        }
+    ]
     assert sorted(report["api_services"], key=lambda service: service["name"]) == [
         {"name": "v1.unavailable.example.test", "status": "False", "reason": "MissingEndpoints"},
         {"name": "v1.unknown.example.test", "status": "Unknown", "reason": "UnavailableProbe"},
@@ -310,6 +422,7 @@ def test_selected_namespace_resource_and_unavailable_api_metadata_are_safe(
 @pytest.fixture(autouse=True)
 def forbid_real_processes_and_network(monkeypatch: pytest.MonkeyPatch) -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-1: no real kubectl or cluster prerequisite."""
+
     def forbidden(*_args: Any, **_kwargs: Any) -> Any:
         """@spec NAMESPACE-CLEANUP-EVIDENCE-1."""
         raise AssertionError("unit test attempted a real external process or network connection")
@@ -342,9 +455,16 @@ def test_projection_limit_counts_utf8_bytes_before_parsing_or_symbol_folding(
 ) -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-3."""
     module, world = load(), Kubernetes()
-    value = json.dumps([{
-        "finalizers": ["Ω" * (512 * 1024)], "deleting": False, "owner_kinds": [],
-    }], ensure_ascii=False)
+    value = json.dumps(
+        [
+            {
+                "finalizers": ["Ω" * (512 * 1024)],
+                "deleting": False,
+                "owner_kinds": [],
+            }
+        ],
+        ensure_ascii=False,
+    )
     assert len(value) < 1024 * 1024 < len(value.encode())
     world.overrides["resource:secrets"] = value
     report = collect(module, world, monkeypatch)
@@ -368,7 +488,8 @@ def test_absent_available_condition_is_reported_as_unknown_service(
 
 @pytest.mark.parametrize("field", ["namespace", "api_services"])
 def test_malformed_top_level_selected_metadata_does_not_become_empty_success(
-    field: str, monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-2 NAMESPACE-CLEANUP-EVIDENCE-3."""
     module, world = load(), Kubernetes()
@@ -402,12 +523,16 @@ def test_multiple_valid_namespaces_are_reported_separately_without_merging_count
 
 
 def test_cli_partial_evidence_is_json_and_never_a_cleanup_success_claim(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-1 NAMESPACE-CLEANUP-EVIDENCE-3."""
     module, world = load(), Kubernetes()
     world.overrides["resource:secrets"] = subprocess.CompletedProcess(
-        ["kubectl"], 1, stdout=SECRET, stderr=SECRET,
+        ["kubectl"],
+        1,
+        stdout=SECRET,
+        stderr=SECRET,
     )
     monkeypatch.setattr(module, "_run", world.run)
     status = module.main(["--context", CONTEXT, "--namespace", NAMESPACE, "--budget-seconds", "1"])
@@ -418,7 +543,6 @@ def test_cli_partial_evidence_is_json_and_never_a_cleanup_success_claim(
     safe(report)
     assert report["complete"] is False
     assert errors(report)
-
 
 
 def test_workload_commands_request_only_projected_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -436,15 +560,24 @@ def test_workload_commands_request_only_projected_metadata(monkeypatch: pytest.M
             rendered = " ".join(command)
             assert "go-template" in rendered
             for forbidden in (
-                ".metadata.name", ".metadata.namespace", ".name", ".uid", ".labels",
-                ".annotations", ".spec", ".data", "{{.}}", "{{ . }}",
+                ".metadata.name",
+                ".metadata.namespace",
+                ".name",
+                ".uid",
+                ".labels",
+                ".annotations",
+                ".spec",
+                ".data",
+                "{{.}}",
+                "{{ . }}",
             ):
                 assert forbidden not in rendered
 
 
 @pytest.mark.parametrize("where", ["namespace", "api_services", "resource:secrets"])
 def test_unknown_symbols_become_unrecognized_without_echoing_input(
-    where: str, monkeypatch: pytest.MonkeyPatch,
+    where: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-2."""
     module, world = load(), Kubernetes()
@@ -456,9 +589,13 @@ def test_unknown_symbols_become_unrecognized_without_echoing_input(
         world.services["items"][1]["metadata"]["name"] = invalid
         world.services["items"][1]["status"]["conditions"][0]["reason"] = "a" * 257
     else:
-        world.projections["secrets"] = [{
-            "finalizers": [invalid, "a" * 257], "deleting": False, "owner_kinds": [invalid],
-        }]
+        world.projections["secrets"] = [
+            {
+                "finalizers": [invalid, "a" * 257],
+                "deleting": False,
+                "owner_kinds": [invalid],
+            }
+        ]
     report = collect(module, world, monkeypatch)
     safe(report)
     assert invalid not in json.dumps(report)
@@ -466,15 +603,21 @@ def test_unknown_symbols_become_unrecognized_without_echoing_input(
     assert "unrecognized" in json.dumps(report)
 
 
-@pytest.mark.parametrize("value", [
-    "not-json", "{}", '[{"finalizers":[],"deleting":"false","owner_kinds":[]}]',
-    '[{"finalizers":{},"deleting":false,"owner_kinds":[]}]',
-    '[{"finalizers":[],"deleting":0,"owner_kinds":[]}]',
-    '[{"finalizers":[1],"deleting":false,"owner_kinds":[]}]',
-    '[{"finalizers":[],"deleting":false,"owner_kinds":[true]}]',
-])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "not-json",
+        "{}",
+        '[{"finalizers":[],"deleting":"false","owner_kinds":[]}]',
+        '[{"finalizers":{},"deleting":false,"owner_kinds":[]}]',
+        '[{"finalizers":[],"deleting":0,"owner_kinds":[]}]',
+        '[{"finalizers":[1],"deleting":false,"owner_kinds":[]}]',
+        '[{"finalizers":[],"deleting":false,"owner_kinds":[true]}]',
+    ],
+)
 def test_invalid_workload_projection_is_partial_not_coerced_or_reported_empty(
-    value: str, monkeypatch: pytest.MonkeyPatch,
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-2 NAMESPACE-CLEANUP-EVIDENCE-3."""
     module, world = load(), Kubernetes()
@@ -486,32 +629,47 @@ def test_invalid_workload_projection_is_partial_not_coerced_or_reported_empty(
     assert "invalid_projection" in {error["reason"] for error in errors(report)}
 
 
-@pytest.mark.parametrize(("operation", "fault", "reason"), [
-    ("namespace", "missing", "not_found"),
-    ("resource:secrets", "error", "command_error"),
-    ("api_services", "timeout", "timeout"),
-    ("discovery", "error", "command_error"),
-    ("namespace", "bad-json", "invalid_projection"),
-    ("api_services", "bad-json", "invalid_projection"),
-])
+@pytest.mark.parametrize(
+    ("operation", "fault", "reason"),
+    [
+        ("namespace", "missing", "not_found"),
+        ("resource:secrets", "error", "command_error"),
+        ("api_services", "timeout", "timeout"),
+        ("discovery", "error", "command_error"),
+        ("namespace", "bad-json", "invalid_projection"),
+        ("api_services", "bad-json", "invalid_projection"),
+    ],
+)
 def test_external_failures_remain_safe_partial_evidence_without_retry(
-    operation: str, fault: str, reason: str, monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    fault: str,
+    reason: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-2 NAMESPACE-CLEANUP-EVIDENCE-3."""
     module, world = load(), Kubernetes()
     if fault == "missing":
         world.overrides[operation] = subprocess.CompletedProcess(
-            ["kubectl"], 1, stdout=SECRET,
-            stderr=('Error from server (NotFound): namespaces "'
-                    + NAMESPACE + '" not found ' + SECRET),
+            ["kubectl"],
+            1,
+            stdout=SECRET,
+            stderr=(
+                'Error from server (NotFound): namespaces "' + NAMESPACE + '" not found ' + SECRET
+            ),
         )
     elif fault == "error":
         world.overrides[operation] = subprocess.CompletedProcess(
-            ["kubectl"], 1, stdout=SECRET, stderr=SECRET,
+            ["kubectl"],
+            1,
+            stdout=SECRET,
+            stderr=SECRET,
         )
     elif fault == "timeout":
         world.overrides[operation] = subprocess.TimeoutExpired(
-            ["kubectl"], 5, output=SECRET, stderr=SECRET,
+            ["kubectl"],
+            5,
+            output=SECRET,
+            stderr=SECRET,
         )
     else:
         world.overrides[operation] = SECRET
@@ -525,11 +683,20 @@ def test_external_failures_remain_safe_partial_evidence_without_retry(
         assert report["namespaces"][0]["errors"]
 
 
-@pytest.mark.parametrize("name", [
-    "--all", "pods;echo", "pods/exec", "pods --all", "pods..example.test", "a" * 257,
-])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "--all",
+        "pods;echo",
+        "pods/exec",
+        "pods --all",
+        "pods..example.test",
+        "a" * 257,
+    ],
+)
 def test_discovery_names_never_become_unvalidated_command_arguments(
-    name: str, monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-1 NAMESPACE-CLEANUP-EVIDENCE-3."""
     module, world = load(), Kubernetes()
@@ -545,7 +712,8 @@ def test_discovery_names_never_become_unvalidated_command_arguments(
 
 @pytest.mark.parametrize("count", [128, 129])
 def test_discovery_kind_limit_is_enforced_without_unbounded_queries(
-    count: int, monkeypatch: pytest.MonkeyPatch,
+    count: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-3."""
     module, world = load(), Kubernetes()
@@ -563,7 +731,9 @@ def test_discovery_kind_limit_is_enforced_without_unbounded_queries(
 
 @pytest.mark.parametrize(("size", "complete"), [(1024 * 1024, True), (1024 * 1024 + 1, False)])
 def test_projection_byte_bound_is_inclusive(
-    size: int, complete: bool, monkeypatch: pytest.MonkeyPatch,
+    size: int,
+    complete: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-3."""
     module, world = load(), Kubernetes()
@@ -577,7 +747,9 @@ def test_projection_byte_bound_is_inclusive(
 
 @pytest.mark.parametrize(("count", "complete"), [(1024, True), (1025, False)])
 def test_projection_item_bound_is_inclusive(
-    count: int, complete: bool, monkeypatch: pytest.MonkeyPatch,
+    count: int,
+    complete: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-3."""
     module, world = load(), Kubernetes()
@@ -596,7 +768,10 @@ def test_projection_item_bound_is_inclusive(
 @pytest.mark.parametrize("field", ["finalizers", "owner_kinds"])
 @pytest.mark.parametrize(("count", "complete"), [(64, True), (65, False)])
 def test_per_object_metadata_list_bound_is_inclusive(
-    field: str, count: int, complete: bool, monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    count: int,
+    complete: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-3."""
     module, world = load(), Kubernetes()
@@ -639,7 +814,11 @@ def test_exhaustion_during_failed_command_never_retries_or_starts_a_later_comman
     world.clock, world.consume = clock, 5
     timeout = subprocess.TimeoutExpired(["kubectl"], 1, output=SECRET, stderr=SECRET)
     for operation in (
-        "namespace", "discovery", "api_services", "resource:secrets", "resource:pods",
+        "namespace",
+        "discovery",
+        "api_services",
+        "resource:secrets",
+        "resource:pods",
     ):
         world.overrides[operation] = timeout
     report = collect(module, world, monkeypatch, budget_s=1)
@@ -650,7 +829,8 @@ def test_exhaustion_during_failed_command_never_retries_or_starts_a_later_comman
 
 
 def test_cli_returns_only_safe_json_for_actual_collector_protocol(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-1 NAMESPACE-CLEANUP-EVIDENCE-2."""
     module, world = load(), Kubernetes()
@@ -666,7 +846,8 @@ def test_cli_returns_only_safe_json_for_actual_collector_protocol(
 
 @pytest.mark.parametrize("operation", ["namespace", "api_services", "resource:secrets"])
 def test_json_null_is_invalid_evidence_and_never_silent_complete_unknown_state(
-    operation: str, monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-2 NAMESPACE-CLEANUP-EVIDENCE-3."""
     module, world = load(), Kubernetes()
@@ -681,7 +862,8 @@ def test_json_null_is_invalid_evidence_and_never_silent_complete_unknown_state(
 
 @pytest.mark.parametrize("operation", ["namespace", "api_services"])
 def test_empty_json_object_cannot_attest_namespace_or_api_service_state(
-    operation: str, monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-2 NAMESPACE-CLEANUP-EVIDENCE-3."""
     module, world = load(), Kubernetes()
@@ -720,7 +902,8 @@ def test_enormous_integer_budget_uses_fixed_input_refusal_before_commands(
 
 @pytest.mark.parametrize("timestamp", [False, 0, []])
 def test_namespace_deletion_timestamp_presence_rejects_nonstring_shapes(
-    timestamp: Any, monkeypatch: pytest.MonkeyPatch,
+    timestamp: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """@spec NAMESPACE-CLEANUP-EVIDENCE-2 NAMESPACE-CLEANUP-EVIDENCE-3."""
     module, world = load(), Kubernetes()

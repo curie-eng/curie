@@ -19,8 +19,14 @@ from principal_adoption_support import ISSUER
 from role_policy_support import change, run
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from apps.api.tests.test_http_approval_answers import answer, resolve
+from apps.api.tests.test_http_approval_answers import (
+    OTHER_APPROVER,
+    answer,
+    resolve,
+    restrict_route,
+)
 from apps.api.tests.test_http_approval_answers import answer_case as answer_case
+from apps.api.tests.test_http_approval_answers import routed_case as routed_case
 from apps.api.tests.test_http_approval_creation import creation_case as creation_case
 from apps.api.tests.test_http_approval_grants import (
     assert_grant,
@@ -120,3 +126,17 @@ def test_approver_removed_after_resolution_refuses_the_resume_and_the_grant(
         post_grant(case.client, body), body, decision="refuse", reason="caller_not_allowed",
     )
 
+
+
+def test_route_exclusion_after_resolution_refuses_the_resume_definitively(
+    routed_case: SimpleNamespace,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-8/12: an explicit route denial is refuse, not unavailable."""
+    case = routed_case
+    token, payload = approved(case)
+    restrict_route(case, [OTHER_APPROVER])
+    request = resume_check(case, token, payload, stage="claim_or_resume")
+    assert_response(
+        post_check(case.client, request), request, decision="refuse",
+        reason="caller_not_allowed",
+    )

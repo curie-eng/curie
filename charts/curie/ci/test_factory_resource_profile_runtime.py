@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
+import mmap
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -157,6 +160,46 @@ def diagnostic(completed: subprocess.CompletedProcess[str]) -> dict:
     return json.loads(lines[0].removeprefix("control diagnostics: "))
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux page-cache accounting")
+def test_workspace_fill_keeps_disk_data_without_retaining_page_cache(tmp_path: Path) -> None:
+    size = 64 * 1024 * 1024
+    path = tmp_path / "fill.bin"
+    environment = os.environ.copy()
+    environment.update(FILL_BYTES=str(size), FILL_PATH=str(path))
+    source = SCRIPT.read_text()
+    command = "\n".join(shell_function(source, name) for name in ("kc", "fill_workspace"))
+    command += """
+kubectl() {
+    shift 4
+    [[ "$1 $3 $4 $5" == 'exec -c runner --' ]] || return 91
+    shift 5
+    "$@"
+}
+CONTEXT=kind-acme-test
+NAMESPACE=test-profile
+fill_workspace pod-control
+"""
+    completed = subprocess.run(
+        ["bash", "-euc", command], env=environment, text=True,
+        capture_output=True, check=False, timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout.strip() == str(size)
+    assert path.stat().st_size == size
+    assert path.stat().st_blocks * 512 >= size
+    with path.open("rb") as handle, mmap.mmap(
+        handle.fileno(), size, flags=mmap.MAP_PRIVATE, prot=mmap.PROT_READ | mmap.PROT_WRITE,
+    ) as mapping:
+        pages = (ctypes.c_ubyte * (size // mmap.PAGESIZE))()
+        address = ctypes.addressof(ctypes.c_char.from_buffer(mapping))
+        libc = ctypes.CDLL(None, use_errno=True)
+        assert libc.mincore(ctypes.c_void_p(address), ctypes.c_size_t(size), pages) == 0
+        resident_bytes = sum(page & 1 for page in pages) * mmap.PAGESIZE
+        assert resident_bytes <= 16 * 1024 * 1024
+        for offset in range(0, size, 1024 * 1024):
+            assert len(set(mapping[offset:offset + 1024])) > 1
+
+
 @pytest.mark.parametrize("write_status", [0, 23, 137])
 @pytest.mark.parametrize("scenario_status", [0, 1])
 def test_write_status_output_and_diagnostics_precede_cleanup(
@@ -181,7 +224,7 @@ def test_write_status_output_and_diagnostics_precede_cleanup(
     assert [event["reason"] for event in summary["events"]] == ["Evicted"]
     assert SECRET not in output + completed.stderr
     assert output.index("control diagnostics: ") < output.index("boundary delete sandboxclaims")
-    assert output.index("control diagnostics: ") < output.index("boundary helm")
+    assert "boundary helm" not in output
     assert not tmp_path.exists()
 
 
@@ -203,6 +246,13 @@ def test_unavailable_or_replaced_original_pod_keeps_uid_scoped_events(
     assert not tmp_path.exists()
 
 
+def test_control_eviction_check_is_disabled() -> None:
+    source = SCRIPT.read_text()
+    assert "control runner workspace eviction check disabled (#5293)" in source
+    assert "the control runner pod was not evicted" not in source
+    assert "the factory sandbox kept 1280Mi in /workspace" in source
+
+
 def test_diagnostic_read_failures_preserve_scenario_status_and_cleanup(tmp_path: Path) -> None:
     completed = run_control(tmp_path, workspace_status=42, events_status=43)
     assert completed.returncode == 0, completed.stdout + completed.stderr
@@ -211,5 +261,6 @@ def test_diagnostic_read_failures_preserve_scenario_status_and_cleanup(tmp_path:
     assert summary["workspace_read_exit_status"] == 42
     assert summary["events"] is None
     assert summary["events_read_exit_status"] == 43
-    assert "boundary delete namespace" in completed.stdout
+    assert "boundary delete sandboxclaims" in completed.stdout
+    assert "boundary delete namespace" not in completed.stdout
     assert not tmp_path.exists()

@@ -569,6 +569,17 @@ class GitHubFake:
                     "object": {"sha": sha, "type": "commit", "url": ""},
                 },
             )
+        if parts[:3] == ["git", "matching-refs", "heads"]:
+            # https://docs.github.com/en/rest/git/refs#list-matching-references
+            prefix = unquote("/".join(parts[3:]))
+            return _json(
+                200,
+                [
+                    {"ref": f"refs/heads/{branch}", "object": {"sha": sha, "type": "commit"}}
+                    for branch, sha in self.branches.items()
+                    if branch.startswith(prefix)
+                ],
+            )
         if parts[:2] == ["git", "commits"] and len(parts) == 3:
             # https://docs.github.com/en/rest/git/commits#get-a-commit-object
             commit = self.commits.get(parts[2])

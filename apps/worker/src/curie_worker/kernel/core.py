@@ -316,6 +316,7 @@ class Kernel:
     release_thread = delivery.release_thread
     interrupt_agent = delivery.interrupt_agent
     _close_hook_run_after_error = hooks._close_hook_run_after_error
+    _close_hook_run_after_refusal = hooks._close_hook_run_after_refusal
     _post_notice_after_error = hooks._post_notice_after_error
     _start_turn_under_hook_control = hooks._start_turn_under_hook_control
     _sweep_run = sweep_slices._sweep_run

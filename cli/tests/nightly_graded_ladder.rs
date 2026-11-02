@@ -1815,6 +1815,7 @@ fn product_observability_requires_four_valid_seeds_and_count_only_mcp_receipt() 
 fn run_plain_reply_seed(
     function_name: &str,
     finalized: bool,
+    query_state: &str,
 ) -> (Output, Vec<Vec<String>>, String) {
     let harness = tempfile::tempdir().expect("create plain reply seed harness");
     let argv_log = harness.path().join("message-argv.log");
@@ -1874,7 +1875,7 @@ restore_local_langfuse_auth() {{ echo restored >> "$TEST_PHASE_LOG"; }}
 {}
 {}
 if [[ "$TEST_SEED_FUNCTION" == seed_ordinary_turn ]]; then
-    seed_ordinary_turn local fixture-agent present
+    seed_ordinary_turn local fixture-agent "$TEST_QUERY_STATE"
 else
     case_local_langfuse_invalid_auth fixture-agent
 fi
@@ -1890,6 +1891,7 @@ fi
         .env("TEST_MESSAGE_ARGV", &argv_log)
         .env("TEST_PHASE_LOG", &phase_log)
         .env("TEST_SEED_FUNCTION", function_name)
+        .env("TEST_QUERY_STATE", query_state)
         .env(
             "TEST_MESSAGE_REPLY",
             serde_json::json!({"finalized": finalized, "reply": "seed complete"}).to_string(),
@@ -1912,7 +1914,7 @@ fi
 #[test]
 fn plain_reply_observability_seeds_send_an_exact_marker_task() {
     for function_name in ["seed_ordinary_turn", "case_local_langfuse_invalid_auth"] {
-        let (output, invocations, phases) = run_plain_reply_seed(function_name, true);
+        let (output, invocations, phases) = run_plain_reply_seed(function_name, true, "present");
         assert!(
             output.status.success(),
             "{function_name} must complete with a finalized reply: {}",
@@ -1989,7 +1991,7 @@ fn restored_healthy_control_forbids_tool_calls() {
 #[test]
 fn plain_reply_observability_seeds_reject_nonfinal_replies_and_restore_auth() {
     for function_name in ["seed_ordinary_turn", "case_local_langfuse_invalid_auth"] {
-        let (output, invocations, phases) = run_plain_reply_seed(function_name, false);
+        let (output, invocations, phases) = run_plain_reply_seed(function_name, false, "present");
         assert!(
             !output.status.success(),
             "{function_name} must propagate a nonfinal CLI refusal: {}",
@@ -6548,4 +6550,76 @@ fn oracle_success_does_not_write_a_failure_summary() {
         leftover.is_empty(),
         "exact-trace temp files must be gone: {leftover:?}"
     );
+}
+
+#[test]
+fn disabled_ordinary_ingestion_keeps_the_turn_and_correlation() {
+    let (output, invocations, phases) =
+        run_plain_reply_seed("seed_ordinary_turn", true, "disabled:5256");
+    assert!(output.status.success(), "{}", transcript(&output));
+    assert_eq!(invocations.len(), 1);
+    assert!(phases.contains("endpoints"));
+    assert!(phases.contains("discover local curie-seed-ordinary-"));
+    assert!(!phases.contains("query "));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("DISABLED:"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("#5256"));
+
+    let (failed, _, phases) = run_plain_reply_seed("seed_ordinary_turn", false, "disabled:5256");
+    assert!(!failed.status.success(), "{}", transcript(&failed));
+    assert!(!phases.contains("discover "));
+}
+
+#[test]
+fn disabled_ordinary_membership_is_explicit_and_sibling_failures_still_block() {
+    let harness = tempfile::tempdir().expect("create evidence harness");
+    for (membership, accepted, cluster, expected) in [
+        ("disabled:5256", "1", "true", true),
+        ("disabled:5256", "0", "true", false),
+        ("false", "1", "true", false),
+        ("disabled:5256", "1", "false", false),
+    ] {
+        let script = format!(
+            r#"set -euo pipefail
+PRODUCT_OBSERVABILITY_RUN_ID=fixture-run
+LOCAL_PRODUCT_EVIDENCE="$TEST_WORKDIR/local.json"
+CLUSTER_PRODUCT_EVIDENCE="$TEST_WORKDIR/cluster.json"
+{}
+{}
+write_product_observability_evidence "$LOCAL_PRODUCT_EVIDENCE" local "$TEST_ACCEPTED" 1 "$TEST_MEMBERSHIP" not-applicable false
+write_product_observability_evidence "$CLUSTER_PRODUCT_EVIDENCE" cluster 1 1 "$TEST_CLUSTER" true false
+classify_product_observability_owner
+"#,
+            ladder_function_before(
+                "write_product_observability_evidence",
+                "run_cluster_product_observability",
+            ),
+            ladder_function_before(
+                "classify_product_observability_owner",
+                "rung_cluster_product"
+            ),
+        );
+        let output = Command::new("bash")
+            .args(["-c", &script])
+            .env("TEST_WORKDIR", harness.path())
+            .env("TEST_MEMBERSHIP", membership)
+            .env("TEST_ACCEPTED", accepted)
+            .env("TEST_CLUSTER", cluster)
+            .output()
+            .expect("execute product evidence consumers");
+        assert_eq!(output.status.success(), expected, "{}", transcript(&output));
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(harness.path().join("local.json")).expect("read local evidence"),
+        )
+        .expect("parse local evidence");
+        assert_eq!(
+            record["disabled_assertions"]["ordinary_exact_trace_ingestion"],
+            "#5256"
+        );
+        if membership == "disabled:5256" {
+            assert!(record["langfuse_observation_membership"].is_null());
+        } else {
+            assert_eq!(record["langfuse_observation_membership"], false);
+        }
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("curie-clear:"));
+    }
 }

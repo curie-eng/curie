@@ -59,6 +59,7 @@ from ..runner_client import (
 )
 from ..sandbox.quota import capacity_rejection_is_valid
 from ..sandbox.types import (
+    AdmissionUnavailableError,
     CapacityExhaustedError,
     MissingAgentPoolError,
     SandboxError,
@@ -455,26 +456,33 @@ async def _attempt_turn(
             constants._ATTACHMENT_ACCESS_TURN.reset(aa_turn)
             constants._MEMORY_MINT.reset(memory_mint)
             constants._CHANNEL_READ_MINT.reset(cr_mint)
-    except CapacityExhaustedError as exc:
-        rejection = exc.rejection
-        logger.warning(
-            "sandbox capacity exhausted for event %s: quota=%s requested=%s used=%s hard=%s",
-            qevent.event_id,
-            rejection.quota_name,
-            rejection.requested,
-            rejection.used,
-            rejection.hard,
-        )
+    except (CapacityExhaustedError, AdmissionUnavailableError) as exc:
+        rejection = exc.rejection if isinstance(exc, CapacityExhaustedError) else None
+        if rejection is None:
+            logger.warning("sandbox admission inventory unavailable for event %s", qevent.event_id)
+        else:
+            logger.warning(
+                "sandbox capacity exhausted for event %s: quota=%s requested=%s used=%s hard=%s",
+                qevent.event_id,
+                rejection.quota_name,
+                rejection.requested,
+                rejection.used,
+                rejection.hard,
+            )
         parsed_execute = parse_work_item_event_id(qevent.event_id)
         if parsed_execute is not None and parsed_execute.kind in {"execute"}:
             run = self._work_item_runs.get(parsed_execute.request_id)
             if run is not None and not run.started:
                 release_order()
                 try:
-                    await run.defer("capacity", capacity=True, start_failure_detail=None)
+                    await run.defer(
+                        "admission_unavailable" if rejection is None else "capacity",
+                        capacity=rejection is not None,
+                        start_failure_detail=None,
+                    )
                 except WorkItemConflict as exc:
                     logger.info(
-                        "work-item capacity defer refused for %s: %s",
+                        "work-item admission defer refused for %s: %s",
                         qevent.event_id,
                         exc.code,
                     )
@@ -492,6 +500,17 @@ async def _attempt_turn(
                 release_order()
                 return failures.TurnOutcome(terminal_ok=False, classification="sandbox-capacity")
             return await capacity_response()
+
+        if rejection is None:
+            release_order()
+            if (
+                qevent.source is TurnSource.SLACK
+                and handle is not None
+                and not self._is_approval_resume(qevent.event_id)
+                and (parsed_execute is None or not parsed_execute.is_ci_fix)
+            ):
+                raise CapacityWaitRequested() from None
+            raise
 
         if pressure_retried:
             self._record_pressure_outcome("reclaimed-retry-refused")
@@ -852,13 +871,31 @@ async def _attempt_turn(
             outcome.approval_granted_tool,
         ):
             snapshot = None
+            # The worker names the base the snapshot is anchored at: the
+            # prepared commit retained for this thread, never the agent's HEAD.
+            snapshot_base: str | None = None
+            snapshot_base_error: str | None = None
+            try:
+                if self._workspace is None:
+                    raise WorkspacePreparationError(
+                        "publication-validation",
+                        "managed workspace coordinator is unavailable",
+                    )
+                prepared = await asyncio.to_thread(self._workspace.current, thread_key)
+                if prepared is None:
+                    raise WorkspacePreparationError(
+                        "publication-validation", "thread has no retained sanitized base"
+                    )
+                snapshot_base = prepared.base_sha
+            except WorkspacePreparationError as exc:
+                snapshot_base_error = f"publication snapshot failed: {exc}"
             snapshot_started = clock.time.monotonic()
             snapshot_budget_s = (
                 None if remaining_s is None else remaining_s - (snapshot_started - attempt_started)
             )
             snapshot_attempts = 0
             snapshot_failure_text = "remaining budget is 5 s or less"
-            while snapshot_attempts < 3:
+            while snapshot_base is not None and snapshot_attempts < 3:
                 snapshot_remaining_s = (
                     None
                     if snapshot_budget_s is None
@@ -874,6 +911,7 @@ async def _attempt_turn(
                     snapshot = await self._runner.snapshot(
                         routed.handle.base_url,
                         token=routed.handle.token or None,
+                        base_sha=snapshot_base,
                         remaining_s=snapshot_remaining_s,
                     )
                 except (RunnerError, aiohttp.ClientError, TimeoutError) as exc:
@@ -906,7 +944,9 @@ async def _attempt_turn(
                     await asyncio.sleep(float(snapshot_attempts))
                 else:
                     break
-            if snapshot is None:
+            if snapshot_base_error is not None:
+                outcome.publication_snapshot_error = snapshot_base_error
+            elif snapshot is None:
                 # A trusted publication request never falls through into an
                 # ordinary approval when snapshotting fails. The pause path
                 # reports this error and creates neither durable row.
