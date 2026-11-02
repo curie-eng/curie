@@ -168,7 +168,7 @@ def test_v2_atomically_retains_payload_trace_context_and_permanent_receipts(
                 scope.claim, scope.stream, scope.fence, scope.reservation.token_key,
                 scope.receipt, OWNER, PAYLOAD, "payload", "60", "traceparent", TRACE, "",
                 "identity_guard_v2", STABLE, scope.reservation.token,
-                "-62135596800", "0", "253402300799", "999999", CAPSULE, INTENT, digest,
+                "-62135596800", "0", "253402300799", "999999", CAPSULE, INTENT, digest, "",
             ))]
             assert success is True
             assert await observer.xrange(scope.stream) == [(stream_id.encode(), {
@@ -564,3 +564,57 @@ def test_ordinary_enqueue_controls_do_not_acquire_context_metadata(mode: str) ->
             ]
             assert await observer.get(scope.receipt) is None
     asyncio.run(run())
+
+
+SLOT = "1720000000.000300"
+
+
+def test_named_reply_slot_is_retained_canonically_and_returned_on_read() -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-27: the slot is retained, never part of the intent."""
+    context_type()
+    reader = getattr(delivery, "read_identity_delivery_receipt_with_slot", None)
+    assert callable(reader), "read_identity_delivery_receipt_with_slot is not implemented"
+    async def run() -> None:
+        """@spec HTTP-INVOCATION-EXECUTION-27."""
+        scope = Scope()
+        async with clients(scope) as (client, observer):
+            await prepare(client, scope)
+            success, stream_id = await append(
+                client, scope, identity_context=scope.context(reply_ref=SLOT),
+            )
+            assert success is True
+            metadata = await observer.get(scope.receipt)
+            assert json.loads(metadata) == {
+                "schema_version": 1, "intent_digest": INTENT, "reply_ref": SLOT,
+                "context_digest": hashlib.sha256(CAPSULE.encode("ascii")).hexdigest(),
+                "stream_id": stream_id,
+            }
+            assert metadata == json.dumps(
+                json.loads(metadata), sort_keys=True, separators=(",", ":"),
+            ).encode()
+            values = dict(key=scope.claim, receipt_key=scope.receipt, intent_digest=INTENT)
+            assert await reader(client, **values) == (stream_id, SLOT)
+            assert await read_receipt(client, scope) == stream_id
+            # A retry under the same intent with a different slot is a duplicate.
+            assert await append(
+                client, scope, identity_context=scope.context(reply_ref="1720000000.000400"),
+            ) == (False, stream_id)
+            assert json.loads(await observer.get(scope.receipt))["reply_ref"] == SLOT
+            for damaged in ("", "1.2.3", "a.b", "1" * 21 + ".1"):
+                corrupt = json.loads(metadata)
+                corrupt["reply_ref"] = damaged
+                await observer.set(
+                    scope.receipt, json.dumps(corrupt, sort_keys=True, separators=(",", ":")),
+                )
+                with pytest.raises(delivery.DeliveryGuardRefusal):
+                    await reader(client, **values)
+            await observer.set(scope.receipt, metadata)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("slot", ["1.2.3", "not-a-slot", "1" * 21 + ".1", ".1", 1.5])
+def test_context_refuses_a_reply_slot_outside_the_timestamp_grammar(slot: Any) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-27: only JSON-safe Slack timestamps are retained."""
+    scope = Scope()
+    with pytest.raises(ValueError, match="^invalid_delivery_context$"):
+        scope.context(reply_ref=slot)
