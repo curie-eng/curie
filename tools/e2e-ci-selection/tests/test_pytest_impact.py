@@ -1087,16 +1087,28 @@ def test_documentation_a_test_reads_selects_its_readers(
         assert selection.reason == "empty impact"
 
 
-def test_agents_md_only_pull_request_runs_its_readers(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("path", "required"),
+    (
+        # The recipe that used to live in AGENTS.md; the revision gate test reads it.
+        ("docs/local-verification.md", "apps/api/tests/test_alembic_revision_gate.py"),
+        # Read by no runnable test now, so only the always-selected set runs.
+        ("AGENTS.md", "tools/doclint/tests/test_counts.py"),
+    ),
+)
+def test_documentation_only_pull_request_runs_its_readers(
+    tmp_path: Path, real_graph: Any, path: str, required: str
+) -> None:
     targets = tmp_path / "targets.txt"
 
-    completed, output = _run_selector(tmp_path, "--path", "AGENTS.md", targets_out=targets)
+    completed, output = _run_selector(tmp_path, "--path", path, targets_out=targets)
 
     assert completed.returncode == 0, completed.stderr
     assert output["pytest"] == "true"
     assert output["pytest_scope"] == "impact"
     selected = set(targets.read_text(encoding="utf-8").split())
-    assert "apps/api/tests/test_alembic_revision_gate.py" in selected
+    assert required in selected
+    assert real_graph.repo_wide("tools/doclint/tests/test_counts.py")
 
 
 @pytest.mark.parametrize(
@@ -1469,10 +1481,19 @@ def _git(repo: Path, *args: str) -> str:
 
 def _workflow(**runs: str) -> str:
     jobs = ("changes", "python-pytest", "rust-lint", *UPGRADE_JOBS)
-    return "name: Example CI\njobs:\n" + "".join(
-        f"  {job}:\n    runs-on: ubuntu-latest\n    steps:\n"
-        f"      - run: {runs.get(job.replace('-', '_'), f'echo {job}')}\n"
-        for job in jobs
+    # Selection reads the candidate chart job even when the changed hunk is
+    # elsewhere, so keep its real steps in this otherwise minimal workflow.
+    chart_job = _registry_document()["chart_scenarios"]["job"]
+    chart = yaml.safe_load((REPO_ROOT / WORKFLOW_PATH).read_text())["jobs"][chart_job]
+    chart_text = yaml.safe_dump({chart_job: chart}, sort_keys=False)
+    return (
+        "name: Example CI\njobs:\n"
+        + "".join("  " + line for line in chart_text.splitlines(keepends=True))
+        + "".join(
+            f"  {job}:\n    runs-on: ubuntu-latest\n    steps:\n"
+            f"      - run: {runs.get(job.replace('-', '_'), f'echo {job}')}\n"
+            for job in jobs
+        )
     )
 
 
