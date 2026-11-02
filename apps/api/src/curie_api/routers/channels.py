@@ -817,6 +817,9 @@ async def _enqueue_turn(
                 # the payload away.
                 turn = _mint_turn(row, body, event_id)
                 identity_arguments: dict[str, Any] = {}
+                # @spec HTTP-INVOCATION-EXECUTION-27/29: only a Slack delivery names a
+                # reply slot; an email reply_ref stays inside its intent.
+                reply_slot = body.reply_ref if row.kind == "slack" else ""
                 if http_invocation is not None:
                     assert turn.reply_handle is not None
                     # @spec HTTP-INVOCATION-EXECUTION-27: a nonempty slot is the
@@ -824,7 +827,7 @@ async def _enqueue_turn(
                     turn = turn.model_copy(update={
                         "author_principal": http_invocation.principal_ref,
                         "reply_handle": turn.reply_handle.model_copy(
-                            update={"placeholder": body.reply_ref or None}
+                            update={"placeholder": reply_slot or None}
                         ),
                     })
                 payload = turn.model_dump_json()
@@ -832,7 +835,7 @@ async def _enqueue_turn(
                     context, guard = http_invocation.seal_payload(
                         payload=payload, event_id=event_id,
                         original_invocation_id=event_id, reservation=reservation,
-                        receipt_key=f"{key}:identity", reply_ref=body.reply_ref,
+                        receipt_key=f"{key}:identity", reply_ref=reply_slot,
                     )
                     identity_arguments = {"identity_context": context, "guard": guard}
                 carrier: dict[str, str] = {}
