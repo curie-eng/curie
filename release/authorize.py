@@ -57,11 +57,14 @@ pipeline, and it fails closed on either of two questions:
             release-PR merge on an unmoved base is proved by its PR head this
             way. A parent with a different tree is never consulted by this
             rule. Second, inside the walk, a delta that also touches
-            SCHEMA_WINDOWS_PATH still counts as version-only when the only
-            change to that JSON document is registering this tag's schema
+            the schema-window catalog still counts as version-only when the
+            only change to that JSON document is registering this tag's schema
             window: a new `windows` key (the tag without its `v`) whose value
             equals the candidate's `candidate` entry, with every other key and
             window unchanged. Any other edit to that file ends the walk.
+            ADR-0257 moves that rule into `release/atlas.py`
+            (`version_only_extra`) so the atlas pin gate and the CI selector
+            apply it too.
 
 Both live as separately-testable functions so the negative case -- an
 unreviewed or check-less commit is refused -- is an ordinary pytest assertion
@@ -110,11 +113,6 @@ PASSING_CONCLUSIONS = {"success", "neutral"}
 # merge of one, on top of green CI; ten leaves room for a few stacked bumps
 # without letting the walk wander arbitrarily far back.
 VERSION_ONLY_PROOF_DEPTH = 10
-
-# The schema-window catalog `bump-version` edits in the same release
-# preparation commit (ADR-0247, issue #4862). Registering this tag's window
-# there is version identity; any other change to it is not.
-SCHEMA_WINDOWS_PATH = "cli/src/application_schema_windows.json"
 
 # The two rules that may stand a proof commit's checks in for the tagged
 # commit's own, as `Proof.path` labels (ADR-0195 as amended by ADR-0247).
@@ -476,82 +474,6 @@ def find_tree_identical_parent_proof(
     return None
 
 
-def _schema_windows_at(commit: str, *, cwd: Path | None) -> object:
-    """The parsed schema-window catalog at `commit`, or None if unreadable.
-
-    A missing file or malformed JSON is not an error here: it only means the
-    delta cannot be a registration, so the walk refuses on its own terms. A
-    document with a duplicate object key at any level is treated the same way:
-    json.loads would silently keep the last member, but the Rust consumer
-    rejects such documents.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "show", f"{commit}:{SCHEMA_WINDOWS_PATH}"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError as exc:
-        raise AuthorizationError(
-            f"could not read {SCHEMA_WINDOWS_PATH} at {commit}: {exc}"
-        ) from exc
-    if result.returncode != 0:
-        return None
-    try:
-        return json.loads(result.stdout, object_pairs_hook=_reject_duplicate_keys)
-    except (json.JSONDecodeError, ValueError):
-        return None
-
-
-def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate key {key!r}")
-        result[key] = value
-    return result
-
-
-def _canonical(value: object) -> str:
-    """Type-sensitive form of parsed JSON: True and 1 and 1.0 stay distinct."""
-    return json.dumps(value, sort_keys=True)
-
-
-def is_schema_window_registration(
-    base: str, sha: str, version: str, *, cwd: Path | None = None
-) -> bool:
-    """Is the catalog change from `base` to `sha` only registering `version`?
-
-    True only when both documents are objects with an object `windows`,
-    `version` is a new key in `windows` whose value equals `base`'s
-    `candidate` (what bump-version promotes), and every other top-level key
-    and every other window is unchanged (ADR-0247, issue #4862).
-    """
-    old = _schema_windows_at(base, cwd=cwd)
-    new = _schema_windows_at(sha, cwd=cwd)
-    if not isinstance(old, dict) or not isinstance(new, dict):
-        return False
-    old_windows = old.get("windows")
-    new_windows = new.get("windows")
-    if not isinstance(old_windows, dict) or not isinstance(new_windows, dict):
-        return False
-    if version in old_windows or version not in new_windows:
-        return False
-    if "candidate" not in old or _canonical(new_windows[version]) != _canonical(
-        old["candidate"]
-    ):
-        return False
-    if _canonical({k: v for k, v in new_windows.items() if k != version}) != (
-        _canonical(old_windows)
-    ):
-        return False
-    return _canonical({k: v for k, v in new.items() if k != "windows"}) == (
-        _canonical({k: v for k, v in old.items() if k != "windows"})
-    )
-
-
 def find_version_only_proof(
     sha: str,
     tag: str,
@@ -565,15 +487,14 @@ def find_version_only_proof(
 
     Walks at most VERSION_ONLY_PROOF_DEPTH first-parent ancestors, nearest
     first. The diff from each candidate to `sha` is checked against
-    `version_only_paths` for `tag` before that candidate's check-runs are
-    fetched; the first candidate outside the set ends the walk. A delta that
-    also touches SCHEMA_WINDOWS_PATH stays inside the set only when that
-    change registers this tag's schema window (ADR-0247). Returns None when
-    no candidate qualifies. Git failures raise AuthorizationError.
+    `release/atlas.py`'s `version_only_extra` for `tag` before that
+    candidate's check-runs are fetched; the first candidate outside it ends
+    the walk. A delta that also touches the schema-window catalog stays
+    inside only when that change registers this tag's schema window
+    (ADR-0247, ADR-0257). Returns None when no candidate qualifies. Git
+    failures raise AuthorizationError.
     """
     version = tag.strip().removeprefix("refs/tags/")
-    allowed = _atlas.version_only_paths(version)
-    window_key = version.removeprefix("v")
     ancestors = _git_output(
         [
             "rev-list",
@@ -590,11 +511,13 @@ def find_version_only_proof(
             cwd=cwd,
             purpose=f"diff {candidate} against {sha}",
         ).splitlines()
-        extra = {path for path in changed if path} - allowed
-        if extra and not (
-            extra == {SCHEMA_WINDOWS_PATH}
-            and is_schema_window_registration(candidate, sha, window_key, cwd=cwd)
-        ):
+        try:
+            extra = _atlas.version_only_extra(
+                [path for path in changed if path], version, candidate, sha, cwd=cwd
+            )
+        except _atlas.AtlasError as exc:
+            raise AuthorizationError(str(exc)) from exc
+        if extra:
             return None
         runs = exclude_current_workflow_run(fetch_check_runs(candidate), exclude_run_id)
         if not missing_required_checks(runs, required_names):
