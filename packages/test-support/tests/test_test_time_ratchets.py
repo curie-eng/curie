@@ -653,7 +653,7 @@ def test_budget_scope_uses_the_diff_and_base_inventory(tmp_path: Path) -> None:
     source(tmp_path, file, original.replace("return 1", "return 2") + "\ndef test_added(): pass\n")
     git(tmp_path, "commit", "-qam", "Change one test and add another")
     collected = [*known_ids, file + "::test_added", file + "::test_existing[new]"]
-    enforced = budget_targets(tmp_path, collected, known)
+    enforced = budget_targets(tmp_path, collected, known, known)
     assert enforced == {
         file + "::test_changed",
         file + "::test_added",
@@ -661,9 +661,20 @@ def test_budget_scope_uses_the_diff_and_base_inventory(tmp_path: Path) -> None:
     }
     assert budget_failure(file + "::test_untouched_in_same_file", 120, enforced) is None
     assert budget_failure(file + "::test_existing", 120, enforced) is None
+    with pytest.raises(ValueError, match="dropped collected base identities"):
+        budget_targets(tmp_path, collected, known, {})
+    remaining = [nodeid for nodeid in collected if nodeid != file + "::test_existing"]
+    retained = {
+        file: [
+            entry
+            for entry in known[file]
+            if entry != hashlib.sha256((file + "::test_existing").encode()).hexdigest()
+        ]
+    }
+    assert budget_targets(tmp_path, remaining, known, retained) == enforced
     assert "exceeds" in (budget_failure(file + "::test_changed", 120, enforced) or "")
     assert "exceeds" in (budget_failure(file + "::test_existing[new]", 120, enforced) or "")
-    assert budget_targets(tmp_path, collected, None) == {
+    assert budget_targets(tmp_path, collected, None, known) == {
         file + "::test_changed",
         file + "::test_added",
     }
