@@ -956,7 +956,6 @@ def test_elapsed_and_expired_capacity_wait_name_the_previous_start_failure(
     monkeypatch.setenv("CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS", "3")
     get_settings.cache_clear()
     facts = _facts(agent["agent_id"])
-    admitted_at = time.monotonic()
     seeded = _admit(facts)
     _defer_once(
         facts.request_id,
@@ -965,7 +964,11 @@ def test_elapsed_and_expired_capacity_wait_name_the_previous_start_failure(
         detail=START_FAILURE_DETAIL,
     )
     _defer_once(facts.request_id, reason="capacity", capacity=True, detail=None)
-    time.sleep(max(0.0, 3.5 - (time.monotonic() - admitted_at)))
+    _execute(
+        "SELECT pg_sleep(GREATEST(0, EXTRACT(EPOCH FROM (wait_deadline - clock_timestamp())))) "
+        "FROM curie.execution_requests WHERE id = :id",
+        {"id": facts.request_id},
+    )
 
     elapsed = _detail(stack, auth_headers, seeded.work_item_id)
     assert elapsed["state"] == "waiting"
