@@ -47,10 +47,17 @@ ci_policy_tests:
   tools/e2e-ci-selection/tests/test_live_manifest_parity.py:
     [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
      charts/curie]
+  tools/e2e-ci-selection/tests/test_pytest_impact.py:
+    [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
+     adapters, apps, charts, cli, compose, docs, examples, otel, packages,
+     release, runner, scripts, tests, tools]
+  tools/e2e-ci-selection/tests/test_pytest_shard_services.py:
+    [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
+     apps, packages, runner]
   tools/e2e-ci-selection/tests/test_python_pytest_selection.py:
     [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
      apps, charts/curie/Chart.yaml, cli, docs/architecture-atlas, examples/tests,
-     packages, release/atlas.py, runner, scripts/check-docs.sh, tools]
+     packages, release/atlas.py, runner, scripts/check-docs.sh, tests, tools]
   tools/e2e-ci-selection/tests/test_upgrade_matrix_budget.py:
     [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock]
   tools/e2e-ci-selection/tests/test_workflow_hunk_selection.py:
@@ -79,6 +86,52 @@ pytest_scopes:
     excluded_prefixes: [cli/scripts]
     python_prefixes: [cli/tests]
     test_files: tools/e2e-ci-selection/cli_pytest_files.txt
+# Pull request pytest impact selection (tools/e2e-ci-selection/pytest_impact.py).
+# A change under `everything` runs the whole suite; a change under `no_impact`
+# selects nothing on its own; a ci.yaml hunk in a `workflow_jobs` job (or
+# outside jobs) runs the whole suite. `excluded` mirrors exactly what the
+# python-pytest Pytest step ignores or deselects, because pytest still collects
+# an explicitly passed path that is also ignored. `always` joins every impact
+# selection. A shard should hold at least 1/min_shard_share of the suite.
+pytest_impact:
+  everything:
+    - uv.lock
+    - pyproject.toml
+    - conftest.py
+    - compose.dev.yaml
+    - otel
+    - packages/test-support
+    - tools/e2e-ci-selection
+    - scripts/wait-for-langfuse.py
+    - scripts/check-released-upgrade.py
+  no_impact:
+    - tools/e2e-ci-selection/tests
+  workflow_jobs: [python-pytest, python, changes]
+  excluded:
+    - tools/factory-e2e/tests/test_c4_initial_binding.py
+    - tools/factory-e2e/tests/test_c4_static_token_rotation.py
+    - tools/factory-e2e/tests/test_c4_held_cancellation.py
+    - tools/factory-e2e/tests/test_c4_forge_instances.py
+    - tools/factory-e2e/tests/test_c4_admitted_agent.py
+    - tools/factory-e2e/tests/test_c4_upgrade_migration.py
+    - tools/factory-e2e/tests/test_c4_cluster_up.py
+    - tools/factory-e2e/tests/test_c4_tracker_scope.py
+    - examples/tests/test_sre_bot_observability_runtime.py
+    - tools/factory-e2e/tests/test_c4_dry_run.py
+    - tools/ci-retry-gate
+    - tools/ci-workflow-paths
+    - tools/ci-release-target-parity
+    - tools/e2e-ci-selection
+    - tools/helm-ci-gate
+    - tools/fix-pin-ci
+    - tools/p0-closes-ci
+    - tools/runtime-assertion-gate
+    - tools/dependency-audit-paths
+    - tools/close-on-next
+  always:
+    - tests
+  min_shard_share: 24
+  max_shards: 6
 conditional_pytest_files:
   examples/tests/test_sre_bot_observability_runtime.py:
     - examples/sre-bot

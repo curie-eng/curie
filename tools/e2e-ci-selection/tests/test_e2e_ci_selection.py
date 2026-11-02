@@ -793,9 +793,141 @@ def test_ci_policy_valid_synthetic_registry_remains_live(tmp_path: Path) -> None
     )
 
 
+PYTEST_PLAN_KEYS = (
+    "pytest_targets",
+    "pytest_shards",
+    "pytest_storage_shards",
+    "pytest_full_shards",
+)
+PYTEST_SHARD_MAX = 6
+# Paths under these always run the whole suite (the registry's
+# pytest_impact.everything), except the no-impact test directory.
+PYTEST_EVERYTHING_PREFIXES = (
+    "uv.lock",
+    "pyproject.toml",
+    "conftest.py",
+    "compose.dev.yaml",
+    "otel",
+    "packages/test-support",
+    "tools/e2e-ci-selection",
+    "scripts/wait-for-langfuse.py",
+    "scripts/check-released-upgrade.py",
+)
+PYTEST_NO_IMPACT_PREFIX = "tools/e2e-ci-selection/tests"
+
+
+def _under(path: str, prefix: str) -> bool:
+    return path == prefix or path.startswith(prefix + "/")
+
+
+def _pytest_everything_trigger(path: str) -> bool:
+    """Whether a path-mode diff containing this path always runs the full suite."""
+    if _under(path, PYTEST_NO_IMPACT_PREFIX):
+        return False
+    if any(_under(path, prefix) for prefix in PYTEST_EVERYTHING_PREFIXES):
+        return True
+    if path in (".github/workflows/ci.yaml", ".github/e2e-selection.yaml"):
+        return True
+    ignored = yaml.safe_load(REGISTRY.read_text())["rules"]["ignored_exact"]
+    return "/" not in path and path not in ignored
+
+
+def _pytest_plan_problems(
+    values: dict[str, str],
+    *,
+    expected_scope: str,
+    paths: tuple[str, ...],
+    push: bool,
+    pytest_needed: bool,
+) -> list[str]:
+    """Why the selector's pytest scope and shard plan is wrong, empty when right."""
+    scope = values["pytest_scope"]
+    plan = [values[key] for key in PYTEST_PLAN_KEYS]
+    if push:
+        if scope != "full" or plan != ["", "6", "6", "6"]:
+            return [f"push must be scope full, no targets, 6/6/6, got {scope} {plan}"]
+        return []
+    allowed = {expected_scope}
+    if (
+        expected_scope == "full"
+        and pytest_needed
+        and not any(_pytest_everything_trigger(path) for path in paths)
+    ):
+        allowed.add("impact")
+    problems = []
+    if scope not in allowed:
+        problems.append(f"pytest_scope {scope} not in {sorted(allowed)}")
+    digest = values["pytest_targets"]
+    if scope == "impact":
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            problems.append(f"impact targets must be a sha256 digest, got {digest!r}")
+    elif digest:
+        problems.append(f"scope {scope} must have empty targets, got {digest!r}")
+    try:
+        shards, storage, full = (int(value) for value in plan[1:])
+    except ValueError:
+        return [*problems, f"shard counts must be integers, got {plan[1:]}"]
+    if not (1 <= shards <= PYTEST_SHARD_MAX and 0 <= full <= storage <= shards):
+        problems.append(f"bad shard plan shards={shards} storage={storage} full={full}")
+    return problems
+
+
+class _ExpectedOutput(str):
+    """The expected GITHUB_OUTPUT text, compared structurally to the selector's.
+
+    Every key before the pytest plan, and the key order, must match exactly.
+    pytest_scope and the plan keys are checked by `_pytest_plan_problems`.
+    """
+
+    paths: tuple[str, ...]
+    push: bool
+    pytest_needed: bool
+
+    def __new__(
+        cls, text: str, *, paths: tuple[str, ...], push: bool, pytest_needed: bool
+    ) -> _ExpectedOutput:
+        self = super().__new__(cls, text)
+        self.paths = paths
+        self.push = push
+        self.pytest_needed = pytest_needed
+        return self
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, str):
+            return NotImplemented
+        if not other.endswith("\n"):
+            return False
+        try:
+            actual = _outputs_of(other)
+            expected = _outputs_of(str(self))
+        except ValueError:
+            return False
+        actual_lines = [line.split("=", maxsplit=1)[0] for line in other.splitlines()]
+        if actual_lines != list(expected) or list(actual) != actual_lines:
+            return False
+        skipped = {"pytest_scope", *PYTEST_PLAN_KEYS}
+        if any(actual[key] != value for key, value in expected.items() if key not in skipped):
+            return False
+        return not _pytest_plan_problems(
+            actual,
+            expected_scope=expected["pytest_scope"],
+            paths=self.paths,
+            push=self.push,
+            pytest_needed=self.pytest_needed,
+        )
+
+    def __ne__(self, other: object) -> bool:
+        result = self.__eq__(other)
+        return result if result is NotImplemented else not result
+
+    __hash__ = str.__hash__
+
+
 def _expected_output(
     *selected: str,
     ci_policy_files: tuple[str, ...],
+    paths: tuple[str, ...] = (),
+    push: bool = False,
     pytest_needed: bool = True,
     pytest_deselect: str = "",
     pytest_scope: str = "full",
@@ -828,7 +960,16 @@ def _expected_output(
     rendered = list(scenarios) if "cluster" in selected_tiers else []
     lines.append("chart_scenarios=" + json.dumps(rendered, separators=(",", ":")))
     lines.append("chart_legs=" + json.dumps(_expected_chart_legs(rendered), separators=(",", ":")))
-    return "\n".join(lines) + "\n"
+    # Placeholders for the pytest plan; `_ExpectedOutput` checks the real values.
+    if push:
+        plan = ["", "6", "6", "6"]
+    else:
+        assert paths, "a pull request expectation must name its paths"
+        plan = ["<empty or sha256>", "<1..6>", "<0..shards>", "<0..storage>"]
+    lines.extend(f"{key}={value}" for key, value in zip(PYTEST_PLAN_KEYS, plan, strict=True))
+    return _ExpectedOutput(
+        "\n".join(lines) + "\n", paths=paths, push=push, pytest_needed=pytest_needed
+    )
 
 
 def _assert_selection(
@@ -861,6 +1002,7 @@ def _assert_selection(
         released_upgrade_full=False,
         chart_scenarios=_expected_chart_for_path(path),
         ci_policy_files=_expected_ci_policy_files(path),
+        paths=(path,),
     )
 
 
@@ -1885,6 +2027,7 @@ def test_mixed_root_documentation_and_runtime_diff_selects_runtime_tiers(
             "workspace-diagnostic",
         ),
         ci_policy_files=_expected_ci_policy_files("ARCHITECTURE.md", "apps/api/main.py"),
+        paths=("ARCHITECTURE.md", "apps/api/main.py"),
     )
 
 
@@ -1894,6 +2037,7 @@ def test_unknown_and_union_selection_are_deterministic(tmp_path: Path) -> None:
     assert unknown_output == _expected_output(
         *BASE_TIERS,
         ci_policy_files=_expected_ci_policy_files("new-surface/module.py"),
+        paths=("new-surface/module.py",),
     )
 
     forward, forward_output = _invoke_selector(
@@ -1921,6 +2065,7 @@ def test_unknown_and_union_selection_are_deterministic(tmp_path: Path) -> None:
             ci_policy_files=_expected_ci_policy_files(
                 "charts/curie/values.yaml", "compose.dev.yaml", "otel/collector.yaml"
             ),
+            paths=("charts/curie/values.yaml", "compose.dev.yaml", "otel/collector.yaml"),
         )
     )
 
@@ -1937,6 +2082,7 @@ def test_push_selects_every_tier_without_a_repository(tmp_path: Path) -> None:
         factory=True,
         approval_resume=True,
         ci_policy_files=_expected_ci_policy_files(push=True),
+        push=True,
     )
 
 
@@ -1960,6 +2106,7 @@ def test_omit_kind_drops_cluster_tiers_and_keeps_the_rest(tmp_path: Path) -> Non
         images_needed=True,
         cli_release_needed=True,
         ci_policy_files=_expected_ci_policy_files(push=True),
+        push=True,
     )
 
     chart, chart_output = _invoke_selector(
@@ -1971,6 +2118,7 @@ def test_omit_kind_drops_cluster_tiers_and_keeps_the_rest(tmp_path: Path) -> Non
     assert chart_output == _expected_output(
         pytest_needed=True,
         ci_policy_files=_expected_ci_policy_files("charts/curie/values.yaml"),
+        paths=("charts/curie/values.yaml",),
     )
 
     untouched, untouched_output = _invoke_selector(
@@ -1983,6 +2131,7 @@ def test_omit_kind_drops_cluster_tiers_and_keeps_the_rest(tmp_path: Path) -> Non
         "released-upgrade",
         pytest_needed=True,
         ci_policy_files=_expected_ci_policy_files("charts/curie/values.yaml"),
+        paths=("charts/curie/values.yaml",),
     )
 
 
@@ -2042,6 +2191,7 @@ def test_revisions_select_changed_paths_and_unknown_fallback(tmp_path: Path) -> 
         "local",
         pytest_deselect=ALL_CONDITIONAL,
         ci_policy_files=_expected_ci_policy_files("compose.dev.yaml"),
+        paths=("compose.dev.yaml",),
     )
 
     (repository / "new-surface.txt").write_text("new\n")
@@ -2064,6 +2214,7 @@ def test_revisions_select_changed_paths_and_unknown_fallback(tmp_path: Path) -> 
     assert unknown_output == _expected_output(
         *BASE_TIERS,
         ci_policy_files=_expected_ci_policy_files("new-surface.txt"),
+        paths=("new-surface.txt",),
     )
 
 
@@ -2089,6 +2240,7 @@ def _version_only_paths(version: str) -> tuple[str, ...]:
 def _version_only_selection() -> str:
     return _expected_output(
         "local-release",
+        paths=_version_only_paths(_repo_version()),
         pytest_needed=False,
         cli_release_needed=True,
         version_only=True,
@@ -2098,12 +2250,14 @@ def _version_only_selection() -> str:
 
 # What the same five paths selected before #3858, and still select whenever
 # the delta is not version-only.
-def _full_prep_selection() -> str:
+def _full_prep_selection(*extra: str, version: str | None = None) -> str:
+    paths = (*_version_only_paths(version or _repo_version()), *extra)
     return _expected_output(
         *TIERS,
         pytest_deselect=_expected_conditional_deselect(*_version_only_paths(_repo_version())),
         cli_release_needed=True,
         ci_policy_files=_expected_ci_policy_files(*_version_only_paths(_repo_version())),
+        paths=paths,
     )
 
 
@@ -2124,7 +2278,7 @@ def test_another_releases_snapshot_is_not_version_only(tmp_path: Path) -> None:
     assert _repo_version() != "v9.9.9"
     completed, output = _invoke_selector(tmp_path, *_version_only_paths("v9.9.9"))
     assert completed.returncode == 0, completed.stderr
-    assert output == _full_prep_selection()
+    assert output == _full_prep_selection(version="v9.9.9")
 
 
 @pytest.mark.parametrize("extra", ["cli/src/main.rs", "README.md"])
@@ -2132,7 +2286,7 @@ def test_any_other_path_makes_the_prep_diff_not_version_only(tmp_path: Path, ext
     """#3858: one path outside the set restores today's selection."""
     completed, output = _invoke_selector(tmp_path, *_version_only_paths(_repo_version()), extra)
     assert completed.returncode == 0, completed.stderr
-    assert output == _full_prep_selection()
+    assert output == _full_prep_selection(extra)
 
 
 def test_push_is_never_version_only(tmp_path: Path) -> None:
@@ -2144,6 +2298,23 @@ def test_push_is_never_version_only(tmp_path: Path) -> None:
 
 def _outputs_of(output: str) -> dict[str, str]:
     return dict(line.split("=", maxsplit=1) for line in output.splitlines())
+
+
+def test_selector_writes_exactly_the_output_keys_the_expectation_knows(tmp_path: Path) -> None:
+    """A new selector output key must be added to `_expected_output` in one place."""
+    known_pull_request = set(
+        _outputs_of(str(_expected_output(ci_policy_files=(), paths=("README.md",))))
+    )
+    known_push = set(_outputs_of(str(_expected_output(ci_policy_files=(), push=True))))
+    assert known_pull_request == known_push
+    assert set(PYTEST_PLAN_KEYS) <= known_push
+    for invocation in ({"push": True}, {}):
+        paths = () if invocation else ("README.md",)
+        completed, output = _invoke_selector(tmp_path, *paths, **invocation)
+        assert completed.returncode == 0, completed.stderr
+        written = [line.split("=", maxsplit=1)[0] for line in output.splitlines()]
+        assert len(written) == len(set(written))
+        assert set(written) == known_push
 
 
 def _git(repository: Path, *args: str) -> str:
@@ -2280,6 +2451,7 @@ def test_exact_path_under_ignored_prefix_is_selected(tmp_path: Path) -> None:
         "cluster",
         chart_scenarios=(),
         ci_policy_files=_expected_ci_policy_files("scripts/selected.sh", registry=registry),
+        paths=("scripts/selected.sh",),
     )
     for path in ("scripts/other.sh", "scripts/selected.sh/child.sh"):
         ignored, ignored_output = _invoke_selector(tmp_path, path, registry=registry)
@@ -2287,6 +2459,7 @@ def test_exact_path_under_ignored_prefix_is_selected(tmp_path: Path) -> None:
         assert ignored_output == _expected_output(
             pytest_needed=False,
             ci_policy_files=_expected_ci_policy_files(path, registry=registry),
+            paths=(path,),
         )
 
 
@@ -2362,6 +2535,7 @@ def test_exact_ignore_under_selected_prefix_does_not_hide_siblings(tmp_path: Pat
     assert ignored_output == _expected_output(
         pytest_needed=False,
         ci_policy_files=_expected_ci_policy_files("charts/curie/README.md", registry=registry),
+        paths=("charts/curie/README.md",),
     )
     assert sibling_output == _expected_output(
         "cluster",
@@ -2370,6 +2544,7 @@ def test_exact_ignore_under_selected_prefix_does_not_hide_siblings(tmp_path: Pat
         ci_policy_files=_expected_ci_policy_files(
             "charts/curie/README.md/runtime-check.sh", registry=registry
         ),
+        paths=("charts/curie/README.md/runtime-check.sh",),
     )
 
 
@@ -2381,6 +2556,7 @@ def test_more_specific_ignored_child_of_selected_prefix_is_allowed(tmp_path: Pat
     assert ignored_output == _expected_output(
         pytest_needed=False,
         ci_policy_files=_expected_ci_policy_files("charts/ci/probe.sh", registry=registry),
+        paths=("charts/ci/probe.sh",),
     )
 
     selected, selected_output = _invoke_selector(
@@ -2391,6 +2567,7 @@ def test_more_specific_ignored_child_of_selected_prefix_is_allowed(tmp_path: Pat
         "cluster",
         "released-upgrade",
         ci_policy_files=_expected_ci_policy_files("charts/curie/values.yaml", registry=registry),
+        paths=("charts/curie/values.yaml",),
     )
 
 
@@ -2499,7 +2676,7 @@ def test_both_trains_omit_kind_on_push_and_keep_full_dispatch(
         *(TIERS if full else TIERS[:3]),
         ci_policy_files=_expected_ci_policy_files(".github/workflows/ci.yaml"),
         images_needed=True, cli_release_needed=True, released_upgrade_full=full,
-        factory=full, approval_resume=full,
+        factory=full, approval_resume=full, push=True,
     )
     if full:
         listed = subprocess.run(
@@ -2852,7 +3029,8 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         "pytest": "${{ steps.filter.outputs.pytest }}",
         "pytest_deselect": "${{ steps.filter.outputs.pytest_deselect }}",
         "pytest_scope": "${{ steps.filter.outputs.pytest_scope }}",
-        "ci_policy": "${{ steps.filter.outputs.ci_policy }}",
+        **{key: f"${{{{ steps.filter.outputs.{key} }}}}" for key in PYTEST_PLAN_KEYS},
+        "ci_policy":"${{ steps.filter.outputs.ci_policy }}",
         "ci_policy_files": "${{ steps.filter.outputs.ci_policy_files }}",
         "version_only": "${{ steps.filter.outputs.version_only }}",
         "factory": "${{ steps.filter.outputs.factory }}",
@@ -3685,6 +3863,7 @@ def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
     assert output == _expected_output(
         pytest_needed=False,
         ci_policy_files=_expected_ci_policy_files("ARCHITECTURE.md"),
+        paths=("ARCHITECTURE.md",),
     )
     outputs = dict(line.split("=", maxsplit=1) for line in output.splitlines())
 
