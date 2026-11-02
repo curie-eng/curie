@@ -464,12 +464,14 @@ def test_selected_unsupported_turn_and_approval_lanes_refuse_before_legacy_work(
     rig = HttpRig()
     app, legacy = _selected(cfg, redis_client, rig)
     if lane == "im":
+        # A plain one-to-one DM is criterion 26's source; a group DM stays
+        # unsupported and silent. @spec HTTP-INVOCATION-EXECUTION-26.
         event = {
             "type": "message",
-            "channel_type": "im",
-            "channel": "D0EXAMPLE1",
+            "channel_type": "mpim",
+            "channel": "G0EXAMPLE1",
             "user": "U123",
-            "text": "Synthetic unsupported IM",
+            "text": "Synthetic unsupported group IM",
             "ts": "1700.0001",
         }
         request = _events_api_request("env-unsupported", "EvUnsupportedIM", event)
