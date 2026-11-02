@@ -212,12 +212,14 @@ def test_selected_complete_denial_or_route_miss_never_enters_legacy_fallback(
         _finish_owned_listeners(app)
     assert sock.acked_envelope_ids == ["env-http"] and len(rig.requests) == 1
     # @spec HTTP-INVOCATION-EXECUTION-19/27: the placeholder and one notice are the only
-    # Slack effects; a refusal turns the placeholder into the notice.
+    # Slack effects; a refusal deletes the placeholder and tells only the sender.
     if status == 403:
-        rig.web.chat_update.assert_called_once_with(
-            channel=CHANNEL, ts=PLACEHOLDER_TS, text=REFUSED_TEXT,
+        rig.web.chat_delete.assert_called_once_with(channel=CHANNEL, ts=PLACEHOLDER_TS)
+        rig.web.chat_delete.reset_mock()
+        rig.web.chat_postEphemeral.assert_called_once_with(
+            channel=CHANNEL, user=SENDER, thread_ts="1700.0001", text=REFUSED_TEXT,
         )
-        rig.web.chat_update.reset_mock()
+        rig.web.chat_postEphemeral.reset_mock()
     else:
         rig.web.chat_postEphemeral.assert_called_once_with(
             channel=CHANNEL, user=SENDER, thread_ts="1700.0001", text=UNAVAILABLE_TEXT,
@@ -301,8 +303,9 @@ def test_selected_refused_or_unavailable_mention_tells_only_the_sender_in_a_chan
 ) -> None:
     """@spec HTTP-INVOCATION-EXECUTION-19/27: one fixed notice per outcome class, no reason.
 
-    A refusal replaces this attempt's placeholder; unavailable keeps it and tells the
-    sender privately.
+    A refusal deletes this attempt's placeholder; unavailable keeps it. Either
+    way only the sender sees the notice, so the channel never learns who was
+    refused.
     """
     api()
     rig = HttpRig(_answering(status))
@@ -311,15 +314,14 @@ def test_selected_refused_or_unavailable_mention_tells_only_the_sender_in_a_chan
     web.chat_postMessage.assert_called_once_with(
         channel=CHANNEL, thread_ts="1700.0001", text=config.placeholder_text,
     )
+    web.chat_postEphemeral.assert_called_once_with(
+        channel=CHANNEL, user=SENDER, thread_ts="1700.0001", text=text,
+    )
+    web.chat_update.assert_not_called()
     if text == REFUSED_TEXT:
-        web.chat_update.assert_called_once_with(channel=CHANNEL, ts=PLACEHOLDER_TS, text=text)
-        web.chat_postEphemeral.assert_not_called()
+        web.chat_delete.assert_called_once_with(channel=CHANNEL, ts=PLACEHOLDER_TS)
     else:
-        web.chat_postEphemeral.assert_called_once_with(
-            channel=CHANNEL, user=SENDER, thread_ts="1700.0001", text=text,
-        )
-        web.chat_update.assert_not_called()
-    web.chat_delete.assert_not_called()
+        web.chat_delete.assert_not_called()
     for posted in _posted_texts(web):
         assert not any(leak in posted.lower() for leak in _LEAKS), posted
     rig.closed()
@@ -345,21 +347,21 @@ def test_selected_mention_whose_api_is_unreachable_gets_the_retry_notice(
     web.chat_update.assert_not_called()
 
 
+@pytest.mark.parametrize(("status", "text"), [(403, REFUSED_TEXT), (503, UNAVAILABLE_TEXT)])
 def test_selected_top_level_mention_notice_is_not_threaded(
-    config: DispatcherConfig, redis_client: redis.Redis
+    config: DispatcherConfig, redis_client: redis.Redis, status: int, text: str
 ) -> None:
     """@spec HTTP-INVOCATION-EXECUTION-19/27: a channel-level mention gets a channel ephemeral."""
     api()
-    rig = HttpRig(_answering(503))
+    rig = HttpRig(_answering(status))
     body, event = native()
     event.pop("thread_ts")
     web = _deliver_selected(config, redis_client, rig, body)
     web.chat_postMessage.assert_called_once_with(
         channel=CHANNEL, thread_ts="1700.0002", text=config.placeholder_text,
     )
-    web.chat_postEphemeral.assert_called_once_with(
-        channel=CHANNEL, user=SENDER, text=UNAVAILABLE_TEXT,
-    )
+    web.chat_postEphemeral.assert_called_once_with(channel=CHANNEL, user=SENDER, text=text)
+    web.chat_update.assert_not_called()
 
 
 @pytest.mark.parametrize(("status", "text"), [(403, REFUSED_TEXT), (503, UNAVAILABLE_TEXT)])
@@ -442,15 +444,16 @@ def test_selected_repeated_refused_delivery_posts_one_notice(
         config, redis_client, rig, first, again, placeholders=(PLACEHOLDER_TS, "556.000"),
     )
     assert len(rig.requests) == 2
-    # Bolt's listener pool may run the two deliveries in either order: whichever
-    # is first turns its placeholder into the notice, the other is deleted.
-    web.chat_update.assert_called_once()
-    web.chat_delete.assert_called_once()
-    updated, deleted = web.chat_update.call_args.kwargs, web.chat_delete.call_args.kwargs
-    assert updated["channel"] == deleted["channel"] == CHANNEL
-    assert updated["text"] == REFUSED_TEXT
-    assert {updated["ts"], deleted["ts"]} == {PLACEHOLDER_TS, "556.000"}
-    web.chat_postEphemeral.assert_not_called()
+    # Bolt's listener pool may run the two deliveries in either order: both
+    # placeholders are deleted and only the first tells the sender, privately.
+    assert sorted(
+        (deleted.kwargs["channel"], deleted.kwargs["ts"])
+        for deleted in web.chat_delete.call_args_list
+    ) == [(CHANNEL, PLACEHOLDER_TS), (CHANNEL, "556.000")]
+    web.chat_postEphemeral.assert_called_once_with(
+        channel=CHANNEL, user=SENDER, thread_ts="1700.0001", text=REFUSED_TEXT,
+    )
+    web.chat_update.assert_not_called()
 
 
 def test_selected_pending_or_accepted_mention_posts_no_notice(
@@ -520,19 +523,28 @@ def test_selected_failed_placeholder_submits_an_empty_slot(
     rig.web.chat_delete.assert_not_called()
 
 
-@pytest.mark.parametrize("failing", ["chat_update", "chat_postEphemeral", "chat_delete"])
+@pytest.mark.parametrize(
+    ("failing", "answer"),
+    [("chat_postEphemeral", "unavailable"), ("chat_delete", "duplicate"),
+     ("chat_delete", "refused")],
+)
 def test_selected_failed_notice_is_logged_by_class_and_never_raises(
     config: DispatcherConfig,
     redis_client: redis.Redis,
     caplog: pytest.LogCaptureFixture,
     failing: str,
+    answer: str,
 ) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-19/27: a lost notice or deletion changes no outcome."""
+    """@spec HTTP-INVOCATION-EXECUTION-19/27: a lost notice or deletion changes no outcome.
+
+    A refused mention whose placeholder survives a failed delete still tells
+    only the sender: the notice never becomes public.
+    """
     api()
-    if failing == "chat_delete":
+    if answer == "duplicate":
         rig = HttpRig(_duplicate_of("554.000"))
     else:
-        rig = HttpRig(_answering(403 if failing == "chat_update" else 503))
+        rig = HttpRig(_answering(403 if answer == "refused" else 503))
     body, _event = native()
     app, _legacy = _selected(config, redis_client, rig)
     getattr(rig.web, failing).side_effect = RuntimeError("synthetic " + SENDER + " failure")
@@ -552,6 +564,14 @@ def test_selected_failed_notice_is_logged_by_class_and_never_raises(
             _finish_owned_listeners(app)
     assert errors == [] and sock.acked_envelope_ids == ["env-fail"]
     getattr(rig.web, failing).assert_called_once()
+    if answer == "refused":
+        rig.web.chat_postEphemeral.assert_called_once_with(
+            channel=CHANNEL, user=SENDER, thread_ts="1700.0001", text=REFUSED_TEXT,
+        )
+        rig.web.chat_update.assert_not_called()
+        assert [
+            sent.kwargs["text"] for sent in rig.web.chat_postMessage.call_args_list
+        ] == [config.placeholder_text]
     assert "RuntimeError" in caplog.text
     assert "synthetic " + SENDER + " failure" not in caplog.text
 
