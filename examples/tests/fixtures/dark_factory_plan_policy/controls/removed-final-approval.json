@@ -8,8 +8,8 @@
   ],
   "deletions": [
     {
-      "find": "Every run walks nine phases, named in each step heading below: `read_issue`,\n`pin_criteria`, `plan` (which starts by exploring the repository),\n`plan_review`, `failing_test`, `implement` (which also runs the checks),\n`review_diff`, `publish` and `wait_ci`. The plan gets exactly one review,\n`plan_review` round 1. Two pairs loop: `implement` and `review_diff`, then\n`wait_ci` back to `implement` when the pull request's checks fail. Each of\nthose loops runs at most 3 rounds.",
-      "replace": "Every run walks eight phases, named in each step heading below: `read_issue`,\n`pin_criteria`, `plan` (which starts by exploring the repository),\n`plan_review`, `failing_test`, `implement` (which also runs the checks),\n`publish` and `wait_ci`. The plan gets exactly one review,\n`plan_review` round 1. One pair loops: `wait_ci` back to `implement` when the\npull request's checks fail. That loop runs at most 3 rounds."
+      "find": "Every run walks nine phases, named in each step heading below: `read_issue`,\n`pin_criteria`, `plan` (which starts by exploring the repository),\n`plan_review`, `failing_test`, `implement` (which also runs the checks),\n`review_diff`, `publish` and `wait_ci`. The plan review is one advisory\nround: `plan` and `plan_review` run once. Two pairs loop: `implement` and\n`review_diff`, at most 5 completed rounds, then `wait_ci` back to `implement`\nwhen the pull request's checks fail, at most 3 rounds.",
+      "replace": "Every run walks eight phases, named in each step heading below: `read_issue`,\n`pin_criteria`, `plan` (which starts by exploring the repository),\n`plan_review`, `failing_test`, `implement` (which also runs the checks),\n`publish` and `wait_ci`. The plan review is one advisory round: `plan` and\n`plan_review` run once. One pair loops: `wait_ci` back to `implement` when\nthe pull request's checks fail, at most 3 rounds."
     },
     {
       "find": "`round` for `plan`, `plan_review`, `implement` and\n`review_diff`, and an optional",
@@ -36,20 +36,20 @@
       "replace": "to every plan review call."
     },
     {
-      "find": "give each finding with its resolution to the diff\n  reviewer in step 7.",
-      "replace": "give each finding with its resolution in the pull\n  request body in step 8."
+      "find": "   resolve each one before the diff review in step 7. Keep findings verbatim\n   and include each finding and its resolution in the diff review prompt.",
+      "replace": "   resolve each one before publication in step 8. Keep findings verbatim\n   and include each finding and its resolution in the pull request body."
     },
     {
-      "find": "On round 2 or 3,\nfix every finding from the previous diff review.",
-      "replace": "On round 2 or 3,\nfix what the failing checks show."
+      "find": "On round 1 after a\nplan review `VERDICT: CHANGES`, resolve every plan review finding. From round\n2 on, fix every finding from the previous diff review.",
+      "replace": "On round 1 after a\nplan review `VERDICT: CHANGES`, resolve every plan review finding. From round\n2 on, fix what the failing checks show."
     },
     {
       "find": "a mock presented as real, or a fixed result.\n",
       "replace": "a mock presented as real, or a fixed result. When the checks are done, go to\nstep 8.\n"
     },
     {
-      "find": "The diff loop and the `wait_ci` loop each run at most 3 rounds. The plan\nreview is a single pass and never repeats. A diff review rejection returns to\nstep 6 (implement), never to the plan. When the diff reviewer still answers\n`VERDICT: CHANGES` on round 3, or a review fails, do not publish:",
-      "replace": "The `wait_ci` loop runs at most 3 rounds. The plan review is a single pass\nand never repeats. When the checks still fail on `wait_ci` round 3, or a\nreview fails, do not publish:"
+      "find": "The plan review runs once, the diff review loop at most 5 completed rounds,\nand the `wait_ci` loop at most 3 rounds. A diff review rejection returns to\nstep 6 (implement), never to the plan. When the diff reviewer still answers\n`VERDICT: CHANGES` on round 5, a review stays unavailable, or the hook stops\nthe run, do not publish:",
+      "replace": "The plan review runs once and the `wait_ci` loop at most 3 rounds. When the\nchecks still fail on `wait_ci` round 3, a review stays unavailable, or the\nhook stops the run, do not publish:"
     },
     {
       "find": ", every available product check passes, and the\ndiff reviewer's latest verdict is `VERDICT: APPROVE`.",
@@ -66,6 +66,14 @@
     {
       "find": "Then run step 7 (`review_diff`) again and\npublish per step 8;",
       "replace": "Then publish per step 8;"
+    },
+    {
+      "find": "The review gate enforces these limits from the same values. It refuses a plan\nreview, and opening a new implementation round, at or after\n`execution_deadline - S/6`. It refuses edits, Bash and the diff review at or\nafter `execution_deadline - S/12`. Publication is still allowed until\n`execution_deadline` when the diff reviewer's approval matches the current\ncheckout. The hook caps every Bash timeout to the time left before\n`execution_deadline - S/12`. When the hook says the execution timing is\nunknown, call `mcp__curie__get_issue` again.",
+      "replace": "The review gate enforces these limits from the same values. It refuses a plan\nreview, and opening a new implementation round, at or after\n`execution_deadline - S/6`. It refuses edits and Bash at or after\n`execution_deadline - S/12`. Publication is still allowed until\n`execution_deadline`. The hook caps every Bash timeout to the time left\nbefore `execution_deadline - S/12`. When the hook says the execution timing\nis unknown, call `mcp__curie__get_issue` again."
+    },
+    {
+      "find": "A `wait_ci` round opens a new diff review loop of at most\n5 rounds. ",
+      "replace": ""
     }
   ]
 }
