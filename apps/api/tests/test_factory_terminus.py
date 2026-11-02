@@ -386,6 +386,110 @@ def test_capacity_wait_expiry_posts_one_comment(admitted: Any) -> None:
     assert len(_notices(row["id"])) == 1
 
 
+@pytest.mark.parametrize("capacity_first", [False, True])
+def test_admission_unavailable_deferral_preserves_deadline_and_neutral_surfaces(
+    admitted: Any,
+    capacity_first: bool,
+) -> None:
+    client, github, sink = admitted
+    number = 5296
+    _label(client, github, number)
+    row = _request(number)
+    request_id = row["id"]
+    original = _rows(
+        "SELECT wait_deadline FROM curie.execution_requests WHERE id=:id",
+        {"id": request_id},
+    )[0]["wait_deadline"]
+
+    deferrals = ([("capacity", True)] if capacity_first else []) + [
+        ("admission_unavailable", False),
+        ("admission_unavailable", False),
+    ]
+    for generation, (reason, capacity) in enumerate(deferrals, start=1):
+
+        async def acquire_waiting(current_generation: int) -> Any:
+            async with client.app.state.sessionmaker() as session:
+                return await acquire(
+                    session,
+                    request_id,
+                    owner="factory-owner",
+                    generation=current_generation,
+                    wake=await factory_wake(session, request_id),
+                    context=None,
+                    client=client.app.state.http_client,
+                )
+
+        acquired = client.portal.call(acquire_waiting, generation)
+        assert not isinstance(acquired, DispatchConflict), acquired
+        response = client.post(
+            f"/v1/internal/work-items/requests/{request_id}/defer",
+            headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
+            json={
+                "owner": "factory-owner",
+                "generation": generation,
+                "reason": reason,
+                "capacity": capacity,
+                "start_failure_detail": None,
+            },
+        )
+        assert response.status_code == 200, response.text
+        persisted = _rows(
+            "SELECT status, wait_deadline, capacity_deferrals, start_deferrals, "
+            "execution_attempts, last_deferral_reason FROM curie.execution_requests WHERE id=:id",
+            {"id": request_id},
+        )[0]
+        assert persisted["status"] == "waiting"
+        assert persisted["wait_deadline"] == original
+        assert persisted["capacity_deferrals"] == int(capacity_first)
+        assert persisted["start_deferrals"] == 0
+        assert persisted["execution_attempts"] == 0
+        assert persisted["last_deferral_reason"] == reason
+        view = client.get(
+            f"/work-items/{row['work_item_id']}",
+            headers={"X-API-Key": get_settings().api_key},
+        )
+        assert view.status_code == 200, view.text
+        assert view.json()["state"] == "waiting"
+        if capacity:
+            assert "waiting for sandbox capacity" in view.json()["actionable_cause"]
+        else:
+            assert "admission observations" in view.json()["actionable_cause"]
+            assert "capacity" not in view.json()["actionable_cause"]
+
+    _reconcile_later(31)
+    expired = _request(number)
+    assert expired["status"] == "expired"
+    assert expired["terminal_cause"] == "capacity_wait_expired"
+    final_row = _rows(
+        "SELECT wait_deadline, capacity_deferrals FROM curie.execution_requests WHERE id=:id",
+        {"id": request_id},
+    )[0]
+    assert final_row["wait_deadline"] == original
+    assert final_row["capacity_deferrals"] == int(capacity_first)
+    notices = _notices(request_id)
+    assert len(notices) == 1
+    assert notices[0]["posted_at"] is not None
+    body = sink.comments[0]["body"]
+    neutral = "sandbox admission did not complete before the wait expired."
+    assert body.startswith(f"Could not complete: {neutral}")
+    assert "Cause: capacity_wait_expired" in body
+    assert "no runner capacity" not in body
+    assert "no sandbox capacity" not in body
+    view = client.get(
+        f"/work-items/{row['work_item_id']}",
+        headers={"X-API-Key": get_settings().api_key},
+    )
+    assert view.status_code == 200, view.text
+    assert "sandbox admission did not complete" in view.json()["actionable_cause"]
+    card = client.get(f"/v1/factory/cards/{notices[0]['card_token']}.svg")
+    assert card.status_code == 200, card.text
+    assert neutral in card.text
+    assert "no runner capacity" not in card.text
+    assert "no sandbox capacity" not in card.text
+    _reconcile()
+    assert sink.posts == 1
+
+
 def test_label_removal_posts_one_comment(admitted: Any) -> None:
     client, github, sink = admitted
     number = 9202

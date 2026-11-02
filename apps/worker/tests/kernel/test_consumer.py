@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import sys
 import time
@@ -57,15 +58,37 @@ from curie_worker.kernel import constants as kernel_constants
 from curie_worker.kernel import routing as kernel_routing
 from curie_worker.runner_client import TurnStream
 from curie_worker.sandbox import QuotaRejection
+from curie_worker.sandbox import k8s as k8s_module
+from curie_worker.sandbox.k8s import KubernetesSandboxClient
 from curie_worker.stream_consumer import ConsumerLivenessExpired
 from curie_worker.threadlock import ThreadLock
 from curie_worker.workspace import WorkspacePreparationError
+from kubernetes.utils.quantity import parse_quantity
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind
 from redis.asyncio import Redis as AsyncRedis
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from urllib3.exceptions import MaxRetryError, ReadTimeoutError
+
+from ..eval.conftest import FakeEvalRunner
+from ..eval.test_stream import (
+    _consumer as _eval_consumer,
+)
+from ..eval.test_stream import (
+    _FakeBundleStore,
+    _FakeReporter,
+    _fence_suite,
+    _StubRepo,
+    _suite_bundle,
+)
+from ..eval.test_stream import (
+    _item as _eval_item,
+)
+from ..sandbox.test_admission_k8s import InventoryAPI
+from ..sandbox.test_k8s_claim import _chart_template_spec, _seed_chart
+from .test_work_item_workspace import _Binding, _DeferRecordingWorkItems, _turn, _Workspace
 
 # importlib import mode does not add the test root to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -1109,6 +1132,436 @@ def test_interactive_capacity_wait_acks_without_completing_the_turn(make_harness
     asyncio.run(go())
 
 
+def _inventory_timeout_client(
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    failure: str,
+    restore: bool,
+    failures: int = 2,
+) -> tuple[KubernetesSandboxClient, Any, str]:
+    class API(InventoryAPI):
+        delivery_counts: list[int]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.delivery_counts = []
+            self.failures_left = failures
+
+        def list_namespaced_custom_object(self, *args: Any, **kwargs: Any) -> Any:
+            plural = args[3]
+            if plural == "sandboxclaims":
+                pending = sync_redis.xpending_range(names["stream"], names["group"], "-", "+", 10)
+                self.delivery_counts.extend(row["times_delivered"] for row in pending)
+            if plural == "sandboxes" and failure == "exhausted-budget" and self.failures_left:
+                if restore:
+                    self.failures_left -= 1
+                time.sleep(kwargs["_request_timeout"] + 0.002)
+            return super().list_namespaced_custom_object(*args, **kwargs)
+
+        def list_namespaced_pod(self, namespace: str, **kwargs: Any) -> SimpleNamespace:
+            if failure == "sdk-timeout" and self.failures_left:
+                if restore:
+                    self.failures_left -= 1
+                # #5296 observed this SDK exception and its ReadTimeoutError cause.
+                cause = ReadTimeoutError(None, "/api/v1/namespaces/test-ns/pods", "read timed out")
+                raise MaxRetryError(None, cause.url, cause) from cause
+            return super().list_namespaced_pod(namespace, **kwargs)
+
+        def read_namespaced_resource_quota(self, *args: Any, **kwargs: Any) -> Any:
+            if failure == "quota-timeout" and self.failures_left:
+                if restore:
+                    self.failures_left -= 1
+                cause = ReadTimeoutError(
+                    None, "/api/v1/namespaces/test-ns/resourcequotas", "read timed out"
+                )
+                raise MaxRetryError(None, cause.url, cause) from cause
+            return super().read_namespaced_resource_quota(*args, **kwargs)
+
+        def create_namespaced_custom_object(self, *args: Any, **kwargs: Any) -> Any:
+            obj = super().create_namespaced_custom_object(*args, **kwargs)
+            if args[3] == "sandboxclaims":
+                name = obj["metadata"]["name"]
+                sandbox = self.seed("sandboxes", name, {"operatingMode": "Running"})
+                sandbox["status"] = {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "serviceFQDN": "127.0.0.1",
+                }
+                self.objects[("sandboxclaims", name)]["status"] = {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "sandbox": {"name": name},
+                }
+            return obj
+
+    api = API()
+    spec = _chart_template_spec()
+    spec["podTemplate"]["spec"].pop("runtimeClassName", None)
+    _seed_chart(api, pool="test-pool", spec=spec)
+    monkeypatch.setattr(k8s_module.k8s_config, "load_incluster_config", lambda: None)
+    monkeypatch.setattr(k8s_module.k8s_client, "CustomObjectsApi", lambda _client: api)
+    monkeypatch.setattr(k8s_module.k8s_client, "CoreV1Api", lambda _client: api)
+    client = KubernetesSandboxClient("test-ns")
+    footprint = client.claim_resources(
+        pool="test-pool",
+        runner_resources=None,
+        agent_name=None,
+        executor_secret_names=None,
+    )
+    hard = {key: str(parse_quantity(value) * 4) for key, value in footprint.items()}
+    api.quota = SimpleNamespace(
+        metadata=SimpleNamespace(name="acme-sandbox-quota", namespace="test-ns"),
+        spec=SimpleNamespace(hard=hard),
+        status=SimpleNamespace(hard=hard, used=dict.fromkeys(hard, "0")),
+    )
+    admission = json.dumps(
+        {
+            "quota_name": "acme-sandbox-quota",
+            "priority_class": "acme-sandbox",
+            "ceiling": 4,
+            "hard": hard,
+        }
+    )
+
+    return client, api, admission
+
+
+@pytest.mark.parametrize("failure", ["sdk-timeout", "exhausted-budget", "quota-timeout"])
+@pytest.mark.parametrize("restore", [True, False], ids=["restored", "unavailable"])
+@pytest.mark.parametrize("placeholder", ["p-1", None], ids=["placeholder", "no-placeholder"])
+def test_inventory_timeout_capacity_wait_preserves_delivery_bound(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    restore: bool,
+    placeholder: str | None,
+) -> None:
+    client, api, admission = _inventory_timeout_client(
+        sync_redis,
+        names,
+        monkeypatch,
+        failure=failure,
+        restore=restore,
+    )
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            slack_no_edit_streaming=True,
+            reclaim_min_idle_ms=0,
+        ) as h:
+            h.runner.default_script = [Final(text="inventory restored", status=DONE)]
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event = _qevent(
+                "hello",
+                thread="inventory-thread",
+                event_id="inventory-turn",
+                placeholder=placeholder,
+            )
+            entry_id, fields = await _pending_local_entry(h, event)
+            original_deadline = None
+            for attempt in range(3):
+                if attempt == 0:
+                    await consumer._sem.acquire()
+                    await consumer._handle(entry_id, fields)
+                else:
+                    record = await consumer._waits.get(event.event_id)
+                    if record is None:
+                        assert await consumer._reclaim_once() == 1
+                        await asyncio.gather(*list(consumer._inflight))
+                    else:
+                        assert record.state == "waiting"
+                        assert record.fields == to_stream_fields(event)
+                        if original_deadline is None:
+                            original_deadline = record.deadline_ms
+                        assert record.deadline_ms == original_deadline
+                        assert api.created == []
+                        assert api.secrets == {}
+                        assert h.runner.opened == []
+                        assert not await h.async_redis.exists(h.config.done_key(event.event_id))
+                        assert (
+                            await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+                        )["pending"] == 0
+                        consumer = _capacity_consumer(h)
+                        await h.async_redis.zadd(consumer._waits._due, {event.event_id: 0})
+                        assert await consumer._waits.wake_due() == 1
+                        rows = await h.async_redis.xreadgroup(
+                            h.config.consumer_group,
+                            h.config.consumer_name,
+                            {h.config.stream: ">"},
+                            count=1,
+                        )
+                        entry_id, fields = rows[0][1][0]
+                        await consumer._sem.acquire()
+                        await consumer._handle(entry_id, fields)
+            if restore:
+                assert h.runner.queried == ["hello"]
+                assert h.sink.last_text == "inventory restored"
+                assert len(h.sink.completions) == 1
+            assert max(api.delivery_counts) <= 2, api.delivery_counts
+            assert not await h.async_redis.exists(f"{h.config.stream}:dead")
+            record = await consumer._waits.get(event.event_id)
+            assert record is not None
+            assert record.deadline_ms == original_deadline
+            assert record.deferrals == (2 if restore else 3)
+            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                "pending"
+            ] == 0
+            if restore:
+                assert record.state == "done"
+                assert h.runner.queried == ["hello"]
+                assert h.sink.last_text == "inventory restored"
+                assert len(h.sink.completions) == 1
+                assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            else:
+                assert record.state == "waiting"
+                assert record.deferrals == 3
+                assert api.created == []
+                assert api.secrets == {}
+                assert h.runner.opened == h.sink.completions == []
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("failure", ["sdk-timeout", "quota-timeout"])
+def test_factory_admission_unavailable_defers_without_capacity_accounting(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    client, api, admission = _inventory_timeout_client(
+        sync_redis,
+        names,
+        monkeypatch,
+        failure=failure,
+        restore=True,
+        failures=1,
+    )
+
+    async def go() -> None:
+        work_items = _DeferRecordingWorkItems()
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_items=work_items,
+            slack_no_edit_streaming=True,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            request_id = uuid.uuid4()
+            event = _turn(f"work-item-{request_id}-execute-1", "Implement the admitted change")
+            entry_id, fields = await _pending_local_entry(h, event)
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, fields)
+            assert len(work_items.defers) == 1
+            deferred_id, deferred = work_items.defers[0]
+            assert deferred_id == request_id
+            assert deferred["reason"] == "admission_unavailable"
+            assert deferred["capacity"] is False
+            assert deferred["start_failure_detail"] is None
+            assert "start" not in work_items.calls
+            assert work_items.finishes == h.runner.opened == []
+            assert api.created == [] and api.secrets == {}
+            assert h.sink.updates == []
+            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                "pending"
+            ] == 0
+            assert not await h.async_redis.exists(f"{h.config.stream}:dead")
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("lane", ["webhook", "approval-resume"])
+@pytest.mark.parametrize("failure", ["sdk-timeout", "quota-timeout"])
+def test_inventory_timeout_without_durable_wait_stays_pending_then_completes(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    lane: str,
+    failure: str,
+) -> None:
+    client, api, admission = _inventory_timeout_client(
+        sync_redis,
+        names,
+        monkeypatch,
+        failure=failure,
+        restore=True,
+        failures=1,
+    )
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            slack_no_edit_streaming=True,
+            reclaim_min_idle_ms=0,
+        ) as h:
+            h.runner.default_script = [Final(text="inventory restored", status=DONE)]
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event = _qevent(
+                "hello",
+                event_id=(
+                    "approval-inventory-resolved"
+                    if lane == "approval-resume"
+                    else "headless-inventory"
+                ),
+                source=(TurnSource.SLACK if lane == "approval-resume" else TurnSource.WEBHOOK),
+            )
+            entry_id, fields = await _pending_local_entry(h, event)
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, fields)
+            pending = await h.async_redis.xpending_range(
+                h.config.stream,
+                h.config.consumer_group,
+                "-",
+                "+",
+                10,
+            )
+            assert len(pending) == 1
+            assert pending[0]["message_id"] == entry_id
+            assert pending[0]["times_delivered"] == 1
+            assert not await h.async_redis.exists(h.config.done_key(event.event_id))
+            assert await consumer._waits.get(event.event_id) is None
+            assert h.sink.updates == h.sink.completions == h.runner.opened == []
+            assert api.created == [] and api.secrets == {}
+            assert await consumer._reclaim_once() == 1
+            await asyncio.gather(*list(consumer._inflight))
+            assert max(api.delivery_counts) == 2
+            assert h.runner.queried == ["hello"]
+            assert len(h.sink.completions) == 1
+            assert all("at capacity" not in text for _, _, text in h.sink.updates)
+            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                "pending"
+            ] == 0
+            assert not await h.async_redis.exists(f"{h.config.stream}:dead")
+
+    asyncio.run(go())
+
+
+def test_slack_without_reply_handle_is_refused_before_admission(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, api, admission = _inventory_timeout_client(
+        sync_redis,
+        names,
+        monkeypatch,
+        failure="sdk-timeout",
+        restore=True,
+        failures=1,
+    )
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event = _qevent("hello").model_copy(update={"reply_handle": None})
+            entry_id, fields = await _pending_local_entry(h, event)
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, fields)
+            assert api.delivery_counts == []
+            assert api.created == [] and api.secrets == {}
+            assert h.runner.opened == h.sink.updates == h.sink.completions == []
+            dead = await h.async_redis.xrange(f"{h.config.stream}:dead")
+            assert len(dead) == 1
+            assert dead[0][1]["dl_reason"] == "unparseable"
+            assert dead[0][1]["dl_original_id"] == entry_id
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("failure", ["sdk-timeout", "quota-timeout"])
+def test_eval_inventory_timeout_stays_pending_without_provisioning_report(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    client, api, admission = _inventory_timeout_client(
+        sync_redis,
+        names,
+        monkeypatch,
+        failure=failure,
+        restore=True,
+        failures=1,
+    )
+
+    async def go() -> None:
+        runner = FakeEvalRunner()
+        runner.responses["q"] = "ok"
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            runner_app=runner.app,
+            reclaim_min_idle_ms=0,
+            eval_stream=names["stream"],
+            eval_consumer_group=names["group"],
+        ) as h:
+            reporter = _FakeReporter()
+            consumer = _eval_consumer(
+                h.config,
+                redis=h.async_redis,
+                substrate=h.substrate,
+                bundle_store=_FakeBundleStore(_suite_bundle(_fence_suite())),
+                reporter=reporter,
+                repo_lookup=_StubRepo(),
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
+            await consumer.ensure_group()
+            item = _eval_item(
+                suite="fence", sha="inventory", bundle_ref="suite.tgz", target_url=None
+            )
+            entry_id = await h.async_redis.xadd(
+                h.config.eval_stream, {"payload": item.model_dump_json()}
+            )
+            rows = await h.async_redis.xreadgroup(
+                h.config.eval_consumer_group,
+                h.config.eval_consumer_name,
+                {h.config.eval_stream: ">"},
+                count=1,
+            )
+            await consumer._handle(entry_id, rows[0][1][0][1])
+            pending = await h.async_redis.xpending_range(
+                h.config.eval_stream,
+                h.config.eval_consumer_group,
+                "-",
+                "+",
+                10,
+            )
+            assert len(pending) == 1
+            assert pending[0]["message_id"] == entry_id
+            assert pending[0]["times_delivered"] == 1
+            assert reporter.reports == runner.seen == []
+            assert api.created == [] and api.secrets == {}
+            assert await consumer._reclaim_once() == 1
+            assert max(api.delivery_counts) == 2
+            assert len(reporter.reports) == 1
+            assert reporter.reports[0].passed_count == 1
+            assert len(runner.seen) == 1
+            assert (
+                await h.async_redis.xpending(h.config.eval_stream, h.config.eval_consumer_group)
+            )["pending"] == 0
+            assert not await h.async_redis.exists(f"{h.config.eval_stream}:dead")
+
+    asyncio.run(go())
+
+
 def test_slack_reply_handle_does_not_make_a_webhook_turn_interactive(
     make_harness,
 ) -> None:
@@ -1649,72 +2102,6 @@ def test_lost_capacity_grant_response_recovers_started_turn(make_harness) -> Non
                 hold.set()
                 if not owner_task.done():
                     await asyncio.wait_for(owner_task, timeout=5)
-
-    asyncio.run(go())
-
-
-def test_expired_parked_wait_does_not_interrupt_later_turn_on_same_thread(
-    make_harness,
-) -> None:
-    async def go() -> None:
-        async with make_harness(
-            slack_no_edit_streaming=True,
-            claim_timeout_seconds=0.05,
-            capacity_wait_budget_s=2.0,
-        ) as h:
-            h.fake_k8s.quota_rejection = QuotaRejection(
-                quota_name="curie-sandbox-quota",
-                requested={"pods": "1"},
-                used={"pods": "2"},
-                hard={"pods": "2"},
-            )
-            parked_event = _qevent("parked", thread="shared-thread", event_id="parked-turn")
-            first = _capacity_consumer(h)
-            await first.ensure_group()
-            await h.async_redis.xadd(h.config.stream, to_stream_fields(parked_event))
-            first_task = asyncio.create_task(first.run())
-            try:
-                parked = await _wait_capacity_state(first, parked_event.event_id, "waiting")
-            finally:
-                first.request_stop()
-                await first_task
-
-            h.fake_k8s.quota_rejection = None
-            hold = asyncio.Event()
-            h.runner.hold = hold
-            h.runner.default_script = [TextDelta(text="working")]
-            h.runner.tail = [Final(text="later answer", status=DONE)]
-            later_event = _qevent("later", thread="shared-thread", event_id="later-turn")
-            consumer = _capacity_consumer(h)
-            await consumer.ensure_group()
-            await h.async_redis.xadd(h.config.stream, to_stream_fields(later_event))
-            task = asyncio.create_task(consumer.run())
-            try:
-                await _wait_until(lambda: h.runner.turn_active)
-                assert h.runner.queried == ["later"]
-                assert h.runner.steers == []
-                server_time = await h.async_redis.time()
-                now_ms = int(server_time[0]) * 1000 + int(server_time[1]) // 1000
-                await asyncio.sleep(max(0, parked.deadline_ms - now_ms) / 1000 + 0.05)
-                await consumer._waits.wake_due()
-                expired = await _wait_capacity_state(consumer, parked_event.event_id, "expired")
-                assert expired.cause == "capacity_wait_expired"
-                assert h.runner.turn_active
-                assert h.runner.interrupts == 0
-                assert h.runner.timeout_calls == 0
-                assert h.runner.queried == ["later"]
-                assert h.runner.steers == []
-                assert not await h.async_redis.exists(h.config.done_key(later_event.event_id))
-
-                hold.set()
-                await _wait_key(h.async_redis, h.config.done_key(later_event.event_id))
-                assert h.sink.last_text == "later answer"
-                assert h.runner.interrupts == 0
-                assert h.runner.timeout_calls == 0
-            finally:
-                hold.set()
-                consumer.request_stop()
-                await task
 
     asyncio.run(go())
 

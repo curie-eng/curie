@@ -998,7 +998,8 @@ def test_elapsed_and_expired_capacity_wait_name_the_previous_start_failure(
     expired = _detail(stack, auth_headers, seeded.work_item_id)
     assert expired["state"] == "expired"
     assert expired["actionable_cause"] == (
-        "expired: capacity_wait_expired, no sandbox capacity before the waiting deadline"
+        "expired: capacity_wait_expired, sandbox admission did not complete before the "
+        "waiting deadline"
         + PREVIOUS_START_FAILURE
     )
     assert expired["requests"][-1]["last_start_failure_detail"] == START_FAILURE_DETAIL
@@ -1521,6 +1522,62 @@ def test_queued_revision_promotion_reads_the_stored_reply_target(
         assert (outcome.request.status, outcome.request.terminal_cause) == (status, cause)
 
     with_session(promote)
+
+
+
+def test_expired_admission_wait_does_not_claim_observed_capacity_exhaustion() -> None:
+    now = datetime.now(UTC)
+    work_item_id = uuid.uuid4()
+    item = WorkItem(
+        id=work_item_id,
+        agent_id=uuid.uuid4(),
+        tracker_kind="github",
+        tracker_host="github.com",
+        tracker_scope_id="101",
+        tracker_issue_id="5296",
+        code_host_kind="github",
+        code_host_host="github.com",
+        repository_project_id="101",
+        repository_path=REPO,
+        cancelled_at=None,
+        created_at=now,
+        updated_at=now,
+    )
+    request = ExecutionRequest(
+        id=uuid.uuid4(),
+        work_item_id=work_item_id,
+        sequence=1,
+        status="expired",
+        wait_deadline=now,
+        started_at=None,
+        execution_deadline=None,
+        terminal_at=now,
+        terminal_cause="capacity_wait_expired",
+        termination_observation=None,
+        created_at=now,
+        capacity_deferrals=1,
+        last_deferral_reason="capacity",
+        last_start_failure_detail=None,
+        objective=OBJECTIVE,
+        requester=REQUESTER,
+    )
+    outcome = derive_outcome(
+        item,
+        [request],
+        lineage=None,
+        publication=None,
+        approval=None,
+        pending_turn_approval=False,
+        now=now,
+        issue_url="https://github.com/curie-eng/curie/issues/5296",
+    )
+    assert outcome.state == "expired"
+    assert outcome.requests[0].terminal_cause == "capacity_wait_expired"
+    assert outcome.actionable_cause == (
+        "expired: capacity_wait_expired, sandbox admission did not complete before the "
+        "waiting deadline"
+    )
+    assert "no sandbox capacity" not in outcome.actionable_cause
 
 
 def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:

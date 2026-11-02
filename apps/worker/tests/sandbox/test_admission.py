@@ -19,7 +19,7 @@ from curie_worker.sandbox import (
     SandboxHandle,
     SandboxSubstrate,
 )
-from curie_worker.sandbox.types import SandboxError, ToolDaemonMount
+from curie_worker.sandbox.types import AdmissionUnavailableError, SandboxError, ToolDaemonMount
 
 from .conftest import FakeSandboxClient
 from .test_tool_daemon import BASE, BASE_POOL, REPO, _entry
@@ -402,7 +402,7 @@ def test_unreadable_capacity_fails_closed_before_credentials(
     substrate = make_substrate(client, affinity, key_prefix)
     minted: list[object] = []
     substrate.set_boot_credential_minter(lambda env: minted.append(env) or dict(env))
-    with pytest.raises(TimeoutError, match="capacity read unavailable"):
+    with pytest.raises(AdmissionUnavailableError, match="admission inventory unavailable"):
         substrate.claim("unreadable", env={})
     assert client.created == minted == []
     setattr(client, f"{failure}_error", None)

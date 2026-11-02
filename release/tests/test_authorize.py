@@ -39,6 +39,8 @@ def load_module():
 
 authorize_module = load_module()
 
+SCHEMA_WINDOWS_PATH = authorize_module._atlas.SCHEMA_WINDOWS_PATH
+
 
 def run_git(repo: Path, *args: str) -> str:
     result = subprocess.run(
@@ -1723,10 +1725,10 @@ class TestSchemaWindowRegistration:
     @staticmethod
     def _base(git_repo: Path, catalog: dict | None = None) -> str:
         """Commit the catalog as the green ancestor's state and return its sha."""
-        path = git_repo / authorize_module.SCHEMA_WINDOWS_PATH
+        path = git_repo / SCHEMA_WINDOWS_PATH
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(catalog_text(schema_catalog() if catalog is None else catalog))
-        run_git(git_repo, "add", "--", authorize_module.SCHEMA_WINDOWS_PATH)
+        run_git(git_repo, "add", "--", SCHEMA_WINDOWS_PATH)
         run_git(git_repo, "commit", "-q", "-m", "schema catalog")
         return run_git(git_repo, "rev-parse", "HEAD")
 
@@ -1735,10 +1737,10 @@ class TestSchemaWindowRegistration:
         git_repo: Path, text: str, paths: Sequence[str] = V0112_PREP_PATHS
     ) -> str:
         """One release-prep commit: the version paths plus the catalog as `text`."""
-        path = git_repo / authorize_module.SCHEMA_WINDOWS_PATH
+        path = git_repo / SCHEMA_WINDOWS_PATH
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
-        run_git(git_repo, "add", "--", authorize_module.SCHEMA_WINDOWS_PATH)
+        run_git(git_repo, "add", "--", SCHEMA_WINDOWS_PATH)
         return commit_paths(git_repo, paths, "prepare release")
 
     def _assert_refused(self, git_repo: Path, tagged: str, parent: str, **kwargs) -> None:
@@ -1749,7 +1751,7 @@ class TestSchemaWindowRegistration:
         assert fetcher.calls == []
 
     def test_schema_windows_path(self):
-        assert authorize_module.SCHEMA_WINDOWS_PATH == "cli/src/application_schema_windows.json"
+        assert SCHEMA_WINDOWS_PATH == "cli/src/application_schema_windows.json"
 
     def test_registering_this_tags_window_is_version_only(self, git_repo):
         parent = self._base(git_repo)

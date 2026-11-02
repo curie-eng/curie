@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """Recording external process boundary; never claims a real Kubernetes run."""
 
 import copy

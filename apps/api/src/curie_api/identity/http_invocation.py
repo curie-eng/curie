@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import uuid
@@ -14,7 +15,11 @@ from typing import Annotated, Any, Literal, Never, Protocol, Self, SupportsIndex
 
 from aci_protocol import PrincipalRef
 from curie_internal import identity_context as codec
-from curie_internal.identity_authority import TurnAuthorityRequestV1, TurnAuthorityResponseV1
+from curie_internal.identity_authority import (
+    IDENTITY_CALLER_WAIT_SECONDS,
+    TurnAuthorityRequestV1,
+    TurnAuthorityResponseV1,
+)
 from fastapi import HTTPException, Request
 from pydantic import Field, model_validator
 from redis.exceptions import RedisError
@@ -707,6 +712,14 @@ class _StaleCapture(Exception):
 
 
 _COMPOSITION_ATTEMPTS = 3
+# One monotonic deadline bounds a whole composition: lock waits, provider
+# lookups, writer settlement and final revalidation, across every retry. The
+# dispatcher receiver and the worker stop waiting after
+# IDENTITY_CALLER_WAIT_SECONDS, so the budget is derived from that shared value
+# and leaves this margin for request handling before the composition and the
+# enqueue after it. Authority is never yielded after the caller gave up.
+_COMPOSITION_MARGIN_SECONDS = 1.0
+_COMPOSITION_BUDGET_SECONDS = IDENTITY_CALLER_WAIT_SECONDS - _COMPOSITION_MARGIN_SECONDS
 
 
 @asynccontextmanager
@@ -722,35 +735,41 @@ async def current_source_authority(
     """
     factory = request.app.state.sessionmaker
     valkey = request.app.state.valkey
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _COMPOSITION_BUDGET_SECONDS
     for _attempt in range(_COMPOSITION_ATTEMPTS):
         try:
-            async with factory() as session, session.begin():
-                await identity_fence.lock_identity_reader(session)
-                captured, _ = await capture_source(session, registration, source)
-                credential = runtime._providers.resolve(captured.authority.configuration)
-                if not isinstance(credential, ResolvedProviderCredential):
+            # Expiry cancels the current phase; owned writers still settle or
+            # discard their lease before the timeout surfaces as unavailable.
+            async with asyncio.timeout_at(deadline):
+                async with factory() as session, session.begin():
+                    await identity_fence.lock_identity_reader(session)
+                    captured, _ = await capture_source(session, registration, source)
+                    credential = runtime._providers.resolve(captured.authority.configuration)
+                    if not isinstance(credential, ResolvedProviderCredential):
+                        _unavailable()
+                lookup = lookup_request(registration, captured, credential, purpose="invocation")
+                observation = await client.lookup(
+                    target=credential.target, bearer=credential.bearer, request=lookup,
+                    limits=credential.limits, deadline=deadline,
+                )
+                if not isinstance(observation, HttpIdentityObservation):
                     _unavailable()
-            lookup = lookup_request(registration, captured, credential, purpose="invocation")
-            observation = await client.lookup(
-                target=credential.target, bearer=credential.bearer, request=lookup,
-                limits=credential.limits,
-            )
-            if not isinstance(observation, HttpIdentityObservation):
-                _unavailable()
-            async with identity_fence.mutation(factory, valkey) as writer:
-                async with writer.begin():
-                    current, _ = await capture_source(
-                        writer, registration, source, writer_agent=captured.agent_id,
-                    )
-                    if current != captured:
-                        raise _StaleCapture
-                    source_facts(observation.response_bytes, lookup, credential)
-                    application = await principal_authority.apply_http_principal(
-                        writer, capture=captured.authority, request=lookup,
-                        response_bytes=observation.response_bytes,
-                    )
-                    await writer.commit()
-            # Leaving the writer successfully acknowledges stable settlement as well as COMMIT.
+                async with identity_fence.mutation(factory, valkey) as writer:
+                    async with writer.begin():
+                        current, _ = await capture_source(
+                            writer, registration, source, writer_agent=captured.agent_id,
+                        )
+                        if current != captured:
+                            raise _StaleCapture
+                        source_facts(observation.response_bytes, lookup, credential)
+                        application = await principal_authority.apply_http_principal(
+                            writer, capture=captured.authority, request=lookup,
+                            response_bytes=observation.response_bytes,
+                        )
+                        await writer.commit()
+                # Leaving the writer successfully acknowledges stable settlement as well as
+                # COMMIT.
         except (HTTPException, _StaleCapture) as error:
             if isinstance(error, HTTPException):
                 raise
@@ -760,54 +779,61 @@ async def current_source_authority(
         live: CurrentHttpInvocation | None = None
         async with factory() as session, session.begin():
             try:
-                await identity_fence.lock_identity_reader(session)
-                current, binding = await capture_source(session, registration, source)
-                if (
-                    request.app.state.http_identity_runtime is not runtime
-                    or request.app.state.http_identity_client is not client
-                ):
-                    _unavailable()
-                if (
-                    current.fingerprint != captured.fingerprint
-                    or current.authority.lifecycle_generation != application.lifecycle_generation
-                ):
-                    raise _StaleCapture
-                facts = source_facts(observation.response_bytes, lookup, credential)
-                if application.principal_id is not None:
-                    principal = await session.get(Principal, application.principal_id)
+                async with asyncio.timeout_at(deadline):
+                    await identity_fence.lock_identity_reader(session)
+                    current, binding = await capture_source(session, registration, source)
                     if (
-                        principal is None or str(principal.tenant_id) != registration.tenant_id
-                        or facts.identity is None or principal.idp_issuer != facts.identity.issuer
-                        or principal.idp_subject != facts.identity.subject
-                        or principal.type != "human"
-                        or principal.status != facts.identity.account_status
-                        or principal.authorization_version != application.authorization_version
+                        request.app.state.http_identity_runtime is not runtime
+                        or request.app.state.http_identity_client is not client
                     ):
                         _unavailable()
-                source_permission(
-                    current, binding, facts,
-                    current.sender.native_id in registration.human_native_ids, original,
-                )
-                stable = await valkey.get(identity_fence.FENCE_KEY)
-                if isinstance(stable, bytes):
-                    stable = stable.decode("ascii")
-                if type(stable) is not str or not stable.startswith("stable:"):
-                    _unavailable()
-                uuid.UUID(stable.removeprefix("stable:"))
-                validity = identity_delivery_window(facts, credential.limits)
-                principal_ref = None
-                if application.principal_id is not None:
-                    assert application.authorization_version is not None
-                    principal_ref = PrincipalRef(
-                        principal_id=str(application.principal_id),
-                        authorization_version=application.authorization_version,
+                    generation = current.authority.lifecycle_generation
+                    if (
+                        current.fingerprint != captured.fingerprint
+                        or generation != application.lifecycle_generation
+                    ):
+                        raise _StaleCapture
+                    facts = source_facts(observation.response_bytes, lookup, credential)
+                    if application.principal_id is not None:
+                        principal = await session.get(Principal, application.principal_id)
+                        identity = facts.identity
+                        if (
+                            principal is None
+                            or str(principal.tenant_id) != registration.tenant_id
+                            or identity is None or principal.idp_issuer != identity.issuer
+                            or principal.idp_subject != identity.subject
+                            or principal.type != "human"
+                            or principal.status != identity.account_status
+                            or principal.authorization_version
+                            != application.authorization_version
+                        ):
+                            _unavailable()
+                    source_permission(
+                        current, binding, facts,
+                        current.sender.native_id in registration.human_native_ids, original,
                     )
-                live = CurrentHttpInvocation(
-                    binding, session, intent_digest,
-                    principal_ref, runtime, registration, current, facts, application, stable,
-                    validity, observation.response_bytes, lookup, credential, source, client,
-                    original, _sealable=original is None,
-                )
+                    stable = await valkey.get(identity_fence.FENCE_KEY)
+                    if isinstance(stable, bytes):
+                        stable = stable.decode("ascii")
+                    if type(stable) is not str or not stable.startswith("stable:"):
+                        _unavailable()
+                    uuid.UUID(stable.removeprefix("stable:"))
+                    validity = identity_delivery_window(facts, credential.limits)
+                    principal_ref = None
+                    if application.principal_id is not None:
+                        assert application.authorization_version is not None
+                        principal_ref = PrincipalRef(
+                            principal_id=str(application.principal_id),
+                            authorization_version=application.authorization_version,
+                        )
+                    if loop.time() >= deadline:
+                        _unavailable()
+                    live = CurrentHttpInvocation(
+                        binding, session, intent_digest, principal_ref, runtime, registration,
+                        current, facts, application, stable, validity,
+                        observation.response_bytes, lookup, credential, source, client,
+                        original, _sealable=original is None,
+                    )
             except _StaleCapture:
                 pass
             except HTTPException:

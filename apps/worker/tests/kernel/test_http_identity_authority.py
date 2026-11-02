@@ -22,6 +22,7 @@ from curie_worker.binding import HttpIdentityBinding
 from curie_worker.capacity_wait import WAIT_REPLY_REF_FIELD
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore
+from curie_worker.hook_runs import HookRunRecorderError
 from curie_worker.identity_authority import HttpTurnAuthorityClient, TurnAuthorityUnavailable
 from curie_worker.kernel.core import Kernel
 from curie_worker.sandbox import SuspendedThreadError
@@ -31,6 +32,8 @@ from ..queue_fixtures import qevent, wait_until
 from ..test_sibling_wiring import built as built
 from .test_attachment_claim import _FakeAttachmentLane, _WorkspaceProbe
 from .test_binding_integration import StubBinding, _resolved
+from .test_hook_runs import _event as _cron_event
+from .test_hook_runs import _reject_hook_run_outcome
 
 CAPSULE = "curie-context-v1.e30." + "A" * 43
 ORIGINAL_HASH = hashlib.sha256(b"synthetic original queued bytes").hexdigest()
@@ -990,3 +993,98 @@ def test_completed_workspace_failure_retries_with_current_authority_in_the_same_
                 await asyncio.to_thread(coordinator.release, "slack:C1:retry-workspace")
                 await asyncio.to_thread(h.substrate.release, "slack:C1:retry-workspace")
     asyncio.run(run())
+
+
+def _cron_binding(run: Any, *, required: bool = True) -> Binding:
+    """A synthetic binding that resolves the cron route to the seeded run's own agent."""
+    binding = Binding(required=required)
+    binding.identity = binding.identity.model_copy(update={"agent_id": run.agent_id})
+    binding.resolved = _resolved(run.agent_id, bundle=None)
+    binding._by_route[("slack", "C1")] = binding.resolved
+    return binding
+
+
+@pytest.mark.parametrize(
+    ("context", "refuse"),
+    [(None, None), (CAPSULE, "prepare"), (CAPSULE, "start")],
+    ids=["no-context", "prepare-gate", "start-gate"],
+)
+def test_identity_refused_cron_turn_closes_its_hook_run_failed(
+    make_harness, make_hook_run, context: str | None, refuse: str | None,
+):
+    """#5305: a definitive identity refusal closes the owned run before the marker."""
+    async def run_case() -> None:
+        async with make_hook_run() as run:
+            binding, core = _cron_binding(run), Core()
+            core.refuse = refuse
+            async with make_harness(
+                binding=binding, identity_authority=core, hook_runs=run.recorder(),
+            ) as h:
+                event = _cron_event(hook_run=run.ref)
+                await process(h, event, context=context)
+                assert h.runner.opened == [] and h.sink.events == []
+                assert await h.async_redis.exists(h.config.done_key(event.event_id))
+                outcome, ended_at = await run.state() or (None, None)
+                assert outcome == "failed" and ended_at is not None
+                assert await run.reason() == "identity_refused"
+
+                # Redelivery is idempotent: the terminal marker skips it and
+                # the recorded outcome and end time do not move.
+                await process(h, event, context=context)
+                assert await run.state() == ("failed", ended_at)
+                assert h.runner.opened == []
+    asyncio.run(run_case())
+
+
+def test_identity_refusal_close_failure_precedes_the_done_marker(make_harness, make_hook_run):
+    """#5305: a failed refusal close leaves the delivery pending, never terminal and open."""
+    async def run_case() -> None:
+        async with make_hook_run() as run:
+            async with make_harness(
+                binding=_cron_binding(run), hook_runs=run.recorder(),
+            ) as h:
+                event = _cron_event(hook_run=run.ref)
+                async with _reject_hook_run_outcome(run.engine, run.run_id, "failed"):
+                    with pytest.raises(HookRunRecorderError):
+                        await h.kernel.process_event(event)
+                assert await run.state() == (None, None)
+                assert not await h.async_redis.exists(h.config.done_key(event.event_id))
+                assert h.runner.opened == []
+
+                # The redelivery after the backend recovers closes the run.
+                await h.kernel.process_event(event)
+                assert (await run.state() or (None,))[0] == "failed"
+                assert await run.reason() == "identity_refused"
+                assert await h.async_redis.exists(h.config.done_key(event.event_id))
+    asyncio.run(run_case())
+
+
+def test_identity_refusal_leaves_an_already_terminal_run_untouched(make_harness, make_hook_run):
+    """#5305: the refusal close never overwrites an earlier outcome."""
+    async def run_case() -> None:
+        async with make_hook_run(outcome="ran") as run:
+            before = await run.state()
+            async with make_harness(
+                binding=_cron_binding(run), hook_runs=run.recorder(),
+            ) as h:
+                event = _cron_event(hook_run=run.ref)
+                await h.kernel.process_event(event)
+                assert await run.state() == before
+                assert await run.reason() is None
+                assert await h.async_redis.exists(h.config.done_key(event.event_id))
+    asyncio.run(run_case())
+
+
+def test_local_binding_cron_control_still_runs_and_closes_ran(make_harness, make_hook_run):
+    """#5305 control: a binding that does not require HTTP identity runs the hook."""
+    async def run_case() -> None:
+        async with make_hook_run() as run:
+            async with make_harness(
+                binding=_cron_binding(run, required=False), hook_runs=run.recorder(),
+            ) as h:
+                h.runner.default_script = [Final(text="complete", status=SessionStatus.DONE)]
+                event = _cron_event(hook_run=run.ref)
+                await h.kernel.process_event(event)
+                assert h.runner.opened == [event.text]
+                assert (await run.state() or (None,))[0] == "ran"
+    asyncio.run(run_case())

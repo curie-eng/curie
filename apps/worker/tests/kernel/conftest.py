@@ -63,7 +63,7 @@ from curie_worker.sandbox import (
     QuotaRejection,
     SandboxSubstrate,
 )
-from curie_worker.sandbox.types import ClaimView, SandboxView
+from curie_worker.sandbox.types import ClaimView, SandboxClient, SandboxView
 from curie_worker.threadlock import ThreadLock
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
@@ -1160,6 +1160,7 @@ async def kernel_harness(
     runner_app: web.Application | None = None,
     claim_timeout_seconds: float = 3.0,
     substrate_env: Mapping[str, str] | None = None,
+    sandbox_client: SandboxClient | None = None,
     per_sandbox_runners: int = 0,
     hook_runs: object | None = None,
     sibling_limit_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
@@ -1221,7 +1222,7 @@ async def kernel_harness(
         maint_notifications_config=MaintNotificationsConfig(enabled=False),
     )
     substrate = SandboxSubstrate(
-        fake_k8s,  # type: ignore[arg-type]
+        sandbox_client if sandbox_client is not None else fake_k8s,  # type: ignore[arg-type]
         AffinityStore(
             sync_redis,
             pressure_client=pressure_async_redis,

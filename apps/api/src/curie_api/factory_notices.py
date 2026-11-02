@@ -145,7 +145,7 @@ _CAUSE_TEXT = {
         "the existing pull request is unchanged because this revision published nothing."
     ),
     "execution_deadline": "the run did not finish before its deadline.",
-    "capacity_wait_expired": "no runner capacity came free before the wait expired.",
+    "capacity_wait_expired": "sandbox admission did not complete before the wait expired.",
     "start_failed": "the sandbox did not start.",
     "owner_lost": "the worker running this request stopped responding.",
     "issue_cancelled": "the request was cancelled.",

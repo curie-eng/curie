@@ -20,7 +20,7 @@ from curie_api.db import SCHEMA
 from curie_api.identity.http_approval import http_expiry_owner
 from curie_api.resumequeue import ResumeQueue
 from curie_api.resumereconciler import ResumeReconciler
-from curie_api.sweeper import sweep_expired_approvals
+from curie_api.sweeper import SealedExpiryCursor, sweep_expired_approvals
 from redis import asyncio as redis_async
 from role_policy_support import run
 from sqlalchemy import text
@@ -492,3 +492,68 @@ def test_resolve_after_a_concurrent_expiry_keeps_the_existing_410(
     )
     assert response.status_code == 410, response.text
     assert rows(row["dedupe_key"]) == [expired]
+
+
+def sealed_passes(
+    case: SimpleNamespace, passes: int, *, limit: int, share_cursor: bool = True,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-10: sweeper passes with the production owner."""
+    runtime = case.client.app.state.http_identity_runtime
+
+    async def go(factory: async_sessionmaker[AsyncSession]) -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-10: one cursor lives across the passes."""
+        valkey = redis_async.from_url(get_settings().valkey_dsn())
+        stream = f"test:curie:runs:sealed-cursor:{uuid.uuid4().hex}"
+        try:
+            stores = SimpleNamespace(
+                sessionmaker=factory, valkey=valkey, http_identity_runtime=runtime,
+            )
+            cursor = SealedExpiryCursor()
+            for _ in range(passes):
+                async with factory() as session:
+                    await sweep_expired_approvals(
+                        session, ResumeQueue(valkey, stream=stream),
+                        now=datetime.now(UTC).replace(tzinfo=None), limit=limit,
+                        http_expiry=http_expiry_owner(stores),
+                        sealed_cursor=cursor if share_cursor else None,
+                    )
+        finally:
+            await valkey.delete(stream)
+            await valkey.aclose()
+
+    run(go)
+
+
+def test_unexpirable_sealed_batch_does_not_starve_later_expiries(
+    creation_case: SimpleNamespace,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-10: a full unverifiable page never hides a valid row."""
+    case = creation_case
+    valid = lapse(case, created(case))
+    source = rows(valid["dedupe_key"])[0]
+    now = datetime.now(UTC).replace(tzinfo=None)
+    stuck = seed_rows(source, [
+        {"status": "pending", "expires": now - timedelta(hours=2), "context": "synthetic-retired"},
+        {"status": "pending", "expires": now - timedelta(hours=1), "context": "synthetic-retired"},
+    ])
+    sealed_passes(case, 2, limit=2)
+    assert row_by_id(valid["id"])["status"] == "expired"
+    assert all(row_by_id(item)["status"] == "pending" for item in stuck)
+
+
+def test_verifiable_sealed_rows_expire_in_the_first_pass(
+    creation_case: SimpleNamespace,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-10: control; verifiable rows lead and expire at once."""
+    case = creation_case
+    valid = lapse(case, created(case))
+    now = datetime.now(UTC).replace(tzinfo=None)
+    stuck = seed_rows(valid, [
+        {
+            "status": "pending", "expires": now - timedelta(minutes=1),
+            "context": "synthetic-retired",
+        },
+    ])
+    sealed_passes(case, 1, limit=2)
+    assert row_by_id(valid["id"])["status"] == "expired"
+    assert all(row_by_id(item)["status"] == "pending" for item in stuck)

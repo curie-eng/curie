@@ -14,7 +14,7 @@ import aiohttp
 import anyio
 from aci_protocol import PublicationContext
 
-from .workspace_snapshot import capture_workspace_snapshot
+from .workspace_snapshot import WorkspaceHistoryError, capture_workspace_snapshot
 
 PRECHECK_TIMEOUT_SECONDS = 10
 _MAX_PRECHECKS = 5
@@ -168,20 +168,22 @@ class PublicationPrecheck:
                 partial(
                     capture_workspace_snapshot,
                     self._workspace,
+                    base_sha=context.expected_head,
                     trusted_origin=self._repo_origin,
                     repository_path=self._repo_path,
                 ),
                 abandon_on_cancel=True,
             )
+        except WorkspaceHistoryError:
+            return (
+                "head_changed: Local HEAD is not the prepared head or a local commit on top "
+                "of it. Restore or refresh the checkout through the trusted workspace path "
+                "before retrying."
+            )
         except Exception:  # noqa: BLE001 - existing broad catch retained
             return (
                 "precheck_unavailable: The workspace snapshot could not be captured. "
                 "Correct the working tree and retry."
-            )
-        if snapshot.base_sha != context.expected_head:
-            return (
-                "head_changed: Local HEAD differs from the prepared head. Restore or "
-                "refresh the checkout through the trusted workspace path before retrying."
             )
         if snapshot.patch:
             return None

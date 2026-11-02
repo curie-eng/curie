@@ -129,7 +129,9 @@ def _cause(
         if deadline is None:
             raise ValueError("a waiting request has no capacity deadline")
         text = "waiting for sandbox capacity"
-        if req.capacity_deferrals:
+        if req.last_deferral_reason == "admission_unavailable":
+            text = "waiting for sandbox admission observations"
+        elif req.capacity_deferrals:
             text += (
                 f"; deferred {req.capacity_deferrals} time(s) for capacity, "
                 f"last reason: {req.last_deferral_reason or 'unknown'}"
@@ -157,7 +159,7 @@ def _cause(
     if state == "expired":
         if cause == "capacity_wait_expired":
             return (
-                "expired: capacity_wait_expired, no sandbox capacity before the "
+                "expired: capacity_wait_expired, sandbox admission did not complete before the "
                 "waiting deadline"
             ) + _previous_start_failure(req)
         return (

@@ -39,8 +39,16 @@ _MAX_BODY_BYTES = 65_536
 _NO_STORE = {"Cache-Control": "no-store"}
 
 
-class _CurrentAuthorityRoute(APIRoute):
-    """@spec HTTP-INVOCATION-EXECUTION-8/16."""
+class _BoundedJsonRoute(APIRoute):
+    """Bounded, strictly decoded JSON before authentication, with fixed refusals.
+
+    Subclasses name the body subject, the fixed 422 detail, and optionally the
+    fixed detail that replaces the 413 one. Excessive nesting is a 422, never a 500.
+    """
+
+    subject: str
+    invalid_detail: str
+    oversize_detail: str | None = None
 
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
         """@spec HTTP-INVOCATION-EXECUTION-16."""
@@ -49,24 +57,30 @@ class _CurrentAuthorityRoute(APIRoute):
         async def guarded(request: Request) -> Response:
             """@spec HTTP-INVOCATION-EXECUTION-16."""
             try:
-                raw = await read_bounded_body(
-                    request, _MAX_BODY_BYTES, subject="turn authority body",
-                )
+                raw = await read_bounded_body(request, _MAX_BODY_BYTES, subject=self.subject)
                 request._body = raw
                 request._json = decode_json_bytes(raw, max_bytes=_MAX_BODY_BYTES)
                 response = await handler(request)
             except HTTPException as error:
                 error.headers = {**(error.headers or {}), **_NO_STORE}
+                if error.status_code == 413 and self.oversize_detail:
+                    error.detail = self.oversize_detail
                 raise
-            except (ValueError, TypeError, RequestValidationError):
+            except (ValueError, TypeError, RecursionError, RequestValidationError):
                 return JSONResponse(
-                    {"detail": "invalid_turn_authority_request"},
-                    status_code=422, headers=_NO_STORE,
+                    {"detail": self.invalid_detail}, status_code=422, headers=_NO_STORE,
                 )
             response.headers.update(_NO_STORE)
             return response
 
         return guarded
+
+
+class _CurrentAuthorityRoute(_BoundedJsonRoute):
+    """@spec HTTP-INVOCATION-EXECUTION-8/16."""
+
+    subject = "turn authority body"
+    invalid_detail = "invalid_turn_authority_request"
 
 
 router = APIRouter(
@@ -83,36 +97,12 @@ async def check_turn_authority(
     return await check_current_turn_authority(request, body)
 
 
-class _ApprovalGrantRoute(APIRoute):
+class _ApprovalGrantRoute(_BoundedJsonRoute):
     """Strict bound before parsing; fixed 413/422. @spec HTTP-APPROVAL-CONTINUITY-12."""
 
-    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
-        """@spec HTTP-APPROVAL-CONTINUITY-12."""
-        handler = super().get_route_handler()
-
-        async def guarded(request: Request) -> Response:
-            """@spec HTTP-APPROVAL-CONTINUITY-12."""
-            try:
-                raw = await read_bounded_body(
-                    request, _MAX_BODY_BYTES, subject="approval grant body",
-                )
-                request._body = raw
-                request._json = decode_json_bytes(raw, max_bytes=_MAX_BODY_BYTES)
-                response = await handler(request)
-            except HTTPException as error:
-                error.headers = {**(error.headers or {}), **_NO_STORE}
-                if error.status_code == 413:
-                    error.detail = "body_too_large"
-                raise
-            except (ValueError, TypeError, RecursionError, RequestValidationError):
-                return JSONResponse(
-                    {"detail": "invalid_approval_grant_request"},
-                    status_code=422, headers=_NO_STORE,
-                )
-            response.headers.update(_NO_STORE)
-            return response
-
-        return guarded
+    subject = "approval grant body"
+    invalid_detail = "invalid_approval_grant_request"
+    oversize_detail = "body_too_large"
 
 
 grant_router = APIRouter(
@@ -129,34 +119,12 @@ async def check_approval_grant(
     return await check_http_approval_grant(request, body)
 
 
-class _BindingClassificationRoute(APIRoute):
+class _BindingClassificationRoute(_BoundedJsonRoute):
     """Strict bound before parsing; fixed 422. @spec HTTP-INVOCATION-EXECUTION-22."""
 
-    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
-        """@spec HTTP-INVOCATION-EXECUTION-22."""
-        handler = super().get_route_handler()
+    subject = "binding classification body"
+    invalid_detail = "invalid_binding_classification_request"
 
-        async def guarded(request: Request) -> Response:
-            """@spec HTTP-INVOCATION-EXECUTION-22."""
-            try:
-                raw = await read_bounded_body(
-                    request, _MAX_BODY_BYTES, subject="binding classification body",
-                )
-                request._body = raw
-                request._json = decode_json_bytes(raw, max_bytes=_MAX_BODY_BYTES)
-                response = await handler(request)
-            except HTTPException as error:
-                error.headers = {**(error.headers or {}), **_NO_STORE}
-                raise
-            except (ValueError, TypeError, RecursionError, RequestValidationError):
-                return JSONResponse(
-                    {"detail": "invalid_binding_classification_request"},
-                    status_code=422, headers=_NO_STORE,
-                )
-            response.headers.update(_NO_STORE)
-            return response
-
-        return guarded
 
 
 classification_router = APIRouter(

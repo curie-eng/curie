@@ -9,6 +9,7 @@ import ssl
 import subprocess
 import sys
 from collections.abc import Iterator
+from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -20,9 +21,10 @@ import httpx  # noqa: E402
 import pytest  # noqa: E402
 from c4_dynamic_base import (  # noqa: E402
     CHANGE,
+    DynamicKind,
     assert_ci_still_owns_request,
+    configure_dynamic,
     dynamic_model_type,
-    dynamic_stub_type,
 )
 
 
@@ -335,29 +337,63 @@ def test_unissued_output_does_not_claim_a_checkout_observation(model: Any) -> No
     assert model.observations() == []
 
 
-@pytest.fixture
-def dynamic_github(tmp_path: Path) -> Iterator[Any]:
-    from curie_telemetry.redact import redact_text
+@pytest.fixture(params=[False, True], ids=["standalone", "after-shared-install"])
+def dynamic_github(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Iterator[Any]:
+    import scripted_kind as sk
+    from c4_admitted_kind import AdmittedKind, configure_harness
 
     tools = Path(__file__).resolve().parents[2]
     source = tools / "github-stub/github_stub.py"
-    spec = importlib.util.spec_from_file_location("dynamic_github_selftest", source)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
     recording = json.loads((tools / "github-stub/recordings/curie-pr-3400.json").read_text())
-    stub = dynamic_stub_type(module, redact=redact_text)(
-        tmp_path / "github",
-        recording,
-        seed_tree=tools / "factory-e2e/fixtures/unitconv",
-        issue_file=tools / "factory-e2e/fixtures/unitconv-issue.md",
-    )
-    try:
+    inputs = {
+        "seed_tree": tools / "factory-e2e/fixtures/unitconv",
+        "issue_file": tools / "factory-e2e/fixtures/unitconv-issue.md",
+    }
+    with ExitStack() as cleanup:
+        if request.param:
+            shared = AdmittedKind(tmp_path / "shared", Path(sys.executable))
+            shared.root.mkdir()
+            configure_harness(monkeypatch, shared)
+            module = sk._module("shared_github_selftest", source)
+            shared.stub = module.GithubStub(shared.root / "github", recording, **inputs)
+            cleanup.callback(shared.stub.close)
+            shared.stub.start()
+        run = DynamicKind(tmp_path, Path(sys.executable))
+        configure_dynamic(monkeypatch, run)
+        module = sk._module("dynamic_github_selftest", source)
+        stub = module.GithubStub(tmp_path / "github", recording, **inputs)
+        cleanup.callback(stub.close)
         stub.start()
+        run.stub = stub
+        stub.harness_values = sk.scripted_values(
+            model_base_url="http://127.0.0.1:18111",
+            github_api=stub.base_url,
+            clone_base=stub.base_url,
+            ca_configmap="acme-ca",
+            runner_image=run.images["runner"],
+        )
         yield stub
-    finally:
-        stub.close()
+
+
+def test_dynamic_configuration_renders_unique_current_provider_bindings(
+    dynamic_github: Any,
+) -> None:
+    import yaml
+
+    values = dynamic_github.harness_values
+    for entries in (values["factory"]["trackers"], values["factory"]["codeHosts"]):
+        names = [entry["name"] for entry in entries]
+        assert len(names) == len(set(names))
+        assert all(entry["apiUrl"].startswith(dynamic_github.base_url) for entry in entries)
+    assert values["factory"]["baseLabelSettleSeconds"] == 15
+    rendered = subprocess.run(
+        ["helm", "template", "acme", str(Path(__file__).resolve().parents[3] / "charts/curie"),
+         "-f", "-"],
+        input=yaml.safe_dump(values), capture_output=True, text=True, check=False,
+    )
+    assert rendered.returncode == 0, rendered.stderr
 
 
 @pytest.fixture
