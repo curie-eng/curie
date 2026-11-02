@@ -127,9 +127,16 @@ async def process_event(
         except identity.HttpIdentityRefused:
             if lease is not None:
                 lease.raise_if_lost()
-            await self._markers.mark_done(qevent.event_id, marker_value="1")
-            constants._LIFECYCLE_OUTCOME.set("classified_failure")
-            logger.info("HTTP invocation refused before further execution")
+            try:
+                # The run closes before the marker, so a failed close leaves
+                # the delivery pending rather than terminal and open (#5305).
+                await self._close_hook_run_after_refusal(qevent)
+            except HookRunRecorderError as exc:
+                error = exc
+            else:
+                await self._markers.mark_done(qevent.event_id, marker_value="1")
+                constants._LIFECYCLE_OUTCOME.set("classified_failure")
+                logger.info("HTTP invocation refused before further execution")
         except asyncio.CancelledError as exc:
             error = exc
             await self._close_hook_run_after_error(
