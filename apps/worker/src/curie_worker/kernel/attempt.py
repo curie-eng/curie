@@ -59,6 +59,7 @@ from ..runner_client import (
 )
 from ..sandbox.quota import capacity_rejection_is_valid
 from ..sandbox.types import (
+    AdmissionUnavailableError,
     CapacityExhaustedError,
     MissingAgentPoolError,
     SandboxError,
@@ -455,26 +456,33 @@ async def _attempt_turn(
             constants._ATTACHMENT_ACCESS_TURN.reset(aa_turn)
             constants._MEMORY_MINT.reset(memory_mint)
             constants._CHANNEL_READ_MINT.reset(cr_mint)
-    except CapacityExhaustedError as exc:
-        rejection = exc.rejection
-        logger.warning(
-            "sandbox capacity exhausted for event %s: quota=%s requested=%s used=%s hard=%s",
-            qevent.event_id,
-            rejection.quota_name,
-            rejection.requested,
-            rejection.used,
-            rejection.hard,
-        )
+    except (CapacityExhaustedError, AdmissionUnavailableError) as exc:
+        rejection = exc.rejection if isinstance(exc, CapacityExhaustedError) else None
+        if rejection is None:
+            logger.warning("sandbox admission inventory unavailable for event %s", qevent.event_id)
+        else:
+            logger.warning(
+                "sandbox capacity exhausted for event %s: quota=%s requested=%s used=%s hard=%s",
+                qevent.event_id,
+                rejection.quota_name,
+                rejection.requested,
+                rejection.used,
+                rejection.hard,
+            )
         parsed_execute = parse_work_item_event_id(qevent.event_id)
         if parsed_execute is not None and parsed_execute.kind in {"execute"}:
             run = self._work_item_runs.get(parsed_execute.request_id)
             if run is not None and not run.started:
                 release_order()
                 try:
-                    await run.defer("capacity", capacity=True, start_failure_detail=None)
+                    await run.defer(
+                        "admission_unavailable" if rejection is None else "capacity",
+                        capacity=rejection is not None,
+                        start_failure_detail=None,
+                    )
                 except WorkItemConflict as exc:
                     logger.info(
-                        "work-item capacity defer refused for %s: %s",
+                        "work-item admission defer refused for %s: %s",
                         qevent.event_id,
                         exc.code,
                     )
@@ -492,6 +500,17 @@ async def _attempt_turn(
                 release_order()
                 return failures.TurnOutcome(terminal_ok=False, classification="sandbox-capacity")
             return await capacity_response()
+
+        if rejection is None:
+            release_order()
+            if (
+                qevent.source is TurnSource.SLACK
+                and handle is not None
+                and not self._is_approval_resume(qevent.event_id)
+                and (parsed_execute is None or not parsed_execute.is_ci_fix)
+            ):
+                raise CapacityWaitRequested() from None
+            raise
 
         if pressure_retried:
             self._record_pressure_outcome("reclaimed-retry-refused")
