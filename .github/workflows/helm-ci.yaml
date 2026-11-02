@@ -32,6 +32,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       chart: ${{ steps.filter.outputs.chart }}
+      deep: ${{ steps.filter.outputs.deep }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -41,6 +42,9 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          # The kind jobs are deep tiers. A pull request runs them only with
+          # the ci:deep label, read from the event on the next push.
+          DEEP_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:deep') }}
         run: python3 tools/helm-ci-gate/decide.py select
 
   # The chart gate runs as parallel shards. The render assertions used to be
@@ -1178,7 +1182,7 @@ jobs:
   helm:
     name: Chart (lint + template + kubeconform)
     runs-on: ubuntu-24.04
-    needs: [chart-changes, chart-lint-and-assertions-1, chart-assertions-2, chart-assertions-retained-values]
+    needs: [chart-changes, chart-lint-and-assertions-1, chart-assertions-2, chart-assertions-retained-values, reserved-env-upgrade, automatic-thread-isolation]
     # A completed run must record this check as success or failure. A
     # condition that can be false would mark it skipped and block release
     # authorization (#1470). Cancellation is the only skip.
@@ -1194,13 +1198,17 @@ jobs:
           SHARD_LINT: ${{ needs.chart-lint-and-assertions-1.result }}
           SHARD_RENDER: ${{ needs.chart-assertions-2.result }}
           SHARD_RETAINED: ${{ needs.chart-assertions-retained-values.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          DEEP: ${{ needs.chart-changes.outputs.deep }}
+          KIND_RESERVED_ENV: ${{ needs.reserved-env-upgrade.result }}
+          KIND_THREAD_ISOLATION: ${{ needs.automatic-thread-isolation.result }}
         run: python3 tools/helm-ci-gate/decide.py aggregate
 
   reserved-env-upgrade:
     name: Reject legacy extraEnv before upgrade mutation
     runs-on: ubuntu-24.04
     needs: [chart-changes]
-    if: ${{ needs.chart-changes.outputs.chart == 'true' }}
+    if: ${{ needs.chart-changes.outputs.chart == 'true' && needs.chart-changes.outputs.deep == 'true' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -1277,7 +1285,7 @@ jobs:
     name: Automatic thread isolation (kind)
     runs-on: ubuntu-24.04
     needs: [chart-changes]
-    if: ${{ needs.chart-changes.outputs.chart == 'true' }}
+    if: ${{ needs.chart-changes.outputs.chart == 'true' && needs.chart-changes.outputs.deep == 'true' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7

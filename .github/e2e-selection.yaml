@@ -19,7 +19,12 @@ ci_policy_tests:
     [.github, tools/ci-workflow-paths, conftest.py, pyproject.toml, uv.lock]
   tools/ci-workflow-paths/tests/test_workflow_paths.py:
     [.github, tools/ci-workflow-paths, conftest.py, pyproject.toml, uv.lock,
-     apps/ui, cli, scripts/check-glibc-floor.sh, scripts/check-version-consistency.sh]
+     apps/ui, cli, scripts/check-glibc-floor.sh, scripts/check-version-consistency.sh,
+     tools/e2e-ci-selection, tools/helm-ci-gate, AGENTS.md,
+     charts/curie/templates/_helpers.tpl,
+     charts/curie/ci/runtime/connector-readiness-runtime.sh,
+     tools/factory-e2e/scripted_kind.py, apps/worker/src/curie_worker/approvals.py,
+     apps/api/alembic/versions/0140_execution_deadline_twelve_hours.py]
   tools/close-on-next/tests/test_close_on_next.py:
     [.github, tools/close-on-next, conftest.py, pyproject.toml, uv.lock]
   tools/dependency-audit-paths/tests/test_dependency_audit_paths.py:
@@ -36,6 +41,11 @@ ci_policy_tests:
      apps/api, charts/curie, cli, docs/architecture-atlas, examples/sre-bot,
      examples/tests, otel, packages/channel-protocol, packages/plugin-format,
      packages/telemetry-schema, release/atlas.py, runner, tests/vectors]
+  tools/e2e-ci-selection/tests/test_deep_tier_aggregates.py:
+    [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
+     tools/ci-workflow-paths, tools/helm-ci-gate,
+     apps/worker/src/curie_worker/approvals.py, charts/curie/ci/runtime,
+     charts/curie/templates/_helpers.tpl, tools/factory-e2e/scripted_kind.py]
   tools/e2e-ci-selection/tests/test_e2e_ci_selection.py:
     [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
      apps, charts/curie, cli, docs, examples, otel, packages, release, runner,
