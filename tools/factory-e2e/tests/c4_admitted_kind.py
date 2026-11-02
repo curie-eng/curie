@@ -40,6 +40,9 @@ CLAIM_RESOURCE = "sandboxclaims.extensions.agents.x-k8s.io"
 SANDBOX_RESOURCE = "sandboxes.agents.x-k8s.io"
 # apps/worker/src/curie_worker/sandbox/k8s.py ADMISSION_CLAIM_LABEL
 ADMISSION_CLAIM_LABEL = "sandbox.users.io/curie-admission-claim"
+# Every per-publication Job, Secret and ConfigMap carries this label; the
+# persistent owner ConfigMap does not (apps/worker/src/curie_worker/publication_k8s.py).
+PUBLICATION_SELECTOR = "curietech.ai/component=publication"
 # CI builds the candidate CLI and images once per workflow run; the fixture
 # then tags those images instead of rebuilding them from the checkout.
 CANDIDATE_CLI_ENV = "CURIE_C4_CANDIDATE_CLI"
@@ -208,6 +211,8 @@ class AdmittedKind(sk.ScriptedRun):
         # Recorded once by the session fixture when the shared install is
         # ready, the worker is at zero replicas and no agent exists.
         self.baseline: InstallSnapshot | None = None
+        # Worker log tails read just before a reset stops the workers.
+        self.stopped_worker_logs: dict[str, str] | None = None
         self.secrets.extend((gitlab.TOKEN, jira.TOKEN))
 
     def record_failure(self, operation: str, exc: BaseException) -> None:
@@ -1023,6 +1028,12 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
                 tenants=frozenset(rows["tenants"]),
                 sandbox_claims=self.resource_names(self.namespace, CLAIM_RESOURCE),
                 publication_jobs=self.resource_names(self.publication_namespace(), "jobs"),
+                publication_secrets=self.resource_names(
+                    self.publication_namespace(), "secrets", "-l", PUBLICATION_SELECTOR
+                ),
+                publication_config_maps=self.resource_names(
+                    self.publication_namespace(), "configmaps", "-l", PUBLICATION_SELECTOR
+                ),
                 api_forges=self.api_forges(),
                 worker_env=tuple(sorted(self.env_pair(e) for e in self.worker_container_env())),
                 worker_pods=len(
@@ -1092,22 +1103,11 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
             )
         except Exception as exc:  # noqa: BLE001
             evidence["api_logs"] = unavailable(exc)
-        worker_logs: dict[str, str] = {}
-        try:
-            pods = self.resource_names(
-                self.namespace, "pods", "-l", "app.kubernetes.io/component=worker"
-            )
-        except Exception as exc:  # noqa: BLE001
-            pods = frozenset()
-            worker_logs["(pods)"] = unavailable(exc)
-        for pod in sorted(pods):
-            try:
-                worker_logs[pod] = bounded(
-                    self.kubectl("-n", self.namespace, "logs", pod, "--all-containers", tail)
-                )
-            except Exception as exc:  # noqa: BLE001
-                worker_logs[pod] = unavailable(exc)
-        evidence["worker_logs"] = worker_logs
+        # A reset stops the workers before it can fail, so their tails were
+        # read first; the live read covers a case-start failure.
+        if self.stopped_worker_logs is not None:
+            evidence["stopped_worker_logs"] = self.stopped_worker_logs
+        evidence["worker_logs"] = self.worker_log_tails()
         try:
             digest = json.dumps(
                 {"phase": phase, "case": case, "leftovers": evidence["leftovers"]},
@@ -1136,6 +1136,35 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
                 f"case isolation diagnostics were not recorded: {type(exc).__name__}",
                 file=sys.stderr,
             )
+
+    def worker_log_tails(self) -> dict[str, str]:
+        """Redacted, bounded log tails of every worker pod; never raises."""
+
+        def bounded(text: str) -> str:
+            return self.redact_model_evidence(text)[-EVIDENCE_TEXT_LIMIT:]
+
+        tails: dict[str, str] = {}
+        try:
+            pods = self.resource_names(
+                self.namespace, "pods", "-l", "app.kubernetes.io/component=worker"
+            )
+        except Exception as exc:  # noqa: BLE001 - evidence must not mask the failure
+            return {"(pods)": bounded(f"unavailable: {type(exc).__name__}: {exc}")}
+        for pod in sorted(pods):
+            try:
+                tails[pod] = bounded(
+                    self.kubectl(
+                        "-n",
+                        self.namespace,
+                        "logs",
+                        pod,
+                        "--all-containers",
+                        f"--tail={EVIDENCE_LOG_LINES}",
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                tails[pod] = bounded(f"unavailable: {type(exc).__name__}: {exc}")
+        return tails
 
     @staticmethod
     def snapshot_evidence(snapshot: InstallSnapshot) -> dict[str, Any]:
@@ -1246,6 +1275,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
             self.record_isolation_failure("reset", leftovers, None, case=case)
             return CaseIsolationError("; ".join(leftovers))
 
+        self.stopped_worker_logs = self.worker_log_tails()
         self.worker_replicas(0)
         self.retire_case_tickets()
         retired_at = time.monotonic()
@@ -1306,6 +1336,20 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
             "--timeout=180s",
             timeout=240,
         )
+        # A case that ends mid-publication leaves the Job's Secret and
+        # ConfigMap. They are owned by the persistent owner ConfigMap, not the
+        # Job, so they go here, before the truncate drops their cleanup records.
+        self.kubectl(
+            "-n",
+            self.publication_namespace(),
+            "delete",
+            "secrets,configmaps",
+            "-l",
+            PUBLICATION_SELECTOR,
+            "--wait=true",
+            "--timeout=120s",
+            timeout=180,
+        )
         # Every table that references curie.agents (channels, versions,
         # deployments and their dependants) or curie.work_items is truncated
         # with them, which releases the case-created tenants those rows named.
@@ -1335,8 +1379,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         ]
         self.write_sql(
             "TRUNCATE " + ", ".join(swept) + " CASCADE; "
-            "DELETE FROM curie.tenants"
-            + (f" WHERE id NOT IN ({tenants})" if tenants else "")
+            "DELETE FROM curie.tenants" + (f" WHERE id NOT IN ({tenants})" if tenants else "")
         )
         self.valkey("XTRIM", RUNS_STREAM_DEFAULT, "MAXLEN", "0")
         for stream in sorted(self.stream_keys() - baseline.streams):
@@ -1354,6 +1397,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
             raise CaseIsolationError(
                 "the shared install kept case state after reset: " + "; ".join(leftovers)
             )
+        self.stopped_worker_logs = None
 
     def binding(self, kind: str, label: str | None) -> dict[str, Any]:
         result = {"kind": kind, "address": LOCATIONS[kind], "trigger_label": label}

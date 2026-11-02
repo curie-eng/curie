@@ -25,6 +25,10 @@ class InstallSnapshot:
     tenants: frozenset[str]
     sandbox_claims: frozenset[str]
     publication_jobs: frozenset[str]
+    # Per-publication companions. The persistent publication owner ConfigMap
+    # owns them, so deleting a Job leaves them behind.
+    publication_secrets: frozenset[str]
+    publication_config_maps: frozenset[str]
     api_forges: Any
     worker_env: tuple[tuple[str, str], ...]
     worker_pods: int
@@ -44,7 +48,14 @@ _ZERO_FIELDS = frozenset(
     {"agents", "work_items", "execution_requests", "worker_pods", "runs_stream_length"}
 )
 _EMPTY_FIELDS = frozenset(
-    {"sandbox_claims", "publication_jobs", "claimed_sandboxes", "terminating_pods"}
+    {
+        "sandbox_claims",
+        "publication_jobs",
+        "publication_secrets",
+        "publication_config_maps",
+        "claimed_sandboxes",
+        "terminating_pods",
+    }
 )
 _BASELINE_SET_FIELDS = frozenset(
     {"tenants", "deployments", "network_policies", "streams", "persistent_keys"}
