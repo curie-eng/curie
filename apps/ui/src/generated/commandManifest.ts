@@ -10363,6 +10363,33 @@ export const commandManifest = {
       "name": "dev",
       "subcommands": [
         {
+          "about": "Check or regenerate the shrinking test-time baselines",
+          "args": [
+            {
+              "global": false,
+              "help": "Regenerate baselines and prune stale entries",
+              "id": "regenerate",
+              "long": "regenerate",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Pytest call-phase artifacts from at least two CI runs",
+              "id": "durations",
+              "long": "durations",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "test-ratchets"
+        },
+        {
           "about": "Run commands with private backing services",
           "hidden": false,
           "name": "test-env",

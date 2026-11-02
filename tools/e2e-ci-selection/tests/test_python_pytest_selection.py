@@ -467,6 +467,7 @@ def test_static_job_holds_exactly_the_moved_gates_in_order() -> None:
         *MOVED_STATIC_STEPS[1:4],
         # ADR 0232 (#4610) added this gate after the move.
         "Contract migration timing gate",
+        "Test-time ratchets",
         *MOVED_STATIC_STEPS[4:],
     ]
     assert static_names == expected

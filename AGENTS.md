@@ -405,6 +405,8 @@ delivery cap is a bug.
 
 ## Test policy
 
+Generated test-time ratchets reject growth from the merge-base in real sleeps, per-case provisioning fixtures, and non-exempt PR-shard call phases over 30 seconds. Regenerate baselines with `curie dev test-ratchets --regenerate`, supplying `--durations <artifact>` from at least two CI runs to prune exemptions whose maximum call time is under 10 seconds; stale entries are reported without failing CI.
+
 1. Test behavior through the nearest executable boundary. Assert outcomes and state transitions rather than source names, syntax or implementation structure.
 2. Cross artifact contracts use shared inputs and expected outputs under `tests/vectors`. Every reader exercises its own production parser or behavior against the same vector.
 3. Text pins are permitted only for security configuration that cannot be executed by the test. Each pin names the issue requiring it.

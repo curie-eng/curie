@@ -128,7 +128,11 @@ impl Fixture {
         .unwrap();
         fs::write(
             self.root.join("pyproject.toml"),
-            "[tool.uv.workspace]\nmembers = []\n",
+            concat!(
+                "[tool.uv.workspace]\nmembers = [\"packages/test-support\"]\n",
+                "[dependency-groups]\ndev = [\"curie-test-support\"]\n",
+                "[tool.uv.sources]\ncurie-test-support = {workspace = true}\n",
+            ),
         )
         .unwrap();
         fs::write(self.root.join("tools/preflight/always.txt"), "").unwrap();
@@ -139,6 +143,10 @@ impl Fixture {
             ".github/e2e-selection.yaml",
             "release/atlas.py",
             "cli/Cargo.toml",
+            "packages/test-support/pyproject.toml",
+            "packages/test-support/src/curie_test_support/__init__.py",
+            "packages/test-support/src/curie_test_support/ratchets.py",
+            "tests/baselines/test-time.json",
         ] {
             let destination = self.root.join(relative);
             fs::create_dir_all(destination.parent().unwrap()).unwrap();
@@ -394,7 +402,12 @@ fn cli_preflight_json_dry_run_matches_the_real_python_tool() {
     assert_preflight_schema(&cli_report);
     assert_eq!(cli_report["checks"], python_report["checks"]);
     assert_eq!(cli_report["dry_run"], true);
-    assert_eq!(cli_report["checks"].as_array().unwrap().len(), 3);
+    assert_eq!(cli_report["checks"].as_array().unwrap().len(), 4);
+    assert!(cli_report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| { check["job"] == "python-static" && check["step"] == "Test-time ratchets" }));
 }
 
 #[test]
@@ -418,7 +431,12 @@ fn cli_preflight_defaults_to_full_and_executes_docs_only_without_services() {
     assert_eq!(report["failures"], serde_json::json!([]));
     assert_eq!(report["ci_only"], serde_json::json!([]));
     let checks = report["checks"].as_array().unwrap();
-    for job in ["action-pins", "commit-messages", "gitleaks"] {
+    for job in [
+        "action-pins",
+        "commit-messages",
+        "gitleaks",
+        "python-static",
+    ] {
         let check = checks
             .iter()
             .find(|check| check["job"] == job)

@@ -149,6 +149,13 @@ CONTRACTS_SETUP = exact(
 )
 CHECKS = (
     exact(
+        "python-static",
+        "Test-time ratchets",
+        "uv run python -m curie_test_support.ratchets",
+        ".",
+        "always",
+    ),
+    exact(
         "action-pins",
         "Require third party action SHA pins and version comments",
         ACTION_PINS_COMMAND,
@@ -789,6 +796,8 @@ def check_pr_body(
 
 def render_command(root: Path, check: Check, base: str, head: str) -> str:
     command = check.command
+    if check.step == "Test-time ratchets":
+        command += " --base-ref " + shlex.quote(f"origin/{base}")
     range_ = f"origin/{base}..{head}"
     command = command.replace(
         '"${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"',
@@ -876,7 +885,11 @@ def execute_checks(root: Path, base: str, head: str, dry_run: bool, report: dict
             )
             command = f"{CONTRACTS_SETUP.command}\n{command}"
         try:
-            result = run_process(["bash", "-e", "-o", "pipefail", "-c", command], root / check.cwd)
+            result = run_process(
+                ["bash", "-e", "-o", "pipefail", "-c", command],
+                root / check.cwd,
+                {**os.environ, "GITHUB_BASE_REF": base},
+            )
             exit_code, output = result.returncode, result.stdout
         except OSError as error:
             exit_code, output = 127, str(error)
