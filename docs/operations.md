@@ -1646,7 +1646,11 @@ the wait with `factory.ciWaitSeconds` (API env `FACTORY_CI_WAIT_S`, default
 kept. The wait still ends at the execution deadline if that comes first. CI that cannot be verified, including unreadable checks or missing
 required evidence, ends as `ci_unverified`, which is never success. The notice's
 Reason line explains why. The pull request stays open. The work item detail route still
-reports CI as `unavailable` / `github_forbidden` without the permission.
+reports CI as `unavailable`, with a 403's reason naming the read GitHub
+refused (`github_forbidden_list_check_runs`, `github_forbidden_get_combined_status`,
+`github_forbidden_get_branch_rules` or `github_forbidden_get_branch`). The
+reason names the operation and does not claim which App permission is missing:
+a 403 alone cannot say that (#5222).
 
 Per-repository factory settings live under `factory.bindings[].repos[]`. A
 binding joins one tracker (`tracker`) to its repositories, and each `repos`
@@ -2335,6 +2339,8 @@ it. `ci.state` is `passing`, `failing`, `pending`, `none` (no check runs),
 `not_applicable` (no pull request) or `unavailable` with a fixed `reason`:
 `no_head_sha`, `app_not_configured`, `installation_refused`,
 `github_unauthorized`, `github_forbidden`,
+`github_forbidden_list_check_runs`, `github_forbidden_get_combined_status`,
+`github_forbidden_get_branch_rules`, `github_forbidden_get_branch`,
 `github_not_found`, `github_rate_limited`, `github_error`, `timeout`,
 `malformed_response`, `too_many_check_runs` or `observation_busy` (every
 concurrent credential slot is held by an in-flight mint). The list route reports
