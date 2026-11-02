@@ -62,7 +62,8 @@ contradict ADR 0220 section 9.
    The `cron:<name>` author, the `source` field and the event id are routing
    data. None of them alone, or together, satisfies this check. A turn that
    fails it is a definitive refusal, and its run closes as `failed` with reason
-   `identity_refused` (#5305).
+   `identity_refused`, as [#5305](https://github.com/curie-eng/curie/issues/5305)
+   already realized.
 
 3. **Revocation takes effect at every execution boundary.** The kernel repeats
    the decision 2 check at each boundary where it checks an HTTP turn today
@@ -88,6 +89,32 @@ contradict ADR 0220 section 9.
    HTTP-selected binding raises an HTTP-selected approval. The answering actor
    is resolved and checked as ADR 0246 requires. The deployment authority never
    answers an approval.
+
+## Realizing work and acceptance evidence
+
+[#5304](https://github.com/curie-eng/curie/issues/5304) tracks the
+implementation, which begins only after acceptance. The realizing code paths
+are:
+
+1. `curie_worker.kernel.identity.prepare` and `curie_worker.kernel.identity.check`:
+   the typed scheduled authority of decisions 1 to 3, read from durable state
+   at `prepare`, `claim_or_resume` and `start`.
+2. `curie_worker.cron_loop.CronSchedulerLoop._admit`: the shared predicate of
+   decision 4 before a run row is inserted.
+3. `curie_api.routers.hook_fire`: the manual fire of decision 5 reaching the
+   same kernel check.
+4. `curie_worker.kernel.hooks._close_hook_run_after_refusal`: the refusal
+   closure, already realized by
+   [#5307](https://github.com/curie-eng/curie/pull/5307) for
+   [#5305](https://github.com/curie-eng/curie/issues/5305).
+
+Acceptance evidence is a worker regression with real Postgres and Valkey and
+the production binding classifier: a valid scheduled turn on an HTTP-required
+binding runs once; each failed condition of decision 2 refuses before any
+claim; a deployment replaced, a pause, a kill and a binding change between
+admission and each boundary of decision 3 refuse before the next effect; and a
+context-free turn that only claims `TurnSource.CRON`, without an open run row
+for the bound agent, is refused.
 
 ## Consequences
 
@@ -126,4 +153,4 @@ contradict ADR 0220 section 9.
   bindings.** Rejected: it leaves a supported feature broken on every binding an
   operator migrates, and contradicts the separate contract the earlier ADRs
   reserved. Until this ADR is accepted and realized, that is the current
-  behavior, now with closed run records (#5305).
+  behavior, now with closed run records (#5305, fixed by #5307).
