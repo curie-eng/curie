@@ -1,6 +1,8 @@
 name: PR body guard
 
 on:
+  merge_group:
+    types: [checks_requested]
   pull_request:
     branches: [main, next, "task/**"]
     # A PR body can be edited without a new commit. Re-run the body guards on
@@ -10,8 +12,8 @@ on:
     types: [opened, synchronize, reopened, edited]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -23,12 +25,17 @@ jobs:
     name: PR body (real newlines)
     runs-on: ubuntu-24.04
     steps:
+      - name: Acknowledge the PR metadata judgment
+        if: github.event_name == 'merge_group'
+        run: echo 'PR-event run already judged this metadata; merge groups reuse that judgment.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@v7
+        if: github.event_name != 'merge_group'
         with:
           persist-credentials: false
       # Keep untrusted PR text out of shell source. github-script reads the
       # payload directly and writes its bytes to a runner-owned temporary file.
       - name: Write the pull request body, title, changed files, and open waiver issues
+        if: github.event_name != 'merge_group'
         uses: actions/github-script@v9
         env:
           PR_BODY_FILE: ${{ runner.temp }}/curie-pr-body.md
@@ -145,8 +152,10 @@ jobs:
       # Prove both branches of the matcher can still be reached before trusting
       # its verdict against the event payload.
       - name: PR body guard self-test
+        if: github.event_name != 'merge_group'
         run: bash scripts/check-pr-body.sh --self-test
       - name: Check body guards and required tier evidence
+        if: github.event_name != 'merge_group'
         env:
           PR_BODY_FILE: ${{ runner.temp }}/curie-pr-body.md
           PR_TITLE_FILE: ${{ runner.temp }}/curie-pr-title.txt

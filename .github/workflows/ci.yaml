@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, next]
   pull_request:
@@ -251,7 +253,12 @@ jobs:
         id: python-runtime
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            uv run python tools/e2e-ci-selection/select_tiers.py \
+              --registry .github/e2e-selection.yaml \
+              --base "${{ github.event.merge_group.base_sha }}" \
+              --head "${{ github.event.merge_group.head_sha }}"
+          elif [ "${{ github.event_name }}" != "pull_request" ]; then
             uv run python tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --push
@@ -651,8 +658,9 @@ jobs:
         run: uv run python scripts/check-alembic-revisions.py
       - name: Alembic cross-train lineage
         env:
-          BASE: ${{ github.base_ref || github.ref_name }}
+          BASE: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_ref || github.base_ref || github.ref_name }}
         run: |
+          BASE="${BASE#refs/heads/}"
           case "$BASE" in
             main) other_train=next ;;
             next) other_train=main ;;
@@ -717,8 +725,12 @@ jobs:
       # unbumped wire change vs an existing base lock exits 1.
       - name: ACI wire-lock base gate
         run: |
-          git fetch --no-tags --depth=1 origin "${{ github.base_ref || github.ref_name }}" || true
-          git show "origin/${{ github.base_ref || github.ref_name }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock 2>/dev/null || true
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            git show "${{ github.event.merge_group.base_sha }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock
+          else
+            git fetch --no-tags --depth=1 origin "${{ github.base_ref || github.ref_name }}" || true
+            git show "origin/${{ github.base_ref || github.ref_name }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock 2>/dev/null || true
+          fi
           uv run python -m aci_protocol.wire_lock --check-base /tmp/base-wire.lock
 
   python:
@@ -955,10 +967,12 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
           VERSION_ONLY: ${{ needs.changes.outputs.version_only }}
         run: |
           set -euo pipefail
-          if [ "$EVENT" != "pull_request" ]; then
+          if [ "$EVENT" != "pull_request" ] && [ "$EVENT" != "merge_group" ]; then
             echo "tests=true ($EVENT always runs the Rust tests)"
             echo "tests=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -970,9 +984,14 @@ jobs:
             echo "tests=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git fetch --quiet origin "$BASE_REF"
+          if [ "$EVENT" = "merge_group" ]; then
+            diff_range="$BASE_SHA..$HEAD_SHA"
+          else
+            git fetch --quiet origin "$BASE_REF"
+            diff_range="origin/$BASE_REF...HEAD"
+          fi
           grep -vE '^[[:space:]]*(#|$)' .github/rust-test-paths.txt > "$RUNNER_TEMP/patterns"
-          git diff --name-only "origin/$BASE_REF...HEAD" > "$RUNNER_TEMP/changed"
+          git diff --name-only "$diff_range" > "$RUNNER_TEMP/changed"
           # grep exits 1 for "no match" and 2 for a broken pattern; only the
           # first may skip the tests, so a bad regex fails this job closed.
           status=0
@@ -1296,7 +1315,7 @@ jobs:
     # on every push to main and next (so every releasable commit is proven, and
     # the per-commit portable binaries below still publish for both branches)
     # and on the nightly workflow_dispatch of the full suite.
-    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.cli_release == 'true' }}
+    if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && needs.changes.outputs.cli_release == 'true' }}
     # The release cross-compile path was never exercised before a tag, so a
     # regression in it was undiscoverable until someone tried the artifact on a
     # real host. #1341 shipped exactly that way: both Linux targets inherited
@@ -1383,7 +1402,7 @@ jobs:
     needs: [changes]
     # Same trigger as `cli-portability`: push to main and next plus the nightly
     # dispatch, never a pull request.
-    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.cli_release == 'true' }}
+    if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && needs.changes.outputs.cli_release == 'true' }}
     # `aarch64-apple-darwin` ships in the release matrix (release.yaml) and was
     # compiled for the FIRST TIME when a tag was pushed. Anything that breaks it
     # -- a dependency that does not build on macOS, a `cfg(unix)` assumption that
@@ -1904,13 +1923,20 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
         run: |
-          if [ "$EVENT_NAME" != pull_request ]; then
+          if [ "$EVENT_NAME" != pull_request ] && [ "$EVENT_NAME" != merge_group ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git fetch --no-tags origin "$BASE_REF"
-          if git diff --quiet "origin/${BASE_REF}...HEAD" -- apps/docker-daemon .github/workflows/ci.yaml; then
+          if [ "$EVENT_NAME" = merge_group ]; then
+            diff_range="$BASE_SHA..$HEAD_SHA"
+          else
+            git fetch --no-tags origin "$BASE_REF"
+            diff_range="origin/${BASE_REF}...HEAD"
+          fi
+          if git diff --quiet "$diff_range" -- apps/docker-daemon .github/workflows/ci.yaml; then
             echo "No change under apps/docker-daemon or ci.yaml; skipping"
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
@@ -2550,9 +2576,13 @@ jobs:
   commit-messages:
     name: Commit messages (no AI attribution)
     runs-on: ubuntu-24.04
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     steps:
+      - name: Acknowledge the PR metadata judgment
+        if: github.event_name == 'merge_group'
+        run: echo 'PR-event run already judged this metadata; merge groups reuse that judgment.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request'
         with:
           persist-credentials: false
           # The range needs both endpoints present locally.
@@ -2560,8 +2590,10 @@ jobs:
       # Prove the matcher still distinguishes attribution from mention before
       # trusting its verdict; a gate that cannot fail is not a gate.
       - name: Gate self-test (negative control)
+        if: github.event_name == 'pull_request'
         run: bash scripts/check-commit-messages.sh --self-test
       - name: Check the PR's commit messages
+        if: github.event_name == 'pull_request'
         run: |
           bash scripts/check-commit-messages.sh \
             "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
@@ -2831,6 +2863,12 @@ jobs:
               --registry .github/e2e-selection.yaml \
               --base "origin/$base_ref" \
               --head HEAD
+          elif [ "$event" = "merge_group" ]; then
+            uv run --no-project --with pyyaml==6.0.3 python \
+              tools/e2e-ci-selection/select_tiers.py \
+              --registry .github/e2e-selection.yaml \
+              --base "${{ github.event.merge_group.base_sha }}" \
+              --head "${{ github.event.merge_group.head_sha }}"
           elif [ "$event" = "push" ]; then
             uv run --no-project --with pyyaml==6.0.3 python \
               tools/e2e-ci-selection/select_tiers.py \
@@ -2854,7 +2892,12 @@ jobs:
         run: |
           set -euo pipefail
           scripts='[]'
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            scripts="$(uv run --no-project --with pyyaml==6.0.3 python \
+              tools/runtime-assertion-gate/gate.py select \
+              --base "${{ github.event.merge_group.base_sha }}" \
+              --head "${{ github.event.merge_group.head_sha }}")"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
             scripts="$(uv run --no-project --with pyyaml==6.0.3 python \
               tools/runtime-assertion-gate/gate.py select \
               --base "origin/${{ github.base_ref }}" --head HEAD)"
