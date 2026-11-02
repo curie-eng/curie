@@ -24,19 +24,7 @@ def _check_body(
 ) -> subprocess.CompletedProcess[str]:
     body_path = tmp_path / "pull-request-body.md"
     body_path.write_text(body, encoding="utf-8")
-    changed_files_path = tmp_path / "changed-files.json"
-    changed_files_path.write_text("[]\n", encoding="utf-8")
-    open_issues_path = tmp_path / "open-issues.json"
-    open_issues_path.write_text("[]\n", encoding="utf-8")
-    command = [
-        "bash",
-        str(CHECKER),
-        str(body_path),
-        "--changed-files-file",
-        str(changed_files_path),
-        "--open-issues-file",
-        str(open_issues_path),
-    ]
+    command = ["bash", str(CHECKER), str(body_path)]
     if title is not None:
         title_path = tmp_path / "pull-request-title.txt"
         title_path.write_text(title, encoding="utf-8")
@@ -301,22 +289,10 @@ def test_pr_body_self_test_covers_the_patch_release_half() -> None:
     assert "Live proof" in combined, _diagnostics(completed)
 
 
-@pytest.mark.parametrize("path", [
-    "apps/api/src/curie_api/routers/publications.py",
-    "runner/src/curie_runner/verification_preflight.py",
-    "charts/curie/templates/deployment.yaml",
-    "apps/worker/src/curie_worker/workitem_execution.py",
-])
-def test_protected_paths_need_no_tier_rows(tmp_path: Path, path: str) -> None:
-    body = tmp_path / "body.md"
-    body.write_text("## Verification\n\nLocally: focused guard tests passed.\n", encoding="utf-8")
-    files = tmp_path / "changed-files.json"
-    files.write_text(__import__("json").dumps([path]), encoding="utf-8")
-    issues = tmp_path / "open-issues.json"
-    issues.write_text("[]", encoding="utf-8")
-    completed = subprocess.run(
-        ["bash", str(CHECKER), str(body), "--changed-files-file", str(files),
-         "--open-issues-file", str(issues)],
-        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+def test_pr_body_needs_no_tier_rows_or_path_metadata(tmp_path: Path) -> None:
+    completed = _check_body(
+        tmp_path,
+        "## Verification\n\nLocally: focused guard tests passed.\n"
+        "CI results are read from CI. No external proof is needed.\n",
     )
     assert completed.returncode == 0, _diagnostics(completed)

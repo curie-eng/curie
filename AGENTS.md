@@ -1,6 +1,6 @@
 # AGENTS.md - Curie
 
-**Public information boundary — applies before every publication.** Never put
+**Public information boundary ,  applies before every publication.** Never put
 real customer or downstream deployment information into this public upstream
 repository or its public records. This includes files, commit messages, branch
 and tag names, PRs, issues, comments, releases, and CI logs or artifacts. Use
@@ -65,252 +65,35 @@ before starting work that is otherwise ready. Keep shared-file ownership and
 merge or deployment dependencies sequential. After a prerequisite merges,
 retarget its dependent PR promptly and rerun the required gates before merging.
 
+## CI gates
+
+1. PR gate: static checks, unit tests and impact-selected tests, with at most one
+   shared real install. The target is p90 at most 10 minutes.
+2. Merge queue target state, once the queue is enabled: GitHub `merge_group` runs
+   the deep shared-install factory and chart suites, plus lifecycle and upgrade
+   suites when chart, migration or upgrade paths change. Nothing lands without
+   that gate. Once the queue is enabled, agents land PRs with
+   `gh pr merge --auto --merge` after review and PR checks pass; a queue failure
+   comes back to the PR.
+3. Nightly: full upgrade matrix, fresh-cluster lifecycle cases and real-model
+   ladder. Fix a red nightly or delete the suite within one working day.
+4. Release: version-only release PRs and forward merges reuse proof from the
+   identical tree.
+5. Shared installs: a CI job performs at most one kind cluster and one platform
+   install. A test owns its own cluster or install only when cluster or install
+   lifecycle is the behavior under test; those tests run nightly.
+6. Flakes: a test that fails and then passes on an unchanged rerun is deleted or
+   demoted, never retried or repaired in place. The deleting PR names lost coverage.
+
 ## Verify commands (per package)
 
-Run these from the repo root unless noted. CI (`.github/workflows/ci.yaml`) runs
-the same commands.
-
-**Python (all packages, from root):**
-Run this local Python CI baseline. For concurrent jobs, first apply
-[Concurrent local verification](#concurrent-local-verification) below: this
-block is the default port reference, not a requirement to share its resources.
-Do not use `--profile full` for startup because it can start stale application images.
-Set `base=next` when your worktree targets `next`.
-
-```bash
-(
-  set -e
-  base=${base:-main}
-  if [[ -n "${COMPOSE_FILE:-}" && -z "${COMPOSE_PROJECT_NAME:-}" ]]; then
-    echo "Set COMPOSE_PROJECT_NAME with a custom COMPOSE_FILE" >&2
-    exit 2
-  fi
-  if [[ -z "${COMPOSE_PROJECT_NAME:-}" ]]; then
-    export COMPOSE_PROJECT_NAME=curie-implement-baseline
-    baseline_default=1
-  else
-    baseline_default=0
-  fi
-  compose_base="$PWD/compose.dev.yaml"
-  compose_file_list=${COMPOSE_FILE:-$compose_base}
-  IFS=: read -r -a compose_files <<< "$compose_file_list"
-  compose=(docker compose -p "$COMPOSE_PROJECT_NAME")
-  for compose_file in "${compose_files[@]}"; do
-    [[ "$compose_file" = /* && -f "$compose_file" ]] || {
-      echo "COMPOSE_FILE must contain existing absolute paths" >&2
-      exit 2
-    }
-    compose+=(-f "$compose_file")
-  done
-  if (( baseline_default )); then
-    baseline_lock=/tmp/curie-implement-baseline.lock
-  else
-    [[ "$COMPOSE_PROJECT_NAME" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || {
-      echo "COMPOSE_PROJECT_NAME is not safe for a lock path" >&2
-      exit 2
-    }
-    baseline_lock="/tmp/curie-implement-${COMPOSE_PROJECT_NAME}.lock"
-    : "${CURIE_RELEASED_UPGRADE_POSTGRES_HOST:?set the isolated Postgres host}"
-    : "${CURIE_RELEASED_UPGRADE_POSTGRES_PORT:?set the isolated Postgres port}"
-    export CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT="$COMPOSE_PROJECT_NAME"
-    export CURIE_RELEASED_UPGRADE_COMPOSE_FILES="$compose_file_list"
-    export CURIE_RELEASED_UPGRADE_INTEGRATION=1
-    export TEST_DATABASE_URL="postgresql+asyncpg://postgres:postgres@${CURIE_RELEASED_UPGRADE_POSTGRES_HOST}:${CURIE_RELEASED_UPGRADE_POSTGRES_PORT}/postgres"
-    export DATABASE_URL="$TEST_DATABASE_URL"
-  fi
-  export TEST_VALKEY_HOST=${TEST_VALKEY_HOST:-127.0.0.1}
-  export TEST_VALKEY_PORT=${TEST_VALKEY_PORT:-26379}
-  export VALKEY_HOST="$TEST_VALKEY_HOST"
-  export VALKEY_PORT="$TEST_VALKEY_PORT"
-  export TEST_S3_ENDPOINT_URL=${TEST_S3_ENDPOINT_URL:-http://127.0.0.1:29000}
-  export S3_ENDPOINT_URL="$TEST_S3_ENDPOINT_URL"
-  export TEST_LANGFUSE_HOST=${TEST_LANGFUSE_HOST:-${LANGFUSE_HOST:-http://127.0.0.1:23000}}
-  export LANGFUSE_HOST="$TEST_LANGFUSE_HOST"
-  export TEST_OTEL_COLLECTOR_ENDPOINT=${TEST_OTEL_COLLECTOR_ENDPOINT:-http://127.0.0.1:24318/v1/traces}
-  exec 9>"$baseline_lock"
-  if ! flock -n 9; then
-    echo "Another local Python CI baseline is already running"
-    exit 1
-  fi
-  wire_lock=$(mktemp /tmp/curie-implement-baseline-wire.lock.XXXXXX)
-  cleanup() {
-    "${compose[@]}" --profile full down -v
-    rm -f "$wire_lock"
-  }
-  trap cleanup EXIT
-  uv lock --check
-  uv sync
-  uv run python scripts/check-alembic-revisions.py
-  case "$base" in
-    main) other_train=next ;;
-    next) other_train=main ;;
-    *) other_train= ;;
-  esac
-  if [[ -n "$other_train" ]]; then
-    git fetch --no-tags origin "$other_train"
-    uv run python scripts/check-alembic-revisions.py --other-train-ref "origin/$other_train"
-  else
-    echo "cross-train lineage skipped: base $base is not a train branch"
-  fi
-  uv run python scripts/check-schema-window.py
-  uv run python scripts/check-contract-migration-timing.py
-  uv run ruff check .
-  uv run mypy
-  uv run lint-imports
-  bash scripts/check-docs.sh
-  bash scripts/check-wire-tolerance.sh
-  COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" COMPOSE_FILE="$compose_file_list" \
-    python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480
-  git fetch --force --tags origin refs/heads/main:refs/remotes/origin/main
-  uv run python scripts/check-released-upgrade.py --self-test
-  uv run python scripts/check-released-upgrade.py
-  (cd apps/api && uv run alembic upgrade head)
-  git fetch --no-tags origin "$base" || true
-  git show "origin/$base:packages/aci-protocol/schema/wire.lock" > "$wire_lock" 2>/dev/null || true
-  uv run python -m aci_protocol.wire_lock --check-base "$wire_lock"
-  uv run pytest -q
-)
-```
-
-Linked worktrees share their repository's Git shallow metadata. Never use a
-shallow fetch in this checkout or one of its linked worktrees; if a shallow
-fetch is needed, use an independent clone instead.
-
-Occupied default ports are a reason to isolate the job, not by themselves a
-failed precondition. Preserve the existing owner and follow the instructions
-below before deciding that local verification is blocked.
-
-### Concurrent local verification
-
-This applies to every local implementation job, including Bonus Drain. Agents
-are authorized to create disposable Compose overrides, endpoint files and test
-launchers inside their own worktree without asking permission. Keep them under
-the gitignored `.projects/` directory. Do not add infrastructure features to the
-product just to run a job. Direct Compose invocation for this disposable setup
-is an exception to the CLI entry point guidance in `CLAUDE.md`.
-
-1. Choose a unique Compose project for this execution, such as
-   `curie-check-<issue>-<run-suffix>`. Inventory running containers, published
-   ports and network ownership first. Use the same project, absolute base
-   Compose path and override files for config, startup, exec, logs and teardown.
-   A project name alone does not change published ports or explicitly named
-   networks.
-2. Generate a private override for every service you will start. Replace each
-   published port list with `ports: !override [...]`, binding to `127.0.0.1`.
-   This requires Compose 2.24.4 or later; see the
-   [Compose merge reference](https://docs.docker.com/reference/compose-file/merge/#replace-value).
-   Plain Compose list merging can retain the original occupied binding. Either
-   choose unused custom ports and retry allocation on a bind collision, or let
-   Docker allocate ports and discover them with `docker compose port` before
-   starting consumers. Do not assume an unused port probe reserves the port.
-   Keep chosen ports below 49152: short-lived local listeners take ports in
-   the macOS ephemeral range (49152-65535), and one that lands on the local
-   reply stub port (`CURIE_LOCAL_STUB_PORT`) makes `curie local message`
-   refuse to start (#4823).
-   For a full Python baseline, replace every published backing service port:
-
-   ```yaml
-   services:
-     postgres:
-       ports: !override ["127.0.0.1:35432:5432"]
-     valkey:
-       ports: !override ["127.0.0.1:36379:6379"]
-     clickhouse:
-       ports: !override ["127.0.0.1:38123:8123", "127.0.0.1:39009:9000"]
-     rustfs:
-       ports: !override ["127.0.0.1:39000:9000", "127.0.0.1:39001:9001"]
-     langfuse-web:
-       ports: !override ["127.0.0.1:33000:3000"]
-     otel-collector:
-       ports: !override ["127.0.0.1:34317:4317", "127.0.0.1:34318:4318", "127.0.0.1:38888:8888"]
-   networks:
-     curie_runner:
-       name: "${COMPOSE_PROJECT_NAME}_runner"
-   ```
-
-   These example ports must also be checked for occupancy. Inspect the resolved
-   `docker compose -p "$COMPOSE_PROJECT_NAME" -f compose.dev.yaml -f <override> config`
-   before startup; confirm that no enabled service retains a shared binding and
-   the runner network belongs to this project.
-3. Point every host consumer at the chosen endpoints. Inspect the actual test
-   fixtures and settings: common variables include `DATABASE_URL`,
-   `TEST_DATABASE_URL`, `VALKEY_HOST`, `VALKEY_PORT`, `TEST_VALKEY_PORT`,
-   `S3_ENDPOINT_URL`, `TEST_S3_ENDPOINT_URL`, `LANGFUSE_HOST`, `CURIE_API_URL`,
-   `CURIE_API_TARGET` and `PW_PORT`. Export only settings the consumer reads.
-   Bridge containers keep their internal service addresses. The host network
-   worker needs explicit override entries for its database, Valkey, S3, API
-   and worker OTel endpoints, plus `CURIE_DOCKER_NETWORK` matching the private
-   runner network. Shell exports do not replace literal Compose environment
-   entries. Use private image tags when building or running workers. The Docker
-   substrate copies validated bundle, workspace, and attachment inputs through
-   the Docker API into claim-owned named volumes. Workspaces and temporary
-   directories need no shared filesystem or matching daemon-host paths.
-4. Export the full isolated contract before the baseline. The baseline consumes
-   `COMPOSE_PROJECT_NAME` and `COMPOSE_FILE`, keeps the default shared lock only
-   when it selected the default project itself, and uses a project scoped lock
-   for every caller supplied project. It passes the same Compose files and
-   project to the upgrade gate through
-   `CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT` and
-   `CURIE_RELEASED_UPGRADE_COMPOSE_FILES`; supply the matching loopback
-   `CURIE_RELEASED_UPGRADE_POSTGRES_HOST` and
-   `CURIE_RELEASED_UPGRADE_POSTGRES_PORT`. Also export matching
-   `TEST_VALKEY_HOST`, `TEST_VALKEY_PORT`, `TEST_S3_ENDPOINT_URL`,
-   `TEST_LANGFUSE_HOST`, and `TEST_OTEL_COLLECTOR_ENDPOINT`. The baseline derives
-   runtime consumer variables from those values, and the readiness helper reads
-   `TEST_LANGFUSE_HOST` for its web endpoint.
-   For example:
-
-   ```bash
-   export COMPOSE_PROJECT_NAME=curie-check-2751-a
-   export COMPOSE_FILE="$PWD/compose.dev.yaml:$PWD/.projects/2751/compose.yaml"
-   export CURIE_RELEASED_UPGRADE_POSTGRES_HOST=127.0.0.1
-   export CURIE_RELEASED_UPGRADE_POSTGRES_PORT=35432
-   export TEST_VALKEY_PORT=36379
-   export TEST_S3_ENDPOINT_URL=http://127.0.0.1:39000
-   export TEST_LANGFUSE_HOST=http://127.0.0.1:33000
-   export TEST_OTEL_COLLECTOR_ENDPOINT=http://127.0.0.1:34318/v1/traces
-   ```
-
-   Record resolved mappings, candidate identity, and exact commands without
-   credential values. The gate rejects incomplete or mismatched configuration
-   before database mutation. Keep all baseline assertions unchanged.
-5. Do not silently replace a required ladder with focused tests or weaken a
-   gate. Preserve other jobs and run each cleanup with its exact Compose array.
-   The Python baseline, released upgrade gate, CLI local lifecycle, connectors,
-   and E2E ladder all consume the same isolation contract: `COMPOSE_PROJECT_NAME`,
-   ordered `COMPOSE_FILE` (candidate `compose.dev.yaml` then a private override),
-   and matching host endpoints. Do not force project `curie` or a single
-   `compose.dev.yaml` when those values are set. Example local CLI / ladder run:
-
-   ```bash
-   export COMPOSE_PROJECT_NAME=curie-check-2780-a
-   export COMPOSE_FILE="$PWD/compose.dev.yaml:$PWD/.projects/2780/compose.yaml"
-   export CURIE_API_URL=http://127.0.0.1:38000
-   export VALKEY_HOST=127.0.0.1 VALKEY_PORT=36379
-   export S3_ENDPOINT_URL=http://127.0.0.1:39000
-   export CURIE_DOCKER_NETWORK=curie-check-2780-a_runner
-   export CURIE_LOCAL_STUB_PORT=18155
-   export CURIE_LOCAL_POSTGRES_HOST=127.0.0.1 CURIE_LOCAL_POSTGRES_PORT=35432
-   export CURIE_LOCAL_IMAGE_TAG=dev-2780-a
-   export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:34318
-   export CURIE_LOCAL_OTEL_METRICS_URL=http://127.0.0.1:38888/metrics
-   curie local up --build
-   CURIE_E2E_TIERS=local curie dev e2e-ladder
-   curie local down
-   ```
-
-   Incomplete isolation is a usage error. Teardown uses the same project, files,
-   and labels; never a global `curie*` name sweep.
-6. Install cleanup before startup and remove only this execution's containers,
-   networks, volumes and spawned runners. Identify resources by the project
-   label and recorded container IDs, never a global `curie*` name sweep. On a
-   partial startup failure, clean the owned partial stack before reallocating.
-   Verify that owned resources are gone and other jobs remain running.
-
-Existing task contracts still govern scope and required evidence. A running job
-or older worktree does not automatically acquire newer instructions; read this
-section from the updated base when resuming. Do not edit a live claimed Bonus
-Drain task or launch a second copy to apply the guidance.
+Use the [local verification reference](docs/local-verification.md) for the Python
+baseline, isolated Compose setup, backing services and cleanup procedures.
+Concurrent jobs must isolate every port, network, image and consumer endpoint,
+preserve other owners, install cleanup before startup, and verify teardown.
+Never weaken or replace a required gate when isolating verification. Linked
+worktrees share shallow metadata: never shallow-fetch in this checkout or its
+linked worktrees; use an independent clone if a shallow fetch is needed.
 
 ### Preflight checks
 
@@ -390,11 +173,9 @@ Only product behavior assertions belong in the test body.
 A PR closing a `bug`-labeled issue includes exactly one `Fix pin: <SELECTOR>` line in its body,
 or an explicit `Fix pin: n/a - <reason>` line; CI enforces this. A PR closing no bug-labeled issue may omit
 the declaration, but a selector supplied voluntarily on any PR is still verified.
-The pin's tier is derived from the selector's location (unit tests,
-`cli/tests/local/test_*.py` local tests, `charts/curie/ci/*` cluster checks,
-and other `test_live.py` live tests), not from prose. A pin below the closed issue's `found:unit` /
-`found:local` / `found:cluster` / `found:live` label fails unless the body also carries
-`Fix pin waiver: <reason>`.
+A lower-tier pin that reproduces the defect is accepted without a waiver,
+regardless of the closed issue's discovery label. The verifier must still prove
+that the selected changed test passes and fails when the fix is reversed.
 Assertions about an external API or SDK's shape or auth must be grounded in
 provider docs or observed behavior, cited in a test comment, never in the
 implementation's own assumption. Any read-modify-write on a versioned row needs a
@@ -416,80 +197,11 @@ delivery cap is a bug.
 
 ## The dev stack: compose.dev.yaml
 
-The compose stack now has two profiles. `full` brings up the whole backing
-stack (Postgres + Valkey + Langfuse v3 + ClickHouse + RustFS + OTel Collector).
-`core` brings up the smaller local product loop (Postgres + Valkey + RustFS +
-API + worker). Every backend integration test and UI E2E runs against `full`.
-
-```bash
-docker compose --profile full -f compose.dev.yaml up -d   # full stack
-OTEL_EXPORTER_OTLP_ENDPOINT= docker compose --profile core -f compose.dev.yaml up -d   # 7-service minimal stack (no Langfuse/ClickHouse/OTel/UI); blank endpoint avoids a DNS retry against the absent otel-collector
-docker compose -f compose.dev.yaml ps        # check health
-docker compose -f compose.dev.yaml down      # stop, KEEP volumes (fast restart)
-docker compose -f compose.dev.yaml down -v   # stop and WIPE volumes (throwaway)
-```
-
-**Clean up after yourself — this is not optional.** If you bring the local
-stack up, you MUST take it down when you are done. This box does not have the
-RAM to leave the full stack idling, and this keeps happening: stacks get left
-running across sessions and starve the machine. Before you end a session in
-which you ran `curie local up` / `docker compose ... up`, run `curie local
-down` (or `docker compose -f compose.dev.yaml down`) and confirm with
-`docker ps` that none of this run's containers are still up. Use the same private
-project and overrides used for startup. Also remove stray runner containers this
-run spawned, identified by recorded IDs or ownership labels; preserve other
-jobs' containers. The thread that brought the
-stack up owns tearing it down — a blocked or crashed test agent never cleans up
-after itself, so do not assume someone else will.
-
-**Do stack testing from a worktree, not the main checkout.** If a local test
-requires code edits, make them in a git worktree cut from the release train base
-selected below and land them as a PR. Never edit `main` or `next` in place to
-make a local run work. Read only runs against the current tree are fine; the
-moment you need to change code, cut a worktree.
-
-Add `--profile slack` through `curie local up --slack` to start the optional dispatcher for real Slack.
-
-Host ports (non-default host ports to avoid local collisions):
-
-| Service | Host port |
-|---|---|
-| Langfuse UI | http://localhost:23000 |
-| Postgres | localhost:25432 |
-| Valkey | localhost:26379 |
-| ClickHouse | HTTP 28123, native 29009 |
-| RustFS | S3 29000, console 29001 |
-| OTel Collector | gRPC 24317, HTTP 24318 |
-
-Config lives in `.env.example` (copy to the gitignored `.env` to override; the
-stack runs on the baked defaults without one). Load-bearing facts:
-
-- **ClickHouse:** `compose.dev.yaml` stays on `:24.8.14.39` so an SSE4.2-only
-  developer host can still boot the local stack (Langfuse `3.225.5` still
-  applies on the 24.8 line). The Helm chart default is `:25.12.11.4`, required
-  by the Langfuse pin's ClickHouse migrations from 39 onward; AVX is a
-  chart-default requirement. `preflights.avxCheck` fails an AVX-less node
-  unless the operator pins a tag in `clickhouse.sse42SafeTags`. Do not move the
-  two chart pins independently (#2210). Both sides name a patch build, not a
-  `24.8` / `25.12` alias -- upstream republishes those (#2319).
-- **Postgres and Valkey are one pin, not two:** `postgres.image` is
-  digest-pinned (`postgres:16.15-alpine@sha256:cf78e766...`, because
-  PostgreSQL's version is two components) and `valkey.image` is
-  `valkey/valkey:8.1.10-alpine`. `charts/curie/values.yaml`, `compose.dev.yaml`,
-  the rust job's Valkey service in `.github/workflows/ci.yaml`, and
-  `charts/curie/ci/postgres-readiness-delay.Dockerfile` must all name the same
-  build; `compose/tests/test_generate_release_compose.py` asserts it.
-  `postgres.podSecurityContext.fsGroup` is `70`, the `postgres` gid inside the
-  pinned image, asserted against the running image by
-  `charts/curie/ci/postgres-fsgroup-assertions.sh` (#2319).
-- **Langfuse OTLP ingest is HTTP-only** (gRPC is silently unsupported). Services
-  may emit OTLP over gRPC or HTTP to the OTel Collector (4317/4318); the
-  collector always exports to Langfuse over HTTP. Send app traces to the
-  collector, not directly to Langfuse.
-- **Langfuse is bootstrapped headless** with a fixed dev project (`curie-dev`)
-  and keys `pk-lf-curie-dev` / `sk-lf-curie-dev`, so the OTel path
-  authenticates on first boot with no manual key-minting. Read traces back via
-  `curl -u pk-lf-curie-dev:sk-lf-curie-dev http://localhost:23000/api/public/...`. <!-- gitleaks:allow -->
+The [local verification reference](docs/local-verification.md#the-dev-stack-composedevyaml)
+covers profiles, endpoints, version pins and trace authentication. Run stack tests
+from a worktree. If code needs edits, create a worktree from the selected release
+train first. Every stack owner must stop its exact private project, remove only
+its runners, and confirm all owned containers are gone before reporting done.
 
 ## This repo is PUBLIC: examples only, never real identifiers
 
@@ -639,197 +351,9 @@ rather than silently diverging.
 
 ## Parity seams: cover the sibling or file it
 
-Sibling-path drift is the dominant historical bug class here: logic or hardening
-lands on one side of a structural seam while its twin keeps the old behavior.
-Known seam pairs, each tagged with what actually enforces it -- `vector:` (a
-frozen two-sided vector file), `gate:` (a test or CI job), `by construction:` (a
-shared module both sides route through), or `convention` (no gate covers the pair
-as a whole; remembered only):
-
-- worker vs CLI credential forwarding -- `_SDK_PASSTHROUGH_ENV`
-  (`apps/worker/src/curie_worker/sandbox/docker.py`) and the CLI picker
-  (`cli/src/commands/credential_env.rs`) can't share code across Python/Rust, so they are frozen
-  together in `tests/vectors/model-credential-forwarding.json`.
-  [vector: `tests/vectors/model-credential-forwarding.json`]
-- dispatcher vs CLI approval action ids -- the approval-card action-id constants
-  (`apps/dispatcher/src/curie_dispatcher/approval_actions.py`) and the CLI's
-  `APPROVE_ACTION_ID_PREFIX` (`cli/src/chat.rs`) can't share code across
-  Python/Rust, so they are frozen together in
-  `tests/vectors/approval-action-ids.json`.
-  [vector: `tests/vectors/approval-action-ids.json`]
-- worker vs CLI progress block ids -- the Slack progress card and milestone
-  `block_id` prefixes (`PROGRESS_CARD_BLOCK_ID_PREFIX` and
-  `PROGRESS_MILESTONE_BLOCK_ID_PREFIX` in `apps/worker/src/curie_worker/blocks.py`)
-  and the CLI stub's copies (`cli/src/chat.rs`), which tell a progress post or
-  edit from the turn's answer, can't share code across Python/Rust, so they are
-  frozen together in `tests/vectors/progress-blocks.json`.
-  [vector: `tests/vectors/progress-blocks.json`]
-- dispatcher vs API approval-principal tokens -- the dispatcher mint codec
-  (`apps/dispatcher/src/curie_dispatcher/approval_principal.py`) and API verifier
-  (`apps/api/src/curie_api/approval_principal.py`) are frozen together in
-  `tests/vectors/approval-principal.json`.
-  [vector: `tests/vectors/approval-principal.json`]
-- dispatcher vs API approval-row miss -- the API 404 detail
-  (`apps/api/src/curie_api/routers/approvals.py`) and the dispatcher's
-  ownership-miss match (`apps/dispatcher/src/curie_dispatcher/approval_actions.py`)
-  cannot share code, so they are frozen together in
-  `tests/vectors/approval-ownership.json`.
-  [vector: `tests/vectors/approval-ownership.json`]
-- API vs worker approval re-raise refusal code -- the 409 code
-  (`apps/api/src/curie_api/routers/approvals.py`) and the worker's refusal
-  match (`apps/worker/src/curie_worker/approvals.py`) cannot share code, so
-  they are frozen together in `tests/vectors/approval-reraise-refusal.json`.
-  [vector: `tests/vectors/approval-reraise-refusal.json`]
-- API vs worker vs CLI thread-reset SET -- `THREAD_RESET_SET` /
-  `THREAD_RESET_INFLIGHT_SET` (`apps/api/src/curie_api/threadreset.py`,
-  `apps/worker/src/curie_worker/consumer.py`) and the CLI's `THREAD_RESET_SET`
-  (`cli/src/queue.rs`) can't share code across Python/Rust. Operator
-  `reset-thread` and `local`/`cluster` eval (#1534) both SADD the same set.
-  Frozen in `tests/vectors/thread-reset-set.json`.
-  [vector: `tests/vectors/thread-reset-set.json`]
-- worker vs CLI eval-isolate prefix -- `EVAL_ISOLATE_THREAD_PREFIX`
-  (`apps/worker/src/curie_worker/binding.py`) and the CLI copy
-  (`cli/src/queue.rs`, stamped in `cli/src/message.rs::run_eval_turns`)
-  cannot share code across Python/Rust, so they are frozen together in
-  `tests/vectors/eval-memory-isolation.json`.
-  [vector: `tests/vectors/eval-memory-isolation.json`]
-- worker vs API workspace-selection refusal codes -- the 409 `detail.code`
-  values the API's selection router emits
-  (`apps/api/src/curie_api/routers/workspaces.py`) and the worker's prose map
-  (`_SELECTION_REFUSAL_MESSAGES` in `apps/worker/src/curie_worker/workspace.py`)
-  cannot share code because the worker does not import the API package at
-  runtime; the worker maps each code to its own prose and treats an unmapped
-  code as an invalid refusal response (#2684).
-  [vector: `tests/vectors/workspace-selection-refusal.json`]
-  [gate: `apps/api/tests/test_workspace_control_plane.py::test_first_repo_selection_is_sticky_allowlisted_and_conflict_safe`]
-  [gate: `apps/worker/tests/test_workspace.py::test_internal_workspace_selection_409_maps_machine_code_not_detail_prose`]
-- API vs CLI snapshot sealing key custody -- the reserved names, refusal
-  reason and reference grammar (`packages/curie-internal/src/curie_internal/sealing_key.py`)
-  with the API's bundle check (`apps/api/src/curie_api/bundles.py::sealing_key_custody_issues`)
-  and the CLI deploy preflight's mirror (`cli/src/sealing_key.rs`) can't share
-  code across Python/Rust, so the names, the reason verbatim and every bundle's
-  refusals with their locations are frozen together in
-  `tests/vectors/sealing-key-custody.json` (ACTION-EXECUTOR-23).
-  [vector: `tests/vectors/sealing-key-custody.json`]
-- real SDK vs fake model session in the runner (`FakeModelSession`,
-  `runner/src/curie_runner/fake.py`).
-  [by construction: `runner/src/curie_runner/adapter.py::ModelSession`]
-- runs lane vs eval lane stream consumers (`apps/worker/src/curie_worker/consumer.py`
-  vs `eval/stream.py`, both on the shared `stream_consumer.py`).
-  [by construction: `apps/worker/src/curie_worker/stream_consumer.py`]
-- CLI-side vs API-side input validation (validate at the API/persistence
-  boundary, mirror in the CLI). [convention]
-- `local up` vs `local down` compose profile sets.
-  [gate: `cli/src/local.rs::down_passes_every_up_profile`]
-- `compose.dev.yaml` vs the generated release compose.
-  [by construction: `compose/generate_release_compose.py`]
-- `core` vs `full` compose profiles.
-  [gate: `cli/src/local.rs::compose_file_declares_core_and_full_profiles`]
-- `local` vs `cluster` verb pairs (reachability defaults, outcome enums). [convention]
-- CLI `--json` DTOs vs the API models they mirror. [gate: `cli/tests/api_field_parity.rs`]
-- deploy-time validators vs the runtime loaders that re-parse the same value
-  (share normalization code). [convention]
-- worker caller-token minter vs connector proxy verifier -- `mint`
-  (`apps/worker/src/curie_worker/caller_token.py`) and `decide`
-  (`apps/worker/src/curie_connector_proxy/caller.py`) run in different pods,
-  and the proxy may not import the worker, so both read one frozen corpus; the
-  CLI derives its generated public keys against the same seeds.
-  [vector: `tests/vectors/connector-caller-token.json`]
-- connector proxy refusal vs runner diagnosis -- the proxy's refusal body
-  (`apps/worker/src/curie_connector_proxy/server.py`) and the runner's
-  `caller_refused` reason (`runner/src/curie_runner/mcp_tool_capability.py`)
-  ship in different images, so they are frozen together.
-  [vector: `tests/vectors/connector-caller-refusal.json`]
-- worker vs runner vs API deliberate progress capability (ADR-0130) -- the
-  runner control headers and `turn.progress` token scope the worker mints
-  (`apps/worker/src/curie_worker/turn_progress.py`), the runner reads
-  (`runner/src/curie_runner/turn_progress.py`) and the API verifies, and the
-  inbox stream the API appends to (`apps/api/src/curie_api/turn_progress.py`)
-  and the worker's pump reads, cross three images, so they are frozen together.
-  [vector: `tests/vectors/turn-progress-capability.json`]
-- worker vs runner executor route (ACTION-EXECUTOR-24) -- the worker's
-  `execute` client and executor mode variable
-  (`apps/worker/src/curie_worker/runner_client.py`) and the runner's
-  `/v1/execute` route and executor mode status body
-  (`runner/src/curie_runner/server.py::create_executor_app`) ship in different
-  images and cannot share code at runtime, so the request and response of every
-  phase, the route's refusal codes and the worker code each maps to, the status
-  body and the mode variable are frozen together. The `observe_version` and
-  `restore` call arguments and the reply-to-outcome mapping the two sides apply
-  around those phases are frozen beside it. The remediation `read` phase
-  (AUTOMATED-REMEDIATION-12: the request's `pointer`, one `read` per sandbox,
-  `tool_not_read_only` without dialing, the read refusals' worker codes) and
-  the codes it adds, which the API's
-  `apps/api/src/curie_api/action_execution_codes.py` also reads (the
-  worker-reported pre-dispatch code and the sample results that are never
-  refusals), are frozen in the same vector.
-  [vector: `tests/vectors/runner-execute.json`]
-  [vector: `tests/vectors/executor-restore-calls.json`]
-- runner vs worker remediation sample (AUTOMATED-REMEDIATION-12, -17) -- the
-  runner's pointer extraction in the `read` phase
-  (`runner/src/curie_runner/executor.py`: structured content, or a single text
-  block's strict JSON, otherwise `result_unstructured`) and the worker's sample
-  report (`apps/worker/src/curie_worker/action_executor.py::sample_report`) ship
-  in different images, so every pointer, result shape and sample kind is frozen
-  together with the comparator cases the API's evaluator
-  (`apps/api/src/curie_api/remediation_predicate.py::evaluate_sample`, which
-  judges each verifier sample, plan task 11) reads too: ordering comparators
-  read a JSON number or a strict numeric string, `eq`, `ne` and `in` never
-  coerce, and every unsuccessful sample (including the API's own `skipped`) is
-  `unsuccessful`. Read by `apps/api/tests/test_remediation_predicate_vector.py`.
-  [vector: `tests/vectors/remediation-predicate.json`]
-- API vs CLI remediation policy validation and policy refusal codes
-  (AUTOMATED-REMEDIATION-3) -- the API validator
-  (`apps/api/src/curie_api/remediation_policy_document.py`) and the CLI's
-  mirrored validation (`cli/src/remediation_policy.rs`) cannot share code
-  across Python/Rust, so the valid and invalid documents, each refusal's code
-  and path, and the numeric edge cases are frozen together; the closed policy
-  refusal codes the API returns (`POLICY_REFUSALS` in
-  `apps/api/src/curie_api/remediation_codes.py`) are the set the CLI renders
-  (`POLICY_REFUSALS` in `cli/src/remediation.rs`), frozen as `policy_refusals`.
-  The receipt vocabulary (AUTOMATED-REMEDIATION-20) is a third reader: the
-  worker's thread receipts (`apps/worker/src/curie_worker/remediation_receipts.py`:
-  `RECEIPT_STAGES`, `VERIFICATION_OUTCOMES`, `AUTHORITIES`, `RECEIPT_CODES`), the
-  API's nomination read (`remediation_codes.py`) and the CLI's `remediation list`
-  and `show` (`NOMINATION_STATES`, `RECEIPT_STAGES` and the rest in
-  `cli/src/remediation.rs`) all read the same frozen sets.
-  [vector: `tests/vectors/remediation-policy.json`]
-  [vector: `tests/vectors/remediation-codes.json`]
-- runner vs worker sealed envelope (ACTION-EXECUTOR-9, -10) -- the runner's
-  redactor (`runner/src/curie_runner/redact.py::OutboundRedactor`) decides
-  whether an envelope crosses unaltered and the worker's `_snapshot`
-  (`apps/worker/src/curie_worker/actions.py`) decides whether it is recorded;
-  both validate the same envelope grammar in different images, so they read one
-  sealed-reply vector, as does the API's `undoable` grammar
-  (`apps/api/src/curie_api/sealed_snapshot.py`).
-  [vector: `tests/vectors/sealed-snapshot-reply.json`]
-- API vs worker vs proxy vs runner canonical arguments (ACTION-EXECUTOR-7) --
-  the undo ruling's `arguments_sha256`
-  (`apps/api/src/curie_api/routers/actions.py::restore_arguments_sha256`), the
-  worker's canonicalizer and digest (`apps/worker/src/curie_worker/connector_grant.py`),
-  the caller proxy's production parser
-  (`apps/worker/src/curie_connector_proxy/server.py::_canonical_arguments`) and
-  the runner's `call` preflight must agree byte for byte, and they ship in
-  different images, so the canonical texts and digests are frozen together.
-  [vector: `tests/vectors/action-canonical-arguments.json`]
-- attachments-init vs docker `_prepare_attachments` (ADR 0205) -- the program
-  the chart renders into the sandbox's `attachments-init` container
-  (`charts/curie/templates/agent-sandbox.yaml`) cannot import the worker, so the
-  docker driver (`apps/worker/src/curie_worker/sandbox/docker.py`) reimplements
-  it: exact names, current files first and all-or-nothing, earlier files best
-  effort with a recorded reason, digest mismatch always fatal, and the hidden
-  `.curie-attachments-status.json`, and the pre-ADR rules for a payload
-  without "c" (mixed-version rollout). Both run one payload-to-outcome corpus
-  (`charts/curie/ci/attachment-init-behavior-assertions.sh` and
-  `apps/worker/tests/sandbox/test_docker_attachment_claim.py`).
-  [vector: `tests/vectors/attachment-init-outcomes.json`]
-
-A PR touching one side of a seam must route the behavior through a shared helper
-both sides call, change both sides in the same PR, or name the sibling in the PR
-body with a follow-up issue number. Prefer parity by construction over remembered
-duplication. Ship a test that arms the behavior via the secondary path only
-(bundle-manifest-only gate, fake-tier-only, minimal-profile-only) and asserts it
-matches the primary path.
+Read the [parity-seam registry](docs/parity-seams.md) before changing a registered
+seam. Cover its sibling consumer or file the missing coverage as specified there;
+reuse the shared negative-control corpus for the mechanism across tiers.
 
 ## Guards are outcome-tested
 
@@ -850,12 +374,12 @@ drive the actual surface (the `curie` CLI, the deployed compose services, a
 real sandbox on-cluster) with realistic input and assert the real outcome, not
 just that unit tests pass.
 
-- **Pick the driver from the diff.** An end-to-end test is black-box testing of the
+1. **Pick the driver from the diff.** An end-to-end test is black-box testing of the
   components that changed, so the box is the diff, not the whole system. A driving
   surface is valid only if the path from it traverses every component you changed;
   if it routes around one, it is not a valid driver for that change. Inside the box
   nothing may be faked.
-- **Slack is a driver, not a requirement.** Approvals resolve equally through an
+2. **Slack is a driver, not a requirement.** Approvals resolve equally through an
   operator principal: `curie cluster approvals <agent> --mint-operator-principal
   <USER>`, then export `CURIE_APPROVAL_PRINCIPAL_TOKEN` and `--resolve <id>` (or
   `--reject`). Proven on a real cluster against an install with the dispatcher at
@@ -866,25 +390,25 @@ just that unit tests pass.
   drive from the CLI, or resolution is refused 403. Reach for a real Slack pass only
   when the change is in the Slack surface itself. Everything else drives from the
   CLI, and an agent can run it unattended rather than handing a human a click list.
-- **In-repo tests are the durable net.** Prefer landing unit + integration tests
-  (and a Playwright/e2e assertion where a UI or full-flow path changed) in the
-  same PR. These are what keep the change working after you leave.
-- **A hands-on e2e pass is non-negotiable on top of that.** Even when CI is
+3. **In-repo tests are the durable net.** Test at the cheapest
+  boundary that proves the changed contract. A higher tier needs a failure mode
+  the lower tier cannot see. Land that test in the same PR.
+4. **A hands-on e2e pass is non-negotiable on top of that.** Even when CI is
   green, run the changed path yourself through the CLI / docker / cluster and
   confirm the observable behavior. CI runs against frozen fixtures; a live pass
   catches config drift, deploy-pipeline regressions, and "is my code path even
   wired" gaps that unit tests cannot see.
-- **Assert outcomes, not presence.** Use strong, deterministic assertions on real
+5. **Assert outcomes, not presence.** Use strong, deterministic assertions on real
   behavior (values, state transitions, emitted events, trace contents). Avoid
   hollow "does it render / does an element exist" checks and any AI-vision or
   screenshot-polling assertions -- they mask weak architecture and rot fast.
-- **New/changed CLI commands follow the agent-facing contract (ADR-0021):**
+6. **New/changed CLI commands follow the agent-facing contract (ADR-0021):**
   structured `--json` output for read/report commands (JSON to stdout, human/log
   to stderr), semantic exit codes (0 success / 1 failure / 2 usage / 3 transient),
   non-interactive (a `--yes`/`--force` path, never blocking on stdin), and errors
   as `{"error","fix"}` recovery instructions. Exit-code scheme: see
   `cli/README.md`.
-- **The agent-facing read and result verbs emit one JSON object to stdout under
+7. **The agent-facing read and result verbs emit one JSON object to stdout under
   `--json` -- never empty stdout (issue #456).** That covers the read/query verbs
   (`versions`, `memory`, `approvals`, `observability`), the lifecycle result
   verbs (`kill`, `resume`, `budget`, `delete`), and every verb's `--dry-run`
@@ -900,11 +424,11 @@ just that unit tests pass.
   migration onto `Ui::emit` in #474; and the operator verbs (`up`, `down`,
   `status`, `comms`), `deploy`, and `skill message` have real-path success output
   that is not yet structured under `--json`, tracked in #485.
-- **Console/CLI parity is a two-sided invariant (epic #145):** any CLI
+8. **Console/CLI parity is a two-sided invariant (epic #145):** any CLI
   command-surface change regenerates the committed manifest (`cli/CLAUDE.md`),
   and every wired console action maps to a real command or an explicit
   `noCliEquivalent` (`apps/ui/CLAUDE.md`). Keep both sides in the same change.
-- **A runtime acceptance criterion is not satisfied by static verification.** When
+9. **A runtime acceptance criterion is not satisfied by static verification.** When
   a ticket's AC is a runtime/observable check -- an exec command, an HTTP response,
   a rendered-then-running behavior -- you MUST run that exact check against a
   running cluster and paste its output; `helm lint`, `helm template`, typecheck,
@@ -918,121 +442,44 @@ just that unit tests pass.
 
 ### The tier decision rule
 
-Applicability is a recorded decision, not a matter of taste. Every
-behavior-bearing change classifies all seven tiers below as **required** or
-**not applicable**, and a not-applicable row states a concrete reason naming
-the surface the change does not reach. "Unit tests cover it", "low risk", "CI
-is green", and "no time" are not reasons.
+Choose the cheapest executable boundary whose path traverses every changed
+component, with nothing faked inside that boundary. Explain the failure mode a
+higher tier catches that the lower tier cannot. Record what ran locally and any
+live or external proof CI cannot produce; read CI tier results from CI rather
+than restating them in the PR body. Documentation and behavior-preserving
+refactors use the validators appropriate to the changed artifact.
 
-A behavior-bearing change has at least one required tier, on the quick path as
-much as the build path. A classification that marks all seven not applicable is
-a claim that the change alters no runtime behavior on any surface: either say
-that plainly and carry no tier, or the tier set is wrong for this change and
-the maintainer decides, but do not proceed on all seven not applicable while
-still calling the change behavior-bearing. A change that genuinely bears no
-runtime behavior records that reason once and is exempt from tier
-classification and E2E evidence for each acceptance criterion, including on
-the build path. Examples include an explanatory documentation edit, an ADR
-pointer repair that leaves the decision unchanged, and a strictly
-behavior-preserving refactor. Run and report the checks appropriate to the
-changed artifact instead: the repository's applicable formatting, link,
-command, or documentation validators for prose; review that an ADR repair did
-not change its decision; and the touched area's tests for a behavior-preserving
-refactor. File type alone does not grant the exemption: a documentation or ADR
-change that alters runtime behavior remains behavior-bearing and follows the
-full tier rule. Promoting a tier to required is always allowed; dropping a
-required tier is not.
-
-Classification is taken at triage and re-checked whenever the diff grows past
-the scope that was triaged. A tier that becomes reachable is promoted to
-required and proved, not carried on the original classification.
-
-| Tier | Required when the change reaches | Command |
-| --- | --- | --- |
-| skill | plugin or skill packaging, the runner turn loop, ACI events, skill eval or check | `CURIE_E2E_TIERS=skill curie dev e2e-ladder` |
-| local | compose services, dispatcher, worker, or API wiring, boot env crossing a service boundary, the console UI, or any `curie` verb whose output, exit code, or `--json` shape changed | `CURIE_E2E_TIERS=local curie dev e2e-ladder`; for console login (OIDC against a real Dex, login codes, sessions, logout) also `curie dev oidc-e2e` |
-| local-release | released binary or image identity, the install path, version pins, release compose | `CURIE_E2E_TIERS=local-release curie dev e2e-ladder` |
-| cluster | chart templates, RBAC, securityContext, NetworkPolicy, sandbox claims, init containers | `CURIE_E2E_TIERS=cluster curie dev e2e-ladder`, or `curie dev chart-runtime-e2e` for a chart, sandbox, or bundle slice |
-| live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow; also the MCP/workspace/coding-tool path set below | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |
-| external integration | Slack, git push webhooks, connector OAuth, or any third-party API shape; Slack is required on the MCP/workspace/coding-tool path set below | drive the real integration; a replayed fixture or a fake does not close this tier |
-| factory | API factory runtime, CI, progress, or publication behavior; runner verification preflight or factory progress; the dark factory example; worker work item execution | `curie dev factory-e2e scripted` from a source checkout (add `--build-images` when the four local images are not built), or the `scenario` leg of the `E2E scripted factory (kind, scripted model, <leg>)` PR CI job, which runs it whenever a factory path changes |
-
-The factory path set includes `apps/api/src/curie_api/factory_runtime*`,
-`factory_ci*`, `factory_progress*`, and `routers/publications*`;
-runner verification preflight and progress; `examples/dark-factory/`; and
-worker work item execution. `curie dev factory-e2e scripted` creates and deletes
-its own kind cluster, installs the candidate chart, replays the recorded
-transcript against the GitHub stub and the unitconv fixture, drives one labelled
-issue to a pull request, and exits nonzero when the preflight outcome, the
-published paths, or the final comment are wrong.
-
-The PR body guard derives minimum required tiers from changed files. A row
-required by those paths cannot be omitted or marked not applicable through
-body prose. Classify all seven rows and supply the changed files and current
-open issues to the guard. Skill and local may use fake in the mode column when
-the row supplies its exact command and an observed completed outcome. Live
-provider, external integration, and factory require `live` in the mode column;
-a blank cell or any other mode leaves the row unproved.
-
-When the required body tiers are only skill, the prepublication skill row
-records the sandbox command that runs the changed tests and its observed
-result. The skill, local, local-release and cluster jobs selected for a runner
-path remain required on the PR head. They are not additional sandbox commands
-before publication. A missing `curie`, `docker` or `kind` binary is a missing
-binary dependency, not an absent service, and does not authorize delegation of
-that skill row.
-
-Evidence text saying blocked, not run, or fake leaves a required row unproved
-at any tier. For a completed negative test, describe the observed outcome as
-denied, refused, or returned 401; reserve blocked, not run, and fake for
-unproved status requiring a waiver. To proceed as discovery, include the
-visible line
-`Discovery waiver: <reason> #N`, naming an open issue that tracks the missing
-proof. Table rows and waiver lines must be visible. Text inside HTML comments,
-fenced code blocks, or indented code blocks does not count as evidence.
-Any follow up named in the tier table must include its issue number.
-A waiver records the missing proof; it does not change the tier to not
-applicable or claim that the acceptance criterion passed.
-
+A runtime acceptance criterion still requires its named runtime observation.
+Provider auth, credential resolution and external API shape require real-provider
+or real-integration proof where lower tiers cannot observe the failure.
 The path set is runner MCP catalog projection, unscoped PreToolUse,
 in-process platform MCP tools, workspace publication, and
 built-in coding-tool session capability. A behavior-bearing change that
 reaches any of those reaches both live-provider and external-integration.
-Those two rows are required on that path. "No model routing change" is not a valid n/a reason.
+"No model routing change" is not a valid n/a reason.
 Fake-model kind, skill ladder, and helper-only tests remain useful and are
 not sufficient for those acceptance criteria. Leave the required-tier item
-open when the evidence is missing; do not close it by marking the row n/a.
-This rule does not pull the live e2e ladder onto unrelated pull requests.
+open when the evidence is missing, with its blocker and a Discovery waiver
+naming an open issue; a waiver never claims the criterion passed.
 
 ### Evidence per acceptance criterion
 
-Every meaningful acceptance criterion needs two observations, not one.
-
-- **Positive proof.** The exact command run against the required tier, the
-  candidate commit it ran against, and the observed outcome showing the
-  criterion met.
-- **A falsifiable negative, or a second independent path.** The same surface
-  observed refusing, failing, or reporting absent once the criterion's
-  precondition is removed: feed the guard a violating input, unset the
-  credential, drop the flag, omit the manifest entry. Where no negative is
-  constructible, assert the same outcome through a second independent path
-  instead. A positive alone cannot separate a working change from a check that
-  would have passed regardless.
-
-Record both against the run, per the run state contract in
-`.claude/skills/implement/SKILL.md`, and expose them in the pull request
-through the checklist in `.github/PULL_REQUEST_TEMPLATE.md`. A required tier
-with no passing evidence record blocks completion unless the discovery waiver
-above names an open issue. Report the missing proof as a blocker, including
-when proceeding under that waiver.
+Record positive proof: the exact command, candidate commit and observed outcome
+for each meaningful acceptance criterion. One shared negative-control corpus per
+mechanism suffices across tiers. Exercise a falsifiable negative by removing the
+precondition, or use a second independent path when no negative is constructible;
+do not copy the same controls at every tier. Record this evidence against the run
+under the implement skill's state contract. Missing required proof blocks
+completion unless a Discovery waiver names an open issue, and remains reported
+as missing even under that waiver.
 
 ## Playwright: two modes
 
-- **The merge gate is the committed E2E suite** under `apps/ui` (Playwright,
+1. **The merge gate is the committed E2E suite** under `apps/ui` (Playwright,
   headless, in CI against the compose stack). It asserts behavior (deploy flow
   completes, runs view renders the tool-call tree, eval matrix populates). This
   is the regression net; it must be green to merge.
-- **The `@playwright/mcp` server** (wired in `.mcp.json`) is for interactive
+2. **The `@playwright/mcp` server** (wired in `.mcp.json`) is for interactive
   verification *during* development: drive the real browser, click through the
   flow you just built, and screenshot it to check visual fidelity. Commit
   assertions into the suite to make them a gate.
@@ -1113,15 +560,17 @@ of merged heads stays enabled so task branches still clean up; an ordinary
 deletion ruleset (issue #2090). Run
 `python3 release/preserve_next.py --repo <owner/name>` before enabling
 auto-merge: it refuses that ordinary path until the head is not `next` or an
-active deletion ruleset covers `next` with an empty bypass list. Then run every
-parity ladder rung on the resulting `main` commit:
+active deletion ruleset covers `next` with an empty bypass list. For a forward merge,
+reuse passing proof from the identical tree. If no identical-tree proof exists,
+run every parity ladder rung on the resulting `main` commit:
 
 ```bash
 CURIE_E2E_TIERS=all curie dev e2e-ladder
 CURIE_E2E_TIERS=local-release curie dev e2e-ladder
 ```
 
-Tag the final feature release on `main` only after both commands pass. Only an
+Tag the final feature release on `main` only after identical-tree proof or both
+commands establish the required outcomes. Only an
 administrator may retire `next`. Before deleting it, the administrator must
 merge one release workflow and contract test change that removes `next` from the
 workflow trigger branch list, removes the `RELEASE_NEXT_BRANCH` environment
@@ -1137,8 +586,8 @@ branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
 `--reviewed-ref origin/$RELEASE_NEXT_BRANCH` argument, and updates
 `release/tests/test_authorize.py` before accepting PRs against it.
 
-- Commit message format: a short imperative summary line, then detail bullets.
-- Reference the relevant issue in the PR body (e.g. `Closes #123`). GitHub only
+1. Commit message format: a short imperative summary line, then detail bullets.
+2. Reference the relevant issue in the PR body (e.g. `Closes #123`). GitHub only
   auto closes an issue when the PR merges into the default branch, so a closing
   keyword in a PR that targets `next` never fires on its own. Issues referenced
   by a `next` targeted PR are closed at the `next` into `main` merge, where the
@@ -1152,11 +601,11 @@ standalone `this-pr-ci` line inside that section, or `waiver: <reason>`);
 the same guard rejects either section left empty. The marker references the
 preparation PR's own CI and proves only the rungs that CI actually ran; a
 required live surface outside that run still needs a run URL or waiver. Run
-`scripts/check-pr-body.sh <body-file> --changed-files-file <changed-files-json> --open-issues-file <open-issues-json>` before opening or editing a PR
+`scripts/check-pr-body.sh <body-file>` before opening or editing a PR
 (`--title-file` for a release PR). See
 [`docs/release-verification.md`](docs/release-verification.md#patch-releases-name-their-trigger-and-live-proof).
 
-- **Never mention any AI assistant (Claude, Codex, GPT, etc.) or AI in general in
+1. **Never mention any AI assistant (Claude, Codex, GPT, etc.) or AI in general in
   commit messages OR pull request bodies, and never add `Co-Authored-By` lines
   referencing AI.** This applies to the PR body as much as to the commits: many
   assistants append a "Generated with" footer to a PR description by default, and
@@ -1166,7 +615,7 @@ required live surface outside that run still needs a run URL or waiver. Run
 
   ```bash
   scripts/check-commit-messages.sh origin/<base>..HEAD
-  scripts/check-pr-body.sh <body-file> --changed-files-file <changed-files-json> --open-issues-file <open-issues-json>
+  scripts/check-pr-body.sh <body-file>
   scripts/check-commit-messages.sh --self-test
   scripts/check-pr-body.sh --self-test
   ```
@@ -1184,7 +633,7 @@ required live surface outside that run still needs a run URL or waiver. Run
   body half is not a broad net either. A commit range the script cannot resolve is
   a hard failure naming the range, not a silent pass. It checks only the PR's own
   commits, so pre-gate history is not retroactively enforced.
-- No dashes/emdashes in prose content; no emojis in code or docs.
+2. No dashes/emdashes in prose content; no emojis in code or docs.
 
 ## Ticket implementation
 
@@ -1211,23 +660,23 @@ realizing code path. Without both, acceptance must precede implementation. Track
 the work in a linked GitHub issue and pull request. Follow
 [`docs/adr/AGENTS.md`](docs/adr/AGENTS.md) for the complete procedure.
 
-- Write an **ADR** (`docs/adr/`, see ADR-0001) only for a **cross-cutting
+1. Write an **ADR** (`docs/adr/`, see ADR-0001) only for a **cross-cutting
   architectural decision that closes the door on alternatives.** It is a choice
   about the *shape* of the system (a contract, a seam, a substrate, an invariant)
   that is expensive to reverse and whose *why* a future contributor must understand
   before touching that area. An ADR is not just what we chose; it **must record what
   we decided against and why** (the alternatives and their rejection). If no real
   alternative is being closed off, it is not an ADR.
-- An ADR or plan whose rationale claims observability, convergence, protection, or
+2. An ADR or plan whose rationale claims observability, convergence, protection, or
   parity must name the code path that realizes the claim in the same change, or
   name the tracked follow-up issue that will. A rationale that says "this becomes
   observable" without a consumer or alert is an unmet claim and blocks acceptance.
-- Write a **GitHub issue** (with a rich description) for a **feature**, however
+3. Write a **GitHub issue** (with a rich description) for a **feature**, however
   large. A new CLI command, a UI surface, a connector: it may be a lot of code, but
   it is deletable and does not change the architecture, so it is a feature, not an
   architectural decision. The issue carries the what and the why; the *how* lives in
   the PR. An issue may cite an ADR.
-- **An example bundle or agent is never the subject of an ADR.** What a bundle
+4. **An example bundle or agent is never the subject of an ADR.** What a bundle
   under `examples/` does (its skill text, prompts, tool policy, test or verdict
   rules, safety rules, operator guidance) is that bundle's design, even when it
   is safety relevant. Record it in the bundle's README or `docs/`, and track
@@ -1236,12 +685,12 @@ the work in a linked GitHub issue and pull request. Follow
   it holds for every bundle, not the bundle's own rules. The mean tester ADRs
   (0169, 0172, 0181) are the counterexample: they record one example bundle's
   behavior.
-- **When in doubt, write the issue.** Promote to an ADR only when the same decision
+5. **When in doubt, write the issue.** Promote to an ADR only when the same decision
   gets re-explained across a third issue or PR.
 
 ## Gotchas discovered during the build
 
-- **Deployment-to-runtime binding is wired; it binds per fresh mention.** The
+1. **Deployment-to-runtime binding is wired; it binds per fresh mention.** The
   worker resolves a thread's Slack channel to its agent, that agent's active
   deployment (prod outranks dev, then most recent), and the resolved
   `CURIE_BUNDLE_REF`, injecting it into each sandbox claim so a fresh mention
@@ -1249,27 +698,27 @@ the work in a linked GitHub issue and pull request. Follow
   (`apps/worker/src/curie_worker/binding.py`). The seam to remember: an
   existing thread keeps the sandbox and bundle it first booted with; only a new
   mention (a new claim) picks up a newer deployment.
-- **Sandbox cold boots must never pull an image.** The four Deployment services
+2. **Sandbox cold boots must never pull an image.** The four Deployment services
   (`api`, `worker`, `dispatcher`, `ui`) default to `pullPolicy: Always`, but the
   runner image is `IfNotPresent` and kept pinned on every node by the
   `agentSandbox.runner.prewarm` DaemonSet, which pulls at install/upgrade. A
   mid-boot pull of the ~380MB runner image blew the 90s claim timeout in a live
   incident (2026-07-06); never switch the runner image to `Always`
   (`charts/curie/templates/runner-prewarm.yaml`, `charts/curie/values.yaml`).
-- **Suspend/resume is a cold rehydrate, not a live hibernate** (ADR-0003). A
+3. **Suspend/resume is a cold rehydrate, not a live hibernate** (ADR-0003). A
   suspended sandbox's pod is deleted; resume creates a new pod and injects
   `CURIE_HISTORY_REF`. Never assume prompt-cache warmth survives a suspend, and
   never design a feature that needs a sandbox's in-process state to outlive a
   suspend.
-- **Warm-pool claims are fast only without per-claim env.** A claim that needs
+4. **Warm-pool claims are fast only without per-claim env.** A claim that needs
   `CURIE_HISTORY_REF`/`CURIE_SESSION_ID` injected (the resume path) cannot
   bind a pre-warmed sandbox and cold-creates one instead (seconds, not the ~0.2s
   warm-pool bind). This is inherent to `agent-sandbox`'s
   `envVarsInjectionPolicy: Overrides`, not a bug to fix.
-- **A cluster's CNI must actually enforce NetworkPolicy** or the chart's egress
+5. **A cluster's CNI must actually enforce NetworkPolicy** or the chart's egress
   lockdown is a silent false-pass. The chart ships a before/after enforcement
   probe (`preflights.networkPolicyProbe`) for exactly this reason -- never trust
   an egress policy without it.
-- **gVisor needs `runsc` on the node**, which the chart cannot install. On a
+6. **gVisor needs `runsc` on the node**, which the chart cannot install. On a
   cluster without it, use the ready-made `-f charts/curie/values-e2e-nogvisor.yaml`
   overlay rather than hand-editing security values (see `charts/curie/CLAUDE.md`).

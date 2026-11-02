@@ -2174,8 +2174,12 @@ def test_missing_gh_fails_closed_without_calling_curie(tmp_path: Path) -> None:
     assert not call_log.exists(), "an unavailable label API must not open the gate"
 
 
-@pytest.mark.parametrize("labels", [FOUND_UNIT_LABELS, FOUND_LOCAL_LABELS, FOUND_CLUSTER_LABELS, FOUND_LIVE_LABELS])
-@pytest.mark.parametrize("selector", [VALID_SELECTOR, LOCAL_SELECTOR, LIVE_SELECTOR, CHART_SELECTOR])
+@pytest.mark.parametrize(
+    "labels", [FOUND_UNIT_LABELS, FOUND_LOCAL_LABELS, FOUND_CLUSTER_LABELS, FOUND_LIVE_LABELS]
+)
+@pytest.mark.parametrize(
+    "selector", [VALID_SELECTOR, LOCAL_SELECTOR, LIVE_SELECTOR, CHART_SELECTOR]
+)
 def test_reproducing_pin_is_verified_regardless_of_discovery_tier(
     tmp_path: Path, labels: str, selector: str
 ) -> None:

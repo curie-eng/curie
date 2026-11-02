@@ -75,23 +75,6 @@ KIND_MODULES = frozenset(
     }
 )
 BUG_LABEL = "bug"
-# Discovery surfaces and pin tiers share this order. A pin whose location maps
-# below the closed issue's found:* label fails unless the body also carries
-# `Fix pin waiver: <reason>`. Location, not prose, decides the pin tier:
-# cli/tests/local/test_*.py -> local, */test_live.py -> live,
-# charts/curie/ci/* -> cluster, everything else that the selector grammar
-# admits -> unit.
-TIERS = ("unit", "local", "cluster", "live")
-TIER_RANK = {name: index for index, name in enumerate(TIERS)}
-FOUND_LABELS = {f"found:{name}": name for name in TIERS}
-# GitHub issue forms render the required dropdown as a heading plus the
-# selected option. Scan only that section so a narrative "not found:live" in
-# the reproduction notes cannot raise the floor.
-DISCOVERY_FIELD = re.compile(
-    r"^### Discovery surface[ \t]*\r?\n+(?:[ \t]*\r?\n)*found:(?P<tier>unit|local|cluster|live)\b",
-    re.MULTILINE,
-)
-WAIVER = re.compile(r"^Fix pin waiver:\s*(?P<reason>.*)$")
 ISSUE_JQ = "{labels:[.labels[].name],body:.body}"
 
 
@@ -286,48 +269,6 @@ def _declaration(body: str) -> Declaration:
     return Declaration(selector=selector)
 
 
-def _waiver(body: str) -> str | None:
-    uncommented = COMMENT.sub("", body)
-    reasons = [
-        match.group("reason").strip()
-        for line in uncommented.splitlines()
-        if (match := WAIVER.fullmatch(line)) is not None
-    ]
-    if not reasons:
-        return None
-    if len(reasons) != 1:
-        raise ValueError("Fix pin waiver must be exactly one unindented line")
-    if not reasons[0]:
-        raise ValueError("Fix pin waiver must state why, as `Fix pin waiver: <reason>`")
-    return reasons[0]
-
-
-def _pin_tier(selector: str) -> str:
-    path = selector.split("::", 1)[0]
-    filename = path.rsplit("/", 1)[-1]
-    # Location only. test_live.py is the live pin the ticket names; the Python
-    # CI job does not currently export CURIE_E2E_LIVE, so a live selector still
-    # has to survive verify-fix-pin on its own. Until that job can run live
-    # tests, a found:live bug is expected to use a lower-tier pin plus
-    # `Fix pin waiver:`.
-    if path.startswith("cli/tests/local/"):
-        return "local"
-    if filename == "test_live.py":
-        return "live"
-    if path.startswith("charts/curie/ci/"):
-        return "cluster"
-    return "unit"
-
-
-def _discovery_tier(labels: Sequence[str], body: str = "") -> str | None:
-    found = [FOUND_LABELS[label] for label in labels if label in FOUND_LABELS]
-    if (field := DISCOVERY_FIELD.search(body)) is not None:
-        found.append(field.group("tier"))
-    if not found:
-        return None
-    return max(found, key=lambda tier: TIER_RANK[tier])
-
-
 def _pin_requirements(body: str) -> dict[str, bool]:
     try:
         selector = _declaration(body).selector
@@ -440,20 +381,6 @@ def _closed_bugs(event: dict[str, object], body: str) -> list[int]:
     ]
 
 
-def _required_discovery(event: dict[str, object], body: str) -> str | None:
-    """Highest found:* label or body field among closed bug issues."""
-    found: list[str] = []
-    for _issue, record in _closed_issue_records(event, body):
-        if BUG_LABEL not in record.labels:
-            continue
-        tier = _discovery_tier(record.labels, record.body)
-        if tier is not None:
-            found.append(tier)
-    if not found:
-        return None
-    return max(found, key=lambda tier: TIER_RANK[tier])
-
-
 def _print_verification_failure_guidance() -> None:
     print(
         "Fix pin verification failed. This failure is deterministic. Edit the "
@@ -485,15 +412,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         event = _event(arguments.event)
         body = _body(event)
         declaration = _declaration(body)
-        waiver = _waiver(body)
     except ValueError as error:
-        message = str(error)
-        prefix = (
-            "Fix pin waiver error"
-            if message.startswith("Fix pin waiver")
-            else "Fix pin declaration error"
-        )
-        print(f"{prefix}: {message}", file=sys.stderr)
+        print(f"Fix pin declaration error: {error}", file=sys.stderr)
         return 1
 
     try:
@@ -530,22 +450,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         print("SKIPPED: no Fix pin declaration")
         return 0
-
-    try:
-        required = _required_discovery(event, body)
-    except ValueError as error:
-        print(f"Fix pin requirement error: {error}", file=sys.stderr)
-        return 1
-    if required is not None:
-        pin = _pin_tier(declaration.selector)
-        if TIER_RANK[pin] < TIER_RANK[required] and waiver is None:
-            print(
-                f"Fix pin tier error: selector {declaration.selector} is a {pin} "
-                f"pin, which is below the discovery surface found:{required}. "
-                f"Pin at found:{required} or add a `Fix pin waiver: <reason>` line.",
-                file=sys.stderr,
-            )
-            return 1
 
     completed = subprocess.run(
         [arguments.curie, "dev", "verify-fix-pin", arguments.ref, declaration.selector],
