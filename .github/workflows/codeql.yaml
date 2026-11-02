@@ -1,6 +1,8 @@
 name: CodeQL
 
 on:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, next]
   pull_request:
@@ -12,8 +14,8 @@ on:
 # Supersede an in-flight run when the same ref is pushed again so runs stop
 # stacking (scheduled/dispatch runs each key on their own ref).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

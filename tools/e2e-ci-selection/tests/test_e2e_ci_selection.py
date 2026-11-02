@@ -248,14 +248,6 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
         "inputs": ["charts/curie/ci/runtime/runner-resources-assertions.sh"],
         "leg": "chart",
     },
-    "langfuse-postgres-readiness": {
-        "step": "Langfuse web waits for delayed Postgres without restarting",
-        "inputs": [
-            "charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh",
-            "charts/curie/ci/postgres-readiness-delay.Dockerfile",
-        ],
-        "leg": "chart",
-    },
     "connector-readiness": {
         "step": "Connector that never listens stays not-Ready until it binds",
         "inputs": [
@@ -2658,7 +2650,7 @@ def _changes_filter_script() -> str:
     # Pull requests into next select kind tiers by changed paths exactly like
     # main, so the script has no branch that singles next out.
     assert '"next"' not in run
-    assert run.count("select_tiers.py") == 3
+    assert run.count("select_tiers.py") == 4
     return run
 
 
@@ -2667,6 +2659,8 @@ def _assert_changes_filter_route(script: str, event: str, branch: str) -> list[s
         "github.event_name": event,
         "github.ref": f"refs/heads/{branch}",
         "github.base_ref": branch if event == "pull_request" else "",
+        "github.event.merge_group.base_sha": "a" * 40,
+        "github.event.merge_group.head_sha": "b" * 40,
     }.items():
         script = script.replace("${{ " + expression + " }}", value)
     assert "${{" not in script
@@ -2686,7 +2680,8 @@ def _assert_changes_filter_route(script: str, event: str, branch: str) -> list[s
     ]
     options = (
         ["--base", f"origin/{branch}", "--head", "HEAD"]
-        if event == "pull_request" else ["--push"]
+        if event == "pull_request" else
+        ["--base", "a" * 40, "--head", "b" * 40] if event == "merge_group" else ["--push"]
     )
     if event == "push":
         options.append("--omit-kind")
@@ -2792,7 +2787,7 @@ def test_pull_requests_supersede_while_pushes_and_dispatches_queue() -> None:
     # could be cancelled by a scheduled one, so dispatches and pushes queue.
     assert concurrency["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
     # A new trigger must force a decision about whether its runs cancel.
-    assert set(workflow[True]) == {"push", "pull_request", "workflow_dispatch"}
+    assert set(workflow[True]) == {"push", "pull_request", "merge_group", "workflow_dispatch"}
 
 
 IMAGE_PROOFS_IF = (
@@ -2908,6 +2903,8 @@ def _assert_image_proofs(workflow: dict[str, Any]) -> None:
     assert scope["env"] == {
         "EVENT_NAME": "${{ github.event_name }}",
         "BASE_REF": "${{ github.base_ref }}",
+        "BASE_SHA": "${{ github.event.merge_group.base_sha }}",
+        "HEAD_SHA": "${{ github.event.merge_group.head_sha }}",
     }
     assert by_name["Docker daemon: Set up Buildx"]["id"] == "set_up_buildx"
     assert by_name["Toolchain: Install uv"]["id"] == "install_uv"
@@ -3106,7 +3103,8 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
     assert "worker-local-image" not in jobs
     _assert_image_proofs(workflow)
     assert jobs["cli-portability"]["if"] == (
-        "${{ github.event_name != 'pull_request' && needs.changes.outputs.cli_release == 'true' }}"
+        "${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && "
+        "needs.changes.outputs.cli_release == 'true' }}"
     )
     assert jobs["cli-darwin"]["if"] == jobs["cli-portability"]["if"]
     assert "changes" in jobs["rust-build"]["needs"]
@@ -4366,7 +4364,6 @@ def _selector_outputs_omit_kind(tmp_path: Path, path: str) -> dict[str, str]:
 
 
 CLUSTER_RUNG_MOVED_PROOFS = {
-    "Langfuse web waits for delayed Postgres without restarting": "e2e-cluster-chart-regressions",
     "Connector that never listens stays not-Ready until it binds": "e2e-cluster-chart-regressions",
     "Runner BYO egress enforces (not just rendered)": "e2e-cluster-chart-regressions",
     "Rollout-free first invocation and dead-consumer recovery": "e2e-cluster-rollout-recovery",
@@ -4623,7 +4620,7 @@ def test_approval_resume_follows_push_and_kind_omission(tmp_path: Path) -> None:
     assert _outputs_of(next_pr_output)["approval_resume"] == "false"
 
 
-@pytest.mark.parametrize("event_name", ["pull_request", "push", "workflow_dispatch"])
+@pytest.mark.parametrize("event_name", ["pull_request", "merge_group", "push", "workflow_dispatch"])
 def test_aggregate_requires_approval_resume_success_when_selected(
     event_name: str,
 ) -> None:
@@ -4787,7 +4784,7 @@ def test_unrelated_paths_do_not_select_admitted_agent_factory(tmp_path: Path, pa
     assert _outputs_of(output)["factory"] == "false", path
 
 
-@pytest.mark.parametrize("event_name", ["pull_request", "push", "workflow_dispatch"])
+@pytest.mark.parametrize("event_name", ["pull_request", "merge_group", "push", "workflow_dispatch"])
 @pytest.mark.parametrize("result", ["failure", "skipped", "cancelled", ""])
 def test_aggregate_requires_scripted_factory_success_when_selected(
     event_name: str, result: str
@@ -4800,7 +4797,7 @@ def test_aggregate_requires_scripted_factory_success_when_selected(
     assert rejected.returncode != 0, rejected.stdout + rejected.stderr
 
 
-@pytest.mark.parametrize("event_name", ["pull_request", "push", "workflow_dispatch"])
+@pytest.mark.parametrize("event_name", ["pull_request", "merge_group", "push", "workflow_dispatch"])
 @pytest.mark.parametrize("result", ["success", "failure", "cancelled", ""])
 def test_aggregate_requires_scripted_factory_skip_when_not_selected(
     event_name: str, result: str
@@ -4813,7 +4810,7 @@ def test_aggregate_requires_scripted_factory_skip_when_not_selected(
 
 
 @pytest.mark.parametrize("sibling", sorted(FACTORY_SIBLING_RESULTS))
-@pytest.mark.parametrize("event_name", ["pull_request", "push", "workflow_dispatch"])
+@pytest.mark.parametrize("event_name", ["pull_request", "merge_group", "push", "workflow_dispatch"])
 @pytest.mark.parametrize("selected", ["true", "false"])
 def test_aggregate_requires_factory_sibling_results_to_follow_factory_selection(
     event_name: str,
@@ -5485,10 +5482,10 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
         ((), True, True, ()),
         (("apps/api/src/curie_api/main.py",), False, True, ()),
         (
-            ("charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh",),
+            ("charts/curie/ci/runtime/connector-readiness-runtime.sh",),
             False,
             True,
-            ("failed-first-install-retry", "langfuse-postgres-readiness"),
+            ("connector-readiness", "failed-first-install-retry"),
         ),
         (
             (WORKLOAD_INSTALL,),
@@ -5560,10 +5557,6 @@ def test_chart_scenarios_follow_changed_inputs_and_final_tiers(
         ("charts/curie/values-dev.yaml", CHART_IDS),
         ("charts/curie/values.schema.json", CHART_IDS),
         ("charts/curie/values-custom.yaml", CHART_IDS),
-        (
-            "charts/curie/ci/postgres-readiness-delay.Dockerfile",
-            ("failed-first-install-retry", "langfuse-postgres-readiness"),
-        ),
         (
             "apps/worker/src/curie_worker/connector_k8s.py.bak",
             (
@@ -5839,11 +5832,6 @@ def test_chart_scenario_registry_rejects_a_scenario_without_a_valid_leg(
         _SELECTOR_MODULE._load_registry(path)
 
 
-CHART_FIXTURE_STEPS = (
-    "Load the Postgres readiness fixture built by the ci-images job",
-    "Tag the Postgres readiness fixture",
-    "Load the Postgres readiness fixture into the kind cluster",
-)
 WORKLOAD_STAGING_STEPS = (
     "Download the workspace diagnostic CLI",
     "Load the workspace diagnostic candidate images",
@@ -5861,8 +5849,6 @@ def test_chart_job_runs_one_leg_per_runner_from_the_selected_legs() -> None:
     }
     assert chart["if"] == CHART_JOB_IF
     steps = {step.get("name"): step for step in chart["steps"]}
-    for name in CHART_FIXTURE_STEPS:
-        assert steps[name].get("if") == "${{ matrix.leg == 'chart' }}", name
     for name in WORKLOAD_STAGING_STEPS:
         assert steps[name].get("if") == WORKLOAD_STAGING_IF, name
     upload = steps["Upload runtime assertion receipts"]

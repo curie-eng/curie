@@ -9,6 +9,7 @@ note in tools/e2e-ci-selection/tests/test_e2e_ci_selection.py.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -242,6 +243,7 @@ def test_workflow_triggers_are_unfiltered_on_both_releasable_branches():
         assert triggers[event]["branches"] == ["main", "next"]
         assert "paths" not in triggers[event]
         assert "paths-ignore" not in triggers[event]
+    assert triggers["merge_group"] == {"types": ["checks_requested"]}
 
 
 def test_chart_changes_selects_through_decide():
@@ -402,3 +404,44 @@ def test_select_cli_push_selects_the_chart(tmp_path: Path):
     result = _run_select(work, output, "push")
     assert result.returncode == 0
     assert "chart=true" in output.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "changed", ["README.md", "charts/curie/templates/café.yaml", "cli/src/main.rs"],
+)
+def test_merge_group_uses_payload_bounds_and_matches_pr(tmp_path: Path, changed: str):
+    work = _work_repo(tmp_path)
+    base = _git(work, "rev-parse", "HEAD").stdout.strip()
+    _commit_path(work, changed, "example\n")
+    head = _git(work, "rev-parse", "HEAD").stdout.strip()
+    payload = tmp_path / "event.json"
+    payload.write_text(json.dumps({"merge_group": {"base_sha": base, "head_sha": head}}))
+    pr_output = tmp_path / "pr-output"
+    pr_result = _run_select(work, pr_output, "pull_request")
+    assert pr_result.returncode == 0, pr_result.stderr
+    # A later checkout commit is deliberately outside the queued SHA bounds.
+    _commit_path(work, "charts/curie/outside.yaml", "outside\n")
+    queue_output = tmp_path / "queue-output"
+    result = subprocess.run(
+        [sys.executable, str(DECIDE_PATH), "select"], cwd=work,
+        env={**os.environ, "EVENT_NAME": "merge_group", "GITHUB_EVENT_PATH": str(payload),
+             "GITHUB_OUTPUT": str(queue_output)}, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert queue_output.read_text() == pr_output.read_text()
+
+
+@pytest.mark.parametrize(
+    "payload", [{}, {"merge_group": {}}, {"merge_group": {"base_sha": "bad", "head_sha": "bad"}}],
+)
+def test_merge_group_rejects_missing_or_invalid_bounds(tmp_path: Path, payload: dict):
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps(payload))
+    output = tmp_path / "output"
+    result = subprocess.run(
+        [sys.executable, str(DECIDE_PATH), "select"], cwd=REPO_ROOT,
+        env={**os.environ, "EVENT_NAME": "merge_group", "GITHUB_EVENT_PATH": str(event),
+             "GITHUB_OUTPUT": str(output)}, capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert not output.exists()

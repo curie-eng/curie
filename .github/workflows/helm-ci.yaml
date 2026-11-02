@@ -5,6 +5,8 @@ name: Helm CI
 # job gives the chart the CI it otherwise lacks -- lint, render every shipped
 # values overlay, and schema-validate the rendered manifests.
 on:
+  merge_group:
+    types: [checks_requested]
   # Pull requests to main and next always start this workflow so the chart
   # aggregator can report. chart-changes decides whether the shards run,
   # using the historical path list in tools/helm-ci-gate/decide.py. Pushes

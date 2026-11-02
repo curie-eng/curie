@@ -1,6 +1,8 @@
 name: Fix pin verification
 
 on:
+  merge_group:
+    types: [checks_requested]
   pull_request:
     branches: [main, next, "task/**"]
     types: [opened, synchronize, reopened, edited]
@@ -47,7 +49,11 @@ jobs:
       issues: read
       pull-requests: read
     steps:
+      - name: Acknowledge the PR metadata judgment
+        if: github.event_name == 'merge_group'
+        run: echo 'PR-event run already judged this metadata; merge groups reuse that judgment.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@v7
+        if: github.event_name != 'merge_group'
         with:
           # verify-fix-pin.sh resolves HEAD and adds a detached worktree at it,
           # and the gate diffs against the base, so the full history is needed.
@@ -57,33 +63,36 @@ jobs:
       # third-party tool, so it may be wrapped. The verification below is this
       # repository's own gate and is deliberately not.
       - name: Install uv
+        if: github.event_name != 'merge_group'
         id: install_uv
         continue-on-error: true
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
-        if: steps.install_uv.outcome == 'failure'
+        if: ${{ github.event_name != 'merge_group' && (steps.install_uv.outcome == 'failure') }}
         run: |
           echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
           sleep 15
       - name: Install uv (retry)
-        if: steps.install_uv.outcome == 'failure'
+        if: ${{ github.event_name != 'merge_group' && (steps.install_uv.outcome == 'failure') }}
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
       - name: Sync workspace
+        if: github.event_name != 'merge_group'
         run: uv sync
       # Setup follows the parsed requirements. Verification always runs so
       # malformed or missing declarations still reach the policy gate.
       - name: Decide whether the current curie binary is needed
+        if: github.event_name != 'merge_group'
         id: fix-pin-curie
         run: >-
           python3 tools/fix-pin-ci/check.py
           --event "$GITHUB_EVENT_PATH"
           --needs-curie
       - name: Prepare source-local factory upgrade artifacts
-        if: steps.fix-pin-curie.outputs.needs_factory_upgrade == 'true'
+        if: ${{ github.event_name != 'merge_group' && (steps.fix-pin-curie.outputs.needs_factory_upgrade == 'true') }}
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/.projects/4628/tmp" \
@@ -91,18 +100,18 @@ jobs:
           echo "TMPDIR=$GITHUB_WORKSPACE/.projects/4628/tmp" >> "$GITHUB_ENV"
           echo "CURIE_C4_RELEASE_ASSETS=$GITHUB_WORKSPACE/.projects/4628/assets" >> "$GITHUB_ENV"
       - name: Cargo cache
-        if: steps.fix-pin-curie.outputs.needed == 'true'
+        if: ${{ github.event_name != 'merge_group' && (steps.fix-pin-curie.outputs.needed == 'true') }}
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: cli
           shared-key: curie-cli-release
           cache-on-failure: true
       - name: Build the current curie binary for fix pin verification
-        if: steps.fix-pin-curie.outputs.needed == 'true'
+        if: ${{ github.event_name != 'merge_group' && (steps.fix-pin-curie.outputs.needed == 'true') }}
         run: cargo build --release --locked --manifest-path cli/Cargo.toml
       # A `chart` selector runs charts/curie/ci/<name>.sh, which needs Helm.
       - name: Install Helm for fix pin verification
-        if: steps.fix-pin-curie.outputs.needed == 'true'
+        if: ${{ github.event_name != 'merge_group' && (steps.fix-pin-curie.outputs.needed == 'true') }}
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v3.16.4
@@ -110,16 +119,16 @@ jobs:
       # runner) and the scripted driver requires 30 GB free. Remove only the
       # preinstalled .NET, Haskell and Android trees, which are unused here.
       - name: Free disk for the disposable factory cluster
-        if: steps.fix-pin-curie.outputs.needs_kind == 'true'
+        if: ${{ github.event_name != 'merge_group' && (steps.fix-pin-curie.outputs.needs_kind == 'true') }}
         run: |
           set -euo pipefail
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
           df -h /
       - name: Ensure kind-registry exists
-        if: steps.fix-pin-curie.outputs.needs_kind == 'true'
+        if: ${{ github.event_name != 'merge_group' && (steps.fix-pin-curie.outputs.needs_kind == 'true') }}
         run: bash cli/scripts/ensure-kind-registry.sh
       - name: Install kind and kubectl without creating a cluster
-        if: steps.fix-pin-curie.outputs.needs_kind == 'true'
+        if: ${{ github.event_name != 'merge_group' && (steps.fix-pin-curie.outputs.needs_kind == 'true') }}
         id: install_kind
         continue-on-error: true
         uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
@@ -128,20 +137,20 @@ jobs:
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
           install_only: true
       - name: Back off before retrying Install kind and kubectl without creating a cluster
-        if: steps.fix-pin-curie.outputs.needs_kind == 'true' && steps.install_kind.outcome == 'failure'
+        if: ${{ github.event_name != 'merge_group' && (steps.fix-pin-curie.outputs.needs_kind == 'true' && steps.install_kind.outcome == 'failure') }}
         run: |
           echo "Install kind and kubectl without creating a cluster failed on attempt 1 of 2, retrying in 15 seconds"
           bash cli/scripts/ensure-kind-registry.sh
           sleep 15
       - name: Install kind and kubectl without creating a cluster (retry)
-        if: steps.fix-pin-curie.outputs.needs_kind == 'true' && steps.install_kind.outcome == 'failure'
+        if: ${{ github.event_name != 'merge_group' && (steps.fix-pin-curie.outputs.needs_kind == 'true' && steps.install_kind.outcome == 'failure') }}
         uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
           install_only: true
       - name: Download and verify the exact public v0.12.5 factory upgrade assets
-        if: steps.fix-pin-curie.outputs.needs_factory_upgrade == 'true'
+        if: ${{ github.event_name != 'merge_group' && (steps.fix-pin-curie.outputs.needs_factory_upgrade == 'true') }}
         run: |
           set -euo pipefail
           release_url=https://github.com/curie-eng/curie/releases/download/v0.12.5
@@ -159,19 +168,20 @@ jobs:
       # Use the same migration, authenticated read and worker readiness gate
       # as the Python job before executing any pinned integration selector.
       - name: Start dev stack
-        if: steps.fix-pin-curie.outputs.needs_stack == 'true'
+        if: ${{ github.event_name != 'merge_group' && (steps.fix-pin-curie.outputs.needs_stack == 'true') }}
         run: python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480
       - name: Wait for Langfuse to serve
-        if: steps.fix-pin-curie.outputs.needs_stack == 'true'
+        if: ${{ github.event_name != 'merge_group' && (steps.fix-pin-curie.outputs.needs_stack == 'true') }}
         run: python3 scripts/wait-for-langfuse.py
       # A pinned worker binding test dials the shared default database and
       # assumes the curie schema exists, exactly as it does under the Python
       # job, so the same migration runs here.
       - name: Migrate the shared database
-        if: steps.fix-pin-curie.outputs.needs_stack == 'true'
+        if: ${{ github.event_name != 'merge_group' && (steps.fix-pin-curie.outputs.needs_stack == 'true') }}
         working-directory: apps/api
         run: uv run alembic upgrade head
       - name: Require declared fixes to be pinned by a changed test
+        if: github.event_name != 'merge_group'
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/cli/target
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -184,5 +194,5 @@ jobs:
       # --profile full, `docker compose logs` matches no service and prints
       # nothing, so a real outage gets diagnosed with no container logs at all.
       - name: Dump dev stack logs on failure
-        if: ${{ failure() && steps.fix-pin-curie.outputs.needs_stack == 'true' }}
+        if: ${{ github.event_name != 'merge_group' && (failure() && steps.fix-pin-curie.outputs.needs_stack == 'true') }}
         run: docker compose --profile full -f compose.dev.yaml logs --no-color --tail=200

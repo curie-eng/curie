@@ -1052,6 +1052,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--head")
     parser.add_argument("--push", action="store_true")
     parser.add_argument(
+        "--full-pytest",
+        action="store_true",
+        help=(
+            "Select tiers from the revision diff but keep pytest off impact selection: "
+            "the path rules decide whether it runs, on its full scope and shard plan "
+            "(the merge queue)."
+        ),
+    )
+    parser.add_argument(
         "--pytest-targets-out",
         type=Path,
         help="Write the impact targets one per line (empty unless the scope is impact).",
@@ -1105,7 +1114,7 @@ def _run() -> None:
         pytest_needed = _pytest_needed(
             registry,
             paths,
-            pull_request=True,
+            pull_request=not args.full_pytest,
             workflow_jobs_changed=workflow_jobs_changed,
             registry_pytest_changed=registry_pytest_changed,
         )
@@ -1194,7 +1203,7 @@ def _run() -> None:
         registry,
         paths,
         pytest_scope,
-        pull_request=not args.push,
+        pull_request=not (args.push or args.full_pytest),
         pytest_needed=pytest_needed,
         workflow_jobs_changed=workflow_jobs_changed,
         registry_pytest_changed=registry_pytest_changed,
