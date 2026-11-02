@@ -48,12 +48,12 @@ def test_sleep_new_violation_fails(tmp_path: Path, argument: str) -> None:
     assert "sleeps" in result.stdout
 
 
-def test_sleep_removed_baseline_entry_fails(tmp_path: Path) -> None:
+def test_sleep_removed_baseline_entry_is_reported_and_pruned(tmp_path: Path) -> None:
     source(tmp_path, "tests/test_case.py", "import time\ntime.sleep(1)\n")
     assert generate(tmp_path)["sleeps"] == {"tests/test_case.py": 1}
     source(tmp_path, "tests/test_case.py", "import time\ntime.sleep(0)\n")
     result = command(tmp_path)
-    assert result.returncode == 1
+    assert result.returncode == 0
     assert "stale" in result.stdout
     generate(tmp_path)
     assert command(tmp_path).returncode == 0
@@ -100,14 +100,14 @@ def test_new_per_case_fixture_fails_through_imported_helper(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize("scope", ['(scope="module")', '(scope="session")'])
-def test_removed_fixture_baseline_entry_fails(tmp_path: Path, scope: str) -> None:
+def test_removed_fixture_baseline_entry_is_reported_and_pruned(tmp_path: Path, scope: str) -> None:
     source(tmp_path, "helpers.py", HELPER)
     source(tmp_path, "tests/test_case.py", FIXTURE.format(scope=""))
     assert generate(tmp_path)["fixtures"] == ["tests/test_case.py::cluster"]
     assert command(tmp_path).returncode == 0
     source(tmp_path, "tests/test_case.py", FIXTURE.format(scope=scope))
     assert "stale" in command(tmp_path).stdout
-    assert command(tmp_path).returncode == 1
+    assert command(tmp_path).returncode == 0
     generate(tmp_path)
     assert command(tmp_path).returncode == 0
 
@@ -135,7 +135,9 @@ def test_deleted_test_file_is_stale(tmp_path: Path) -> None:
     source(tmp_path, "tests/test_case.py", "import asyncio\nasyncio.sleep(delay)\n")
     generate(tmp_path)
     (tmp_path / "tests/test_case.py").unlink()
-    assert command(tmp_path).returncode == 1
+    assert command(tmp_path).returncode == 0
+    assert "stale" in command(tmp_path).stdout
+    assert generate(tmp_path)["sleeps"] == {}
 
 
 @pytest.mark.parametrize("contents", ["{}", "{", '{"sleeps": [], "fixtures": [], "durations": []}'])
@@ -151,23 +153,29 @@ def test_missing_baseline_fails_closed(tmp_path: Path) -> None:
 def test_duration_baseline_uses_call_phase_and_normalizes_xdist(tmp_path: Path) -> None:
     artifact = tmp_path / "durations.log"
     artifact.write_text("""30.00s setup tests/test_case.py::test_setup
-21.00s call tests/test_case.py::test_slow@tests/test_case.py
+31.00s call tests/test_case.py::test_slow@tests/test_case.py
 19.99s call tests/test_case.py::test_fast
 40.00s teardown tests/test_case.py::test_teardown
 """)
-    result = command(tmp_path, "--regenerate", "--durations", str(artifact))
+    source(tmp_path, "tests/test_case.py", "def test_slow(): pass\n")
+    artifact2 = tmp_path / "second.log"
+    artifact2.write_text(artifact.read_text())
+    result = command(
+        tmp_path, "--regenerate", "--durations", str(artifact), "--durations", str(artifact2)
+    )
     assert result.returncode == 0, result.stdout + result.stderr
     baseline = json.loads((tmp_path / BASELINE).read_text())
     assert baseline["durations"] == ["tests/test_case.py::test_slow"]
 
 
 def test_duration_new_violation_fails() -> None:
-    assert "exceeds" in (budget_failure("tests/test_case.py::test_slow", 20.01, set()) or "")
+    assert "exceeds" in (budget_failure("tests/test_case.py::test_slow", 30.01, set()) or "")
 
 
-def test_duration_removed_violation_fails() -> None:
-    assert "stale" in (
-        budget_failure("tests/test_case.py::test_slow", 20, {"tests/test_case.py::test_slow"}) or ""
+def test_fast_exempt_duration_never_fails_ci() -> None:
+    assert (
+        budget_failure("tests/test_case.py::test_slow", 0.1, {"tests/test_case.py::test_slow"})
+        is None
     )
 
 
@@ -223,8 +231,7 @@ def test_fast(setup_delay): pass
         json.dumps({"sleeps": {}, "fixtures": [], "durations": ["test_case.py::test_fast"]}),
     )
     result = subprocess.run(argv, cwd=tmp_path, env=env, capture_output=True, text=True)
-    assert result.returncode == 1, result.stdout + result.stderr
-    assert "stale" in result.stdout
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(
@@ -251,35 +258,47 @@ def test_duration_parameter_identity_is_preserved() -> None:
     )
 
 
-def test_complete_empty_duration_observation_removes_exemption(tmp_path: Path) -> None:
-    source(tmp_path, "durations.log", "test-time duration observations: 0 over budget\n")
-    assert (
-        command(tmp_path, "--regenerate", "--durations", str(tmp_path / "durations.log")).returncode
-        == 0
-    )
-    assert json.loads((tmp_path / BASELINE).read_text())["durations"] == []
+def duration_artifacts(root: Path, *seconds: float) -> list[str]:
+    arguments = []
+    for index, duration in enumerate(seconds):
+        artifact = root / f"run-{index}.log"
+        artifact.write_text(f"{duration}s call tests/test_case.py::test_case\n")
+        arguments.extend(["--durations", str(artifact)])
+    return arguments
 
 
-def test_deleted_duration_test_is_stale(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("first", "second", "retained"), [(8, 9, False), (8, 10, True), (8, 31, True)]
+)
+def test_duration_regeneration_uses_maximum_and_hysteresis(
+    tmp_path: Path, first: float, second: float, retained: bool
+) -> None:
     source(tmp_path, "tests/test_case.py", "def test_case(): pass\n")
-    source(tmp_path, "durations.log", "21.0s call tests/test_case.py::test_case\n")
-    assert (
-        command(tmp_path, "--regenerate", "--durations", str(tmp_path / "durations.log")).returncode
-        == 0
-    )
-    assert command(tmp_path).returncode == 0
+    assert command(tmp_path, "--regenerate", *duration_artifacts(tmp_path, 31, 32)).returncode == 0
+    result = command(tmp_path, "--regenerate", *duration_artifacts(tmp_path, first, second))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert bool(json.loads((tmp_path / BASELINE).read_text())["durations"]) is retained
+
+
+def test_duration_regeneration_requires_two_runs(tmp_path: Path) -> None:
+    assert command(tmp_path, "--regenerate", *duration_artifacts(tmp_path, 31)).returncode != 0
+
+
+def test_deleted_duration_test_is_reported_then_pruned(tmp_path: Path) -> None:
+    source(tmp_path, "tests/test_case.py", "def test_case(): pass\n")
+    assert command(tmp_path, "--regenerate", *duration_artifacts(tmp_path, 31, 32)).returncode == 0
     source(tmp_path, "tests/test_case.py", "def test_other(): pass\n")
-    result = command(tmp_path)
-    assert result.returncode == 1
-    assert "stale test identity" in result.stdout
+    assert command(tmp_path).returncode == 0
+    assert "stale" in command(tmp_path).stdout
+    assert generate(tmp_path)["durations"] == []
 
 
-def test_removed_duration_parameter_is_rejected_at_collection(tmp_path: Path) -> None:
+def test_removed_duration_parameter_is_ignored_at_collection(tmp_path: Path) -> None:
     source(
         tmp_path,
         "test_case.py",
         'import pytest\n@pytest.mark.parametrize("value", ["current"])\n'
-        'def test_case(value): pass\n',
+        "def test_case(value): pass\n",
     )
     source(
         tmp_path,
@@ -304,5 +323,70 @@ def test_removed_duration_parameter_is_rejected_at_collection(tmp_path: Path) ->
         text=True,
         capture_output=True,
     )
-    assert result.returncode != 0
-    assert "stale collected identities" in result.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tests/queue_fixtures.py",
+        "tools/factory-e2e/tests/c4_admitted_kind.py",
+        "packages/test-support/src/helpers.py",
+    ],
+)
+def test_helpers_anyio_and_assignment_aliases_are_scanned(tmp_path: Path, path: str) -> None:
+    source(
+        tmp_path, path, "import anyio as io\nwait = io.sleep\nalias = wait\nalias(1)\nalias(0)\n"
+    )
+    assert generate(tmp_path)["sleeps"] == {path: 1}
+
+
+def git(root: Path, *argv: str) -> str:
+    result = subprocess.run(["git", *argv], cwd=root, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout.strip()
+
+
+def test_ci_ratchets_compare_merge_base_not_advanced_tip(tmp_path: Path) -> None:
+    git(tmp_path, "init", "-q", "-b", "main")
+    git(tmp_path, "config", "user.name", "Example")
+    git(tmp_path, "config", "user.email", "test@example.com")
+    git(tmp_path, "config", "core.hooksPath", os.devnull)
+    source(tmp_path, "tests/test_case.py", "import time\ntime.sleep(1)\n")
+    generate(tmp_path)
+    git(tmp_path, "add", ".")
+    git(tmp_path, "commit", "-qm", "Initial test costs")
+    git(tmp_path, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(tmp_path, "branch", "feature")
+    source(tmp_path, "tests/test_case.py", "import time\ntime.sleep(0)\n")
+    generate(tmp_path)
+    git(tmp_path, "commit", "-qam", "Remove a sleep")
+    git(tmp_path, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(tmp_path, "checkout", "-q", "feature")
+    assert command(tmp_path).returncode == 0
+    source(tmp_path, "tests/queue_fixtures.py", "import anyio\nanyio.sleep(1)\n")
+    assert command(tmp_path).returncode == 1
+
+
+@pytest.mark.parametrize(
+    ("event", "base", "ref", "expected"),
+    [
+        ("pull_request", "next", "123/merge", "origin/next"),
+        ("push", "", "next", "origin/next"),
+        ("workflow_dispatch", "", "main", "origin/main"),
+        ("schedule", "", "next", "origin/next"),
+        ("merge_group", "", "gh-readonly-queue/next/test", "origin/next"),
+    ],
+)
+def test_ci_event_base_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event: str, base: str, ref: str, expected: str
+) -> None:
+    from curie_test_support.test_ratchets import base_reference
+
+    monkeypatch.setenv("GITHUB_EVENT_NAME", event)
+    monkeypatch.setenv("GITHUB_BASE_REF", base)
+    monkeypatch.setenv("GITHUB_REF_NAME", ref)
+    payload = tmp_path / "event.json"
+    payload.write_text(json.dumps({"merge_group": {"base_ref": "refs/heads/next"}}))
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(payload))
+    assert base_reference() == expected
