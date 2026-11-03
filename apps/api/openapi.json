@@ -13631,6 +13631,18 @@
         "additionalProperties": false,
         "description": "The identity-bearing fields of one Slack delivery, as the dispatcher read them.\n\nStrict, so a string ``\"false\"`` is never taken as the positive statement\n``is_ext_shared_channel: false``; extra fields are refused, so a field this\nmapping does not use cannot be sent as if it were evidence.",
         "properties": {
+          "channel_type": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Type"
+          },
           "delivery": {
             "maxLength": 256,
             "title": "Delivery",
@@ -13644,6 +13656,18 @@
             "maxItems": 32,
             "title": "Enterprise Ids",
             "type": "array"
+          },
+          "event_source_team": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Source Team"
           },
           "event_team": {
             "anyOf": [
@@ -14679,6 +14703,17 @@
           "event_id": {
             "title": "Event Id",
             "type": "string"
+          },
+          "reply_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Ref"
           },
           "stream_id": {
             "anyOf": [

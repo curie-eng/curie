@@ -355,7 +355,8 @@ def test_invalid_or_unsupported_delivery_refuses_before_http(damage: str) -> Non
     elif damage in {"identity", "bot"}:
         kwargs["slack_identity" if damage == "identity" else "bot_user_id"] = "synthetic-other"
     else:
-        event.update(type="message", channel_type="im")
+        # A group DM is never a direct-message source. @spec HTTP-INVOCATION-EXECUTION-26.
+        event.update(type="message", channel_type="mpim")
     result = runtime.submit(**kwargs)
     assert result.status == "refused" and result.stream_id is None
     assert rig.requests == []
@@ -698,3 +699,70 @@ def test_grid_mention_signs_every_enterprise_signal_for_the_api_to_check() -> No
     ordinary = HttpRig(auth=grid_auth())
     with pytest.raises(ValueError, match="^invalid_http_receiver_runtime$"):
         ordinary.runtime(module)
+
+
+SLOT = "1700.0099"
+
+
+def test_prepared_submission_signs_its_reply_slot_inside_the_body() -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-27: the slot is authenticated, posted only after prepare."""
+    module = api()
+    rig = HttpRig()
+    runtime = rig.runtime(module)
+    body, event = native()
+    prepared = runtime.prepare(body=body, event=event, slack_identity=NAME, bot_user_id=BOT)
+    assert prepared is not None and rig.requests == []
+    assert prepared.channel == CHANNEL and prepared.thread_ts == "1700.0001"
+    assert CREDENTIAL not in repr(prepared)
+    with pytest.raises(TypeError):
+        pickle.dumps(prepared)
+    result = runtime.send(prepared, reply_ref=SLOT)
+    assert result.status == "accepted" and result.duplicate is False and result.reply_ref is None
+    (request,) = rig.requests
+    assert json.loads(request.content)["reply_ref"] == SLOT
+    ring = codec.build_identity_keyring("receiver", ((RECEIVER, 2, KEY),))
+    proof = codec.verify_receiver_proof(request.headers["X-Curie-Receiver-Proof"], ring)
+    assert isinstance(proof, codec.ReceiverProofV1)
+    assert proof.body_sha256 == hashlib.sha256(request.content).hexdigest()
+    body, event = native()
+    event["channel"] = "C0EXAMPLEUNBOUND"
+    assert runtime.prepare(body=body, event=event, slack_identity=NAME, bot_user_id=BOT) is None
+    rig.closed()
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        ({"duplicate": True, "reply_ref": SLOT}, ("accepted", True, SLOT)),
+        ({"duplicate": True}, ("accepted", True, None)),
+        ({"duplicate": True, "reply_ref": "not-a-slot"}, ("unavailable", False, None)),
+        ({"duplicate": True, "reply_ref": None}, ("unavailable", False, None)),
+        ({"duplicate": True, "reply_ref": 1700}, ("unavailable", False, None)),
+    ],
+)
+def test_duplicate_receipt_slot_is_decoded_strictly(
+    answer: dict[str, Any], expected: tuple[str, bool, str | None],
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-27: a malformed slot is never proof of ownership."""
+    module = api()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=receipt(**answer))
+
+    rig = HttpRig(handler)
+    result = rig.submit(rig.runtime(module))
+    assert (result.status, result.duplicate, result.reply_ref) == expected
+    rig.closed()
+
+
+def test_pending_receipt_never_carries_a_slot() -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-27: only a permanent receipt names the accepted slot."""
+    module = api()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(202, json=receipt(pending=True, reply_ref=SLOT))
+
+    rig = HttpRig(handler)
+    result = rig.submit(rig.runtime(module))
+    assert result.status == "unavailable" and result.reply_ref is None
+    rig.closed()

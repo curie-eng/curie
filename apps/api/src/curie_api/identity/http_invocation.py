@@ -1,4 +1,4 @@
-"""Current HTTP invocation composition. @spec HTTP-INVOCATION-EXECUTION-1/2/4/5/6/15."""
+"""Current HTTP invocation composition. @spec HTTP-INVOCATION-EXECUTION-1/2/4/5/6/15/29."""
 
 from __future__ import annotations
 
@@ -41,6 +41,7 @@ from curie_api.delivery import (
     DeliveryEnqueueGuard,
     DeliveryIdentityContext,
     DeliveryValidityWindow,
+    is_reply_slot,
 )
 from curie_api.identity.delivery_validity import identity_delivery_window
 from curie_api.identity.http_credential_registry import (
@@ -96,10 +97,13 @@ class ReceiverRegistrationV1(FactsModel):
     bot_user_id: codec.Identifier
     binding_ids: Annotated[tuple[CanonicalUUID, ...], Field(min_length=1, max_length=256)]
     human_native_ids: Annotated[tuple[codec.Identifier, ...], Field(max_length=256)]
+    # Operator-trusted Slack Connect partners (ADR 0261 decision 1). Absent or
+    # empty is the existing registration. @spec HTTP-INVOCATION-EXECUTION-24.
+    trusted_namespaces: Annotated[tuple[NamespaceV1, ...], Field(max_length=256)] = ()
 
     @model_validator(mode="after")
     def consistent_scope(self) -> Self:
-        """@spec HTTP-INVOCATION-EXECUTION-15/21."""
+        """@spec HTTP-INVOCATION-EXECUTION-15/21/24."""
         namespace = self.namespace
         ordinary = (
             namespace.kind == SLACK_WORKSPACE_KIND and namespace.key == self.installation_account
@@ -107,22 +111,122 @@ class ReceiverRegistrationV1(FactsModel):
         grid = (
             namespace.kind == SLACK_ENTERPRISE_KIND and namespace.key != self.installation_account
         )
+        entries = self.trusted_namespaces
+        allowed = {SLACK_WORKSPACE_KIND, SLACK_ENTERPRISE_KIND} if ordinary else {
+            SLACK_WORKSPACE_KIND,
+        }
+        keys = {entry.key for entry in entries}
+        ids = {entry.id for entry in entries}
         if (
             namespace.authority != "" or not (ordinary or grid)
             or len(set(self.binding_ids)) != len(self.binding_ids)
             or len(set(self.human_native_ids)) != len(self.human_native_ids)
+            or any(entry.authority != "" or entry.kind not in allowed for entry in entries)
+            or len(keys) != len(entries) or len(ids) != len(entries)
+            or namespace.key in keys or self.installation_account in keys
+            or namespace.id in ids
         ):
             raise ValueError("invalid_receiver_registration")
         return self
 
+    def namespace_for_key(self, key: str) -> NamespaceV1 | None:
+        """The registered namespace a derived sender key names, if any.
+
+        The registration's own namespace for its own key, otherwise the trusted
+        entry with that key. @spec HTTP-INVOCATION-EXECUTION-24.
+        """
+        if key == self.namespace.key:
+            return self.namespace
+        return next((entry for entry in self.trusted_namespaces if entry.key == key), None)
+
+    def recorded_namespace(self, recorded: NamespaceV1 | codec.ContextNamespaceV1) -> (
+        NamespaceV1 | None
+    ):
+        """Own namespace or the trusted entry exactly equal to a recorded one.
+
+        Every later check accepts a recorded sender namespace only through this,
+        so removing an entry refuses its members. @spec HTTP-INVOCATION-EXECUTION-24.
+        """
+        value = recorded.model_dump()
+        return next((
+            candidate for candidate in (self.namespace, *self.trusted_namespaces)
+            if candidate.model_dump() == value
+        ), None)
+
+    def trusted_keys(self, kind: str) -> frozenset[str]:
+        """@spec HTTP-INVOCATION-EXECUTION-24."""
+        return frozenset(entry.key for entry in self.trusted_namespaces if entry.kind == kind)
+
+
+EMAIL_DOMAIN_KIND = "email_domain"
+_MAX_EMAIL_DOMAINS = 16
+
+
+class EmailReceiverRegistrationV1(FactsModel):
+    """An operator's mail adapter registration. @spec HTTP-INVOCATION-EXECUTION-29.
+
+    Email bindings have no ChannelIdentity or ProviderInstallation rows, so
+    both ids are operator-chosen stable values. Each domain is a namespace
+    descriptor the sender's address must fall in.
+    """
+
+    schema_version: codec.Version
+    receiver_id: CanonicalUUID
+    generation: codec.Generation
+    tenant_id: CanonicalUUID
+    channel_identity_id: CanonicalUUID
+    provider_installation_id: CanonicalUUID
+    binding_ids: Annotated[tuple[CanonicalUUID, ...], Field(min_length=1, max_length=256)]
+    domains: Annotated[
+        tuple[NamespaceV1, ...], Field(min_length=1, max_length=_MAX_EMAIL_DOMAINS),
+    ]
+
+    @model_validator(mode="after")
+    def consistent_domains(self) -> Self:
+        """@spec HTTP-INVOCATION-EXECUTION-29: lowercase unique email_domain keys."""
+        keys = [domain.key for domain in self.domains]
+        if (
+            any(
+                domain.kind != EMAIL_DOMAIN_KIND or domain.authority != ""
+                or domain.key != domain.key.lower() or "@" in domain.key
+                or len(domain.key) > 253
+                or any(c.isspace() or not c.isprintable() for c in domain.key)
+                for domain in self.domains
+            )
+            or len(set(keys)) != len(keys)
+            or len({domain.id for domain in self.domains}) != len(self.domains)
+            or len(set(self.binding_ids)) != len(self.binding_ids)
+        ):
+            raise ValueError("invalid_email_receiver_registration")
+        return self
+
+    def domain(self, key: str) -> NamespaceV1 | None:
+        """The trusted descriptor for one address domain. @spec HTTP-INVOCATION-EXECUTION-29."""
+        return next((domain for domain in self.domains if domain.key == key), None)
+
+
+AnyReceiverRegistration = ReceiverRegistrationV1 | EmailReceiverRegistrationV1
+
+
+def independent_human(registration: AnyReceiverRegistration, native_id: str) -> bool:
+    """Operator-declared human evidence; email declares none. @spec HTTP-INVOCATION-EXECUTION-29."""
+    return isinstance(registration, ReceiverRegistrationV1) and (
+        native_id in registration.human_native_ids
+    )
+
 
 class HttpInvocationRuntime:
-    """@spec HTTP-INVOCATION-EXECUTION-1/15."""
+    """@spec HTTP-INVOCATION-EXECUTION-1/15/29."""
 
-    __slots__ = ("_providers", "_receivers", "_receiver_keys", "_context_keys", "_signing_key")
+    __slots__ = (
+        "_providers", "_receivers", "_receiver_keys", "_email_receivers", "_email_keys",
+        "_context_keys", "_signing_key",
+    )
     _providers: ProviderCredentialRegistry
     _receivers: Mapping[tuple[str, int], ReceiverRegistrationV1]
     _receiver_keys: codec.IdentityKeyring
+    _email_receivers: Mapping[tuple[str, int], EmailReceiverRegistrationV1]
+    _email_keys: codec.IdentityKeyring
     _context_keys: codec.IdentityKeyring
     _signing_key: tuple[str, int]
 
@@ -161,12 +265,15 @@ def build_http_invocation_runtime(
     context_keys: tuple[tuple[str, int, bytes], ...],
     *,
     signing_key: tuple[str, int],
+    email_receivers: tuple[tuple[EmailReceiverRegistrationV1, bytes], ...] = (),
 ) -> HttpInvocationRuntime:
-    """@spec HTTP-INVOCATION-EXECUTION-1/15."""
+    """@spec HTTP-INVOCATION-EXECUTION-1/15/29."""
     try:
         if (
             type(providers) is not ProviderCredentialRegistry
             or type(receiver_registrations) is not tuple or len(receiver_registrations) > 256
+            or type(email_receivers) is not tuple or len(email_receivers) > 256
+            or not receiver_registrations and not email_receivers
             or type(context_keys) is not tuple or type(signing_key) is not tuple
             or len(signing_key) != 2
         ):
@@ -189,6 +296,7 @@ def build_http_invocation_runtime(
             materials.add(material)
             receivers[pair] = registration
             receiver_keys.append((*pair, material))
+        email, email_keys = _email_registrations(email_receivers, receivers, materials)
         context_ring = codec.build_identity_keyring("context", context_keys)
         references = set()
         for key_id, generation, material in context_keys:
@@ -207,11 +315,77 @@ def build_http_invocation_runtime(
         object.__setattr__(runtime, "_receiver_keys", codec.build_identity_keyring(
             "receiver", tuple(receiver_keys),
         ))
+        object.__setattr__(runtime, "_email_receivers", MappingProxyType(email))
+        object.__setattr__(runtime, "_email_keys", codec.build_identity_keyring(
+            "receiver", email_keys,
+        ))
         object.__setattr__(runtime, "_context_keys", context_ring)
         object.__setattr__(runtime, "_signing_key", signing_key)
         return runtime
     except Exception:  # noqa: BLE001 - initializer failures never disclose key material.
         raise ValueError("invalid_http_invocation_runtime") from None
+
+
+def _email_registrations(
+    supplied: tuple[tuple[EmailReceiverRegistrationV1, bytes], ...],
+    slack: Mapping[tuple[str, int], ReceiverRegistrationV1],
+    materials: set[bytes],
+) -> tuple[dict[tuple[str, int], EmailReceiverRegistrationV1], tuple[tuple[str, int, bytes], ...]]:
+    """Email registrations whose keys, domains and ids are unique across the runtime.
+
+    ``materials`` already holds every Slack receiver key and gains each email
+    key, so the later context keys are compared against both.
+    @spec HTTP-INVOCATION-EXECUTION-29.
+    """
+    slack_ids = {registration.receiver_id for registration in slack.values()}
+    slack_scopes = {
+        value for registration in slack.values()
+        for value in (registration.channel_identity_id, registration.provider_installation_id)
+    }
+    # Own and trusted Slack namespaces alike. @spec HTTP-INVOCATION-EXECUTION-24/29.
+    slack_namespaces = {
+        namespace.id for registration in slack.values()
+        for namespace in (registration.namespace, *registration.trusted_namespaces)
+    }
+    slack_bindings = {
+        binding for registration in slack.values() for binding in registration.binding_ids
+    }
+    registrations: dict[tuple[str, int], EmailReceiverRegistrationV1] = {}
+    keys: list[tuple[str, int, bytes]] = []
+    receiver_ids: set[str] = set()
+    scopes: set[str] = set()
+    domains: set[str] = set()
+    namespaces: set[str] = set()
+    bindings: set[str] = set()
+    for item in supplied:
+        if type(item) is not tuple or len(item) != 2:
+            raise ValueError
+        value, material = item
+        if type(value) is not EmailReceiverRegistrationV1:
+            raise ValueError
+        registration = EmailReceiverRegistrationV1.model_validate(value.model_dump())
+        own_scope = {registration.channel_identity_id, registration.provider_installation_id}
+        own_domains = {domain.key for domain in registration.domains}
+        own_namespaces = {domain.id for domain in registration.domains}
+        own_bindings = set(registration.binding_ids)
+        if (
+            registration.receiver_id in receiver_ids or registration.receiver_id in slack_ids
+            or own_scope & (scopes | slack_scopes) or own_domains & domains
+            or own_namespaces & (namespaces | slack_namespaces)
+            or own_bindings & (bindings | slack_bindings)
+            or type(material) is not bytes or len(material) != 32 or material in materials
+        ):
+            raise ValueError
+        receiver_ids.add(registration.receiver_id)
+        scopes |= own_scope
+        domains |= own_domains
+        namespaces |= own_namespaces
+        bindings |= own_bindings
+        materials.add(material)
+        pair = (registration.receiver_id, registration.generation)
+        registrations[pair] = registration
+        keys.append((*pair, material))
+    return registrations, tuple(keys)
 
 
 def registers_binding_identity(
@@ -235,11 +409,14 @@ def registers_binding_identity(
 async def binding_requires_http_identity(
     session: AsyncSession, runtime: HttpInvocationRuntime | None, binding: AgentChannel,
 ) -> bool:
-    """The one per-binding HTTP classification. @spec HTTP-INVOCATION-EXECUTION-22.
+    """The one per-binding HTTP classification.
 
     SQL presence keeps corrupt JSON null out of the legacy path (criteria 15 and
     17). In a selected tenant a registered identity requires HTTP identity, and
-    so does an agent whose invocation filter only HTTP facts can evaluate.
+    so does an agent whose invocation or approver role only HTTP facts can
+    evaluate. Turn ingress, the worker's classification route and approval
+    continuity all ask this. @spec HTTP-INVOCATION-EXECUTION-22
+    HTTP-APPROVAL-CONTINUITY-14.
     """
     selected = await session.scalar(
         select(TenantIdentityProvider.http_selection.is_not(None)).where(
@@ -252,15 +429,16 @@ async def binding_requires_http_identity(
         runtime, tenant_id=binding.tenant_id, kind=binding.kind, adapter=binding.adapter,
     ):
         return True
-    return await _invocation_needs_http_facts(session, binding)
+    return await _roles_need_http_facts(session, binding)
 
 
-async def _invocation_needs_http_facts(session: AsyncSession, binding: AgentChannel) -> bool:
-    """A migrated or filtered invocation role is never legacy-evaluable.
+async def _roles_need_http_facts(session: AsyncSession, binding: AgentChannel) -> bool:
+    """A migrated or filtered invocation or approver role is never legacy-evaluable.
 
     A migrated role keeps no team requirement and agent-owned filters are read
-    only from HTTP facts, so the legacy path would admit callers they exclude.
-    An unreadable policy fails closed. @spec HTTP-INVOCATION-EXECUTION-22.
+    only from HTTP facts, so the legacy path would admit callers, or answer
+    approvals for actors, they exclude. An unreadable policy fails closed.
+    @spec HTTP-INVOCATION-EXECUTION-22 HTTP-APPROVAL-CONTINUITY-14.
     """
     result = (await session.execute(select(
         AgentAccessPolicy, AgentAccessPolicy.role_configuration.is_(None),
@@ -274,9 +452,11 @@ async def _invocation_needs_http_facts(session: AsyncSession, binding: AgentChan
         )
     except agent_role_policy.RolePolicyRefusal:
         return True
-    invocation = None if policy is None else policy.roles.invocation
-    return invocation is not None and (
-        invocation.legacy_state == "migrated" or invocation.filter is not None
+    if policy is None:
+        return False
+    return any(
+        role is not None and (role.legacy_state == "migrated" or role.filter is not None)
+        for role in (policy.roles.invocation, policy.roles.approver)
     )
 
 
@@ -338,38 +518,135 @@ def _receiver_source(
     registration: ReceiverRegistrationV1, proof: codec.ReceiverProofV1,
     claims: channel_token.ChannelClaims, body: Any,
 ) -> AuthenticatedSource:
-    """@spec HTTP-INVOCATION-EXECUTION-2/15/21."""
+    """@spec HTTP-INVOCATION-EXECUTION-2/15/21/24/26."""
+    # A Connect channel (shared flag True) is attributed by the owner below; an
+    # absent flag is never a channel of either kind. A direct message (ADR 0263)
+    # is attributed by the same owner and routed by the same binding checks.
     if (
         proof.binding_id != claims.channel_id or proof.binding_generation != claims.generation
         or proof.channel_identity_id != registration.channel_identity_id
         or proof.provider_installation_id != registration.provider_installation_id
-        or proof.slack.delivery != "app_mention" or proof.slack.is_ext_shared_channel is not False
+        or proof.slack.delivery not in {"app_mention", "message"}
+        or type(proof.slack.is_ext_shared_channel) is not bool
         or body.kind != "slack" or body.address != proof.native_channel_id
         or body.delivery_id != proof.delivery_id or body.conversation_id != proof.conversation_id
+        # @spec HTTP-INVOCATION-EXECUTION-27: only a Slack timestamp names a slot.
+        or (body.reply_ref != "" and not is_reply_slot(body.reply_ref))
     ):
         _invalid_receiver()
     evidence = SlackEvidence.model_validate(proof.slack.model_dump(mode="json"))
-    sender = derive_registered_sender(
-        evidence,
-        namespace_kind=registration.namespace.kind,
-        namespace_authority=registration.namespace.authority,
-        namespace_key=registration.namespace.key,
-        installation_account=registration.installation_account,
-    )
-    if (
-        not isinstance(sender, tuple) or sender[0] != registration.namespace.key
-        or sender[1] != body.author
-    ):
+    sender, namespace = registered_sender(registration, evidence)
+    if sender != body.author:
         _invalid_receiver()
     return AuthenticatedSource(
         claims.channel_id, claims.generation,
         SenderV1(
             provider="slack", channel_identity_id=registration.channel_identity_id,
             provider_installation_id=registration.provider_installation_id,
-            namespace=registration.namespace, native_id=sender[1],
+            namespace=namespace, native_id=sender,
         ),
         address=proof.native_channel_id,
     )
+
+
+def registered_sender(
+    registration: ReceiverRegistrationV1, evidence: SlackEvidence,
+) -> tuple[str, NamespaceV1]:
+    """The registered sender's native ID and namespace, or invalid receiver.
+
+    @spec HTTP-INVOCATION-EXECUTION-21/24 HTTP-APPROVAL-CONTINUITY-7.
+    """
+    sender = derive_registered_sender(
+        evidence,
+        namespace_kind=registration.namespace.kind,
+        namespace_authority=registration.namespace.authority,
+        namespace_key=registration.namespace.key,
+        installation_account=registration.installation_account,
+        trusted_workspaces=registration.trusted_keys(SLACK_WORKSPACE_KIND),
+        trusted_organisations=registration.trusted_keys(SLACK_ENTERPRISE_KIND),
+    )
+    namespace = None if not isinstance(sender, tuple) else registration.namespace_for_key(
+        sender[0],
+    )
+    if not isinstance(sender, tuple) or namespace is None:
+        _invalid_receiver()
+    return sender[1], namespace
+
+
+async def _current_slack_scope(
+    session: AsyncSession, registration: ReceiverRegistrationV1, tenant_id: uuid.UUID,
+) -> None:
+    """The registered Slack identity, installation and namespace rows, current.
+
+    @spec HTTP-INVOCATION-EXECUTION-15/21.
+    """
+    identity = await session.get(
+        ChannelIdentity, uuid.UUID(registration.channel_identity_id), populate_existing=True,
+    )
+    installation = await session.get(
+        ProviderInstallation, uuid.UUID(registration.provider_installation_id),
+        populate_existing=True,
+    )
+    namespace = await session.get(
+        IdentityNamespace, uuid.UUID(registration.namespace.id), populate_existing=True,
+    )
+    if (
+        identity is None or identity.tenant_id != tenant_id or identity.provider != "slack"
+        or identity.name != registration.channel_identity_name or identity.status != "active"
+        or identity.installation_mismatch
+        or str(identity.provider_installation_id) != registration.provider_installation_id
+        or installation is None or installation.tenant_id != tenant_id
+        or installation.provider != "slack" or installation.status != "connected"
+        or installation.authority != registration.namespace.authority
+        or installation.external_account_id != registration.installation_account
+        or namespace is None or namespace.tenant_id != tenant_id or namespace.provider != "slack"
+        or namespace.status != "active" or namespace.authority != registration.namespace.authority
+        or namespace.kind != registration.namespace.kind
+        or namespace.key != registration.namespace.key
+    ):
+        _invalid_receiver()
+
+
+def _email_receiver_source(
+    runtime: HttpInvocationRuntime, receiver_proof: str,
+    claims: channel_token.ChannelClaims, body: Any, submitted_bytes: bytes,
+) -> tuple[EmailReceiverRegistrationV1, AuthenticatedSource, codec.EmailReceiverProofV1]:
+    """The sender a registered mail adapter signed for exactly this submission.
+
+    Every mismatch is an invalid receiver; a verified address outside the
+    registration's domains is a caller refusal. Both precede any lookup. The
+    verified proof is returned for the delivery intent.
+    @spec HTTP-INVOCATION-EXECUTION-27/29.
+    """
+    proof = codec.verify_email_receiver_proof(receiver_proof, runtime._email_keys)
+    if not isinstance(proof, codec.EmailReceiverProofV1):
+        _invalid_receiver()
+    registration = runtime._email_receivers.get((proof.receiver_id, proof.receiver_generation))
+    listing = [
+        candidate for candidate in runtime._email_receivers.values()
+        if claims.channel_id in candidate.binding_ids
+    ]
+    author = body.author
+    if (
+        registration is None or listing != [registration]
+        or proof.binding_id != claims.channel_id
+        or proof.body_sha256 != hashlib.sha256(submitted_bytes).hexdigest()
+        or body.kind != "email" or type(author) is not str
+        or proof.delivery_id != body.delivery_id or proof.sender != author.lower()
+    ):
+        _invalid_receiver()
+    namespace = registration.domain(proof.sender.rpartition("@")[2])
+    if namespace is None:
+        _deny()
+    return registration, AuthenticatedSource(
+        claims.channel_id, claims.generation,
+        SenderV1(
+            provider="email", channel_identity_id=registration.channel_identity_id,
+            provider_installation_id=registration.provider_installation_id,
+            namespace=namespace, native_id=proof.sender,
+        ),
+        address=body.address,
+    ), proof
 
 
 Role = Literal["invocation", "approver"]
@@ -377,7 +654,7 @@ Role = Literal["invocation", "approver"]
 
 async def capture_source(
     session: AsyncSession,
-    registration: ReceiverRegistrationV1,
+    registration: AnyReceiverRegistration,
     source: AuthenticatedSource,
     *,
     writer_agent: uuid.UUID | None = None,
@@ -389,7 +666,7 @@ async def capture_source(
     An answering actor's receiver may differ from the binding's identity: its
     required identity comes from the server-resolved approval target, checked by
     the answer owner, so ``binding_identity`` is false there.
-    @spec HTTP-INVOCATION-EXECUTION-2/4/5/15 HTTP-APPROVAL-CONTINUITY-8.
+    @spec HTTP-INVOCATION-EXECUTION-2/4/5/15/29 HTTP-APPROVAL-CONTINUITY-8.
     """
     tenant_id = uuid.UUID(registration.tenant_id)
     if writer_agent is not None:
@@ -416,16 +693,27 @@ async def capture_source(
     if (
         binding is None or str(binding.id) not in registration.binding_ids
         or binding.tenant_id != tenant_id or binding.generation != source.binding_generation
-        or binding.kind != "slack"
         or (source.address is not None and source.address != binding.address)
         or (source.agent_id is not None and source.agent_id != str(binding.agent_id))
+        or source.sender.channel_identity_id != registration.channel_identity_id
+        or source.sender.provider_installation_id != registration.provider_installation_id
+    ):
+        _invalid_receiver()
+    if isinstance(registration, EmailReceiverRegistrationV1):
+        # @spec HTTP-INVOCATION-EXECUTION-29: no identity, installation or namespace row.
+        if (
+            binding.kind != "email" or source.sender.provider != "email"
+            or source.sender.namespace not in registration.domains
+        ):
+            _invalid_receiver()
+    elif (
+        binding.kind != "slack"
         or (binding_identity and (binding.adapter or "default")
             != registration.channel_identity_name)
         or binding.endpoint is not None
         or source.sender.provider != "slack"
-        or source.sender.channel_identity_id != registration.channel_identity_id
-        or source.sender.provider_installation_id != registration.provider_installation_id
-        or source.sender.namespace != registration.namespace
+        # Own or trusted entry exactly. @spec HTTP-INVOCATION-EXECUTION-24.
+        or registration.recorded_namespace(source.sender.namespace) is None
     ):
         _invalid_receiver()
     agent = await session.get(Agent, binding.agent_id, populate_existing=True)
@@ -438,31 +726,8 @@ async def capture_source(
     policy = agent_role_policy.stored_snapshot(
         policy_row, sql_null, tenant_id=tenant_id, agent_id=agent.id,
     )
-    identity = await session.get(
-        ChannelIdentity, uuid.UUID(registration.channel_identity_id), populate_existing=True,
-    )
-    installation = await session.get(
-        ProviderInstallation, uuid.UUID(registration.provider_installation_id),
-        populate_existing=True,
-    )
-    namespace = await session.get(
-        IdentityNamespace, uuid.UUID(registration.namespace.id), populate_existing=True,
-    )
-    if (
-        identity is None or identity.tenant_id != tenant_id or identity.provider != "slack"
-        or identity.name != registration.channel_identity_name or identity.status != "active"
-        or identity.installation_mismatch
-        or str(identity.provider_installation_id) != registration.provider_installation_id
-        or installation is None or installation.tenant_id != tenant_id
-        or installation.provider != "slack" or installation.status != "connected"
-        or installation.authority != registration.namespace.authority
-        or installation.external_account_id != registration.installation_account
-        or namespace is None or namespace.tenant_id != tenant_id or namespace.provider != "slack"
-        or namespace.status != "active" or namespace.authority != registration.namespace.authority
-        or namespace.kind != registration.namespace.kind
-        or namespace.key != registration.namespace.key
-    ):
-        _invalid_receiver()
+    if isinstance(registration, ReceiverRegistrationV1):
+        await _current_slack_scope(session, registration, tenant_id)
     role_config = None if policy is None else getattr(policy.roles, role)
     team_id = None if policy_row is None else (
         policy_row.invocation_team_id if role == "invocation" else policy_row.approver_team_id
@@ -503,7 +768,7 @@ async def capture_source(
 
 
 def lookup_request(
-    registration: ReceiverRegistrationV1, captured: SourceCapture,
+    registration: AnyReceiverRegistration, captured: SourceCapture,
     credential: ResolvedProviderCredential, *, purpose: Literal["invocation", "approval"],
 ) -> LookupRequestV1:
     """A fresh bounded lookup for one source and provider purpose.
@@ -593,7 +858,7 @@ class CurrentHttpInvocation:
     intent_digest: str = field(repr=False)
     principal_ref: PrincipalRef | None
     _runtime: HttpInvocationRuntime = field(repr=False)
-    _registration: ReceiverRegistrationV1 = field(repr=False)
+    _registration: AnyReceiverRegistration = field(repr=False)
     _capture: SourceCapture = field(repr=False)
     _facts: ValidatedFacts = field(repr=False)
     _application: principal_authority.PrincipalApplication = field(repr=False)
@@ -620,9 +885,9 @@ class CurrentHttpInvocation:
 
     def seal_payload(
         self, *, payload: str, event_id: str, original_invocation_id: str,
-        reservation: BacklogReservation, receipt_key: str,
+        reservation: BacklogReservation, receipt_key: str, reply_ref: str = "",
     ) -> tuple[DeliveryIdentityContext, DeliveryEnqueueGuard]:
-        """@spec HTTP-INVOCATION-EXECUTION-6/15."""
+        """@spec HTTP-INVOCATION-EXECUTION-6/15/27."""
         if not self._sealable or not self._open or not self.session.in_transaction():
             _unavailable()
         config = self._capture.authority.configuration
@@ -648,7 +913,7 @@ class CurrentHttpInvocation:
             ),
             receiver_id=self._registration.receiver_id,
             receiver_generation=self._registration.generation,
-            independent_human=sender.native_id in self._registration.human_native_ids,
+            independent_human=independent_human(self._registration, sender.native_id),
             provider_issuer=selection.issuer, provider_version=config.version,
             provider_credential_id=selection.credential_ref.id,
             provider_credential_generation=selection.credential_ref.generation,
@@ -667,7 +932,7 @@ class CurrentHttpInvocation:
         return (
             DeliveryIdentityContext(
                 codec.seal_invocation_context(context, self._runtime._context_keys),
-                self.intent_digest, receipt_key,
+                self.intent_digest, receipt_key, reply_ref,
             ),
             DeliveryEnqueueGuard(
                 identity_fence.FENCE_KEY, self._stable, self._validity, reservation,
@@ -690,18 +955,54 @@ async def current_http_invocation(
     claims = channel_token.verify_claims(
         channel_credential, get_settings().api_key, scope=channel_token.CHANNEL_ENQUEUE_SCOPE,
     )
-    proof = codec.verify_receiver_proof(receiver_proof, runtime._receiver_keys)
-    if claims is None or not isinstance(proof, codec.ReceiverProofV1):
+    if claims is None:
         _invalid_receiver()
-    registration = runtime._receivers.get((proof.receiver_id, proof.receiver_generation))
-    if registration is None or proof.body_sha256 != hashlib.sha256(submitted_bytes).hexdigest():
-        _invalid_receiver()
-    source = _receiver_source(registration, proof, claims, body)
+    registration: AnyReceiverRegistration
+    verified: codec.ReceiverProofV1 | codec.EmailReceiverProofV1
+    if body.kind == "email":
+        # @spec HTTP-INVOCATION-EXECUTION-29: only an email proof names an email sender.
+        registration, source, verified = _email_receiver_source(
+            runtime, receiver_proof, claims, body, submitted_bytes,
+        )
+    else:
+        proof = codec.verify_receiver_proof(receiver_proof, runtime._receiver_keys)
+        if not isinstance(proof, codec.ReceiverProofV1):
+            _invalid_receiver()
+        slack = runtime._receivers.get((proof.receiver_id, proof.receiver_generation))
+        if slack is None or proof.body_sha256 != hashlib.sha256(submitted_bytes).hexdigest():
+            _invalid_receiver()
+        registration, source = slack, _receiver_source(slack, proof, claims, body)
+        verified = proof
     async with current_source_authority(
         request, runtime=runtime, client=client, registration=registration, source=source,
-        intent_digest=hashlib.sha256(receiver_proof.encode("ascii")).hexdigest(),
+        intent_digest=delivery_intent_digest(verified, body),
     ) as current:
         yield current
+
+
+def delivery_intent_digest(
+    proof: codec.ReceiverProofV1 | codec.EmailReceiverProofV1, body: Any,
+) -> str:
+    """The immutable delivery a receipt records, excluding the authenticated reply slot.
+
+    Receiver, binding, native delivery, conversation and sender evidence come from
+    the verified proof without its body digest; address, author, text and
+    attachments come from the parsed body without reply_ref. A Slack redelivery
+    with a fresh placeholder is therefore the same intent. An email delivery has
+    no reply slot, so its whole body, reply_ref included, is the intent.
+    @spec HTTP-INVOCATION-EXECUTION-27/29.
+    """
+    slot = {"reply_ref"} if isinstance(proof, codec.ReceiverProofV1) else set()
+    delivery = body.model_dump(mode="json", exclude=slot)
+    receiver = proof.model_dump(mode="json", exclude={"body_sha256"})
+    canonical = json.dumps(
+        {
+            "delivery": delivery, "purpose": "http_delivery_intent", "receiver": receiver,
+            "schema_version": 1,
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class _StaleCapture(Exception):
@@ -725,7 +1026,7 @@ _COMPOSITION_BUDGET_SECONDS = IDENTITY_CALLER_WAIT_SECONDS - _COMPOSITION_MARGIN
 @asynccontextmanager
 async def current_source_authority(
     request: Request, *, runtime: HttpInvocationRuntime, client: HttpIdentityClient,
-    registration: ReceiverRegistrationV1, source: AuthenticatedSource,
+    registration: AnyReceiverRegistration, source: AuthenticatedSource,
     intent_digest: str = "", original: codec.InvocationContextV1 | None = None,
 ) -> AsyncIterator[CurrentHttpInvocation]:
     """One caller's lookup/application/reader owner, purpose and role invocation.
@@ -810,7 +1111,7 @@ async def current_source_authority(
                             _unavailable()
                     source_permission(
                         current, binding, facts,
-                        current.sender.native_id in registration.human_native_ids, original,
+                        independent_human(registration, current.sender.native_id), original,
                     )
                     stable = await valkey.get(identity_fence.FENCE_KEY)
                     if isinstance(stable, bytes):
@@ -869,15 +1170,22 @@ def turn_authority_response(
 def invocation_source(
     runtime: HttpInvocationRuntime, context: codec.InvocationContextV1 | OriginalAssociation,
 ) -> tuple[ReceiverRegistrationV1, AuthenticatedSource]:
-    """Authenticated source scope only. @spec HTTP-APPROVAL-CONTINUITY-4/9."""
+    """Authenticated source scope only.
+
+    A recorded namespace must be the registration's own or one of its trusted
+    entries exactly. @spec HTTP-APPROVAL-CONTINUITY-4/9 HTTP-INVOCATION-EXECUTION-24.
+    """
     scope = context.scope
     registration = runtime._receivers.get((context.receiver_id, context.receiver_generation))
+    namespace = None if registration is None else registration.recorded_namespace(
+        scope.namespace,
+    )
     if (
         registration is None or registration.tenant_id != scope.tenant_id
         or scope.binding_id not in registration.binding_ids or scope.provider != "slack"
         or registration.channel_identity_id != scope.channel_identity_id
         or registration.provider_installation_id != scope.provider_installation_id
-        or registration.namespace.model_dump() != scope.namespace.model_dump()
+        or namespace is None
         or context.independent_human != (scope.native_id in registration.human_native_ids)
     ):
         _invalid_receiver()
@@ -886,11 +1194,51 @@ def invocation_source(
         SenderV1(
             provider=scope.provider, channel_identity_id=scope.channel_identity_id,
             provider_installation_id=scope.provider_installation_id,
-            namespace=registration.namespace, native_id=scope.native_id,
+            namespace=namespace, native_id=scope.native_id,
         ),
         agent_id=scope.agent_id,
     )
     return registration, source
+
+
+def turn_invocation_source(
+    runtime: HttpInvocationRuntime, context: codec.InvocationContextV1,
+) -> tuple[AnyReceiverRegistration, AuthenticatedSource]:
+    """The current check's source: an email sender only from its email registration.
+
+    Approval and resume keep the Slack-only ``invocation_source``.
+    @spec HTTP-INVOCATION-EXECUTION-16/29.
+    """
+    scope = context.scope
+    if scope.provider != "email":
+        return invocation_source(runtime, context)
+    registration = runtime._email_receivers.get((context.receiver_id, context.receiver_generation))
+    namespace = None
+    if registration is not None:
+        namespace = next((
+            domain for domain in registration.domains
+            if domain.model_dump() == scope.namespace.model_dump()
+        ), None)
+    if (
+        registration is None or namespace is None
+        or registration.tenant_id != scope.tenant_id
+        or scope.binding_id not in registration.binding_ids
+        or registration.channel_identity_id != scope.channel_identity_id
+        or registration.provider_installation_id != scope.provider_installation_id
+        or context.independent_human is not False
+        or not codec.is_email_sender(scope.native_id)
+        or scope.native_id.rpartition("@")[2] != namespace.key
+    ):
+        _invalid_receiver()
+    return registration, AuthenticatedSource(
+        scope.binding_id, scope.binding_generation,
+        SenderV1(
+            provider="email", channel_identity_id=registration.channel_identity_id,
+            provider_installation_id=registration.provider_installation_id,
+            namespace=namespace, native_id=scope.native_id,
+        ),
+        agent_id=scope.agent_id,
+    )
 
 
 async def check_http_turn_authority(
@@ -913,7 +1261,7 @@ async def check_http_turn_authority(
     ):
         return turn_authority_response(check, "refuse", "invalid_context")
     try:
-        registration, source = invocation_source(runtime, context)
+        registration, source = turn_invocation_source(runtime, context)
     except HTTPException:
         return turn_authority_response(check, "refuse", "invalid_context")
     if check.approval_id is not None:
@@ -984,5 +1332,5 @@ async def revalidate_http_approval_caller(
             _unavailable()
     source_permission(
         current, binding, facts,
-        current.sender.native_id in caller._registration.human_native_ids, caller._original,
+        independent_human(caller._registration, current.sender.native_id), caller._original,
     )

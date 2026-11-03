@@ -48,6 +48,7 @@ from .http_invocation import (
     capture_source,
     invocation_source,
     lookup_request,
+    registered_sender,
     source_facts,
     source_permission,
 )
@@ -57,7 +58,7 @@ from .http_resume_publication import (
     ResumeWindow,
 )
 from .http_transport import HttpIdentityClient, HttpIdentityObservation
-from .slack import INTERACTION_DELIVERIES, SlackEvidence, derive_registered_sender
+from .slack import INTERACTION_DELIVERIES, SlackEvidence
 
 logger = logging.getLogger(__name__)
 
@@ -190,18 +191,13 @@ def _authenticate_actor(
         _invalid()
     # The registered-sender owner: an ordinary workspace keeps the existing
     # derivation; a Grid workspace resolves in its organisation and only from
-    # its own workspace (@spec HTTP-INVOCATION-EXECUTION-21).
-    sender = derive_registered_sender(
-        signed,
-        namespace_kind=registration.namespace.kind,
-        namespace_authority=registration.namespace.authority,
-        namespace_key=registration.namespace.key,
-        installation_account=registration.installation_account,
-    )
-    if (
-        not isinstance(sender, tuple) or sender[0] != registration.namespace.key
-        or sender[1] != principal.subject
-    ):
+    # its own workspace (@spec HTTP-INVOCATION-EXECUTION-21); a trusted partner
+    # resolves in its own entry (@spec HTTP-INVOCATION-EXECUTION-24).
+    try:
+        native_id, namespace = registered_sender(registration, signed)
+    except HTTPException:
+        _invalid()
+    if native_id != principal.subject:
         _invalid()
     return _Actor(
         registration,
@@ -210,7 +206,7 @@ def _authenticate_actor(
             SenderV1(
                 provider="slack", channel_identity_id=registration.channel_identity_id,
                 provider_installation_id=registration.provider_installation_id,
-                namespace=registration.namespace, native_id=sender[1],
+                namespace=namespace, native_id=native_id,
             ),
             agent_id=saved.scope.agent_id,
         ),
@@ -553,12 +549,15 @@ def _preserved_actor(
     registration = None if scope is None or saved.actor_receiver_id is None else (
         runtime._receivers.get((saved.actor_receiver_id, saved.actor_receiver_generation or 0))
     )
+    # Own or trusted entry exactly. @spec HTTP-INVOCATION-EXECUTION-24.
+    namespace = None if scope is None or registration is None else (
+        registration.recorded_namespace(scope.namespace)
+    )
     if (
-        scope is None or registration is None
+        scope is None or registration is None or namespace is None
         or registration.tenant_id != scope.tenant_id or scope.tenant_id != saved.scope.tenant_id
         or registration.channel_identity_id != scope.channel_identity_id
         or registration.provider_installation_id != scope.provider_installation_id
-        or registration.namespace.model_dump() != scope.namespace.model_dump()
         or registration.channel_identity_name != approval_token_identity(row)
         or saved.scope.binding_id not in registration.binding_ids
         or scope.provider != "slack"
@@ -572,7 +571,7 @@ def _preserved_actor(
             SenderV1(
                 provider="slack", channel_identity_id=registration.channel_identity_id,
                 provider_installation_id=registration.provider_installation_id,
-                namespace=registration.namespace, native_id=scope.native_id,
+                namespace=namespace, native_id=scope.native_id,
             ),
             agent_id=saved.scope.agent_id,
         ),

@@ -49,6 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .action_undoable import undo_refusal
 from .config import get_settings
+from .identity.http_invocation import HttpInvocationRuntime
 from .identity.writer_selection import http_selected_scope
 from .models import (
     Agent,
@@ -213,6 +214,8 @@ async def _offer_undo(
     store: ObjectStore,
     nomination: RemediationNomination,
     action: AgentAction,
+    *,
+    identity_runtime: HttpInvocationRuntime | None = None,
 ) -> uuid.UUID | None:
     """Raise the undo approval of an undoable ``reversible`` record, or None."""
 
@@ -239,7 +242,7 @@ async def _offer_undo(
         return None
     # The outcome's own transaction must commit, so a refusal only declines the
     # offer. Unavailable classification never selects legacy.
-    # @spec HTTP-APPROVAL-CONTINUITY-1.
+    # @spec HTTP-APPROVAL-CONTINUITY-1/14.
     try:
         selected = await http_selected_scope(
             session,
@@ -249,6 +252,7 @@ async def _offer_undo(
                 reply_channel=surface.channel,
                 reply_adapter=surface.adapter,
             ),
+            runtime=identity_runtime,
         )
     except HTTPException:
         selected = True
@@ -291,6 +295,7 @@ async def escalate(
     outcome: str,
     action_id: uuid.UUID | None,
     store: ObjectStore | None = None,
+    identity_runtime: HttpInvocationRuntime | None = None,
 ) -> None:
     """Write the escalation of a remediation whose outcome is not ``verified``.
 
@@ -325,7 +330,10 @@ async def escalate(
         else None
     )
     undo_approval_id = (
-        await _offer_undo(session, store or BundleStore(get_settings()), nomination, action)
+        await _offer_undo(
+            session, store or BundleStore(get_settings()), nomination, action,
+            identity_runtime=identity_runtime,
+        )
         if action is not None and action.agent_id == nomination.agent_id
         else None
     )

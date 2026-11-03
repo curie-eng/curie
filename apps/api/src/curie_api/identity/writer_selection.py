@@ -14,16 +14,20 @@ from curie_api import identity_fence
 from curie_api.models import Approval
 
 from .http_approval import approval_is_selected
+from .http_invocation import HttpInvocationRuntime
 
 
-async def http_selected_scope(session: AsyncSession, approval: Approval) -> bool:
+async def http_selected_scope(
+    session: AsyncSession, approval: Approval, *, runtime: HttpInvocationRuntime | None,
+) -> bool:
     """Whether the unsaved row's agent or any route candidate is HTTP-selected.
 
     Takes the shared identity lock public creation takes, so a concurrent
     adoption cannot change the answer before this transaction ends. Raises the
     fixed 503 ``authority_unavailable`` when classification cannot be made;
-    unavailable is never legacy. @spec HTTP-APPROVAL-CONTINUITY-1.
+    unavailable is never legacy. Runtime None registers no identity.
+    @spec HTTP-APPROVAL-CONTINUITY-1/14.
     """
 
     await identity_fence.lock_identity_reader(session)
-    return await approval_is_selected(session, approval)
+    return await approval_is_selected(session, approval, runtime=runtime)

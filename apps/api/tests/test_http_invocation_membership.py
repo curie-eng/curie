@@ -298,6 +298,8 @@ def _runtime(module: ModuleType, scope: dict[str, Any]) -> Any:
         bot_user_id="U0EXAMPLEBOT",
         binding_ids=(scope["binding"],),
         human_native_ids=(SENDER,),
+        # @spec HTTP-INVOCATION-EXECUTION-24: only a scope that declares trust passes it.
+        **({"trusted_namespaces": scope["trusted"]} if scope.get("trusted") else {}),
     )
     return module.build_http_invocation_runtime(
         providers,

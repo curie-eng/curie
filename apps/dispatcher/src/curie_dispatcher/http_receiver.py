@@ -1,4 +1,4 @@
-"""Selected native Slack intake. @spec HTTP-INVOCATION-EXECUTION-1/2/3/19."""
+"""Selected native Slack intake. @spec HTTP-INVOCATION-EXECUTION-1/2/3/19/26."""
 
 from __future__ import annotations
 
@@ -26,6 +26,26 @@ from .inbound_attachments import derive_attachments
 from .inbound_text import derive_text, strip_self_mention
 from .installation_report import auth_test_report
 from .relevance import NON_CONTENT_SUBTYPES
+
+DIRECT_MESSAGE_CHANNEL_TYPE = "im"
+
+
+def is_plain_direct_message(event: Any) -> bool:
+    """A person's own one-to-one direct message to the bot (ADR 0263 decision 1).
+
+    Exactly ``channel_type`` ``im``, no ``subtype`` key at all, no ``bot_id``
+    key and a nonempty user: group DMs, channel messages, edits, deletions,
+    file shares and bot posts are not. @spec HTTP-INVOCATION-EXECUTION-26.
+    """
+    if type(event) is not dict:
+        return False
+    user = event.get("user")
+    return (
+        event.get("type") == "message"
+        and event.get("channel_type") == DIRECT_MESSAGE_CHANNEL_TYPE
+        and "subtype" not in event and "bot_id" not in event
+        and type(user) is str and bool(user)
+    )
 
 
 class _Frozen(BaseModel):
@@ -91,18 +111,91 @@ class HttpReceiverBindingV1(_Frozen):
 
 
 class ReceiverSubmission(_Frozen):
-    """@spec HTTP-INVOCATION-EXECUTION-19."""
+    """@spec HTTP-INVOCATION-EXECUTION-19.
+
+    ``duplicate`` and ``reply_ref`` describe an accepted answer: whether another
+    attempt enqueued the turn, and the reply slot its receipt names, if any.
+    @spec HTTP-INVOCATION-EXECUTION-27.
+    """
 
     status: Literal["accepted", "pending", "refused", "unavailable"]
     stream_id: codec.Identifier | None
+    duplicate: bool = False
+    reply_ref: str | None = None
+
+
+# A Slack message timestamp, the only reply slot. @spec HTTP-INVOCATION-EXECUTION-27.
+_REPLY_SLOT = re.compile(r"[0-9]{1,20}\.[0-9]{1,20}")
+
+
+def is_reply_slot(value: object) -> bool:
+    """@spec HTTP-INVOCATION-EXECUTION-27."""
+    return type(value) is str and _REPLY_SLOT.fullmatch(value) is not None
+
+
+def _slot(value: object) -> str:
+    """@spec HTTP-INVOCATION-EXECUTION-27."""
+    if not is_reply_slot(value):
+        raise ValueError("invalid_receiver_receipt")
+    assert type(value) is str
+    return value
 
 
 class _TurnAccepted(_Frozen):
-    """The existing API receipt, not a second turn. @spec HTTP-INVOCATION-EXECUTION-19."""
+    """The existing API receipt, not a second turn. @spec HTTP-INVOCATION-EXECUTION-19/27."""
 
     event_id: codec.Identifier
     stream_id: codec.Identifier | None
     duplicate: bool
+    # Absent when the API names no slot; present, it must be a valid slot.
+    reply_ref: Annotated[str, BeforeValidator(_slot)] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def present_slot_is_not_null(cls, value: Any) -> Any:
+        """@spec HTTP-INVOCATION-EXECUTION-27: an explicit null is not an absent slot."""
+        if type(value) is dict and "reply_ref" in value and value["reply_ref"] is None:
+            raise ValueError("invalid_receiver_receipt")
+        return value
+
+
+class PreparedSubmission:
+    """One locally checked mention, before its reply slot exists.
+
+    Opaque, redacted and nonserializable: it holds the pinned channel credential.
+    @spec HTTP-INVOCATION-EXECUTION-27.
+    """
+
+    __slots__ = ("_content", "_proof", "_credential", "channel", "thread_ts")
+    _content: dict[str, Any]
+    _proof: dict[str, Any]
+    _credential: str
+    channel: str
+    thread_ts: str
+
+    def __new__(cls, *args: object, **kwargs: object) -> Self:
+        """@spec HTTP-INVOCATION-EXECUTION-27."""
+        raise TypeError("prepared_submission_not_public")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """@spec HTTP-INVOCATION-EXECUTION-27."""
+        raise AttributeError("immutable_prepared_submission")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> Never:
+        """@spec HTTP-INVOCATION-EXECUTION-27."""
+        raise TypeError("prepared_submission_not_serializable")
+
+    def __getstate__(self) -> Never:
+        """@spec HTTP-INVOCATION-EXECUTION-27."""
+        raise TypeError("prepared_submission_not_serializable")
+
+    def __repr__(self) -> str:
+        """@spec HTTP-INVOCATION-EXECUTION-27."""
+        return "PreparedSubmission()"
+
+    def __bool__(self) -> Never:
+        """@spec HTTP-INVOCATION-EXECUTION-27."""
+        raise TypeError("prepared_submission_is_not_permission")
 
 
 _REFUSED = ReceiverSubmission(status="refused", stream_id=None)
@@ -164,12 +257,19 @@ async def _receipt(response: httpx.Response) -> ReceiverSubmission:
         receipt = _TurnAccepted.model_validate(value)
         if response.status_code == 202:
             return (
-                ReceiverSubmission(status="pending", stream_id=None)
-                if receipt.stream_id is None and receipt.duplicate is True else _UNAVAILABLE
+                ReceiverSubmission(status="pending", stream_id=None, duplicate=True)
+                if receipt.stream_id is None and receipt.duplicate is True
+                and receipt.reply_ref is None else _UNAVAILABLE
             )
         if receipt.stream_id is None or re.fullmatch(r"[0-9]+-[0-9]+", receipt.stream_id) is None:
             return _UNAVAILABLE
-        return ReceiverSubmission(status="accepted", stream_id=receipt.stream_id)
+        # @spec HTTP-INVOCATION-EXECUTION-27: only a duplicate names the accepted slot.
+        if receipt.reply_ref is not None and receipt.duplicate is not True:
+            return _UNAVAILABLE
+        return ReceiverSubmission(
+            status="accepted", stream_id=receipt.stream_id, duplicate=receipt.duplicate,
+            reply_ref=receipt.reply_ref,
+        )
     except (ValueError, TypeError, RecursionError):
         return _UNAVAILABLE
 
@@ -268,11 +368,14 @@ class HttpReceiverRuntime:
         return self._scope.channel_identity_name
 
     def validate_connection(self, identity_name: str, web_client: WebClient) -> None:
-        """@spec HTTP-INVOCATION-EXECUTION-19."""
+        """The app's identity and client match this runtime; Slack is not asked again.
+
+        @spec HTTP-INVOCATION-EXECUTION-19/25: ``build_http_receiver_runtime`` already
+        qualified this receiver once, so app construction repeats no network call.
+        """
         try:
-            if identity_name != self.identity_name:
+            if identity_name != self.identity_name or not isinstance(web_client, WebClient):
                 raise ValueError
-            _qualified(self._scope, web_client)
         except Exception:  # noqa: BLE001 - startup errors exclude provider and secret bytes.
             raise ValueError("invalid_http_receiver_runtime") from None
 
@@ -280,59 +383,119 @@ class HttpReceiverRuntime:
         self, *, body: dict[str, Any], event: dict[str, Any], slack_identity: str,
         bot_user_id: str | None,
     ) -> ReceiverSubmission:
-        """@spec HTTP-INVOCATION-EXECUTION-2/3/19."""
+        """Prepare and send with no reply slot. @spec HTTP-INVOCATION-EXECUTION-2/3/19/26/27."""
+        prepared = self.prepare(
+            body=body, event=event, slack_identity=slack_identity, bot_user_id=bot_user_id,
+        )
+        if prepared is None:
+            return _REFUSED
+        return self.send(prepared, reply_ref="")
+
+    def prepare(
+        self, *, body: dict[str, Any], event: dict[str, Any], slack_identity: str,
+        bot_user_id: str | None,
+    ) -> PreparedSubmission | None:
+        """Every local check, before any placeholder; None is a local refusal.
+
+        @spec HTTP-INVOCATION-EXECUTION-2/3/19/26/27.
+        """
         scope = self._scope
         try:
             if (
                 type(body) is not dict or type(event) is not dict
                 or body.get("event") != event or body.get("type") != "event_callback"
                 or body.get("team_id") != scope.installation_account
-                or event.get("type") != "app_mention" or event.get("bot_id")
+                or not (event.get("type") == "app_mention" or is_plain_direct_message(event))
+                or event.get("bot_id")
                 or event.get("subtype") in NON_CONTENT_SUBTYPES
                 or slack_identity != scope.channel_identity_name or bot_user_id != scope.bot_user_id
             ):
-                return _REFUSED
+                return None
             channel = event.get("channel")
             if type(channel) is not str or channel not in self._bindings:
-                return _REFUSED
+                return None
             binding = self._bindings[channel]
             timestamp = event.get("thread_ts") or event.get("ts")
             sender = event.get("user")
             if type(timestamp) is not str or not timestamp or type(sender) is not str or not sender:
-                return _REFUSED
+                return None
             delivery = body.get("event_id")
             if type(delivery) is not str or not delivery:
-                return _REFUSED
+                return None
             evidence = slack_evidence(body)
             if evidence is None:
-                return _REFUSED
+                return None
             evidence = {
                 "delivery": None, "user_id": None, "event_user_team": None, "event_team": None,
                 "interaction_user_team_id": None, "is_ext_shared_channel": None,
                 **evidence,
             }
             evidence["enterprise_ids"] = tuple(evidence.get("enterprise_ids", ()))
+            # The shared copier is unchanged; only this receiver states the
+            # conversation type, and only for a DM. @spec HTTP-INVOCATION-EXECUTION-26.
+            if event.get("type") == "message":
+                evidence["channel_type"] = DIRECT_MESSAGE_CHANNEL_TYPE
             conversation = timestamp
-            payload = json.dumps({
+            content = {
                 "kind": "slack", "address": channel, "adapter": scope.channel_identity_name,
                 "delivery_id": delivery, "conversation_id": conversation, "author": sender,
                 "text": strip_self_mention(derive_text(event), bot_user_id), "reply_ref": "",
                 "attachments": [item.model_dump(mode="json") for item in derive_attachments(event)],
-            }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            proof = codec.ReceiverProofV1(
-                schema_version=1, receiver_id=scope.receiver_id,
-                receiver_generation=scope.receiver_generation,
-                channel_identity_id=scope.channel_identity_id,
-                provider_installation_id=scope.provider_installation_id,
-                binding_id=binding.binding_id, binding_generation=binding.binding_generation,
-                delivery_id=delivery, native_channel_id=channel, conversation_id=conversation,
-                body_sha256=hashlib.sha256(payload).hexdigest(),
-                slack=codec.ReceiverSlackEvidenceV1.model_validate(evidence),
-            )
-            token = codec.sign_receiver_proof(proof, self._keys)
+            }
+            proof = {
+                "schema_version": 1, "receiver_id": scope.receiver_id,
+                "receiver_generation": scope.receiver_generation,
+                "channel_identity_id": scope.channel_identity_id,
+                "provider_installation_id": scope.provider_installation_id,
+                "binding_id": binding.binding_id,
+                "binding_generation": binding.binding_generation,
+                "delivery_id": delivery, "native_channel_id": channel,
+                "conversation_id": conversation,
+                "slack": codec.ReceiverSlackEvidenceV1.model_validate(evidence),
+            }
+            # Every local check, signing included, passes before a placeholder exists.
+            self._signed(content, proof, "")
+        except (ValueError, TypeError, AttributeError, RecursionError):
+            return None
+        prepared = object.__new__(PreparedSubmission)
+        object.__setattr__(prepared, "_content", content)
+        object.__setattr__(prepared, "_proof", proof)
+        object.__setattr__(prepared, "_credential", binding.channel_credential)
+        object.__setattr__(prepared, "channel", channel)
+        object.__setattr__(prepared, "thread_ts", conversation)
+        return prepared
+
+    def _signed(
+        self, content: dict[str, Any], proof: dict[str, Any], reply_ref: str,
+    ) -> tuple[bytes, str]:
+        """Serialize the complete TurnIn once and sign its exact bytes.
+
+        @spec HTTP-INVOCATION-EXECUTION-19/27.
+        """
+        payload = json.dumps(
+            {**content, "reply_ref": reply_ref}, ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8")
+        signed = codec.ReceiverProofV1(
+            **proof, body_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+        return payload, codec.sign_receiver_proof(signed, self._keys)
+
+    def send(self, prepared: PreparedSubmission, *, reply_ref: str) -> ReceiverSubmission:
+        """Sign the prepared delivery with its reply slot and submit it once.
+
+        ``reply_ref`` is the placeholder's ts, or the empty string when none was
+        obtained. @spec HTTP-INVOCATION-EXECUTION-3/19/27.
+        """
+        try:
+            if type(prepared) is not PreparedSubmission or (
+                reply_ref != "" and not is_reply_slot(reply_ref)
+            ):
+                return _REFUSED
+            payload, token = self._signed(prepared._content, prepared._proof, reply_ref)
         except (ValueError, TypeError, AttributeError, RecursionError):
             return _REFUSED
-        return asyncio.run(self._submit(payload, token, binding.channel_credential))
+        return asyncio.run(self._submit(payload, token, prepared._credential))
+
 
     def submit_answer(
         self, *, approval_id: str, decision: str, note: str | None, user: str, channel: str,
@@ -469,8 +632,13 @@ def build_http_receiver_runtime(
     scope: HttpReceiverScopeV1, bindings: tuple[HttpReceiverBindingV1, ...], *,
     receiver_key: bytes, web_client: WebClient, api_base_url: str,
     http_client_factory: Callable[[], httpx.AsyncClient] | None = None,
+    on_stage: Callable[[Literal["auth_test", "runtime"]], None] | None = None,
 ) -> HttpReceiverRuntime:
-    """@spec HTTP-INVOCATION-EXECUTION-1/2/19."""
+    """@spec HTTP-INVOCATION-EXECUTION-1/2/19/25.
+
+    ``on_stage`` is told ``auth_test`` just before the one Slack call and ``runtime`` once it
+    has been qualified, so a caller's failure boundary can name the stage that failed.
+    """
     try:
         if type(scope) is not HttpReceiverScopeV1 or type(bindings) is not tuple:
             raise ValueError
@@ -501,7 +669,11 @@ def build_http_receiver_runtime(
         _ = url.port
         if http_client_factory is not None and not callable(http_client_factory):
             raise ValueError
+        if on_stage is not None:
+            on_stage("auth_test")
         _qualified(scope, web_client)
+        if on_stage is not None:
+            on_stage("runtime")
         runtime = object.__new__(HttpReceiverRuntime)
         object.__setattr__(runtime, "_scope", scope)
         object.__setattr__(runtime, "_bindings", MappingProxyType(by_channel))

@@ -10021,10 +10021,14 @@ export interface components {
          *     mapping does not use cannot be sent as if it were evidence.
          */
         SlackEvidence: {
+            /** Channel Type */
+            channel_type?: string | null;
             /** Delivery */
             delivery: string;
             /** Enterprise Ids */
             enterprise_ids?: string[];
+            /** Event Source Team */
+            event_source_team?: string | null;
             /** Event Team */
             event_team?: string | null;
             /** Event User Team */
@@ -10442,6 +10446,8 @@ export interface components {
             duplicate: boolean;
             /** Event Id */
             event_id: string;
+            /** Reply Ref */
+            reply_ref?: string | null;
             /** Stream Id */
             stream_id: string | null;
         };

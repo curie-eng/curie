@@ -51,7 +51,8 @@ from ..action_execution_codes import (
 )
 from ..auth import require_internal_worker_token, require_platform_key
 from ..config import get_settings
-from ..deps import KillSwitchDep, SessionDep, StoreDep
+from ..deps import IdentityRuntimeDep, KillSwitchDep, SessionDep, StoreDep
+from ..identity.http_invocation import HttpInvocationRuntime
 from ..models import (
     ActionAuditEntry,
     ActionExecution,
@@ -374,7 +375,9 @@ async def create_probe(
 # --------------------------------------------------------------------------- #
 
 
-async def _expire_dispatched(session: AsyncSession, now: datetime) -> None:
+async def _expire_dispatched(
+    session: AsyncSession, now: datetime, *, identity_runtime: HttpInvocationRuntime | None,
+) -> None:
     """@spec ACTION-EXECUTOR-17: a ``dispatched`` lease that expired is ``indeterminate``.
 
     The call may have reached the connector, so it is never repeated.
@@ -397,7 +400,7 @@ async def _expire_dispatched(session: AsyncSession, now: datetime) -> None:
     if expired:
         await session.flush()
     for execution in expired:
-        await finish_unverified(session, execution, now)
+        await finish_unverified(session, execution, now, identity_runtime=identity_runtime)
 
 
 # @spec AUTOMATED-REMEDIATION-12 (executor amendment E9): one transaction-scoped
@@ -468,7 +471,8 @@ def _due(now: datetime) -> Any:
     responses={204: {"description": "Nothing is claimable."}},
 )
 async def claim_execution(
-    data: ExecutionClaim, session: SessionDep, store: StoreDep, kill_switch: KillSwitchDep
+    data: ExecutionClaim, session: SessionDep, store: StoreDep, kill_switch: KillSwitchDep,
+    identity_runtime: IdentityRuntimeDep,
 ) -> Any:
     """Claim the oldest due execution under a lease, or ``204``.
 
@@ -497,13 +501,15 @@ async def claim_execution(
 
     owed: list[uuid.UUID] = []
     expired_reads: list[ActionExecution] = []
-    answer = await _claim(data, session, owed, expired_reads)
+    answer = await _claim(data, session, owed, expired_reads, identity_runtime=identity_runtime)
     preconditions = [r.id for r in expired_reads if precondition_nomination(r.idempotency_key)]
     # After the claim transaction ended: the approvals of nominations a changed
     # authority returned, and the preconditions an expiry ended.
     for nomination_id in owed:
-        await raise_approval(session, nomination_id)
-    await preconditions_ended(session, store, kill_switch, preconditions)
+        await raise_approval(session, nomination_id, identity_runtime=identity_runtime)
+    await preconditions_ended(
+        session, store, kill_switch, preconditions, identity_runtime=identity_runtime,
+    )
     return answer
 
 
@@ -512,20 +518,22 @@ async def _claim(
     session: AsyncSession,
     owed: list[uuid.UUID],
     expired_reads: list[ActionExecution],
+    *,
+    identity_runtime: HttpInvocationRuntime | None,
 ) -> Any:
     settings = get_settings()
     if not settings.action_executor_enabled:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     await session.execute(_CLAIM_LOCK)
     now = await _now(session)
-    await _expire_dispatched(session, now)
+    await _expire_dispatched(session, now, identity_runtime=identity_runtime)
     expired_reads.extend(await _expire_claimed_reads(session, now))
     ended = [execution.idempotency_key for execution in expired_reads]
     ended += await _skip_missed_samples(session, now)
     await session.flush()
     # @spec AUTOMATED-REMEDIATION-18: a read the claim route ended may decide
     # its verification, which ends the rest of that series before any is handed out.
-    await reads_ended(session, ended, now)
+    await reads_ended(session, ended, now, identity_runtime=identity_runtime)
     await qualification_reads_ended(session, ended, now)
     await session.flush()
 
@@ -573,7 +581,7 @@ async def _claim(
         if execution.state == ExecutionState.claimed and execution.attempt >= MAX_ATTEMPTS:
             _finish(session, execution, ExecutionState.refused, EXHAUSTED_CLAIM_CODE, now)
             await session.flush()
-            await finish_unverified(session, execution, now)
+            await finish_unverified(session, execution, now, identity_runtime=identity_runtime)
             continue
         if await authority_refusal(session, execution) is not None:
             # @spec AUTOMATED-REMEDIATION-11 (E8): before any sandbox claim.
@@ -615,7 +623,8 @@ def _observed(execution: ActionExecution) -> tuple[bool, str | None]:
 
 @router.post("/{execution_id}/observation", response_model=ExecutionOut)
 async def record_observation(
-    execution_id: uuid.UUID, data: ExecutionObservation, session: SessionDep
+    execution_id: uuid.UUID, data: ExecutionObservation, session: SessionDep,
+    identity_runtime: IdentityRuntimeDep,
 ) -> ExecutionOut:
     """Compare the version observed now with the version the action left.
 
@@ -629,7 +638,9 @@ async def record_observation(
     now = await _now(session)
     _check_fence(execution, data, now)
     if is_observe_only(execution):
-        return await _record_observe_only(session, execution, data, now)
+        return await _record_observe_only(
+            session, execution, data, now, identity_runtime=identity_runtime,
+        )
     if execution.kind != ExecutionKind.restore:
         raise _conflict("only a restore observes a version")
     seen, version = _observed(execution)
@@ -666,6 +677,8 @@ async def _record_observe_only(
     execution: ActionExecution,
     data: ExecutionObservation,
     now: datetime,
+    *,
+    identity_runtime: HttpInvocationRuntime | None,
 ) -> ExecutionOut:
     """@spec AUTOMATED-REMEDIATION-18 (executor amendment E3): an observe-only read.
 
@@ -686,7 +699,7 @@ async def _record_observe_only(
     execution.outcome = {"observed_version": observed}
     _finish(session, execution, ExecutionState.confirmed, None, now)
     await session.flush()
-    await reads_ended(session, [execution.idempotency_key], now)
+    await reads_ended(session, [execution.idempotency_key], now, identity_runtime=identity_runtime)
     await qualification_reads_ended(session, [execution.idempotency_key], now)
     await session.commit()
     await session.refresh(execution)
@@ -700,7 +713,8 @@ async def _record_observe_only(
 
 @router.post("/{execution_id}/dispatch", response_model=ExecutionOut)
 async def dispatch_execution(
-    execution_id: uuid.UUID, data: ExecutionFence, session: SessionDep, store: StoreDep
+    execution_id: uuid.UUID, data: ExecutionFence, session: SessionDep, store: StoreDep,
+    identity_runtime: IdentityRuntimeDep,
 ) -> ExecutionOut:
     """Commit ``dispatched``, the last step before a write call.
 
@@ -745,7 +759,7 @@ async def dispatch_execution(
             await session.refresh(execution)
             answer = _out(execution)
             if returned:
-                await raise_approval(session, nomination.id)
+                await raise_approval(session, nomination.id, identity_runtime=identity_runtime)
             return answer
         await _record_forward_action(session, execution)
     elif execution.kind != ExecutionKind.restore:
@@ -937,6 +951,7 @@ async def report_outcome(
     session: SessionDep,
     store: StoreDep,
     kill_switch: KillSwitchDep,
+    identity_runtime: IdentityRuntimeDep,
 ) -> ExecutionOut:
     """Record how an execution ended.
 
@@ -1022,16 +1037,22 @@ async def report_outcome(
         await _confirm_restore(session, execution, now)
     elif execution.kind == ExecutionKind.forward:
         await session.flush()
-        await schedule_verification(session, store, execution, now)
+        await schedule_verification(
+            session, store, execution, now, identity_runtime=identity_runtime,
+        )
     elif execution.kind == ExecutionKind.read:
         await session.flush()
-        await reads_ended(session, [execution.idempotency_key], now)
+        await reads_ended(
+            session, [execution.idempotency_key], now, identity_runtime=identity_runtime,
+        )
         await qualification_reads_ended(session, [execution.idempotency_key], now)
     await session.commit()
     await session.refresh(execution)
     answer = _out(execution)
     if precondition_nomination(execution.idempotency_key) is not None:
-        await preconditions_ended(session, store, kill_switch, [execution_id])
+        await preconditions_ended(
+            session, store, kill_switch, [execution_id], identity_runtime=identity_runtime,
+        )
     return answer
 
 
@@ -1056,6 +1077,7 @@ async def report_sample(
     session: SessionDep,
     store: StoreDep,
     kill_switch: KillSwitchDep,
+    identity_runtime: IdentityRuntimeDep,
 ) -> ExecutionOut:
     """Record the one sample a claimed read execution took, ending it ``confirmed``.
 
@@ -1088,11 +1110,13 @@ async def report_sample(
     _finish(session, execution, ExecutionState.confirmed, None, now)
     await session.flush()
     # @spec AUTOMATED-REMEDIATION-18: the API evaluates the predicate.
-    await reads_ended(session, [execution.idempotency_key], now)
+    await reads_ended(session, [execution.idempotency_key], now, identity_runtime=identity_runtime)
     await qualification_reads_ended(session, [execution.idempotency_key], now)
     await session.commit()
     await session.refresh(execution)
     answer = _out(execution)
     if precondition_nomination(execution.idempotency_key) is not None:
-        await preconditions_ended(session, store, kill_switch, [execution_id])
+        await preconditions_ended(
+            session, store, kill_switch, [execution_id], identity_runtime=identity_runtime,
+        )
     return answer

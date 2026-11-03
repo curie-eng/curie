@@ -48,7 +48,7 @@ from .github_app import credentials_for, log_credential_path
 from .github_checks import GitHubStatusReporter
 from .github_review_store import GitHubReviewReconciler
 from .graveyardwatcher import GraveyardWatcher
-from .identity.http_approval import http_expiry_owner
+from .identity.http_approval import http_expiry_owner, identity_runtime
 from .identity.http_approval_answer import approved_resume_authority
 from .identity.http_initializer import (
     configured_http_identity_runtime,
@@ -247,6 +247,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         grace_seconds=settings.resume_reconciler_grace_seconds,
         batch_limit=settings.resume_reconciler_batch_limit,
         dead_letter_scan_limit=settings.resume_dead_letter_scan_limit,
+        identity_runtime=identity_runtime(app.state),
     )
     app.state.resume_reconciler = reconciler
     work_item_reconciler = WorkItemReconciler(
@@ -287,11 +288,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 sweeper_stop,
                 publication_patch_retention_seconds=(settings.publication_patch_retention_seconds),
                 http_expiry=app.state.http_approval_expiry,
+                identity_runtime=identity_runtime(app.state),
                 remediation_admissions=(
                     partial(
                         reconcile_admissions,
                         store=app.state.bundle_store,
                         kill_switch=app.state.kill_switch,
+                        identity_runtime=identity_runtime(app.state),
                     )
                     if settings.remediation_enabled and settings.action_executor_enabled
                     else None
