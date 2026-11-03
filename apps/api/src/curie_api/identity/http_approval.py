@@ -70,6 +70,11 @@ _RECORD_FIELDS = (
 )
 
 
+# Reply handle kind and sealed sender provider an approval may originate from.
+# @spec HTTP-APPROVAL-CONTINUITY-4.
+_ORIGINS = frozenset({("slack", "slack"), ("email", "email")})
+
+
 def _refuse(status: int, code: str) -> NoReturn:
     """@spec HTTP-APPROVAL-CONTINUITY-3."""
     raise HTTPException(status, code, headers={"Cache-Control": "no-store"})
@@ -455,7 +460,9 @@ def _original(
             or handle.adapter != data.reply_adapter
             or handle.identity != data.reply_identity
             or handle.endpoint != data.reply_endpoint
-            or handle.kind != "slack"
+            # A Slack turn under a Slack context, or an email turn under an
+            # email receiver's context (ADR 0267); nothing else.
+            or (handle.kind, context.scope.provider) not in _ORIGINS
         ):
             raise ValueError
     except (ValueError, TypeError, HTTPException):

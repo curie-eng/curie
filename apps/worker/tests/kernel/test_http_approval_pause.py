@@ -407,3 +407,37 @@ def test_explicit_local_approval_keeps_the_legacy_creator_signature_and_pause(
             assert len(h.sink.posts) == 1
             assert await h.async_redis.exists(h.config.done_key(event.event_id))
     asyncio.run(run())
+
+
+def test_selected_email_turn_without_approver_emails_reaches_identity_creation(
+    make_harness: Any,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-4/15: the approver role, not a route list, decides.
+
+    A legacy email turn with no route approver emails escalates; a selected one
+    creates through the identity transport, whose answer owner applies the role.
+    """
+    async def run() -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-4/15."""
+        binding, creator = Binding(), Creator()
+        binding._by_route[("email", "acme-agent@example.com")] = binding.resolved
+        async with make_harness(binding=binding, identity_authority=Core(), approvals=creator) as h:
+            h.runner.default_script = awaiting()
+            event = qevent(
+                "synthetic email approval", kind="email", channel="acme-agent@example.com",
+                adapter="acme-mail", endpoint="https://mail.example.com/reply",
+            )
+            raw = raw_payload(event)
+            leases = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+            )
+            entry_id, observed = await pending_entry(h, consumer, {
+                "payload": raw, "curie_identity_context_v1": CAPSULE,
+            })
+            await consumer._handle(entry_id, observed)
+            request = assert_identity(creator, binding, raw)
+            assert request.reply_kind == "email"
+            assert request.route is None
+            assert request.card_channel == "acme-agent@example.com"
+    asyncio.run(run())

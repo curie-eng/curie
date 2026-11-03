@@ -697,8 +697,16 @@ async def capture_source(
     if writer_agent is not None:
         binding_query = binding_query.with_for_update()
     binding = await session.scalar(binding_query.execution_options(populate_existing=True))
+    # An email turn's approval is answered by a Slack actor whose receiver lists
+    # no email binding; the answer owner binds it to the stored fixed Slack card
+    # instead. @spec HTTP-APPROVAL-CONTINUITY-7.
+    email_origin = (
+        not binding_identity and isinstance(registration, ReceiverRegistrationV1)
+        and binding is not None and binding.kind == "email"
+    )
     if (
-        binding is None or str(binding.id) not in registration.binding_ids
+        binding is None
+        or (str(binding.id) not in registration.binding_ids and not email_origin)
         or binding.tenant_id != tenant_id or binding.generation != source.binding_generation
         or (source.address is not None and source.address != binding.address)
         or (source.agent_id is not None and source.agent_id != str(binding.agent_id))
@@ -714,10 +722,10 @@ async def capture_source(
         ):
             _invalid_receiver()
     elif (
-        binding.kind != "slack"
+        (binding.kind != "slack" and not email_origin)
         or (binding_identity and (binding.adapter or "default")
             != registration.channel_identity_name)
-        or binding.endpoint is not None
+        or (binding.endpoint is not None and not email_origin)
         or source.sender.provider != "slack"
         # Own or trusted entry exactly. @spec HTTP-INVOCATION-EXECUTION-24.
         or registration.recorded_namespace(source.sender.namespace) is None
@@ -1209,12 +1217,14 @@ def invocation_source(
 
 
 def turn_invocation_source(
-    runtime: HttpInvocationRuntime, context: codec.InvocationContextV1,
+    runtime: HttpInvocationRuntime, context: codec.InvocationContextV1 | OriginalAssociation,
 ) -> tuple[AnyReceiverRegistration, AuthenticatedSource]:
-    """The current check's source: an email sender only from its email registration.
+    """The original invoker's source: an email sender only from its email registration.
 
-    Approval and resume keep the Slack-only ``invocation_source``.
-    @spec HTTP-INVOCATION-EXECUTION-16/29.
+    The turn check, and approval creation, answer and resume of an email turn
+    (ADR 0267), all reconstruct the invoker here; a Slack context keeps
+    ``invocation_source``.
+    @spec HTTP-INVOCATION-EXECUTION-16/29 HTTP-APPROVAL-CONTINUITY-4/11.
     """
     scope = context.scope
     if scope.provider != "email":
@@ -1294,12 +1304,15 @@ async def check_http_turn_authority(
 async def current_http_approval_caller(
     request: Request, context: codec.InvocationContextV1,
 ) -> AsyncIterator[CurrentHttpInvocation]:
-    """Read-only preparation for the separate insert owner. @spec HTTP-APPROVAL-CONTINUITY-9."""
+    """Read-only preparation for the separate insert owner.
+
+    @spec HTTP-APPROVAL-CONTINUITY-4/9.
+    """
     runtime = getattr(request.app.state, "http_identity_runtime", None)
     client = getattr(request.app.state, "http_identity_client", None)
     if type(runtime) is not HttpInvocationRuntime or not isinstance(client, HttpIdentityClient):
         _unavailable()
-    registration, source = invocation_source(runtime, context)
+    registration, source = turn_invocation_source(runtime, context)
     async with current_source_authority(
         request, runtime=runtime, client=client, registration=registration,
         source=source, original=context,
