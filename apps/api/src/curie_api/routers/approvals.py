@@ -570,16 +570,19 @@ async def resolve_approval(
             )
         proof = request.headers.get(PROOF_HEADER)
         attestation = request.headers.get(APPROVAL_PRINCIPAL_HEADER)
-        if proof is None or attestation is None or principal.kind != "chat":
+        # A mail adapter's email reply carries its signed email answer proof and
+        # no chat attestation. @spec HTTP-APPROVAL-CONTINUITY-15.
+        emailed = principal.kind == "adapter" and proof is not None
+        if proof is None or (not emailed and (attestation is None or principal.kind != "chat")):
             # 403, not 409: a 409 reads as settled and would retire a card whose
-            # row is still pending. Only a receiver-proved Slack answer qualifies.
+            # row is still pending. Only a receiver-proved answer qualifies.
             raise HTTPException(status.HTTP_403_FORBIDDEN, "unsupported_approval")
         try:
             resolved = await answer_http_approval(
                 request, approval_id, principal=principal, approver_sets=approver_sets,
                 answer=ApprovalAnswer(
                     operation="resolve", decision=data.decision, note=data.note,
-                    body=await request.body(), attestation=attestation, proof=proof,
+                    body=await request.body(), attestation=attestation or "", proof=proof,
                 ),
             )
         except ApprovalSettled as settled:

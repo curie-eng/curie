@@ -34,23 +34,25 @@ from curie_api.crud import approvals as approvals_crud
 from curie_api.models import Approval, ApprovalAuditEntry, ApprovalStatus, Principal
 from curie_api.resumequeue import ApprovalResumeRefused, approval_trace_context
 from curie_api.schemas.http_authority import HttpSelectionV1
-from curie_api.schemas.http_identity import LookupRequestV1, SenderV1, ValidatedFacts
+from curie_api.schemas.http_identity import LookupRequestV1, NamespaceV1, SenderV1, ValidatedFacts
 from curie_api.slack_approvers import SlackUserGroupMembers, approval_token_identity
 
 from .delivery_validity import identity_delivery_window
 from .http_approval import approval_record_digest, verified_capsule
 from .http_credential_registry import ResolvedProviderCredential
 from .http_invocation import (
+    AnyReceiverRegistration,
     AuthenticatedSource,
+    EmailReceiverRegistrationV1,
     HttpInvocationRuntime,
     ReceiverRegistrationV1,
     SourceCapture,
     capture_source,
-    invocation_source,
     lookup_request,
     registered_sender,
     source_facts,
     source_permission,
+    turn_invocation_source,
 )
 from .http_resume_publication import (
     ApprovedResumeAuthority,
@@ -140,11 +142,93 @@ class ApprovalSettled(Exception):  # noqa: N818 - a settled outcome, not a failu
 
 @dataclass(frozen=True)
 class _Actor:
-    """Receiving scope of an authenticated answering actor. @spec HTTP-APPROVAL-CONTINUITY-7."""
+    """Receiving scope of an authenticated answering actor.
 
-    registration: ReceiverRegistrationV1
+    @spec HTTP-APPROVAL-CONTINUITY-7/15.
+    """
+
+    registration: AnyReceiverRegistration
     source: AuthenticatedSource
     channel: str
+
+
+def _serves_origin(
+    registration: ReceiverRegistrationV1, row: Approval, saved: wire.ApprovalContextV1,
+) -> bool:
+    """Whether an answering Slack registration may answer for this approval's origin.
+
+    A Slack origin keeps the explicit registration restriction. No Slack
+    registration lists an email binding, so an email turn's approval with a
+    fixed Slack card is bound instead to that stored card; the caller checks the
+    proved channel and identity against it. @spec HTTP-APPROVAL-CONTINUITY-7.
+    """
+    if saved.scope.provider == "email":
+        return (
+            row.reply_kind == "email" and row.card_channel is not None
+            and row.card_channel != row.reply_channel
+        )
+    return saved.scope.binding_id in registration.binding_ids
+
+
+def _email_namespace(
+    registration: EmailReceiverRegistrationV1, sender: str,
+) -> NamespaceV1 | None:
+    """The registration's domain descriptor a lowercase sender falls in.
+
+    @spec HTTP-APPROVAL-CONTINUITY-15 HTTP-INVOCATION-EXECUTION-29.
+    """
+    domain = sender.rpartition("@")[2]
+    return next((item for item in registration.domains if item.key == domain), None)
+
+
+def _authenticate_email_actor(
+    runtime: HttpInvocationRuntime,
+    row: Approval,
+    saved: wire.ApprovalContextV1,
+    principal: AuthenticatedApprovalPrincipal,
+    answer: ApprovalAnswer,
+) -> _Actor:
+    """An email reply forwarded by the mail adapter with its signed answer proof.
+
+    The proof binds purpose, approval, binding, sender and the exact body, so it
+    cannot move to another approval, decision or sender, or serve as an
+    invocation proof. Only a card shown in the email thread is answered here.
+    @spec HTTP-APPROVAL-CONTINUITY-15.
+    """
+    if (
+        principal.kind != "adapter" or type(answer.body) is not bytes
+        or answer.operation != "resolve" or row.reply_kind != "email"
+        or row.card_channel != row.reply_channel
+    ):
+        _invalid()
+    proof = wire.verify_email_approval_answer_proof(answer.proof, runtime._email_keys)
+    if not isinstance(proof, wire.EmailApprovalAnswerProofV1):
+        _invalid()
+    registration = runtime._email_receivers.get((proof.receiver_id, proof.receiver_generation))
+    namespace = None if registration is None else _email_namespace(registration, proof.sender)
+    if (
+        registration is None or namespace is None
+        or proof.approval_id != str(row.id)
+        or not hmac.compare_digest(proof.body_sha256, _sha256(answer.body))
+        or proof.sender != principal.subject.strip().lower()
+        or proof.binding_id != saved.scope.binding_id
+        or proof.binding_id not in registration.binding_ids
+        or registration.tenant_id != saved.scope.tenant_id
+    ):
+        _invalid()
+    return _Actor(
+        registration,
+        AuthenticatedSource(
+            saved.scope.binding_id, saved.scope.binding_generation,
+            SenderV1(
+                provider="email", channel_identity_id=registration.channel_identity_id,
+                provider_installation_id=registration.provider_installation_id,
+                namespace=namespace, native_id=proof.sender,
+            ),
+            agent_id=saved.scope.agent_id,
+        ),
+        row.reply_channel,
+    )
 
 
 def _authenticate_actor(
@@ -186,7 +270,7 @@ def _authenticate_actor(
         # binding must be one this registration explicitly serves.
         or registration.channel_identity_name != approval_token_identity(row)
         or registration.tenant_id != saved.scope.tenant_id
-        or saved.scope.binding_id not in registration.binding_ids
+        or not _serves_origin(registration, row, saved)
     ):
         _invalid()
     # The registered-sender owner: an ordinary workspace keeps the existing
@@ -219,7 +303,7 @@ class _Subject:
     """One subject's captured scope and external observation. @spec HTTP-APPROVAL-CONTINUITY-9."""
 
     role: Literal["invocation", "approver"]
-    registration: ReceiverRegistrationV1
+    registration: AnyReceiverRegistration
     source: AuthenticatedSource
     capture: SourceCapture
     credential: ResolvedProviderCredential
@@ -227,13 +311,19 @@ class _Subject:
     response_bytes: bytes = b""
 
     def independent_human(self) -> bool:
-        """Registered evidence only, never inferred. @spec HTTP-APPROVAL-CONTINUITY-7/8."""
+        """Registered evidence only, never inferred.
+
+        An email sender is never an independent human (invocation criterion 29).
+        @spec HTTP-APPROVAL-CONTINUITY-7/8/15 HTTP-INVOCATION-EXECUTION-29.
+        """
+        if not isinstance(self.registration, ReceiverRegistrationV1):
+            return False
         return self.source.sender.native_id in self.registration.human_native_ids
 
 
 async def _prepare(
     session: AsyncSession, runtime: HttpInvocationRuntime,
-    role: Literal["invocation", "approver"], registration: ReceiverRegistrationV1,
+    role: Literal["invocation", "approver"], registration: AnyReceiverRegistration,
     source: AuthenticatedSource,
 ) -> _Subject:
     """Phase 1 for one subject: capture and a fresh role-purpose lookup request.
@@ -302,8 +392,13 @@ async def _route_decision(
     approver_set = approver_sets(row, route_binding)
     if isinstance(approver_set, SlackUserGroupMembers):
         approver_set = approver_set.fresh()
+    # An email actor answers as its mail adapter's principal, so a declared
+    # route email list narrows it. @spec HTTP-APPROVAL-CONTINUITY-15.
+    kind: Literal["chat", "adapter"] = (
+        "adapter" if actor.source.sender.provider == "email" else "chat"
+    )
     _, decision = await authorize_approval(
-        row, subject, channel, approver_set=approver_set, principal_kind="chat",
+        row, subject, channel, approver_set=approver_set, principal_kind=kind,
     )
     if not decision.allowed:
         if isinstance(decision.evidence, dict) and decision.evidence.get("lookup_failed"):
@@ -543,9 +638,11 @@ def _preserved_actor(
 ) -> tuple[_Actor, _PreservedAssociation]:
     """The sealed answering actor, under its still-current registration.
 
-    @spec HTTP-APPROVAL-CONTINUITY-7/8.
+    @spec HTTP-APPROVAL-CONTINUITY-7/8/15.
     """
     scope = saved.actor_scope
+    if scope is not None and scope.provider == "email":
+        return _preserved_email_actor(runtime, row, saved)
     registration = None if scope is None or saved.actor_receiver_id is None else (
         runtime._receivers.get((saved.actor_receiver_id, saved.actor_receiver_generation or 0))
     )
@@ -559,7 +656,7 @@ def _preserved_actor(
         or registration.channel_identity_id != scope.channel_identity_id
         or registration.provider_installation_id != scope.provider_installation_id
         or registration.channel_identity_name != approval_token_identity(row)
-        or saved.scope.binding_id not in registration.binding_ids
+        or not _serves_origin(registration, row, saved)
         or scope.provider != "slack"
         or (scope.native_id in registration.human_native_ids) != saved.actor_independent_human
     ):
@@ -579,6 +676,54 @@ def _preserved_actor(
     ), _PreservedAssociation(
         saved.scope, registration.receiver_id, registration.generation,
         scope.native_id in registration.human_native_ids, saved.actor_canonical,
+    )
+
+
+def _preserved_email_actor(
+    runtime: HttpInvocationRuntime, row: Approval, saved: wire.ApprovalContextV1,
+) -> tuple[_Actor, _PreservedAssociation]:
+    """A sealed email actor, under its still-current email registration.
+
+    The same rules that admitted the answer: listed originating binding, tenant,
+    ids, a domain the registration lists and a sender inside it, an email-thread
+    card, never an independent human. @spec HTTP-APPROVAL-CONTINUITY-15.
+    """
+    scope = saved.actor_scope
+    registration = None if scope is None or saved.actor_receiver_id is None else (
+        runtime._email_receivers.get(
+            (saved.actor_receiver_id, saved.actor_receiver_generation or 0),
+        )
+    )
+    namespace = None if scope is None or registration is None else (
+        _email_namespace(registration, scope.native_id)
+    )
+    if (
+        scope is None or registration is None or namespace is None
+        or namespace.model_dump() != scope.namespace.model_dump()
+        or registration.tenant_id != scope.tenant_id or scope.tenant_id != saved.scope.tenant_id
+        or registration.channel_identity_id != scope.channel_identity_id
+        or registration.provider_installation_id != scope.provider_installation_id
+        or saved.scope.binding_id not in registration.binding_ids
+        or not codec.is_email_sender(scope.native_id)
+        or row.reply_kind != "email" or row.card_channel != row.reply_channel
+        or saved.actor_independent_human is not False
+    ):
+        _deny()
+    return _Actor(
+        registration,
+        AuthenticatedSource(
+            saved.scope.binding_id, saved.scope.binding_generation,
+            SenderV1(
+                provider="email", channel_identity_id=registration.channel_identity_id,
+                provider_installation_id=registration.provider_installation_id,
+                namespace=namespace, native_id=scope.native_id,
+            ),
+            agent_id=saved.scope.agent_id,
+        ),
+        scope.actor_channel,
+    ), _PreservedAssociation(
+        saved.scope, registration.receiver_id, registration.generation, False,
+        saved.actor_canonical,
     )
 
 
@@ -635,9 +780,13 @@ async def _answer(
         saved = verified_capsule(runtime, row)
         if saved is None or saved.status != "pending" or row.purpose != "session":
             _refuse(403, "unsupported_approval")
-        actor_scope = _authenticate_actor(runtime, row, saved, principal, answer)
+        actor_scope = (
+            _authenticate_email_actor(runtime, row, saved, principal, answer)
+            if principal.kind == "adapter"
+            else _authenticate_actor(runtime, row, saved, principal, answer)
+        )
         try:
-            caller_registration, caller_source = invocation_source(runtime, saved)
+            caller_registration, caller_source = turn_invocation_source(runtime, saved)
         except HTTPException:
             _deny()
         caller = await _prepare(
@@ -787,7 +936,7 @@ def approved_resume_authority(state: Any) -> ApprovedResumeAuthority:
                 _refuse(403, "unsupported_approval")
             actor, association = _preserved_actor(runtime, row, saved)
             try:
-                caller_registration, caller_source = invocation_source(runtime, saved)
+                caller_registration, caller_source = turn_invocation_source(runtime, saved)
             except HTTPException:
                 _deny()
             caller = await _prepare(

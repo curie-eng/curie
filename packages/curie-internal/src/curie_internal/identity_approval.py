@@ -228,6 +228,23 @@ class ApprovalAnswerProofV1(ApprovalWireModel):
     slack: codec.ReceiverSlackEvidenceV1
 
 
+class EmailApprovalAnswerProofV1(ApprovalWireModel):
+    """What a mail adapter signs to forward one email reply answer.
+
+    @spec HTTP-APPROVAL-CONTINUITY-15.
+    """
+
+    schema_version: codec.Version
+    purpose: Literal["approval_answer"]
+    operation: Literal["resolve"]
+    receiver_id: codec.CanonicalUUID
+    receiver_generation: codec.Generation
+    binding_id: codec.CanonicalUUID
+    approval_id: codec.CanonicalUUID
+    sender: codec.EmailSender
+    body_sha256: codec.Digest
+
+
 class ApprovalGrantExpectationV1(ApprovalWireModel):
     """@spec HTTP-APPROVAL-CONTINUITY-12."""
 
@@ -296,3 +313,17 @@ def verify_approval_answer_proof(
 ) -> ApprovalAnswerProofV1 | codec.ContextRefusal:
     """@spec HTTP-APPROVAL-CONTINUITY-7."""
     return codec.verify_approval_answer_proof(token, keyring)
+
+
+def sign_email_approval_answer_proof(
+    value: EmailApprovalAnswerProofV1, keyring: codec.IdentityKeyring,
+) -> str:
+    """@spec HTTP-APPROVAL-CONTINUITY-15."""
+    return codec.sign_email_approval_answer_proof(value, keyring)
+
+
+def verify_email_approval_answer_proof(
+    token: str, keyring: codec.IdentityKeyring,
+) -> EmailApprovalAnswerProofV1 | codec.ContextRefusal:
+    """@spec HTTP-APPROVAL-CONTINUITY-15."""
+    return codec.verify_email_approval_answer_proof(token, keyring)

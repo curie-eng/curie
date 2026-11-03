@@ -653,7 +653,10 @@ async def _pause_for_approval(
             card_kind, card_channel = fixed_target
         elif handle.kind in constants._APPROVER_EMAIL_KINDS:
             card_approver_emails = _approver_emails(binding)
-            if not card_approver_emails:
+            # A selected turn's answer is authorized by the agent's approver
+            # role, so a route without an email list still has approvers
+            # (ADR 0267). @spec HTTP-APPROVAL-CONTINUITY-4/15.
+            if not card_approver_emails and not selected:
                 await self._escalate_unanswerable_email_approval(
                     qevent, route, agent_id, route_name
                 )
@@ -683,9 +686,11 @@ async def _pause_for_approval(
                 failure_class="approval-approvers-unverifiable",
             )
             return _ApprovalPause(created=False)
-    elif handle.kind in constants._APPROVER_EMAIL_KINDS:
+    elif handle.kind in constants._APPROVER_EMAIL_KINDS and not selected:
         # ADR-0177 amendment A3: a routeless approval has no binding, so no
-        # approver emails, and on email nobody else may answer it.
+        # approver emails, and on email nobody else may answer it. A selected
+        # turn's approver role answers instead (ADR 0267).
+        # @spec HTTP-APPROVAL-CONTINUITY-4/15.
         await self._escalate_unanswerable_email_approval(qevent, route, agent_id, None)
         return _ApprovalPause(created=False)
 
