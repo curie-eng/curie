@@ -6,6 +6,7 @@ requires-python = ">=3.13"
 dependencies = [
     "aci-protocol",
     "curie-channel-protocol",
+    "curie-internal",
     "curie-telemetry",
     "curie-upgrade-pause",
     "pydantic>=2.10",

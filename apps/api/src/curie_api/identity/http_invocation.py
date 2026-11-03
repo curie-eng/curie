@@ -331,10 +331,12 @@ def _email_registrations(
     slack: Mapping[tuple[str, int], ReceiverRegistrationV1],
     materials: set[bytes],
 ) -> tuple[dict[tuple[str, int], EmailReceiverRegistrationV1], tuple[tuple[str, int, bytes], ...]]:
-    """Email registrations whose keys, domains and ids are unique across the runtime.
+    """Email registrations whose keys and ids are unique across the runtime.
 
-    ``materials`` already holds every Slack receiver key and gains each email
-    key, so the later context keys are compared against both.
+    Several registrations may trust one domain, but only under one namespace
+    id, and that id names no other domain (ADR 0266). ``materials`` already
+    holds every Slack receiver key and gains each email key, so the later
+    context keys are compared against both.
     @spec HTTP-INVOCATION-EXECUTION-29.
     """
     slack_ids = {registration.receiver_id for registration in slack.values()}
@@ -354,8 +356,9 @@ def _email_registrations(
     keys: list[tuple[str, int, bytes]] = []
     receiver_ids: set[str] = set()
     scopes: set[str] = set()
-    domains: set[str] = set()
-    namespaces: set[str] = set()
+    # One namespace id per domain key and one domain key per namespace id.
+    namespace_of: dict[str, str] = {}
+    domain_of: dict[str, str] = {}
     bindings: set[str] = set()
     for item in supplied:
         if type(item) is not tuple or len(item) != 2:
@@ -365,21 +368,25 @@ def _email_registrations(
             raise ValueError
         registration = EmailReceiverRegistrationV1.model_validate(value.model_dump())
         own_scope = {registration.channel_identity_id, registration.provider_installation_id}
-        own_domains = {domain.key for domain in registration.domains}
-        own_namespaces = {domain.id for domain in registration.domains}
         own_bindings = set(registration.binding_ids)
         if (
             registration.receiver_id in receiver_ids or registration.receiver_id in slack_ids
-            or own_scope & (scopes | slack_scopes) or own_domains & domains
-            or own_namespaces & (namespaces | slack_namespaces)
+            or own_scope & (scopes | slack_scopes)
+            or any(
+                domain.id in slack_namespaces
+                or namespace_of.get(domain.key, domain.id) != domain.id
+                or domain_of.get(domain.id, domain.key) != domain.key
+                for domain in registration.domains
+            )
             or own_bindings & (bindings | slack_bindings)
             or type(material) is not bytes or len(material) != 32 or material in materials
         ):
             raise ValueError
         receiver_ids.add(registration.receiver_id)
         scopes |= own_scope
-        domains |= own_domains
-        namespaces |= own_namespaces
+        for domain in registration.domains:
+            namespace_of[domain.key] = domain.id
+            domain_of[domain.id] = domain.key
         bindings |= own_bindings
         materials.add(material)
         pair = (registration.receiver_id, registration.generation)

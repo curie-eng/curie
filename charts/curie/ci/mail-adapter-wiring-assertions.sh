@@ -86,6 +86,9 @@
 #      port derived from the endpoint URL. Overbroad peers, a port contradicting
 #      the URL, and a stale key set while the in-chart Collector is deployed all
 #      refuse; otelCollector.telemetryDisabled=true remains the escape hatch.
+#   28 Email receiver proof (ADR 0260): the three CURIE_MAIL_RECEIVER_* variables
+#      render only when mailAdapter.emailReceiver.receiverId is set, the key by
+#      secretKeyRef only, and a partial setting fails the render.
 #
 # NOTE ON `--output-dir`: copied deliberately from
 # dispatcher-api-wiring-assertions.sh. In this environment `helm template` into a
@@ -1886,4 +1889,38 @@ assert_render_fails_named \
   --set otelCollector.deploy=false \
   --set 'mailAdapter.otelEgress.httpsCidrs[0]=192.0.2.40/32'
 
-echo "OK: mail-adapter chart wiring and build-path render assertions passed (27 assertions)"
+# 28: email receiver proof wiring (ADR 0260). Default render carries none of the
+#     three variables; receiverId plus keyExistingSecret renders all three with
+#     the key by secretKeyRef only; a partial setting fails the render.
+RECV_ID=00000000-0000-4000-8000-000000000001
+RECV_DEFAULT="$(render receiver-default "${ON[@]}" "${CREDS[@]}")"
+for v in CURIE_MAIL_RECEIVER_ID CURIE_MAIL_RECEIVER_GENERATION CURIE_MAIL_RECEIVER_KEY; do
+  if env_field "$RECV_DEFAULT" "$DEPLOY_NAME" "$v" >/dev/null 2>&1; then
+    fail "default render carries $v; empty receiverId must render none of the receiver variables"
+  fi
+done
+RECV_ON="$(render receiver-on "${ON[@]}" "${CREDS[@]}" \
+  --set "mailAdapter.emailReceiver.receiverId=$RECV_ID" \
+  --set mailAdapter.emailReceiver.generation=7 \
+  --set mailAdapter.emailReceiver.keyExistingSecret=mail-receiver-key)"
+assert_env_value "$RECV_ON" CURIE_MAIL_RECEIVER_ID "$RECV_ID" "the receiver id must render verbatim"
+assert_env_value "$RECV_ON" CURIE_MAIL_RECEIVER_GENERATION "7" "the generation must render as an integer string"
+[ "$(env_field "$RECV_ON" "$DEPLOY_NAME" CURIE_MAIL_RECEIVER_KEY valueFrom.secretKeyRef.name)" = "mail-receiver-key" ] \
+  || fail "CURIE_MAIL_RECEIVER_KEY must reference Secret mail-receiver-key"
+[ "$(env_field "$RECV_ON" "$DEPLOY_NAME" CURIE_MAIL_RECEIVER_KEY valueFrom.secretKeyRef.key)" = "emailReceiverKey" ] \
+  || fail "CURIE_MAIL_RECEIVER_KEY must default to the emailReceiverKey Secret key"
+if env_field "$RECV_ON" "$DEPLOY_NAME" CURIE_MAIL_RECEIVER_KEY value >/dev/null 2>&1; then
+  fail "CURIE_MAIL_RECEIVER_KEY must never carry an inline value"
+fi
+assert_render_fails_named \
+  "receiverId without keyExistingSecret" \
+  "mailAdapter.emailReceiver.keyExistingSecret" \
+  "${ON[@]}" "${CREDS[@]}" \
+  --set "mailAdapter.emailReceiver.receiverId=$RECV_ID"
+assert_render_fails_named \
+  "keyExistingSecret without receiverId" \
+  "mailAdapter.emailReceiver.receiverId" \
+  "${ON[@]}" "${CREDS[@]}" \
+  --set mailAdapter.emailReceiver.keyExistingSecret=mail-receiver-key
+
+echo "OK: mail-adapter chart wiring and build-path render assertions passed (28 assertions)"
