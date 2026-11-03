@@ -1828,6 +1828,20 @@ def _load_hook(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str) -> An
     return module
 
 
+def test_evidence_falls_back_to_state_dir_when_progress_target_is_unwritable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The runner's PID 1 is non-dumpable, so /proc/1/fd/2 raises EACCES for the
+    hook; the line must still land somewhere a reader can find it."""
+    module = _load_hook(monkeypatch, tmp_path, "review_gate_unwritable_target")
+    # A directory as the target: open(..., "a") fails.
+    monkeypatch.setenv("DARK_FACTORY_PROGRESS_LOG", str(tmp_path))
+    state = module._fresh("hello")
+    module.emit_gate(state, "facts_injected", stage="plan_review")
+    lines = (tmp_path / "state" / "gate.log").read_text().splitlines()
+    assert [json.loads(line)["curie_gate"] for line in lines] == ["facts_injected"]
+
+
 class _ExpiringClock:
     """A monotonic clock that stands still, then jumps past every deadline."""
 
