@@ -172,7 +172,7 @@ of these containers the liveness cutoff must strictly exceed the readiness
 cutoff -- otherwise a container still legitimately booting (WAL recovery,
 Prisma/ClickHouse boot migrations, API warm-up) gets killed and restarted back
 into the same boot path instead of being given time to finish it.
-`ci/probe-window-assertions.sh` enforces this ordering render-wide.
+policy P3 in `ci/policy/` enforces this ordering render-wide.
 
 | Value | Default | Meaning |
 | --- | --- | --- |
@@ -844,7 +844,7 @@ rather than a sizing knob. On each container the liveness failure cutoff
 (`initialDelaySeconds + (failureThreshold - 1) * periodSeconds`) outlasts the
 readiness cutoff by design -- 370 seconds against 310 -- so the kubelet cannot
 restart a container that is still inside the boot window readiness was sized to
-tolerate. `charts/curie/ci/probe-window-assertions.sh` pins that ordering for
+tolerate. policy P3 in `charts/curie/ci/policy/` pins that ordering for
 every container in the rendered chart.
 
 `langfuse-worker` also carries its own `readinessProbe` (`httpGet /api/ready`)

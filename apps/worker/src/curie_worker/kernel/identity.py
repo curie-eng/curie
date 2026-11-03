@@ -11,7 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from aci_protocol import QueuedTurn
+from aci_protocol import QueuedTurn, ReplyHandle, TurnSource
 from curie_internal.identity_approval import (
     ApprovalCreationIdentityV1,
     ApprovalGrantAuthorityRequestV1,
@@ -26,6 +26,7 @@ from curie_internal.identity_authority import (
 )
 
 from ..binding import AmbiguousRoute, HttpIdentityBinding, binding_adapter_for_handle
+from ..hook_runs import HookRunRecorderError
 from ..identity_authority import TurnAuthorityUnavailable
 from .approval import _approval_id_from_resume_event
 
@@ -54,6 +55,9 @@ class HttpTurnCarry:
     owner: asyncio.Task[object] | None = field(default_factory=asyncio.current_task, repr=False)
     # Exact stream bytes before any rewrite. @spec HTTP-APPROVAL-CONTINUITY-4.
     original_payload: str | None = field(default=None, repr=False)
+    # The binding a context-free cron turn's deployment authority was
+    # verified against at prepare. @spec HTTP-INVOCATION-EXECUTION-23.
+    scheduled: HttpIdentityBinding | None = None
 
 
 CURRENT: ContextVar[HttpTurnCarry | None] = ContextVar("http_turn_authority", default=None)
@@ -88,9 +92,36 @@ async def prepare(self: Kernel) -> None:
             raise HttpIdentityRefused()
         carry.legacy = True
         return
+    classification = await _classify(self, carry, handle)
+    if classification is None:
+        if recognized:
+            raise HttpIdentityRefused()
+        carry.legacy = True
+        return
+    if not recognized:
+        if classification.http_identity_required:
+            if not await _scheduled_authority(self, carry, classification):
+                raise HttpIdentityRefused()
+            carry.scheduled = classification
+            return
+        carry.legacy = True
+        return
+    carry.scope = TurnAuthorityScopeV1(
+        tenant_id=str(classification.tenant_id), agent_id=str(classification.agent_id),
+        binding_id=str(classification.binding_id),
+        binding_generation=classification.binding_generation,
+    )
+    await check(self, "prepare")
+
+
+async def _classify(
+    self: Kernel, carry: HttpTurnCarry, handle: ReplyHandle,
+) -> HttpIdentityBinding | None:
+    """The route's current binding classification. @spec HTTP-INVOCATION-EXECUTION-17/18."""
     classifier = getattr(self._binding, "identity_binding", None)
     if not callable(classifier):
         raise TurnAuthorityUnavailable()
+    classification: HttpIdentityBinding | None
     try:
         classification = await classifier(
             handle.kind, binding_adapter_for_handle(handle), handle.channel,
@@ -107,22 +138,58 @@ async def prepare(self: Kernel) -> None:
         raise TurnAuthorityUnavailable() from None
     if not is_live(carry):
         raise TurnAuthorityUnavailable()
-    if classification is None:
-        if recognized:
-            raise HttpIdentityRefused()
-        carry.legacy = True
-        return
-    if not recognized:
-        if classification.http_identity_required:
-            raise HttpIdentityRefused()
-        carry.legacy = True
-        return
-    carry.scope = TurnAuthorityScopeV1(
-        tenant_id=str(classification.tenant_id), agent_id=str(classification.agent_id),
-        binding_id=str(classification.binding_id),
-        binding_generation=classification.binding_generation,
-    )
-    await check(self, "prepare")
+    return classification
+
+
+async def _scheduled_authority(
+    self: Kernel, carry: HttpTurnCarry, classification: HttpIdentityBinding,
+) -> bool:
+    """A context-free cron turn's deployment authority, read from durable state.
+
+    The source and reference only locate the run row; the row decides.
+    @spec HTTP-INVOCATION-EXECUTION-23.
+    """
+    event = carry.event
+    ref = event.hook_run
+    recorder = self._hook_runs
+    if event.source is not TurnSource.CRON or ref is None or recorder is None:
+        return False
+    try:
+        if uuid.UUID(ref.agent_id) != classification.agent_id:
+            return False
+    except (AttributeError, TypeError, ValueError):
+        return False
+    try:
+        held = await recorder.scheduled_authority(ref)
+    except HookRunRecorderError as exc:
+        if exc.code == "invalid_ref":
+            return False
+        raise TurnAuthorityUnavailable() from None
+    if not is_live(carry):
+        raise TurnAuthorityUnavailable()
+    return held
+
+
+async def _recheck_scheduled(self: Kernel, carry: HttpTurnCarry) -> None:
+    """Repeat the prepare-time scheduled authority at a later boundary.
+
+    @spec HTTP-INVOCATION-EXECUTION-23.
+    """
+    expected = carry.scheduled
+    handle = carry.event.reply_handle
+    if expected is None or handle is None:
+        raise HttpIdentityRefused()
+    if not is_live(carry):
+        raise TurnAuthorityUnavailable()
+    current = await _classify(self, carry, handle)
+    if current is None or (
+        current.tenant_id, current.agent_id, current.binding_id, current.binding_generation,
+    ) != (
+        expected.tenant_id, expected.agent_id, expected.binding_id, expected.binding_generation,
+    ):
+        raise HttpIdentityRefused()
+    if not await _scheduled_authority(self, carry, current):
+        raise HttpIdentityRefused()
 
 
 async def classify_skip(self: Kernel) -> None:
@@ -168,8 +235,11 @@ def creation_identity() -> ApprovalCreationIdentityV1:
 
 
 async def check(self: Kernel, stage: Stage) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-8/18."""
+    """@spec HTTP-INVOCATION-EXECUTION-8/18/23."""
     carry = CURRENT.get()
+    if carry is not None and carry.context is None and carry.scheduled is not None:
+        await _recheck_scheduled(self, carry)
+        return
     if carry is None or carry.context is None:
         return
     if not is_live(carry) or carry.scope is None or self._identity_authority is None:

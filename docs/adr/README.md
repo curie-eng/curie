@@ -277,6 +277,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0255 | [Claim-backed sandbox scratch is bounded by its storage request](0255-claim-backed-sandbox-scratch-is-bounded-by-its-storage-request.md) | Draft |
 | 0256 | [Publication validates and pushes a Git object overlay](0256-publication-validates-and-pushes-a-git-object-overlay.md) | Draft |
 | 0257 | [A release registers its schema window only at the cut](0257-a-release-registers-its-schema-window-only-at-the-cut.md) | Accepted |
+| 0258 | [A scheduled hook turn carries its deployment authority on HTTP identity bindings](0258-a-scheduled-hook-turn-carries-its-deployment-authority-on-http-identity-bindings.md) | Accepted |
 | 0260 | [HTTP identity admits an email sender only on a signed email receiver proof](0260-http-identity-admits-an-email-sender-only-on-a-signed-email-receiver-proof.md) | Draft |
 | 0261 | [HTTP identity resolves Slack Connect senders from operator-trusted partner namespaces](0261-http-identity-resolves-slack-connect-senders-from-operator-trusted-partner-namespaces.md) | Draft |
 | 0263 | [HTTP identity accepts a one-to-one direct message to a registered receiver's bot](0263-http-identity-accepts-a-one-to-one-direct-message-to-a-registered-receivers-bot.md) | Draft |
