@@ -150,9 +150,16 @@ def _admits(event: object, body: object) -> bool:
 
 
 def _page_messages(payload: object) -> list[object] | None:
-    if not isinstance(payload, dict) or payload.get("ok") is not True:
+    """Messages from one history page.
+
+    ``WebClient`` returns a ``SlackResponse`` and keeps the decoded page on
+    ``data``. A plain dict is that same page.
+    """
+
+    page = getattr(payload, "data", payload)
+    if not isinstance(page, dict) or page.get("ok") is not True:
         return None
-    messages = payload.get("messages")
+    messages = page.get("messages")
     if not isinstance(messages, list):
         return None
     return messages

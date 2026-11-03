@@ -42,6 +42,7 @@ from pydantic import ValidationError
 from slack_sdk.errors import SlackApiError
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.web import WebClient
+from slack_sdk.web.slack_response import SlackResponse
 
 from .test_config import _clear_all_config_env, _set_valid_chat_attester_secret
 from .test_http_receiver import BOT, SENDER, HttpRig, api
@@ -111,12 +112,28 @@ def _history_page(*, agent_user: str, agent_bot_id: str) -> dict[str, Any]:
     }
 
 
+def _history_response(page: dict[str, Any]) -> SlackResponse:
+    """What ``WebClient.conversations_history`` returns. The page is on ``data``."""
+
+    return SlackResponse(
+        client=None,
+        http_verb="GET",
+        api_url="https://slack.com/api/conversations.history",
+        req_args={},
+        data=page,
+        headers={},
+        status_code=200,
+    )
+
+
 def _history_client(result: Any) -> WebClient:
     client = WebClient(token="xoxb-test")
     if isinstance(result, BaseException):
         mocked = MagicMock(side_effect=result)
     else:
-        mocked = MagicMock(return_value=result)
+        # A decoded page is wrapped in the SlackResponse WebClient returns.
+        value = _history_response(result) if isinstance(result, dict) else result
+        mocked = MagicMock(return_value=value)
     client.conversations_history = mocked  # type: ignore[method-assign]
     return client
 
