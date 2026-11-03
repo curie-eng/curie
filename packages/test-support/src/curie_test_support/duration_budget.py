@@ -79,6 +79,24 @@ def budget_targets(root: Path, collected: list[str]) -> set[str]:
     revision = merge_base(root)
     if revision is None:
         return set()
+    revisions = {revision}
+    for reference in ("origin/main", "origin/next"):
+        exists = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/{reference}^{{commit}}"],
+            cwd=root,
+            capture_output=True,
+        )
+        if exists.returncode == 0:
+            revision = merge_base(root, reference)
+            if revision is not None:
+                revisions.add(revision)
+    targets = set(collected)
+    for revision in sorted(revisions):
+        targets.intersection_update(_budget_targets(root, collected, revision))
+    return targets
+
+
+def _budget_targets(root: Path, collected: list[str], revision: str) -> set[str]:
     diff = subprocess.run(
         [
             "git",
