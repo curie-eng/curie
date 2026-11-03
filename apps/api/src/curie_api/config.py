@@ -35,7 +35,7 @@ from curie_internal.driver_declaration import (
     parse_drivers,
     refuse_published_defaults,
 )
-from curie_internal.keyspace import WORKER_KEY_PREFIX_DEFAULT
+from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT, WORKER_KEY_PREFIX_DEFAULT
 from curie_upgrade_pause import authoritative_key
 from plugin_format.connector_render import ConnectorProxy
 from pydantic import AliasChoices, Field, field_validator, model_validator
@@ -161,6 +161,34 @@ class Settings(BaseSettings):
         default=(),
         validation_alias=AliasChoices(TEST_INSTALLATION_DRIVERS_ENV, "test_installation_drivers"),
     )
+
+    # Opt-in lazy attachment facade; never infer activation from a URL.
+    attachment_access_enabled: bool = False
+    attachment_broker_url: str = ""
+    attachment_sandbox_key_prefix: str = SANDBOX_KEY_PREFIX_DEFAULT
+    attachment_transfer_timeout_seconds: int = Field(default=300, ge=1, le=3600)
+
+    workspace_recovery_enabled: bool = Field(
+        default=False, validation_alias="CURIE_WORKSPACE_RECOVERY_ENABLED"
+    )
+    workspace_bucket: str = Field(
+        default="curie-workspaces", min_length=1, validation_alias="CURIE_WORKSPACE_BUCKET"
+    )
+    workspace_reference_ttl_seconds: int = Field(
+        default=300, ge=1, validation_alias="CURIE_WORKSPACE_REFERENCE_TTL_SECONDS"
+    )
+    workspace_recovery_max_bytes: int | None = Field(
+        default=None, gt=0, validation_alias="CURIE_WORKSPACE_RECOVERY_MAX_BYTES"
+    )
+    workspace_max_archive_bytes: int = Field(
+        default=268435456, gt=0, validation_alias="CURIE_WORKSPACE_MAX_ARCHIVE_BYTES"
+    )
+
+    @model_validator(mode="after")
+    def _validate_workspace_recovery(self) -> "Settings":
+        if self.workspace_recovery_enabled and self.workspace_recovery_max_bytes is None:
+            raise ValueError("workspace recovery requires a positive installation byte cap")
+        return self
 
     # Separate trust boundary for credential redemption. The operator/CLI API
     # key can administer deployments but cannot redeem the GitHub identity.
@@ -303,6 +331,7 @@ class Settings(BaseSettings):
     # Polling is the default intake (#3745). Webhook mode is opt-in and keeps
     # the missed-label backstop. The poll interval is the GitHub tracker's.
     factory_intake: Literal["poll", "webhook"] = "poll"
+    factory_base_label_settle_s: int = Field(default=60, ge=0)
     # A failed label delivery is never redelivered by GitHub (#3081). The work
     # item reconciler lists labeled open issues this often and admits any with
     # no WorkItem once its label is older than the grace, so a delivery still
@@ -794,6 +823,11 @@ class Settings(BaseSettings):
     # protected row reports runtime_unavailable. Nothing in this API creates it.
     protected_runtime_dir: str | None = Field(
         default=None, validation_alias="CURIE_PROTECTED_RUNTIME_DIR"
+    )
+    # The operator directory holding api-runtime.json (HTTP-INVOCATION-EXECUTION-20).
+    # Unset is the unconfigured install; any value must initialize completely.
+    http_identity_dir: str | None = Field(
+        default=None, validation_alias="CURIE_HTTP_IDENTITY_DIR"
     )
     channel_binding_backlog_limit: int = 64
     channel_binding_backlog_window_s: int = Field(default=60, gt=0)

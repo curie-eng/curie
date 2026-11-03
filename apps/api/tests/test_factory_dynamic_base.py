@@ -1,0 +1,891 @@
+"""Current tracker selection is pinned once at the execution acquisition boundary."""
+
+# ruff: noqa: F811
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+import uuid
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from curie_api.config import Settings, get_settings
+from curie_api.factory_notices import sync_status_comments
+from curie_api.forges.registry import forges_registry
+from forge_fakes.github import LABEL, REPO, _issue_event, _post, _signature
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+from test_github_factory_base import (  # noqa: F401
+    MAIN_SHA,
+    NEXT_SHA,
+    WORKER,
+    _acquire,
+    _acquire_body,
+    _execute,
+    _execution,
+    _label,
+    _open_lineage,
+    _work_item,
+    base_app,
+)
+from test_github_factory_ingress import _code, _rows
+
+pytestmark = pytest.mark.usefixtures("clean_db")
+
+
+def _due(number: int) -> None:
+    _execute(
+        "UPDATE curie.execution_requests SET base_settle_until = clock_timestamp(), "
+        "dispatch_not_before = clock_timestamp(), published_generation = dispatch_generation "
+        "WHERE id = :id",
+        {"id": _execution(number)["id"]},
+    )
+
+
+def _start(client: Any, number: int, grant: Any) -> Any:
+    row = _execution(number)
+    return client.post(
+        f"/v1/internal/work-items/requests/{row['id']}/start",
+        headers=WORKER,
+        json={
+            "owner": "factory-base-owner",
+            "generation": grant.json()["generation"],
+            "claim_name": "claim-factory-base",
+            "sandbox_name": "sandbox-factory-base",
+            "context": grant.json()["context"],
+        },
+    )
+
+
+def _set_forges(
+    client: Any, monkeypatch: pytest.MonkeyPatch, environment: dict[str, str | None]
+) -> None:
+    for key, value in environment.items():
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    get_settings.cache_clear()
+    client.app.state.forges = forges_registry(get_settings())
+
+
+def _revoke_tracker(
+    client: Any, monkeypatch: pytest.MonkeyPatch, *, change: str = "removed"
+) -> dict[str, str | None]:
+    original = {
+        key: os.environ.get(key) for key in ("CURIE_FORGES", "FACTORY_ENABLED", "GITHUB_API_URL")
+    }
+    document = json.loads(os.environ["CURIE_FORGES"])
+    revoked = {**original, "FACTORY_ENABLED": "false"}
+    if change == "removed":
+        removed = {entry["name"] for entry in document["trackers"]}
+        document["bindings"] = [
+            entry for entry in document["bindings"] if entry["tracker"] not in removed
+        ]
+        document["trackers"] = []
+    else:
+        assert change == "host_changed"
+        revoked["GITHUB_API_URL"] = "https://github.example.com/api/v3"
+        for section in ("trackers", "code_hosts"):
+            for entry in document[section]:
+                entry["host"] = "github.example.com"
+                entry["api_url"] = "https://github.example.com/api/v3"
+    revoked["CURIE_FORGES"] = json.dumps(document)
+    _set_forges(client, monkeypatch, revoked)
+    return original
+
+
+def _acquire_through_forge(
+    client: Any,
+    request_id: uuid.UUID,
+    payload: dict[str, Any],
+    forge: Callable[[httpx.Request], httpx.Response],
+) -> httpx.Response:
+    async def post() -> httpx.Response:
+        previous = client.app.state.http_client
+        async with httpx.AsyncClient(transport=httpx.MockTransport(forge)) as external:
+            client.app.state.http_client = external
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
+                ) as http:
+                    return await http.post(
+                        f"/v1/internal/work-items/requests/{request_id}/acquire",
+                        headers=WORKER,
+                        json=payload,
+                    )
+            finally:
+                client.app.state.http_client = previous
+
+    return client.portal.call(post)
+
+
+def _assert_unstarted_and_unpinned(number: int, admitted: dict[str, Any]) -> None:
+    row = _execution(number)
+    assert row["id"] == admitted["id"]
+    assert row["objective"] == admitted["objective"]
+    assert row["wait_deadline"] == admitted["wait_deadline"]
+    assert row["execution_attempts"] == 0
+    assert row["runtime_epoch"] == admitted["runtime_epoch"]
+    for field in (
+        "acquire_owner",
+        "acquired_generation",
+        "acquire_expires_at",
+        "started_at",
+        "execution_deadline",
+        "runtime_owner",
+        "runtime_claim_name",
+        "runtime_sandbox_name",
+    ):
+        assert row[field] is None, (field, row[field])
+    (item,) = _rows(
+        "SELECT base_branch, base_source, base_commit, base_resolved_request_id, "
+        "base_selection_fingerprint, publication_lineage_id FROM curie.work_items WHERE id = :id",
+        {"id": admitted["work_item_id"]},
+    )
+    assert all(value is None for value in item.values()), item
+    assert _rows(
+        "SELECT id FROM curie.publications WHERE execution_request_id = :id",
+        {"id": admitted["id"]},
+    ) == []
+
+
+@pytest.mark.parametrize("change", ["removed", "host_changed"])
+def test_unresolved_acquisition_refuses_invalid_tracker_authority_and_recovers(
+    base_app: Any, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    client, api = base_app
+    number = 32010
+    assert _label(client, api, number, "base:next").json()["status"] == "factory_admitted"
+    _due(number)
+    before, payload = _execution(number), _acquire_body(number)
+    original = _revoke_tracker(client, monkeypatch, change=change)
+    reads: list[str] = []
+
+    def forge(request: httpx.Request) -> httpx.Response:
+        reads.append(request.url.path)
+        return api.handle(request)
+
+    refused = _acquire_through_forge(client, before["id"], payload, forge)
+
+    assert refused.status_code == 409, refused.text
+    assert _code(refused) == "factory_surface_mismatch"
+    row = _execution(number)
+    assert row["status"] == "waiting"
+    assert row["last_deferral_reason"] == "not_started:factory_surface_mismatch"
+    assert row["start_deferrals"] == before["start_deferrals"] + 1
+    assert row["capacity_deferrals"] == before["capacity_deferrals"]
+    assert row["dispatch_generation"] == before["dispatch_generation"] + 1
+    assert row["terminal_cause"] is None
+    assert reads == []
+    _assert_unstarted_and_unpinned(number, before)
+    _set_forges(client, monkeypatch, original)
+    _due(number)
+
+    restored = _acquire(client, number)
+
+    assert restored.status_code == 200, restored.text
+    assert _execution(number)["id"] == before["id"]
+    assert _execution(number)["start_deferrals"] == before["start_deferrals"] + 1
+    assert _work_item(number)["base_commit"] == NEXT_SHA
+    assert _start(client, number, restored).status_code == 200
+    assert _execution(number)["execution_attempts"] == 1
+
+
+def test_removed_tracker_settles_after_five_refusals_and_keeps_its_status_outbox_owed(
+    base_app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, api = base_app
+    monkeypatch.setenv("CURIE_WORK_ITEM_START_DEFERRAL_LIMIT", "5")
+    get_settings.cache_clear()
+    number = 32011
+    assert _label(client, api, number).json()["status"] == "factory_admitted"
+    _due(number)
+    before = _execution(number)
+    notice_sql = "SELECT * FROM curie.factory_terminal_notices WHERE execution_request_id = :id"
+    (notice_before,) = _rows(notice_sql, {"id": before["id"]})
+    _revoke_tracker(client, monkeypatch)
+    for attempt in range(1, 6):
+        _due(number)
+        refused = _acquire(client, number)
+        assert refused.status_code == 409, refused.text
+        assert _code(refused) == (
+            "factory_start_failed" if attempt == 5 else "factory_surface_mismatch"
+        )
+        row = _execution(number)
+        assert row["status"] == ("failed" if attempt == 5 else "waiting")
+        assert row["start_deferrals"] == attempt
+        assert row["capacity_deferrals"] == before["capacity_deferrals"]
+        assert row["dispatch_generation"] == before["dispatch_generation"] + attempt
+        assert row["last_deferral_reason"] == "not_started:factory_surface_mismatch"
+        _assert_unstarted_and_unpinned(number, before)
+    assert row["terminal_cause"] == "start_failed"
+    assert row["terminal_at"] is not None
+    (terminal_notice,) = _rows(notice_sql, {"id": before["id"]})
+    assert terminal_notice["terminal_cause"] == "start_failed"
+    assert terminal_notice["card_token"] == notice_before["card_token"]
+
+    async def sync() -> int:
+        return await sync_status_comments(
+            client.app.state.sessionmaker, get_settings(), owner="authority-outbox", limit=1
+        )
+
+    for attempt in range(1, 3):
+        assert client.portal.call(sync) == 0
+        (notice,) = _rows(notice_sql, {"id": before["id"]})
+        assert notice["execution_request_id"] == before["id"]
+        assert notice["work_item_id"] == before["work_item_id"]
+        assert notice["terminal_cause"] == "start_failed"
+        assert notice["attempts"] == terminal_notice["attempts"] + attempt
+        assert notice["sync_owner"] is None
+        assert notice["sync_lease_expires_at"] is None
+        for field in ("finalized_at", "refusal", "refused_at"):
+            assert notice[field] is None
+        assert notice["rendered_digest"] == notice_before["rendered_digest"]
+        assert _execution(number) == row
+    assert api.comment_writes == []
+    assert api.branch_requests == []
+
+
+@pytest.mark.parametrize(
+    ("delivery", "code"),
+    [("generation", "not_published"), ("owner", "duplicate"), ("wake", "factory_wake_mismatch")],
+)
+def test_invalid_unresolved_delivery_cannot_classify_revoked_authority(
+    base_app: Any, monkeypatch: pytest.MonkeyPatch, delivery: str, code: str
+) -> None:
+    client, api = base_app
+    number = 32012
+    assert _label(client, api, number).json()["status"] == "factory_admitted"
+    _due(number)
+    payload = _acquire_body(number)
+    if delivery == "generation":
+        _execute(
+            "UPDATE curie.execution_requests SET dispatch_generation = dispatch_generation + 1 "
+            "WHERE id = :id",
+            {"id": _execution(number)["id"]},
+        )
+        _due(number)
+    elif delivery == "owner":
+        _execute(
+            "UPDATE curie.execution_requests SET acquire_owner = 'other-owner', "
+            "acquired_generation = dispatch_generation, acquire_expires_at = wait_deadline "
+            "WHERE id = :id",
+            {"id": _execution(number)["id"]},
+        )
+    else:
+        payload["wake"]["conversation_id"] = "foreign-issue-thread"
+    before = _execution(number)
+    item_before = _work_item(number)
+    _revoke_tracker(client, monkeypatch)
+    reads: list[str] = []
+
+    def forge(request: httpx.Request) -> httpx.Response:
+        reads.append(request.url.path)
+        return api.handle(request)
+
+    refused = _acquire_through_forge(client, before["id"], payload, forge)
+
+    assert refused.status_code == 409, refused.text
+    assert _code(refused) == code
+    assert _execution(number) == before
+    assert _work_item(number) == item_before
+    assert reads == []
+
+
+def test_an_authorized_tracker_outage_does_not_count_as_a_start_refusal(base_app: Any) -> None:
+    client, api = base_app
+    number = 32013
+    assert _label(client, api, number, "base:next").json()["status"] == "factory_admitted"
+    _due(number)
+    before = _execution(number)
+    reads: list[str] = []
+
+    def forge(request: httpx.Request) -> httpx.Response:
+        reads.append(request.url.path)
+        if request.url.path == f"/repos/{REPO}/issues/{number}":
+            return httpx.Response(503, json={"message": "Service Unavailable"})
+        return api.handle(request)
+
+    refused = _acquire_through_forge(client, before["id"], _acquire_body(number), forge)
+
+    assert refused.status_code == 409, refused.text
+    assert _code(refused) == "not_dispatchable"
+    row = _execution(number)
+    assert row["status"] == "waiting"
+    assert row["last_deferral_reason"] == "base_unavailable"
+    assert row["start_deferrals"] == 0
+    assert row["capacity_deferrals"] == before["capacity_deferrals"]
+    assert f"/repos/{REPO}/issues/{number}" in reads
+    assert api.branch_requests == []
+    _assert_unstarted_and_unpinned(number, before)
+    _due(number)
+
+    restored = _acquire(client, number)
+
+    assert restored.status_code == 200, restored.text
+    assert _execution(number)["id"] == before["id"]
+    assert _work_item(number)["base_commit"] == NEXT_SHA
+    assert _start(client, number, restored).status_code == 200
+
+
+def test_admission_does_not_read_or_resolve_a_branch_head(base_app: Any) -> None:
+    client, api = base_app
+
+    response = _label(client, api, 32001, "base:next")
+
+    assert response.json()["status"] == "factory_admitted", response.text
+    assert api.branch_requests == []
+    item = _work_item(32001)
+    assert item is not None
+    assert (item["base_branch"], item["base_source"], item["base_commit"]) == (None, None, None)
+    assert _execution(32001)["acquire_owner"] is None
+
+
+def test_default_settle_interval_is_sixty_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("FACTORY_BASE_LABEL_SETTLE_S", raising=False)
+
+    assert Settings(_env_file=None).factory_base_label_settle_s == 60
+
+
+@pytest.mark.parametrize("seconds", [0, 2, 60])
+def test_settle_uses_database_time_and_cannot_grant_early(
+    base_app: Any, monkeypatch: pytest.MonkeyPatch, seconds: int
+) -> None:
+    client, api = base_app
+    monkeypatch.setenv("FACTORY_BASE_LABEL_SETTLE_S", str(seconds))
+    get_settings.cache_clear()
+    before = _rows("SELECT clock_timestamp() AS now")[0]["now"]
+
+    assert _label(client, api, 32002).json()["status"] == "factory_admitted"
+
+    after = _rows("SELECT clock_timestamp() AS now")[0]["now"]
+    row = _execution(32002)
+    assert seconds <= (row["base_settle_until"] - before).total_seconds()
+    assert (row["base_settle_until"] - after).total_seconds() <= seconds
+    if seconds:
+        _execute(
+            "UPDATE curie.execution_requests SET base_settle_until = wait_deadline WHERE id = :id",
+            {"id": row["id"]},
+        )
+        row = _execution(32002)
+        early = _acquire(client, 32002)
+        assert early.status_code == 409, early.text
+        assert _execution(32002)["acquire_owner"] is None
+        assert _work_item(32002)["base_commit"] is None
+        assert api.branch_requests == []
+        deferred = _execution(32002)
+        assert deferred["dispatch_not_before"] == row["base_settle_until"]
+        _due(32002)
+
+    ready = _acquire(client, 32002)
+
+    assert ready.status_code == 200, ready.text
+    assert _work_item(32002)["base_commit"] == MAIN_SHA
+
+
+def test_delayed_base_label_is_read_when_settle_finishes(
+    base_app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, api = base_app
+    monkeypatch.setenv("FACTORY_BASE_LABEL_SETTLE_S", "60")
+    get_settings.cache_clear()
+    assert _label(client, api, 32003).json()["status"] == "factory_admitted"
+    api.labels = [LABEL, "base:next"]
+    api.branches["next"] = "4" * 40
+    _due(32003)
+
+    claimed = _acquire(client, 32003)
+
+    assert claimed.status_code == 200, claimed.text
+    item = _work_item(32003)
+    assert (item["base_branch"], item["base_source"], item["base_commit"]) == (
+        "next",
+        "label",
+        "4" * 40,
+    )
+    assert api.branch_requests == ["next"]
+    (pin,) = _rows(
+        "SELECT base_resolved_request_id FROM curie.work_items WHERE id = :id",
+        {"id": item["id"]},
+    )
+    assert pin["base_resolved_request_id"] == _execution(32003)["id"]
+
+
+def test_duplicate_delivery_does_not_restart_the_settle_interval(
+    base_app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, api = base_app
+    monkeypatch.setenv("FACTORY_BASE_LABEL_SETTLE_S", "60")
+    get_settings.cache_clear()
+    api.issue_number = 32004
+    api.labels = [LABEL]
+    api.advance_label_event(32004)
+    event = _issue_event("labeled", 32004, label={"name": LABEL})
+    delivery = str(uuid.uuid4())
+    assert _post(client, "issues", event, delivery=delivery).status_code == 200
+    before = _execution(32004)
+
+    assert _post(client, "issues", event, delivery=delivery).status_code == 200
+
+    after = _execution(32004)
+    assert (after["id"], after["base_settle_until"]) == (before["id"], before["base_settle_until"])
+    assert api.branch_requests == []
+    _due(32004)
+    assert _acquire(client, 32004).status_code == 200
+
+
+def test_held_acquisition_renewal_never_repins_the_request(base_app: Any) -> None:
+    client, api = base_app
+    assert _label(client, api, 32005, "base:next").json()["status"] == "factory_admitted"
+    first = _acquire(client, 32005)
+    assert first.status_code == 200, first.text
+    before = _work_item(32005)
+    api.branches["next"] = "5" * 40
+    api.labels = [LABEL, "base:main"]
+    api.branch_requests.clear()
+
+    renewed = _acquire(client, 32005)
+
+    assert renewed.status_code == 200, renewed.text
+    after = _work_item(32005)
+    assert (after["base_branch"], after["base_commit"]) == (before["base_branch"], NEXT_SHA)
+    assert api.branch_requests == []
+    assert _start(client, 32005, renewed).status_code == 200
+
+
+def test_capacity_redelivery_preserves_the_request_pin(base_app: Any) -> None:
+    client, api = base_app
+    assert _label(client, api, 32006, "base:next").json()["status"] == "factory_admitted"
+    first = _acquire(client, 32006)
+    assert first.status_code == 200, first.text
+    row = _execution(32006)
+    deferred = client.post(
+        f"/v1/internal/work-items/requests/{row['id']}/defer",
+        headers=WORKER,
+        json={
+            "owner": "factory-base-owner",
+            "generation": first.json()["generation"],
+            "reason": "capacity",
+            "capacity": True,
+        },
+    )
+    assert deferred.status_code == 200, deferred.text
+    api.branches["next"] = "6" * 40
+    api.branch_requests.clear()
+    _due(32006)
+
+    redelivered = _acquire(client, 32006)
+
+    assert redelivered.status_code == 200, redelivered.text
+    assert _execution(32006)["id"] == row["id"]
+    assert _work_item(32006)["base_commit"] == NEXT_SHA
+    assert api.branch_requests == []
+
+
+def test_superseding_a_blocked_external_read_cannot_pin_or_start_the_old_request(
+    base_app: Any,
+) -> None:
+    client, api = base_app
+    assert _label(client, api, 32007, "base:next").json()["status"] == "factory_admitted"
+    old = _execution(32007)
+    payload = _acquire_body(32007)
+
+    async def race() -> None:
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def forge(request: httpx.Request) -> httpx.Response:
+            if request.url.path == f"/repos/{REPO}/git/ref/heads/next":
+                entered.set()
+                await release.wait()
+            return api.handle(request)
+
+        original = client.app.state.http_client
+        async with httpx.AsyncClient(transport=httpx.MockTransport(forge)) as external:
+            client.app.state.http_client = external
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
+                ) as http:
+                    claiming = asyncio.create_task(
+                        http.post(
+                            f"/v1/internal/work-items/requests/{old['id']}/acquire",
+                            headers=WORKER,
+                            json=payload,
+                        )
+                    )
+                    try:
+                        await asyncio.wait_for(entered.wait(), 5)
+                        api.labels = [LABEL, "base:main"]
+                        api.advance_label_event(32007)
+                        body = json.dumps(
+                            _issue_event("labeled", 32007, label={"name": LABEL})
+                        ).encode()
+                        changed = await asyncio.wait_for(
+                            http.post(
+                                "/github/webhook",
+                                content=body,
+                                headers={
+                                    "X-GitHub-Delivery": str(uuid.uuid4()),
+                                    "X-GitHub-Event": "issues",
+                                    "X-Hub-Signature-256": _signature(body),
+                                    "Content-Type": "application/json",
+                                },
+                            ),
+                            5,
+                        )
+                        assert changed.status_code == 200, changed.text
+                    finally:
+                        release.set()
+                    stale = await asyncio.wait_for(claiming, 5)
+                    assert stale.status_code == 409, stale.text
+            finally:
+                client.app.state.http_client = original
+
+    client.portal.call(race)
+
+    current = _execution(32007)
+    assert current["id"] != old["id"]
+    assert _work_item(32007)["base_commit"] is None
+    assert _acquire(client, 32007).status_code == 200
+    assert _work_item(32007)["base_commit"] == MAIN_SHA
+    (stale,) = _rows(
+        "SELECT status, acquire_owner FROM curie.execution_requests WHERE id = :id",
+        {"id": old["id"]},
+    )
+    assert stale == {"status": "cancelled", "acquire_owner": None}
+
+
+@pytest.mark.parametrize("label", ["base:next", "base:release-1", "base:main"])
+def test_a_base_only_label_observation_fences_a_blocked_first_acquisition(
+    base_app: Any, label: str
+) -> None:
+    client, api = base_app
+    number = 32008
+    assert _label(client, api, number, "base:main").json()["status"] == "factory_admitted"
+    original = _execution(number)
+    payload = _acquire_body(number)
+
+    async def race() -> httpx.Response:
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def forge(request: httpx.Request) -> httpx.Response:
+            if request.url.path == f"/repos/{REPO}/git/ref/heads/main":
+                entered.set()
+                await release.wait()
+            return api.handle(request)
+
+        previous = client.app.state.http_client
+        async with httpx.AsyncClient(transport=httpx.MockTransport(forge)) as external:
+            client.app.state.http_client = external
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
+                ) as http:
+                    claiming = asyncio.create_task(
+                        http.post(
+                            f"/v1/internal/work-items/requests/{original['id']}/acquire",
+                            headers=WORKER,
+                            json=payload,
+                        )
+                    )
+                    try:
+                        await asyncio.wait_for(entered.wait(), 5)
+                        api.labels = [LABEL, label]
+                        body = json.dumps(
+                            _issue_event("labeled", number, label={"name": label})
+                        ).encode()
+                        observed = await asyncio.wait_for(
+                            http.post(
+                                "/github/webhook",
+                                content=body,
+                                headers={
+                                    "X-GitHub-Delivery": str(uuid.uuid4()),
+                                    "X-GitHub-Event": "issues",
+                                    "X-Hub-Signature-256": _signature(body),
+                                    "Content-Type": "application/json",
+                                },
+                            ),
+                            5,
+                        )
+                        assert observed.status_code == 200, observed.text
+                    finally:
+                        release.set()
+                    return await asyncio.wait_for(claiming, 5)
+            finally:
+                client.app.state.http_client = previous
+
+    first = client.portal.call(race)
+
+    current = _execution(number)
+    assert current["id"] == original["id"]
+    assert current["status"] == "waiting"
+    if label != "base:main":
+        assert first.status_code == 409, first.text
+    else:
+        assert first.status_code in {200, 409}, first.text
+    if first.status_code == 409:
+        assert current["acquire_owner"] is None
+        item = _work_item(number)
+        assert (item["base_branch"], item["base_source"], item["base_commit"]) == (
+            None,
+            None,
+            None,
+        )
+    _due(number)
+
+    latest = _acquire(client, number)
+
+    if label == "base:release-1":
+        assert latest.status_code == 409, latest.text
+        assert _execution(number)["id"] == original["id"]
+        assert _execution(number)["acquire_owner"] is None
+        assert _work_item(number)["base_commit"] is None
+        api.labels = [LABEL, "base:next"]
+        _due(number)
+        latest = _acquire(client, number)
+    assert latest.status_code == 200, latest.text
+    assert _execution(number)["id"] == original["id"]
+    expected = ("main", MAIN_SHA) if label == "base:main" else ("next", NEXT_SHA)
+    item = _work_item(number)
+    assert (item["base_branch"], item["base_commit"]) == expected
+
+
+@pytest.mark.parametrize("latest_base", ["next", "main"])
+def test_a_base_label_waiting_behind_the_first_pin_still_replaces_its_granted_owner(
+    base_app: Any, latest_base: str
+) -> None:
+    client, api = base_app
+    number = 32009
+    assert _label(client, api, number, "base:main").json()["status"] == "factory_admitted"
+    original = _execution(number)
+    item = _work_item(number)
+    payload = _acquire_body(number)
+
+    async def race() -> tuple[httpx.Response, httpx.Response]:
+        branch_read = asyncio.Event()
+
+        async def forge(request: httpx.Request) -> httpx.Response:
+            if request.url.path == f"/repos/{REPO}/git/ref/heads/main":
+                branch_read.set()
+            return api.handle(request)
+
+        engine = create_async_engine(get_settings().database_url)
+        previous = client.app.state.http_client
+        try:
+            async with (
+                engine.connect() as holder,
+                engine.connect() as inspector,
+                httpx.AsyncClient(transport=httpx.MockTransport(forge)) as external,
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
+                ) as http,
+            ):
+                client.app.state.http_client = external
+                holder_pid = await holder.scalar(text("SELECT pg_backend_pid()"))
+                await holder.execute(
+                    text("SELECT id FROM curie.work_items WHERE id = :id FOR UPDATE"),
+                    {"id": item["id"]},
+                )
+
+                async def waiter(blocker: int, request: asyncio.Task[httpx.Response]) -> int:
+                    async with asyncio.timeout(5):
+                        while True:
+                            result = await inspector.execute(
+                                text(
+                                    "SELECT DISTINCT pid FROM pg_locks WHERE NOT granted "
+                                    "AND CAST(:blocker AS integer) = ANY(pg_blocking_pids(pid))"
+                                ),
+                                {"blocker": blocker},
+                            )
+                            waiting = result.scalars().all()
+                            if waiting:
+                                (pid,) = waiting
+                                return int(pid)
+                            assert not request.done(), "request completed before the row lock wait"
+
+                async with asyncio.TaskGroup() as requests:
+                    acquiring = requests.create_task(
+                        http.post(
+                            f"/v1/internal/work-items/requests/{original['id']}/acquire",
+                            headers=WORKER,
+                            json=payload,
+                        )
+                    )
+                    try:
+                        await asyncio.wait_for(branch_read.wait(), 5)
+                        acquiring_pid = await waiter(int(holder_pid), acquiring)
+                        api.labels = [LABEL, "base:next"]
+                        body = json.dumps(
+                            _issue_event("labeled", number, label={"name": "base:next"})
+                        ).encode()
+                        observing = requests.create_task(
+                            http.post(
+                                "/github/webhook",
+                                content=body,
+                                headers={
+                                    "X-GitHub-Delivery": str(uuid.uuid4()),
+                                    "X-GitHub-Event": "issues",
+                                    "X-Hub-Signature-256": _signature(body),
+                                    "Content-Type": "application/json",
+                                },
+                            )
+                        )
+                        observing_pid = await waiter(acquiring_pid, observing)
+                        assert observing_pid != acquiring_pid
+                        api.labels = [LABEL, f"base:{latest_base}"]
+                    finally:
+                        await holder.rollback()
+                    acquired, observed = await asyncio.wait_for(
+                        asyncio.gather(acquiring, observing), 5
+                    )
+                    return acquired, observed
+        finally:
+            client.app.state.http_client = previous
+            await engine.dispose()
+
+    acquired, observed = client.portal.call(race)
+
+    assert acquired.status_code == 200, acquired.text
+    assert observed.status_code == 200, observed.text
+    requests = _rows(
+        "SELECT id, status, acquire_owner FROM curie.execution_requests "
+        "WHERE work_item_id = :id ORDER BY sequence",
+        {"id": item["id"]},
+    )
+    if latest_base == "main":
+        assert requests == [
+            {"id": original["id"], "status": "waiting", "acquire_owner": "factory-base-owner"}
+        ]
+        assert (_work_item(number)["base_branch"], _work_item(number)["base_commit"]) == (
+            "main",
+            MAIN_SHA,
+        )
+        started = _start(client, number, acquired)
+        assert started.status_code == 200, started.text
+        return
+    assert [request["status"] for request in requests] == ["cancelled", "waiting"], requests
+    predecessor, successor = requests
+    assert predecessor == {"id": original["id"], "status": "cancelled", "acquire_owner": None}
+    assert successor["id"] != original["id"]
+    assert successor["status"] == "waiting"
+    stale_start = client.post(
+        f"/v1/internal/work-items/requests/{original['id']}/start",
+        headers=WORKER,
+        json={
+            "owner": "factory-base-owner",
+            "generation": acquired.json()["generation"],
+            "claim_name": "claim-factory-base",
+            "sandbox_name": "sandbox-factory-base",
+            "context": acquired.json()["context"],
+        },
+    )
+    assert stale_start.status_code == 409, stale_start.text
+    _due(number)
+
+    healthy = _acquire(client, number)
+
+    assert healthy.status_code == 200, healthy.text
+    assert (_work_item(number)["base_branch"], _work_item(number)["base_commit"]) == (
+        "next",
+        NEXT_SHA,
+    )
+    assert _start(client, number, healthy).status_code == 200
+
+
+def test_a_conflict_hold_requires_a_new_factory_application_before_retrying(base_app: Any) -> None:
+    from curie_api.models import FactoryBaseTransition, ThreadPublicationLineage, WorkItem
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+    client, api = base_app
+    number = 32008
+    assert _label(client, api, number, "base:next").json()["status"] == "factory_admitted"
+    request = _execution(number)
+    item = _work_item(number)
+    assert item is not None
+    _open_lineage(item["id"])
+    transition_id = uuid.uuid4()
+
+    async def hold() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                stored = await session.get(WorkItem, item["id"])
+                assert stored is not None
+                lineage = await session.get(ThreadPublicationLineage, stored.publication_lineage_id)
+                assert lineage is not None
+                now = await session.scalar(text("SELECT clock_timestamp()"))
+                stored.base_branch, stored.base_source, stored.base_commit = (
+                    "main",
+                    "default",
+                    MAIN_SHA,
+                )
+                lineage.base_sha = MAIN_SHA
+                session.add(
+                    FactoryBaseTransition(
+                        id=transition_id,
+                        work_item_id=stored.id,
+                        request_id=request["id"],
+                        ci_request_id=request["id"],
+                        lineage_id=lineage.id,
+                        phase="conflict",
+                        version=1,
+                        old_base_ref="main",
+                        old_base_sha=MAIN_SHA,
+                        old_head_sha="3" * 40,
+                        target_base_ref="next",
+                        target_base_sha=NEXT_SHA,
+                        base_source="label",
+                        branch=lineage.branch,
+                        pull_request_number="77",
+                        committer_name="Curie",
+                        committer_email="factory@example.com",
+                        committer_time=now,
+                        error_code="rebase_conflict",
+                        changed_paths=[],
+                    )
+                )
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(hold())
+    api.branch_requests.clear()
+    for labels, action, label in [
+        ([LABEL, "base:main"], "labeled", "base:main"),
+        ([LABEL, "base:next"], "unlabeled", "base:main"),
+    ]:
+        api.labels = labels
+        response = _post(client, "issues", _issue_event(action, number, label={"name": label}))
+        assert response.status_code == 200, response.text
+        assert _execution(number)["id"] == request["id"]
+    held = _acquire(client, number)
+    assert held.status_code == 409, held.text
+    assert api.branch_requests == []
+    assert _work_item(number)["base_commit"] == MAIN_SHA
+    api.labels = ["base:next"]
+    removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
+    assert removed.status_code == 200, removed.text
+
+    reapplied = _label(client, api, number, "base:next")
+
+    assert reapplied.json()["status"] == "factory_admitted", reapplied.text
+    successor = _execution(number)
+    assert successor["id"] != request["id"]
+    assert successor["status"] == "waiting"
+    transitions = _rows(
+        "SELECT request_id, phase FROM curie.factory_base_transitions WHERE work_item_id = :id",
+        {"id": item["id"]},
+    )
+    assert transitions == [{"request_id": request["id"], "phase": "conflict"}]
+    assert api.branch_requests == []

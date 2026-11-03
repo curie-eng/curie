@@ -159,6 +159,183 @@ def test_the_entry_consumes_only_the_campaign_lane_and_parks_verified_claims(
     assert entry
 
 
+# --- Parked claims: re-checked after a restart and while running (#4900) ---------------------
+
+
+async def _run_until(worker: Any, predicate: Any) -> None:
+    task = asyncio.create_task(worker.run())
+    try:
+        await until(lambda: predicate(worker.verdicts) or task.done())
+    finally:
+        worker.request_stop()
+        await asyncio.wait_for(task, 10)
+
+
+def _deliveries(broker: Any, campaign: Any, entry: str) -> int:
+    from curie_protected_hooks.commissioning_acl import derive_commissioning_lane
+
+    lane = derive_commissioning_lane(campaign.permit)
+    script = "return redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[2], ARGV[2], 1)"
+    rows = broker.command("EVAL", script, 1, campaign.stream, lane.group, entry)
+    assert len(rows) == 1, "the claim stays pending"
+    return int(rows[0][3])
+
+
+def _untouched(broker: Any, campaign: Any) -> None:
+    from curie_protected_hooks.commissioning_acl import derive_commissioning_lane
+
+    assert not broker.command("EXISTS", derive_commissioning_lane(campaign.permit).dead)
+    remaining = keys(broker)
+    assert not any(":lease:" in key or ":delivery:" in key for key in remaining), remaining
+
+
+def test_a_restart_rechecks_a_parked_claim_after_its_admission_commits(
+    pworker_service: Any, campaign: Any, tmp_path: Path
+) -> None:
+    from curie_protected_hooks.commissioning_admissions import CampaignAdmissions
+    from curie_protected_hooks.commissioning_worker import CampaignDispatchable, CampaignParked
+
+    directory = campaign.write_directory(tmp_path / "runtime")
+    probe = GuardProbe(campaign)
+
+    async def scenario() -> tuple[str, Any]:
+        async with started(campaign) as control:
+            entry, envelope, _ = await campaign.enqueue(control, BODY, commit=False)
+            # More restarts than the transport's delivery cap: parking spends no
+            # delivery attempt, so no restart may retire the claim.
+            first = await opened(directory, guard=probe.guard)
+            restarts = first.consumer_config.max_delivery + 1
+            await first.close()
+            for _ in range(restarts):
+                parked = await opened(directory, guard=probe.guard)
+                try:
+                    await _run_until(parked, lambda v: entry in v)
+                finally:
+                    await parked.close()
+                assert parked.verdicts[entry] == CampaignParked(8)
+            admission = await CampaignAdmissions(control).commit(envelope, entry)
+            second = await opened(directory, guard=probe.guard)
+            try:
+                await _run_until(second, lambda v: type(v.get(entry)) is CampaignDispatchable)
+            finally:
+                await second.close()
+            verdict = second.verdicts[entry]
+            assert type(verdict) is CampaignDispatchable
+            assert verdict.admission == admission and verdict.envelope == envelope
+            return entry, verdict
+
+    entry, _ = run(scenario())
+    assert _deliveries(pworker_service, campaign, entry) == 1, "recovery claims nothing again"
+    _untouched(pworker_service, campaign)
+
+
+def test_a_running_worker_rechecks_a_parked_claim_after_its_admission_commits(
+    pworker_service: Any, campaign: Any, tmp_path: Path
+) -> None:
+    from curie_protected_hooks.commissioning_admissions import CampaignAdmissions
+    from curie_protected_hooks.commissioning_worker import CampaignDispatchable, CampaignParked
+
+    directory = campaign.write_directory(tmp_path / "runtime")
+    probe = GuardProbe(campaign)
+
+    async def scenario() -> str:
+        async with started(campaign) as control:
+            worker = await opened(directory, guard=probe.guard, recheck_interval_s=0.1)
+            task = asyncio.create_task(worker.run())
+            try:
+                entry, envelope, _ = await campaign.enqueue(control, BODY, commit=False)
+                await until(lambda: worker.verdicts.get(entry) == CampaignParked(8))
+                calls = probe.calls
+                await until(lambda: probe.calls > calls + 1)
+                assert worker.verdicts[entry] == CampaignParked(8), "still parked, re-checked"
+                admission = await CampaignAdmissions(control).commit(envelope, entry)
+                await until(lambda: type(worker.verdicts.get(entry)) is CampaignDispatchable)
+                assert worker.verdicts[entry].admission == admission
+                settled = probe.calls
+                await asyncio.sleep(0.5)
+                assert probe.calls == settled, "a dispatchable claim is not re-checked"
+            finally:
+                worker.request_stop()
+                await asyncio.wait_for(task, 10)
+                await worker.close()
+            return entry
+
+    entry = run(scenario())
+    assert _deliveries(pworker_service, campaign, entry) == 1
+    _untouched(pworker_service, campaign)
+
+
+def test_a_parked_claim_is_refused_once_the_campaign_stops_running(
+    pworker_service: Any, campaign: Any, tmp_path: Path
+) -> None:
+    from curie_protected_hooks.commissioning_worker import CampaignParked, CampaignRefused
+
+    directory = campaign.write_directory(tmp_path / "runtime")
+    probe = GuardProbe(campaign)
+
+    async def scenario() -> str:
+        async with started(campaign) as control:
+            worker = await opened(directory, guard=probe.guard, recheck_interval_s=0.1)
+            task = asyncio.create_task(worker.run())
+            try:
+                entry, _, _ = await campaign.enqueue(control, BODY, commit=False)
+                await until(lambda: worker.verdicts.get(entry) == CampaignParked(8))
+                state = await control.journal.status()
+                await control.journal.begin_close(state.generation)
+                await until(lambda: worker.verdicts.get(entry) == CampaignRefused(6))
+                refused = probe.calls
+                await asyncio.sleep(0.5)
+                assert probe.calls == refused, "a refused claim is not re-checked while running"
+            finally:
+                worker.request_stop()
+                await asyncio.wait_for(task, 10)
+                await worker.close()
+            restarted = await opened(directory, guard=probe.guard)
+            try:
+                await _run_until(restarted, lambda v: entry in v)
+            finally:
+                await restarted.close()
+            assert restarted.verdicts[entry] == CampaignRefused(6)
+            return entry
+
+    entry = run(scenario())
+    assert _deliveries(pworker_service, campaign, entry) == 1
+    _untouched(pworker_service, campaign)
+
+
+def test_a_parked_claim_committed_for_another_entry_is_refused_on_recheck(
+    pworker_service: Any, campaign: Any, tmp_path: Path
+) -> None:
+    from curie_protected_hooks.commissioning_admissions import CampaignAdmissions
+    from curie_protected_hooks.commissioning_worker import CampaignParked, CampaignRefused
+
+    directory = campaign.write_directory(tmp_path / "runtime")
+    probe = GuardProbe(campaign)
+
+    async def scenario() -> str:
+        async with started(campaign) as control:
+            entry, envelope, _ = await campaign.enqueue(control, BODY, commit=False)
+            first = await opened(directory, guard=probe.guard)
+            try:
+                await _run_until(first, lambda v: entry in v)
+            finally:
+                await first.close()
+            assert first.verdicts[entry] == CampaignParked(8)
+            # The control commits this delivery's admission for a different lane entry.
+            await CampaignAdmissions(control).commit(envelope, "1-1")
+            second = await opened(directory, guard=probe.guard)
+            try:
+                await _run_until(second, lambda v: entry in v)
+            finally:
+                await second.close()
+            assert second.verdicts[entry] == CampaignRefused(8)
+            return entry
+
+    entry = run(scenario())
+    assert _deliveries(pworker_service, campaign, entry) == 1
+    _untouched(pworker_service, campaign)
+
+
 # --- Step 1: predeclared entry point and B against G and M ----------------------------------
 
 

@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +14,8 @@ from curie_api.schemas.channels import BUILTIN_CLUSTER_MESSAGE_ADAPTER
 from curie_api.schemas.publications import PublicationCreate
 
 from ..config import get_settings
+from ..identity.http_invocation import HttpInvocationRuntime
+from ..identity.writer_selection import http_selected_scope
 from ..models import (
     Approval,
     ApprovalAuditEntry,
@@ -21,6 +23,7 @@ from ..models import (
     CredentialRedemptionAuditEntry,
     Deployment,
     ExecutionRequest,
+    FactoryBaseTransition,
     Publication,
     PublicationReviewReservation,
     ThreadPublicationLineage,
@@ -342,8 +345,12 @@ async def create_publication(
     patch: bytes,
     metadata_check: Callable[[], Awaitable[None]],
     traceparent: str | None = None,
+    identity_runtime: HttpInvocationRuntime | None = None,
 ) -> tuple[Publication, bool]:
     """Atomically create the durable approval and its private publication.
+
+    ``identity_runtime`` is the app's HTTP invocation runtime, which the approval
+    scope is classified with (HTTP-APPROVAL-CONTINUITY-14).
 
     ``dedupe_key`` belongs to Approval, so the replay lookup starts there. An
     exact replay adopts both rows; a changed patch or snapshot fact is a hard
@@ -379,6 +386,24 @@ async def create_publication(
     if agent is None:
         raise LookupError("agent not found")
     auto = agent.publication_policy == POLICY_AUTO
+    # Before any lineage or reservation change. @spec HTTP-APPROVAL-CONTINUITY-1/14.
+    if await http_selected_scope(
+        session,
+        Approval(
+            agent_id=deployment.agent_id,
+            reply_kind=data.reply_kind,
+            reply_channel=data.reply_channel,
+            reply_adapter=data.reply_adapter,
+            reply_identity=normalized_reply_identity(
+                data.reply_kind, data.reply_adapter, data.reply_identity
+            ),
+        ),
+        runtime=identity_runtime,
+    ):
+        raise PublicationLineageConflict(
+            "publication.unsupported_approval",
+            "publication approvals are not supported for an HTTP-selected scope",
+        )
 
     owned_request = await _refuse_fenced_work_item(
         session,
@@ -548,6 +573,37 @@ async def create_publication(
             revision_number = lineage.latest_revision + 1
         lineage.latest_revision = revision_number
         lineage.updated_at = func.now()
+
+    moving_base = await session.scalar(
+        select(FactoryBaseTransition.id)
+        .where(
+            FactoryBaseTransition.lineage_id == lineage.id,
+            or_(
+                FactoryBaseTransition.phase.in_(
+                    ("pending", "prepared", "pushed", "retargeted", "ci_prepared", "ci_pushed")
+                ),
+                and_(
+                    FactoryBaseTransition.phase == "applied",
+                    FactoryBaseTransition.outcome_ready_at.is_(None),
+                ),
+                and_(
+                    FactoryBaseTransition.phase.in_(("conflict", "refused")),
+                    FactoryBaseTransition.request_id.in_(
+                        select(ExecutionRequest.id).where(
+                            ExecutionRequest.status.in_(
+                                ("waiting", "running", "cancellation_requested")
+                            )
+                        )
+                    ),
+                ),
+            ),
+        )
+        .limit(1)
+    )
+    if moving_base is not None:
+        raise PublicationLineageConflict(
+            "publication.base_transition_pending", "a base change owns this lineage"
+        )
 
     if (
         auto

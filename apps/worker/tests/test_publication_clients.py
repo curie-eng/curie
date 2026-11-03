@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from pathlib import Path
 from urllib.parse import quote
 
 import httpx
@@ -39,6 +40,21 @@ LINEAGE_PATH = f"/v1/internal/publications/{PUBLICATION_ID}/lineage"
 WORKER_TOKEN = "publication-worker-test-token"
 
 pytestmark = pytest.mark.anyio
+
+_BASE_BRANCH_VECTORS = json.loads(
+    (Path(__file__).resolve().parents[3] / "tests/vectors/factory-base-branches.json").read_text(
+        encoding="utf-8"
+    )
+)["cases"]
+_VALID_BASE_BRANCH_CASES = [
+    pytest.param(case["branch"], id=case["id"])
+    for case in _BASE_BRANCH_VECTORS
+    if case["valid"]
+] + [
+    pytest.param("release/example", id="release_example"),
+    pytest.param("refs/heads/main", id="literal_main_ref"),
+    pytest.param(PRIOR_HEAD, id="literal_prior_head_hex"),
+]
 
 
 @pytest.fixture
@@ -150,7 +166,7 @@ async def test_an_unreachable_api_is_a_reconcile_error() -> None:
 
 
 @pytest.mark.parametrize("head", [REVISION_HEAD, None])
-@pytest.mark.parametrize("base_branch", ["main", "next", "release/example"])
+@pytest.mark.parametrize("base_branch", _VALID_BASE_BRANCH_CASES)
 async def test_branch_head_is_read_for_the_publication(head: str | None, base_branch: str) -> None:
     requests: list[httpx.Request] = []
 
@@ -187,8 +203,6 @@ async def test_an_invalid_branch_head_is_refused() -> None:
         {"head_sha": None, "base_branch": ""},
         {"head_sha": None, "base_branch": 123},
         {"head_sha": None, "base_branch": "x" * 1025},
-        {"head_sha": None, "base_branch": "refs/heads/main"},
-        {"head_sha": None, "base_branch": PRIOR_HEAD},
         {"head_sha": None, "base_branch": "main\nnext"},
         {"head_sha": None, "base_branch": "../main"},
         {"head_sha": REVISION_HEAD.upper(), "base_branch": "main"},

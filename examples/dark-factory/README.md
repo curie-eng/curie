@@ -56,9 +56,79 @@ same two values (see "Review loops").
 Running the repository's tests is an instruction in this skill. The platform
 does not enforce it, and a different bundle can choose differently.
 
+## Inspect a pull request locally
+
+The companion `review-pr` skill runs in the human's existing coding agent.
+Install the local Software Factory skills with `curie factory skills install --agent codex`, or select
+`claude-code`, `copilot`, `gemini` or `cursor`. It explains components and calls,
+diff and behavior changes, new and regression tests, and guides local manual
+verification. It can publish approved feedback through existing host tools,
+request a configured factory revision and complete an explicitly approved merge.
+The [PR review guide](../../docs/guides/factory-pr-review.md) explains the workflow.
+The skill stays under `review/skills/`, outside this bundle's executable `skills/`
+tree, and adds no platform runtime or tracker integration.
+
+## Prepare a specification locally
+
+The factory bundle also distributes a text-only `prepare-factory-ticket` skill
+for your existing local coding agent. It inspects a repository, clarifies intent,
+and prepares a reviewed specification or proposed ticket set, with optional
+approved publication and configured-label factory selection. It requires no host Python,
+parser installation, Curie service or container runtime. Repository-specific
+verification uses the repository's own prerequisites and records any missing ones.
+
+Install directly with `curie factory skills install --agent codex`, or select
+`claude-code`, `copilot`, `gemini` or `cursor`. Add `--global` for personal use
+across repositories, or `--dir DIR` to choose an existing project directory.
+The command is offline and preserves existing local edits. The
+[preparation guide](../../docs/guides/factory-preparation.md)
+covers installation and invocation for supported clients and a plain-file
+fallback. A pre-existing CLI release will not gain new embedded files by selecting
+a newer deployment image; use a CLI built from this change or a release containing it.
+
+The installer copies only the human-facing skill folders. The root factory plugin's execution
+hooks require an implementation plan and are unsuitable for local draft authoring.
+The nested preparation skill is not registered as a factory execution skill.
+Its Markdown references stay inside the copied folder, so no Curie source checkout
+or Python package is needed to use it.
+
+## Prepare and maintain repository environments
+
+The same installer includes `factory-environment-setup` and
+`factory-environment-maintenance` from [`environment/skills/`](environment/skills/).
+These are local admin skills, outside the deployed factory execution skill.
+Setup examines the configured tracker issues, code-host pull or merge request
+history, verification commands and current repository runner before proposing
+an operator-owned runner spec. After admin review, it uses the existing
+`curie cluster factory --repo-runner` build and binding flow. Maintenance
+groups failed work items, distinguishes missing image tools from egress and
+other causes, and proposes targeted changes for review. An admin may schedule
+that local skill at a chosen cadence.
+
+Both skills follow the binding's actual GitHub, GitLab, Jira Cloud or Bitbucket
+Cloud/DC provider identities. The selected repository image carries its own
+tool manifest; its digest-pinned binding is operator configuration. Neither
+skill grants new sandbox egress or credentials.
+The [repository environment guide](../../docs/guides/factory-environments.md)
+walks through setup, review, deployment validation, and recurring maintenance.
+
+Deployment readiness stays `unvalidated`, including after developer review,
+publication and selection. After presenting the complete specification, the skill
+asks whether to publish only, publish and start the factory, or retain local drafts.
+It uses existing authenticated tracker tools, verifies the published body, then
+adds the confirmed factory label only to explicitly selected eligible issues.
+The evidence report remains local. Connected deployment validation and validated
+handoff remain #4488 and #4490; the skill does not implement the requested feature.
+Python packaging checks and managed behavior replays are contributor verification;
+they are not client installation requirements.
+
 ## Review loops
 
-The plan review runs once and is advisory. The diff loop (`implement` and
+The plan review runs once and is advisory. Either verdict opens the failing test.
+Carry every finding into implementation, resolve each blocking finding before
+the diff review, and include each finding and its resolution in that review prompt.
+
+The diff loop (`implement` and
 `review_diff`) runs at most 5 completed rounds, and `wait_ci` back to
 `implement` at most 3. A round counts only when the reviewer returns a
 verdict. When the diff reviewer still asks for changes on round 5, a reviewer

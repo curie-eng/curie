@@ -549,6 +549,32 @@ def test_an_encoded_body_reaches_the_server_byte_for_byte() -> None:
 
 
 # @spec ADR-0168 d7
+def test_an_admitted_post_over_the_body_limit_never_reaches_the_server(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The starting point ADR 0240 (Draft) would change for declared routes: an
+    # admitted caller's POST is buffered, and one past 1 MiB stops here.
+    oversized = b"x" * (server._MAX_BODY_BYTES + 1)
+
+    async def go() -> None:
+        async with _serving() as (upstream, proxy):
+            async with aiohttp.ClientSession() as client:
+                async with client.post(
+                    proxy.make_url("/v1/review"),
+                    data=oversized,
+                    headers={caller.HEADER: _TOKEN, "Content-Type": "application/octet-stream"},
+                ) as answer:
+                    assert answer.status == server.REFUSAL_STATUS
+                    assert await answer.text() == "the request body is too large\n"
+            assert upstream.seen == []
+
+    with caplog.at_level(logging.INFO, logger="curie_connector_proxy"):
+        _run(go)
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "caller=acme-dev outcome=too_large method=POST path='/v1/review'" in text
+
+
+# @spec ADR-0168 d7
 def test_a_path_cannot_forge_a_second_log_line(caplog: pytest.LogCaptureFixture) -> None:
     forged = "caller=a outcome=admitted method=GET path=/mcp"
 

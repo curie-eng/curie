@@ -161,6 +161,7 @@ class WorkItemReconciler:
             ("reconcile_missed_labels", self._reconcile_missed_labels),
             ("poll_trackers", self._poll_trackers),
             ("redispatch_lapsed_acquisitions", self._redispatch_lapsed_acquisitions),
+            ("reconcile_base_transitions", self._reconcile_base_transitions),
             ("publish_execute_wakes", self._publish_execute_wakes),
         ):
             attributes = {"service.name": "curie-api", "step": name}
@@ -204,6 +205,19 @@ class WorkItemReconciler:
             except Exception:
                 logger.exception("work item status comment pass failed")
             await asyncio.sleep(self._settings.work_item_reconciler_interval_seconds)
+
+    async def _reconcile_base_transitions(self) -> None:
+        from .factory_base_reconcile import reconcile_base_transitions
+
+        if not self._settings.factory_enabled:
+            return
+        async with httpx.AsyncClient(
+            timeout=self._settings.github_app_timeout_seconds,
+            verify=code_host_verify(self._settings),
+        ) as client:
+            await reconcile_base_transitions(
+                self._sessionmaker, settings=self._settings, client=client
+            )
 
     async def _expire_waiting(self) -> None:
         async with self._sessionmaker() as session:

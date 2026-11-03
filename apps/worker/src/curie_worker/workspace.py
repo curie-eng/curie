@@ -40,6 +40,7 @@ from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 
 from aci_protocol import BootEnv
+from curie_internal.workspace_objects import WorkspaceObjectPort, WorkspaceObjectSigner
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +173,16 @@ class WorkspacePreparationError(RuntimeError):
     def __init__(self, stage: str, detail: str) -> None:
         self.stage = stage
         super().__init__(f"workspace {stage} failed: {detail}")
+
+
+class GitCommandError(WorkspacePreparationError):
+    """A git subprocess exited non-zero. Holds a redacted diagnostic, never raw stderr."""
+
+    def __init__(self, step: str, exit_status: int, diagnostic: str) -> None:
+        self.step = step
+        self.exit_status = exit_status
+        self.diagnostic = diagnostic
+        super().__init__("command", f"git {step} exited {exit_status}: {diagnostic}")
 
 
 class WorkspaceStageTimeout(WorkspacePreparationError):
@@ -717,6 +728,57 @@ def scrubbed_git_environment(
     return process_env
 
 
+_GIT_DIAGNOSTIC_LINE = re.compile(r"^(?:fatal|error|remote):")
+_GIT_DIAGNOSTIC_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_GIT_URL_USERINFO = re.compile(r"(?i)(https?://)[^\s/@]+@")
+# The value runs to the next URL or the end of the line, so a scheme other
+# than Basic or Bearer cannot leave a second secret word behind.
+_GIT_AUTHORIZATION_VALUE = re.compile(
+    r"(?i)(authorization:\s*)(?:(?!https?://)(?!;)(?!(?:fatal|error|remote):)\S+\s*)+"
+)
+_GIT_BASIC_OR_BEARER = re.compile(r"(?i)\b(?:Basic|Bearer)\s+\S+")
+_GIT_HUB_TOKEN = re.compile(r"\b(?:ghs_|ghp_|gho_|ghu_|ghr_|github_pat_)[A-Za-z0-9_]+")
+_GIT_DIAGNOSTIC_LIMIT = 240
+
+
+def redact_git_diagnostic(stderr: str) -> str:
+    """Keep the last two fatal, error, or remote lines, with secrets removed."""
+
+    matched = [
+        line.lstrip() for line in stderr.splitlines() if _GIT_DIAGNOSTIC_LINE.match(line.lstrip())
+    ]
+    text = "; ".join(matched[-2:])
+    text = _GIT_DIAGNOSTIC_CONTROL.sub("", text)
+    text = _GIT_URL_USERINFO.sub(r"\1", text)
+    # Scheme-plus-value first, so a later header pass cannot leave the value behind.
+    text = _GIT_BASIC_OR_BEARER.sub("<redacted>", text)
+    text = _GIT_AUTHORIZATION_VALUE.sub(r"\1<redacted>", text)
+    text = _GIT_HUB_TOKEN.sub("<redacted>", text)
+    return _cap_git_diagnostic(text)
+
+
+def _cap_git_diagnostic(text: str) -> str:
+    """Cap at 240 characters without keeping a word sliced at the boundary."""
+
+    if len(text) <= _GIT_DIAGNOSTIC_LIMIT:
+        return text
+    clipped = text[:_GIT_DIAGNOSTIC_LIMIT]
+    if text[_GIT_DIAGNOSTIC_LIMIT].isspace() or clipped[-1].isspace():
+        return clipped.rstrip()
+    if not any(character.isspace() for character in clipped):
+        return ""
+    return clipped.rsplit(None, 1)[0]
+
+
+def _redact_redeemed_credential(diagnostic: str, credential: WorkspaceCredential) -> str:
+    header = credential.authorization_header
+    token = header.split(" ", 1)[1] if " " in header else ""
+    redacted = diagnostic.replace(header, "<redacted>")
+    if token:
+        redacted = redacted.replace(token, "<redacted>")
+    return _cap_git_diagnostic(redacted)
+
+
 class SubprocessCommands:
     """Subprocess adapter that never invokes a shell or echoes credentials."""
 
@@ -749,39 +811,19 @@ class SubprocessCommands:
         except subprocess.TimeoutExpired as exc:
             raise TimeoutError("command exceeded its deadline") from exc
         if completed.returncode != 0:
-            # stderr is intentionally omitted: git may include an authenticated
-            # challenge in diagnostics, and no command detail is needed to act.
-            raise WorkspacePreparationError(
-                "command", f"git exited with status {completed.returncode}"
+            # Raw stderr is never stored or logged. The diagnostic keeps only
+            # fatal, error, and remote lines, with credentials removed.
+            step = argv[1] if len(argv) > 1 else "command"
+            raise GitCommandError(
+                str(step),
+                completed.returncode,
+                redact_git_diagnostic(completed.stderr or ""),
             )
         return CommandResult(stdout=completed.stdout)
 
 
-class WorkspaceObjectPort(Protocol):
-    def put_stream(self, key: str, chunks: Iterable[bytes]) -> None: ...
-
-    def get_stream(self, key: str) -> Iterator[bytes]: ...
-
-    def presign_get(self, key: str, *, expires_seconds: int) -> str: ...
-
-    def delete(self, key: str) -> None: ...
-
-    def list_keys(self, prefix: str) -> Iterator[str]: ...
-
-
-class WorkspaceObjectStore:
+class WorkspaceObjectStore(WorkspaceObjectSigner):
     """Private S3/RustFS storage with streaming exact-object operations."""
-
-    def __init__(self, *, client: Any, bucket: str, prefix: str = "private/workspaces") -> None:
-        self._client = client
-        self._bucket = bucket
-        self._prefix = prefix.strip("/")
-
-    def _key(self, key: str) -> str:
-        clean = key.lstrip("/")
-        if clean.startswith("../") or "/../" in clean:
-            raise ValueError("workspace object key escapes its private prefix")
-        return f"{self._prefix}/{clean}"
 
     def put_stream(self, key: str, chunks: Iterable[bytes]) -> None:
         # boto3 upload_fileobj streams and multipart-uploads as needed. Adapt the
@@ -801,15 +843,6 @@ class WorkspaceObjectStore:
             close = getattr(body, "close", None)
             if close is not None:
                 close()
-
-    def presign_get(self, key: str, *, expires_seconds: int) -> str:
-        return str(
-            self._client.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": self._bucket, "Key": self._key(key)},
-                ExpiresIn=expires_seconds,
-            )
-        )
 
     def delete(self, key: str) -> None:
         self._client.delete_object(Bucket=self._bucket, Key=self._key(key))
@@ -1315,14 +1348,32 @@ class WorkspacePreparer:
                                 self._real_remaining(real_started),
                             ),
                         )
-                except TimeoutError as exc:
-                    raise WorkspaceStageTimeout("clone", self.limits.clone_timeout_seconds) from exc
                 except WorkspaceStageTimeout:
                     raise
+                except TimeoutError as exc:
+                    raise WorkspaceStageTimeout("clone", self.limits.clone_timeout_seconds) from exc
                 except WorkspacePreparationError as exc:
-                    raise WorkspacePreparationError(
-                        "clone", "git refused the server-derived repository checkout"
-                    ) from exc
+                    step = getattr(exc, "step", None)
+                    status = getattr(exc, "exit_status", None)
+                    diagnostic = _redact_redeemed_credential(
+                        getattr(exc, "diagnostic", ""), credential
+                    )
+                    if isinstance(exc, GitCommandError):
+                        # The chained cause is logged with the outer error.
+                        # It must not keep a credential the outer text dropped.
+                        exc.diagnostic = diagnostic
+                        exc.args = (
+                            "workspace command failed: "
+                            f"git {exc.step} exited {exc.exit_status}: {diagnostic}",
+                        )
+                    if step in {"clone", "fetch", "checkout"} and isinstance(status, int):
+                        detail = (
+                            "git refused the server-derived repository checkout "
+                            f"(git {step} exited {status}: {diagnostic})"
+                        )
+                    else:
+                        detail = "git refused the server-derived repository checkout"
+                    raise WorkspacePreparationError("clone", detail) from exc
                 os.chmod(checkout, 0o700)
                 self._check_total(started)
 
@@ -1705,6 +1756,7 @@ class WorkspaceClaimCoordinator:
         repo_full_name: str | None = None,
         replace_handle: Any | None = None,
         revalidate_before_handoff: Callable[[], None] | None = None,
+        revalidate_before_claim: Callable[[], None] | None = None,
         validate_candidate: Callable[[Any], None] | None = None,
         lineage_branch: str | None = None,
         lineage_head: str | None = None,
@@ -1782,6 +1834,9 @@ class WorkspaceClaimCoordinator:
                     if validate_candidate is not None
                     else {}
                 )
+                # @spec HTTP-INVOCATION-EXECUTION-18: sample after all preparation/fences.
+                if revalidate_before_claim is not None:
+                    revalidate_before_claim()
                 handle = self.substrate.handoff(
                     thread_key,
                     expected=replace_handle,
@@ -1796,6 +1851,8 @@ class WorkspaceClaimCoordinator:
                 )
             else:
                 try:
+                    if revalidate_before_claim is not None:
+                        revalidate_before_claim()
                     handle = self.substrate.claim(
                         thread_key,
                         env=claim_env,
@@ -1812,6 +1869,8 @@ class WorkspaceClaimCoordinator:
                     # port independent of the concrete Docker/Kubernetes package.
                     if not isinstance(exc, self._suspended_errors):
                         raise
+                    if revalidate_before_claim is not None:
+                        revalidate_before_claim()
                     handle = self.substrate.resume(
                         thread_key,
                         env=claim_env,

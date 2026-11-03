@@ -22,7 +22,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import math
+import os
 from dataclasses import dataclass, field
+from threading import get_ident
 from typing import Any, Self
 
 from redis import asyncio as aioredis
@@ -178,6 +181,72 @@ class _TerminalConnection(_AsyncConnection):
             raise ConnectionError(_ERROR)
 
 
+_TRANSPORT_FORK_GENERATION = 0
+
+
+def _parent_transport_forked() -> None:
+    global _TRANSPORT_FORK_GENERATION
+    _TRANSPORT_FORK_GENERATION += 1
+
+
+os.register_at_fork(after_in_parent=_parent_transport_forked)
+
+
+class _DeadlineLifetime(_Lifetime):
+    """Every failure hard-closes before any inherited cleanup detaches its writer."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.writers: set[asyncio.StreamWriter] = set()
+        self.sockets: dict[asyncio.StreamWriter, Any] = {}
+        self._owner_pid = os.getpid()
+        self._fork_generation = _TRANSPORT_FORK_GENERATION
+
+    def require_unforked(self) -> None:
+        # Opt-in registered observations/join witnesses use this check. Default
+        # sessions retain their existing behavior. A joined child cannot undo
+        # the fact that original socket ownership became ambiguous on fork.
+        if self._owner_pid != os.getpid() or self._fork_generation != _TRANSPORT_FORK_GENERATION:
+            raise CommissioningJournalRefused()
+
+    def fail(self) -> None:
+        for connection in self.async_connections:
+            writer = connection._writer
+            if writer is not None and writer not in self.writers:
+                self.writers.add(writer)
+                # SSLProtocolTransport detaches its protocol at connection_lost;
+                # retain the original socket before requesting close.
+                try:
+                    self.sockets[writer] = writer.get_extra_info("socket")
+                except AttributeError:
+                    self.sockets[writer] = None
+        super().fail()
+        for connection in self.async_connections:
+            if connection._writer is not None:
+                abort = connection._writer.transport.abort
+                if get_ident() == self.loop_thread:
+                    abort()
+                elif not self.loop.is_closed():
+                    self.loop.call_soon_threadsafe(abort)
+
+    async def join_closed(self) -> None:
+        """Join retained TLS writers after failure, @spec COMMISSIONING-SERIES-8."""
+        self.fail()
+        results = await asyncio.gather(
+            *(writer.wait_closed() for writer in self.writers), return_exceptions=True
+        )
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(
+                result, (OSError, ConnectionError)
+            ):
+                raise CommissioningJournalRefused()
+        for writer in self.writers:
+            socket = self.sockets[writer]
+            if not writer.is_closing() or socket is None or socket.fileno() != -1:
+                raise CommissioningJournalRefused()
+        self.require_unforked()
+
+
 class CommissioningSession:
     """One authenticated, non-reconnecting session as one named principal.
 
@@ -220,14 +289,24 @@ class CommissioningSession:
         *,
         principal: dict[str, Any],
         terminal: bool = False,
+        deadline: float | None = None,
     ) -> Self:
         """Pin TLS and epoch, then prove ``ACL WHOAMI`` names the principal.
 
         @spec PROTECTED-COMMISSIONING-1/3.
         """
-        lifetime = _Lifetime()
+        lifetime = _Lifetime() if deadline is None else _DeadlineLifetime()
         pool: _AsyncPool | None = None
+        expiry: asyncio.TimerHandle | None = None
         try:
+            if deadline is not None:
+                if (
+                    type(deadline) is not float
+                    or not math.isfinite(deadline)
+                    or terminal is not True
+                ):
+                    raise CommissioningJournalRefused()
+                expiry = asyncio.get_running_loop().call_at(deadline, lifetime.fail)
             if (
                 type(manifest) is not Manifest
                 or type(credential) is not WorkerCredential
@@ -269,12 +348,24 @@ class CommissioningSession:
         except BaseException as error:  # noqa: BLE001  Close the socket before suppressing transport details.
             lifetime.fail()
             if pool is not None:
-                await pool.disconnect()
+                if deadline is None:
+                    await pool.disconnect()
+                else:
+                    lifetime.fail()
+                    await asyncio.gather(
+                        *(
+                            connection.disconnect(nowait=True)
+                            for connection in lifetime.async_connections
+                        )
+                    )
             if not isinstance(error, Exception):
                 raise
             if isinstance(error, CommissioningJournalRefused):
                 raise CommissioningJournalRefused(error.reason) from None
             raise CommissioningJournalRefused() from None
+        finally:
+            if expiry is not None:
+                expiry.cancel()
 
     @property
     def principal(self) -> dict[str, Any]:
@@ -325,10 +416,41 @@ class CommissioningSession:
             type(manifest) is Manifest and manifest.as_dict()["broker_identity"] == self.__identity
         )
 
-    async def close(self) -> None:
+    def abort(self) -> None:
+        """Immediately poison sockets before cancelled parser draining can delay closure."""
+        self.__lifetime.fail()
+
+    async def close(self, *, nowait: bool = False) -> None:
         """End the session without a reconnect path, @spec PROTECTED-COMMISSIONING-3."""
         self.__lifetime.fail()
-        await self.__pool.disconnect()
+        if nowait:
+            self.abort()
+            await asyncio.gather(
+                *(
+                    connection.disconnect(nowait=True)
+                    for connection in self.__lifetime.async_connections
+                )
+            )
+        else:
+            await self.__pool.disconnect()
+
+    async def close_joined(self) -> None:
+        """Actual writer closure for the finite host witness, @spec COMMISSIONING-SERIES-8.
+
+        The owning adapter must first join its command tasks. This method alone
+        supplies no registry completeness, SDK join or independent broker absence.
+        """
+        if type(self.__lifetime) is not _DeadlineLifetime:
+            raise CommissioningJournalRefused()
+        self.__lifetime.fail()
+        await self.close(nowait=True)
+        await self.__lifetime.join_closed()
+
+    def check_process_custody(self) -> None:
+        """Registered process/fork fence, no broker verdict, @spec COMMISSIONING-SERIES-8."""
+        if type(self.__lifetime) is not _DeadlineLifetime:
+            raise CommissioningJournalRefused()
+        self.__lifetime.require_unforked()
 
 
 def _binding(

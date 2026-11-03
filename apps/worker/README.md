@@ -1244,6 +1244,62 @@ That tail consumes unused claim reserve and never authorizes requester retry.
   (`tests/sandbox/test_e2e_k8scratch.py`, `CURIE_SANDBOX_E2E=1`) drives the
   real cluster.
 
+### Workspace recovery metadata (ADR 0251)
+
+`curie_worker.workspace_recovery.WorkspaceRecoveryClient` calls the worker-only
+`/v1/internal/workspace-recovery` API using the required internal worker
+credential (`CURIE_INTERNAL_WORKER_TOKEN`, sent as `X-Curie-Worker-Token`).
+Recovery is off by default; enabling `CURIE_WORKSPACE_RECOVERY_ENABLED` on the
+API requires a positive installation cap in `CURIE_WORKSPACE_RECOVERY_MAX_BYTES`.
+The API and worker must share the `CURIE_WORKSPACE_MAX_ARCHIVE_BYTES` base ceiling.
+`reserve`, `complete` and `fail` manage bounded checkpoint metadata; reservations
+have a completion deadline of at most 60 seconds (the capture's remaining budget)
+and a 600-second staging lifetime.
+`acquire-reader` and `release-reader` manage at most eight readers per WorkItem,
+each bounded to 300 seconds. Two-phase metadata collection uses `claim-collection`
+to fence eligible objects against readers, then `finalize-collection` after deletion.
+
+`curie_worker.workspace_recovery_storage` moves recovery objects. They live in the
+private workspace bucket under `private/workspace-recovery/`, a subtree disjoint
+from claim objects, so releasing a claim never deletes them. The checkpoint writer
+reserves capacity before any upload, uploads each object by explicit multipart
+upload within a 60-second aggregate budget, verifies the stored size and SHA-256
+by HEAD and a full read-back, and only then completes the checkpoint. A failed or
+late capture gets five seconds of foreground cleanup: a ledger `fail`, then, only
+once the tombstone is confirmed, multipart abort and deletion of the keys it
+declared. Anything left stays staging until the collector removes it. The reader holds a non-renewable reader lease and signs a
+GET for exactly one object, expiring at the lesser of
+`CURIE_WORKSPACE_REFERENCE_TTL_SECONDS` and the lease's remaining time, then
+streams and verifies the download. When `CURIE_WORKSPACE_RECOVERY_ENABLED` is set
+on the worker and the internal worker token is present, the worker supervises the
+`workspace-recovery-gc` collector every
+`CURIE_WORKSPACE_RECOVERY_COLLECT_INTERVAL_S` seconds (default 30): it claims
+eligible objects, deletes them outside any lock, and finalizes each claim, so a
+collector interrupted between deletion and finalization repeats both after
+restart. Logs carry ids, kinds, sizes and typed codes only.
+
+Capture is wired on ordinary failure (#5143). A run whose failed finish is known
+to have committed is marked recovery eligible; cancellation, execution deadline,
+termination, owner loss and a `work_item_cancelled` finish refusal never are, and
+keep the plain release. Before releasing an eligible run's claim, the kernel holds
+a renewable lease on the thread lock and, only while the thread's route still
+names the run's claim, `curie_worker.workspace_recovery_capture.WorkspaceRecoveryCapture`
+reads the WorkItem's repository and base through the ledger's `context`
+operation, asks the runner's `POST /v1/checkpoint` for a patch and manifest against
+the claim's trusted base, and writes the checkpoint. One 60-second aggregate
+deadline covers all of it, and `reserve` carries the budget still left, so the
+ledger's completion deadline never outlives it. A capture that ends before any
+reservation (torn capture, oversized patch or manifest, runner unavailable,
+timeout, base mismatch) records its reason through the `outcome` operation within
+the five-second cleanup allowance. The lease is checked before every completion
+attempt and once after it commits; a lease lost first tombstones the staging, and
+a lease lost after commit retracts the just-completed checkpoint back to the
+previous one, leaving its objects to the collector. When the lease is lost before
+the release, the lock is reacquired and the plain release runs with the recorded
+claim. A capture failure never changes the WorkItem's terminal outcome. Enabling
+recovery on the worker requires `CURIE_INTERNAL_WORKER_TOKEN` and
+`CURIE_WORKSPACE_ENABLED`. Restoration is not wired yet.
+
 ### Retained thread attachments
 
 An attachment on an idle retained thread needs new claim environment, so the
@@ -1342,3 +1398,38 @@ Receipt and CLI progress metadata use the same reference-boundary vector as
 approval displays. Closing code quotes end a sentence reference just as closing
 parentheses, brackets and ordinary quotes do; requested filenames and paths stay
 literal. This wording changes neither answers nor stored actions.
+
+### On-demand attachment rollout
+
+The attachment lane remains off by default. With `CURIE_ATTACHMENT_ENABLED=true`,
+`CURIE_ATTACHMENT_MODE=eager` preserves the existing complete-set handoff and its
+positive byte budgets. Explicit `CURIE_ATTACHMENT_MODE=lazy` registers inbound
+metadata before routing, including references above the legacy byte budgets, and
+starts without downloading provider file bodies. Text-only follow-ups register
+no files and do not rebuild attachment history. The real runner exposes
+`list_attachments` and `fetch_attachment` through its existing platform tool
+server; only a selected file is streamed into its private writable cache.
+
+Lazy activation requires matching API, worker, broker and runner support. The
+worker refuses a runner that does not advertise literal `attachment_access:
+true`; the API refuses a missing or incompatible private broker. There is no
+eager fallback. Fake-model runs cannot enable this mode. Every logical opener
+owns a scoped finite lease for the actual sandbox session and route generation.
+A steer renews that opener; completion, cancellation and failed start revoke
+only the ending owner's authority. A crash or unavailable revoke is bounded by
+the independently renewed 90-second lease.
+
+The broker listens on a private worker port (`CURIE_ATTACHMENT_BROKER_PORT`,
+default `8093`) and accepts only internal worker authentication. Channel
+credentials stay in the worker. The API alone exposes the runner-facing facade;
+capabilities are carried on authenticated ACI events, never in boot environment
+variables. Broker concurrency defaults to eight transfers and each transfer has
+a 300-second deadline. Cache storage remains finite; an incomplete transfer or
+capacity failure returns no usable final path. Removing policy byte ceilings
+does not expand the sandbox's storage or memory resources.
+
+The Docker substrate uses a claim-owned named tmpfs volume, bounded by
+`CURIE_ATTACHMENT_CACHE_SIZE_BYTES` (default 512 MiB). These cached bytes consume
+effective memory resources in addition to the model process; a file under the
+volume capacity is not guaranteed to fit the runner's remaining memory. This is
+a resource capacity limit, not a catalog selection or per-file policy ceiling.

@@ -23,6 +23,7 @@ import httpx
 from aci_protocol import BootEnv, parse_ndjson_line
 from aiohttp import web
 
+from .commissioning_registry import CommissioningLaunchSnapshot
 from .protected_kubernetes_projection import Projection, render_pod
 from .protected_launch_kubernetes import (
     FINALIZER,
@@ -38,12 +39,11 @@ from .protected_launch_kubernetes import (
     sha256_text,
     termination_observation,
 )
-from .protected_launch_records import IssuerPodBinding, LaunchReceipt, canonical_json
+from .protected_launch_records import IssuerPodBinding, canonical_json
 from .protected_launch_registry import (
     CleanupReceipt,
     LaunchSnapshot,
     OperationKind,
-    ProtectedLaunchRegistry,
 )
 
 EPOCH_HEADER = "X-Curie-Turn-Epoch"
@@ -52,14 +52,23 @@ CONTROL_DEADLINE = web.RequestKey("protected_launch_control_deadline", asyncio.T
 # The closed authorizer set. A new authorizer is a reviewed change to this set
 # and to ``_authorizer_classes``. Names only filter class definitions; the
 # mechanics admit an authorizer by its exact class object.
-_AUTHORIZERS = frozenset({"curie_worker.protected_launch_server.ProductionLaunchAuthorizer"})
+_AUTHORIZERS = frozenset(
+    {
+        "curie_worker.protected_launch_server.ProductionLaunchAuthorizer",
+        "curie_worker.commissioning_launch.CommissioningLaunchAuthorizer",
+    }
+)
+
+# One owned launch row under either authorizer's bookkeeping.
+LaunchRow = LaunchSnapshot | CommissioningLaunchSnapshot
 
 
 def _authorizer_classes() -> tuple[type[LaunchAuthorizer], ...]:
     # Imported here because the authorizer modules import these mechanics.
+    from .commissioning_launch import CommissioningLaunchAuthorizer
     from .protected_launch_server import ProductionLaunchAuthorizer
 
-    return (ProductionLaunchAuthorizer,)
+    return (ProductionLaunchAuthorizer, CommissioningLaunchAuthorizer)
 
 
 class LaunchRefusal(Exception):
@@ -80,7 +89,9 @@ class LiveLaunch:
     source: dict[str, str] = field(repr=False)
     expires_at_ms: int
     deadline: float
-    receipt: LaunchReceipt | None = None
+    # Authorizer-owned receipt and the runner start it was issued for.
+    receipt: Any = None
+    started_at: str | None = None
     binding: IssuerPodBinding | None = None
     job: asyncio.Task[None] | None = None
     watchdog: asyncio.Task[None] | None = None
@@ -99,6 +110,10 @@ class LaunchAuthorizer:
         ):
             raise TypeError("Protected launch authorizers are closed")
 
+    def open_registry(self, root: str, *, boot_id: str) -> Any:
+        """Open this authorizer's own launch bookkeeping for the mechanics."""
+        raise NotImplementedError
+
     async def reverify(self, live: LiveLaunch) -> tuple[Any, Projection, dict[str, Any]]:
         """Re-verify authority; return evidence plus the re-measured projection."""
         raise NotImplementedError
@@ -112,7 +127,7 @@ class LaunchAuthorizer:
     def validate_start(self, parsed: Any, live: LiveLaunch) -> None:
         raise NotImplementedError
 
-    def receipt(self, row: LaunchSnapshot, live: LiveLaunch, started_at: str) -> LaunchReceipt:
+    def receipt(self, row: Any, live: LiveLaunch, started_at: str) -> Any:
         raise NotImplementedError
 
 
@@ -135,7 +150,9 @@ class ProtectedLaunchMechanics:
         self._authorizer, self._kube = authorizer, kubernetes
         self._runner_scheme, self._runner_dns_suffix = runner_scheme, runner_dns_suffix
         self._boot_id = str(uuid4())
-        self._registry = ProtectedLaunchRegistry.open(registry_root, boot_id=self._boot_id)
+        # ProtectedLaunchRegistry under production, CommissioningLaunchRegistry
+        # under commissioning; the two never share files or rows.
+        self._registry: Any = authorizer.open_registry(registry_root, boot_id=self._boot_id)
         self._live: dict[str, LiveLaunch] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._create_lock = asyncio.Lock()
@@ -157,7 +174,7 @@ class ProtectedLaunchMechanics:
         return self._boot_id
 
     @property
-    def registry(self) -> ProtectedLaunchRegistry:
+    def registry(self) -> Any:
         return self._registry
 
     @property
@@ -175,8 +192,9 @@ class ProtectedLaunchMechanics:
     def mutex(self, launch_id: str) -> asyncio.Lock:
         return self._locks.setdefault(launch_id, asyncio.Lock())
 
-    def _row(self, owner: str, launch_id: str) -> LaunchSnapshot:
-        return self._registry.get(owner, launch_id)
+    def _row(self, owner: str, launch_id: str) -> LaunchRow:
+        row: LaunchRow = self._registry.get(owner, launch_id)
+        return row
 
     async def prepare(self, launch_id: str) -> None:
         live = self._live[launch_id]
@@ -280,6 +298,7 @@ class ProtectedLaunchMechanics:
                             live.receipt = self._authorizer.receipt(
                                 row, live, observation.started_at
                             )
+                            live.started_at = observation.started_at
                             self._registry.transition(owner, launch_id, row.revision, "idle")
                             live.watchdog = asyncio.create_task(
                                 self._expire(launch_id), name="protected-launch-deadline"
@@ -328,7 +347,7 @@ class ProtectedLaunchMechanics:
 
     @staticmethod
     def _check_status(
-        status: dict[str, Any], live: LiveLaunch, row: LaunchSnapshot, *, idle: bool
+        status: dict[str, Any], live: LiveLaunch, row: LaunchRow, *, idle: bool
     ) -> None:
         require(
             status["ready"] is True
@@ -352,7 +371,7 @@ class ProtectedLaunchMechanics:
                 and status.get("capacity_admission_result") == "pending"
             )
 
-    async def _positive(self, row: LaunchSnapshot, *, idle: bool) -> LiveLaunch:
+    async def _positive(self, row: LaunchRow, *, idle: bool) -> LiveLaunch:
         require(row.boot_id == self._boot_id and row.state == ("idle" if idle else "waiting"))
         live = self._live[row.launch_id]
         require(
@@ -377,7 +396,7 @@ class ProtectedLaunchMechanics:
             container_id=present(o.container_id),
             node_uid=o.node_uid,
         )
-        require(observation.started_at == present(live.receipt).as_dict()["workload"]["started_at"])
+        require(observation.started_at == present(live.started_at))
         require(present(live.binding).runner_url == self._pod_origin(observation.pod_ip))
         self._check_status(
             await self.runner_status(
@@ -394,7 +413,7 @@ class ProtectedLaunchMechanics:
         self,
         request: web.Request,
         owner: str,
-        row: LaunchSnapshot,
+        row: LaunchRow,
         parsed: Any,
         request_digest: str,
     ) -> web.StreamResponse:
@@ -524,7 +543,7 @@ class ProtectedLaunchMechanics:
     async def control(
         self,
         owner: str,
-        row: LaunchSnapshot,
+        row: LaunchRow,
         operation: str,
         parsed: Any,
         request_digest: str,
@@ -611,7 +630,7 @@ class ProtectedLaunchMechanics:
                     raw.extend(chunk)
                 require(decode_observation(bytes(raw)) == {"ok": True})
 
-    async def binding_for_stop(self, row: LaunchSnapshot) -> IssuerPodBinding:
+    async def binding_for_stop(self, row: LaunchRow) -> IssuerPodBinding:
         live = self._live.get(row.launch_id)
         if live and live.binding:
             return live.binding

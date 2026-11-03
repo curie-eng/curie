@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 from ..actions import ActionRecorder
@@ -9,6 +10,7 @@ from ..approvals import (
     ApprovalReader,
     PublicationCreator,
 )
+from ..attachment_access_client import AttachmentAccessClient
 from ..attachments import (
     AttachmentCoordinator,
 )
@@ -18,6 +20,7 @@ from ..binding import (
 from ..bundle_store import BundleReader
 from ..config import WorkerConfig
 from ..hook_runs import HookRunRecorder
+from ..identity_authority import HttpTurnAuthorityClient
 from ..killswitch import KillSwitch
 from ..ledger_client import ThreadAttachmentLedgerClient
 from ..markers import Markers
@@ -40,6 +43,7 @@ from ..workitem_dispatch import (
 from ..workspace import (
     WorkspaceClaimCoordinator,
 )
+from ..workspace_recovery_capture import WorkspaceRecoveryCapture
 from . import (
     approval,
     approval_key,
@@ -54,6 +58,7 @@ from . import (
     lifecycle,
     memory,
     publication,
+    route_tokens,
     routing,
     sweep_slices,
     work_items,
@@ -76,9 +81,11 @@ class Kernel:
         markers: Markers,
         config: WorkerConfig,
         binding: BindingResolver | None = None,
+        identity_authority: HttpTurnAuthorityClient | None = None,
         workspace: WorkspaceClaimCoordinator | None = None,
         attachments: AttachmentCoordinator | None = None,
         attachment_ledger: ThreadAttachmentLedgerClient | None = None,
+        attachment_access: AttachmentAccessClient | None = None,
         killswitch: KillSwitch | None = None,
         approvals: ApprovalCreator | None = None,
         publication_creator: PublicationCreator | None = None,
@@ -97,6 +104,7 @@ class Kernel:
         sibling_limit: SiblingTurnLimit | None = None,
         progress: ProgressStore | None = None,
         bundles: BundleReader | None = None,
+        recovery: WorkspaceRecoveryCapture | None = None,
     ) -> None:
         self._substrate = substrate
         self._runner = runner
@@ -116,6 +124,7 @@ class Kernel:
         # Deployment-to-runtime binding and the kill switch are optional: when
         # absent the kernel runs a generic sandbox (the F1 behavior); when present
         # it resolves channel -> agent -> bundle/budget and gates killed agents.
+        self._identity_authority = identity_authority
         self._binding = binding
         revoker = getattr(self._substrate, "set_boot_credential_revoker", None)
         poster = (
@@ -131,6 +140,9 @@ class Kernel:
         # and legacy deployments. A turn that requires a repository refuses when
         # this lane is unavailable instead of booting an empty directory.
         self._workspace = workspace
+        # The terminal recovery capture (ADR 0251, #5143). None, the default and
+        # the disabled configuration, keeps every release on the plain path.
+        self._recovery = recovery
         # The inbound-attachment lane (#2567), optional on exactly the same
         # terms as the workspace lane above: a deployment that has not wired it
         # runs every turn unchanged rather than discovering a missing attribute.
@@ -145,6 +157,7 @@ class Kernel:
         # boot for a thread rebuilds the thread's whole file set from it, and a
         # file turn appends its files once they are installed.
         self._attachment_ledger = attachment_ledger
+        self._attachment_access = attachment_access
         self._killswitch = killswitch
         # The approval-record backend (#244). When absent (unwired tests, a
         # deployment without the API), an awaiting-approval run degrades to an
@@ -181,6 +194,10 @@ class Kernel:
         # The grant each bundle declares, by bundle ref (a stored bundle is
         # write once). Cleared past 4096 entries.
         self._bundle_grants: dict[str, bool] = {}
+        # ADR 0240: the hosted connectors each (bundle, agent) declares routes
+        # on, read from the same stored bundle. Cleared past 4096 entries.
+        self._bundle_routes: dict[tuple[str, str], frozenset[str]] = {}
+        self._bundle_route_lookups: dict[tuple[str, str], asyncio.Future[frozenset[str]]] = {}
         # Keyed by request id, never thread key: a steered follow-up shares the
         # thread and must not see or remove this run.
         self._work_item_runs: dict[uuid.UUID, WorkItemRun] = {}
@@ -299,6 +316,7 @@ class Kernel:
     release_thread = delivery.release_thread
     interrupt_agent = delivery.interrupt_agent
     _close_hook_run_after_error = hooks._close_hook_run_after_error
+    _close_hook_run_after_refusal = hooks._close_hook_run_after_refusal
     _post_notice_after_error = hooks._post_notice_after_error
     _start_turn_under_hook_control = hooks._start_turn_under_hook_control
     _sweep_run = sweep_slices._sweep_run
@@ -314,6 +332,7 @@ class Kernel:
     _record_turn_deadline = memory._record_turn_deadline
     _settle_memory_turns = memory._settle_memory_turns
     _close_memory_turns = memory._close_memory_turns
+    _route_connectors = route_tokens.route_connectors
     _with_channel_read = channel_read._with_channel_read
     _steer_channel_read = channel_read._steer_channel_read
     _settle_channel_read = channel_read._settle_channel_read
@@ -347,6 +366,7 @@ class Kernel:
     _preflight_reclaimed_delivery = work_items._preflight_reclaimed_delivery
     _quiesce_capacity_epoch = work_items._quiesce_capacity_epoch
     _release_work_item_sandbox = work_items._release_work_item_sandbox
+    _release_with_recovery = work_items._release_with_recovery
     _terminate_work_item = work_items._terminate_work_item
     _stop_owned_work_item = work_items._stop_owned_work_item
     _abandon_stale_work_item = work_items._abandon_stale_work_item

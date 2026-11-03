@@ -333,6 +333,61 @@ def test_extractor_normalizes_only_named_defaults_and_detaches_mutable_input():
     assert pod == original
 
 
+def server_admitted_observation():
+    """Shape a v1.34/v1.35 API server returns for render_pod under the Priority plugin."""
+    pod = observation()
+    pod["spec"].update(priority=0, preemptionPolicy="PreemptLowerPriority")
+    del pod["spec"]["containers"][0]["args"]
+    return pod
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda pod: pod["spec"].update(priority=0),
+        lambda pod: pod["spec"].update(preemptionPolicy="PreemptLowerPriority"),
+        lambda pod: pod["spec"]["containers"][0].pop("args"),
+        lambda pod: pod.update(server_admitted_observation()),
+    ],
+)
+def test_extractor_accepts_named_api_server_defaults(mutate):
+    p = product()
+    projection = p.parse_projection(canonical(projection_value()))
+    pod = observation()
+    mutate(pod)
+    original = deepcopy(pod)
+    assert (
+        p.extract_pod_projection(pod, projection=projection, pod_uid=UID, **kwargs()) == projection
+    )
+    assert pod == original
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda pod: pod["spec"].update(priority=1),
+        lambda pod: pod["spec"].update(priority=-1),
+        lambda pod: pod["spec"].update(priority=False),
+        lambda pod: pod["spec"].update(priority=0.0),
+        lambda pod: pod["spec"].update(priority="0"),
+        lambda pod: pod["spec"].update(priority=None),
+        lambda pod: pod["spec"].update(preemptionPolicy="Never"),
+        lambda pod: pod["spec"].update(preemptionPolicy=None),
+        lambda pod: pod["spec"].update(priorityClassName="system-node-critical"),
+        lambda pod: pod["spec"].update(priorityClassName=""),
+        lambda pod: pod["spec"]["containers"][0].update(args=["--other"]),
+        lambda pod: pod["spec"]["containers"][0].update(args=None),
+    ],
+)
+def test_extractor_refuses_non_default_priority_and_args(mutate):
+    p = product()
+    projection = p.parse_projection(canonical(projection_value()))
+    pod = server_admitted_observation()
+    mutate(pod)
+    with pytest.raises(p.ProjectionInvalid):
+        p.extract_pod_projection(pod, projection=projection, pod_uid=UID, **kwargs())
+
+
 def binding_vectors():
     """Independent immutable source vectors, with no runtime observations/qualification."""
     from curie_protected_hooks.artifact_measurement import parse_artifact_measurement

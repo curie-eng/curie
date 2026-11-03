@@ -37,7 +37,7 @@ import secrets
 import time
 import uuid
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 from urllib.parse import urlsplit
 
 import redis.asyncio as redis
@@ -68,6 +68,7 @@ from fastapi.exceptions import RequestValidationError
 from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.crud import channels as crud_channels
 
@@ -77,27 +78,40 @@ from curie_api.crud import channels as crud_channels
 from curie_api.graveyardwatcher import text
 from curie_api.schemas.channels import ChannelBinding
 
-from .. import adapter_principal, channel_token, identity_audit, identity_fence, team_authorization
-from ..admission import AdmissionDecision, admit
+from .. import (
+    adapter_principal,
+    admission,
+    channel_token,
+    identity_audit,
+    identity_fence,
+    team_authorization,
+)
+from ..admission import AdmissionDecision
 from ..approval_auth import platform_key_or_adapter
 from ..auth import require_api_key, verify_platform_key
 from ..channel_token import CHANNEL_ENQUEUE_SCOPE
 from ..config import get_settings
 from ..delivery import (
+    DeliveryGuardRefusal,
     backlog_reservation,
     claim_delivery,
     duplicate_stream_id,
     enqueue_owned,
+    read_identity_delivery_receipt_with_slot,
     settle_failed_delivery,
     sha16,
     take_backlog_slot,
 )
 from ..deps import SessionDep
 from ..identity import connect
+from ..identity.http_invocation import binding_requires_http_identity, current_http_invocation
 from ..identity.slack import SlackEvidence
 from ..models import AgentChannel
 from ..wirebody import read_bounded_body
 from .identity_connect import public_api_prefix
+
+if TYPE_CHECKING:
+    from ..identity.http_invocation import CurrentHttpInvocation
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +268,10 @@ class TurnAccepted(BaseModel):
     event_id: str
     stream_id: str | None
     duplicate: bool
+    # @spec HTTP-INVOCATION-EXECUTION-27: on a duplicate, the reply slot the accepted
+    # turn's receipt retains. Serialized only when set, so a caller that submits no
+    # slot keeps reading the three-field receipt.
+    reply_ref: str | None = None
 
 
 # --- shared helpers -----------------------------------------------------------
@@ -587,24 +605,35 @@ def _mint_turn(row: AgentChannel, body: TurnIn, event_id: str) -> QueuedTurn:
     )
 
 
-def _duplicate(event_id: str, current: str, response: Response) -> TurnAccepted:
+def _duplicate(
+    event_id: str, current: str, response: Response, *, reply_ref: str = ""
+) -> TurnAccepted:
     """Answer a delivery someone else owns, from what the claim key holds.
 
     The status and the None-vs-id decision live in `delivery.duplicate_stream_id`
     so the hook ingress cannot drift from them; only this route's receipt SHAPE
-    is built here.
+    is built here. A retained reply slot is named only beside a stream id
+    (@spec HTTP-INVOCATION-EXECUTION-27).
     """
 
     stream_id = duplicate_stream_id(current, response)
+    if stream_id is not None and reply_ref:
+        return TurnAccepted(
+            event_id=event_id, stream_id=stream_id, duplicate=True, reply_ref=reply_ref
+        )
     return TurnAccepted(event_id=event_id, stream_id=stream_id, duplicate=True)
 
 
-@router.post("/turns", response_model=TurnAccepted)
+# @spec COMMON-ADMISSION-EXTRACTION-1
+# @spec COMMON-ADMISSION-EXTRACTION-3
+# @spec COMMON-ADMISSION-EXTRACTION-4
+@router.post("/turns", response_model=TurnAccepted, response_model_exclude_unset=True)
 async def ingest_turn(
     request: Request,
     response: Response,
     session: SessionDep,
     x_api_key: Annotated[str | None, Header()] = None,
+    x_curie_receiver_proof: Annotated[str | None, Header()] = None,
 ) -> TurnAccepted:
     """Enqueue one inbound delivery for the binding the body names.
 
@@ -635,6 +664,8 @@ async def ingest_turn(
         subject="channel turn body",
     )
     body = _parse_turn(raw)
+    if x_curie_receiver_proof is not None and not x_api_key:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_http_receiver")
     claims = _verify_credential(x_api_key)
     await identity_fence.lock_identity_reader(session)
     # `TurnIn` deliberately does not model `adapter` (plan D4.1, `TurnIn`'s own
@@ -659,29 +690,67 @@ async def ingest_turn(
         # worker a turn with nowhere to reply and no credential to reply with.
         raise _unroutable(body.kind, body.address)
 
+    # @spec HTTP-INVOCATION-EXECUTION-2 HTTP-INVOCATION-EXECUTION-3
+    # HTTP-INVOCATION-EXECUTION-22: the binding's registered identity, not the
+    # tenant alone, selects this lane; a supplied proof always enters it.
+    http_mode = await binding_requires_http_identity(
+        session, getattr(request.app.state, "http_identity_runtime", None), row,
+    )
+    if http_mode or x_curie_receiver_proof is not None:
+        if claims is None or not x_curie_receiver_proof:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_http_receiver")
+        # @spec HTTP-INVOCATION-EXECUTION-4/15: external lookup holds no reader.
+        await session.rollback()
+        assert x_api_key is not None
+        try:
+            async with current_http_invocation(
+                request, body=body, submitted_bytes=raw,
+                channel_credential=x_api_key, receiver_proof=x_curie_receiver_proof,
+            ) as current:
+                return await _enqueue_turn(
+                    request, response, current.session, current.row, body, claims,
+                    http_invocation=current,
+                )
+        except DeliveryGuardRefusal as exc:
+            if exc.code == "intent_conflict":
+                raise HTTPException(409, "delivery_intent_conflict") from None
+            raise HTTPException(503, "identity_authority_unavailable") from None
+
     # ADR 0175: the one admission check, after the credential proved it speaks
     # for this binding and before anything is claimed or queued. The adapter is
     # trusted to send the sender it authenticated, as it always was; `author`
     # is that sender. The platform key is not exempt: the list is about who
     # wrote the message, not who carried it.
-    decision = admit(row, [body.author])
-    if not decision.allowed:
+    def on_list_refusal(decision: AdmissionDecision) -> None:
+        """@spec COMMON-ADMISSION-EXTRACTION-3"""
         _record_refusal(row, decision, surface="channel-port")
         record_metric(
             "curie.turn.refused",
             attributes={"service.name": "curie-api", "reason": decision.reason.value},
         )
-        raise HTTPException(status.HTTP_403_FORBIDDEN, CALLER_NOT_ALLOWED_DETAIL)
 
-    human = await team_authorization.check_binding(
+    decision = await admission.evaluate_invocation(
         session,
         row,
-        role="invocation",
+        [body.author],
+        surface="channel-port",
         email=body.author if row.kind == "email" else None,
+        on_list_refusal=on_list_refusal,
     )
-    if not human.allowed:
+    if not decision.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, CALLER_NOT_ALLOWED_DETAIL)
 
+    return await _enqueue_turn(request, response, session, row, body, claims)
+
+
+# @spec HTTP-INVOCATION-EXECUTION-7 HTTP-INVOCATION-EXECUTION-15
+async def _enqueue_turn(
+    request: Request, response: Response, session: AsyncSession, row: AgentChannel,
+    body: TurnIn, claims: channel_token.ChannelClaims | None,
+    *, http_invocation: CurrentHttpInvocation | None = None,
+) -> TurnAccepted:
+    """Use the existing delivery owner inside the caller's live boundary."""
+    settings = get_settings()
     # One hash of the `delivery_id`, shared by the two names derived from it.
     digest = sha16(body.delivery_id)
     event_id = _event_id(row.id, digest)
@@ -747,6 +816,28 @@ async def ingest_turn(
                 # those requests answers from `event_id` alone and would have thrown
                 # the payload away.
                 turn = _mint_turn(row, body, event_id)
+                identity_arguments: dict[str, Any] = {}
+                # @spec HTTP-INVOCATION-EXECUTION-27/29: only a Slack delivery names a
+                # reply slot; an email reply_ref stays inside its intent.
+                reply_slot = body.reply_ref if row.kind == "slack" else ""
+                if http_invocation is not None:
+                    assert turn.reply_handle is not None
+                    # @spec HTTP-INVOCATION-EXECUTION-27: a nonempty slot is the
+                    # placeholder the worker edits; an empty one replies fresh.
+                    turn = turn.model_copy(update={
+                        "author_principal": http_invocation.principal_ref,
+                        "reply_handle": turn.reply_handle.model_copy(
+                            update={"placeholder": reply_slot or None}
+                        ),
+                    })
+                payload = turn.model_dump_json()
+                if http_invocation is not None:
+                    context, guard = http_invocation.seal_payload(
+                        payload=payload, event_id=event_id,
+                        original_invocation_id=event_id, reservation=reservation,
+                        receipt_key=f"{key}:identity", reply_ref=reply_slot,
+                    )
+                    identity_arguments = {"identity_context": context, "guard": guard}
                 carrier: dict[str, str] = {}
                 enqueue_error: Exception | None = None
                 enqueue_result: tuple[bool, str] | None = None
@@ -762,7 +853,7 @@ async def ingest_turn(
                             key=key,
                             stream=settings.runs_stream,
                             owner=owner,
-                            payload=turn.model_dump_json(),
+                            payload=payload,
                             payload_field=STREAM_PAYLOAD_FIELD,
                             lease_s=settings.channel_delivery_lease_s,
                             transport_field=(
@@ -771,6 +862,7 @@ async def ingest_turn(
                                 else None
                             ),
                             transport_value=carrier.get(TRACEPARENT_STREAM_FIELD),
+                            **identity_arguments,
                         )
                     except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                         enqueue_error = exc
@@ -820,7 +912,14 @@ async def ingest_turn(
                     return TurnAccepted(event_id=event_id, stream_id=current, duplicate=False)
                 # Branch (c): our lease was re-claimed while we were slow. The other
                 # claimant owns the delivery; we do not enqueue on top of it.
-                return _duplicate(event_id, current, response)
+                slot = ""
+                if http_invocation is not None and not current.startswith("pending:"):
+                    # @spec HTTP-INVOCATION-EXECUTION-27: name the accepted slot.
+                    _owner, slot = await read_identity_delivery_receipt_with_slot(
+                        client, key=key, receipt_key=f"{key}:identity",
+                        intent_digest=http_invocation.intent_digest,
+                    )
+                return _duplicate(event_id, current, response, reply_ref=slot)
             except BaseException:
                 await settle_failed_delivery(
                     client,
@@ -830,9 +929,19 @@ async def ingest_turn(
                     preserve_quota=preserve_quota,
                 )
                 raise
-        held = await client.get(key)
+        held: bytes | str | None
+        slot = ""
+        if http_invocation is not None:
+            # @spec HTTP-INVOCATION-EXECUTION-14: historical claims require metadata.
+            # @spec HTTP-INVOCATION-EXECUTION-27: and name the accepted turn's slot.
+            held, slot = await read_identity_delivery_receipt_with_slot(
+                client, key=key, receipt_key=f"{key}:identity",
+                intent_digest=http_invocation.intent_digest,
+            )
+        else:
+            held = await client.get(key)
         if held is not None:
-            return _duplicate(event_id, text(held), response)
+            return _duplicate(event_id, text(held), response, reply_ref=slot)
 
     response.status_code = status.HTTP_202_ACCEPTED
     return TurnAccepted(event_id=event_id, stream_id=None, duplicate=True)
@@ -841,6 +950,9 @@ async def ingest_turn(
 # --- POST /channels/admission ---------------------------------------------------
 
 
+# @spec COMMON-ADMISSION-EXTRACTION-1
+# @spec COMMON-ADMISSION-EXTRACTION-3
+# @spec COMMON-ADMISSION-EXTRACTION-4
 @router.post(
     "/admission",
     response_model=AdmissionOut,
@@ -870,25 +982,27 @@ async def check_admission(
     response.headers["Cache-Control"] = "private, no-store"
     await identity_fence.lock_identity_reader(session)
     row = await crud_channels.binding_for_route(session, data.kind, data.adapter, data.address)
-    decision = admit(row, data.callers)
-    if not decision.allowed and row is not None:
+
+    def on_list_refusal(decision: AdmissionDecision) -> None:
+        """@spec COMMON-ADMISSION-EXTRACTION-3"""
         # The dispatcher counts its own refusal (`curie.turn.refused` with
         # service curie-dispatcher); counting it here too would double every
         # Slack refusal, so this side only logs the binding and reason.
-        _record_refusal(row, decision, surface="admission", level=logging.DEBUG)
+        if row is not None:
+            _record_refusal(row, decision, surface="admission", level=logging.DEBUG)
+
+    decision = await admission.evaluate_invocation(
+        session,
+        row,
+        data.callers,
+        surface="admission",
+        slack=data.slack,
+        on_list_refusal=on_list_refusal,
+    )
     connect_url = None
     allowed, restricted = decision.allowed, decision.restricted
-    if row is not None:
-        human = await team_authorization.check_binding(
-            session,
-            row,
-            role="invocation",
-            slack=data.slack,
-        )
-        allowed = allowed and human.allowed
-        restricted = restricted or human.restricted
-        if human.restricted and data.slack is not None:
-            allowed = allowed and data.slack.user_id in data.callers
+    human = decision.team_decision
+    if row is not None and human is not None:
         if not allowed and human.restricted:
             identity_audit.record(
                 session,
@@ -902,7 +1016,7 @@ async def check_admission(
             origin = urlsplit(get_settings().oidc_redirect_uri)
             if (
                 human.unlinked
-                and decision.allowed
+                and decision.list_decision.allowed
                 and data.slack is not None
                 and data.slack.user_id in data.callers
                 and get_settings().oidc_enabled

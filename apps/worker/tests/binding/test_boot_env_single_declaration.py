@@ -93,10 +93,23 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # off switch, the per-file size cap and the reference/retention TTLs,
         # read from the WORKER's env by WorkerConfig at startup and consumed by
         # run.build and AttachmentCoordinator. Never injected into a sandbox
-        # claim -- the only attachment name that crosses into a claim is
-        # CURIE_ATTACHMENTS_REF, classified below beside CURIE_WORKSPACE_REF for
-        # the same reason.
+        # claim -- runner-bound refs and attachment-access enablement use the
+        # separately declared BootEnv contract.
         "CURIE_ATTACHMENT_ENABLED",
+        # ADR 0244: WorkerConfig selects the worker's eager/lazy routing in
+        # run.build and Kernel. BindingResolver emits only the separately
+        # declared BootEnv attachment-access flag, never this operator mode.
+        "CURIE_ATTACHMENT_MODE",
+        # run._sandbox_client passes this physical cache capacity to
+        # DockerSandboxClient's claim-owned volume; the runner never reads it.
+        "CURIE_ATTACHMENT_CACHE_SIZE_BYTES",
+        # run._run_runtime binds the worker's private broker TCPSite here.
+        "CURIE_ATTACHMENT_BROKER_HOST",
+        "CURIE_ATTACHMENT_BROKER_PORT",
+        # run.build passes the broker's own finite transfer envelope to
+        # AttachmentBroker, not to the sandbox process environment.
+        "CURIE_ATTACHMENT_BROKER_MAX_CONCURRENT",
+        "CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS",
         "CURIE_ATTACHMENT_MAX_FILE_BYTES",
         "CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS",
         "CURIE_ATTACHMENT_RETENTION_TTL_SECONDS",
@@ -181,6 +194,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_WORKSPACE_MAX_COMPRESSION_RATIO",
         "CURIE_WORKSPACE_REFERENCE_TTL_SECONDS",
         "CURIE_WORKSPACE_MAX_CONCURRENT_CLONES",
+        # The worker's recovery collector switch and pass interval (ADR 0251);
+        # the API reads the same enable switch. Neither reaches the sandbox.
+        "CURIE_WORKSPACE_RECOVERY_ENABLED",
+        "CURIE_WORKSPACE_RECOVERY_COLLECT_INTERVAL_S",
         # WorkspaceClaimCoordinator injects these exact-object handoff values
         # into a claim for the workspace-init container
         # to consume. They are substrate-local delivery inputs, not fields read
@@ -419,8 +436,14 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # header only when it is set. It is not a BootEnv field: the caller
         # token contract stays unchanged.
         "CURIE_CONNECTOR_TOOL_GRANT",
+        # ADR 0240 decision 2: the route tokens, written beside BootEnv the
+        # same way, and the descriptor the runner hands a declared caller.
+        # Neither is a BootEnv field, so the ACI contract stays unchanged.
+        "CURIE_CONNECTOR_ROUTE_TOKENS",
+        "CURIE_CONNECTOR_ROUTES_FD",
         # The connector proxy process, not the sandbox. The API render writes
         # these onto the proxy container.
+        "CURIE_CALLER_PROXY_ROUTES",
         "CURIE_CALLER_PROXY_GATED_TOOLS",
         "CURIE_CALLER_PROXY_CONNECTOR",
         "CURIE_CALLER_PROXY_GRANT_STORE",

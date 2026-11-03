@@ -343,6 +343,7 @@ class IngressState:
     def __init__(self) -> None:
         self.url = ""
         self.requests: list[tuple[Any, dict[str, Any]]] = []  # (headers, body)
+        self.raw_bodies: list[bytes] = []  # the exact bytes of each recorded turn
         self.attempts = 0  # includes the ones dropped mid-flight
         self.attempt_times: list[float] = []
         self.drop_next = 0  # simulate N transport failures before answering
@@ -528,7 +529,9 @@ class IngressHandler(_JsonHandler):
             state.drop_next -= 1
             self.close_connection = True  # a real transport failure at the client
             return
-        body = self._read_body()
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        state.raw_bodies.append(raw)
+        body = json.loads(raw.decode()) if raw else {}
         # Kept as the parsed message so header lookups stay case-insensitive,
         # exactly as HTTP (and Starlette on the platform side) treats them.
         state.requests.append((self.headers, body))

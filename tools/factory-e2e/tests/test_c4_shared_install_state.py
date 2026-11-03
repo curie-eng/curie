@@ -17,6 +17,7 @@ import pytest  # noqa: E402
 from c4_shared_install import (  # noqa: E402
     CaseIsolationError,
     InstallSnapshot,
+    case_owned_streams,
     leftover_state,
 )
 
@@ -218,6 +219,38 @@ def test_missing_stream_is_named() -> None:
     messages = leftover_state(baseline, current)
     assert len(messages) == 1
     assert "curie:runs" in messages[0]
+
+
+@pytest.mark.parametrize(
+    "backend_stream",
+    ["bull:ingestion-queue:events", "bull:otel-ingestion-queue:events"],
+)
+def test_langfuse_stream_lifecycle_does_not_change_case_inventory(backend_stream: str) -> None:
+    baseline = clean_baseline()
+    streams = case_owned_streams({*baseline.streams, backend_stream})
+    assert streams == baseline.streams
+    assert leftover_state(baseline, replace(baseline, streams=streams)) == []
+    assert leftover_state(replace(baseline, streams=streams), baseline) == []
+
+
+@pytest.mark.parametrize(
+    "case_stream",
+    ["curie:runs:c4-owner", "bull:curie:events", "bull:ingestion-queue:events:curie"],
+)
+def test_case_stream_is_still_detected_beside_langfuse_streams(case_stream: str) -> None:
+    baseline = clean_baseline()
+    streams = case_owned_streams(
+        {
+            *baseline.streams,
+            "bull:ingestion-queue:events",
+            "bull:otel-ingestion-queue:events",
+            case_stream,
+        }
+    )
+    assert streams == baseline.streams | {case_stream}
+    assert leftover_state(baseline, replace(baseline, streams=streams)) == [
+        f"streams: extra {case_stream}"
+    ]
 
 
 def test_extra_tenant_is_named() -> None:

@@ -293,6 +293,11 @@ The cluster factory command performs the same check for its allowlisted reposito
 Without `--app-id`, it prints `toolchain inference skipped: no --app-id`.
 Dry-run describes the inference without reading GitHub.
 
+For a repository-specific image based on issue and PR history, use the local
+[factory environment setup skill](factory-environments.md) before reviewing a
+`--repo-runner` build and binding change. Its companion maintenance skill
+reviews later `needs human` outcomes for image and non-image repairs.
+
 Factory commits are authored by the GitHub App's bot identity. Before any Helm
 call, App setup resolves `<slug>[bot]` through GitHub's user API and configures
 `worker.publication.gitUserName=<slug>[bot]` and
@@ -417,14 +422,24 @@ reads as a single forge configuration document:
 3. `factory.bindings` join a tracker to repositories. Each entry under
    `repos` has an `alias`, a `codeHost`, a `projectId`, a `path`, optional
    `bases` and `defaultBase`, and an optional `ci` policy (`required` with
-   `key`, `paths` and `pendingKeyPrefix`, and `metadataRerunKeys`).
+   `key`, `paths` and `pendingKeyPrefix`, and `metadataRerunKeys`). `bases`
+   accepts case-sensitive glob patterns such as `release/*`; `defaultBase`
+   remains a literal allowed branch. Every selected branch must exist remotely.
 4. `factory.codeHosts[].egress` and `factory.trackers[].egress` list the CIDRs
    and ports the entry needs. A GitHub entry with none gets the chart's built-in
    GitHub set. `factory.sandboxEgress.<agent>: true` enrolls an agent in that
    egress policy.
 5. `factory.enabled`, `factory.intake` (`poll` or `webhook`),
    `factory.cardBaseUrl` and `factory.ciWaitSeconds` replace the matching
-   `api.*` settings.
+   `api.*` settings. `factory.baseLabelSettleSeconds` controls the wait after
+   the selection label is applied before the factory reads the current base
+   labels at sandbox acquisition. It defaults to 60 seconds; zero is valid.
+
+Base changes restart unpublished work or durably rebase and retarget its PR.
+A clean replay uses an expected-head fence, and required CI runs on a distinct
+same-tree commit pushed after retargeting. Conflicts leave the branch and PR
+target unchanged until the factory label is reapplied; see the
+[base selection rules](../operations.md#admitting-a-labelled-github-issue).
 
 The old `api.githubFactory*` keys are removed. To upgrade a v0.12.5
 installation configured with `curie cluster factory`, use a CLI containing
@@ -942,6 +957,14 @@ Cloud ranges from `https://ip-ranges.atlassian.com/` on port 443, or the
 addresses your Data Center host resolves to on its port.
 
 ## Label an issue
+
+For guided issue preparation, install the
+[preparation skill](factory-preparation.md#install-prepare-and-hand-off) in your
+coding agent. It helps clarify the request, presents the full specification for
+review, and can publish and select it after explicit approval using your tracker
+connection. The guide includes the install command, supported clients and source
+build instructions while the feature awaits release. This uses the factory you
+configured above; skill installation alone does not create one.
 
 In the GitHub website, open an issue on the repository and add the label
 `curie-factory`. The person who adds the label must have write or admin access.

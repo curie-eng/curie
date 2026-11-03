@@ -32,6 +32,8 @@ _NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _PROVIDER = re.compile(r"/apis/[a-z0-9.-]+/v[0-9a-z]+/[a-z0-9]+")
 _LISTS = {
     "nodes": "/api/v1/nodes",
+    "namespaces": "/api/v1/namespaces",  # clause 5 (the least-privilege probe list)
+    "pods": "/api/v1/pods",  # cluster-wide, clause 5 (case 7 running_node_capability)
     "rolebindings": "/apis/rbac.authorization.k8s.io/v1/rolebindings",
     "clusterrolebindings": "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings",
 }
@@ -69,9 +71,17 @@ def _name(value: str) -> str:
 class MeasuringIdentityAPI:
     """Implements ``ProbeCluster`` with the clause 5 rights and nothing else."""
 
-    def __init__(self, credentials: MeasuringCredentials, *, namespaces: Sequence[str]) -> None:
+    def __init__(
+        self,
+        credentials: MeasuringCredentials,
+        *,
+        namespaces: Sequence[str],
+        policy_namespaces: Sequence[str] = (),
+    ) -> None:
         # The namespaces the probe kit may create pods in: probe, protected and release.
         self._namespaces = frozenset(_name(item) for item in namespaces)
+        # Clause 5: NetworkPolicy writes are allowed only in the probe namespaces.
+        self._policy_namespaces = frozenset(_name(item) for item in policy_namespaces)
         self._origin = credentials.origin.rstrip("/")
         self._client = httpx.AsyncClient(
             verify=credentials.context(),
@@ -178,6 +188,27 @@ class MeasuringIdentityAPI:
             return None
         allowed = status.get("allowed")
         return allowed if type(allowed) is bool else None
+
+    def _policies(self, namespace: str, name: str | None = None) -> str:
+        require(_name(namespace) in self._policy_namespaces)
+        path = "/apis/networking.k8s.io/v1/namespaces/" + namespace + "/networkpolicies"
+        return path if name is None else path + "/" + _name(name)
+
+    async def create_network_policy(
+        self, namespace: str, document: dict[str, Any]
+    ) -> dict[str, Any]:
+        created = await self._json("POST", self._policies(namespace), document)
+        require(created is not None)
+        assert created is not None
+        return created
+
+    async def delete_network_policy(self, namespace: str, name: str, uid: str) -> None:
+        require(isinstance(uid, str) and bool(uid))
+        status, _body = await self._send(
+            "DELETE", self._policies(namespace, name),
+            {"apiVersion": "v1", "kind": "DeleteOptions", "preconditions": {"uid": uid}},
+        )
+        require(200 <= status < 300 or status in (404, 409))
 
     async def list_items(self, collection: str) -> list[dict[str, Any]] | None:
         if collection.startswith("networkpolicies:"):

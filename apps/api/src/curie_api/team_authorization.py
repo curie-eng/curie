@@ -50,7 +50,8 @@ async def resolve_email(
     trust the adapter to authenticate the sender. Profile email is never used.
     """
     config = await session.get(TenantIdentityProvider, tenant_id)
-    if config is None or email != email.strip().lower() or email.count("@") != 1:
+    if (config is None or config.governed_domains is None
+            or email != email.strip().lower() or email.count("@") != 1):
         return None
     domain = email.rsplit("@", 1)[1]
     if domain not in config.governed_domains:
