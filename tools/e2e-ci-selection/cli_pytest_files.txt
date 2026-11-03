@@ -62,6 +62,7 @@ packages/plugin-format/tests/test_schema_compat.py
 packages/plugin-format/tests/test_validate.py
 packages/protected-hooks/tests/test_schema_serving.py
 packages/test-support/tests/test_pytest_collection.py
+packages/test-support/tests/test_test_time_ratchets.py
 release/tests/test_atlas.py
 release/tests/test_authorize.py
 release/tests/test_get_curie.py
@@ -117,6 +118,7 @@ tools/e2e-ci-selection/tests/test_workflow_hunk_selection.py
 tools/e2e-ci-selection/tests/test_xdist_scheduling.py
 tools/factory-e2e/tests/test_acceptance.py
 tools/factory-e2e/tests/test_acquire_lost_assert_started.py
+tools/factory-e2e/tests/test_admitted_observation.py
 tools/factory-e2e/tests/test_bitbucket_dc_fixture_tool.py
 tools/factory-e2e/tests/test_bitbucket_dc_live.py
 tools/factory-e2e/tests/test_bitbucket_drivers.py
