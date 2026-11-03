@@ -281,5 +281,6 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0259 | [A binding requires HTTP identity when its invocation or approver role needs HTTP facts](0259-a-binding-requires-http-identity-when-its-invocation-or-approver-role-needs-http-facts.md) | Draft |
 | 0261 | [HTTP identity resolves Slack Connect senders from operator-trusted partner namespaces](0261-http-identity-resolves-slack-connect-senders-from-operator-trusted-partner-namespaces.md) | Draft |
 | 0262 | [The dispatcher qualifies each HTTP receiver once behind its own failure boundary](0262-the-dispatcher-qualifies-each-http-receiver-once-behind-its-own-failure-boundary.md) | Draft |
+| 0263 | [HTTP identity accepts a one-to-one direct message to a registered receiver's bot](0263-http-identity-accepts-a-one-to-one-direct-message-to-a-registered-receivers-bot.md) | Draft |
 | 0265 | [A file-bearing Slack message's sender team may come from the sender's own files](0265-a-file-bearing-slack-messages-sender-team-may-come-from-the-senders-own-files.md) | Draft |
 <!-- END GENERATED: adr-index -->

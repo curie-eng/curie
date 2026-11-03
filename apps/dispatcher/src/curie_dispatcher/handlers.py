@@ -96,7 +96,11 @@ from .approval_actions import (
     this_release_owns_action,
 )
 from .config import DispatcherConfig, release_identity
-from .http_receiver import HttpReceiverRuntime, SelectedApprovalAnswers
+from .http_receiver import (
+    HttpReceiverRuntime,
+    SelectedApprovalAnswers,
+    is_plain_direct_message,
+)
 from .identities import delivery_key, minted_adapter
 from .identity import (
     IdentityResolver,
@@ -328,10 +332,10 @@ SELECTED_UNAVAILABLE_TEXT = (
 
 
 class _SelectedNotices:
-    """Tell a person once why a selected mention was not taken.
+    """Tell a person once why a selected mention or direct message was not taken.
 
     Bounded per listener: a Slack redelivery reuses its native event_id, so a
-    remembered id posts no second notice. @spec HTTP-INVOCATION-EXECUTION-19.
+    remembered id posts no second notice. @spec HTTP-INVOCATION-EXECUTION-19/26.
     """
 
     _LIMIT = 1024
@@ -371,8 +375,9 @@ class _SelectedNotices:
             return
         text = SELECTED_REFUSED_TEXT if status == "refused" else SELECTED_UNAVAILABLE_TEXT
         try:
-            if channel.startswith("D"):
+            if channel.startswith("D") or is_plain_direct_message(event):
                 # A direct message has no audience to hide the notice from.
+                # @spec HTTP-INVOCATION-EXECUTION-19/26.
                 self._web.chat_postMessage(channel=channel, thread_ts=thread_ts or ts, text=text)
             elif thread_ts:
                 self._web.chat_postEphemeral(
@@ -1015,7 +1020,7 @@ def register_handlers(
     log = logger or logging.getLogger(__name__)
 
     driver_approval_probe = _DriverApprovalProbe()
-    # @spec HTTP-INVOCATION-EXECUTION-19: only the selected mention lane notifies.
+    # @spec HTTP-INVOCATION-EXECUTION-19/26: only the selected mention and DM lanes notify.
     selected_notices = None if http_receiver is None else _SelectedNotices(web_client, log)
 
     def _driver_approval_owner(
@@ -1128,9 +1133,27 @@ def register_handlers(
 
     @app.event("message")
     def _on_message(body: dict[str, Any], event: dict[str, Any], context: dict[str, Any]) -> None:
-        # @spec HTTP-INVOCATION-EXECUTION-19.
+        # @spec HTTP-INVOCATION-EXECUTION-19/26.
         if http_receiver is not None:
-            drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="", lane="im")
+            if not is_plain_direct_message(event):
+                # Every other message event stays silent.
+                drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="", lane="im")
+                return
+            result = http_receiver.submit(
+                body=body, event=event, slack_identity=slack_identity,
+                bot_user_id=context.get("bot_user_id"),
+            )
+            if result.status in {"refused", "unavailable"}:
+                drop(
+                    log, DropReason.CALLER_NOT_ALLOWED if result.status == "refused"
+                    else DropReason.ADMISSION_UNAVAILABLE, lane="im",
+                    event_id=str(body.get("event_id") or ""),
+                )
+                assert selected_notices is not None
+                selected_notices.send(
+                    status=result.status, body=body, event=event,
+                    bot_user_id=context.get("bot_user_id"),
+                )
             return
         # ENVELOPE VALIDATION, not a relevance decision (#2006). The manifest at
         # `apps/dispatcher/slack-app-manifest.yaml` subscribes bot_events to

@@ -116,18 +116,23 @@ class ReceiverSlackEvidenceV1(_Wire):
     enterprise_ids: tuple[Identifier, ...] = Field(max_length=32)
     # The event's source_team, copied only when present. @spec HTTP-INVOCATION-EXECUTION-24.
     event_source_team: Identifier | None = None
+    # A direct message's conversation type, set only by the selected receiver
+    # for a `message` delivery. @spec HTTP-INVOCATION-EXECUTION-26.
+    channel_type: Identifier | None = None
 
     @model_serializer(mode="wrap")
-    def _omit_absent_source_team(
+    def _omit_absent_optionals(
         self, handler: SerializerFunctionWrapHandler, info: SerializationInfo,
     ) -> dict[str, Any]:
         """Absent stays absent, so every existing proof signs today's exact bytes.
 
-        @spec HTTP-INVOCATION-EXECUTION-24.
+        @spec HTTP-INVOCATION-EXECUTION-24/26.
         """
         data: dict[str, Any] = handler(self)
         if self.event_source_team is None:
             data.pop("event_source_team", None)
+        if self.channel_type is None:
+            data.pop("channel_type", None)
         return data
 
 

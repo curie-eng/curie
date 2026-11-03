@@ -355,7 +355,8 @@ def test_invalid_or_unsupported_delivery_refuses_before_http(damage: str) -> Non
     elif damage in {"identity", "bot"}:
         kwargs["slack_identity" if damage == "identity" else "bot_user_id"] = "synthetic-other"
     else:
-        event.update(type="message", channel_type="im")
+        # A group DM is never a direct-message source. @spec HTTP-INVOCATION-EXECUTION-26.
+        event.update(type="message", channel_type="mpim")
     result = runtime.submit(**kwargs)
     assert result.status == "refused" and result.stream_id is None
     assert rig.requests == []

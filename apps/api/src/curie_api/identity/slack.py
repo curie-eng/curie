@@ -81,18 +81,23 @@ class SlackEvidence(BaseModel):
     # The event's source_team; only an operator-registered receiver reads it
     # (ADR 0261). @spec HTTP-INVOCATION-EXECUTION-24.
     event_source_team: str | None = Field(default=None, max_length=MAX_EVIDENCE_LENGTH)
+    # A direct message's conversation type; only an operator-registered
+    # receiver sets or reads it (ADR 0263). @spec HTTP-INVOCATION-EXECUTION-26.
+    channel_type: str | None = Field(default=None, max_length=MAX_EVIDENCE_LENGTH)
 
     @model_serializer(mode="wrap")
-    def _omit_absent_source_team(
+    def _omit_absent_optionals(
         self, handler: SerializerFunctionWrapHandler, info: SerializationInfo,
     ) -> dict[str, Any]:
         """Absent stays absent, so existing evidence serialises unchanged.
 
-        @spec HTTP-INVOCATION-EXECUTION-24.
+        @spec HTTP-INVOCATION-EXECUTION-24/26.
         """
         data: dict[str, Any] = handler(self)
         if self.event_source_team is None:
             data.pop("event_source_team", None)
+        if self.channel_type is None:
+            data.pop("channel_type", None)
         return data
 
 
@@ -318,6 +323,50 @@ def _derive_grid(
     return NAMESPACE_CONFLICT
 
 
+DIRECT_MESSAGE_DELIVERY = "message"
+DIRECT_MESSAGE_CHANNEL_TYPE = "im"
+
+
+def _derive_direct_message(
+    evidence: SlackEvidence, *, namespace_kind: str, namespace_key: str,
+    installation_account: str, grid_shape_valid: bool,
+) -> tuple[str, str] | str:
+    """A one-to-one direct message to a registered receiver's bot (ADR 0263).
+
+    Its payload shape is unmeasured, so every statement relied on must be
+    present and agree; absence never permits. @spec HTTP-INVOCATION-EXECUTION-26.
+    """
+    user_id = evidence.user_id
+    if not user_id or not user_id.strip():
+        return SUBJECT_UNIDENTIFIED
+    if (
+        evidence.channel_type != DIRECT_MESSAGE_CHANNEL_TYPE
+        or evidence.is_ext_shared_channel is not False
+    ):
+        return SUBJECT_UNIDENTIFIED
+    signals = evidence.enterprise_ids
+    if namespace_kind == SLACK_WORKSPACE_KIND and namespace_key == installation_account:
+        if signals:
+            return SUBJECT_UNIDENTIFIED
+        if evidence.event_user_team is None and evidence.event_team is None:
+            return SUBJECT_UNIDENTIFIED
+        teams = (evidence.event_user_team, evidence.event_team, evidence.event_source_team)
+        if any(team is not None and team != installation_account for team in teams):
+            return NAMESPACE_CONFLICT
+        return (installation_account, user_id)
+    if (
+        namespace_kind == SLACK_ENTERPRISE_KIND and namespace_key != installation_account
+        and grid_shape_valid
+    ):
+        # ADR 0252's enterprise checks; team fields are neither namespace nor check.
+        if not signals or ENTERPRISE_INSTALL_SIGNAL in signals:
+            return SUBJECT_UNIDENTIFIED
+        if any(signal != namespace_key for signal in signals):
+            return NAMESPACE_CONFLICT
+        return (namespace_key, user_id)
+    return SUBJECT_UNIDENTIFIED
+
+
 def derive_registered_sender(
     evidence: SlackEvidence,
     *,
@@ -330,18 +379,29 @@ def derive_registered_sender(
 ) -> tuple[str, str] | str:
     """Return ``(namespace key, native id)`` for an operator-registered receiver.
 
-    @spec HTTP-INVOCATION-EXECUTION-21/24. An ordinary registration that trusts
+    @spec HTTP-INVOCATION-EXECUTION-21/24/26. An ordinary registration that trusts
     nothing is exactly :func:`derive` with positive non-Grid evidence for its
     own account, except that a Slack Connect mention from its own members is
     attributed (ADR 0261); a Grid workspace registration resolves in its
-    organisation (ADR 0252). A returned key is the registration's own key or
-    the key of one of its trusted partner namespaces.
+    organisation (ADR 0252). A plain one-to-one direct message resolves only in
+    the registration's own namespace from positive statements (ADR 0263), and
+    only a direct message may carry a conversation type. A returned key is the
+    registration's own key or the key of one of its trusted partner namespaces.
     """
 
     if namespace_authority != "":
         return SUBJECT_UNIDENTIFIED
     own = {namespace_key, installation_account}
     if any(key in own for key in (*trusted_workspaces, *trusted_organisations)):
+        return SUBJECT_UNIDENTIFIED
+    if evidence.delivery == DIRECT_MESSAGE_DELIVERY:
+        # Trusted entries are never read for a direct message (ADR 0263).
+        return _derive_direct_message(
+            evidence, namespace_kind=namespace_kind, namespace_key=namespace_key,
+            installation_account=installation_account,
+            grid_shape_valid=not trusted_organisations,
+        )
+    if evidence.channel_type is not None:
         return SUBJECT_UNIDENTIFIED
     if namespace_kind == SLACK_WORKSPACE_KIND:
         if namespace_key != installation_account:

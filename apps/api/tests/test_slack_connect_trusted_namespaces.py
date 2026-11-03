@@ -118,8 +118,10 @@ def test_ordinary_connect_mention_resolves_in_the_home_teams_namespace(
     # An absent shared flag is not a Connect channel and a partner is never attributed.
     (connect(is_ext_shared_channel=None, event_user_team=PARTNER, event_team=None),
      "namespace_conflict"),
+    # A message delivery is a direct message candidate (ADR 0263): without the
+    # exact `im` conversation type it is unidentified. @spec HTTP-INVOCATION-EXECUTION-26.
     (connect(delivery="message", event_user_team=PARTNER, event_team=None),
-     "namespace_conflict"),
+     "subject_unidentified"),
 ])
 def test_ordinary_connect_mention_refusals_name_their_reason(
     value: dict[str, Any], reason: str,
