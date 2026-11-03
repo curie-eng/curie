@@ -50,8 +50,34 @@ def read_baseline(path: Path) -> dict[str, Any]:
     return baseline_value(json.loads(path.read_text()))
 
 
-def base_reference() -> str:
+TRAINS = ("main", "next")
+
+
+def _tag_ref() -> bool:
+    return os.environ.get("GITHUB_REF_TYPE") == "tag" or os.environ.get(
+        "GITHUB_REF", ""
+    ).startswith("refs/tags/")
+
+
+def tag_train(root: Path) -> str:
+    """The train branch whose history contains the tagged commit, main first."""
+    for train in TRAINS:
+        contained = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", "HEAD", f"refs/remotes/origin/{train}"],
+            cwd=root,
+            capture_output=True,
+        )
+        if contained.returncode == 0:
+            return train
+    tag = os.environ.get("GITHUB_REF_NAME", "")
+    raise ValueError(f"tagged commit {tag} is on no train branch: {', '.join(TRAINS)}")
+
+
+def base_reference(root: Path = Path()) -> str:
     event = os.environ.get("GITHUB_EVENT_NAME", "")
+    if event not in {"merge_group", "pull_request", "pull_request_target"} and _tag_ref():
+        # A tag is not a remote branch. Compare against the train that released it.
+        return "origin/" + tag_train(root)
     if event == "merge_group":
         payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
         branch = payload["merge_group"]["base_ref"].removeprefix("refs/heads/")
@@ -73,7 +99,7 @@ def merge_base(root: Path, reference: str | None = None) -> str | None:
     head = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=root, capture_output=True)
     if head.returncode:
         return None
-    reference = reference or base_reference()
+    reference = reference or base_reference(root)
     merge = subprocess.run(
         ["git", "merge-base", "HEAD", reference], cwd=root, text=True, capture_output=True
     )
