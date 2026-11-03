@@ -273,6 +273,20 @@ The worker HttpTurnAuthorityClient gains classify_binding(request) with criterio
 
 Independent tests use real PostgreSQL and the actual ASGI routes: in one adopted tenant with one registered identity, a context-free channel-token turn on a second, unregistered identity queues one legacy turn with no provider call, while the registered identity still refuses it; an unregistered binding whose agent has a migrated or filtered invocation role refuses with no provider call or delivery state, with or without a runtime; with no runtime the same tenant's bindings stay legacy; the internal route classifies registered, unregistered, non-Slack and unadopted bindings and refuses a changed scope; and the worker resolver consults the classifier only for selected tenants and propagates its failure.
 
+## 23. Scheduled hook turns
+
+<!-- @spec HTTP-INVOCATION-EXECUTION-23 -->
+
+Realizes [ADR 0258](../../adr/0258-a-scheduled-hook-turn-carries-its-deployment-authority-on-http-identity-bindings.md), tracked in [#5304](https://github.com/curie-eng/curie/issues/5304). Criterion 18's refusal of a context-free turn on a binding with http_identity_required has one exception: a turn the platform started for a declared cron hook, which carries the deployment authority instead of an HTTP principal.
+
+At prepare, a context-free turn whose binding requires HTTP identity continues only when its source is TurnSource.CRON, it carries a HookRunRef, the reference's agent equals the classified binding's agent, and `HookRunRecorder.scheduled_authority(ref)` reports that the exact run row is open and records the version of the agent's active deployment, ranked prod before dev, then the most recent deployed_at, then id, as the scheduler and binding resolver rank it. The carry then records that scheduled authority and the classified binding, keeps context and scope unset, and is not legacy, so no courtesy caption mutates. A missing or malformed reference, an absent recorder, an agent mismatch, a closed or absent row, or a stale version is a definitive HttpIdentityRefused; a database failure is TurnAuthorityUnavailable. The author, source and event id never satisfy the check on their own.
+
+At every later current check (claim_or_resume, start, steer) a carry holding scheduled authority classifies the route again through identity_binding and requires the same tenant, agent, binding id and generation, then repeats the run-row predicate. Any difference or a closed row refuses before the next effect; classifier or database failure is unavailable. Scheduled authority sends no request to the current-authority client and mints no approval grant. The operator pause, kill switch and budget keep their existing guards.
+
+A scheduled turn has no invocation context, so identity.selected() stays false and it cannot create an HTTP-selected approval; the API refuses such a legacy creation with unsupported_approval, as criterion 18 and HTTP-APPROVAL-CONTINUITY-1 already require.
+
+Independent tests use the actual kernel harness with real PostgreSQL, real Valkey, the production HookRunRecorder and a labeled synthetic binding classifier: a valid scheduled turn on an HTTP-required binding runs once and closes ran without any current-authority request; a replaced deployment and a reference for another agent each refuse before any boot or claim and close an open run failed with identity_refused, and a closed run refuses without changing its outcome; a deployment replaced or a binding generation changed after prepare refuses at claim_or_resume before the claim; and a binding without the HTTP requirement keeps its existing behavior.
+
 ## 28. File-bearing message sender team
 
 <!-- @spec HTTP-INVOCATION-EXECUTION-28 -->
