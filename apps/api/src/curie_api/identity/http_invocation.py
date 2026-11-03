@@ -96,10 +96,13 @@ class ReceiverRegistrationV1(FactsModel):
     bot_user_id: codec.Identifier
     binding_ids: Annotated[tuple[CanonicalUUID, ...], Field(min_length=1, max_length=256)]
     human_native_ids: Annotated[tuple[codec.Identifier, ...], Field(max_length=256)]
+    # Operator-trusted Slack Connect partners (ADR 0261 decision 1). Absent or
+    # empty is the existing registration. @spec HTTP-INVOCATION-EXECUTION-24.
+    trusted_namespaces: Annotated[tuple[NamespaceV1, ...], Field(max_length=256)] = ()
 
     @model_validator(mode="after")
     def consistent_scope(self) -> Self:
-        """@spec HTTP-INVOCATION-EXECUTION-15/21."""
+        """@spec HTTP-INVOCATION-EXECUTION-15/21/24."""
         namespace = self.namespace
         ordinary = (
             namespace.kind == SLACK_WORKSPACE_KIND and namespace.key == self.installation_account
@@ -107,13 +110,51 @@ class ReceiverRegistrationV1(FactsModel):
         grid = (
             namespace.kind == SLACK_ENTERPRISE_KIND and namespace.key != self.installation_account
         )
+        entries = self.trusted_namespaces
+        allowed = {SLACK_WORKSPACE_KIND, SLACK_ENTERPRISE_KIND} if ordinary else {
+            SLACK_WORKSPACE_KIND,
+        }
+        keys = {entry.key for entry in entries}
+        ids = {entry.id for entry in entries}
         if (
             namespace.authority != "" or not (ordinary or grid)
             or len(set(self.binding_ids)) != len(self.binding_ids)
             or len(set(self.human_native_ids)) != len(self.human_native_ids)
+            or any(entry.authority != "" or entry.kind not in allowed for entry in entries)
+            or len(keys) != len(entries) or len(ids) != len(entries)
+            or namespace.key in keys or self.installation_account in keys
+            or namespace.id in ids
         ):
             raise ValueError("invalid_receiver_registration")
         return self
+
+    def namespace_for_key(self, key: str) -> NamespaceV1 | None:
+        """The registered namespace a derived sender key names, if any.
+
+        The registration's own namespace for its own key, otherwise the trusted
+        entry with that key. @spec HTTP-INVOCATION-EXECUTION-24.
+        """
+        if key == self.namespace.key:
+            return self.namespace
+        return next((entry for entry in self.trusted_namespaces if entry.key == key), None)
+
+    def recorded_namespace(self, recorded: NamespaceV1 | codec.ContextNamespaceV1) -> (
+        NamespaceV1 | None
+    ):
+        """Own namespace or the trusted entry exactly equal to a recorded one.
+
+        Every later check accepts a recorded sender namespace only through this,
+        so removing an entry refuses its members. @spec HTTP-INVOCATION-EXECUTION-24.
+        """
+        value = recorded.model_dump()
+        return next((
+            candidate for candidate in (self.namespace, *self.trusted_namespaces)
+            if candidate.model_dump() == value
+        ), None)
+
+    def trusted_keys(self, kind: str) -> frozenset[str]:
+        """@spec HTTP-INVOCATION-EXECUTION-24."""
+        return frozenset(entry.key for entry in self.trusted_namespaces if entry.kind == kind)
 
 
 class HttpInvocationRuntime:
@@ -338,38 +379,56 @@ def _receiver_source(
     registration: ReceiverRegistrationV1, proof: codec.ReceiverProofV1,
     claims: channel_token.ChannelClaims, body: Any,
 ) -> AuthenticatedSource:
-    """@spec HTTP-INVOCATION-EXECUTION-2/15/21."""
+    """@spec HTTP-INVOCATION-EXECUTION-2/15/21/24."""
+    # A Connect channel (shared flag True) is attributed by the owner below; an
+    # absent flag is never a channel of either kind.
     if (
         proof.binding_id != claims.channel_id or proof.binding_generation != claims.generation
         or proof.channel_identity_id != registration.channel_identity_id
         or proof.provider_installation_id != registration.provider_installation_id
-        or proof.slack.delivery != "app_mention" or proof.slack.is_ext_shared_channel is not False
+        or proof.slack.delivery != "app_mention"
+        or type(proof.slack.is_ext_shared_channel) is not bool
         or body.kind != "slack" or body.address != proof.native_channel_id
         or body.delivery_id != proof.delivery_id or body.conversation_id != proof.conversation_id
     ):
         _invalid_receiver()
     evidence = SlackEvidence.model_validate(proof.slack.model_dump(mode="json"))
-    sender = derive_registered_sender(
-        evidence,
-        namespace_kind=registration.namespace.kind,
-        namespace_authority=registration.namespace.authority,
-        namespace_key=registration.namespace.key,
-        installation_account=registration.installation_account,
-    )
-    if (
-        not isinstance(sender, tuple) or sender[0] != registration.namespace.key
-        or sender[1] != body.author
-    ):
+    sender, namespace = registered_sender(registration, evidence)
+    if sender != body.author:
         _invalid_receiver()
     return AuthenticatedSource(
         claims.channel_id, claims.generation,
         SenderV1(
             provider="slack", channel_identity_id=registration.channel_identity_id,
             provider_installation_id=registration.provider_installation_id,
-            namespace=registration.namespace, native_id=sender[1],
+            namespace=namespace, native_id=sender,
         ),
         address=proof.native_channel_id,
     )
+
+
+def registered_sender(
+    registration: ReceiverRegistrationV1, evidence: SlackEvidence,
+) -> tuple[str, NamespaceV1]:
+    """The registered sender's native ID and namespace, or invalid receiver.
+
+    @spec HTTP-INVOCATION-EXECUTION-21/24 HTTP-APPROVAL-CONTINUITY-7.
+    """
+    sender = derive_registered_sender(
+        evidence,
+        namespace_kind=registration.namespace.kind,
+        namespace_authority=registration.namespace.authority,
+        namespace_key=registration.namespace.key,
+        installation_account=registration.installation_account,
+        trusted_workspaces=registration.trusted_keys(SLACK_WORKSPACE_KIND),
+        trusted_organisations=registration.trusted_keys(SLACK_ENTERPRISE_KIND),
+    )
+    namespace = None if not isinstance(sender, tuple) else registration.namespace_for_key(
+        sender[0],
+    )
+    if not isinstance(sender, tuple) or namespace is None:
+        _invalid_receiver()
+    return sender[1], namespace
 
 
 Role = Literal["invocation", "approver"]
@@ -425,7 +484,8 @@ async def capture_source(
         or source.sender.provider != "slack"
         or source.sender.channel_identity_id != registration.channel_identity_id
         or source.sender.provider_installation_id != registration.provider_installation_id
-        or source.sender.namespace != registration.namespace
+        # Own or trusted entry exactly. @spec HTTP-INVOCATION-EXECUTION-24.
+        or registration.recorded_namespace(source.sender.namespace) is None
     ):
         _invalid_receiver()
     agent = await session.get(Agent, binding.agent_id, populate_existing=True)
@@ -869,15 +929,22 @@ def turn_authority_response(
 def invocation_source(
     runtime: HttpInvocationRuntime, context: codec.InvocationContextV1 | OriginalAssociation,
 ) -> tuple[ReceiverRegistrationV1, AuthenticatedSource]:
-    """Authenticated source scope only. @spec HTTP-APPROVAL-CONTINUITY-4/9."""
+    """Authenticated source scope only.
+
+    A recorded namespace must be the registration's own or one of its trusted
+    entries exactly. @spec HTTP-APPROVAL-CONTINUITY-4/9 HTTP-INVOCATION-EXECUTION-24.
+    """
     scope = context.scope
     registration = runtime._receivers.get((context.receiver_id, context.receiver_generation))
+    namespace = None if registration is None else registration.recorded_namespace(
+        scope.namespace,
+    )
     if (
         registration is None or registration.tenant_id != scope.tenant_id
         or scope.binding_id not in registration.binding_ids or scope.provider != "slack"
         or registration.channel_identity_id != scope.channel_identity_id
         or registration.provider_installation_id != scope.provider_installation_id
-        or registration.namespace.model_dump() != scope.namespace.model_dump()
+        or namespace is None
         or context.independent_human != (scope.native_id in registration.human_native_ids)
     ):
         _invalid_receiver()
@@ -886,7 +953,7 @@ def invocation_source(
         SenderV1(
             provider=scope.provider, channel_identity_id=scope.channel_identity_id,
             provider_installation_id=scope.provider_installation_id,
-            namespace=registration.namespace, native_id=scope.native_id,
+            namespace=namespace, native_id=scope.native_id,
         ),
         agent_id=scope.agent_id,
     )

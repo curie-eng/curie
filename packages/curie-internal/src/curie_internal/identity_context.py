@@ -17,6 +17,9 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    SerializationInfo,
+    SerializerFunctionWrapHandler,
+    model_serializer,
     model_validator,
 )
 
@@ -111,6 +114,21 @@ class ReceiverSlackEvidenceV1(_Wire):
     interaction_user_team_id: Identifier | None
     is_ext_shared_channel: bool | None
     enterprise_ids: tuple[Identifier, ...] = Field(max_length=32)
+    # The event's source_team, copied only when present. @spec HTTP-INVOCATION-EXECUTION-24.
+    event_source_team: Identifier | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_source_team(
+        self, handler: SerializerFunctionWrapHandler, info: SerializationInfo,
+    ) -> dict[str, Any]:
+        """Absent stays absent, so every existing proof signs today's exact bytes.
+
+        @spec HTTP-INVOCATION-EXECUTION-24.
+        """
+        data: dict[str, Any] = handler(self)
+        if self.event_source_team is None:
+            data.pop("event_source_team", None)
+        return data
 
 
 class ReceiverProofV1(_Wire):

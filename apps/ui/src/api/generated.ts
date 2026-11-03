@@ -10025,6 +10025,8 @@ export interface components {
             delivery: string;
             /** Enterprise Ids */
             enterprise_ids?: string[];
+            /** Event Source Team */
+            event_source_team?: string | null;
             /** Event Team */
             event_team?: string | null;
             /** Event User Team */
