@@ -87,7 +87,7 @@ class ApiStandIn:
         if self.transport_down:
             raise httpx.ConnectError("api unreachable", request=request)
         if self.hang_s:
-            await asyncio.sleep(self.hang_s)
+            await asyncio.Event().wait()
         path = request.url.path
         if request.method == "PUT" and path == EVIDENCE_PREFIX:
             if self.fault == "upload_rejection":
@@ -499,7 +499,7 @@ class _HangingCreator:
 
     async def upload_ui_evidence(self, *_args: object, **_kwargs: object) -> None:
         self.calls += 1
-        await asyncio.sleep(3600)
+        await asyncio.Event().wait()
 
 
 class _CreatorWithoutUpload:

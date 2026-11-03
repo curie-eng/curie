@@ -112,7 +112,7 @@ class _EvidenceRoutes:
         self.events.append("evidence_image")
         if self.mode == "hang":
             self.hung.set()
-            await asyncio.sleep(3600)
+            await asyncio.Event().wait()
         kwargs["sink"].write(IMAGES[int(kwargs["index"])])
 
 
