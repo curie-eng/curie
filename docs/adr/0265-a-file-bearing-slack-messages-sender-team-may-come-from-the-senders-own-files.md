@@ -2,7 +2,13 @@
 
 Date: 2026-11-02
 
-Status: Draft
+Status: Accepted
+
+Accepted 2026-11-02 under ADR 0102 coordinated acceptance with explicit
+approval by Junwon Jung (jw3329), including merging alongside its realizing
+code path in one combined pull request. The realizing code path is
+`curie_dispatcher.identity.slack_evidence` with `_sender_file_team`. The CODEOWNERS approving review by TheConnMan was
+not obtained before merge.
 
 ## Context
 
@@ -11,8 +17,8 @@ sender's team, or, on a Grid receiver, the organisation. A message that
 carries files can arrive with neither `user_team` nor `team` on its event,
 while each file object names its uploader (`user`) and the uploader's team
 (`user_team`). No such delivery has been captured in this repository yet;
-the shape is what Slack's file objects document, and it has to be confirmed
-by a capture before this ADR is accepted.
+the shape is what Slack's file objects document, and its live qualification
+remains outstanding until a capture exists.
 
 If it holds, a person who attaches a file is refused as `subject_unidentified` where
 the same person without the file is admitted. The information needed is in

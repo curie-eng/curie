@@ -2,9 +2,18 @@
 
 Date: 2026-11-02
 
-Status: Draft
+Status: Accepted
 
-Proposes a partial supersession of
+Accepted 2026-11-02 under ADR 0102 coordinated acceptance with explicit
+approval by Junwon Jung (jw3329), including merging alongside its realizing
+code path in one combined pull request. The realizing code path is
+`curie_api.identity.http_invocation.binding_requires_http_identity` (with
+`_roles_need_http_facts`), `curie_api.identity.http_approval._selected`,
+`approval_is_selected` and `require_legacy_approval_creation`, and the
+reclassification in `curie_api.routers.approvals._refresh_authority`. The CODEOWNERS approving review by TheConnMan was
+not obtained before merge.
+
+Partially supersedes
 [ADR 0254](0254-http-identity-applies-to-the-channel-identities-an-operator-registers.md)
 decision 2 and of its note that approval continuity still classifies by
 tenant, as stated below.
@@ -79,7 +88,7 @@ identity is registered or the approver role is changed, the same outcome ADR
 
 ## Supersession
 
-If accepted, this partially supersedes ADR 0254 decision 2 by adding the
+This partially supersedes ADR 0254 decision 2 by adding the
 approver-role clause to the per-binding test, and replaces ADR 0254's note
 that approval continuity still classifies by tenant. ADR 0254 remains Accepted
 in every other respect.

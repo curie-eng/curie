@@ -2,7 +2,14 @@
 
 Date: 2026-11-02
 
-Status: Draft
+Status: Accepted
+
+Accepted 2026-11-02 under ADR 0102 coordinated acceptance with explicit
+approval by Junwon Jung (jw3329), including merging alongside its realizing
+code path in one combined pull request. The realizing code path is
+`curie_dispatcher.http_receiver_initializer.build_selected_receivers` and
+`curie_dispatcher.run.build_identity_connections`. The CODEOWNERS approving review by TheConnMan was
+not obtained before merge.
 
 ## Context
 

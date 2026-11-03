@@ -4,6 +4,11 @@ Date: 2026-10-29
 
 Status: Accepted
 
+Partially superseded by [ADR 0259](0259-a-binding-requires-http-identity-when-its-invocation-or-approver-role-needs-http-facts.md):
+decision 2 gains the approver-role clause, and the note that approval
+continuity still classifies by tenant is replaced; other clauses remain
+unchanged.
+
 Accepted 2026-10-29 with explicit maintainer approval from jw3329, including
 merging alongside its realizing code path, recorded in the publishing pull
 request ([#5176](https://github.com/curie-eng/curie/pull/5176)). The same day the

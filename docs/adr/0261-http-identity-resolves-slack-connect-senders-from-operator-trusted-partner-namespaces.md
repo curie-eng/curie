@@ -2,7 +2,16 @@
 
 Date: 2026-11-02
 
-Status: Draft
+Status: Accepted
+
+Accepted 2026-11-02 under ADR 0102 coordinated acceptance with explicit
+approval by Junwon Jung (jw3329), including merging alongside its realizing
+code path in one combined pull request. The realizing code path is
+`curie_api.identity.slack.derive_registered_sender`,
+`curie_api.identity.http_invocation.ReceiverRegistrationV1.trusted_namespaces`
+with `recorded_namespace` and `capture_source`, and the dispatcher evidence
+copier `curie_dispatcher.identity.slack_evidence`. The CODEOWNERS approving review by TheConnMan was
+not obtained before merge.
 
 ## Context
 
@@ -100,8 +109,8 @@ member's click on a card in a Connect channel hosted in the organisation is
 expected to carry the organisation's enterprise id, but the `view_submission`
 of a modal opened from that click is a separate payload whose team fields can
 describe the submitter rather than the channel, with no enterprise id at all.
-That shape must be confirmed by a capture before this ADR is accepted. If it
-holds, such a submission resolves in the trusted
+No capture of that shape exists in this repository; its live qualification
+remains outstanding. Such a submission resolves in the trusted
 `slack_workspace` entry when all of these hold: it is a `view_submission`,
 the user id is present, no enterprise id is present, and `user.team_id` is a
 trusted workspace key. Every other Grid delivery without an enterprise id

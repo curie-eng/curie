@@ -2,7 +2,15 @@
 
 Date: 2026-11-02
 
-Status: Draft
+Status: Accepted
+
+Accepted 2026-11-02 under ADR 0102 coordinated acceptance with explicit
+approval by Junwon Jung (jw3329), including merging alongside its realizing
+code path in one combined pull request. The realizing code path is
+`curie_dispatcher.http_receiver.is_plain_direct_message` and the selected
+receiver's `message` handling, and
+`curie_api.identity.slack.derive_registered_sender` for `message` deliveries. The CODEOWNERS approving review by TheConnMan was
+not obtained before merge.
 
 ## Context
 
