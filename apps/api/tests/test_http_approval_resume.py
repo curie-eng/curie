@@ -321,6 +321,71 @@ def test_revoked_original_invoker_leaves_the_wake_owed_and_appends_nothing(
     assert rows(row["dedupe_key"])[0]["resumed_at"] is None
 
 
+def test_a_definitively_refused_expired_wake_is_not_reselected_on_every_pass(
+    creation_case: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-11: a caller_not_allowed refusal backs off, bounded."""
+    from curie_api import resumereconciler
+
+    case = creation_case
+    row = lapse(case, created(case))
+    now = [1000.0]
+    monkeypatch.setattr(resumereconciler, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    attempts: list[str] = []
+
+    async def body(stores: SimpleNamespace) -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-11."""
+        await expire(stores, stores.plain)
+        case.provider.member = False
+        real = stores.queue.enqueue_approval
+
+        async def counted(approval_id: Any, **kwargs: Any) -> str:
+            attempts.append(str(approval_id))
+            return await real(approval_id, **kwargs)
+
+        monkeypatch.setattr(stores.queue, "enqueue_approval", counted)
+        reconciler = ResumeReconciler(
+            stores.factory, stores.queue, interval_seconds=30, grace_seconds=0, batch_limit=10,
+        )
+        await asyncio.sleep(0.01)
+        assert await reconciler.reconcile_once() == 0
+        assert len(attempts) == 1
+        # The next pass does not re-evaluate the refused row.
+        now[0] += 30
+        assert await reconciler.reconcile_once() == 0
+        assert len(attempts) == 1
+        # Inside the first delay (twice the interval) it is still skipped.
+        now[0] += 29
+        assert await reconciler.reconcile_once() == 0
+        assert len(attempts) == 1
+        # Once the delay lapses it is retried, and the next delay doubles.
+        now[0] += 2
+        assert await reconciler.reconcile_once() == 0
+        assert len(attempts) == 2
+        now[0] += 119
+        assert await reconciler.reconcile_once() == 0
+        assert len(attempts) == 2
+        # The delay is capped at one hour, however many refusals came before.
+        for _ in range(12):
+            now[0] += 3601
+            assert await reconciler.reconcile_once() == 0
+        assert len(attempts) == 14
+        now[0] += 3601
+        assert await reconciler.reconcile_once() == 0
+        assert len(attempts) == 15
+        # A restored invoker publishes on the next attempt and drops the schedule.
+        case.provider.member = True
+        now[0] += 3601
+        assert await reconciler.reconcile_once() == 1
+        now[0] += 3601
+        assert await reconciler.reconcile_once() == 0
+        assert len(attempts) == 16
+
+    entries = with_stores(case, body)
+    assert len(entries) == 1
+    assert rows(row["dedupe_key"])[0]["resumed_at"] is not None
+
+
 def test_a_selected_row_without_provenance_is_refused_without_an_append(
     creation_case: SimpleNamespace,
 ) -> None:
