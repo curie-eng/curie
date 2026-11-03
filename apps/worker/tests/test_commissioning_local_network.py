@@ -19,9 +19,11 @@ from typing import Any
 import pytest
 from curie_worker.commissioning_local_cilium import CILIUM_AGENT_OBJECTS, CILIUM_POLICY_COLLECTIONS
 from curie_worker.commissioning_local_network import (
+    FACTS,
     LOCAL_PRODUCER_KIND,
     NOT_APPLICABLE_SUB_CASES,
     LocalCiliumNetworkProducer,
+    local_channel_digest,
     local_required_entries,
 )
 from curie_worker.managed_cni_cases import (
@@ -36,7 +38,6 @@ from curie_worker.managed_cni_probe_kit import (
     Measurement,
     ObservationEntry,
     ProbeKitRefused,
-    channel_digest,
 )
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -135,7 +136,11 @@ class FakeKit:
         self.calls += 1
         if self.during is not None:
             self.during()
-        measurement = Measurement(tuple(self.entries), self.refusal)
+        from curie_worker.managed_cni_probe_kit import PRODUCER_KIND, producer_constants_digest
+        from curie_worker.managed_cni_probe_programs import probe_kit_digest
+
+        measurement = Measurement(tuple(self.entries), self.refusal, PRODUCER_KIND,
+                                  producer_constants_digest(), probe_kit_digest())
         self.last = KitResult(measurement, ({"kit": "evidence"},), self.leftovers)
         return measurement
 
@@ -161,6 +166,15 @@ class FakeCluster(FakeReader):
         return None if value is None else [dict(item) for item in value]
 
 
+def bound(entries: Any) -> Measurement:
+    from curie_worker.managed_cni_probe_kit import PRODUCER_KIND, producer_constants_digest
+    from curie_worker.managed_cni_probe_programs import probe_kit_digest
+
+    return Measurement(
+        tuple(entries), None, PRODUCER_KIND, producer_constants_digest(), probe_kit_digest()
+    )
+
+
 def producer(
     cluster: FakeCluster | None = None, kit: FakeKit | None = None, **changes: Any
 ) -> tuple[LocalCiliumNetworkProducer, FakeCluster, FakeKit]:
@@ -179,14 +193,28 @@ def measured(**changes: Any) -> tuple[LocalCiliumNetworkProducer, FakeCluster, F
 
 def test_the_local_producer_has_its_own_kind() -> None:
     made, _, _ = producer()
-    assert made.producer_kind == LOCAL_PRODUCER_KIND == "local-cilium-v1"
+    assert made.producer_kind == LOCAL_PRODUCER_KIND == "local-cilium-v2"
 
 
-def test_the_local_required_set_drops_only_instance_metadata() -> None:
+def test_the_local_required_set_is_an_allowlist_of_the_three_peer_facts() -> None:
     probe_layout = layout()
     assert NOT_APPLICABLE_SUB_CASES == frozenset({"instance_metadata"})
-    dropped = required_entries(probe_layout) - local_required_entries(probe_layout)
-    assert dropped == {(6, "instance_metadata", "ipv4", "none", "runner_policy")}
+    local = local_required_entries(probe_layout)
+    # Exactly the cases of the network (1, 6, 8), hostile (2, 3, 4) and
+    # retained-peer (5) facts, never instance metadata.
+    assert {key[0] for key in local} == {1, 2, 3, 4, 5, 6, 8}
+    assert (6, "instance_metadata", "ipv4", "none", "runner_policy") not in local
+    # Case 7 is not wired locally and is dropped, like any later kit case.
+    dropped = required_entries(probe_layout) - local
+    assert {key[0] for key in dropped} == {6, 7}
+    assert {key for key in dropped if key[0] == 6} == {
+        (6, "instance_metadata", "ipv4", "none", "runner_policy")
+    }
+    assert FACTS == {
+        "network": ("network", (1, 6, 8)),
+        "hostile_peer": ("hostile", (2, 3, 4)),
+        "retained_peer": ("retained_peer", (5,)),
+    }
 
 
 def test_a_clean_local_measurement_passes_every_local_entry() -> None:
@@ -308,7 +336,7 @@ def network(made: LocalCiliumNetworkProducer) -> str:
 def test_the_network_fact_is_the_channel_digest_of_the_network_cases() -> None:
     made, _, _ = measured()
     assert made.last is not None
-    expected = channel_digest(made.last.measurement.entries, "network")
+    expected = local_channel_digest(bound(made.last.measurement.entries), "network")
     assert network(made) == network(made) == expected
 
 
@@ -316,14 +344,57 @@ def test_the_network_fact_covers_only_network_cases() -> None:
     made, _, _ = measured()
     assert made.last is not None
     entries = made.last.measurement.entries
-    assert channel_digest([i for i in entries if i.case != 2], "network") == network(made)
+    assert (local_channel_digest(bound([i for i in entries if i.case != 2]), "network")
+            == network(made))
 
 
-def test_only_the_network_fact_exists_in_this_slice() -> None:
+def test_other_kit_cases_change_neither_the_fact_digest_nor_the_verdict() -> None:
+    # A kit that also reports case 7 produces the same facts and the same (clean)
+    # verdict as a kit that reports only the local cases: case 7 is inert here.
+    probe_layout = layout()
+    full, _, _ = measured()  # kit_entries reports every case 1..8
+    full_digest = network(full)
+    local_keys = local_required_entries(probe_layout)
+    local_only = [item for item in kit_entries(probe_layout) if item.key in local_keys]
+    lean, _, _ = producer(kit=FakeKit(local_only))
+    assert asyncio.run(lean.measure()).refusal is None
+    assert network(lean) == full_digest
+    for name in ("hostile_peer", "retained_peer"):
+        assert observe(lean, name) == observe(full, name)
+
+
+def test_a_non_pass_dropped_case_neither_refuses_nor_changes_the_digest() -> None:
+    # An extra non-pass case-7 entry (an unknown case to this producer) is dropped
+    # before the verdict, so it does not refuse the measurement or move the digest.
+    probe_layout = layout()
+    base_digest = network(measured()[0])
+    entries, flipped = [], False
+    for item in kit_entries(probe_layout):
+        if item.case == 7 and not flipped:
+            item, flipped = entry(item.key, "unavailable", "node_probe_unavailable"), True
+        entries.append(item)
+    assert flipped
+    made, _, _ = producer(kit=FakeKit(entries))
+    assert asyncio.run(made.measure()).refusal is None
+    assert network(made) == base_digest
+
+
+def test_a_missing_required_local_sub_case_still_refuses() -> None:
+    # Dropping a required case-1 entry leaves the local required set incomplete.
+    probe_layout = layout()
+    missing = (1, "non_vacuity", "ipv4", "same_node", "foreign_namespace")
+    entries = [item for item in kit_entries(probe_layout) if item.key != missing]
+    made, _, _ = producer(kit=FakeKit(entries))
+    assert asyncio.run(made.measure()).refusal is not None
+
+
+def test_exactly_the_three_peer_facts_exist() -> None:
     made, _, _ = measured()
-    for fact in ("hostile_peer", "retained_peer", "cni", "permit"):
+    for name in ("network", "hostile_peer", "retained_peer"):
+        assert made.fact(name).fact == name
+    for name in ("cni", "permit", "hostile", "node_local"):
         with pytest.raises(ProbeKitRefused):
-            made.fact(fact)
+            made.fact(name)
 
 
 def test_the_network_fact_refuses_before_a_measurement() -> None:
@@ -395,3 +466,195 @@ def test_the_network_fact_serves_the_commissioning_reobservation_set() -> None:
     _config(cluster.state)["enable-policy"] = "never"
     with pytest.raises(producers.ProducerRefused):
         asyncio.run(reobservation.reobserve())
+
+
+def observe(made: LocalCiliumNetworkProducer, name: str) -> str:
+    return asyncio.run(made.fact(name).observe())
+
+
+def with_outcome(sub_case: str, outcome: str, reason: str) -> list[ObservationEntry]:
+    entries = kit_entries(layout())
+    return [
+        entry(item.key, outcome, reason) if item.sub_case == sub_case else item for item in entries
+    ]
+
+
+def test_each_peer_fact_is_the_channel_digest_of_its_own_cases() -> None:
+    made, _, _ = measured()
+    assert made.last is not None
+    entries = made.last.measurement.entries
+    assert observe(made, "hostile_peer") == local_channel_digest(bound(entries), "hostile")
+    assert observe(made, "retained_peer") == local_channel_digest(bound(entries), "retained_peer")
+    hostile = [item for item in entries if item.case in (2, 3, 4)]
+    assert local_channel_digest(bound(hostile), "hostile") == observe(made, "hostile_peer")
+    assert len({network(made), observe(made, "hostile_peer"), observe(made, "retained_peer")}) == 3
+
+
+@pytest.mark.parametrize(
+    "sub_case,reason,refused,kept",
+    [
+        # Case 5 workload_replaced cannot pass from user space; it refuses only its fact.
+        (
+            "workload_replaced",
+            "sequence_state_unavailable",
+            "retained_peer",
+            ("network", "hostile_peer"),
+        ),
+        # Address reuse a local cluster could not provoke is unavailable, never a pass.
+        ("address_reuse", "reuse_not_provoked", "hostile_peer", ("network", "retained_peer")),
+        ("spoof_terminated", "transport_unavailable", "hostile_peer", ("network", "retained_peer")),
+    ],
+)
+def test_an_unavailable_peer_case_refuses_its_fact_and_the_measurement(
+    sub_case: str, reason: str, refused: str, kept: tuple[str, ...]
+) -> None:
+    made, _, _ = producer(kit=FakeKit(with_outcome(sub_case, "unavailable", reason)))
+    measurement = asyncio.run(made.measure())
+    # The producer's own verdict is never positive while any local entry is not pass.
+    assert measurement.refusal == reason
+    with pytest.raises(ProbeKitRefused):
+        observe(made, refused)
+    # Facts judge only their own channel, so the evidence shows which one refused.
+    clean, _, _ = measured()
+    for name in kept:
+        assert observe(made, name) == observe(clean, name)
+
+
+@pytest.mark.parametrize(
+    "sub_case,reason,refused",
+    [
+        ("spoof_live", "delivered", "hostile_peer"),
+        ("new_pod", "delivered", "hostile_peer"),
+        ("policy_changed", "retained_flow", "retained_peer"),
+        ("workload_replaced", "retained_flow", "retained_peer"),
+    ],
+)
+def test_a_peer_delivery_fails_its_fact(sub_case: str, reason: str, refused: str) -> None:
+    made, _, _ = producer(kit=FakeKit(with_outcome(sub_case, "fail", reason)))
+    assert asyncio.run(made.measure()).refusal == reason
+    with pytest.raises(ProbeKitRefused):
+        observe(made, refused)
+
+
+@pytest.mark.parametrize("missing", ["spoof_live", "new_pod", "policy_changed"])
+def test_a_missing_peer_entry_refuses_its_fact(missing: str) -> None:
+    entries = [item for item in kit_entries(layout()) if item.sub_case != missing]
+    made, _, _ = producer(kit=FakeKit(entries))
+    assert asyncio.run(made.measure()).refusal == "incomplete"
+    fact = "retained_peer" if missing == "policy_changed" else "hostile_peer"
+    with pytest.raises(ProbeKitRefused):
+        observe(made, fact)
+    assert network(made)
+
+
+@pytest.mark.parametrize("name", ["network", "hostile_peer", "retained_peer"])
+@pytest.mark.parametrize(
+    "refusal,leftovers,expected",
+    [
+        # The engine identity is also rechecked per call; these two are not, so only
+        # the bracket guard can refuse a peer fact after them.
+        ("enforcement_absent", (), "enforcement_absent"),
+        (None, ("probe-a/cni-d8-1",), "cleanup_unconfirmed"),
+        ("non_vacuity_unavailable", (), "non_vacuity_unavailable"),
+    ],
+)
+def test_a_bracket_refusal_refuses_every_fact(
+    name: str, refusal: str | None, leftovers: tuple[str, ...], expected: str
+) -> None:
+    # Every entry passes, so no per-fact entry check could refuse on its own.
+    kit = FakeKit(kit_entries(layout()), refusal=refusal, leftovers=leftovers)
+    made, _, _ = producer(kit=kit)
+    assert asyncio.run(made.measure()).refusal == expected
+    with pytest.raises(ProbeKitRefused):
+        observe(made, name)
+
+
+@pytest.mark.parametrize("name", ["network", "hostile_peer", "retained_peer"])
+def test_an_engine_change_during_the_measurement_refuses_every_fact(name: str) -> None:
+    cluster = FakeCluster(installation())
+
+    def restart() -> None:
+        _agents(cluster.state)[0]["status"]["containerStatuses"][0]["restartCount"] = 1
+
+    made, _, _ = producer(cluster=cluster, kit=FakeKit(kit_entries(layout()), during=restart))
+    assert asyncio.run(made.measure()).refusal == "cni_changed"
+    with pytest.raises(ProbeKitRefused):
+        observe(made, name)
+
+
+@pytest.mark.parametrize("name", ["hostile_peer", "retained_peer"])
+def test_every_peer_fact_call_reobserves_the_engine_and_policies(name: str) -> None:
+    made, cluster, kit = measured()
+    observe(made, name)
+    _config(cluster.state)["enable-policy"] = "never"
+    with pytest.raises(ProbeKitRefused):
+        observe(made, name)
+    _config(cluster.state)["enable-policy"] = "default"
+    observe(made, name)
+    cluster.policies[CILIUM_POLICY_COLLECTIONS[0]] = [FakeCluster.policy("allow", "3", PROT)]
+    with pytest.raises(ProbeKitRefused):
+        observe(made, name)
+    assert kit.calls == 1
+
+
+def test_all_three_peer_facts_serve_the_commissioning_reobservation_set() -> None:
+    producers = importlib.import_module("curie_protected_hooks.commissioning_producers")
+    made, _, _ = measured()
+    mine = ("network", "hostile_peer", "retained_peer")
+    facts = tuple(
+        made.fact(name) if name in mine else StubFact(name) for name in producers.OBSERVATION_FACTS
+    )
+    reobserved = asyncio.run(producers.ReobservationSet(facts).reobserve())
+    assert {name: reobserved[name] for name in mine} == {name: observe(made, name) for name in mine}
+
+
+@pytest.mark.parametrize(
+    "extra,fact",
+    [
+        ((3, "spoof_live", "ipv6", "same_node", "raw_socket"), "hostile_peer"),
+        ((5, "policy_changed", "ipv6", "cross_node", "retained_peer"), "retained_peer"),
+    ],
+)
+def test_an_extra_unrequired_peer_entry_refuses(
+    extra: tuple[int, str, str, str, str], fact: str
+) -> None:
+    # A pass entry for a family the layout does not serve is not evidence of it.
+    made, _, _ = producer(kit=FakeKit([*kit_entries(layout()), entry(extra)]))
+    assert asyncio.run(made.measure()).refusal == "incomplete"
+    with pytest.raises(ProbeKitRefused):
+        observe(made, fact)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {},
+        {"producer_kind": "managed-behavioral-v1"},
+        {"producer_constants_digest": "0" * 64},
+        {"probe_kit_digest": "0" * 64},
+    ],
+)
+def test_missing_or_mixed_behavioral_version_cannot_qualify_local_facts(
+    change: dict[str, Any],
+) -> None:
+    from dataclasses import replace
+
+    class WrongKit(FakeKit):
+        async def measure(self) -> Measurement:
+            measurement = await super().measure()
+            if not change:
+                return Measurement(measurement.entries, measurement.refusal)
+            return replace(measurement, **change)
+
+    made, _, _ = producer(kit=WrongKit(kit_entries(layout())))
+    assert asyncio.run(made.measure()).refusal == "producer_binding_unavailable"
+    with pytest.raises(ProbeKitRefused):
+        observe(made, "retained_peer")
+
+
+def test_an_earlier_cleanup_refusal_blocks_every_local_fact_even_after_later_absence() -> None:
+    made, _, _ = producer(kit=FakeKit(kit_entries(layout()), refusal="cleanup_unconfirmed"))
+    assert asyncio.run(made.measure()).refusal == "cleanup_unconfirmed"
+    for name in FACTS:
+        with pytest.raises(ProbeKitRefused):
+            observe(made, name)

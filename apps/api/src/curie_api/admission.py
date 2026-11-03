@@ -1,34 +1,20 @@
-"""Who may start a turn through a binding: the one admission check (ADR 0175).
-
-Each binding may carry `allowed_callers`, a list of exact caller ids. This
-module holds the ONE function that decides whether a caller is let in, and
-every channel asks it: the channel port (`POST /channels/turns`) calls it
-directly after verifying the adapter's token, and the Slack dispatcher, which
-has no database, asks through `POST /channels/admission`. A second copy of the
-rule anywhere else is the drift this module exists to prevent.
-
-The check runs before anything happens: before a delivery is claimed, before a
-turn is queued, before the Slack placeholder is posted. Inside the turn is too
-late, because the turn is what reads the bot's credentials and the model is not
-a security boundary.
-
-A refused caller gets nothing back from the channel (decision 3). Operators see
-the refusal as a log line naming the binding and the reason, never the message,
-and as the `curie.turn.refused` counter.
-
-When #2914 lands, its principal check becomes this function's body and each
-entry becomes an identity link; the callers of `admit` stay as they are.
-"""
+"""Invocation admission (ADRs 0175/0220; COMMON-ADMISSION-EXTRACTION-1)."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Literal
+
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.schemas.channels import normalize_caller_id
 
+from . import team_authorization
+from .identity.slack import SlackEvidence
 from .models import AgentChannel
+from .team_authorization import TeamDecision
 
 
 class AdmissionReason(StrEnum):
@@ -94,4 +80,53 @@ def admit(binding: AgentChannel | None, caller_ids: Iterable[str]) -> AdmissionD
             return AdmissionDecision(allowed=True, restricted=True, reason=AdmissionReason.LISTED)
     return AdmissionDecision(
         allowed=False, restricted=True, reason=AdmissionReason.CALLER_NOT_ALLOWED
+    )
+
+
+@dataclass(frozen=True)
+class InvocationDecision:
+    """@spec COMMON-ADMISSION-EXTRACTION-1: facts retained for transport handling."""
+
+    allowed: bool
+    restricted: bool
+    list_decision: AdmissionDecision
+    team_decision: TeamDecision | None
+
+
+async def evaluate_invocation(
+    session: AsyncSession,
+    binding: AgentChannel | None,
+    caller_ids: Sequence[str],
+    *,
+    surface: Literal["channel-port", "admission"],
+    slack: SlackEvidence | None = None,
+    email: str | None = None,
+    on_list_refusal: Callable[[AdmissionDecision], None] | None = None,
+) -> InvocationDecision:
+    """Compose existing invocation checks.
+
+    @spec COMMON-ADMISSION-EXTRACTION-1
+    @spec COMMON-ADMISSION-EXTRACTION-2
+    @spec COMMON-ADMISSION-EXTRACTION-3
+
+    The synchronous observer lets each transport retain its refusal observation
+    before team I/O, including when that I/O fails.
+    """
+    decision = admit(binding, caller_ids)
+    if not decision.allowed:
+        if on_list_refusal is not None:
+            on_list_refusal(decision)
+        if surface == "channel-port":
+            return InvocationDecision(False, decision.restricted, decision, None)
+    if binding is None:
+        return InvocationDecision(decision.allowed, decision.restricted, decision, None)
+
+    human = await team_authorization.check_binding(
+        session, binding, role="invocation", slack=slack, email=email
+    )
+    allowed = decision.allowed and human.allowed
+    if surface == "admission" and human.restricted and slack is not None:
+        allowed = allowed and slack.user_id in caller_ids
+    return InvocationDecision(
+        allowed, decision.restricted or human.restricted, decision, human
     )

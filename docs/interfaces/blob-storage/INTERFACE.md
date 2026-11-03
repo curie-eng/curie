@@ -112,7 +112,7 @@ package) with `BundleStore` as its S3/RustFS backing.
 8. **Chart workspace-init and attachments-init:**
   `charts/curie/templates/agent-sandbox.yaml` fetches workspace archives and
   parked attachments through presigned HTTP GET URLs from
-  `apps/worker/src/curie_worker/workspace.py::WorkspaceObjectStore.presign_get`.
+  `packages/curie-internal/src/curie_internal/workspace_objects.py::WorkspaceObjectSigner.presign_get`.
   These consumers sit alongside the AWS CLI bundle-fetch path.
 
 Langfuse web and worker are separate S3 consumers. The chart helper
@@ -163,7 +163,7 @@ including why the instance role and IMDS are deliberately unavailable.
 **Workspace and attachment operations are a third adapter surface.**
 `WorkspaceObjectPort` is not a slice of `ObjectStore`: a non-S3 backend must also
 provide streaming put/get, delete, list, and presigned reads
-(`apps/worker/src/curie_worker/workspace.py::WorkspaceObjectStore.presign_get`).
+(`packages/curie-internal/src/curie_internal/workspace_objects.py::WorkspaceObjectSigner.presign_get`).
 Its `delete` operation must be idempotent when a key is absent, and `list_keys` must
 be read-after-write consistent for owner records that were just written. Attachment
 retention arbitrates ownership by scanning those records before deleting bytes

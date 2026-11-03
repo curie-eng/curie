@@ -1,4 +1,4 @@
-"""The local Cilium network producer on a disposable multi-node minikube profile, ADR 0236.
+"""The local Cilium network and peer facts on a disposable multi-node minikube profile, ADR 0236.
 
 @spec PROTECTED-COMMISSIONING-5. Opt-in: it runs only with an explicit
 kubeconfig file, context and minikube profile of a disposable local cluster
@@ -10,9 +10,10 @@ installation bootstrap: namespaces, role-label NetworkPolicies, stand-in broker
 and mediator, a declared egress peer, the stand-in guard and the measuring
 ServiceAccount. This test adds the Cilium reads to the measuring identity and
 an owned off-cluster fixture container on the node network as the local
-``cloud_network`` destination. It then runs the producer, calls the network
-fact, and shows that a policy or engine configuration change refuses the next
-call and that a non-enforcing configuration refuses before any probe pod.
+``cloud_network`` destination. It then runs the producer and calls the
+network, hostile-peer and retained-peer facts. It shows that a policy or
+engine configuration change refuses the next network call and that a
+non-enforcing configuration refuses before any probe pod.
 Local results qualify no other installation and no managed CNI.
 """
 
@@ -351,6 +352,8 @@ def test_local_cilium_network_producer_on_a_local_cluster() -> None:
     client = LocalCiliumAPI(
         MeasuringCredentials(origin, ca_file, token),
         namespaces=(PROT, PROBE_A, FOREIGN, RELEASE),
+        # Clause 5: NetworkPolicy writes (case 5 policy_changed) only in probe namespaces.
+        policy_namespaces=(PROBE_A, FOREIGN),
     )
     probe_layout = layout(nodes, extra["system_set"], Destination(address, FIXTURE_PORT, "tcp"))
     producer = LocalCiliumNetworkProducer(client, probe_layout, profile=PROFILE)
@@ -371,6 +374,12 @@ def test_local_cilium_network_producer_on_a_local_cluster() -> None:
     async def run() -> dict[str, Any]:
         try:
             measurement = await producer.measure()
+            peers = {}
+            for name in ("hostile_peer", "retained_peer"):
+                try:
+                    peers[name] = await producer.fact(name).observe()
+                except ProbeKitRefused:
+                    peers[name] = None
             first = await call("first")
             second = await call("second")
             kubectl(
@@ -405,6 +414,7 @@ def test_local_cilium_network_producer_on_a_local_cluster() -> None:
                 remove_config_key("policy-audit-mode")
             return {
                 "measurement": measurement,
+                "peers": peers,
                 "digests": (first, second, added, restored, changed, back, audit_call),
                 "proxy": (proxy_changed, proxy_back),
                 "audit": audit,
@@ -431,6 +441,7 @@ def test_local_cilium_network_producer_on_a_local_cluster() -> None:
                     "refusal": measurement.refusal,
                     "entries": summary,
                     "fact_calls": calls,
+                    "peer_facts": outcome["peers"],
                     "audit_mode_refusal": outcome["audit"].refusal,
                     "kube_proxy_mode": kube_proxy_mode(result.identity),
                     "kit_evidence": list(result.kit.evidence),
@@ -441,9 +452,30 @@ def test_local_cilium_network_producer_on_a_local_cluster() -> None:
                 sort_keys=True,
             )
     assert result.kit.leftovers == ()
-    assert measurement.refusal is None, summary
+    assert result.bracket is None, summary
     assert {item.key for item in measurement.entries} == local_required_entries(probe_layout)
-    assert {item.outcome for item in measurement.entries} == {"pass"}, summary
+    # No delivery on an enforcing local Cilium: a fail would be a real finding.
+    assert not [item for item in measurement.entries if item.outcome == "fail"], summary
+    # Every local entry outside cases 3, 4 and 5 passes. A timing case this local
+    # cluster cannot provoke is an honest unavailable, never a pass.
+    assert all(item.outcome == "pass" for item in measurement.entries if item.case in (1, 2, 6, 8))
+    not_passed = {item.reason for item in measurement.entries if item.outcome != "pass"}
+    assert not_passed <= {
+        "reuse_not_provoked",
+        "transport_unavailable",
+        "address_reassigned",
+        "phase_timeout",
+        "control_failed",
+    }, summary
+    # Under v2 each missing finite observation refuses; complete observations
+    # may pass without claiming established-flow termination or full commissioning.
+    assert (measurement.refusal is None) == all(
+        item.outcome == "pass" for item in measurement.entries
+    )
+    # Each peer fact is a digest exactly when every entry of its own channel passed.
+    for name, cases in (("hostile_peer", (2, 3, 4)), ("retained_peer", (5,))):
+        clean = all(item.outcome == "pass" for item in measurement.entries if item.case in cases)
+        assert (outcome["peers"][name] is not None) == clean, (name, summary)
     first, second, added, restored, changed, back, audit_call = outcome["digests"]
     assert first is not None and first == second == restored == back
     assert added is None and changed is None and audit_call is None
@@ -455,3 +487,137 @@ def test_local_cilium_network_producer_on_a_local_cluster() -> None:
     assert identity.document["operator_set"]["uid"] in {
         pod["owner"] for pod in identity.document["pods"]["operator"]
     }
+
+
+def test_case_five_v2_and_unfiltered_control_on_a_local_cluster() -> None:
+    """Focused real CNI experiment; not full commissioning qualification."""
+    from curie_worker.commissioning_local_cilium import observe_cilium
+    from curie_worker.managed_cni_cases import _cleanup, _nonce, _Pod, _Run, policy_snapshot
+    from curie_worker.managed_cni_fresh_cases import _Case
+    from curie_worker.managed_cni_probe_kit import PRODUCER_KIND
+    from curie_worker.managed_cni_probe_programs import probe_kit_digest
+    from curie_worker.managed_cni_timing import case_five
+
+    fixture.KUBECONFIG, fixture.CONTEXT = KUBECONFIG, CONTEXT
+    nodes, extra = install()
+    origin, ca_file = fixture.cluster_origin()
+    token = kubectl("create", "token", fixture.MEASURING, "-n", CONTROL, "--duration=1h").strip()
+    client = LocalCiliumAPI(
+        MeasuringCredentials(origin, ca_file, token),
+        namespaces=(PROT, PROBE_A, FOREIGN, RELEASE),
+        policy_namespaces=(PROBE_A, FOREIGN),
+    )
+    # No case6 destination is exercised by this focused test.
+    probe_layout = layout(nodes, extra["system_set"], Destination("192.0.2.1", 18081, "tcp"))
+    run = _Run(client, probe_layout, time.time, asyncio.sleep)
+    payload: dict[str, Any] = {
+        "scope": "case-five integration only",
+        "producer_kind": PRODUCER_KIND,
+        "probe_kit_digest": probe_kit_digest(),
+        "controls": [],
+    }
+
+    async def experiment() -> list[Any]:
+        before = await observe_cilium(client, profile=PROFILE, eligible_nodes=nodes)
+        policies = await policy_snapshot(run)
+        anchor_document = await client.read_pod(PROT, "broker-real")
+        assert anchor_document is not None
+        anchor = _Pod(
+            PROT,
+            "broker-real",
+            anchor_document["metadata"]["uid"],
+            anchor_document["spec"]["nodeName"],
+            tuple(item["ip"] for item in anchor_document["status"]["podIPs"]),
+        )
+        try:
+            entries = await case_five(run, {"broker": anchor})
+            payload["entries"] = [item.document() for item in entries]
+            payload["evidence"] = list(run.evidence)
+            assert await _cleanup(run) == []
+            assert await policy_snapshot(run) == policies
+            assert (
+                await observe_cilium(client, profile=PROFILE, eligible_nodes=nodes)
+            ).digest == before.digest
+            payload["cni_identity_digest"] = before.digest
+            # Under a separate, unfiltered owned listener, the same fixed sender
+            # must expose real completed connections and exact listener delivery.
+            for family in probe_layout.families:
+                for placement in ("same_node", "cross_node"):
+                    source_node = (
+                        anchor.node
+                        if placement == "same_node"
+                        else next(n for n in nodes if n != anchor.node)
+                    )
+                    control_run = _Run(client, probe_layout, time.time, asyncio.sleep)
+                    case = _Case(control_run, family, source_node, probe_layout.target("broker"))
+                    case.deadline = time.monotonic() + 120
+                    try:
+                        assert await client.list_items("networkpolicies:" + FOREIGN) == []
+                        listener = await case.start(
+                            "fresh_probe_listener",
+                            namespace=FOREIGN,
+                            node=anchor.node,
+                            labels={"fixture": "unfiltered"},
+                            argument={"family": family, "port": 16379},
+                        )
+                        address = listener.address(family)
+                        assert address is not None
+                        targets = [
+                            {"target": "twin", "address": address, "port": 16379, "echo": True}
+                        ]
+                        await case.listener(listener)
+                        sender = await case.start(
+                            "fresh_sender",
+                            namespace=PROBE_A,
+                            labels={"fixture": "unfiltered"},
+                            argument=case.arguments(targets, mode="deny", excluded=[]),
+                        )
+                        nonce = _nonce()
+                        case.denial_sender_uid, case.denial_challenge = sender.uid, nonce
+                        case.denial_targets = (("twin", address, 16379),)
+                        trigger = await case.start(
+                            "fresh_trigger",
+                            namespace=PROBE_A,
+                            labels={"fixture": "unfiltered"},
+                            finished=True,
+                            argument={
+                                "family": family,
+                                "address": sender.address(family),
+                                "challenge": nonce,
+                            },
+                        )
+                        await case.same(trigger)
+                        while True:
+                            record = await case.sender(sender)
+                            if record.complete:
+                                break
+                            await case.pause(0.5)
+                        observed = await case.listener(listener)
+                        assert record.challenge == nonce and len(record.attempts) == 5
+                        assert all(
+                            item.outcome == "connected" and item.echo for item in record.attempts
+                        )
+                        assert observed.deliveries(record.attempts) > 0 and case.leaked
+                        payload["controls"].append(
+                            {
+                                "family": family,
+                                "placement": placement,
+                                "connected": len(record.attempts),
+                                "listener_deliveries": observed.deliveries(record.attempts),
+                            }
+                        )
+                    finally:
+                        assert await _cleanup(control_run) == []
+            return entries
+        finally:
+            payload["leftovers"] = await _cleanup(run)
+            await client.close()
+
+    try:
+        entries = asyncio.run(experiment())
+    finally:
+        if EVIDENCE:
+            Path(EVIDENCE).write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n")
+    assert len(entries) == 4 * len(probe_layout.families)
+    assert all(item.outcome == "pass" for item in entries), payload.get("entries")
+    assert payload["leftovers"] == []

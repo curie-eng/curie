@@ -88,7 +88,15 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   `secrets` is `list[str | SecretRef]`
   (`packages/plugin-format/src/plugin_format/connectors.py::SecretRef`, with
   `name` / `from_secret` / `key`) and `secret_files` is by NAME only; neither form
-  carries a value. A hosted connector may also list `config`, env-var names for per-agent
+  carries a value. A `from_secret` without a placeholder is used as written. One that carries
+  `${CURIE_AGENT}` names a Secret per deploying agent: the renderer expands it to the agent's
+  name (`example-read-${CURIE_AGENT}` becomes `example-read-foo` for agent `foo` and
+  `example-read-foo-dev` for `foo-dev`), so agents deployed from one bundle into one namespace
+  read different out-of-band Secrets. It is the only placeholder a `from_secret` accepts
+  (`connectors.secret_ref_unknown_placeholder`), and the template must expand to a Kubernetes
+  Secret name for every valid agent name (`connectors.secret_ref_bad_name`); the render checks
+  the expanded name again. The local tiers have no out-of-band Secrets and refuse every
+  `from_secret` reference, templated or not. A hosted connector may also list `config`, env-var names for per-agent
   NON-secret settings (a folder path, a channel id) the operator stores beside the connector's
   credentials. Each `config` name resolves from the same per-agent store as a plain `secrets`
   name and renders the same `secretKeyRef` env var on the connector pod, but it is never a
@@ -120,6 +128,23 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   connector cannot declare it (`connectors.remote_has_resources`). Neither field touches the caller
   proxy container's probe or resources, and with both omitted the rendered Deployment is unchanged.
   A consumer built before these fields refuses a bundle that sets either one as an unknown key.
+  A hosted connector may declare `routes`, the non-MCP HTTP routes its bundle's own stdio
+  servers call through the caller proxy (ADR 0240). Each entry has a `path`, matched exactly, that
+  starts with `/`, holds only letters, digits, `.`, `_`, `~`, `-` and `/`, has no empty, `.` or `..`
+  segment, and is neither `/mcp` nor under it (`connectors.bad_route_path`); it may not be the
+  connector's `readiness_path` (`connectors.route_is_readiness_path`) or repeat
+  (`connectors.duplicate_route`). `methods` is a non-empty subset of `POST` and `PUT`, defaulting to
+  `[POST]` (`connectors.bad_route_methods`). `max_body_bytes` is a required integer from 1 to
+  268435456, 256 MiB (`connectors.bad_route_max_body_bytes`). `callers` names at least one server
+  (`connectors.route_without_callers`), and bundle validation requires each to be a stdio server the
+  bundle's `.mcp.json` or manifest `mcpServers` declares (`connectors.route_caller_undeclared`,
+  `connectors.route_caller_not_stdio`). A `url` connector cannot declare `routes`
+  (`connectors.remote_has_routes`). A declared caller reads its routes once at start from the
+  descriptor `CURIE_CONNECTOR_ROUTES_FD` names, a JSON object from connector name to `{url, token}`,
+  and sends the token as `X-Curie-Caller` on the route; started without the name set, it has no
+  routes. Declare a caller as the program itself rather than a wrapper that forks (`sh -c`), since
+  the runner observes the lock only on the process it starts, and have it load what it needs at
+  start. A consumer built before the field refuses a bundle that sets it as an unknown key.
   Intake refuses any `sealed_secrets` declaration with
   `connectors.sealed_secrets_unsupported` until a decrypt path exists (see
   [sealed-credential](../sealed-credential/INTERFACE.md)). For a hosted (`image`/`build`) connector

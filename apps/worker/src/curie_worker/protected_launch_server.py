@@ -68,6 +68,7 @@ from .protected_launch_registry import (
     AssignmentMetadata,
     LaunchOwnership,
     LaunchSnapshot,
+    ProtectedLaunchRegistry,
     RegistryConflict,
     RegistryInvalid,
     RegistryRetired,
@@ -191,6 +192,9 @@ class ProductionLaunchAuthorizer(LaunchAuthorizer):
     """Production launch authority: retained delivery, Readiness and Qualification."""
 
     __slots__ = ()
+
+    def open_registry(self, root: str, *, boot_id: str) -> ProtectedLaunchRegistry:
+        return ProtectedLaunchRegistry.open(root, boot_id=boot_id)
 
     async def verify(
         self, runtime: ProvisionedRuntime, request: LaunchRequest
@@ -385,7 +389,7 @@ class ProtectedLaunchServer:
             runner_ca_file=config.runner_ca_file,
         )
         self._boot_id = self._mechanics.boot_id
-        self._registry = self._mechanics.registry
+        self._registry: ProtectedLaunchRegistry = self._mechanics.registry
         self._live = self._mechanics.live
         self._app = web.Application(client_max_size=2097152, middlewares=[self._middleware])
         self._app.router.add_route("*", "/{tail:.*}", self._http)

@@ -35,6 +35,7 @@ from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Operation, Suppo
 from curie_api.forges.errors import Ambiguous, ForgeError, NotFound, Unauthorized, Unavailable
 from curie_api.forges.github import ci
 from curie_api.forges.ports import MarkedComments
+from curie_api.forges.retarget import retarget_checked
 from curie_api.forges.types import (
     Actor,
     CheckSource,
@@ -95,6 +96,12 @@ _PERMANENT_CI_REASONS = {
     "installation_refused": Unauthorized,
     "github_unauthorized": Unauthorized,
     "github_forbidden": Unauthorized,
+    # A 403 names the read GitHub refused (#5222); each stays permanent, so a
+    # refused read is never read as an empty rollup or required-check set.
+    ci.FORBIDDEN_LIST_CHECK_RUNS: Unauthorized,
+    ci.FORBIDDEN_GET_COMBINED_STATUS: Unauthorized,
+    ci.FORBIDDEN_GET_BRANCH_RULES: Unauthorized,
+    ci.FORBIDDEN_GET_BRANCH: Unauthorized,
     "github_not_found": NotFound,
 }
 
@@ -377,25 +384,52 @@ def _human(item: Mapping[str, Any]) -> Actor | None:
 logger = logging.getLogger(__name__)
 
 
-def _log_refusal(method: str, response: httpx.Response) -> None:
+def _log_refusal(
+    method: str,
+    response: httpx.Response,
+    *,
+    operation: str = "",
+    diagnostics: bool = True,
+) -> None:
     """Keep GitHub's diagnostics for an operator (#4159) without carrying them
     across the port: the status, request id and a clipped ``message``.
+
+    ``diagnostics`` is false for a CI read whose refusal must not put a response
+    body or request header into a log (#5222); only the method, the named
+    operation and the status are then recorded, and neither the repository path
+    nor any response text can reach an operator-facing log.
 
     https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api
     """
 
-    try:
-        payload = response.json()
-        message = payload.get("message") if isinstance(payload, dict) else None
-    except ValueError:
-        message = None
+    message = request_id = ""
+    if diagnostics:
+        try:
+            payload = response.json()
+            raw = payload.get("message") if isinstance(payload, dict) else None
+        except ValueError:
+            raw = None
+        message = redact_text(raw.strip()[:200]) if isinstance(raw, str) else ""
+        request_id = response.headers.get("X-GitHub-Request-Id") or ""
     logger.warning(
-        "GitHub code host call refused method=%s status=%s request_id=%s message=%s",
+        "GitHub code host call refused method=%s operation=%s status=%s request_id=%s message=%s",
         method,
+        operation,
         response.status_code,
-        response.headers.get("X-GitHub-Request-Id") or "",
-        redact_text(message.strip()[:200]) if isinstance(message, str) else "",
+        request_id,
+        message,
     )
+
+
+# The operation names a 403 is attributed to (#5222). Only operations whose
+# refusal must be told apart carry one; every other call keeps the generic
+# ``github_forbidden``.
+_FORBIDDEN_OPERATIONS = {
+    "list_check_runs": ci.FORBIDDEN_LIST_CHECK_RUNS,
+    "get_combined_status": ci.FORBIDDEN_GET_COMBINED_STATUS,
+    "get_branch_rules": ci.FORBIDDEN_GET_BRANCH_RULES,
+    "get_branch": ci.FORBIDDEN_GET_BRANCH,
+}
 
 
 def conflicted(payload: Mapping[str, Any]) -> bool | None:
@@ -498,6 +532,8 @@ class GitHubCodeHost:
         params: Mapping[str, Any] | None = None,
         body: Mapping[str, Any] | None = None,
         ok: frozenset[int] = frozenset({200}),
+        operation: str = "",
+        diagnostics: bool = True,
     ) -> httpx.Response:
         try:
             response = await self._client.request(
@@ -519,14 +555,15 @@ class GitHubCodeHost:
             raise Unavailable("github_error") from None
         if response.status_code in ok:
             return response
-        _log_refusal(method, response)
+        _log_refusal(method, response, operation=operation, diagnostics=diagnostics)
         if response.status_code == 401:
             raise Unauthorized("github_unauthorized")
         if response.status_code == 403:
             # A rate-limited request is a 403 with an exhausted budget.
             if response.headers.get("x-ratelimit-remaining") == "0":
                 raise Unavailable("github_rate_limited")
-            raise Unauthorized("github_forbidden")
+            # Name the read GitHub refused (#5222); a bare reason stays generic.
+            raise Unauthorized(_FORBIDDEN_OPERATIONS.get(operation, "github_forbidden"))
         if response.status_code == 404:
             raise NotFound("github_not_found")
         if response.status_code == 429:
@@ -960,6 +997,44 @@ class GitHubCodeHost:
         )
         return self._checked(pull_request, payload)
 
+    async def retarget_pull_request(
+        self,
+        pull_request: PullRequestRef,
+        *,
+        base_ref: str,
+        expected_head_sha: str,
+    ) -> PullRequest:
+        repository = pull_request.repository
+        if repository.kind != self.kind or repository.host != self.host:
+            raise NotFound("repository")
+        if not pull_request.number.isdigit():
+            raise NotFound("pull_request_number_invalid")
+        path = f"{self._repo(repository.path)}/pulls/{int(pull_request.number)}"
+        token = await self._token(repository.path)
+
+        def parse(payload: Any) -> PullRequest:
+            pull = self._pull_request(repository, payload, require_sides=True)
+            if any(
+                str(payload[side]["repo"].get("id")) != repository.project_id
+                for side in ("head", "base")
+            ):
+                raise Unavailable("pull_request_mismatch")
+            return pull
+
+        async def read() -> PullRequest:
+            return parse(await self._json("GET", path, token=token))
+
+        async def update() -> PullRequest:
+            return parse(await self._json("PATCH", path, token=token, body={"base": base_ref}))
+
+        return await retarget_checked(
+            pull_request,
+            base_ref=base_ref,
+            expected_head_sha=expected_head_sha,
+            read=read,
+            update=update,
+        )
+
     def _checked(self, pull_request: PullRequestRef, payload: Any) -> PullRequest:
         pull = self._pull_request(pull_request.repository, payload, require_sides=False)
         if pull.ref.number != pull_request.number:
@@ -1023,19 +1098,33 @@ class GitHubCodeHost:
         no required status checks rule, a missing protection object, and a
         protection object with no required status checks all contribute no
         names from that source. HTTP 404 on the branch endpoint is
-        ``github_not_found``. Every other failure uses the same reason
-        ``observe_ci`` raises for that failure.
+        ``github_not_found``. A 403 names the read it refused
+        (``github_forbidden_get_branch_rules`` or ``github_forbidden_get_branch``,
+        #5222) and never yields an empty set. Every other failure uses the same
+        reason ``observe_ci`` raises for that failure.
         """
 
         token = await self._token(repository.path)
         repo = self._repo(repository.path)
         encoded = quote(branch, safe="")
         try:
-            rules = await self._json("GET", f"{repo}/rules/branches/{encoded}", token=token)
+            rules = await self._json(
+                "GET",
+                f"{repo}/rules/branches/{encoded}",
+                token=token,
+                operation="get_branch_rules",
+                diagnostics=False,
+            )
         except NotFound:
             rules = []
         names = _ruleset_contexts(rules)
-        payload = await self._json("GET", f"{repo}/branches/{encoded}", token=token)
+        payload = await self._json(
+            "GET",
+            f"{repo}/branches/{encoded}",
+            token=token,
+            operation="get_branch",
+            diagnostics=False,
+        )
         names.update(_protection_contexts(payload))
         return frozenset(names)
 

@@ -92,6 +92,7 @@ import pytest
 from aci_protocol import Attachment, Final, QueuedTurn, SessionStatus, TextDelta
 from curie_worker.attachments import AttachmentCoordinator, AttachmentLimits
 from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.binding import HttpIdentityBinding
 from curie_worker.kernel import routing
 from curie_worker.kernel.core import Kernel
 from curie_worker.ledger_client import ThreadAttachmentLedgerClient
@@ -146,6 +147,19 @@ class _Binding:
     ``max_turns`` changes the boot env between turns, which is how the turn
     budget fence (#3071) replaces an idle live route with a handoff.
     """
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = self.resolved.agent_id
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
 
     def __init__(self) -> None:
         self.resolved = SimpleNamespace(
@@ -1433,5 +1447,66 @@ def test_a_404_with_the_ledgers_own_code_still_refuses_a_file_turn(
 
             assert h.fake_k8s.claim_envs == []
             assert "stage=ledger" in caplog.text
+
+    asyncio.run(go())
+
+
+def test_lazy_file_and_text_turns_register_metadata_without_rebuild(make_harness) -> None:
+    from curie_worker.attachment_access_client import AttachmentAccessMint
+
+    async def go() -> None:
+        binding = _Binding()
+        binding.resolved.deployment_id = uuid.uuid4()
+        async with make_harness(
+            binding=binding,
+            attachment_enabled=True,
+            attachment_mode="lazy",
+            internal_worker_token="worker",
+            max_attempts=1,
+        ) as h:
+            lane, ledger = _wire(h)
+            calls = []
+
+            class Control:
+                async def register(self, **body):
+                    calls.append(("register", body))
+
+                async def context(self, **body):
+                    calls.append(("context", body))
+                    return AttachmentAccessMint("opaque", int(time.time()) + 600, 90)
+
+                async def renew(self, **body):
+                    calls.append(("renew", body))
+                    return True
+
+                async def revoke(self, **body):
+                    calls.append(("revoke", body))
+                    return True
+
+            h.kernel._attachment_access = Control()
+            h.runner.attachment_access_enforced = True
+            _answer_everywhere(h)
+            first = _event(
+                "inspect",
+                thread="lazy",
+                event_id="lazy-file",
+                attachments=[Attachment(id="F1", name="large.csv", size_bytes=400_000_000)],
+            )
+            await h.kernel.process_event(first)
+            await h.kernel.process_event(_event("follow up", thread="lazy", event_id="lazy-text"))
+            assert lane.prepare_calls == []
+            assert ledger.query_calls == []
+            assert ledger.append_calls == []
+            registered = [body for op, body in calls if op == "register"]
+            assert len(registered) == 2
+            assert registered[1]["refs"] == []
+            assert registered[0]["refs"][0]["size_bytes"] == 400_000_000
+            assert registered[0]["thread_key"] == _thread_key("lazy")
+            assert len(h.fake_k8s.claim_envs) == 1
+            assert len(h.runner.event_bodies) == 2
+            assert all(
+                body["attachment_access"]["token"] == "opaque" for body in h.runner.event_bodies
+            )
+            assert len([body for op, body in calls if op == "revoke"]) == 2
 
     asyncio.run(go())

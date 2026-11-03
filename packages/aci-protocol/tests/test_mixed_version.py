@@ -27,7 +27,13 @@ from pathlib import Path
 from typing import Literal
 
 from aci_protocol import PROTOCOL_VERSION, Event, ReplyHandle, is_compatible, parse_inbound
-from aci_protocol.events import READER_CONTEXT, PublicationContext, ToolAccess, _AciModel
+from aci_protocol.events import (
+    READER_CONTEXT,
+    ChannelReadCapability,
+    PublicationContext,
+    ToolAccess,
+    _AciModel,
+)
 from pydantic import Field
 
 _FIXTURE = Path(__file__).resolve().parent / "fixtures" / "reply_handle_0_2_9.json"
@@ -178,6 +184,7 @@ def test_the_pinned_0_5_11_event_matches_the_live_model_minus_memory_token() -> 
     assert set(Event.model_fields) - set(_Event_0_5_11.model_fields) == {
         "memory_token",
         "channel_read",
+        "attachment_access",
     }
     assert set(_Event_0_5_11.model_fields) <= set(Event.model_fields)
 
@@ -226,8 +233,33 @@ class _Event_0_5_15(_Event_0_5_11):  # noqa: N801
     memory_token: str | None = Field(default=None, repr=False)
 
 
+class _Event_0_5_23(_Event_0_5_15):  # noqa: N801
+    """Pinned pre-attachment-access reader with the channel-read field."""
+
+    channel_read: ChannelReadCapability | None = Field(default=None, repr=False)
+
+
+def test_pre_attachment_reader_preserves_event_and_ignores_new_context() -> None:
+    current = Event.model_validate({
+        **_event_0_5_11(),
+        "attachment_access": {
+            "url": "https://api.example.com/attachment-access",
+            "token": "attachment.example.signature",
+        },
+    })
+    previous = _Event_0_5_23.model_validate(
+        current.model_dump(mode="json"), context=READER_CONTEXT,
+    )
+    assert previous.text == "Remember that the standup moved to 10am"
+    assert "attachment_access" not in previous.model_dump()
+    assert set(Event.model_fields) - set(_Event_0_5_23.model_fields) == {"attachment_access"}
+
+
 def test_pinned_0_5_15_event_has_exactly_the_previous_patch_fields() -> None:
-    assert set(Event.model_fields) - set(_Event_0_5_15.model_fields) == {"channel_read"}
+    assert set(Event.model_fields) - set(_Event_0_5_15.model_fields) == {
+        "channel_read",
+        "attachment_access",
+    }
     assert set(_Event_0_5_15.model_fields) <= set(Event.model_fields)
     assert is_compatible("0.5.15", PROTOCOL_VERSION)
     assert is_compatible(PROTOCOL_VERSION, "0.5.15")

@@ -37,10 +37,14 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     )
     # The next-only migrations follow the immutable published 0.12.2 chain.
     # The minimum tracks the newest schema the app reads (#2911's tenant scope);
-    # the head is the execution request start failure detail (0123, #4930),
-    # which every ExecutionRequest read names, so the minimum rises with it.
-    # The API writes the twelve-hour execution deadlines only 0140 admits (#5067).
-    assert window == {"schema_min": "0140", "schema_head": "0140"}
+    # The join requires both start diagnostics (0123) and attachment catalogs (0130).
+    # @spec AGENT-ROLE-PERSISTENCE-V1-9: policy ORM reads require 0133.
+    # @spec HTTP-APPROVAL-CONTINUITY-5: approval ORM reads require the 0137 column.
+    # @spec AUTOMATED-REMEDIATION-15: 0138 only widens a CHECK.
+    # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
+    # Workspace recovery reads require the 0141 outcome ledger.
+    # The 0145 join requires both the stable deadline backport (0140) and 0144.
+    assert window == {"schema_min": "0145", "schema_head": "0145"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -71,7 +75,8 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.3") == {"schema_min": "0140", "schema_head": "0140"}
     assert data["windows"].get("0.14.4") == {"schema_min": "0140", "schema_head": "0140"}
-    assert data["revisions"][-16:] == [
+    assert data["revisions"][-29:] == [
+        "0095",
         "0096",
         "0097",
         "0098",
@@ -87,7 +92,19 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0121",
         "0122",
         "0123",
+        "0130",
+        "0131",
+        "0136",
+        "0132",
+        "0133",
+        "0137",
+        "0138",
+        "0139",
         "0140",
+        "0141",
+        "0143",
+        "0144",
+        "0145",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -98,8 +115,21 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0108"] == "expand"
     assert kinds["0120"] == "expand"
     assert kinds["0121"] == "expand"
+    assert kinds["0122"] == "expand"
+    assert kinds["0130"] == "expand"
     assert kinds["0123"] == "expand"
+    assert kinds["0131"] == "expand"
+    assert kinds["0136"] == "expand"
+    assert kinds["0132"] == "expand"
+    assert kinds["0133"] == "expand"
+    assert kinds["0137"] == "expand"
+    assert kinds["0138"] == "expand"
+    assert kinds["0139"] == "expand"
     assert kinds["0140"] == "expand"
+    assert kinds["0141"] == "expand"
+    assert kinds["0143"] == "expand"
+    assert kinds["0144"] == "expand"
+    assert kinds["0145"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -165,11 +195,11 @@ def test_released_0076_startup_refuses_without_migrating_then_0101_starts(
         get_settings.cache_clear()
 
 
-@pytest.mark.parametrize("source", ["0105", "0107", "0106"])
+@pytest.mark.parametrize("source", ["0105", "0107", "0106", "0123", "0130", "0131", "0140", "0144"])
 def test_both_train_heads_upgrade_without_losing_existing_rows(
     source: str, isolated_migration_db: IsolatedMigrationDb
 ) -> None:
-    """The join applies each train's expansion and preserves stored agent rows."""
+    """@spec HTTP-PRINCIPAL-ADOPTION-V1-2: retain rows across the candidate upgrade."""
     isolated_migration_db.at(source)
     agent_id = uuid.uuid4()
     sql_rows(
@@ -183,7 +213,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0140"
+    assert current_revision() == "0145"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]
@@ -196,3 +226,24 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
     }
     assert {("approvals", "reply_identity"), ("publications", "reply_identity")} <= columns
     assert {("agent_channels", "trigger_label"), ("work_items", "trigger_label")} <= columns
+    assert {("attachment_catalogs", "id"), ("attachment_references", "id")} <= columns
+    assert ("execution_requests", "last_start_failure_detail") in columns
+    assert {
+        ("tenant_identity_providers", "http_selection"),
+        ("tenant_identity_providers", "lifecycle_generation"),
+    } <= columns
+    # 0140 (v0.14.3) and 0136 replace the same two checks, so either train's
+    # head reaches the twelve-hour bound through the 0145 join.
+    checks = {
+        row["conname"]: row["definition"]
+        for row in sql_dicts(
+            "SELECT conname, pg_get_constraintdef(oid) AS definition FROM pg_constraint "
+            "WHERE conname IN ('agents_execution_deadline_seconds_ck', "
+            "'execution_requests_deadline_ck')"
+        )
+    }
+    assert set(checks) == {"agents_execution_deadline_seconds_ck", "execution_requests_deadline_ck"}
+    assert "43200" in checks["agents_execution_deadline_seconds_ck"]
+    assert "10800" not in checks["agents_execution_deadline_seconds_ck"]
+    assert "'12:00:00'::interval" in checks["execution_requests_deadline_ck"]
+    assert "'03:00:00'::interval" not in checks["execution_requests_deadline_ck"]

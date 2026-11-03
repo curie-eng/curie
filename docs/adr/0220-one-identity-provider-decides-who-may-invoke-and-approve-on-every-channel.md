@@ -4,6 +4,11 @@ Date: 2026-10-13
 
 Status: Accepted
 
+Partially superseded by [ADR 0246](0246-common-admission-resolves-an-optional-http-identity-before-authorized-enqueue.md):
+the projection-only choice, HTTP link/connect source, expressly migrated raw-grant
+and role-policy clauses, and migrated enqueue cache authority enumerated there.
+Other clauses and unmigrated local behavior remain unchanged.
+
 Accepted 2026-10-14 with explicit maintainer approval from Brian Conn, recorded
 as an approving review on the publishing pull request
 ([#4513](https://github.com/curie-eng/curie/pull/4513)). The review thread on

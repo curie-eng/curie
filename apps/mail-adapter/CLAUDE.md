@@ -10,7 +10,12 @@ the enforceable-rule summary.
   database access.** Its credentials are `CURIE_CHANNEL_TOKEN` (presented as
   `X-API-Key` on ingress), `CURIE_EGRESS_SECRET` (checked on every inbound POST),
   `AGENTMAIL_API_KEY`, and the optional `CURIE_ADAPTER_PRINCIPAL` (ADR-0156,
-  presented only on `POST /approvals/{id}/resolve` when carrying an answer). Do not add `CURIE_API_KEY`, a Valkey client, or a DB
+  presented only on `POST /approvals/{id}/resolve` when carrying an answer). The
+  optional `CURIE_MAIL_RECEIVER_KEY` is its email receiver key (ADR 0260): it
+  signs the sender of each turn through the shared
+  `curie_internal.identity_context` signer and authorizes nothing alone. Never
+  add a second canonicalisation or MAC here, and never post unsigned when the
+  receiver is configured. Do not add `CURIE_API_KEY`, a Valkey client, or a DB
   session to the platform here; a capability the adapter does not hold cannot be
   stolen from it, and re-minting an expired `chn` token is an operator step for
   exactly that reason. Its local SQLite file is delivery state, not a platform

@@ -2603,6 +2603,34 @@ true
 {{- else -}}false{{- end -}}
 {{- end -}}
 
+{{/*
+Workspace recovery (ADR 0251): off by default. Enabling it requires a positive
+integer installation-wide byte cap that counts every recovery byte. Read
+through `default dict` for --reuse-values from a release that predates the key.
+The one helper both the API and the worker include, so a bad cap fails the
+render instead of starting an API that refuses to boot.
+*/}}
+{{- define "curie.workspaceRecoveryEnabled" -}}
+{{- $recovery := dig "workspace" "recovery" dict (.Values.worker | default dict) -}}
+{{- if get $recovery "enabled" -}}
+{{- $_ := include "curie.workspaceRecoveryMaxBytes" . -}}
+true
+{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{- define "curie.workspaceRecoveryMaxBytes" -}}
+{{- $recovery := dig "workspace" "recovery" dict (.Values.worker | default dict) -}}
+{{- $cap := get $recovery "maxBytes" -}}
+{{- if or (kindIs "invalid" $cap) (kindIs "string" $cap) (not (or (kindIs "float64" $cap) (kindIs "int64" $cap) (kindIs "int" $cap))) -}}
+{{- fail "worker.workspace.recovery.enabled=true requires worker.workspace.recovery.maxBytes to be a positive integer (ADR 0251): the installation-wide cap counts every recovery byte" -}}
+{{- end -}}
+{{- $number := float64 $cap -}}
+{{- if or (le $number 0.0) (ne $number (floor $number)) -}}
+{{- fail "worker.workspace.recovery.maxBytes must be a positive integer (ADR 0251): the installation-wide cap counts every recovery byte" -}}
+{{- end -}}
+{{- $cap | int64 -}}
+{{- end -}}
+
 {{/* Code host trust (ADR 0197): renders nothing when no ConfigMap is named. */}}
 {{- define "curie.codeHostTrust.name" -}}
 {{- dig "caBundle" "configMapRef" "name" "" (.Values.codeHostTrust | default dict) -}}
@@ -3008,4 +3036,38 @@ github code host together. */ -}}
 {{- $_ := set $out .path (pick . "pool" "digests" "base" "docker" "egress" "daemon") -}}
 {{- end -}}
 {{- toJson $out -}}
+{{- end -}}
+
+{{/* HTTP identity operator files (@spec HTTP-INVOCATION-EXECUTION-20). Each names an
+     operator-created Secret, or renders empty. Read through dig so a retained
+     release whose values predate httpIdentity renders unchanged. */}}
+{{- define "curie.httpIdentity.apiSecret" -}}
+{{- dig "httpIdentity" "existingSecret" "" (.Values.api | default dict) -}}
+{{- end -}}
+{{- define "curie.httpIdentity.providerCaBundle" -}}
+{{- if dig "httpIdentity" "providerCaBundle" false (.Values.api | default dict) -}}
+{{- if not (include "curie.httpIdentity.apiSecret" .) -}}
+{{- fail "api.httpIdentity.providerCaBundle requires api.httpIdentity.existingSecret: the CA bundle is a key of that Secret" -}}
+{{- end -}}
+true
+{{- end -}}
+{{- end -}}
+{{- define "curie.httpIdentity.receiverSecret" -}}
+{{- $name := dig "httpIdentity" "existingSecret" "" (.Values.dispatcher | default dict) -}}
+{{- if and $name (not (include "curie.httpIdentity.apiSecret" .)) -}}
+{{- fail "dispatcher.httpIdentity.existingSecret requires api.httpIdentity.existingSecret: the API must hold the receiver registrations it verifies" -}}
+{{- end -}}
+{{- $name -}}
+{{- end -}}
+{{/* Named operator Secret keys as 0440 files; only the named workload mounts them. */}}
+{{- define "curie.httpIdentity.volume" -}}
+- name: {{ .name }}
+  secret:
+    secretName: {{ .secret | quote }}
+    defaultMode: 0440
+    items:
+      {{- range .files }}
+      - key: {{ . }}
+        path: {{ . }}
+      {{- end }}
 {{- end -}}

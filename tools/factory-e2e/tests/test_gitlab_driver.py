@@ -57,11 +57,17 @@ The production contract the fakes below rely on:
    WorkItem to show a new request and reports ``delivery_status_code == 200``,
    ``delivery_api_status == "factory_admitted"``.
 8. ``tracker_evidence(change, work_item_id)`` returns ``closes_issue`` (the
-   merge request description carries ``Closes #<iid>``) and ``thread_replies``
-   (factory notes in the review discussion), and on the fixture
-   ``reporter_label_admitted`` and ``reporter_state_labels`` from a second
-   issue labelled by ``reporter``. ``judge_tracker`` is empty for True, 1, and
-   on the fixture False and [], and names each shortfall otherwise.
+   merge request description carries ``Closes #<iid>``), ``thread_replies``
+   (factory notes in the review discussion), ``in_progress_label_seconds``
+   (the seconds from the labeler's label to the ``curie-factory:running``
+   state label first appearing on the issue, None when it never appears within
+   one ``TRACKER_POLL_SECONDS`` interval plus 30) and
+   ``status_note_links_mr`` (True when exactly one non-system note from the
+   factory account on the issue carries the merge request's ``web_url``), and
+   on the fixture ``reporter_label_admitted`` and ``reporter_state_labels``
+   from a second issue labelled by ``reporter``. ``judge_tracker`` is empty
+   for True, 1, a number within the bound, and on the fixture False and [],
+   and names each shortfall otherwise.
 9. ``install_gitlab(p)`` runs ``curie factory quickstart --code-host gitlab
    --tracker gitlab`` with ``--repo``, ``--token-file`` (the factory token
    file), and on the fixture ``--forge-url <base_url>`` and ``--ca-file
@@ -386,9 +392,13 @@ class FakeGitLab:
     """GitLab REST v4 for one project, plus the factory's reaction to a label.
 
     A trigger label added by ``developer`` (fixture) or ``human`` (saas) admits
-    one WorkItem. A label from ``reporter`` admits nothing unless
-    ``admit_reporter`` is set. A diff comment by the labeler opens a review
-    discussion that the factory answers ``reply_count`` times.
+    one WorkItem, and the factory then applies its in-progress state label
+    (``state_label``, after ``state_label_after_polls`` reads of the issue) and
+    posts a status note (``note_links_mr`` decides whether it carries the merge
+    request URL; ``extra_link_notes`` adds more factory notes that do). A label
+    from ``reporter`` admits nothing unless ``admit_reporter`` is set. A diff
+    comment by the labeler opens a review discussion that the factory answers
+    ``reply_count`` times.
     """
 
     def __init__(self, *, target: str, label: str) -> None:
@@ -413,6 +423,14 @@ class FakeGitLab:
         self.closes = True
         self.fail_statuses_read = False
         self.refuse_all = False
+        # #4867: the factory's own reaction once its poll sees the labeler's
+        # label — the in-progress state label that lands on the issue, and the
+        # status note it posts there.
+        self.state_label: str | None = "curie-factory:running"
+        self.state_label_after_polls = 0
+        self.note_links_mr = True
+        self.extra_link_notes = 0
+        self.next_note_id = 500
 
     # -- identity --
 
@@ -508,6 +526,7 @@ class FakeGitLab:
                 "labels": _labels(body.get("labels")),
                 "author": actor,
                 "state": "opened",
+                "notes": [],
             }
             return 201, self.issue_view(iid)
         if rest[0] == "issues" and len(rest) >= 2:
@@ -517,7 +536,12 @@ class FakeGitLab:
             if len(rest) == 2 and method == "PUT":
                 return self.edit_issue(iid, body, actor)
             if len(rest) == 2 and method == "GET":
+                # Each read of the issue is one poll of the factory's tracker
+                # poll (#4867): that is what advances its pending label.
+                self._tick_state_label(iid)
                 return 200, self.issue_view(iid)
+            if len(rest) == 3 and rest[2] == "notes" and method == "GET":
+                return 200, list(self.issues[iid]["notes"])
             return (200, []) if method == "GET" else (201, {})
         if rest == ["merge_requests"] and method == "GET":
             return 200, [self.mr_view()]
@@ -563,6 +587,36 @@ class FakeGitLab:
             "web_url": f"https://example.invalid/{self.path}/-/issues/{iid}",
         }
 
+    def start_request(self, iid: int) -> None:
+        """The factory's own reaction to the labeler's trigger label: the
+        status note it posts on the issue and the in-progress state label it
+        moves there (#4867's two measured behaviors)."""
+
+        issue = self.issues[iid]
+        url = self.mr_view()["web_url"]
+        count = 1 + max(self.extra_link_notes, 0)
+        bodies = [f"Opened the merge request: {url}" if self.note_links_mr else "Opened a change."]
+        for body in bodies * count:
+            issue["notes"].append(self.note(self.factory_user, body, self.next_note_id))
+            self.next_note_id += 1
+        issue["state_label_polls"] = None if self.state_label is None else max(
+            self.state_label_after_polls, 0
+        )
+
+    def _tick_state_label(self, iid: int) -> None:
+        """One poll of the issue: land the pending in-progress label on its tick."""
+
+        issue = self.issues[iid]
+        polls = issue.get("state_label_polls")
+        if polls is None:
+            return
+        if polls > 0:
+            issue["state_label_polls"] = polls - 1
+        if issue["state_label_polls"] == 0 and self.state_label and self.state_label not in (
+            issue["labels"]
+        ):
+            issue["labels"].append(self.state_label)
+
     def edit_issue(self, iid: int, body: Mapping[str, Any], actor: str) -> tuple[int, Any]:
         issue = self.issues[iid]
         for label in _labels(body.get("add_labels")):
@@ -573,6 +627,8 @@ class FakeGitLab:
                 continue
             if actor == self.labeler() or (actor == "reporter" and self.admit_reporter):
                 self.work_items.append((f"wi-{iid}", iid))
+            if actor == self.labeler():
+                self.start_request(iid)
             if actor == "reporter" and self.reporter_state_label:
                 issue["labels"].append("curie-factory:in-progress")
         for label in _labels(body.get("remove_labels")):
@@ -812,7 +868,9 @@ def _rig(
 CHANGE = fe.ChangeRef(MR_IID, "https://example.invalid/mr/7")
 
 
-def _whole_loop(rig: _Rig) -> tuple[Any, dict[str, Any]]:
+def _whole_loop(
+    rig: _Rig, before_evidence: Callable[[_Rig], None] | None = None
+) -> tuple[Any, dict[str, Any]]:
     """Every driver step the loop takes, in its order; the tracker evidence."""
 
     driver = rig.driver()
@@ -826,6 +884,8 @@ def _whole_loop(rig: _Rig) -> tuple[Any, dict[str, Any]]:
     driver.post_review(CHANGE, "Please add a round trip unit test.")
     driver.merge(CHANGE)
     driver.change_merged(CHANGE)
+    if before_evidence is not None:
+        before_evidence(rig)
     evidence = driver.tracker_evidence(CHANGE, work_item_id)
     return driver, evidence
 
@@ -1209,6 +1269,102 @@ def test_fixture_reporter_probe_labels_as_reporter_and_admits_nothing(
 
 
 @pytest.mark.parametrize(
+    ("knobs", "expected"),
+    [
+        # A prompt factory: the label is there on the first poll.
+        ({}, "within"),
+        # The label lands on the third poll, five seconds apart: the driver
+        # must measure that wait, not answer the instant the loop started.
+        ({"state_label_after_polls": 3}, "delayed"),
+        # The label never lands: a missing, a mis-timed and a wrong-state label.
+        ({"state_label": None}, "never"),
+        ({"state_label": "curie-factory:queued"}, "never"),
+        ({"state_label_after_polls": 20}, "never"),
+    ],
+)
+@pytest.mark.parametrize("target", ["fixture", "saas"])
+def test_gitlab_in_progress_label_within_poll(
+    knobs: dict[str, Any],
+    expected: str,
+    target: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_ca: Path,
+) -> None:
+    """#4867 decision 1: the time from the developer's label to the
+    ``curie-factory:running`` label landing on the issue is recorded, and is
+    within one tracker poll interval plus 30 seconds; a label that never lands
+    (or lands past the bound) is one named shortfall."""
+
+    gitlab = _gitlab_module()
+    rig = _target_rig(target, tmp_path, monkeypatch, fixture_ca)
+    for name, value in knobs.items():
+        setattr(rig.gitlab, name, value)
+    driver, evidence = _whole_loop(rig)
+    seconds = evidence["in_progress_label_seconds"]
+    if expected == "never":
+        assert seconds is None, (knobs, seconds)
+        failures = driver.judge_tracker(evidence)
+        assert len(failures) == 1, (knobs, failures)
+        assert "in-progress label" in failures[0], failures
+        return
+    assert isinstance(seconds, (int, float)) and seconds >= 0, seconds
+    assert seconds <= gitlab.IN_PROGRESS_LABEL_BOUND_SECONDS, seconds
+    assert driver.judge_tracker(evidence) == [], (knobs, evidence)
+    if expected == "delayed":
+        # The fake lands the label on its third poll, after two 5 second
+        # sleeps: the driver must have measured those waits, and no more.
+        assert 10 <= seconds <= 11, "the driver did not measure the label's delay"
+
+
+def _human_note_links_mr(rig: _Rig) -> None:
+    """A human's note on the labelled issue that also carries the MR URL."""
+
+    gitlab = rig.gitlab
+    issue = gitlab.issues[gitlab.first_iid()]
+    url = gitlab.mr_view()["web_url"]
+    issue["notes"].append(gitlab.note(gitlab.labeler(), f"Here it is: {url}", 900))
+
+
+@pytest.mark.parametrize(
+    ("knobs", "before_evidence", "expected"),
+    [
+        ({}, None, True),
+        # A human note carrying the URL does not count: exactly one factory note.
+        ({}, _human_note_links_mr, True),
+        ({"note_links_mr": False}, None, False),
+        # Two factory notes carrying the URL: not exactly one.
+        ({"extra_link_notes": 1}, None, False),
+    ],
+)
+@pytest.mark.parametrize("target", ["fixture", "saas"])
+def test_gitlab_status_note_links_mr(
+    knobs: dict[str, Any],
+    before_evidence: Callable[[_Rig], None] | None,
+    expected: bool,
+    target: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_ca: Path,
+) -> None:
+    """#4867 decision 2: ``status_note_links_mr`` is true only when exactly
+    one non-system note from the factory account on the issue carries the merge
+    request's web URL, and anything else is one named shortfall."""
+
+    rig = _target_rig(target, tmp_path, monkeypatch, fixture_ca)
+    for name, value in knobs.items():
+        setattr(rig.gitlab, name, value)
+    driver, evidence = _whole_loop(rig, before_evidence)
+    assert evidence["status_note_links_mr"] is expected, (knobs, evidence)
+    failures = driver.judge_tracker(evidence)
+    if expected is True:
+        assert failures == [], (knobs, failures)
+    else:
+        assert len(failures) == 1, (knobs, failures)
+        assert "status note" in failures[0], failures
+
+
+@pytest.mark.parametrize(
     ("knob", "value", "field"),
     [
         ("admit_reporter", True, "reporter_label_admitted"),
@@ -1216,6 +1372,10 @@ def test_fixture_reporter_probe_labels_as_reporter_and_admits_nothing(
         ("reply_count", 0, "thread_replies"),
         ("reply_count", 2, "thread_replies"),
         ("closes", False, "closes_issue"),
+        ("state_label", None, "in_progress_label_seconds"),
+        ("state_label", "curie-factory:queued", "in_progress_label_seconds"),
+        ("note_links_mr", False, "status_note_links_mr"),
+        ("extra_link_notes", 1, "status_note_links_mr"),
     ],
 )
 def test_fixture_tracker_evidence_and_judge_name_each_shortfall(
@@ -1238,7 +1398,7 @@ def test_fixture_judge_fails_an_empty_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture_ca: Path
 ) -> None:
     driver = _rig(tmp_path, monkeypatch, "fixture", fixture_ca).driver()
-    assert len(driver.judge_tracker({})) == 4
+    assert len(driver.judge_tracker({})) == 6
 
 
 def test_fixture_ci_state_reads_the_commit_statuses(
@@ -1336,7 +1496,7 @@ def test_saas_has_no_reporter_probe_and_judges_without_it(
     assert evidence["closes_issue"] is True
     assert evidence["thread_replies"] == 1
     assert driver.judge_tracker(evidence) == []
-    assert len(driver.judge_tracker({})) == 2
+    assert len(driver.judge_tracker({})) == 4
 
 
 # --- credentials never leak ------------------------------------------------------------

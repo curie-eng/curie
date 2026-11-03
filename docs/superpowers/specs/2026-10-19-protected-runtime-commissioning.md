@@ -18,6 +18,12 @@ provisioning or activation evidence. The design choices that the Accepted ADRs
 leave to a realizing specification are fixed under
 [Design decisions](#design-decisions), each with the clauses it rests on.
 
+The evidence-composition clauses were amended on 2026-10-22 by
+[ADR 0241](../../adr/0241-a-commissioning-run-separates-destructive-trials-from-final-acceptance.md) and its
+[trial-series specification](2026-10-22-commissioning-trial-series.md).
+That amendment governs historical destructive trials, aggregate run custody
+and final-only acceptance. All other clauses remain in force.
+
 ## Scope
 
 In scope are the stages ADR 0236 plans: one disposable local Kubernetes
@@ -62,12 +68,14 @@ to match.
 | Candidate enqueue | Commissioning ingress | Reads permit and journal; submits bounded intents to the campaign lane. | Writes committed admissions, permit, journal, or any production key. |
 | Candidate worker | Commissioning worker | Reads permit, journal and committed admissions; consumes the campaign lane. | Writes control, permit, journal, admission or production lane keys. |
 | Production enqueue, worker, verifier | Production entry points | Unchanged LANE-3 roles from the manifest's `credential_refs`. | Reads or writes any `protected:commissioning:*` key. |
+| Production control reader | Production API ingress | The unchanged LANE-3 `control_reader` metadata role that the runtime directory's `bootstrap.json` names, under [design decision 10](#10-g-covers-every-broker-user-the-installation-creates). | Reads or writes any `protected:commissioning:*` key, or writes any key outside its unchanged role. |
+| Production source writer | Production API ingress, source administration | The unchanged LANE-3 `source_writer` metadata role that the runtime directory's `source_writer.json` names, under [design decision 10](#10-g-covers-every-broker-user-the-installation-creates). | Reads or writes any `protected:commissioning:*` key, or writes any key outside its unchanged role. |
 | Qualification publisher | Verifier, after acceptance | Writes the Qualification record of the manifest's `qualification_id` once with `SET NX`, and reads back only that key, under [design decision 8](#8-a-dedicated-principal-publishes-qualification). | Reads or writes any other key, or holds any scripting, ACL or channel right. |
 | ACL observer | Verifier and guard reobservation | Reads broker ACL users with `ACL GETUSER` only, for the check of [design decision 7](#7-acl-principal-state-is-observed-not-hashed). | Writes any ACL user, or reads or writes any key or channel. |
 | Ordinary worker, source, runner | None | No broker authentication. | Everything above. |
 
-All seven broker identities, the Qualification publisher and the ACL observer
-are distinct ACL users with distinct credential issuances. No principal holds a wildcard write grant that covers another row's
+All seven broker identities, the Qualification publisher, the production
+control reader and source writer and the ACL observer are distinct ACL users with distinct credential issuances. No principal holds a wildcard write grant that covers another row's
 keys. The realizing ACL inventory is measured against the pinned Valkey
 version, including Lua key selectors, as LANE-3 requires. If the pinned version
 cannot separate these rights, the campaign refuses; it does not weaken a role.
@@ -153,6 +161,8 @@ those keep their grammars. It uses the same encoding rules as the permit.
 | `candidate_credentials` | Object with exactly `enqueue` and `worker`. |
 | `issuer_identity`, `control_identity` | `CredentialReference` values. |
 | `qualification_publisher_identity` | `CredentialReference` of the Qualification publisher of [design decision 8](#8-a-dedicated-principal-publishes-qualification). |
+| `control_reader_identity` | `CredentialReference` of the production control reader of [design decision 10](#10-g-covers-every-broker-user-the-installation-creates). |
+| `source_writer_identity` | `CredentialReference` of the production source writer of [design decision 10](#10-g-covers-every-broker-user-the-installation-creates). |
 | `mediator_identity`, `gateway_identity` | `CredentialReference` values for the launch mediator and provider gateway. |
 | `source_scope` | Sorted array of 1 to 64 source objects, as in the permit. |
 | `target_scope` | Sorted array of 1 to 64 `opaque_ref` values. |
@@ -160,7 +170,9 @@ those keep their grammars. It uses the same encoding rules as the permit.
 
 Every credential ID in B is pairwise distinct across `production_credentials`,
 `candidate_credentials`, `issuer_identity`, `control_identity`,
-`qualification_publisher_identity`, `mediator_identity` and `gateway_identity`.
+`qualification_publisher_identity`, `control_reader_identity`,
+`source_writer_identity`,
+`mediator_identity` and `gateway_identity`.
 
 Hash order breaks the cycle between the records:
 
@@ -287,8 +299,12 @@ production and commissioning references refuse.
 <!-- @spec PROTECTED-COMMISSIONING-5 -->
 The operator command of ADR 0236 owns a unique installation, its labels and
 IDs, cleanup registered before startup, the exact image and configuration tuple,
-and one bounded campaign. Each case below needs a passing observation from this
-installation's own producers or from signed channel replies bound to it.
+and one precommitted bounded run containing separate destructive trials and a
+final accepting campaign. The exact inventory, permitted historical evidence,
+aggregate bounds and fresh final checks are defined by the
+[trial-series specification](2026-10-22-commissioning-trial-series.md). Each case
+below still needs a passing observation from this installation's own producers;
+the fixed signed guard channel does not attest arbitrary case results.
 
 Positive: a supplied synthetic alert arrives through signed ingress, a read-only
 turn reads the owned fixture, and a grounded reply reaches the operator's own
@@ -322,6 +338,11 @@ clause demonstrates that transition against the existing production readers.
 If an implementation cannot hold every invariant below, this specification
 returns to ADR review; it does not redefine "unchanged tuple".
 
+For this clause, "the campaign" is the final accepting campaign of the
+[trial series](2026-10-22-commissioning-trial-series.md). Historical trial
+transitions finish before its premeasurement; no historical tuple is relabeled
+as the final tuple.
+
 Before the campaign the provisioner installs, and the campaign measures:
 
 * M, with its `qualification_id` fixed, and the production credentials in
@@ -338,8 +359,9 @@ Before the campaign the provisioner installs, and the campaign measures:
   entry points.
 
 With no Qualification or Readiness record present, the production worker's
-`open_runtime` refuses before consuming and the support probe answers
-`qualification_unavailable`. Those refusals are the ADR 0224 observation that
+`open_runtime` refuses before consuming, a protected source policy cannot be
+published (its publication evaluation answers `qualification_unavailable`) and
+the support probe answers `source_closed` for that unpublished source. Those refusals are the ADR 0224 observation that
 production credentials are assigned and isolated while production dispatch
 authority is unavailable.
 
@@ -474,20 +496,26 @@ observed image IDs per platform, the launch projection digest, and pinned SDK
 primitive observations for that runner image and runtime profile. The verifier
 re-validates the binding on reuse.
 
-Installation observations are never reused: guard, RBAC, CNI and network
+Except for the explicitly precommitted historical destructive trials in the
+[trial-series specification](2026-10-22-commissioning-trial-series.md),
+installation observations are never reused: guard, RBAC, CNI and network
 enforcement, broker ACL and identity, credential separation, revocation,
 cleanup and the ingress to reply path. Installation A cannot qualify
 installation B. A broker `run_id` change, a new manifest, execution
 configuration, guard or bootstrap invalidates the bound campaign evidence and
-requires a new campaign against the new tuple.
+requires a new campaign against the new tuple. The trial-series exception
+retains the old observations only as authenticated transition history within
+one fresh run; it never treats them as fresh checks of the final epoch. The
+final campaign freshly observes the controls and delivery path required by that
+specification.
 
 ## Verification boundary
 
 Closed codec and pure binding tests prove grammar and refusal only. Real
 isolated Valkey tests prove the authenticated journal, reservation and restart
 behavior. Actual Kubernetes controls and pinned SDK tests prove preventive
-controls. Only the complete campaign of clause 5 on a fresh installation proves
-installation delivery. No slice claims production activation or release
+controls. Only the complete trial series and final campaign of clause 5 on a
+fresh installation proves installation delivery. No slice claims production activation or release
 eligibility.
 
 ## Design decisions
@@ -598,15 +626,16 @@ changes. The only measured value that changes is the selection's
 `admission_open`, the predeclared authorization switch; its other members stay
 equal under compare and set. The verifier re-reads B, G, M and the execution
 digest after the last write and records that they equal the premeasured values. Before
-activation the production worker refuses in `open_runtime` and the support
-probe answers `qualification_unavailable`; after it, the same unchanged readers
+activation the production worker refuses in `open_runtime`, a protected source
+policy's publication refuses with `qualification_unavailable` and the support
+probe answers `source_closed`; after it, the same unchanged readers
 accept because the records they already require now exist.
 
 ### 5. Evidence bar
 
 An upstream automated remediation issue closes on evidence from a freshly
-commissioned disposable installation: the complete clause 5 campaign, accepted
-by the ADR 0236 verifier, on an installation created for that run. Code, fake
+commissioned disposable installation: the complete clause 5 trial series and
+final campaign, accepted by the independent verifier under ADRs 0236/0241, on an installation created for that run. Code, fake
 model plumbing, direct provider replies or a reused installation do not close
 it. Closing an upstream issue is not production activation: each production
 installation still runs its own campaign against its own final tuple and is
@@ -700,3 +729,74 @@ that is not commissioned. A commissioned installation moves the write to this
 publisher. Only the writer changes: the Qualification grammar, its key and the
 production readers stay as they are. The readers check the record's content and
 binding to M, not which principal wrote it.
+
+### 9. G hashes candidate rule templates, instantiated per campaign
+
+Decided by the maintainer on 2026-10-21.
+
+Clause 2 fixes the hash order B, then G, then M, then permits. G hashes every
+principal's rules, but the candidate enqueue and candidate worker rules name the
+campaign lane, which clause 1 derives from the permit's runtime and campaign
+identity. No permit exists when G is built, so G cannot hash instantiated
+candidate rules.
+
+G therefore hashes each candidate principal's rule template. A template is the
+exact rule list with every occurrence of the campaign lane prefix
+`protected:commissioning:lane:<digest>` replaced by the single placeholder
+`{lane}`. It is the same template for every campaign of the installation, so G
+stays fixed at installation and needs no permit. No other part of a candidate
+rule varies, and no other principal's rules take a placeholder.
+
+When a campaign starts, the provisioner instantiates each template with the lane
+the permit derives and sets the candidate user's rules to exactly that list. The
+ACL principal state check of design decision 7 then also compares each
+candidate user's rules with the template instantiated for the lane of the
+current permit. A lane other than the current permit's, or any rule outside the
+instantiated template, refuses.
+
+Reasoning. The alternatives each lose a property the specification needs.
+Fixing the campaign identity before G would force a new installation for every
+campaign, including a retry after a failed one. A runtime-scoped lane with no
+campaign identity would drop the per-campaign isolation of clause 1. A template
+keeps both: lanes stay distinct per campaign, and G, M and every other measured
+value stay unchanged across campaigns. Activation step 2 disables the
+candidate users and leaves their instantiated rules in place; it changes no
+template and so no G.
+
+### 10. G covers every broker user the installation creates
+
+Decided by the maintainer on 2026-10-21.
+
+G covers every broker user the installation creates, including production
+metadata principals such as the control reader and the source writer. Each
+such user's rules are
+hashed into G, and the ACL principal state check of design decision 7 observes
+its password hash set and enabled state. No broker user exists outside that
+set.
+
+The production API ingress reads control records through the runtime
+directory of SOURCE-9 and [#4076](https://github.com/curie-eng/curie/issues/4076),
+whose `bootstrap.json` names a LANE-3 `control_reader` principal distinct
+from the enqueue principal. That principal is not one of the manifest's
+`credential_refs`, so B names it separately as `control_reader_identity`, like
+the Qualification publisher of design decision 8.
+
+Source administration (the protected source policy routes) writes source
+records through the runtime directory's `source_writer.json`, which names a
+LANE-3 `source_writer` principal. The campaign's permit sources need a
+protected source policy, so the installation creates this principal too, and
+B names it as `source_writer_identity`.
+
+Each credential is issued by the administrator-run installation bootstrap.
+Their rules are the unchanged production `control_reader` and `source_writer`
+recipes; no production recipe changes.
+
+A production metadata principal that the installation does not create is not
+added. Adding one later is a change to B and G, made before the campaign that
+measures them.
+
+Reasoning. Clause 6 requires every measured value to be in place before the
+campaign, and design decision 7 detects misuse of the provisioner's `ACL
+SETUSER` right only for users it observes. A broker user outside G could hold
+rules no campaign measured and a password no reobservation checks, so the
+installation could not show that its broker authority is what was commissioned.

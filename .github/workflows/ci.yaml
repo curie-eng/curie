@@ -399,7 +399,7 @@ jobs:
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             pytest_args+=(--ci-shard-tiers "$PYTEST_STORAGE_SHARDS,$PYTEST_FULL_SHARDS")
           fi
-          pytest_args+=(--deselect=tools/factory-e2e/tests/test_c4_admitted_agent.py)
+          pytest_args+=(--deselect=tools/factory-e2e/tests/test_c4_admitted_agent.py --deselect=tools/factory-e2e/tests/test_c4_dynamic_base.py)
           pytest_args+=(--ignore tools/factory-e2e/tests/test_c4_upgrade_migration.py)
           pytest_args+=(--ignore tools/factory-e2e/tests/test_c4_cluster_up.py)
           pytest_args+=(--ignore tools/factory-e2e/tests/test_c4_tracker_scope.py)
@@ -778,6 +778,7 @@ jobs:
       # fetch-depth: 0 checkout so the release tags are present.
       - name: Contract migration timing gate
         run: uv run python scripts/check-contract-migration-timing.py
+      - {name: Test-time ratchets, run: uv run python -m curie_test_support.ratchets}
       - name: Ruff
         run: uv run ruff check .
       - name: Mypy
@@ -3642,7 +3643,7 @@ jobs:
           CASE_SHARD: ${{ matrix.shard }}/5
           CURIE_C4_CANDIDATE_CLI: ${{ github.workspace }}/cli/target/release/curie
           CURIE_C4_CANDIDATE_IMAGES: curie-ci/{component}:candidate
-        run: uv run pytest -q -n 0 --durations=0 tools/factory-e2e/tests/test_c4_admitted_agent.py --case-shard "$CASE_SHARD"
+        run: uv run pytest -q -n 0 --durations=0 tools/factory-e2e/tests/test_c4_admitted_agent.py tools/factory-e2e/tests/test_c4_dynamic_base.py --case-shard "$CASE_SHARD"
       - name: Upload the admitted agent failure digests
         if: failure()
         uses: actions/upload-artifact@v7

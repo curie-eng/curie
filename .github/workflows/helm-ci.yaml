@@ -194,6 +194,11 @@ jobs:
       - name: Reject chart-owned extraEnv duplicates
         run: bash charts/curie/ci/reserved-env-assertions.sh
 
+      # Prove the HTTP identity operator files are off by default and, when
+      # selected, mount read-only into the API or dispatcher container alone.
+      - name: helm render assertions (HTTP identity operator files)
+        run: bash charts/curie/ci/http-identity-mount-assertions.sh
+
       # Prove the factory.* block renders CURIE_FORGES with mounted credential
       # files and that a removed api.* factory key is refused (#4397).
       - name: helm render assertions (factory forges)
@@ -224,6 +229,11 @@ jobs:
       # namespace, the same namespace the worker claims sandboxes in.
       - name: helm render assertions (api runner namespace)
         run: bash charts/curie/ci/api-runner-namespace-assertions.sh
+
+      # Prove workspace recovery (ADR 0251) is off by default, reaches the API
+      # and worker when enabled with a positive cap, and refuses a bad cap.
+      - name: helm render assertions (workspace recovery)
+        run: bash charts/curie/ci/workspace-recovery-assertions.sh
 
       # Prove the retired BYO-model LiteLLM sidecar (issue #253) is absent by
       # default and that enabling its values flag is refused by the chart
@@ -366,17 +376,6 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/otel-collector-k8s-events-assertions.sh
 
-      # Prove every first-party chart workload carries the shared OTLP env
-      # (#2360). Membership is derived from rendered chart-owned images, not a
-      # named allowlist, so a sixth Deployment is rejected rather than skipped.
-      # Optional mail, the runner SandboxTemplate, collector-on vs external
-      # endpoint, and the two mutation controls (unknown-without-OTLP, stripped
-      # OTLP) live in this script rather than the durability suite.
-      - name: helm render assertions (instrumented first-party workloads)
-        run: |
-          set -euo pipefail
-          bash charts/curie/ci/instrumented-workload-assertions.sh
-
       - name: helm render assertions (SRE bot observability stack)
         run: |
           set -euo pipefail
@@ -404,17 +403,6 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/langfuse-image-pin-assertions.sh
-
-      # Refuse untagged, :latest and major/minor-alias image references in
-      # values *Image keys, in rendered container image fields, and in
-      # compose.dev.yaml services (#2318, #2319). The security probe's netshoot
-      # image was the first miss: a bare repository pulls :latest with implicit
-      # Always. An alias like postgres:16-alpine is the subtler one -- it has a
-      # tag, but upstream republishes it under the chart version.
-      - name: helm render assertions (unpinned images)
-        run: |
-          set -euo pipefail
-          bash charts/curie/ci/unpinned-image-assertions.sh
 
       # Prove postgres.podSecurityContext.fsGroup is the gid of the `postgres`
       # user inside the digest-pinned image, by running that image (#2319). The
@@ -534,14 +522,6 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/langfuse-clickhouse-readiness-assertions.sh
 
-      # Prove the Langfuse web+worker containers carry a numeric runAsUser
-      # alongside runAsNonRoot (issue #351) so the kubelet can verify non-root
-      # and the pods actually start on an enforcing cluster.
-      - name: helm render assertions (langfuse runAsUser)
-        run: |
-          set -euo pipefail
-          bash charts/curie/ci/langfuse-runasuser-assertions.sh
-
       # Prove the Postgres readiness gate is rendered on BOTH Langfuse
       # Deployments (#2330: it was web-only, so langfuse-worker crash-looped on
       # the same Prisma P1001 that #1853 fixed for web), ordered before the
@@ -555,32 +535,6 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/langfuse-postgres-readiness-assertions.sh
-
-      # Prove langfuse-worker carries both probes on its :3030 endpoint -- #71's
-      # criterion is that every Deployment with a persistent process has both a
-      # readiness and a liveness probe, and the worker was the last violation.
-      # Readiness is the SIGTERM-aware /api/ready so a terminating pod drains;
-      # liveness is tcpSocket so a Postgres or Valkey blip cannot restart the
-      # single replica into its boot migrations (#71, #2330).
-      - name: helm render assertions (langfuse worker probes)
-        run: |
-          set -euo pipefail
-          bash charts/curie/ci/langfuse-worker-probe-assertions.sh
-
-      # Prove the probe-window invariant across the WHOLE render, not a named
-      # list: for every container carrying both probes, the liveness failure
-      # cutoff -- initialDelaySeconds + (failureThreshold - 1) * periodSeconds,
-      # kubelet defaults applied to omitted keys -- must be strictly LATER than
-      # the readiness one, or the kubelet restarts a container that is still
-      # inside the boot window readiness was sized to tolerate. postgres (WAL
-      # replay), langfuse-web and langfuse-worker (Prisma/ClickHouse boot
-      # migrations) and api all inverted the two probes. Also requires an
-      # explicit livenessProbe timeoutSeconds everywhere, since the kubelet's
-      # invisible 1s default is the silent half of the postgres case.
-      - name: helm render assertions (probe windows)
-        run: |
-          set -euo pipefail
-          bash charts/curie/ci/probe-window-assertions.sh
 
       # Prove the controller NetworkPolicy RBAC split (issue #350): exactly one
       # read-only cluster grant (get/list/watch) so the informer syncs, no
@@ -1007,6 +961,11 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/worker-turn-receipt-assertions.sh
+
+      - name: helm render assertions (manifest policy P1-P5)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/policy-assertions.sh
 
       # Prove the key-free object store path (#1325, #2211). Pointing the bundle
       # store at a real cloud object store used to REQUIRE static access keys:

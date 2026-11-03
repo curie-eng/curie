@@ -147,7 +147,15 @@ FORBIDDEN = [
 
 
 def _shipped_files() -> list[Path]:
-    files = [p for p in BUNDLE.rglob("*") if p.is_file()]
+    # Contributor imports create local bytecode with absolute build paths. These
+    # generated caches are excluded from both bundle packing and embedded assets.
+    files = [
+        p
+        for p in BUNDLE.rglob("*")
+        if p.is_file()
+        and not {"__pycache__", ".ruff_cache"}.intersection(p.relative_to(BUNDLE).parts)
+        and p.suffix not in {".pyc", ".pyo"}
+    ]
     return [*files, DRIVER]
 
 

@@ -99,8 +99,9 @@ spec:
       # The runner-logs proxy lists pods and reads pod logs via the K8s API, so
       # the API pod runs as its own ServiceAccount (see api-rbac.yaml).
       serviceAccountName: {{ include "curie.fullname" . }}-api
-      {{- if include "curie.factory.hasCredentials" . }}
-      # The api runs as gid 1000: fsGroup reads the 0440 forge credentials.
+      {{- if or (include "curie.factory.hasCredentials" .) (include "curie.httpIdentity.apiSecret" .) }}
+      # The api runs as gid 1000: fsGroup reads the 0440 forge credentials and
+      # HTTP identity operator file.
       securityContext:
         fsGroup: 1000
       {{- end }}
@@ -224,6 +225,12 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: remediationAuthorityKey
+            - name: ATTACHMENT_TRANSFER_TIMEOUT_SECONDS
+              value: {{ dig "broker" "transferTimeoutSeconds" 300 .Values.worker.attachments | quote }}
+            - name: ATTACHMENT_ACCESS_ENABLED
+              value: {{ and .Values.worker.attachments.enabled (eq (.Values.worker.attachments.mode | default "eager") "lazy") | quote }}
+            - name: ATTACHMENT_BROKER_URL
+              value: {{ printf "http://%s-attachment-broker:%v" (include "curie.fullname" .) (dig "broker" "port" 8093 .Values.worker.attachments) | quote }}
             - name: CURIE_INTERNAL_WORKER_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -247,6 +254,16 @@ spec:
             # renders the same value from the same helper.
             - name: CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES
               value: {{ include "curie.actionExecutorMaxConcurrentSandboxes" . | quote }}
+            {{- if eq (include "curie.workspaceRecoveryEnabled" .) "true" }}
+            # Workspace recovery (ADR 0251). The ledger compares the worker's
+            # archive limit with its own, so both render from the same value.
+            - name: CURIE_WORKSPACE_RECOVERY_ENABLED
+              value: "true"
+            - name: CURIE_WORKSPACE_RECOVERY_MAX_BYTES
+              value: {{ include "curie.workspaceRecoveryMaxBytes" . | quote }}
+            - name: CURIE_WORKSPACE_MAX_ARCHIVE_BYTES
+              value: {{ .Values.worker.workspace.maxArchiveBytes | int64 | quote }}
+            {{- end }}
             # The automated remediation switch (AUTOMATED-REMEDIATION-1). The
             # worker renders the same value from the same helper, which fails
             # the render when it is on and the executor is off.
@@ -353,6 +370,8 @@ spec:
               value: {{ get (.Values.factory | default dict) "enabled" | default false | quote }}
             - name: FACTORY_INTAKE
               value: {{ get (.Values.factory | default dict) "intake" | default "poll" | quote }}
+            - name: FACTORY_BASE_LABEL_SETTLE_S
+              value: {{ dig "baseLabelSettleSeconds" 60 (.Values.factory | default dict) | quote }}
             - name: FACTORY_CI_WAIT_S
               value: {{ include "curie.factory.str" (get (.Values.factory | default dict) "ciWaitSeconds" | default 3600) | quote }}
             - name: CURIE_FORGES
@@ -487,6 +506,11 @@ spec:
             # Per-thread conversation transcript cap in bytes (#3301).
             - name: TRANSCRIPT_MAX_THREAD_BYTES
               value: {{ .Values.api.transcriptMaxThreadBytes | int64 | quote }}
+            {{- if include "curie.httpIdentity.apiSecret" . }}
+            # HTTP identity operator file (HTTP-INVOCATION-EXECUTION-20).
+            - name: CURIE_HTTP_IDENTITY_DIR
+              value: /var/run/curie/http-identity
+            {{- end }}
             {{- $checksumExtraEnv | nindent 12 }}
           ports:
             - name: http
@@ -505,14 +529,24 @@ spec:
             {{- include "curie.api.resources" . | nindent 12 }}
           {{- $codeHostTrust := include "curie.codeHostTrust.name" . }}
           {{- $forgeCredentials := include "curie.factory.hasCredentials" . }}
-          {{- if or $codeHostTrust $forgeCredentials }}
+          {{- $httpIdentity := include "curie.httpIdentity.apiSecret" . }}
+          {{- $providerCa := include "curie.httpIdentity.providerCaBundle" . }}
+          {{- if or $codeHostTrust $forgeCredentials $httpIdentity }}
           volumeMounts:
             {{- include "curie.codeHostTrust.volumeMount" . | nindent 12 }}
             {{- include "curie.factory.credentialMount" . | nindent 12 }}
+            {{- if $httpIdentity }}
+            - name: http-identity
+              mountPath: /var/run/curie/http-identity
+              readOnly: true
+            {{- end }}
           {{- end }}
-      {{- if or $codeHostTrust $forgeCredentials }}
+      {{- if or $codeHostTrust $forgeCredentials $httpIdentity }}
       volumes:
         {{- include "curie.codeHostTrust.volume" . | nindent 8 }}
         {{- include "curie.factory.credentialVolume" . | nindent 8 }}
+        {{- if $httpIdentity }}
+        {{- include "curie.httpIdentity.volume" (dict "name" "http-identity" "secret" $httpIdentity "files" (compact (list "api-runtime.json" (ternary "provider-ca.pem" "" (eq $providerCa "true"))))) | nindent 8 }}
+        {{- end }}
       {{- end }}
 {{- end }}

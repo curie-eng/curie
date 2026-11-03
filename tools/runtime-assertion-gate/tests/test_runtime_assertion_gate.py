@@ -227,6 +227,12 @@ def test_select_lists_added_and_modified_assertions_only(tmp_path: Path) -> None
     subprocess.run([*git, "commit", "-qm", "base"], cwd=repo, check=True)
     (repo / SCRIPT).write_text("echo two\n")
     (repo / "charts/curie/ci/runtime/new-runtime.sh").write_text("echo new\n")
+    (repo / "charts/curie/ci/runtime/failed-first-install-retry-runtime.sh").write_text(
+        "echo held\n"
+    )
+    (repo / "charts/curie/ci/runtime/failed-first-install-retry-other.sh").write_text(
+        "echo required\n"
+    )
     (repo / "charts/curie/ci/runtime/notes.md").write_text("not a script\n")
     fixture = repo / WORKLOAD_INSTALL
     fixture.parent.mkdir(parents=True)
@@ -244,6 +250,7 @@ def test_select_lists_added_and_modified_assertions_only(tmp_path: Path) -> None
     )
     assert json.loads(completed.stdout) == [
         SCRIPT,
+        "charts/curie/ci/runtime/failed-first-install-retry-other.sh",
         "charts/curie/ci/runtime/new-runtime.sh",
         WORKLOAD_INSTALL,
     ]
@@ -469,6 +476,18 @@ def test_chart_scenario_registration_preserves_all_gate_requirements(
 
 def test_real_ci_registers_every_enabled_chart_runtime_script() -> None:
     gate.check_registration(CI, [*CHART_RUNTIME_SCRIPTS, WORKLOAD_INSTALL])
+
+
+def test_disabled_first_install_remains_ineligible_for_registration() -> None:
+    script = "charts/curie/ci/runtime/failed-first-install-retry-runtime.sh"
+    jobs = yaml.safe_load(CI.read_text())["jobs"]
+    step = next(
+        step for step in jobs[CHART_JOB]["steps"]
+        if step.get("name") == "Failed first install retry recreates data volumes"
+    )
+    assert step["if"].endswith(" && false }}")
+    with pytest.raises(gate.GateError, match="canonical chart scenario condition"):
+        gate.check_registration(CI, [script])
 
 
 def test_chart_legs_upload_distinct_receipts_the_required_verdict_merges() -> None:

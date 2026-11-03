@@ -35,6 +35,7 @@ from curie_worker.binding import (
     BUDGET_ENV,
     BUNDLE_REF_ENV,
     PLUGIN_DIR_ENV,
+    HttpIdentityBinding,
     ResolvedDeployment,
 )
 from curie_worker.config import WorkerConfig
@@ -63,6 +64,22 @@ class StubBinding:
     binding up (T-B15(b)): the pre-resolution escalate must build its route from
     the server-minted reply handle, not from a lookup it cannot reach.
     """
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        resolved = self._by_route.get((kind, address))
+        if resolved is None:
+            return None
+        agent_id = resolved.agent_id
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
 
     def __init__(self, by_route: dict[tuple[str, str], ResolvedDeployment]) -> None:
         self._by_route = by_route
@@ -431,8 +448,8 @@ def test_the_already_done_skip_still_lowers_the_shimmer(make_harness) -> None:
 def test_the_prior_side_effect_escalate_emits_through_the_reply_handle_route(
     make_harness,
 ) -> None:
-    # T-B15(b). This is the "a prior attempt started an action before the worker
-    # restarted" escalation -- the one message a human most needs to see -- and
+    # T-B15(b). This is the "a prior attempt may already have executed an action"
+    # escalation -- the one message a human most needs to see -- and
     # revision 3's shape suppressed it. It runs BEFORE binding resolution, so its
     # route comes from the server-minted ``reply_handle`` (EB-B6's trust
     # argument: after phase 2 no adapter writes to the stream at all).
@@ -464,7 +481,7 @@ def test_the_prior_side_effect_escalate_emits_through_the_reply_handle_route(
             await h.kernel.process_event(ev)
 
             assert len(h.sink.updates) == 1
-            assert "prior attempt started an action" in h.sink.updates[0][2]
+            assert "prior attempt may already have executed an action" in h.sink.updates[0][2]
             # The route is the reply handle's, verbatim -- not a lookup, not a
             # default, and never the Slack credential standing in for a missing
             # adapter (the second mutation named in AC10f).

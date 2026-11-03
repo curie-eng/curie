@@ -440,6 +440,30 @@ class Markers:
             pipe.expire(key, _MEMORY_STEER_TURNS_TTL_S)
             await pipe.execute()
 
+    async def record_attachment_access_turn(
+        self, thread_key: str, record: dict[str, Any], ttl_s: int
+    ) -> None:
+        await self._redis.set(
+            self._config.attachment_access_turn_key(thread_key), json.dumps(record), ex=ttl_s
+        )
+
+    async def read_attachment_access_turn(self, thread_key: str) -> dict[str, Any] | None:
+        raw = _as_str(await self._redis.get(self._config.attachment_access_turn_key(thread_key)))
+        if raw is None:
+            return None
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+
+    async def take_attachment_access_turn(self, thread_key: str, owner: str) -> bool:
+        return bool(
+            await self._redis.eval(
+                _TAKE_CHANNEL_READ_TURN_LUA,
+                1,
+                self._config.attachment_access_turn_key(thread_key),
+                owner,
+            )
+        )
+
     async def record_channel_read_turn(
         self, thread_key: str, record: LiveChannelReadTurn, ttl_s: int
     ) -> None:

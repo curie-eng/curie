@@ -37,7 +37,7 @@ from aci_protocol import (
 )
 from curie_worker.approvals import ApprovalRequest, CreatedApproval, PublicationLineage
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.binding import FactoryContext, FactoryWake
+from curie_worker.binding import FactoryContext, FactoryWake, HttpIdentityBinding
 from curie_worker.sandbox import SuspendedThreadError
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
@@ -69,6 +69,19 @@ GITHUB_TOKEN = "gh" + "p_" + "A1b2C3d4" * 5
 
 
 class _Binding:
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = AGENT_ID
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
     def _deployment(self) -> object:
         return SimpleNamespace(
             agent_id=AGENT_ID,

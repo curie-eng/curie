@@ -49,6 +49,7 @@ from .. import adapter_principal, approval_principal
 from ..action_forward import ForwardRefused
 from ..admission import admit
 from ..approval_auth import (
+    APPROVAL_PRINCIPAL_HEADER,
     ApprovalPrincipalDep,
     platform_key_or_adapter,
     require_adapter_principal,
@@ -63,6 +64,18 @@ from ..auth import require_api_key, require_platform_key
 from ..authorizer import AuthzDecision, authorize_approval
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep, get_store
+from ..identity.http_approval import (
+    approval_is_selected,
+    identity_runtime,
+    require_legacy_approval_creation,
+)
+from ..identity.http_approval_answer import (
+    PROOF_HEADER,
+    ApprovalAnswer,
+    ApprovalSettled,
+    answer_http_approval,
+    publish_answered_resume,
+)
 from ..identity_fence import lock_identity_reader
 from ..models import Approval, ApprovalStatus
 from ..remediation_approvals import (
@@ -280,6 +293,9 @@ async def create_approval(
     runner, so a sandbox cannot talk its way past it.
     """
 
+    await require_legacy_approval_creation(
+        session, data, runtime=identity_runtime(request.app.state),
+    )
     traceparent = canonicalize_traceparent(
         request.headers.get(TRACEPARENT_STREAM_FIELD)
     )
@@ -495,6 +511,7 @@ async def _admit_adapter_answer(session: AsyncSession, approval: Approval, sende
 async def resolve_approval(
     approval_id: uuid.UUID,
     data: ApprovalResolve,
+    request: Request,
     session: SessionDep,
     resume_queue: ResumeQueueDep,
     approver_sets: ApproverSetSelectorDep,
@@ -525,6 +542,67 @@ async def resolve_approval(
     ):
         raise _approval_not_found()
     stored_parent = approval_trace_context(approval)
+    # @spec HTTP-APPROVAL-CONTINUITY-7/10: a selected row never reaches legacy
+    # admission, team lookup or CAS. Its deadline expiry goes through the sealing
+    # owner, and an authenticated Slack answer through the approval commit owner;
+    # either way its wake stays owed rather than context-free.
+    if await approval_is_selected(
+        session, approval, runtime=identity_runtime(request.app.state),
+    ):
+        await session.commit()
+        gone: Approval | None = approval if approval.status == ApprovalStatus.expired else None
+        if approval.status == ApprovalStatus.pending and _expired(approval):
+            try:
+                gone = await request.app.state.http_approval_expiry(approval_id)
+                if gone is None:
+                    # A concurrent expiry may have won; it is still the 410 answer.
+                    current = await crud_approvals.reread_approval(session, approval_id)
+                    if current is not None and current.status == ApprovalStatus.expired:
+                        gone = current
+            except Exception:  # noqa: BLE001 - bounded answer, never a raw 500.
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE, "authority_unavailable"
+                ) from None
+        if gone is not None:
+            raise HTTPException(
+                status.HTTP_410_GONE,
+                f"approval expired at {gone.expires_at} and can no longer be resolved",
+            )
+        proof = request.headers.get(PROOF_HEADER)
+        attestation = request.headers.get(APPROVAL_PRINCIPAL_HEADER)
+        if proof is None or attestation is None or principal.kind != "chat":
+            # 403, not 409: a 409 reads as settled and would retire a card whose
+            # row is still pending. Only a receiver-proved Slack answer qualifies.
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "unsupported_approval")
+        try:
+            resolved = await answer_http_approval(
+                request, approval_id, principal=principal, approver_sets=approver_sets,
+                answer=ApprovalAnswer(
+                    operation="resolve", decision=data.decision, note=data.note,
+                    body=await request.body(), attestation=attestation, proof=proof,
+                ),
+            )
+        except ApprovalSettled as settled:
+            if settled.status in (ApprovalStatus.expired, "expired"):
+                raise HTTPException(
+                    status.HTTP_410_GONE, "approval expired and can no longer be resolved",
+                ) from None
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"already resolved by {settled.resolved_by} ({settled.status})",
+            ) from None
+        record_metric(
+            "curie.approval.lifecycle",
+            attributes={"service.name": "curie-api", "operation": "resolve",
+                        "outcome": "resolved"},
+        )
+        # @spec HTTP-APPROVAL-CONTINUITY-11: only after the acknowledged commit.
+        out = ApprovalOut.model_validate(resolved)
+        await publish_answered_resume(
+            session, resume_queue, resolved,
+            reconciler_enabled=get_settings().resume_reconciler_enabled,
+        )
+        return out
 
     # The route binding is read fresh at resolve time (#420), so revoking an
     # approver takes effect on the next click rather than at the next restart.
@@ -611,6 +689,17 @@ async def resolve_approval(
         # refresh re-acquires the fence and reads the current actor and policy.
         was_restricted = team_decision.restricted
         await lock_identity_reader(session)
+        # @spec HTTP-APPROVAL-CONTINUITY-14: a role change or adoption committed
+        # since the first classification (say, during the approver lookup) is
+        # seen here, under the lock the expiry and claim below commit under. It
+        # is a denial: the caller audits it and refuses 403 before any write.
+        if await approval_is_selected(
+            session, approval, runtime=identity_runtime(request.app.state),
+        ):
+            decision = AuthzDecision(
+                False, "unsupported_approval", evidence={"kind": "http_selection"},
+            )
+            return
         team_decision = await approval_team_decision(session, approval, principal)
         current_binding = await crud_approvals.get_approval_route_binding(session, approval)
         if (was_restricted != team_decision.restricted

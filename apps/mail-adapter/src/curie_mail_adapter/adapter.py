@@ -24,6 +24,8 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from channel_protocol import SettledOutcome
+from curie_internal import identity_context
+from curie_internal.operator_file import decode_key_material
 
 from .agentmail import AgentMailClient, AgentMailProvider, request
 from .config import MailAdapterConfig
@@ -34,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 CHANNEL_KIND = "email"
 EVENT_MARKER = "X-Curie-Event:"
+# ADR 0260: the signed sender of a turn, beside the channel token.
+RECEIVER_PROOF_HEADER = "X-Curie-Receiver-Proof"
 EMPTY_REPLY_TEXT = "Curie processed your message but produced no text"
 
 SEEN_MAX = 5000
@@ -158,6 +162,20 @@ class MailAdapter:
             RuntimeError: the state file belongs to another provider.
         """
         self.config = config
+        # The email receiver this adapter signs for (ADR 0260), or None to post
+        # unsigned exactly as before. The config already refused a partial set.
+        self.receiver_keys: identity_context.IdentityKeyring | None = None
+        if config.receiver_id:
+            self.receiver_keys = identity_context.build_identity_keyring(
+                "receiver",
+                (
+                    (
+                        config.receiver_id,
+                        int(config.receiver_generation or 0),
+                        decode_key_material(config.receiver_key),
+                    ),
+                ),
+            )
         self.provider: MailProvider = (
             provider if provider is not None else AgentMailProvider(config, client)
         )
@@ -664,11 +682,22 @@ class MailAdapter:
         """
         url = f"{self.config.api_base_url.rstrip('/')}/channels/turns"
         headers = {"X-API-Key": self.config.channel_token}
+        body: dict[str, Any] | bytes = turn
+        if self.receiver_keys is not None:
+            signed = self._signed_turn(turn, self.receiver_keys)
+            if signed is None:
+                logger.warning(
+                    "ingress refused correlation=%s: the turn cannot be signed for the "
+                    "configured email receiver; settling the message without a turn",
+                    _correlation(str(turn["delivery_id"])),
+                )
+                return "refused"
+            body, headers[RECEIVER_PROOF_HEADER] = signed
         for attempt in range(1, self.config.ingress_attempts + 1):
             result = request(
                 "POST",
                 url,
-                turn,
+                body,
                 headers,
                 max_response_bytes=self.config.max_body_bytes,
             )
@@ -717,6 +746,35 @@ class MailAdapter:
             _correlation(str(turn["delivery_id"])),
         )
         return "retry"
+
+    def _signed_turn(
+        self, turn: dict[str, Any], keys: identity_context.IdentityKeyring
+    ) -> tuple[bytes, str] | None:
+        """The exact bytes to post and their email receiver proof, or None.
+
+        Compact JSON with sorted keys, so a stored turn re-posted after a
+        restart has the same bytes and the same proof, and the platform sees a
+        duplicate rather than a conflicting intent. The proof is the shared
+        signer's, over those bytes; this adapter has no canonical form of its
+        own. @spec HTTP-INVOCATION-EXECUTION-30.
+        """
+        payload = json.dumps(turn, sort_keys=True, separators=(",", ":")).encode()
+        binding = _token_claims(self.config.channel_token).get("channel_id")
+        if not isinstance(binding, str):
+            return None
+        try:
+            proof = identity_context.EmailReceiverProofV1(
+                schema_version=1,
+                receiver_id=self.config.receiver_id,
+                receiver_generation=int(self.config.receiver_generation or 0),
+                binding_id=binding,
+                sender=str(turn["author"]).lower(),
+                delivery_id=str(turn["delivery_id"]),
+                body_sha256=hashlib.sha256(payload).hexdigest(),
+            )
+            return payload, identity_context.sign_email_receiver_proof(proof, keys)
+        except (ValueError, TypeError, KeyError):
+            return None
 
     # -- approvals by email (ADR-0177) ---------------------------------------
 
@@ -1382,17 +1440,17 @@ def _correlation(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:16]
 
 
-def _token_expiry(token: str) -> int | None:
-    """Read an unverified exp from the platform's chn.payload.signature format.
+def _token_claims(token: str) -> dict[str, Any]:
+    """The unverified claims of the platform's chn.payload.signature format, or {}.
 
-    This diagnoses expiry without giving the adapter a platform signing key.
-    Only the platform ingress response can establish credential acceptance.
+    Reading them gives the adapter no platform signing key. Only the platform
+    ingress response can establish credential acceptance.
     """
     if len(token) > 16_384:
-        return None
+        return {}
     parts = token.split(".")
     if len(parts) != 3 or parts[0] != "chn" or not parts[2]:
-        return None
+        return {}
     try:
         payload = json.loads(
             base64.b64decode(
@@ -1402,8 +1460,13 @@ def _token_expiry(token: str) -> int | None:
             )
         )
     except (ValueError, UnicodeDecodeError, binascii.Error):
-        return None
-    exp = payload.get("exp") if isinstance(payload, dict) else None
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _token_expiry(token: str) -> int | None:
+    """Read an unverified exp from the channel token, to diagnose expiry."""
+    exp = _token_claims(token).get("exp")
     # bool is an int subclass, and timestamps outside datetime's range cannot
     # be safely formatted in the operator diagnosis.
     if isinstance(exp, int) and not isinstance(exp, bool) and 0 < exp < 253_402_300_800:

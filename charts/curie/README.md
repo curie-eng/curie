@@ -172,7 +172,7 @@ of these containers the liveness cutoff must strictly exceed the readiness
 cutoff -- otherwise a container still legitimately booting (WAL recovery,
 Prisma/ClickHouse boot migrations, API warm-up) gets killed and restarted back
 into the same boot path instead of being given time to finish it.
-`ci/probe-window-assertions.sh` enforces this ordering render-wide.
+policy P3 in `ci/policy/` enforces this ordering render-wide.
 
 | Value | Default | Meaning |
 | --- | --- | --- |
@@ -844,7 +844,7 @@ rather than a sizing knob. On each container the liveness failure cutoff
 (`initialDelaySeconds + (failureThreshold - 1) * periodSeconds`) outlasts the
 readiness cutoff by design -- 370 seconds against 310 -- so the kubelet cannot
 restart a container that is still inside the boot window readiness was sized to
-tolerate. `charts/curie/ci/probe-window-assertions.sh` pins that ordering for
+tolerate. policy P3 in `charts/curie/ci/policy/` pins that ordering for
 every container in the rendered chart.
 
 `langfuse-worker` also carries its own `readinessProbe` (`httpGet /api/ready`)
@@ -1487,8 +1487,16 @@ requests default to `500m` CPU, `1Gi` memory and `10Gi` ephemeral storage; limit
 default to `2`, `4Gi` and `20Gi`. `factory.docker.storageSizeLimit` defaults to
 `20Gi`, `maxClaimLifetimeSeconds` to `86400` and `pingTimeoutSeconds` to `2`.
 Missing new leaves on retained releases receive these defaults. Namespace quota
-and LimitRange remain separate. This handoff configures future worker creation;
-daemon lifecycle and certificate issuance are not implemented here.
+and LimitRange remain separate. The worker
+(`apps/worker/src/curie_worker/sandbox/tool_daemon.py`) creates each Docker
+claim's daemon Pod, headless Service, ingress NetworkPolicy and per-claim mTLS
+Secret before the claim, reuses a retained route only after an authenticated
+ping, and deletes those objects on every retirement path, with an orphan sweep
+for objects older than the claim timeout. With `factory.docker.createNamespace`
+false, removing the last Docker repository also removes the worker's Role here,
+so daemon objects alive at that upgrade are left for the operator: each Pod
+stops at its `activeDeadlineSeconds`, while its Service, Secret and
+NetworkPolicy remain until deleted by hand.
 
 1. A daemon namespace, `factory.docker.namespace` or
    `<release-namespace>-<fullname>-docker` by default. The chart creates it
@@ -1511,10 +1519,14 @@ daemon lifecycle and certificate issuance are not implemented here.
    egress lists.
 5. With Rail 1 on, `<fullname>-runner-allow-docker-daemon` lets the factory
    agent's runner sandboxes (`curietech.ai/agent` set to the one factory agent
-   repository runners belong to) dial daemon pods on `factory.docker.port`
-   (2376). Other agents' sandboxes get no such allow. Daemon ingress
-   stays default-deny until the worker's per-run policy admits that run's
-   sandbox, so a sandbox reaches only its own daemon.
+   repository runners belong to) dial daemon pods on the full TCP range 1
+   through 65535 (`port: 1`, `endPort: 65535`). Other agents' sandboxes get no
+   such allow. Daemon ingress stays default-deny until the worker's per-run
+   policy admits the sandbox with the same `curietech.ai/sandbox-claim`
+   value, so a sandbox reaches only its own daemon. The runner uses
+   `DOCKER_PUBLISHED_HOST` to reach ports published by containers on its
+   daemon. The Docker API remains on `factory.docker.port` (2376) with
+   unchanged per-claim mTLS.
 6. Three ValidatingAdmissionPolicies with Deny bindings, which need
    Kubernetes 1.30 or newer:
    `<fullname>-docker-daemon-pods` admits only a worker-created pod with one
@@ -1535,13 +1547,18 @@ daemon lifecycle and certificate issuance are not implemented here.
    `activeDeadlineSeconds`.
    `<fullname>-docker-daemon-objects` holds the worker's Services to
    ClusterIP, its Secrets to Opaque or TLS, and its NetworkPolicies to
-   ingress-only policies selecting their own claim, whose every peer is a
-   runner sandbox of this release in the release namespace selected by a
-   label key outside the release selector keys (`name`, `instance`,
-   `component`), with no `ipBlock`, on TCP `factory.docker.port` with no
-   `endPort` range.
+   ingress-only policies selecting their own claim. Every peer must be in
+   the release namespace, with `app.kubernetes.io/component: runner-sandbox`,
+   this release's `app.kubernetes.io/instance`, and
+   `curietech.ai/sandbox-claim` exactly equal to the policy's metadata claim
+   label. Each ingress rule requires nonempty peer and port lists, no
+   `ipBlock`, and TCP `port: 1` with `endPort: 65535`.
    `<fullname>-docker-daemon-cleanup` lets the worker delete only
    NetworkPolicies labelled `curietech.ai/sandbox-claim`, never the chart's.
+
+**Upgrade note.** Existing claims retain their old ingress policies until
+reclaimed. New admission refuses older workers' ingress policies until the
+worker rollout completes.
 
 Opting a repository into Docker widens that repository's egress to what its
 class allows. Runner admission is unchanged.
@@ -2453,6 +2470,60 @@ still running, and that pod can take turns until it is replaced. Upgrading
 first with no key and generating one later does not remove this: the second
 upgrade rolls workers that do not yet hold the key in the same way.
 
+### HTTP identity operator files
+
+HTTP identity (ADR 0246,
+[criterion 20](../../docs/superpowers/specs/2026-10-26-http-invocation-execution-v1.md), section 20)
+is off by default and the default render is unchanged. Two values select it,
+each naming a Secret the operator creates; the chart never creates, reads or
+checksums either one.
+
+| Value | Secret key | Mounted into | Environment |
+| --- | --- | --- | --- |
+| `api.httpIdentity.existingSecret` | `api-runtime.json` | the `api` container only, at `/var/run/curie/http-identity` | `CURIE_HTTP_IDENTITY_DIR` |
+| `api.httpIdentity.providerCaBundle: true` (with the Secret above) | `provider-ca.pem` (optional) | the same `api` volume, beside `api-runtime.json` | `CURIE_HTTP_IDENTITY_DIR` |
+| `dispatcher.httpIdentity.existingSecret` | `receivers.json` | the `dispatcher` container only, at `/var/run/curie/http-receiver` | `CURIE_HTTP_RECEIVER_DIR` |
+
+Each file is mounted read-only with mode 0440 and the pod's `fsGroup` set to
+the image's group, and the process refuses a file that is group-writable or
+grants any permission to other users. Selecting the dispatcher without the API
+fails the render, because the API holds the receiver registrations it verifies.
+Both environment names are reserved even while unselected. The worker, runner,
+bundles and agent Secrets never receive either file; the worker uses its
+existing internal worker token and API URL for current-authority checks.
+
+`api-runtime.json` holds, as strict JSON with no unknown or missing members:
+`schema_version` 1; `providers`, each the tenant's complete HTTP authority
+configuration and its lookup bearer; `receivers`, each an exact receiver
+registration and that receiver's key; `context_keys`, each a core sealing key
+with its key ID and generation; and `signing_key`, the key ID and generation
+used to seal. `receivers.json` holds `schema_version` 1 and `receivers`, each a
+receiver scope, its bindings with their pinned channel credentials, and the same
+receiver key. Every key is an independently generated 32 bytes in unpadded
+base64url, never derived from or reused as another credential.
+
+`provider-ca.pem` is for a provider whose TLS certificate comes from a private
+CA, such as a cluster issuer. When it is mounted, its certificates are the only
+trust anchors for every provider lookup of that API: no system or environment
+CAs are mixed in, hostname verification stays on and TLS 1.2 is the minimum.
+Providers that need different anchors in one installation are not supported.
+The file holds one through 16 PEM `CERTIFICATE` blocks, each a CA certificate
+(basicConstraints CA true), separated only by newlines, at most 262,144 ASCII
+bytes. An empty, malformed or non-CA bundle stops the API. Leaving
+`providerCaBundle` false keeps the default verified trust store.
+
+All of these files are read once at startup. A missing, unsafe or invalid file stops
+the process with a fixed message naming only the failing stage, and a selected
+dispatcher identity that did not pass Slack preflight or whose `auth.test` does
+not match its registration stops the dispatcher rather than starting that
+identity on the legacy path. Changing a Secret takes effect only when the
+workload is rolled. No chart NetworkPolicy selects the API pods, so selecting
+HTTP identity needs no egress value: the API reaches an in-cluster provider
+Service or an external HTTPS host on 443 as it does today. `api.egress` is the
+runner's route to an external API and does not apply here; an egress control
+outside the chart must allow the lookup itself. Rendering these mounts is wiring; key custody, the effective
+mounts on a real cluster and activation remain separate qualification.
+
 ### Reserved environment variables
 
 Every workload accepting `extraEnv` uses the reserved names and replacement
@@ -2467,3 +2538,42 @@ The existing OTEL overrides and worker `CURIE_API_URL` / `CURIE_API_KEY`
 overrides remain supported: their helpers omit the chart entry, so each name
 appears once. Repeating any name within `extraEnv` itself is refused. Workloads
 without an `extraEnv` surface cannot append entries to their chart-owned env.
+
+### Opting into on-demand attachments
+
+The default `worker.attachments.enabled: false` keeps the lane off. Operators
+may opt in with `worker.attachments.enabled: true` and
+`worker.attachments.mode: lazy` after installing compatible API, worker and
+runner images. Activation is an explicit operator choice. Lazy mode requires
+a real runner (`agentSandbox.runner.fakeModel: false`) and the existing
+attachments cache mount. The chart creates an internal broker Service on
+`worker.attachments.broker.port` (default `8093`) and permits ingress only from
+the API pods. It supplies the API facade settings and worker transfer budgets
+from the same values. There is no new external ingress.
+
+The runner retains a writable attachments `emptyDir` with the finite
+`agentSandbox.runner.attachments.sizeLimit` (default `512Mi`) and existing
+sandbox resource limits. Lazy mode renders no eager `attachments-init`
+container. Listing references does not materialize their bytes. A requested file
+must fit the available cache; storage exhaustion is an explicit fetch failure.
+Legacy `maxFileBytes` and `threadMaxBytes` apply only in `mode: eager`.
+
+For an isolated source-built local stack, export
+`CURIE_ATTACHMENT_ENABLED=true`, `CURIE_ATTACHMENT_MODE=lazy` and
+`CURIE_ATTACHMENT_ACCESS_ENABLED=true` before `curie local up --build`, together
+with the existing real-model settings. Choose a unique
+`CURIE_ATTACHMENT_BROKER_PORT` for each simultaneous local stack (default
+`28093`). The broker binds loopback by default. The API reaches the host-network worker
+through `host.docker.internal` where Docker Desktop forwards that loopback
+listener. Native Linux or other topologies may require
+`CURIE_ATTACHMENT_BROKER_HOST` set to a verified private Docker bridge/gateway
+interface and `CURIE_ATTACHMENT_BROKER_URL` set to the matching API-reachable
+origin. A refused/unreachable broker blocks lazy activation. Do not broaden the
+bind to a LAN-facing interface to hide a networking error. Internal authentication
+is required on every broker request. Keep the
+existing Compose project, override files and endpoints consistent for startup
+and teardown. The local runner receives a claim-owned writable named tmpfs cache volume;
+`CURIE_ATTACHMENT_CACHE_SIZE_BYTES` controls its finite capacity (default
+`536870912`, or `512Mi`). Its contents consume effective memory resources, so
+a file below the volume capacity can still fail when the runner's memory limit
+is exhausted. Claim deletion removes only that claim's volume.

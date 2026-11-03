@@ -55,6 +55,7 @@ fn placeholder(id: &str) -> &'static str {
         // empty-stdout bug it exists to catch. Any arg with a value_parser
         // enumeration needs a real value here.
         "phase" => "export",
+        "agent" => "codex",
         _ => "x",
     }
 }

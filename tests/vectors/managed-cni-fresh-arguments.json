@@ -1,0 +1,74 @@
+{
+  "fresh_twin": {
+    "family": "ipv4",
+    "port": 18080
+  },
+  "fresh_probe_listener": {
+    "family": "ipv4",
+    "port": 18080
+  },
+  "fresh_sender": {
+    "mode": "deny",
+    "family": "ipv4",
+    "targets": [
+      {
+        "target": "twin",
+        "address": "127.0.0.1",
+        "port": 18080,
+        "echo": true
+      }
+    ],
+    "excluded_ports": [],
+    "setup": false
+  },
+  "fresh_setup": {
+    "mode": "setup",
+    "family": "ipv4",
+    "targets": [
+      {
+        "target": "twin",
+        "address": "127.0.0.1",
+        "port": 18080,
+        "echo": true
+      }
+    ],
+    "excluded_ports": [],
+    "setup": true,
+    "setup_nonce": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "fresh_control": {
+    "mode": "control",
+    "family": "ipv4",
+    "targets": [
+      {
+        "target": "twin",
+        "address": "127.0.0.1",
+        "port": 18080,
+        "echo": true
+      }
+    ],
+    "excluded_ports": [],
+    "setup": false,
+    "challenge": "cccccccccccccccccccccccccccccccc"
+  },
+  "fresh_allowed_control": {
+    "mode": "control",
+    "family": "ipv4",
+    "targets": [
+      {
+        "target": "twin",
+        "address": "127.0.0.1",
+        "port": 18080,
+        "echo": true
+      }
+    ],
+    "excluded_ports": [],
+    "setup": false,
+    "challenge": "cccccccccccccccccccccccccccccccc"
+  },
+  "fresh_trigger": {
+    "family": "ipv4",
+    "address": "127.0.0.1",
+    "challenge": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}

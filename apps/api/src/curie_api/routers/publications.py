@@ -58,6 +58,7 @@ from ..forges.types import (
     RepositoryRef,
     TrackerIssueRef,
 )
+from ..identity.http_approval import identity_runtime
 from ..models import (
     ExecutionRequest,
     Publication,
@@ -651,6 +652,7 @@ async def create_publication(
             patch=patch,
             metadata_check=metadata_check,
             traceparent=traceparent,
+            identity_runtime=identity_runtime(request.app.state),
         )
     except PublicationPrecheckRefused as exc:
         raise HTTPException(

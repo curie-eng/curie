@@ -162,6 +162,9 @@ class GitHubCodeHostConnection:
             credentials=self._provider.credentials,
             marked_comments=self._marked_comments(client, installations, repository),
             installations=installations,
+            repository_paths={repository.project_id: repository.path}
+            if repository is not None
+            else {},
         )
 
     def _marked_comments(

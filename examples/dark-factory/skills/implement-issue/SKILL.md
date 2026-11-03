@@ -46,14 +46,15 @@ in the foreground. Set `run_in_background` to `false` on every reviewer call.
 
 The bundle's review gate hook enforces the loops. It reports each review phase
 and its round, numbers the rounds, sends the call to the right reviewer in the
-foreground, refuses a review out of order, and refuses publication until the
-diff reviewer approves. Follow its instructions when a tool result or a
-refusal carries them.
+foreground, refuses a review out of order or a second plan review, and
+refuses publication until the diff reviewer approves. Follow its instructions
+when a tool result or a refusal carries them.
 
 Load this skill before any edit. The hook refuses `Edit`, `Write`,
-`MultiEdit` and `NotebookEdit` until the plan review returns its verdict. After
-the verdict the first edits are the failing test: a test file, or an inline
-test in a source file when the edit adds the test (a Rust `#[test]` or
+`MultiEdit` and `NotebookEdit` until the plan review completes with either
+verdict, `VERDICT: APPROVE` or `VERDICT: CHANGES`. After it the first edits
+are the failing test: a test file, or an inline test in a source file when
+the edit adds the test (a Rust `#[test]` or
 `#[cfg(test)]` module, a `def test_` function, and the like). Write the
 failing test, run it with Bash, then call report_progress with phase
 `implement`, then edit source. Running a command does not open source edits;
@@ -186,11 +187,12 @@ its own, and say in the pull request description what you declined.
 ## Reviewer notes
 
 An `APPROVE` verdict can carry a `NOTES:` list of non-blocking improvements,
-and approval ends that review loop. Carry approved-with-notes findings from a
-plan review into `implement`: apply the notes that are cheap and clearly
-right, and ignore the rest. Never apply diff-review notes to the code after
-the diff reviewer approved; that approval covers the diff it read. List
-diff-review notes in the pull request body as notes you did not address.
+and approval ends that review loop. Carry the plan review's findings into
+`implement`: fix every blocking finding of a `VERDICT: CHANGES`, apply the
+notes that are cheap and clearly right, and ignore the rest. Never apply
+diff-review notes to the code after the diff reviewer approved; that approval
+covers the diff it read. List diff-review notes in the pull request body as
+notes you did not address.
 Never start another review round only to address notes.
 
 ## Verification contract
@@ -258,7 +260,8 @@ Before editing, write a short plan in your reply: the files you will change,
 the test you will add or change, which acceptance criterion each edit serves,
 and the verification table the verification contract defines. Keep the scope
 to the criteria. No drive-by refactors, renames,
-reformatting or dependency upgrades.
+reformatting or dependency upgrades. There is no plan round 2 or 3: the plan
+round is always 1, so make this plan complete before the review.
 
 ## 4. Plan review (phase `plan_review`, round 1)
 
@@ -284,7 +287,8 @@ follows:
 2. `VERDICT: CHANGES`: planning is complete too. Do not revise the plan or
    call the plan reviewer again; the hook refuses a second plan review. Carry
    every finding into step 5 (`failing_test`) and step 6 (`implement`), and
-   resolve each one before the diff review in step 7.
+   resolve each one before the diff review in step 7. Keep findings verbatim
+   and include each finding and its resolution in the diff review prompt.
 3. Anything else, including an error, an empty reply, a timeout, a refused
    model, a missing `REVIEWER:` line, or a reply without a `VERDICT:` line:
    the call did not complete. It grants nothing and does not count as the
@@ -293,6 +297,9 @@ follows:
    `plan review failed:` and the error text. Never continue without a real
    verdict, never review the plan yourself in its place, and never claim a
    review that did not return a verdict.
+
+After a completed verdict, never call the plan reviewer again; the hook
+refuses a second completed plan review.
 
 ## 5. Failing test first (phase `failing_test`)
 
@@ -398,7 +405,8 @@ Call the `Agent` tool exactly as in step 4, with `subagent_type`
 `"Diff review round <n>"`, and a `prompt` with the issue link and text, your
 numbered acceptance criteria, each check you ran with its exit status, the
 current verification table, for each delegated row the declared check entry
-it relies on, and, from round 2 on, the previous round's findings.
+it relies on, the plan review's verdict with every plan review finding and
+how you resolved it, and, from round 2 on, the previous round's findings.
 The reviewer reads the diff in `/workspace` itself. Do not pass `isolation` or
 `model`. Set `run_in_background` to `false` (required; never omit it); wait
 for the foreground call to return before any other tool call.
@@ -463,9 +471,9 @@ repository's conventions win. Call `mcp__curie__publish_changes` once, with:
   checklist that maps each acceptance criterion to its evidence, then the
   checks you ran with their results, then the verification table with every
   delegated or blocked check, its cause and the evidence the verification
-  contract requires, then the plan and diff review rounds it
-  took, then anything else you did not verify or deliberately declined, and
-  any reviewer `NOTES:` you did not address.
+  contract requires, then the plan review's verdict and how each of its
+  findings was resolved, then the diff review rounds it took, then anything
+  else you did not verify or deliberately declined, and any reviewer `NOTES:` you did not address.
 
 After calling it, end your turn and say that the publication request is
 pending. Do not report `wait_ci`; the platform reports it (step 9). Do not call it twice. Never push with git; the platform publishes

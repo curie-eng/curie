@@ -293,6 +293,11 @@ The cluster factory command performs the same check for its allowlisted reposito
 Without `--app-id`, it prints `toolchain inference skipped: no --app-id`.
 Dry-run describes the inference without reading GitHub.
 
+For a repository-specific image based on issue and PR history, use the local
+[factory environment setup skill](factory-environments.md) before reviewing a
+`--repo-runner` build and binding change. Its companion maintenance skill
+reviews later `needs human` outcomes for image and non-image repairs.
+
 Factory commits are authored by the GitHub App's bot identity. Before any Helm
 call, App setup resolves `<slug>[bot]` through GitHub's user API and configures
 `worker.publication.gitUserName=<slug>[bot]` and
@@ -417,14 +422,24 @@ reads as a single forge configuration document:
 3. `factory.bindings` join a tracker to repositories. Each entry under
    `repos` has an `alias`, a `codeHost`, a `projectId`, a `path`, optional
    `bases` and `defaultBase`, and an optional `ci` policy (`required` with
-   `key`, `paths` and `pendingKeyPrefix`, and `metadataRerunKeys`).
+   `key`, `paths` and `pendingKeyPrefix`, and `metadataRerunKeys`). `bases`
+   accepts case-sensitive glob patterns such as `release/*`; `defaultBase`
+   remains a literal allowed branch. Every selected branch must exist remotely.
 4. `factory.codeHosts[].egress` and `factory.trackers[].egress` list the CIDRs
    and ports the entry needs. A GitHub entry with none gets the chart's built-in
    GitHub set. `factory.sandboxEgress.<agent>: true` enrolls an agent in that
    egress policy.
 5. `factory.enabled`, `factory.intake` (`poll` or `webhook`),
    `factory.cardBaseUrl` and `factory.ciWaitSeconds` replace the matching
-   `api.*` settings.
+   `api.*` settings. `factory.baseLabelSettleSeconds` controls the wait after
+   the selection label is applied before the factory reads the current base
+   labels at sandbox acquisition. It defaults to 60 seconds; zero is valid.
+
+Base changes restart unpublished work or durably rebase and retarget its PR.
+A clean replay uses an expected-head fence, and required CI runs on a distinct
+same-tree commit pushed after retargeting. Conflicts leave the branch and PR
+target unchanged until the factory label is reapplied; see the
+[base selection rules](../operations.md#admitting-a-labelled-github-issue).
 
 The old `api.githubFactory*` keys are removed. To upgrade a v0.12.5
 installation configured with `curie cluster factory`, use a CLI containing
@@ -943,6 +958,14 @@ addresses your Data Center host resolves to on its port.
 
 ## Label an issue
 
+For guided issue preparation, install the
+[preparation skill](factory-preparation.md#install-prepare-and-hand-off) in your
+coding agent. It helps clarify the request, presents the full specification for
+review, and can publish and select it after explicit approval using your tracker
+connection. The guide includes the install command, supported clients and source
+build instructions while the feature awaits release. This uses the factory you
+configured above; skill installation alone does not create one.
+
 In the GitHub website, open an issue on the repository and add the label
 `curie-factory`. The person who adds the label must have write or admin access.
 Anyone else's label is ignored.
@@ -1053,7 +1076,7 @@ applies to it as well.
 | Work item stays `waiting for sandbox capacity` | Another run holds the sandbox, or the runner pod cannot start | Run the release inspection command below, then use [local kind capacity and recovery](#local-kind-capacity-and-recovery) if a work pod is Pending |
 | Pending work pod reports `Insufficient memory` | Its resource request exceeds the node's remaining allocatable memory | Follow [local kind capacity and recovery](#local-kind-capacity-and-recovery); waiting alone will not schedule it |
 | Status comment ends with `Could not complete:` | The run stopped. The comment's cause lines say why | Fix the cause, then relabel |
-| CI wait ends `github_forbidden` after opening a PR | A GitHub CI read returned 403; the status may not identify which read was refused | Check the installed App's effective permissions and the PR checks. If the stated permissions are present, do not assume a missing grant or call the run complete; record the refusal for [#5222](https://github.com/curie-eng/curie/issues/5222) |
+| CI wait ends `github_forbidden_get_*` after opening a PR | A GitHub CI read returned 403; the reason names the read that was refused (`github_forbidden_list_check_runs`, `github_forbidden_get_combined_status`, `github_forbidden_get_branch_rules` or `github_forbidden_get_branch`) | Check the installed App's effective permissions and the PR checks. The reason does not claim which grant is missing, and a bare `github_forbidden` names no read; do not assume a missing grant or call the run complete, and record the refusal for [#5222](https://github.com/curie-eng/curie/issues/5222) |
 | `Could not resolve host: github.com` on kind | CoreDNS replica race | Rerun. The command scales CoreDNS to one replica |
 | Nothing happens after the label | The labelling user lacks write access, the label name differs, or the agent has no `github=<owner>/<name>` surface | Fix that and relabel. Polling notices the label on its interval |
 | Installation reports a pre-existing agent-sandbox controller | Another release owns it, or an unowned controller is already installed | Curie reuses a controller owned by another Helm release, or a healthy unowned controller with the matching chart image, by inferring `agentSandbox.controller.deploy=false`. An unhealthy or different unowned controller stops setup with a specific repair command. Have its owner make that repair, then rerun; release status cannot repair it. See [controller inference](../operations.md#curie-cluster-up) |

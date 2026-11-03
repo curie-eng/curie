@@ -1,0 +1,79 @@
+{
+ "apiVersion": "v1",
+ "kind": "Pod",
+ "metadata": {
+  "name": "curie-runner-e8ce1a8c-a",
+  "namespace": "fd-proof-e8ce1a8c",
+  "uid": "5c0d9e7b-2a14-4f63-8b1e-7d4c3a2f9e60",
+  "labels": {
+   "app.kubernetes.io/component": "runner-sandbox",
+   "app.kubernetes.io/instance": "fd-proof",
+   "curietech.ai/sandbox-claim": "7bd5b54461f4"
+  }
+ },
+ "spec": {
+  "containers": [
+   {
+    "name": "runner",
+    "env": [
+     {
+      "name": "DOCKER_HOST",
+      "value": "tcp://7bd5b54461f4.fd-proof-d-e8ce1a8c.svc:2376"
+     },
+     {
+      "name": "DOCKER_PUBLISHED_HOST",
+      "value": "7bd5b54461f4.fd-proof-d-e8ce1a8c.svc"
+     },
+     {
+      "name": "DOCKER_TLS_VERIFY",
+      "value": "1"
+     },
+     {
+      "name": "DOCKER_CERT_PATH",
+      "value": "/var/run/curie/docker"
+     },
+     {
+      "name": "GITHUB_TOKEN",
+      "valueFrom": {
+       "secretKeyRef": {
+        "key": "GITHUB_TOKEN",
+        "name": "7bd5b54461f4-tokens",
+        "optional": false
+       }
+      }
+     }
+    ],
+    "volumeMounts": [
+     {
+      "mountPath": "/var/run/curie/docker",
+      "name": "curie-docker-tls",
+      "readOnly": true
+     }
+    ]
+   }
+  ],
+  "volumes": [
+   {
+    "name": "curie-docker-tls",
+    "secret": {
+     "defaultMode": 420,
+     "items": [
+      {
+       "key": "ca.pem",
+       "path": "ca.pem"
+      },
+      {
+       "key": "cert.pem",
+       "path": "cert.pem"
+      },
+      {
+       "key": "key.pem",
+       "path": "key.pem"
+      }
+     ],
+     "secretName": "7bd5b54461f4-tokens"
+    }
+   }
+  ]
+ }
+}
