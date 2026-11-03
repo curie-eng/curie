@@ -1,0 +1,33 @@
+{
+  "base_sha": "8571eea4223a055a895e141929c7ad14cfdecbfc",
+  "chromium": "/usr/bin/chromium",
+  "distinct_pixels": true,
+  "forced_patch_bytes": 3328,
+  "gitignored_untracked_listing": [],
+  "loopback_port": 37813,
+  "patch_cap_bytes": 900000,
+  "recovered_from": ".git/shallow",
+  "screenshots": {
+    "after": {
+      "bytes": 4629,
+      "height": 200,
+      "path": "after.png",
+      "sha256": "6e91edf37e1ece7d155626bcd461804984cfdac20e310eb9b4263397adb93ae9",
+      "width": 800
+    },
+    "before": {
+      "bytes": 3129,
+      "height": 200,
+      "path": "before.png",
+      "sha256": "0cf9b4d3b3820864a4f7e4e6fe031e55e79a5d88055491bb162a51a828c755ea",
+      "width": 800
+    },
+    "story": {
+      "bytes": 6899,
+      "height": 200,
+      "path": "story.png",
+      "sha256": "030c1d953af89a089b65c5845b1f68821d62bf54645d2b2e57141d697f8c0e26",
+      "width": 800
+    }
+  }
+}
