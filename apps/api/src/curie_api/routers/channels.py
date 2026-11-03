@@ -97,7 +97,7 @@ from ..delivery import (
     claim_delivery,
     duplicate_stream_id,
     enqueue_owned,
-    read_identity_delivery_receipt,
+    read_identity_delivery_receipt_with_slot,
     settle_failed_delivery,
     sha16,
     take_backlog_slot,
@@ -268,6 +268,10 @@ class TurnAccepted(BaseModel):
     event_id: str
     stream_id: str | None
     duplicate: bool
+    # @spec HTTP-INVOCATION-EXECUTION-27: on a duplicate, the reply slot the accepted
+    # turn's receipt retains. Serialized only when set, so a caller that submits no
+    # slot keeps reading the three-field receipt.
+    reply_ref: str | None = None
 
 
 # --- shared helpers -----------------------------------------------------------
@@ -601,22 +605,29 @@ def _mint_turn(row: AgentChannel, body: TurnIn, event_id: str) -> QueuedTurn:
     )
 
 
-def _duplicate(event_id: str, current: str, response: Response) -> TurnAccepted:
+def _duplicate(
+    event_id: str, current: str, response: Response, *, reply_ref: str = ""
+) -> TurnAccepted:
     """Answer a delivery someone else owns, from what the claim key holds.
 
     The status and the None-vs-id decision live in `delivery.duplicate_stream_id`
     so the hook ingress cannot drift from them; only this route's receipt SHAPE
-    is built here.
+    is built here. A retained reply slot is named only beside a stream id
+    (@spec HTTP-INVOCATION-EXECUTION-27).
     """
 
     stream_id = duplicate_stream_id(current, response)
+    if stream_id is not None and reply_ref:
+        return TurnAccepted(
+            event_id=event_id, stream_id=stream_id, duplicate=True, reply_ref=reply_ref
+        )
     return TurnAccepted(event_id=event_id, stream_id=stream_id, duplicate=True)
 
 
 # @spec COMMON-ADMISSION-EXTRACTION-1
 # @spec COMMON-ADMISSION-EXTRACTION-3
 # @spec COMMON-ADMISSION-EXTRACTION-4
-@router.post("/turns", response_model=TurnAccepted)
+@router.post("/turns", response_model=TurnAccepted, response_model_exclude_unset=True)
 async def ingest_turn(
     request: Request,
     response: Response,
@@ -806,18 +817,25 @@ async def _enqueue_turn(
                 # the payload away.
                 turn = _mint_turn(row, body, event_id)
                 identity_arguments: dict[str, Any] = {}
+                # @spec HTTP-INVOCATION-EXECUTION-27/29: only a Slack delivery names a
+                # reply slot; an email reply_ref stays inside its intent.
+                reply_slot = body.reply_ref if row.kind == "slack" else ""
                 if http_invocation is not None:
                     assert turn.reply_handle is not None
+                    # @spec HTTP-INVOCATION-EXECUTION-27: a nonempty slot is the
+                    # placeholder the worker edits; an empty one replies fresh.
                     turn = turn.model_copy(update={
                         "author_principal": http_invocation.principal_ref,
-                        "reply_handle": turn.reply_handle.model_copy(update={"placeholder": None}),
+                        "reply_handle": turn.reply_handle.model_copy(
+                            update={"placeholder": reply_slot or None}
+                        ),
                     })
                 payload = turn.model_dump_json()
                 if http_invocation is not None:
                     context, guard = http_invocation.seal_payload(
                         payload=payload, event_id=event_id,
                         original_invocation_id=event_id, reservation=reservation,
-                        receipt_key=f"{key}:identity",
+                        receipt_key=f"{key}:identity", reply_ref=reply_slot,
                     )
                     identity_arguments = {"identity_context": context, "guard": guard}
                 carrier: dict[str, str] = {}
@@ -894,7 +912,14 @@ async def _enqueue_turn(
                     return TurnAccepted(event_id=event_id, stream_id=current, duplicate=False)
                 # Branch (c): our lease was re-claimed while we were slow. The other
                 # claimant owns the delivery; we do not enqueue on top of it.
-                return _duplicate(event_id, current, response)
+                slot = ""
+                if http_invocation is not None and not current.startswith("pending:"):
+                    # @spec HTTP-INVOCATION-EXECUTION-27: name the accepted slot.
+                    _owner, slot = await read_identity_delivery_receipt_with_slot(
+                        client, key=key, receipt_key=f"{key}:identity",
+                        intent_digest=http_invocation.intent_digest,
+                    )
+                return _duplicate(event_id, current, response, reply_ref=slot)
             except BaseException:
                 await settle_failed_delivery(
                     client,
@@ -905,16 +930,18 @@ async def _enqueue_turn(
                 )
                 raise
         held: bytes | str | None
+        slot = ""
         if http_invocation is not None:
             # @spec HTTP-INVOCATION-EXECUTION-14: historical claims require metadata.
-            held = await read_identity_delivery_receipt(
+            # @spec HTTP-INVOCATION-EXECUTION-27: and name the accepted turn's slot.
+            held, slot = await read_identity_delivery_receipt_with_slot(
                 client, key=key, receipt_key=f"{key}:identity",
                 intent_digest=http_invocation.intent_digest,
             )
         else:
             held = await client.get(key)
         if held is not None:
-            return _duplicate(event_id, text(held), response)
+            return _duplicate(event_id, text(held), response, reply_ref=slot)
 
     response.status_code = status.HTTP_202_ACCEPTED
     return TurnAccepted(event_id=event_id, stream_id=None, duplicate=True)

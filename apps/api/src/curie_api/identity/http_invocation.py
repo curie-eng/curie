@@ -41,6 +41,7 @@ from curie_api.delivery import (
     DeliveryEnqueueGuard,
     DeliveryIdentityContext,
     DeliveryValidityWindow,
+    is_reply_slot,
 )
 from curie_api.identity.delivery_validity import identity_delivery_window
 from curie_api.identity.http_credential_registry import (
@@ -529,6 +530,8 @@ def _receiver_source(
         or type(proof.slack.is_ext_shared_channel) is not bool
         or body.kind != "slack" or body.address != proof.native_channel_id
         or body.delivery_id != proof.delivery_id or body.conversation_id != proof.conversation_id
+        # @spec HTTP-INVOCATION-EXECUTION-27: only a Slack timestamp names a slot.
+        or (body.reply_ref != "" and not is_reply_slot(body.reply_ref))
     ):
         _invalid_receiver()
     evidence = SlackEvidence.model_validate(proof.slack.model_dump(mode="json"))
@@ -607,12 +610,13 @@ async def _current_slack_scope(
 def _email_receiver_source(
     runtime: HttpInvocationRuntime, receiver_proof: str,
     claims: channel_token.ChannelClaims, body: Any, submitted_bytes: bytes,
-) -> tuple[EmailReceiverRegistrationV1, AuthenticatedSource]:
+) -> tuple[EmailReceiverRegistrationV1, AuthenticatedSource, codec.EmailReceiverProofV1]:
     """The sender a registered mail adapter signed for exactly this submission.
 
     Every mismatch is an invalid receiver; a verified address outside the
-    registration's domains is a caller refusal. Both precede any lookup.
-    @spec HTTP-INVOCATION-EXECUTION-29.
+    registration's domains is a caller refusal. Both precede any lookup. The
+    verified proof is returned for the delivery intent.
+    @spec HTTP-INVOCATION-EXECUTION-27/29.
     """
     proof = codec.verify_email_receiver_proof(receiver_proof, runtime._email_keys)
     if not isinstance(proof, codec.EmailReceiverProofV1):
@@ -642,7 +646,7 @@ def _email_receiver_source(
             namespace=namespace, native_id=proof.sender,
         ),
         address=body.address,
-    )
+    ), proof
 
 
 Role = Literal["invocation", "approver"]
@@ -881,9 +885,9 @@ class CurrentHttpInvocation:
 
     def seal_payload(
         self, *, payload: str, event_id: str, original_invocation_id: str,
-        reservation: BacklogReservation, receipt_key: str,
+        reservation: BacklogReservation, receipt_key: str, reply_ref: str = "",
     ) -> tuple[DeliveryIdentityContext, DeliveryEnqueueGuard]:
-        """@spec HTTP-INVOCATION-EXECUTION-6/15."""
+        """@spec HTTP-INVOCATION-EXECUTION-6/15/27."""
         if not self._sealable or not self._open or not self.session.in_transaction():
             _unavailable()
         config = self._capture.authority.configuration
@@ -928,7 +932,7 @@ class CurrentHttpInvocation:
         return (
             DeliveryIdentityContext(
                 codec.seal_invocation_context(context, self._runtime._context_keys),
-                self.intent_digest, receipt_key,
+                self.intent_digest, receipt_key, reply_ref,
             ),
             DeliveryEnqueueGuard(
                 identity_fence.FENCE_KEY, self._stable, self._validity, reservation,
@@ -954,9 +958,10 @@ async def current_http_invocation(
     if claims is None:
         _invalid_receiver()
     registration: AnyReceiverRegistration
+    verified: codec.ReceiverProofV1 | codec.EmailReceiverProofV1
     if body.kind == "email":
         # @spec HTTP-INVOCATION-EXECUTION-29: only an email proof names an email sender.
-        registration, source = _email_receiver_source(
+        registration, source, verified = _email_receiver_source(
             runtime, receiver_proof, claims, body, submitted_bytes,
         )
     else:
@@ -967,11 +972,37 @@ async def current_http_invocation(
         if slack is None or proof.body_sha256 != hashlib.sha256(submitted_bytes).hexdigest():
             _invalid_receiver()
         registration, source = slack, _receiver_source(slack, proof, claims, body)
+        verified = proof
     async with current_source_authority(
         request, runtime=runtime, client=client, registration=registration, source=source,
-        intent_digest=hashlib.sha256(receiver_proof.encode("ascii")).hexdigest(),
+        intent_digest=delivery_intent_digest(verified, body),
     ) as current:
         yield current
+
+
+def delivery_intent_digest(
+    proof: codec.ReceiverProofV1 | codec.EmailReceiverProofV1, body: Any,
+) -> str:
+    """The immutable delivery a receipt records, excluding the authenticated reply slot.
+
+    Receiver, binding, native delivery, conversation and sender evidence come from
+    the verified proof without its body digest; address, author, text and
+    attachments come from the parsed body without reply_ref. A Slack redelivery
+    with a fresh placeholder is therefore the same intent. An email delivery has
+    no reply slot, so its whole body, reply_ref included, is the intent.
+    @spec HTTP-INVOCATION-EXECUTION-27/29.
+    """
+    slot = {"reply_ref"} if isinstance(proof, codec.ReceiverProofV1) else set()
+    delivery = body.model_dump(mode="json", exclude=slot)
+    receiver = proof.model_dump(mode="json", exclude={"body_sha256"})
+    canonical = json.dumps(
+        {
+            "delivery": delivery, "purpose": "http_delivery_intent", "receiver": receiver,
+            "schema_version": 1,
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class _StaleCapture(Exception):

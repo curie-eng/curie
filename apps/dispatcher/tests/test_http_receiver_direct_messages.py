@@ -1,6 +1,6 @@
 """Selected receiver intake of one-to-one direct messages to its bot.
 
-@spec HTTP-INVOCATION-EXECUTION-26.
+@spec HTTP-INVOCATION-EXECUTION-26 HTTP-INVOCATION-EXECUTION-27.
 Synthetic Slack/API edges, the actual Bolt Socket Mode owner and real Valkey.
 No real direct message delivery is qualified: its team fields remain unmeasured.
 """
@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from typing import Any
+from unittest.mock import call
 
 import httpx
 import pytest
@@ -32,14 +33,18 @@ from .test_http_receiver import (
     api,
     binding_body,
     native,
+    receipt,
 )
 from .test_http_receiver_dispatch import (
     DM_BINDING,
     DM_CHANNEL,
+    PLACEHOLDER_TS,
     REFUSED_TEXT,
     UNAVAILABLE_TEXT,
     _answering,
     _deliver_selected,
+    _duplicate_of,
+    _notice_texts,
     _posted_texts,
 )
 
@@ -194,19 +199,46 @@ def test_direct_message_keeps_every_mention_check(damage: str) -> None:
     assert rig.requests == []
 
 
-@pytest.mark.parametrize(("status", "text"), [(403, REFUSED_TEXT), (503, UNAVAILABLE_TEXT)])
-def test_refused_or_unavailable_direct_message_gets_the_mention_notice_as_a_reply(
-    config: DispatcherConfig, redis_client: redis.Redis, status: int, text: str,
+def _slot_sent(rig: HttpRig) -> str:
+    """@spec HTTP-INVOCATION-EXECUTION-27: the reply slot the submitted TurnIn carried."""
+    return str(json.loads(rig.requests[0].content)["reply_ref"])
+
+
+def test_refused_direct_message_turns_its_placeholder_into_the_refusal(
+    config: DispatcherConfig, redis_client: redis.Redis,
 ) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-19/26: the actual Bolt message listener submits it."""
+    """@spec HTTP-INVOCATION-EXECUTION-26/27: the actual Bolt message listener submits it."""
     module = api()
-    rig = HttpRig(_answering(status))
+    rig = HttpRig(_answering(403))
     body, _event = dm_native()
     web = _deliver_selected(config, redis_client, rig, body, bindings=dm_bindings(module))
-    assert len(rig.requests) == 1
+    assert len(rig.requests) == 1 and _slot_sent(rig) == PLACEHOLDER_TS
     web.chat_postMessage.assert_called_once_with(
-        channel=DM_CHANNEL, thread_ts="1700.0004", text=text,
+        channel=DM_CHANNEL, thread_ts="1700.0004", text=config.placeholder_text,
     )
+    web.chat_update.assert_called_once_with(
+        channel=DM_CHANNEL, ts=PLACEHOLDER_TS, text=REFUSED_TEXT,
+    )
+    web.chat_delete.assert_not_called()
+    web.chat_postEphemeral.assert_not_called()
+    rig.closed()
+
+
+def test_unavailable_direct_message_keeps_its_placeholder_and_replies_the_notice(
+    config: DispatcherConfig, redis_client: redis.Redis,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-19/26/27: unavailable never removes the placeholder."""
+    module = api()
+    rig = HttpRig(_answering(503))
+    body, _event = dm_native()
+    web = _deliver_selected(config, redis_client, rig, body, bindings=dm_bindings(module))
+    assert len(rig.requests) == 1 and _slot_sent(rig) == PLACEHOLDER_TS
+    assert web.chat_postMessage.call_args_list == [
+        call(channel=DM_CHANNEL, thread_ts="1700.0004", text=config.placeholder_text),
+        call(channel=DM_CHANNEL, thread_ts="1700.0004", text=UNAVAILABLE_TEXT),
+    ]
+    web.chat_update.assert_not_called()
+    web.chat_delete.assert_not_called()
     web.chat_postEphemeral.assert_not_called()
     rig.closed()
 
@@ -225,25 +257,67 @@ def test_direct_message_in_an_unregistered_conversation_gets_the_refusal(
     )
 
 
-def test_accepted_direct_message_posts_nothing_and_a_redelivery_one_notice(
+def test_accepted_direct_message_keeps_its_placeholder_and_a_redelivery_one_notice(
     config: DispatcherConfig, redis_client: redis.Redis,
 ) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-19/26."""
+    """@spec HTTP-INVOCATION-EXECUTION-19/26/27: the answer edits the DM's placeholder."""
     module = api()
     rig = HttpRig()
     body, _event = dm_native()
     web = _deliver_selected(config, redis_client, rig, body, bindings=dm_bindings(module))
-    assert len(rig.requests) == 1 and _posted_texts(web) == []
+    assert len(rig.requests) == 1 and _slot_sent(rig) == PLACEHOLDER_TS
+    web.chat_postMessage.assert_called_once_with(
+        channel=DM_CHANNEL, thread_ts="1700.0004", text=config.placeholder_text,
+    )
+    assert _notice_texts(web, config) == []
+    web.chat_delete.assert_not_called()
     refused = HttpRig(_answering(403))
     first, _event = dm_native()
     again, _event = dm_native()
     web = _deliver_selected(
         config, redis_client, refused, first, again, bindings=dm_bindings(module),
+        placeholders=(PLACEHOLDER_TS, "556.000"),
     )
     assert len(refused.requests) == 2
-    web.chat_postMessage.assert_called_once_with(
-        channel=DM_CHANNEL, thread_ts="1700.0004", text=REFUSED_TEXT,
-    )
+    # Either delivery may run first: it turns its placeholder into the notice
+    # and the repeated event_id deletes its own.
+    web.chat_update.assert_called_once()
+    web.chat_delete.assert_called_once()
+    updated, deleted = web.chat_update.call_args.kwargs, web.chat_delete.call_args.kwargs
+    assert updated["channel"] == deleted["channel"] == DM_CHANNEL
+    assert updated["text"] == REFUSED_TEXT
+    assert {updated["ts"], deleted["ts"]} == {PLACEHOLDER_TS, "556.000"}
+    assert _notice_texts(web, config) == [REFUSED_TEXT]
+
+
+@pytest.mark.parametrize(
+    ("slot", "deleted"),
+    [(PLACEHOLDER_TS, False), ("554.000", True), (None, False)],
+    ids=["own_slot", "other_slot", "no_slot"],
+)
+def test_duplicate_direct_message_deletes_only_a_placeholder_another_slot_owns(
+    config: DispatcherConfig, redis_client: redis.Redis, slot: str | None, deleted: bool,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-26/27: the DM lane follows the mention rules."""
+    module = api()
+    if slot is None:
+        answer = receipt(duplicate=True)
+
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=answer)
+
+        rig = HttpRig(handler)
+    else:
+        rig = HttpRig(_duplicate_of(slot))
+    body, _event = dm_native()
+    web = _deliver_selected(config, redis_client, rig, body, bindings=dm_bindings(module))
+    assert _slot_sent(rig) == PLACEHOLDER_TS
+    if deleted:
+        web.chat_delete.assert_called_once_with(channel=DM_CHANNEL, ts=PLACEHOLDER_TS)
+    else:
+        web.chat_delete.assert_not_called()
+    web.chat_update.assert_not_called()
+    assert _notice_texts(web, config) == []
 
 
 @pytest.mark.parametrize("damage", sorted(DROPPED))
@@ -274,6 +348,7 @@ def test_api_refusal_of_a_direct_message_never_reaches_legacy_lanes(
     body, _event = dm_native()
     web = _deliver_selected(config, redis_client, rig, body, bindings=dm_bindings(module))
     assert len(rig.requests) == 1
-    web.chat_postMessage.assert_called_once_with(
-        channel=DM_CHANNEL, thread_ts="1700.0004", text=REFUSED_TEXT,
+    web.chat_update.assert_called_once_with(
+        channel=DM_CHANNEL, ts=PLACEHOLDER_TS, text=REFUSED_TEXT,
     )
+    assert _notice_texts(web, config) == [REFUSED_TEXT]
