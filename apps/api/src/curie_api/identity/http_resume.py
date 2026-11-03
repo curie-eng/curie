@@ -22,8 +22,8 @@ from curie_api.identity.http_invocation import (
     HttpInvocationRuntime,
     check_http_turn_authority,
     current_source_authority,
-    invocation_source,
     turn_authority_response,
+    turn_invocation_source,
 )
 from curie_api.identity.http_transport import HttpIdentityClient
 from curie_api.models import Approval
@@ -128,7 +128,7 @@ async def _check_resume(
         return turn_authority_response(check, "refuse", "invalid_context")
     try:
         original = _original_invocation(resume)
-        registration, source = invocation_source(runtime, original)
+        registration, source = turn_invocation_source(runtime, original)
     except (ValueError, TypeError, HTTPException):
         return turn_authority_response(check, "refuse", "invalid_context")
     factory = request.app.state.sessionmaker
