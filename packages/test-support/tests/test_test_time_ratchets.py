@@ -20,6 +20,13 @@ def private_step_summary(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def branch_ref_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A CI run on a tag must not leak its ref into tests; tag tests opt in.
+    monkeypatch.setenv("GITHUB_REF_TYPE", "branch")
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
+
+
 def pin_main_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
     monkeypatch.setenv("GITHUB_BASE_REF", "main")
