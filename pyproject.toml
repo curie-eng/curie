@@ -526,6 +526,10 @@ forbidden_modules = ["claude_agent_sdk"]
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
+norecursedirs = [
+    "*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}",
+    "runner/tests/fixtures",
+]
 testpaths = [
     "packages/aci-protocol/tests",
     "packages/channel-protocol/tests",
