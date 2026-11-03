@@ -691,11 +691,15 @@ async def resolve_approval(
         await lock_identity_reader(session)
         # @spec HTTP-APPROVAL-CONTINUITY-14: a role change or adoption committed
         # since the first classification (say, during the approver lookup) is
-        # seen here, under the lock the expiry and claim below commit under.
+        # seen here, under the lock the expiry and claim below commit under. It
+        # is a denial: the caller audits it and refuses 403 before any write.
         if await approval_is_selected(
             session, approval, runtime=identity_runtime(request.app.state),
         ):
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "unsupported_approval")
+            decision = AuthzDecision(
+                False, "unsupported_approval", evidence={"kind": "http_selection"},
+            )
+            return
         team_decision = await approval_team_decision(session, approval, principal)
         current_binding = await crud_approvals.get_approval_route_binding(session, approval)
         if (was_restricted != team_decision.restricted
