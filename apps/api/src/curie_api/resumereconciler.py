@@ -154,6 +154,13 @@ def _parse_dead_lettered_resume(
 # Pages a pass may read past selected rows before it stops for this interval.
 _LEGACY_PAGES = 10
 
+# Refusals no retry can clear until the row's authority or shape changes: the
+# original invoker is not allowed, or the row is not a supported resume. Such a
+# row stays owed and unmarked, but is re-evaluated on a bounded backoff rather
+# than every pass. @spec HTTP-APPROVAL-CONTINUITY-11.
+_DEFINITIVE_REFUSALS = frozenset({"caller_not_allowed", "unsupported_resume"})
+_REFUSAL_BACKOFF_CAP_S = 3600.0
+
 
 class _Outcome(enum.Enum):
     """What one per-row re-enqueue attempt did."""
@@ -192,6 +199,10 @@ class ResumeReconciler:
         # Round-robin keyset cursor over sealed owed wakes, so rows whose current
         # authority keeps refusing cannot starve the rest. @spec HTTP-APPROVAL-CONTINUITY-11.
         self._sealed_after: tuple[datetime, uuid.UUID] | None = None
+        # Per-row (next attempt, last delay) in monotonic seconds for rows refused
+        # definitively. In memory on purpose: a restart retries each row once.
+        # @spec HTTP-APPROVAL-CONTINUITY-11.
+        self._refused: dict[uuid.UUID, tuple[float, float]] = {}
 
     async def reconcile_once(self) -> int:
         """Run one measured pass without changing the reconciler's result shape."""
@@ -285,8 +296,8 @@ class ResumeReconciler:
                 if not still_owed:
                     self._resume_queue.forget_undelivered(approval_id)
             elif outcome is _Outcome.SELECTED:
-                # A refused selected wake stays owed to the grace backstop rather
-                # than repeating its authority lookups every pass.
+                # A refused selected wake stays owed but is re-evaluated on its
+                # per-row backoff, not by repeating authority lookups every pass.
                 self._resume_queue.forget_undelivered(approval_id)
             # _Outcome.FAILED: enqueue re-recorded the id; it stays owed.
 
@@ -358,12 +369,16 @@ class ResumeReconciler:
         mark rolls back, leaving ``resumed_at`` NULL for a later pass.
         """
 
+        refused = self._refused.get(approval_id)
+        if refused is not None and time.monotonic() < refused[0]:
+            return _Outcome.SELECTED
         selected = False
         async with self._sessionmaker() as session:
             try:
                 async with session.begin():
                     approval = await crud_approvals.claim_resume_row(session, approval_id)
                     if approval is None:
+                        self._refused.pop(approval_id, None)
                         # Another replica holds it, or it is already resumed;
                         # exit the txn block cleanly, releasing any lock.
                         return _Outcome.NOT_CLAIMED
@@ -405,16 +420,20 @@ class ResumeReconciler:
         try:
             async with self._sessionmaker() as session:
                 if not await crud_approvals.approval_owes_resume(session, approval_id):
+                    self._refused.pop(approval_id, None)
                     return _Outcome.NOT_CLAIMED
             await self._resume_queue.enqueue_approval(approval_id)
         except ApprovalResumeRefused as refused:
+            retry_in = self._back_off(approval_id, refused.code)
             logger.warning(
-                "selected approval %s resume refused (%s); left owed", approval_id, refused.code,
+                "selected approval %s resume refused (%s); left owed, next attempt in %ds",
+                approval_id, refused.code, retry_in,
             )
             return _Outcome.SELECTED
         except Exception:  # noqa: BLE001 - provider and SQL details stay out of logs.
             logger.warning("selected approval %s resume append unknown; left owed", approval_id)
             return _Outcome.FAILED
+        self._refused.pop(approval_id, None)
         try:
             async with self._sessionmaker() as session:
                 await crud_approvals.mark_approval_resumed(session, approval_id)
@@ -426,6 +445,23 @@ class ResumeReconciler:
             return _Outcome.FAILED
         logger.info("selected approval %s resume turn published", approval_id)
         return _Outcome.ENQUEUED
+
+    def _back_off(self, approval_id: uuid.UUID, code: str) -> float:
+        """Schedule the next attempt for a refused row; return the delay in seconds.
+
+        A definitive refusal doubles the row's delay from twice the interval up to
+        the cap; any other refusal clears the schedule so it retries every pass.
+        @spec HTTP-APPROVAL-CONTINUITY-11.
+        """
+
+        if code not in _DEFINITIVE_REFUSALS:
+            self._refused.pop(approval_id, None)
+            return float(self._interval_seconds)
+        previous = self._refused.get(approval_id)
+        delay = 2.0 * self._interval_seconds if previous is None else previous[1] * 2.0
+        delay = min(delay, max(_REFUSAL_BACKOFF_CAP_S, 2.0 * self._interval_seconds))
+        self._refused[approval_id] = (time.monotonic() + delay, delay)
+        return delay
 
     async def reopen_dead_lettered_resumes(self) -> int:
         """Re-open approvals whose DELIVERED resume turn was dead-lettered (#532).
