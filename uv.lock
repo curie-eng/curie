@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.13"
 resolution-markers = [
     "python_full_version >= '3.15'",
@@ -954,6 +954,7 @@ source = { editable = "apps/mail-adapter" }
 dependencies = [
     { name = "aci-protocol" },
     { name = "curie-channel-protocol" },
+    { name = "curie-internal" },
     { name = "curie-telemetry" },
     { name = "curie-upgrade-pause" },
     { name = "pydantic" },
@@ -964,6 +965,7 @@ dependencies = [
 requires-dist = [
     { name = "aci-protocol", editable = "packages/aci-protocol" },
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
+    { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "curie-upgrade-pause", editable = "packages/upgrade-pause" },
     { name = "pydantic", specifier = ">=2.10" },
