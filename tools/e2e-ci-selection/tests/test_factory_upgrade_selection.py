@@ -125,7 +125,10 @@ def test_mixed_chart_and_factory_migration_pr_runs_upgrade_smoke(tmp_path: Path)
 def _collection_repository(tmp_path: Path) -> Path:
     root = tmp_path / "collection"
     root.mkdir()
-    for relative in ("pyproject.toml", "conftest.py", "tools/factory-e2e/tests/conftest.py"):
+    for relative in (
+        "pyproject.toml", "conftest.py", "tools/factory-e2e/tests/conftest.py",
+        "tests/baselines/test-time.json",
+    ):
         destination = root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(REPO_ROOT / relative, destination)
