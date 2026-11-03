@@ -268,11 +268,14 @@ class HttpReceiverRuntime:
         return self._scope.channel_identity_name
 
     def validate_connection(self, identity_name: str, web_client: WebClient) -> None:
-        """@spec HTTP-INVOCATION-EXECUTION-19."""
+        """The app's identity and client match this runtime; Slack is not asked again.
+
+        @spec HTTP-INVOCATION-EXECUTION-19/25: ``build_http_receiver_runtime`` already
+        qualified this receiver once, so app construction repeats no network call.
+        """
         try:
-            if identity_name != self.identity_name:
+            if identity_name != self.identity_name or not isinstance(web_client, WebClient):
                 raise ValueError
-            _qualified(self._scope, web_client)
         except Exception:  # noqa: BLE001 - startup errors exclude provider and secret bytes.
             raise ValueError("invalid_http_receiver_runtime") from None
 
@@ -469,8 +472,13 @@ def build_http_receiver_runtime(
     scope: HttpReceiverScopeV1, bindings: tuple[HttpReceiverBindingV1, ...], *,
     receiver_key: bytes, web_client: WebClient, api_base_url: str,
     http_client_factory: Callable[[], httpx.AsyncClient] | None = None,
+    on_stage: Callable[[Literal["auth_test", "runtime"]], None] | None = None,
 ) -> HttpReceiverRuntime:
-    """@spec HTTP-INVOCATION-EXECUTION-1/2/19."""
+    """@spec HTTP-INVOCATION-EXECUTION-1/2/19/25.
+
+    ``on_stage`` is told ``auth_test`` just before the one Slack call and ``runtime`` once it
+    has been qualified, so a caller's failure boundary can name the stage that failed.
+    """
     try:
         if type(scope) is not HttpReceiverScopeV1 or type(bindings) is not tuple:
             raise ValueError
@@ -501,7 +509,11 @@ def build_http_receiver_runtime(
         _ = url.port
         if http_client_factory is not None and not callable(http_client_factory):
             raise ValueError
+        if on_stage is not None:
+            on_stage("auth_test")
         _qualified(scope, web_client)
+        if on_stage is not None:
+            on_stage("runtime")
         runtime = object.__new__(HttpReceiverRuntime)
         object.__setattr__(runtime, "_scope", scope)
         object.__setattr__(runtime, "_bindings", MappingProxyType(by_channel))

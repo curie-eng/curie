@@ -287,6 +287,18 @@ A scheduled turn has no invocation context, so identity.selected() stays false a
 
 Independent tests use the actual kernel harness with real PostgreSQL, real Valkey, the production HookRunRecorder and a labeled synthetic binding classifier: a valid scheduled turn on an HTTP-required binding runs once and closes ran without any current-authority request; a replaced deployment and a reference for another agent each refuse before any boot or claim and close an open run failed with identity_refused, and a closed run refuses without changing its outcome; a deployment replaced or a binding generation changed after prepare refuses at claim_or_resume before the claim; and a binding without the HTTP requirement keeps its existing behavior.
 
+## 25. Receiver startup boundary
+
+<!-- @spec HTTP-INVOCATION-EXECUTION-25 -->
+
+Realizes [ADR 0262](../../adr/0262-the-dispatcher-qualifies-each-http-receiver-once-behind-its-own-failure-boundary.md). This amends criteria 19 and 20: a failed `auth.test` qualification, an unadmitted selection or any other single-receiver failure no longer stops dispatcher startup. It excludes that receiver and its identity instead; criteria 19 and 20 otherwise stand.
+
+`build_selected_receivers` qualifies each selected receiver exactly once per process start, through the single `auth.test` call inside `build_http_receiver_runtime`, and returns a frozen `SelectedReceivers` holding the qualified runtimes and the channel identity names it excluded. Every stage of one receiver runs inside that receiver's own boundary: its registration matched to an admitted identity (`registration`), the `auth.test` call with its comparisons including a timeout (`auth_test`), runtime construction (`runtime`), and, in `build_identity_connections`, app construction (`app`). A failure at any stage excludes the receiver and its identity and logs one error naming only the channel identity name and the stage; no Slack response, token, key or exception text is logged. `build_app` keeps its runtime type and identity-name checks but does not call Slack: `HttpReceiverRuntime.validate_connection` no longer runs `auth.test`.
+
+`build_supervisor` and `build_identity_connections` take the excluded names. An excluded identity builds no Web client, app, supervisor or Socket Mode connection, so it opens no Slack connection on any path; the registration still makes the API refuse that identity's channel-token turns. Every other selected receiver and every unregistered identity starts unchanged. `main` still stops startup when `receivers.json` cannot be read or parsed or repeats a channel identity (`unconfigured_directory`, `unsafe_file`, `invalid_document`); the `invalid_runtime` startup stage no longer exists. An excluded receiver is retried only by the next process start, and the unavailable identity shows as `connected` below `configured` in `curie.slack.socket.identities`.
+
+Independent tests use synthetic identities, tokens and Slack answers only, and drive the real `build_supervisor` through `main`: two registered identities whose first fails at each stage while the second connects, an unregistered identity still starting, a malformed file still stopping startup, and one `auth.test` call per receiver.
+
 ## 28. File-bearing message sender team
 
 <!-- @spec HTTP-INVOCATION-EXECUTION-28 -->

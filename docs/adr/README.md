@@ -278,5 +278,6 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0256 | [Publication validates and pushes a Git object overlay](0256-publication-validates-and-pushes-a-git-object-overlay.md) | Draft |
 | 0257 | [A release registers its schema window only at the cut](0257-a-release-registers-its-schema-window-only-at-the-cut.md) | Accepted |
 | 0258 | [A scheduled hook turn carries its deployment authority on HTTP identity bindings](0258-a-scheduled-hook-turn-carries-its-deployment-authority-on-http-identity-bindings.md) | Accepted |
+| 0262 | [The dispatcher qualifies each HTTP receiver once behind its own failure boundary](0262-the-dispatcher-qualifies-each-http-receiver-once-behind-its-own-failure-boundary.md) | Draft |
 | 0265 | [A file-bearing Slack message's sender team may come from the sender's own files](0265-a-file-bearing-slack-messages-sender-team-may-come-from-the-senders-own-files.md) | Draft |
 <!-- END GENERATED: adr-index -->

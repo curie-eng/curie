@@ -7,6 +7,7 @@ once at startup and never carries a core context key.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Never
@@ -31,7 +32,8 @@ from .preflight import PreflightedIdentity
 RECEIVERS_FILE = "receivers.json"
 _MAX_ENTRIES = 256
 
-Stage = Literal["unconfigured_directory", "unsafe_file", "invalid_document", "invalid_runtime"]
+Stage = Literal["unconfigured_directory", "unsafe_file", "invalid_document"]
+ExclusionStage = Literal["registration", "auth_test", "runtime", "app"]
 
 
 class HttpReceiverInitializationError(Exception):
@@ -111,28 +113,55 @@ def load_http_receiver_registrations(directory: str) -> tuple[HttpReceiverRegist
         _refuse("invalid_document")
 
 
+@dataclass(frozen=True, slots=True)
+class SelectedReceivers:
+    """Qualified runtimes and the excluded identities. @spec HTTP-INVOCATION-EXECUTION-25."""
+
+    receivers: tuple[HttpReceiverRuntime, ...]
+    excluded: frozenset[str]
+
+
+def log_receiver_exclusion(
+    logger: logging.Logger, identity_name: str, stage: ExclusionStage,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-25: only the identity name and stage, no Slack bytes."""
+    logger.error("http receiver excluded: identity=%s stage=%s", identity_name, stage)
+
+
 def build_selected_receivers(
     config: DispatcherConfig,
     admitted: Sequence[PreflightedIdentity],
     registrations: tuple[HttpReceiverRegistration, ...],
     *,
     web_client_factory: Callable[[DispatcherConfig, SlackIdentityCredentials], WebClient],
-) -> tuple[HttpReceiverRuntime, ...]:
-    """One qualified runtime per selected admitted identity.
+    logger: logging.Logger,
+) -> SelectedReceivers:
+    """Qualify each selected receiver once, each behind its own failure boundary.
 
-    @spec HTTP-INVOCATION-EXECUTION-19/20: an unadmitted selection or failed auth.test
-    stops startup rather than starting that identity on the legacy path.
+    @spec HTTP-INVOCATION-EXECUTION-25: a failure at any stage (registration, auth.test,
+    runtime) excludes that receiver and its identity and is logged by identity name and
+    stage; the other receivers still start. A defective file never reaches here.
     """
-    try:
-        by_name = {item.credentials.name: item.credentials for item in admitted}
-        receivers = []
-        for registration in registrations:
-            credentials = by_name[registration.scope.channel_identity_name]
+    by_name = {item.credentials.name: item.credentials for item in admitted}
+    receivers: list[HttpReceiverRuntime] = []
+    excluded: set[str] = set()
+    for registration in registrations:
+        name = registration.scope.channel_identity_name
+        stage: ExclusionStage = "registration"
+
+        def reached(next_stage: Literal["auth_test", "runtime"]) -> None:
+            nonlocal stage
+            stage = next_stage
+
+        try:
+            credentials = by_name[name]
+            stage = "runtime"
             receivers.append(build_http_receiver_runtime(
                 registration.scope, registration.bindings, receiver_key=registration.key,
                 web_client=web_client_factory(config, credentials),
-                api_base_url=config.api_base_url,
+                api_base_url=config.api_base_url, on_stage=reached,
             ))
-        return tuple(receivers)
-    except Exception:  # noqa: BLE001 - startup errors exclude Slack and secret bytes.
-        _refuse("invalid_runtime")
+        except Exception:  # noqa: BLE001 - the log names the stage, never Slack or secret bytes.
+            excluded.add(name)
+            log_receiver_exclusion(logger, name, stage)
+    return SelectedReceivers(tuple(receivers), frozenset(excluded))
