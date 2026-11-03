@@ -149,6 +149,10 @@ def _admits(event: object, body: object) -> bool:
     return "thread_ts" not in event or event.get("thread_ts") == event.get("ts")
 
 
+class _MalformedHistoryPage(Exception):
+    """A history page that is not one ok dict with a messages list."""
+
+
 def _page_messages(payload: object) -> list[object] | None:
     """Messages from one history page.
 
@@ -231,6 +235,7 @@ class SlackDmContinuity:
             return text
         messages = _page_messages(payload)
         if messages is None:
+            self._failed(_MalformedHistoryPage())
             return text
         caller = event.get("user")
         selected = select_dm_messages(
