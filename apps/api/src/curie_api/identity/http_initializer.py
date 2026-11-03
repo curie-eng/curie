@@ -1,4 +1,4 @@
-"""Operator initializer for the API HTTP invocation runtime. @spec HTTP-INVOCATION-EXECUTION-20.
+"""Operator initializer for the API HTTP invocation runtime. @spec HTTP-INVOCATION-EXECUTION-20/29.
 
 ``CURIE_HTTP_IDENTITY_DIR`` selects one protected ``api-runtime.json``. It is
 read once at startup; a changed file takes effect only through process
@@ -8,6 +8,7 @@ replacement (HTTP-INVOCATION-EXECUTION-1).
 from __future__ import annotations
 
 import base64
+import hmac
 import json
 import re
 import ssl
@@ -23,12 +24,13 @@ from curie_internal.operator_file import (
 )
 from pydantic import BaseModel, ConfigDict
 
-from curie_api.config import Settings
+from curie_api.config import Settings, get_settings
 from curie_api.identity.http_credential_registry import (
     ProviderCredentialRegistry,
     build_provider_credential_registry,
 )
 from curie_api.identity.http_invocation import (
+    EmailReceiverRegistrationV1,
     HttpInvocationRuntime,
     ReceiverRegistrationV1,
     build_http_invocation_runtime,
@@ -85,9 +87,9 @@ def _object(value: Any, keys: frozenset[str]) -> Mapping[str, Any]:
     return value
 
 
-def _entries(value: Any) -> list[Any]:
-    """@spec HTTP-INVOCATION-EXECUTION-20: 1 through 256 entries."""
-    if type(value) is not list or not 1 <= len(value) <= _MAX_ENTRIES:
+def _entries(value: Any, *, minimum: int = 1) -> list[Any]:
+    """@spec HTTP-INVOCATION-EXECUTION-20/29: 1 (or ``minimum``) through 256 entries."""
+    if type(value) is not list or not minimum <= len(value) <= _MAX_ENTRIES:
         raise ValueError
     return value
 
@@ -112,6 +114,27 @@ def _receiver(value: Any) -> tuple[ReceiverRegistrationV1, bytes]:
     return registration, decode_key_material(entry["key"])
 
 
+def _email_receiver(value: Any) -> tuple[EmailReceiverRegistrationV1, bytes]:
+    """@spec HTTP-INVOCATION-EXECUTION-29: exact email registration in its JSON wire form."""
+    entry = _object(value, frozenset({"registration", "key"}))
+    registration = EmailReceiverRegistrationV1.model_validate_json(
+        json.dumps(entry["registration"], ensure_ascii=False),
+    )
+    return registration, decode_key_material(entry["key"])
+
+
+def _is_platform_key(material: bytes, platform_key: str) -> bool:
+    """Whether key material or its canonical spelling is the platform key.
+
+    @spec HTTP-INVOCATION-EXECUTION-29: a platform-key holder must not hold an
+    email receiver key. Channel tokens are minted per request and cannot be
+    compared here.
+    """
+    spelling = base64.urlsafe_b64encode(material).rstrip(b"=")
+    candidate = platform_key.encode("utf-8")
+    return hmac.compare_digest(material, candidate) or hmac.compare_digest(spelling, candidate)
+
+
 def _context_key(value: Any) -> tuple[str, int, bytes]:
     """@spec HTTP-INVOCATION-EXECUTION-20."""
     entry = _object(value, frozenset({"key_id", "generation", "key"}))
@@ -121,20 +144,38 @@ def _context_key(value: Any) -> tuple[str, int, bytes]:
     return reference.key_id, reference.generation, decode_key_material(entry["key"])
 
 
-def load_http_identity_runtime(directory: str) -> HttpInvocationRuntime:
-    """Build the runtime from one protected operator file. @spec HTTP-INVOCATION-EXECUTION-20."""
+def load_http_identity_runtime(
+    directory: str, *, platform_key: str | None = None,
+) -> HttpInvocationRuntime:
+    """Build the runtime from one protected operator file.
+
+    ``platform_key`` defaults to the configured API platform key.
+    @spec HTTP-INVOCATION-EXECUTION-20/29.
+    """
     try:
         document = read_operator_json(directory, RUNTIME_FILE)
     except OperatorFileRefusal as refusal:
         _refuse(refusal.stage)
     try:
-        root = _object(document, frozenset({
+        members = frozenset({
             "schema_version", "providers", "receivers", "context_keys", "signing_key",
-        }))
+        })
+        optional = frozenset({"email_receivers"}) & frozenset(
+            document if type(document) is dict else (),
+        )
+        root = _object(document, members | optional)
         if type(root["schema_version"]) is not int or root["schema_version"] != 1:
             raise ValueError
         providers = tuple(_provider(item) for item in _entries(root["providers"]))
-        receivers = tuple(_receiver(item) for item in _entries(root["receivers"]))
+        # @spec HTTP-INVOCATION-EXECUTION-29: Slack receivers may be absent only
+        # when email receivers are registered; neither kind refuses.
+        email_receivers = tuple(
+            _email_receiver(item) for item in _entries(root["email_receivers"])
+        ) if "email_receivers" in root else ()
+        receivers = tuple(
+            _receiver(item)
+            for item in _entries(root["receivers"], minimum=0 if email_receivers else 1)
+        )
         context_keys = tuple(_context_key(item) for item in _entries(root["context_keys"]))
         signing = _KeyReference.model_validate(
             dict(_object(root["signing_key"], frozenset({"key_id", "generation"}))),
@@ -145,9 +186,15 @@ def load_http_identity_runtime(directory: str) -> HttpInvocationRuntime:
     if not isinstance(registry, ProviderCredentialRegistry):
         _refuse("invalid_runtime")
     try:
+        configured = get_settings().api_key if platform_key is None else platform_key
+        if type(configured) is not str or any(
+            _is_platform_key(material, configured) for _, material in email_receivers
+        ):
+            raise ValueError
         return build_http_invocation_runtime(
             registry, receivers, context_keys,
             signing_key=(signing.key_id, signing.generation),
+            email_receivers=email_receivers,
         )
     except Exception:  # noqa: BLE001 - runtime conflicts never expose supplied values.
         _refuse("invalid_runtime")
@@ -161,7 +208,7 @@ def configured_http_identity_runtime(settings: Settings) -> HttpInvocationRuntim
     directory = settings.http_identity_dir
     if directory is None:
         return None
-    return load_http_identity_runtime(directory)
+    return load_http_identity_runtime(directory, platform_key=settings.api_key)
 
 
 def _certificate_blocks(raw: bytes) -> int:

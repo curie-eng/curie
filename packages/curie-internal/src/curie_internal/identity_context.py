@@ -153,6 +153,48 @@ class ReceiverProofV1(_Wire):
     slack: ReceiverSlackEvidenceV1
 
 
+def _email_sender(value: str) -> str:
+    """One lowercased address with exactly one ``@``. @spec HTTP-INVOCATION-EXECUTION-29."""
+    local, at, domain = value.partition("@")
+    if (
+        not at or not local or not domain or "@" in domain or value != value.lower()
+        or any(character.isspace() or not character.isprintable() for character in value)
+    ):
+        raise ValueError("invalid_email_sender")
+    return value
+
+
+def is_email_sender(value: object) -> bool:
+    """Whether a value is a proof-grammar sender address. @spec HTTP-INVOCATION-EXECUTION-29."""
+    if type(value) is not str or not 1 <= len(value) <= 256:
+        return False
+    try:
+        _email_sender(value)
+    except ValueError:
+        return False
+    return True
+
+
+EmailSender = Annotated[Identifier, AfterValidator(_email_sender)]
+# A native Message-ID; RFC 5322 bounds a header line well below this.
+NativeDelivery = Annotated[Text, Field(min_length=1, max_length=1024)]
+
+
+class EmailReceiverProofV1(_Wire):
+    """What a mail adapter signs after authenticating one message.
+
+    @spec HTTP-INVOCATION-EXECUTION-29.
+    """
+
+    schema_version: Version
+    receiver_id: CanonicalUUID
+    receiver_generation: Generation
+    binding_id: CanonicalUUID
+    sender: EmailSender
+    delivery_id: NativeDelivery
+    body_sha256: Digest
+
+
 class ContextNamespaceV1(_Wire):
     """@spec HTTP-INVOCATION-EXECUTION-13."""
 
@@ -431,7 +473,10 @@ def open_invocation_context(
 
 
 def _additional_protocol(kind: str) -> tuple[type[BaseModel], str, str]:
-    """Closed protocol dispatch keeps keys here. @spec HTTP-APPROVAL-CONTINUITY-6/7."""
+    """Closed protocol dispatch keeps keys here.
+
+    @spec HTTP-APPROVAL-CONTINUITY-6/7 HTTP-INVOCATION-EXECUTION-29.
+    """
     from curie_internal.identity_approval import (
         ApprovalAnswerProofV1,
         ApprovalContextV1,
@@ -444,18 +489,20 @@ def _additional_protocol(kind: str) -> tuple[type[BaseModel], str, str]:
         return ResumeContextV1, "curie-resume-context-v1", "context"
     if kind == "answer":
         return ApprovalAnswerProofV1, "curie-approval-receiver-v1", "receiver"
+    if kind == "email":
+        return EmailReceiverProofV1, "curie-email-receiver-v1", "receiver"
     raise ValueError
 
 
 def _additional_reference(value: BaseModel, purpose: str) -> tuple[str, int]:
-    """@spec HTTP-APPROVAL-CONTINUITY-6/7."""
+    """@spec HTTP-APPROVAL-CONTINUITY-6/7 HTTP-INVOCATION-EXECUTION-29."""
     from curie_internal.identity_approval import (
         ApprovalAnswerProofV1,
         ApprovalContextV1,
         ResumeContextV1,
     )
 
-    if purpose == "receiver" and isinstance(value, ApprovalAnswerProofV1):
+    if purpose == "receiver" and isinstance(value, (ApprovalAnswerProofV1, EmailReceiverProofV1)):
         return value.receiver_id, value.receiver_generation
     if purpose == "context" and isinstance(value, (ApprovalContextV1, ResumeContextV1)):
         return value.key_id, value.key_generation
@@ -549,4 +596,22 @@ def verify_approval_answer_proof(
     try:
         return cast("ApprovalAnswerProofV1", _open_additional(token, keyring, "answer"))
     except Exception:  # noqa: BLE001 - no supplied token, key or parser text escapes.
+        return ContextRefusal(code="invalid_receiver_proof")
+
+
+def sign_email_receiver_proof(value: EmailReceiverProofV1, keyring: IdentityKeyring) -> str:
+    """@spec HTTP-INVOCATION-EXECUTION-29: the Slack receiver scheme under its own prefix."""
+    try:
+        return _seal_additional(value, keyring, "email")
+    except Exception:  # noqa: BLE001 - no supplied proof/key/parser content escapes.
+        raise ValueError("invalid_receiver_proof") from None
+
+
+def verify_email_receiver_proof(
+    token: str, keyring: IdentityKeyring,
+) -> EmailReceiverProofV1 | ContextRefusal:
+    """@spec HTTP-INVOCATION-EXECUTION-29: a Slack proof never verifies here."""
+    try:
+        return cast("EmailReceiverProofV1", _open_additional(token, keyring, "email"))
+    except Exception:  # noqa: BLE001 - verification has one bounded refusal.
         return ContextRefusal(code="invalid_receiver_proof")
