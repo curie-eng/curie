@@ -639,8 +639,21 @@ def _emit(state: dict[str, Any], record: dict[str, Any]) -> None:
     try:
         with open(target, "a") as log:
             log.write(line + "\n")
+        return
     except OSError:
-        sys.stderr.write(line + "\n")
+        pass
+    # The runner's PID 1 marks itself non-dumpable, so its children get EACCES on
+    # /proc/1/fd/2. Keep the line in the hook's state directory, where a reader
+    # inside the pod can find it, before the swallowed stderr.
+    try:
+        gate_dir = state_dir()
+        gate_dir.mkdir(parents=True, exist_ok=True)
+        with open(gate_dir / "gate.log", "a") as log:
+            log.write(line + "\n")
+        return
+    except OSError:
+        pass
+    sys.stderr.write(line + "\n")
 
 
 def emit_phase(state: dict[str, Any], phase: str, round_: int, note: str, **fields: Any) -> None:
