@@ -90,7 +90,7 @@ def _review_comment(factory: LabelFactory, intake: str, number: int) -> None:
     first = _work(number)[0]
     pull = factory.github.plant_pull()
     _own_pull_request(first["work_item_id"], pull)
-    _complete(first["id"])
+    _complete(factory.client, first["id"])
     comment = factory.github.add_review_comment(
         pull, next(_REVIEW_COMMENTS), f"@{MENTION} please rename the helper"
     )

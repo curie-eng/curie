@@ -46,6 +46,7 @@ from curie_worker.binding import (
     FactoryBindingRefused,
     FactoryContext,
     FactoryWake,
+    HttpIdentityBinding,
 )
 from curie_worker.config import WorkerConfig
 from curie_worker.consumer_liveness import ConsumerLivenessStore, ThreadLockOwnerLiveness
@@ -78,6 +79,19 @@ ISSUE_URL = f"https://github.com/{WORK_ITEM_REPO}/issues/123"
 
 
 class _Binding:
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = AGENT_ID
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
     def _deployment(self) -> object:
         return SimpleNamespace(
             agent_id=AGENT_ID,

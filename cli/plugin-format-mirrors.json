@@ -85,6 +85,12 @@
       "omissions": []
     },
     {
+      "struct": "ConnectorRouteDecl",
+      "file": "cli/src/connector_build.rs",
+      "schema": "ConnectorRoute",
+      "omissions": []
+    },
+    {
       "struct": "RunnerSpecDecl",
       "file": "cli/src/connector_build.rs",
       "schema": "RunnerSpec",

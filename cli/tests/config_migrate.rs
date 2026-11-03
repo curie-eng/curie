@@ -2492,6 +2492,18 @@ const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     "CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES",
     "CURIE_ATTACHMENT_THREAD_MAX_BYTES",
     "CURIE_ATTACHMENT_THREAD_MAX_FILES",
+    // HTTP-INVOCATION-EXECUTION-20: operator file directories were introduced as Helm values.
+    "CURIE_HTTP_IDENTITY_DIR",
+    "CURIE_HTTP_RECEIVER_DIR",
+    // #5005 / ADR 0244: new chart-owned lazy settings have no released extraEnv source.
+    // Broker origins are derived from the private Service, not migrated into a values map.
+    "ATTACHMENT_BROKER_URL",
+    "ATTACHMENT_TRANSFER_TIMEOUT_SECONDS",
+    "CURIE_ATTACHMENT_BROKER_HOST",
+    "CURIE_ATTACHMENT_BROKER_MAX_CONCURRENT",
+    "CURIE_ATTACHMENT_BROKER_PORT",
+    "CURIE_ATTACHMENT_MODE",
+    "CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS",
     "CURIE_REMEDIATION_ENABLED",
     // The ADR 0231 remediation authority is a chart-managed credential from introduction.
     "CURIE_REMEDIATION_AUTHORITY_KEY",
@@ -2610,12 +2622,16 @@ const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     "CURIE_WORKSPACE_MAX_COMPRESSION_RATIO",
     "CURIE_WORKSPACE_MAX_CONCURRENT_CLONES",
     "CURIE_WORKSPACE_MAX_MEMBERS",
+    "CURIE_WORKSPACE_RECOVERY_ENABLED",
+    "CURIE_WORKSPACE_RECOVERY_MAX_BYTES",
     "CURIE_WORKSPACE_REFERENCE_TTL_SECONDS",
     "CURIE_WORKSPACE_SCRATCH_ROOT",
     "CURIE_WORKSPACE_TOTAL_TIMEOUT_SECONDS",
     "CURIE_WORKSPACE_UPLOAD_TIMEOUT_SECONDS",
     "CURIE_WORK_ITEM_MAX_TURNS",
     "ENVIRONMENT",
+    // The new settle setting has no prior extraEnv values to migrate.
+    "FACTORY_BASE_LABEL_SETTLE_S",
     // The factory settings arrived with #4397 as chart values, never extraEnv.
     "FACTORY_CI_WAIT_S",
     "FACTORY_ENABLED",

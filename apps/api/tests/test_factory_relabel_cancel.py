@@ -117,7 +117,7 @@ def test_unlabel_on_running_requests_cancellation_and_publishes_a_terminate_wake
     number = 9601
     assert _labelled(client, github, number).json()["status"] == "factory_admitted"
     request_id = _all(number)[0]["id"]
-    _start_running(request_id)
+    _start_running(client, request_id)
     removed = _unlabelled(client, github, number)
     assert removed.json()["status"] == "factory_cancellation_requested"
     row = _all(number)[0]
@@ -135,7 +135,7 @@ def test_relabel_after_a_terminal_request_admits_a_second_request(admitted: Any)
     number = 9602
     assert _labelled(client, github, number).json()["status"] == "factory_admitted"
     first = _all(number)[0]
-    epoch = _start_running(first["id"])
+    epoch = _start_running(client, first["id"])
     failed = client.post(
         f"/v1/internal/work-items/requests/{first['id']}/finish",
         headers=WORKER,
@@ -208,7 +208,7 @@ def test_relabel_while_running_readmits_after_the_termination_is_observed(
     number = 9605
     assert _labelled(client, github, number).json()["status"] == "factory_admitted"
     old_id = _all(number)[0]["id"]
-    _start_running(old_id)
+    _start_running(client, old_id)
 
     again = _labelled(client, github, number)
 
@@ -251,7 +251,7 @@ def test_unlabel_while_a_readmit_is_pending_clears_it(admitted: Any) -> None:  #
     number = 9606
     assert _labelled(client, github, number).json()["status"] == "factory_admitted"
     old_id = _all(number)[0]["id"]
-    _start_running(old_id)
+    _start_running(client, old_id)
     assert _labelled(client, github, number).json()["status"] == "factory_readmit_pending"
 
     _unlabelled(client, github, number)
@@ -271,7 +271,7 @@ def test_unlabel_while_a_readmit_is_pending_clears_it(admitted: Any) -> None:  #
 def _unowned_cancel(client: Any, github: Any, number: int, age_seconds: int) -> dict[str, Any]:
     assert _labelled(client, github, number).json()["status"] == "factory_admitted"
     request_id = _all(number)[0]["id"]
-    _start_running(request_id)
+    _start_running(client, request_id)
     assert _unlabelled(client, github, number).json()["status"] == (
         "factory_cancellation_requested"
     )
@@ -334,7 +334,7 @@ def test_overdue_cancel_with_a_live_owner_heartbeat_is_not_settled(
     number = 9609
     assert _labelled(client, github, number).json()["status"] == "factory_admitted"
     request_id = _all(number)[0]["id"]
-    _start_running(request_id)
+    _start_running(client, request_id)
     assert _unlabelled(client, github, number).json()["status"] == (
         "factory_cancellation_requested"
     )
@@ -365,7 +365,7 @@ def test_unlabel_after_a_suppressed_termination_still_owes_the_stop_notice(
     number = 9610
     assert _labelled(client, github, number).json()["status"] == "factory_admitted"
     old_id = _all(number)[0]["id"]
-    _start_running(old_id)
+    _start_running(client, old_id)
     assert _labelled(client, github, number).json()["status"] == "factory_readmit_pending"
     _observe_termination(client, old_id)
     # The terminal detail is staged at terminus; nothing is suppressed any more.

@@ -28,7 +28,7 @@ import pytest
 from aci_protocol import ErrorEvent, Final, SessionStatus
 from curie_worker import binding as binding_module
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.binding import BindingResolver, ResolvedDeployment
+from curie_worker.binding import BindingResolver, HttpIdentityBinding, ResolvedDeployment
 from curie_worker.config import WorkerConfig
 from curie_worker.kernel.failures import ThreadBusyError
 
@@ -45,6 +45,19 @@ _qevent = functools.partial(qevent, channel=CHANNEL)
 
 class _RealBootEnvBinding:
     """Resolves one agent; ``boot_env`` is the real resolver's minting."""
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = AGENT_ID
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
 
     def __init__(self) -> None:
         self._real = BindingResolver.__new__(BindingResolver)

@@ -66,6 +66,7 @@ from ..config import get_settings
 from ..deps import SessionDep
 from ..identity import connect as identity_connect
 from ..models import Principal
+from ..principal_authority import PrincipalAuthorityRefusal
 from ..rate_limit import require_rate_limit
 from .identity_connect import (
     CONNECT_COOKIE,
@@ -399,13 +400,24 @@ async def oidc_callback(
         claims, get_settings().oidc_required_claims
     ):
         return _refuse_callback("ID token lacks a required claim")
-    principal = await crud_console.resolve_principal(
-        session, claims, **({"tenant_id": connect_row.tenant_id} if connect_row else {})
-    )
+    # @spec HTTP-PRINCIPAL-ADOPTION-V1-10, HTTP-PRINCIPAL-ADOPTION-V1-11.
+    try:
+        principal = await crud_console.resolve_principal(
+            session, claims, **({"tenant_id": connect_row.tenant_id} if connect_row else {})
+        )
+    except PrincipalAuthorityRefusal:
+        await session.rollback()
+        response = _refuse_callback("principal authority refused login")
+        if connect_token:
+            clear_connect_cookies(response)
+        return response
     if not await crud_console.principal_is_active(session, principal):
         # Undo the attribute refresh: a refused login changes nothing.
         await session.rollback()
-        return _refuse_callback("principal or tenant is not active")
+        response = _refuse_callback("principal or tenant is not active")
+        if connect_token:
+            clear_connect_cookies(response)
+        return response
     if connect_token:
         try:
             proof = await identity_connect.bind_browser_proof(
@@ -426,7 +438,11 @@ async def oidc_callback(
         response.headers["Referrer-Policy"] = "no-referrer"
         set_browser_proof_cookie(response, proof)
     else:
-        token, _ = await crud_console.create_principal_console_session(session, principal)
+        try:
+            token, _ = await crud_console.create_principal_console_session(session, principal)
+        except PrincipalAuthorityRefusal:
+            await session.rollback()
+            return _refuse_callback("principal authority refused login")
         response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER, headers=_NO_STORE)
         set_console_session_cookie(response, token)
     _clear_state_cookie(response)

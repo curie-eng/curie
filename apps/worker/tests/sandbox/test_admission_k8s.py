@@ -13,6 +13,7 @@ from curie_worker.sandbox import k8s as k8s_module
 from curie_worker.sandbox.types import CapacityInventory
 from kubernetes import client as kube
 from kubernetes.utils.quantity import parse_quantity
+from urllib3.exceptions import MaxRetryError, ReadTimeoutError
 
 from .test_k8s_claim import _chart_template_spec, _client, _FakeApi, _seed_chart
 
@@ -417,3 +418,49 @@ def test_incomplete_inventory_raises_instead_of_reporting_empty_capacity(resourc
         _client(api).capacity_inventory(
             priority_class="acme-sandbox", known_claim_resources={}, request_timeout_seconds=1
         )
+
+
+@pytest.mark.parametrize("budget", [0.0, -0.01, 0.01])
+def test_inventory_exhausted_budget_stops_before_next_kubernetes_request(
+    monkeypatch: pytest.MonkeyPatch,
+    budget: float,
+) -> None:
+    api = InventoryAPI()
+    elapsed = 0.0
+    calls: list[float] = []
+    real_list = api.list_namespaced_custom_object
+
+    def list_with_latency(*args: Any, **kwargs: Any) -> Any:
+        nonlocal elapsed
+        calls.append(kwargs["_request_timeout"])
+        elapsed += 0.01
+        return real_list(*args, **kwargs)
+
+    monkeypatch.setattr(api, "list_namespaced_custom_object", list_with_latency)
+    monkeypatch.setattr(k8s_module.time, "monotonic", lambda: elapsed)
+    with pytest.raises(TimeoutError, match="capacity inventory deadline expired"):
+        _client(api).capacity_inventory(
+            priority_class="acme-sandbox",
+            known_claim_resources={},
+            request_timeout_seconds=budget,
+        )
+    assert calls == ([0.01] if budget > 0 else [])
+    assert [plural for plural, _selector in api.lists] == (["sandboxclaims"] if budget > 0 else [])
+    assert api.created == api.patches == []
+    assert api.secrets == {}
+
+
+def test_short_inventory_budget_preserves_sdk_timeout_without_retry() -> None:
+    api = InventoryAPI()
+    # #5296 observed MaxRetryError caused by ReadTimeoutError on Pod LIST.
+    cause = ReadTimeoutError(None, "/api/v1/namespaces/test-ns/pods", "read timed out")
+    api.pod_list_error = MaxRetryError(None, cause.url, cause)
+    with pytest.raises(MaxRetryError) as error:
+        _client(api).capacity_inventory(
+            priority_class="acme-sandbox",
+            known_claim_resources={},
+            request_timeout_seconds=0.086,
+        )
+    assert error.value.reason is cause
+    assert [plural for plural, _selector in api.lists] == ["sandboxclaims", "sandboxes"]
+    assert api.created == api.patches == []

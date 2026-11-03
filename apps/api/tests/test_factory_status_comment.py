@@ -181,7 +181,7 @@ def test_blocked_github_has_no_idle_transaction_and_progress_completes(admitted:
     client, github, sink = admitted
     number = 9951
     request_id = _admit(client, github, sink, number)
-    _start_running(request_id)
+    _start_running(client, request_id)
 
     async def go() -> None:
         inspector = create_async_engine(get_settings().database_url)
@@ -251,7 +251,7 @@ def test_blocked_github_does_not_delay_heartbeat_or_relax_epoch_fencing(admitted
     client, github, sink = admitted
     number = 9952
     request_id = _admit(client, github, sink, number)
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
 
     async def go() -> None:
         async with _blocked_status_sync(client, sink, number) as (sync, _released):
@@ -308,7 +308,7 @@ def test_cancelled_status_sync_releases_claim_and_replacement_finalizes(admitted
     client, github, sink = admitted
     number = 9964
     request_id = _admit(client, github, sink, number)
-    _start_running(request_id)
+    _start_running(client, request_id)
     _attach_publication(_request(number)["work_item_id"], status="succeeded", pr=77)
     client.portal.call(client.app.state.work_item_reconciler.run_once)
     assert _request(number)["status"] == "completed"
@@ -368,7 +368,7 @@ def test_cancelled_stale_status_sync_preserves_replacement_claim(admitted: Any) 
     client, github, sink = admitted
     number = 9965
     request_id = _admit(client, github, sink, number)
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     _finish_failed(client, request_id, epoch, "runner_escalated")
 
     async def go() -> None:
@@ -454,7 +454,7 @@ def test_expired_status_claim_is_taken_over_and_old_writeback_is_dropped(
     client, github, sink = admitted
     number = 9954
     request_id = _admit(client, github, sink, number)
-    _start_running(request_id)
+    _start_running(client, request_id)
     caplog.set_level(logging.INFO, logger="curie_api.factory_notices")
 
     async def go() -> None:
@@ -546,7 +546,7 @@ def test_state_label_change_reads_once_adds_once_and_removes_only_old_label(admi
     request_id = _admit(client, github, sink, number)
     _reconcile()
     sink.requests.clear()
-    _start_running(request_id)
+    _start_running(client, request_id)
     _reconcile()
     path = f"/repos/{REPO}/issues/{number}/labels"
     label_calls = [
@@ -574,7 +574,7 @@ def test_state_labels_on_later_pages_are_removed_and_human_labels_are_preserved(
     sink.issue_labels[number] = human_labels | {"curie-factory:queued"}
     sink.requests.clear()
     sink.label_pages.clear()
-    _start_running(request_id)
+    _start_running(client, request_id)
 
     _reconcile()
 
@@ -605,7 +605,7 @@ def test_failed_second_label_page_does_not_write_or_settle_and_next_pass_recover
     sink.label_page_statuses[(number, 2)] = status
     sink.requests.clear()
     sink.label_pages.clear()
-    _start_running(request_id)
+    _start_running(client, request_id)
 
     _reconcile()
 
@@ -632,7 +632,7 @@ def test_ready_and_heartbeat_use_liveness_pool_when_all_main_connections_are_bus
 ) -> None:  # noqa: F811
     client, github, sink = admitted
     request_id = _admit(client, github, sink, 9956)
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
 
     async def go() -> None:
         async with httpx.AsyncClient(
@@ -688,7 +688,7 @@ def test_liveness_database_failure_rejects_ready_and_does_not_renew_heartbeat(
 ) -> None:  # noqa: F811
     client, github, sink = admitted
     request_id = _admit(client, github, sink, 9960)
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
 
     async def go() -> None:
         async with client.app.state.sessionmaker() as session:
@@ -940,7 +940,7 @@ def test_a_card_url_replaces_the_checklist_as_phases_advance(
     token = _notices(request_id)[0]["card_token"]
     sink.requests.clear()
 
-    _start_running(request_id)
+    _start_running(client, request_id)
     for phase, loop_round in (("read_issue", None), ("plan", 1)):
         assert report(client, request_id, phase, round=loop_round).status_code == 201
     _reconcile()
@@ -967,7 +967,7 @@ def test_progress_edits_the_same_comment_and_moves_the_label_to_running(
     comment_id = _notices(request_id)[0]["comment_id"]
     sink.requests.clear()
 
-    _start_running(request_id)
+    _start_running(client, request_id)
     for phase, loop_round in (("read_issue", None), ("pin_criteria", None), ("plan", 1)):
         assert report(client, request_id, phase, round=loop_round).status_code == 201
     _reconcile()
@@ -1008,7 +1008,7 @@ def test_a_note_is_not_rendered_into_the_comment(admitted: Any) -> None:  # noqa
     client, github, sink = admitted
     number = 9904
     request_id = _admit(client, github, sink, number)
-    _start_running(request_id)
+    _start_running(client, request_id)
     note = "ping @octocat and see [this](https://evil.example)"
     assert report(client, request_id, "read_issue", note=note).status_code == 201
     _reconcile()
@@ -1025,7 +1025,7 @@ def test_diff_review_failure_keeps_completed_phases_after_renewed_plan_review(
     _reconcile()
     comment_id = _notices(request_id)[0]["comment_id"]
     sink.requests.clear()
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     for phase, loop_round in (
         ("plan", 1),
         ("plan_review", 1),
@@ -1071,7 +1071,7 @@ def test_phase_labels_are_markdown_escaped(admitted: Any) -> None:  # noqa: F811
     client, github, sink = admitted
     number = 9905
     request_id = _admit(client, github, sink, number)
-    _start_running(request_id)
+    _start_running(client, request_id)
     declaration = {
         "phases": [
             {"id": "look", "label": "Look *here* [x](y)"},
@@ -1094,7 +1094,7 @@ def test_completion_patches_the_pr_link_and_finalizes(admitted: Any) -> None:  #
     request_id = _admit(client, github, sink, number)
     _reconcile()
     comment_id = _notices(request_id)[0]["comment_id"]
-    _start_running(request_id)
+    _start_running(client, request_id)
     assert report(client, request_id, "publish").status_code == 201
     work_item_id = _request(number)["work_item_id"]
     _attach_publication(work_item_id, status="succeeded", pr=77)
@@ -1137,7 +1137,7 @@ def test_a_preexisting_base_failure_is_named_in_the_final_comment(admitted: Any)
     request_id = _admit(client, github, sink, number)
     _reconcile()
     comment_id = _notices(request_id)[0]["comment_id"]
-    _start_running(request_id)
+    _start_running(client, request_id)
     assert report(client, request_id, "publish").status_code == 201
     work_item_id = _request(number)["work_item_id"]
     sink.ci_scripts = {
@@ -1166,7 +1166,7 @@ def test_a_pending_publication_shows_publishing_and_stays_live(admitted: Any) ->
     client, github, sink = admitted
     number = 9907
     request_id = _admit(client, github, sink, number)
-    _start_running(request_id)
+    _start_running(client, request_id)
     _attach_publication(_request(number)["work_item_id"], status="approved", pr=None)
     _reconcile()
     (comment,) = _marked(sink, request_id)
@@ -1236,15 +1236,27 @@ def _link_through_jira(
     return linked, issue
 
 
-def _bind_lineage_pr(work_item_id: uuid.UUID, pr: int) -> None:
+def _bind_lineage_pr(
+    work_item_id: uuid.UUID, pr: int, *, publication_request_id: uuid.UUID
+) -> None:
     _execute(
-        "UPDATE curie.thread_publication_lineages SET pr_number = :pr, pr_url = :url, "
-        "head_sha = :head WHERE id = (SELECT publication_lineage_id FROM curie.work_items "
-        "WHERE id = :id)",
+        "WITH bound_lineage AS ("
+        "UPDATE curie.thread_publication_lineages AS l SET pr_number = :pr, pr_url = :url, "
+        "head_sha = :head, code_host_kind = w.code_host_kind, "
+        "code_host_host = w.code_host_host, repository_project_id = w.repository_project_id, "
+        "code_host_installation_id = w.code_host_installation_id, code_host_pr_id = :node_id, "
+        "base_ref = w.base_branch, base_sha = w.base_commit, version = l.version + 1 "
+        "FROM curie.work_items AS w WHERE w.id = :id AND l.id = ("
+        "SELECT lineage_id FROM curie.publications WHERE execution_request_id = :request_id) "
+        "RETURNING l.id) "
+        "UPDATE curie.work_items AS w SET publication_lineage_id = l.id, "
+        "version = w.version + 1 FROM bound_lineage AS l WHERE w.id = :id",
         {
             "pr": pr,
             "url": f"https://github.com/{REPO}/pull/{pr}",
             "head": HEAD_A,
+            "node_id": f"PR_fixture_{work_item_id.hex}",
+            "request_id": publication_request_id,
             "id": work_item_id,
         },
     )
@@ -1252,7 +1264,7 @@ def _bind_lineage_pr(work_item_id: uuid.UUID, pr: int) -> None:
 
 def _second_request(client: Any, work_item_id: uuid.UUID, number: int, objective: str) -> uuid.UUID:
     request_id = _insert_revision(work_item_id, number, objective, ISSUE_REPLY)
-    _start_running(request_id)
+    _start_running(client, request_id)
     assert report(client, request_id, "implement", round=1).status_code == 201
     return request_id
 
@@ -1266,7 +1278,7 @@ def test_failed_first_publication_then_second_opens_pr_links_once(
     linked, ticket = _link_through_jira(monkeypatch, jira)
     number = 9931
     first = _admit(client, github, sink, number)
-    _start_running(first)
+    _start_running(client, first)
     work_item_id = _request(number)["work_item_id"]
     # The first publication fails before any push: its lineage has no pull request.
     _attach_publication(work_item_id, status="failed", pr=None)
@@ -1278,7 +1290,7 @@ def test_failed_first_publication_then_second_opens_pr_links_once(
     assert linked == []
 
     second = _second_request(client, work_item_id, number, "Fix the parser")
-    _bind_lineage_pr(work_item_id, 81)
+    _bind_lineage_pr(work_item_id, 81, publication_request_id=first)
     _attach_revision_publication(work_item_id, second, head_sha=HEAD_A)
     _reconcile()
     _reconcile()
@@ -1298,7 +1310,7 @@ def test_revision_request_does_not_link_again(
     linked, ticket = _link_through_jira(monkeypatch, jira)
     number = 9932
     first = _admit(client, github, sink, number)
-    _start_running(first)
+    _start_running(client, first)
     work_item_id = _request(number)["work_item_id"]
     _attach_publication(work_item_id, status="succeeded", pr=82)
     _reconcile()
@@ -1324,7 +1336,7 @@ def test_a_failure_patches_the_plain_reason_and_needs_a_human(admitted: Any) -> 
     number = 9908
     request_id = _admit(client, github, sink, number)
     _reconcile()
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     _finish_failed(
         client, request_id, epoch, "runner_escalated", detail="the tool call kept failing"
     )
@@ -1351,7 +1363,7 @@ def test_sandbox_termination_comment_shows_kubernetes_reason(admitted: Any) -> N
     comment_id = _notices(request_id)[0]["comment_id"]
     sink.requests.clear()
 
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     detail = 'Kubernetes reason: Evicted: EmptyDir volume "workspace" exceeded its limit'
     _finish_failed(client, request_id, epoch, "sandbox_terminated", detail=detail)
     _reconcile()
@@ -1392,7 +1404,7 @@ def test_every_terminal_failure_cause_shows_needs_human_status(
     client, github, sink = admitted
     request_id = _admit(client, github, sink, number)
     _reconcile()
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     _finish_failed(client, request_id, epoch, cause)
     _reconcile()
 
@@ -1416,7 +1428,7 @@ def _issue_requests(number: int) -> list[dict[str, Any]]:
 def _lose_owner(client: Any, request_id: uuid.UUID) -> None:
     """Start the request, lapse its heartbeat, and observe the owner_lost teardown."""
 
-    _start_running(request_id)
+    _start_running(client, request_id)
     _execute(
         "UPDATE curie.execution_requests "
         "SET runtime_heartbeat_expires_at = clock_timestamp() - CAST(:elapsed AS interval) "
@@ -1575,7 +1587,7 @@ def test_budget_failure_comment_identifies_the_limit_or_admits_it_is_unknown(
     comment_id = _notices(request_id)[0]["comment_id"]
     sink.requests.clear()
 
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     _finish_failed(client, request_id, epoch, "budget_exceeded", detail=detail)
     _reconcile()
 
@@ -1612,7 +1624,7 @@ def test_history_capacity_failure_notice_explains_retry(admitted: Any) -> None: 
     number = 9921
     request_id = _admit(client, github, sink, number)
     _reconcile()
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     _finish_failed(
         client,
         request_id,
@@ -1640,41 +1652,38 @@ START_FAILED_SENTENCE = (
 )
 
 
-def _defer_start(request_id: uuid.UUID, times: int) -> None:
+def _defer_start(client: Any, request_id: uuid.UUID, times: int) -> None:
     """Drive the real worker defer path: each attempt is acquired, then deferred."""
 
     async def go() -> None:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with AsyncSession(engine) as session:
-                for _ in range(times):
-                    generation = await session.scalar(
-                        text(
-                            "SELECT dispatch_generation FROM curie.execution_requests "
-                            "WHERE id = :id"
-                        ),
-                        {"id": request_id},
-                    )
-                    acquired = await acquire(
-                        session, request_id, owner="factory-owner", generation=generation,
-                        wake=await factory_wake(session, request_id),
-                        context=None,
-                    )
-                    assert not isinstance(acquired, DispatchConflict), acquired
-                    deferred = await defer(
-                        session,
-                        request_id,
-                        owner="factory-owner",
-                        generation=generation,
-                        reason="not_started:classified_failure",
-                        capacity=False,
-                        start_failure_detail=None,
-                    )
-                    assert not isinstance(deferred, DispatchConflict), deferred
-        finally:
-            await engine.dispose()
+        async with client.app.state.sessionmaker() as session:
+            for _ in range(times):
+                generation = await session.scalar(
+                    text(
+                        "SELECT dispatch_generation FROM curie.execution_requests "
+                        "WHERE id = :id"
+                    ),
+                    {"id": request_id},
+                )
+                acquired = await acquire(
+                    session, request_id, owner="factory-owner", generation=generation,
+                    wake=await factory_wake(session, request_id),
+                    context=None,
+                    client=client.app.state.http_client,
+                )
+                assert not isinstance(acquired, DispatchConflict), acquired
+                deferred = await defer(
+                    session,
+                    request_id,
+                    owner="factory-owner",
+                    generation=generation,
+                    reason="not_started:classified_failure",
+                    capacity=False,
+                    start_failure_detail=None,
+                )
+                assert not isinstance(deferred, DispatchConflict), deferred
 
-    asyncio.run(go())
+    client.portal.call(go)
 
 
 def test_start_failed_comment_names_the_attempts_and_last_reason(
@@ -1687,7 +1696,7 @@ def test_start_failed_comment_names_the_attempts_and_last_reason(
     comment_id = _notices(request_id)[0]["comment_id"]
     sink.requests.clear()
 
-    _defer_start(request_id, 5)
+    _defer_start(client, request_id, 5)
     row = _request(number)
     assert (row["status"], row["terminal_cause"]) == ("failed", "start_failed")
     _reconcile()
@@ -1748,7 +1757,7 @@ def test_a_running_cancellation_shows_stopping(admitted: Any) -> None:  # noqa: 
     client, github, sink = admitted
     number = 9910
     request_id = _admit(client, github, sink, number)
-    _start_running(request_id)
+    _start_running(client, request_id)
     github.labels = []
     _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
     _reconcile()
@@ -1835,7 +1844,7 @@ def test_legacy_pr_open_label_is_replaced_after_finalize(admitted: Any) -> None:
     number = 9917
     request_id = _admit(client, github, sink, number)
     _reconcile()
-    _start_running(request_id)
+    _start_running(client, request_id)
     assert report(client, request_id, "publish").status_code == 201
     work_item_id = _request(number)["work_item_id"]
     _attach_publication(work_item_id, status="succeeded", pr=77)
@@ -1873,7 +1882,7 @@ def test_a_failed_edit_is_retried_and_never_becomes_a_second_comment(
     number = 9912
     request_id = _admit(client, github, sink, number)
     _reconcile()
-    _start_running(request_id)
+    _start_running(client, request_id)
     sink.patch_statuses = [500]
     _reconcile()
     (comment,) = _marked(sink, request_id)
@@ -1892,7 +1901,7 @@ def test_a_comment_deleted_by_a_human_is_recreated_once(admitted: Any) -> None: 
     _reconcile()
     first_id = _notices(request_id)[0]["comment_id"]
     sink.delete_comment(first_id)
-    _start_running(request_id)
+    _start_running(client, request_id)
     sink.requests.clear()
     _reconcile()
     _reconcile()
@@ -1922,7 +1931,7 @@ def test_first_request_status_comment_does_not_claim_to_continue_on_its_own_pr(
 ) -> None:
     client, github, sink = admitted
     request_id = _admit(client, github, sink, 9945)
-    _start_running(request_id)
+    _start_running(client, request_id)
     _attach_publication(_request(9945)["work_item_id"], status="running", pr=78)
 
     _reconcile()
@@ -1947,7 +1956,7 @@ def test_later_request_status_comments_continue_on_the_existing_pr_until_termina
     else:
         number, pr = 9944, 77
         previous_request_id = _admit(client, github, sink, number)
-        _start_running(previous_request_id)
+        _start_running(client, previous_request_id)
         first = _request(number)
         _attach_publication(first["work_item_id"], status="succeeded", pr=pr)
         _execute(
@@ -1984,7 +1993,7 @@ def test_later_request_status_comments_continue_on_the_existing_pr_until_termina
     assert continuation in queued_comment["body"]
     assert FINAL_MARKER not in queued_comment["body"]
     comment_id = queued_comment["id"]
-    epoch = _start_running(successor)
+    epoch = _start_running(client, successor)
     assert report(client, successor, "implement").status_code == 201
     _reconcile()
 
@@ -2030,7 +2039,7 @@ def test_queued_review_revision_replies_that_it_waits_for_the_current_run(
         _revision_objective(pr, "discussion_r88203"),
         _revision_reply(pr, "discussion_r88203"),
     )
-    _start_running(running)
+    _start_running(client, running)
     assert report(client, running, "implement", round=1).status_code == 201
     _reconcile()
     assert _curie_labels(sink, number) == {"curie-factory:running"}
@@ -2146,7 +2155,7 @@ def _live_revision(
         _revision_objective(pr, fragment),
         _revision_reply(pr, fragment),
     )
-    _start_running(revision)
+    _start_running(client, revision)
     # A revision inserted without a status row gets one from its first report.
     assert report(client, revision, "implement", round=1).status_code == 201
     _reconcile()
@@ -2211,7 +2220,7 @@ def test_a_refused_edit_records_the_refusal_and_stops_writing(admitted: Any) -> 
     number = 9914
     request_id = _admit(client, github, sink, number)
     _reconcile()
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     sink.patch_statuses = [403]
     _reconcile()
     row = _notices(request_id)[0]

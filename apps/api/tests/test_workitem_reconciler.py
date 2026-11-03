@@ -32,7 +32,7 @@ from curie_telemetry import build_resource, configure_meter_provider
 from curie_telemetry import metrics as telemetry_metrics
 from curie_telemetry import tracing as telemetry_tracing
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
-from forge_fakes import factory_wake
+from forge_fakes import factory_wake, no_external_calls
 from forge_fakes.github_comments import ci_pending
 from opentelemetry import trace
 from opentelemetry.sdk.metrics import MeterProvider
@@ -74,6 +74,7 @@ RECONCILER_STEPS = (
     "_reconcile_missed_labels",
     "_poll_trackers",
     "_redispatch_lapsed_acquisitions",
+    "_reconcile_base_transitions",
     "_publish_execute_wakes",
 )
 
@@ -1102,7 +1103,7 @@ def test_owner_lost_skips_a_request_whose_publication_owns_its_terminus(
     protected_number, neighbour_number = 9959, 9960
     for number in (protected_number, neighbour_number):
         _label(client, github, number)
-        _start_running(_request(number)["id"])
+        _start_running(client, _request(number)["id"])
     protected, neighbour = _request(protected_number), _request(neighbour_number)
     _attach_publication(
         protected["work_item_id"],
@@ -1150,7 +1151,7 @@ def test_owner_lost_direct_cancellation_refuses_a_publication_owned_terminus(
     number = 9961
     _label(client, github, number)
     request = _request(number)
-    _start_running(request["id"])
+    _start_running(client, request["id"])
     _attach_publication(
         request["work_item_id"],
         status=publication_status,
@@ -1190,7 +1191,7 @@ def test_owner_lost_guarded_update_refuses_a_publication_owned_terminus(
     number = 9962
     _label(client, github, number)
     request = _request(number)
-    _start_running(request["id"])
+    _start_running(client, request["id"])
     _attach_publication(request["work_item_id"], status="approved", pr=None)
     request = _request(number)
 
@@ -1234,7 +1235,7 @@ def test_owner_lost_direct_cancellation_allows_a_terminal_publication(
     number = 9963
     _label(client, github, number)
     request = _request(number)
-    _start_running(request["id"])
+    _start_running(client, request["id"])
     _attach_publication(request["work_item_id"], status=publication_status, pr=None)
     request = _request(number)
 
@@ -1287,7 +1288,7 @@ def test_owner_lost_skips_then_settles_a_terminal_publication(
     number = 9964
     _label(client, github, number)
     request = _request(number)
-    _start_running(request["id"])
+    _start_running(client, request["id"])
     _attach_publication(request["work_item_id"], status="approved", pr=None)
 
     async def steps(
@@ -1333,7 +1334,7 @@ def test_owner_lost_skips_then_completes_a_publication_through_the_ci_gate(
     number = 9965
     _label(client, github, number)
     request = _request(number)
-    _start_running(request["id"])
+    _start_running(client, request["id"])
     _attach_publication(request["work_item_id"], status=publication_status, pr=77)
 
     async def steps(
@@ -1458,14 +1459,16 @@ def test_start_failed_request_gets_no_execute_wake_while_a_waiting_sibling_does(
             text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
             {"id": request_id},
         )
-        granted = await acquire(
-            session,
-            request_id,
-            owner="worker-a",
-            generation=generation,
-            wake=await factory_wake(session, request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            granted = await acquire(
+                session,
+                request_id,
+                owner="worker-a",
+                generation=generation,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=http_client,
+            )
         assert getattr(granted, "code", None) is None, granted
         deferred = await defer(
             session,

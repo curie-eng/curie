@@ -75,7 +75,9 @@ class SecretRef(BaseModel):
 
     # The env var the connector reads.
     name: str
-    # The Kubernetes Secret holding it, provisioned out of band.
+    # The Kubernetes Secret holding it, provisioned out of band. May carry
+    # `${CURIE_AGENT}`, expanded at render to the deploying agent's name, so
+    # one bundle deployed as several agents can give each its own Secret.
     from_secret: str
     # The key within that Secret. Defaults to the env var name, which is the
     # common case and saves repeating it.
@@ -223,6 +225,47 @@ def is_valid_readiness_path(text: str) -> bool:
     )
 
 
+# ADR 0240 decision 1. The MCP path every hosted entry dials
+# (``connector_render.mcp_entry``); a route may not shadow it.
+MCP_PATH: Final = "/mcp"
+ROUTE_METHODS: Final = ("POST", "PUT")
+ROUTE_MAX_BODY_BYTES_CEILING: Final = 256 * 1024 * 1024
+_ROUTE_SEGMENT_RE = re.compile(r"[A-Za-z0-9._~-]+")
+
+
+def is_valid_route_path(text: str) -> bool:
+    """Whether ``text`` may be a declared route's ``path`` (ADR 0240 decision 1).
+
+    Absolute, matched exactly, so only unreserved characters and ``/``: no
+    empty, ``.`` or ``..`` segment, no percent encoding, and nothing at or
+    under the MCP path.
+    """
+
+    if not text.startswith("/") or text == MCP_PATH or text.startswith(MCP_PATH + "/"):
+        return False
+    segments = text[1:].split("/")
+    return all(
+        _ROUTE_SEGMENT_RE.fullmatch(segment) is not None and segment not in {".", ".."}
+        for segment in segments
+    )
+
+
+class ConnectorRoute(BaseModel):
+    """One non-MCP route a hosted connector serves its bundle's stdio servers.
+
+    ADR 0240 decision 1. ``callers`` names stdio servers in the bundle's own MCP
+    config; ``validate_bundle`` checks them, because this file cannot see that
+    config.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    methods: list[str] = Field(default_factory=lambda: ["POST"])
+    max_body_bytes: int = Field(strict=True)
+    callers: list[str]
+
+
 class ConnectorSpec(BaseModel):
     """One declared connector. Exactly one of ``image``, ``build`` or ``url``.
 
@@ -280,6 +323,11 @@ class ConnectorSpec(BaseModel):
     # `tcpSocket` check; a probe carries exactly one handler. None keeps the
     # `tcpSocket` probe. The caller proxy's probe never changes.
     readiness_path: str | None = None
+
+    # Non-MCP routes the caller proxy admits a connector-scoped route token on,
+    # each with its own body limit and the bundle stdio servers that may call
+    # it (ADR 0240). Empty leaves the proxy exactly as it is.
+    routes: list[ConnectorRoute] = Field(default_factory=list)
 
     # The server container's requests and limits, merged per key over
     # DEFAULT_SERVER_RESOURCES. None renders the defaults unchanged.
@@ -510,6 +558,50 @@ def _known_placeholders() -> frozenset[str]:
     from .connector_render import PLACEHOLDERS
 
     return frozenset(PLACEHOLDERS)
+
+
+def _validate_secret_ref_template(
+    where: str, declared: SecretRef, errors: list[tuple[str, str]]
+) -> None:
+    """Check a ``from_secret`` that carries a placeholder.
+
+    Only ``${CURIE_AGENT}`` is substituted there, and it must expand to a
+    Kubernetes Secret name for EVERY valid agent name, because the same bundle
+    deploys as agents the author never saw. An agent name is an RFC 1123 label
+    of at most ``_NAME_MAX`` characters, so substituting the longest such label
+    decides both the shape and the length for all of them. A literal value is
+    not checked here: its validation is unchanged.
+    """
+
+    from .connector_render import SECRET_REF_PLACEHOLDERS, is_secret_name
+
+    remainder = declared.from_secret
+    for placeholder in SECRET_REF_PLACEHOLDERS:
+        remainder = remainder.replace(f"${{{placeholder}}}", "")
+    if "${" in remainder:
+        known = ", ".join(f"${{{p}}}" for p in SECRET_REF_PLACEHOLDERS)
+        errors.append(
+            (
+                "connectors.secret_ref_unknown_placeholder",
+                f"{where}: `{declared.name}` sets `from_secret: {declared.from_secret}`, "
+                f"but a Secret name may carry only {known}. Anything else would reach "
+                "the cluster as literal text in the Secret name.",
+            )
+        )
+        return
+    widest = declared.from_secret
+    for placeholder in SECRET_REF_PLACEHOLDERS:
+        widest = widest.replace(f"${{{placeholder}}}", "a" * _NAME_MAX)
+    if not is_secret_name(widest):
+        errors.append(
+            (
+                "connectors.secret_ref_bad_name",
+                f"{where}: `{declared.name}` sets `from_secret: {declared.from_secret}`, "
+                "which does not expand to a Kubernetes Secret name for every agent name "
+                "(lowercase alphanumeric, `-` or `.`, starting and ending alphanumeric, "
+                f"at most 253 characters with a {_NAME_MAX}-character agent name).",
+            )
+        )
 
 
 def _forges_the_render_join(name: str) -> bool:
@@ -977,6 +1069,8 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                         f"{spec.readiness_path!r}",
                     )
                 )
+        if spec.routes:
+            _validate_routes(where, spec, errors)
         if spec.resources is not None:
             if spec.url is not None:
                 errors.append(
@@ -1034,6 +1128,8 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                         "API server rejects at apply -- long after the deploy looked fine.",
                     )
                 )
+            elif "${" in declared.from_secret:
+                _validate_secret_ref_template(where, declared, errors)
         for env_name, blob in spec.sealed_secrets.items():
             if not env_name.strip():
                 errors.append(
@@ -1159,3 +1255,72 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
         _validate_build("runner", parsed.runner.build, errors)
 
     return (parsed if not errors else None), errors
+
+
+def _validate_routes(where: str, spec: ConnectorSpec, errors: list[tuple[str, str]]) -> None:
+    """ADR 0240 decision 1, for everything this file can see."""
+
+    if spec.url is not None:
+        errors.append(
+            (
+                "connectors.remote_has_routes",
+                f"{where}: `routes` are served through the caller proxy Curie puts in "
+                "front of a connector it hosts; a `url` connector has no such proxy",
+            )
+        )
+        return
+    seen_paths: set[str] = set()
+    for index, route in enumerate(spec.routes):
+        at = f"{where}.routes[{index}]"
+        if not is_valid_route_path(route.path):
+            errors.append(
+                (
+                    "connectors.bad_route_path",
+                    f"{at}: `path` must start with `/` and hold only letters, digits, "
+                    "`.`, `_`, `~`, `-` and `/`, with no empty, `.` or `..` segment, and "
+                    f"must not be or sit under {MCP_PATH}, got {route.path!r}",
+                )
+            )
+        elif route.path == spec.readiness_path:
+            errors.append(
+                (
+                    "connectors.route_is_readiness_path",
+                    f"{at}: `path` {route.path!r} is the connector's `readiness_path`",
+                )
+            )
+        if route.path in seen_paths:
+            errors.append(
+                (
+                    "connectors.duplicate_route",
+                    f"{at}: `path` {route.path!r} is declared more than once",
+                )
+            )
+        seen_paths.add(route.path)
+        if (
+            not route.methods
+            or len(set(route.methods)) != len(route.methods)
+            or any(method not in ROUTE_METHODS for method in route.methods)
+        ):
+            errors.append(
+                (
+                    "connectors.bad_route_methods",
+                    f"{at}: `methods` must be a non-empty list drawn from "
+                    f"{', '.join(ROUTE_METHODS)} with no repeats, got {route.methods!r}",
+                )
+            )
+        if not 0 < route.max_body_bytes <= ROUTE_MAX_BODY_BYTES_CEILING:
+            errors.append(
+                (
+                    "connectors.bad_route_max_body_bytes",
+                    f"{at}: `max_body_bytes` must be a positive integer no larger than "
+                    f"{ROUTE_MAX_BODY_BYTES_CEILING}, got {route.max_body_bytes!r}",
+                )
+            )
+        if not route.callers or any(not caller for caller in route.callers):
+            errors.append(
+                (
+                    "connectors.route_without_callers",
+                    f"{at}: `callers` must name at least one of the bundle's stdio "
+                    "servers, and no name may be empty",
+                )
+            )

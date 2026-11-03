@@ -49,11 +49,14 @@ IMAGE = "valkey/valkey:8.1.10-alpine"
 
 
 @pytest.fixture(scope="module")
-def pworker_service(tmp_path_factory):
+def pworker_service(tmp_path_factory, request):
     """Real TLS, disabled default, only a provisioner, owned cleanup,
     @spec PROTECTED-HOOK-LANE-3."""
     if shutil.which("docker") is None:
         fail_safely("Docker is required for actual TLS worker role verification")
+    persistent = getattr(request, "param", False)
+    if type(persistent) is not bool:
+        fail_safely("persistent TLS fixture mode must be a boolean")
     fixture = helpers.AdmissionBroker()
     fixture.private = tmp_path_factory.mktemp("protected-worker-tls")
     fixture.private.chmod(0o700)
@@ -61,7 +64,11 @@ def pworker_service(tmp_path_factory):
     fixture.admin = None
     cidfile = fixture.private / "container.cid"
     owner = "curie-check-pworker-" + uuid4().hex[:12]
+    data_directory = None
     try:
+        if persistent:
+            data_directory = fixture.private / "data"
+            data_directory.mkdir(mode=0o700)
         config = fixture.private / "docker"
         config.mkdir(mode=0o700)
         fixture.env = {key: FixtureSecret(value) for key, value in os.environ.items()}
@@ -128,6 +135,7 @@ def pworker_service(tmp_path_factory):
                 f"127.0.0.1:{fixture.port}:6379",
                 "-v",
                 str(fixture.private) + ":/tls:ro",
+                *(["-v", str(data_directory) + ":/data"] if persistent else []),
                 IMAGE,
                 "valkey-server",
                 "--port",
@@ -147,7 +155,8 @@ def pworker_service(tmp_path_factory):
                 "--save",
                 "",
                 "--appendonly",
-                "no",
+                "yes" if persistent else "no",
+                *(["--appendfsync", "always"] if persistent else []),
                 allow_port_collision=True,
             )
             if started is not None:
@@ -181,6 +190,8 @@ def pworker_service(tmp_path_factory):
             try:
                 fixture.remove_owned(owner, cidfile)
             finally:
+                if data_directory is not None:
+                    shutil.rmtree(data_directory)
                 for path in fixture.private.iterdir():
                     if path.is_file():
                         path.unlink()

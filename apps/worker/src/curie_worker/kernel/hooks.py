@@ -10,10 +10,11 @@ from aci_protocol import (
     Event,
     HookRunRef,
     QueuedTurn,
+    TurnSource,
 )
 
 from ..delivery_lease import DeliveryLease
-from ..hook_runs import HookRunOutcome, HookRunRecorder, HookRunState
+from ..hook_runs import HookRunOutcome, HookRunRecorder, HookRunRecorderError, HookRunState
 from ..runner_client import (
     TurnStream,
 )
@@ -154,6 +155,29 @@ async def _close_hook_run_after_error(
         )
 
 
+async def _close_hook_run_after_refusal(self: Kernel, qevent: QueuedTurn) -> None:
+    """Close the cron run of a definitively identity-refused delivery (#5305).
+
+    The refusal can precede the run's validation in ``_process_event``, so
+    this reads the reference from the event rather than the carry, and it
+    needs no started attempt. A missing or malformed reference has no run to
+    close. A run already terminal keeps its outcome. A backend failure
+    propagates so the caller leaves the delivery pending. No notice or reply
+    follows: the refusal permits no further side effect.
+    """
+    if qevent.source is not TurnSource.CRON or self._hook_runs is None or qevent.hook_run is None:
+        return
+    carry = constants._HOOK_RUN_CARRY.get()
+    if carry is not None and carry.successor_maybe_published:
+        # A sweep's next slice may exist; its run stays open (#2878).
+        return
+    try:
+        await self._hook_runs.close(qevent.hook_run, "failed", "identity_refused")
+    except HookRunRecorderError as exc:
+        if exc.code not in {"invalid_ref", "missing"}:
+            raise
+
+
 async def _post_notice_after_error(self: Kernel, qevent: QueuedTurn, carry: _HookRunCarry) -> None:
     """Post the notice owed after an exception: the pending one, else a fresh one."""
     text = carry.notice_pending
@@ -174,6 +198,9 @@ async def _start_turn_under_hook_control(
 ) -> TurnStream:
     """Serialize runner admission with the operator pause action."""
 
+    from .identity import check
+
+    await check(self, "start")
     if event.tool_access is not None:
         # @spec WORKER-TOOL-ACCESS-2: every path that opens a turn comes
         # through here, the attachment handoff included.
@@ -201,6 +228,9 @@ async def _start_turn_under_hook_control(
     # reason, and only after the runner advertises enforcement does it ride
     # the event. Every open, the attachment handoff included, comes through.
     event = await self._with_channel_read(event, handle, remaining_s)
+    from .attachment_access import with_attachment_access
+
+    event = await with_attachment_access(self, event, handle, remaining_s)
     carry = constants._HOOK_RUN_CARRY.get()
     if carry is not None and carry.recorder is not None and carry.ref is not None:
         async with carry.recorder.start_guard(carry.ref) as allowed:

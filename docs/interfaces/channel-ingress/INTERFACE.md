@@ -204,6 +204,10 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   `invocation.refused` identity audit event. The list is set with
   `PUT /agents/{agent_id}/channels/callers`, which leaves the binding generation,
   and so the adapter's token, alone.
+  The [common API admission extraction contract](../../superpowers/specs/2026-10-23-common-admission-extraction.md)
+  specifies behavior-preserving delegation of the existing list and invocation-team
+  composition by both API entry points; it preserves their different evidence,
+  refusal, cache and enqueue boundaries.
 - **Delivery canary**: a Slack mention in a channel listed in
   `CURIE_SLACK_DELIVERY_CANARY_CHANNELS` proves that Slack still delivers to that
   identity, and nothing more. The dispatcher counts it on

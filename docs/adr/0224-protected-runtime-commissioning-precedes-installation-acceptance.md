@@ -4,6 +4,8 @@ Date: 2026-10-13
 
 Status: Accepted
 
+Partially superseded by [ADR 0241](0241-a-commissioning-run-separates-destructive-trials-from-final-acceptance.md) for installation evidence across explicitly scheduled manifest/broker-session transitions; all other boundaries remain in force.
+
 Tracked in [#4557](https://github.com/curie-eng/curie/issues/4557).
 This proposes an additional commissioning boundary under
 [ADR 0191](0191-protected-hook-delivery-authority.md); it does not supersede

@@ -30,6 +30,9 @@ REFUSALS = (MISSING, INVALID, EXPIRED, NOT_ADMITTED, GRANT_REQUIRED)
 
 # A connector tool grant, not a caller token. ``cct`` claims stay {agent, exp}.
 GRANT_PREFIX = "ccg"
+# A route token (ADR 0240 decision 2): the caller's claims plus the one
+# connector whose declared routes it is good for.
+ROUTE_PREFIX = "ccr"
 
 _KEY_BYTES = 32
 _SIGNATURE_BYTES = 64
@@ -41,6 +44,7 @@ _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 _CLAIMS = frozenset({"agent", "exp"})
 _RUN_CLAIMS = frozenset({"run", "work_item"})
 _GRANT_CLAIMS = frozenset({"agent", "connector", "tool", "args", "exp", "jti"})
+_ROUTE_CLAIMS = frozenset({"agent", "connector", "exp"})
 
 AGENT_HEADER = "X-Curie-Agent"
 RUN_HEADER = "X-Curie-Run"
@@ -221,3 +225,49 @@ def decide(
             agent=carried.agent, refusal=NOT_ADMITTED, run=carried.run, work_item=carried.work_item
         )
     return carried
+
+
+def decide_route(
+    keys: Sequence[VerifyKey],
+    token: str | None,
+    *,
+    connector: str,
+    admits: frozenset[str],
+    now: int,
+) -> Decision:
+    """Admit a ``ccr`` token on one of ``connector``'s declared routes, or name the refusal.
+
+    ADR 0240 decision 3. A ``cct``, a malformed token, and a ``ccr`` for
+    another connector are all ``invalid``. Never raises on its input.
+    """
+
+    if not token:
+        return Decision(agent=None, refusal=MISSING)
+    parsed = _opened(keys, token, ROUTE_PREFIX)
+    if parsed is None:
+        return Decision(agent=None, refusal=INVALID)
+    present = set(parsed)
+    if present != _ROUTE_CLAIMS and present != _ROUTE_CLAIMS | _RUN_CLAIMS:
+        return Decision(agent=None, refusal=INVALID)
+    agent, named, exp = parsed["agent"], parsed["connector"], parsed["exp"]
+    if not isinstance(agent, str) or not agent or type(exp) is not int:
+        return Decision(agent=None, refusal=INVALID)
+    if not isinstance(named, str) or not connector or named != connector:
+        return Decision(agent=None, refusal=INVALID)
+    run: str | None = None
+    work_item: str | None = None
+    if "run" in parsed:
+        run_value, work_value = parsed["run"], parsed["work_item"]
+        if (
+            not isinstance(run_value, str)
+            or _UUID.fullmatch(run_value) is None
+            or not isinstance(work_value, str)
+            or _UUID.fullmatch(work_value) is None
+        ):
+            return Decision(agent=None, refusal=INVALID)
+        run, work_item = run_value, work_value
+    if exp <= now:
+        return Decision(agent=agent, refusal=EXPIRED, run=run, work_item=work_item)
+    if agent not in admits:
+        return Decision(agent=agent, refusal=NOT_ADMITTED, run=run, work_item=work_item)
+    return Decision(agent=agent, refusal=None, run=run, work_item=work_item)

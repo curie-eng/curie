@@ -34,26 +34,34 @@ Env mapping:
     CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS       -> agentmail_egress_cidrs
     CURIE_MAIL_DISCOVERY_UNREADY_AFTER_SECONDS -> discovery_unready_after_seconds
     CURIE_MAIL_PROVIDER                     -> mail_provider
+    CURIE_MAIL_RECEIVER_ID                  -> receiver_id
+    CURIE_MAIL_RECEIVER_GENERATION          -> receiver_generation
+    CURIE_MAIL_RECEIVER_KEY                 -> receiver_key
 
 The adapter holds no platform API key, queue credential, or platform database
 access: ``CURIE_CHANNEL_TOKEN`` and ``CURIE_EGRESS_SECRET`` are its Curie
 credentials, plus the optional ``CURIE_ADAPTER_PRINCIPAL`` (ADR-0156) that turns
 on answering approvals by email (ADR-0177), and ``AGENTMAIL_API_KEY`` its only
-provider one. Its local SQLite
+provider one. The optional ``CURIE_MAIL_RECEIVER_KEY`` is not a platform
+credential: it is this adapter's email receiver key (ADR 0260), which signs the
+sender of each turn it posts and authorizes nothing by itself. Its local SQLite
 file is a single-replica delivery journal, not a platform capability.
 """
 
 from __future__ import annotations
 
 import ipaddress
-from typing import Annotated, Any
+import uuid
+from typing import Annotated, Any, Self
 
 from aci_protocol.service_config import (
     AliasOnlyEnvSource,
     api_url_validation_alias,
     warn_if_deprecated_api_url_env,
 )
-from pydantic import Field, field_validator
+from curie_internal.identity_context import build_identity_keyring
+from curie_internal.operator_file import decode_key_material
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic_settings.sources import PydanticBaseSettingsSource
 
@@ -61,7 +69,11 @@ from pydantic_settings.sources import PydanticBaseSettingsSource
 class MailAdapterConfig(BaseSettings):
     """Everything the mail adapter needs to run, in one typed object."""
 
-    model_config = SettingsConfigDict(frozen=True, populate_by_name=True, extra="ignore")
+    # Inputs stay out of validation errors: several fields are credentials, and
+    # a truncated echo of one still leaks part of it into a crash log.
+    model_config = SettingsConfigDict(
+        frozen=True, populate_by_name=True, extra="ignore", hide_input_in_errors=True
+    )
 
     @classmethod
     def settings_customise_sources(
@@ -171,6 +183,48 @@ class MailAdapterConfig(BaseSettings):
     # is a provider package registered in the ``curie.mail_provider`` entry-point
     # group, which reads its own settings from its own environment variables.
     mail_provider: str = Field(default="agentmail", validation_alias="CURIE_MAIL_PROVIDER")
+
+    # The email receiver registration this adapter signs for (ADR 0260, ADR
+    # 0266): its receiver id, generation and key, as the API's runtime file
+    # registers them. All three set, every posted turn carries an
+    # X-Curie-Receiver-Proof over its exact bytes; none set, the adapter posts
+    # exactly as it always has, which is what a legacy binding expects. The key
+    # is unpadded base64url of 32 bytes and never appears in a repr.
+    receiver_id: str = Field(default="", validation_alias="CURIE_MAIL_RECEIVER_ID")
+    receiver_generation: int | None = Field(
+        default=None, validation_alias="CURIE_MAIL_RECEIVER_GENERATION"
+    )
+    receiver_key: str = Field(default="", repr=False, validation_alias="CURIE_MAIL_RECEIVER_KEY")
+
+    @model_validator(mode="after")
+    def _complete_receiver(self) -> Self:
+        """All three receiver settings or none; a partial or invalid set refuses startup.
+
+        The error is fixed: a supplied key must never reach a log or a crash
+        report. @spec HTTP-INVOCATION-EXECUTION-30.
+        """
+        settings = (self.receiver_id, self.receiver_generation, self.receiver_key)
+        if settings == ("", None, ""):
+            return self
+        try:
+            if str(uuid.UUID(self.receiver_id)) != self.receiver_id:
+                raise ValueError
+            build_identity_keyring(
+                "receiver",
+                (
+                    (
+                        self.receiver_id,
+                        int(self.receiver_generation or 0),
+                        decode_key_material(self.receiver_key),
+                    ),
+                ),
+            )
+        except Exception:  # noqa: BLE001 - the supplied key never reaches the error.
+            raise ValueError(
+                "CURIE_MAIL_RECEIVER_ID, CURIE_MAIL_RECEIVER_GENERATION and "
+                "CURIE_MAIL_RECEIVER_KEY must be set together and valid, or all left unset"
+            ) from None
+        return self
 
     @field_validator("agentmail_egress_cidrs", mode="before")
     @classmethod

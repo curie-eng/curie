@@ -831,6 +831,18 @@ executing separately; once that approval is resolved or expired, the next
 identical nomination raises a new one. A recurring alert therefore produces one
 open decision at a time.
 
+A nomination whose approval scope is HTTP-selected (the agent, or the reply
+binding the approval would carry, is selected for HTTP identity; see
+HTTP-APPROVAL-CONTINUITY-1) never raises an approval: the legacy writer refuses
+it before insertion, so no pass could ever raise one. The reconciler ends it
+once, `refused` with the terminal nomination refusal `http_identity_selected`
+(no approval, no execution, its reservation released), in the same statement
+family that ends `reply_surface_unavailable` and `unknown_action`, so a later
+pass never selects it and enough of them cannot fill a pass's limit ahead of
+another tenant's owed approval. Only a positive selected classification ends a
+nomination: a scope that cannot be classified stays owed and is retried, and a
+tenant without HTTP selection keeps today's behavior.
+
 The card is posted by a worker remediation loop through an injected reply sink
 and recorded in `ApprovalCardStore`, as `PublicationReconciler.deliver_pending_card`
 does; it uses the existing approval action ids, so the dispatcher is unchanged.

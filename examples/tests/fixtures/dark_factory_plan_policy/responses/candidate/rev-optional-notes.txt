@@ -1,0 +1,8 @@
+REVIEWER: plan-reviewer
+VERDICT: APPROVE
+NOTES:
+- The other helpers in widgets/stats.py each have a docstring, so give widget_count(items) a short one to match the file's convention.
+- The selector `-k empty` could also pick up any existing test in tests/test_stats.py with "empty" in its name. Selecting `-k widget_count_empty` would keep the AC2 check aimed at the new test only.
+VERIFICATION:
+- AC1: sandbox python -m pytest tests/test_stats.py -k counts_items
+- AC2: sandbox python -m pytest tests/test_stats.py -k empty

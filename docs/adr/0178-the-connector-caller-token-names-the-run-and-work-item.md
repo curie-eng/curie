@@ -9,6 +9,12 @@ Status: Accepted
 0229 amends decision 5 so a hosted connector may declare the `Host` its caller
 proxy presents upstream on admitted requests. Decision 6 stands as decided.
 
+**Amended by [ADR-0240](0240-a-hosted-connector-declares-the-routes-its-bundles-stdio-servers-call-through-the-caller-proxy.md)**
+(back-link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+0240 amends decision 4 so the proxy also admits a second token type, `ccr`,
+which names one connector and is admitted only on that connector's declared
+routes. The `cct` claim set is unchanged.
+
 Accepted with explicit maintainer approval from Brian Conn in the pull request
 that published this status, before implementation.
 

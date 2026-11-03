@@ -1272,6 +1272,9 @@ def _loop(
     p.cli_not_found_check = lambda *_a, **_k: None  # type: ignore[method-assign]
     cli_body = json.dumps({"item": {"state": "published", "pr": {"number": 7, "status": "merged"}}})
     p.cli_work_items_raw = lambda _id: (0, cli_body)  # type: ignore[method-assign]
+    # The pre-teardown reads (#4866) are not what these tests observe.
+    p.work_item_usage = lambda _id: {"cost_complete": True}  # type: ignore[method-assign]
+    p.cli_cluster_status = lambda: (0, json.dumps({"credentials": []}))  # type: ignore[method-assign]
     return p, driver
 
 

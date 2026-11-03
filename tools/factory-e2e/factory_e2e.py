@@ -141,6 +141,33 @@ samples are only judge tests.
 `curie dev factory-e2e judge-repo-runner --observation <file>` runs the offline
 judge with no credentials or cluster contact.
 
+`curie dev factory-e2e judge-docker --envelope <file>` runs docker_scenario.py's
+offline judge on a docker-scenario/v1 envelope (ADR 0216, ADR 0217): per-run
+daemon identity and events, refused escapes, blocked egress, cleanup, the
+non-opted control, the runner upgrade, required checks green on the first
+head, a two-service Compose project built and reached on the run's daemon, and
+the skill rung of the e2e ladder against a runner image built there. It needs
+no credentials or cluster contact.
+
+`curie dev factory-e2e run --scenario docker --context <context>` (docker_driver.py)
+collects that envelope live on the cluster the explicit context names (or
+CURIE_FACTORY_KUBE_CONTEXT); there is no default. CURIE_LOCAL_STUB_HOST is the
+routable IPv4 the GitHub stub and the scripted model bind; any model credential or
+model route in the environment, `--model-base-url`, `--candidate-images build` and a
+`--candidate` other than the worktree HEAD are refused. It owns fd-docker-<nonce>
+(namespace and release), fd-docker-d-<nonce> and fd-docker-c-<nonce>, labelled
+owner=factory-tools, and builds every image from the HEAD snapshot into a run-owned
+registry container. The production catalog rebuild always builds linux/amd64 and
+linux/arm64, so the run creates its own docker-container buildx builder
+fd-builder-<nonce> on the default engine and removes it at teardown; that engine's
+host needs linux/arm64 emulation (binfmt). Phases: install as daemon_lifecycle.py
+does, two concurrent Docker runs whose turns run the probe, compose and skill-rung
+collectors, the lifecycle scenarios, an upgrade through `curie cluster upgrade` that
+rebuilds a catalog repository's runner and a turn on the custom repository, CI from
+the stub, then teardown proved object by object. It exits 0 only when
+docker_scenario.py's judge finds nothing and teardown is verified. Live use is the
+w2 waypoint and acceptance.
+
 The App, fixture repository, mention author and model credentials come only
 from operator files or environment variables; nothing here names a real one.
 Standard library only, so it runs from a bare source checkout.
@@ -407,9 +434,10 @@ SCENARIOS: dict[str, ScenarioDriver | None] = {
     "github-loop": None,
     "tls-code-host": None,  # bound at the bottom from tls_code_host.py
     "repo-runner": None,  # bound at the bottom from repo_runner.py
+    "docker": None,  # bound at the bottom from docker_driver.py
 }
 SCENARIO_NAMES = tuple(SCENARIOS)
-WHOLE_FLOW_SCENARIOS = frozenset({"tls-code-host", "repo-runner"})
+WHOLE_FLOW_SCENARIOS = frozenset({"tls-code-host", "repo-runner", "docker"})
 
 
 def resolve_scenario(name: str) -> ScenarioDriver:
@@ -3862,6 +3890,14 @@ class Preflight:
         )
         return body if status == 200 and isinstance(body, dict) else None
 
+    def work_item_usage(self, work_item_id: str) -> dict[str, Any] | None:
+        """`GET /work-items/{id}/usage`: the per-run cost, read before teardown (#4866)."""
+
+        status, body = self.api(
+            "GET", f"/work-items/{work_item_id}/usage", headers={"X-API-Key": self.api_key}
+        )
+        return body if status == 200 and isinstance(body, dict) else None
+
     def execution_request(self, request_id: str) -> dict[str, Any] | None:
         status, body = self.api(
             "GET",
@@ -3898,6 +3934,36 @@ class Preflight:
         env = {
             **os.environ,
             "CURIE_API_KEY": self.api_key,
+            "KUBECONFIG": str(self._kubeconfig),
+            "CURIE_CONFIG_DIR": str(self._curie_config_dir()),
+        }
+        result = subprocess.run(argv, capture_output=True, text=True, env=env, check=False)
+        return result.returncode, result.stdout
+
+    def cli_cluster_status(self) -> tuple[int, str]:
+        """The exit code and stdout of `curie cluster status --json` (#4866).
+
+        Status takes no `--api-url`: it discovers the release's api key from the
+        release secret itself, through the kubeconfig this env names, and
+        reads the credential expiries out of the release's computed values.
+        """
+
+        if self._kubeconfig is None:
+            self._kubeconfig = self._write_kubeconfig()
+        argv = [
+            self.config.curie_bin,
+            "cluster",
+            "--context",
+            self.config.kube_context,
+            "status",
+            "--json",
+            "--namespace",
+            self.namespace,
+            "--release",
+            self.release,
+        ]
+        env = {
+            **os.environ,
             "KUBECONFIG": str(self._kubeconfig),
             "CURIE_CONFIG_DIR": str(self._curie_config_dir()),
         }
@@ -6196,6 +6262,47 @@ def judge_github_loop(obs: Mapping[str, Any]) -> list[str]:
     return failures
 
 
+FIRST_HEAD_GREEN = frozenset({"success", "neutral", "skipped"})
+
+
+def judge_first_head_ci(obs: Mapping[str, Any]) -> list[str]:
+    """Every required check not green on the first published head. Empty means passed. Pure.
+
+    judge_outcome ignores CI and judge_github_loop requires CI red on the first head,
+    so this is the judge for a change that must be green on its first published head.
+    obs is ``{"first_head", "required", "checks"}``; each check is ``{"name",
+    "head_sha", "status", "conclusion"}``. A required check passes when every one of its
+    results on the first head completed with success, neutral or skipped; results on
+    other heads never count.
+    """
+
+    head = obs.get("first_head")
+    if not head or not isinstance(head, str):
+        return ["no first published head was recorded"]
+    required = obs.get("required")
+    if not isinstance(required, list) or not required:
+        return ["no required checks were recorded"]
+    raw = obs.get("checks")
+    checks = [c for c in raw if isinstance(c, Mapping)] if isinstance(raw, list) else []
+    failures: list[str] = []
+    for name in required:
+        results = [c for c in checks if c.get("name") == name and c.get("head_sha") == head]
+        if not results:
+            failures.append(f"required check {name!r} has no result on the first head")
+            continue
+        bad = [
+            c
+            for c in results
+            if c.get("status") != "completed"
+            or not isinstance(c.get("conclusion"), str)
+            or c.get("conclusion") not in FIRST_HEAD_GREEN
+        ]
+        if bad:
+            conclusion = bad[0].get("conclusion") if bad[0].get("status") == "completed" else None
+            failures.append(f"required check {name!r} concluded {conclusion!r} on the first head")
+    return failures
+
+
 def await_work_item_change(p: Preflight, work_item_id: str) -> ChangeRef | None:
     """The change the WorkItem records, polled fast; None if the request ends without one.
 
@@ -6240,6 +6347,60 @@ def _await_work_item_merged(p: Preflight, work_item_id: str) -> dict[str, Any]:
         time.sleep(POLL_SECONDS)
 
 
+def _parse_cli_json(exit_code: int, stdout: str) -> dict[str, Any] | None:
+    """One `curie ... --json` stdout as an object; None unless it exited 0.
+
+    Pure. Stdout that is not a JSON object reads as no object, the same
+    silence ``parse_work_item_cli`` keeps.
+    """
+
+    if exit_code != 0:
+        return None
+    try:
+        parsed = json.loads(stdout)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _record_pre_teardown_reads(
+    p: Preflight, obs: dict[str, Any], work_item_id: str
+) -> None:
+    """Record the reads the evidence must carry while the install is up (#4866).
+
+    The usage route answers through the api port-forward the driver already
+    holds, and the CLI reads the release, so this runs once after the last
+    request ends and before ``main()`` tears the install down in its
+    ``finally`` — after the teardown the same reads would carry nothing. A
+    failed read stays honest: the missing value lands in ``obs`` and a
+    ``cli_failures`` entry the loop judge folds into the verdict.
+    """
+
+    obs["usage"] = p.work_item_usage(work_item_id)
+    status_code, status_stdout = p.cli_cluster_status()
+    status = _parse_cli_json(status_code, status_stdout)
+    if status is None:
+        obs.setdefault("cli_failures", []).append(
+            f"before teardown: cluster status exited {status_code}, expected 0"
+        )
+    obs["cluster_status"] = {"credentials": (status or {}).get("credentials")}
+    items_code, items_stdout = p.cli_work_items_raw(work_item_id)
+    items = _parse_cli_json(items_code, items_stdout)
+    if items is None:
+        obs.setdefault("cli_failures", []).append(
+            f"before teardown: work-items exited {items_code}, expected 0"
+        )
+    item = items.get("item") if isinstance(items, dict) else None
+    tracker = item.get("tracker") if isinstance(item, dict) else None
+    obs["work_items"] = [{"tracker": tracker}] if tracker is not None else []
+    _timeline(
+        obs,
+        "usage and credentials read before teardown",
+        cost_complete=(obs["usage"] or {}).get("cost_complete"),
+        work_items_read=len(obs["work_items"]),
+    )
+
+
 def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
     """Drive one forge through the whole loop and judge it with judge_github_loop."""
 
@@ -6276,6 +6437,7 @@ def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
         _timeline(obs, "request ended without a change", **obs["no_change"])
         obs["tracker"] = driver.tracker_evidence(None, work_item_id)
         _timeline(obs, "tracker evidence", **obs["tracker"])
+        _record_pre_teardown_reads(p, obs, work_item_id)
         return _finish(p, obs, judge_github_loop(obs) + driver.judge_tracker(obs["tracker"]))
     obs["change_number"] = change.number
     obs["change_url"] = change.url
@@ -6356,6 +6518,7 @@ def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
     obs["tracker"] = driver.tracker_evidence(change, work_item_id)
     _timeline(obs, "tracker evidence", **obs["tracker"])
     p.cli_not_found_check(obs)
+    _record_pre_teardown_reads(p, obs, work_item_id)
     return _finish(p, obs, judge_github_loop(obs) + driver.judge_tracker(obs["tracker"]))
 
 
@@ -6435,12 +6598,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "repo-runner: needs an explicit --context (a throwaway cluster such as "
             "k8-scratch), release factory-tools, local scripted model. Set "
             "CURIE_FACTORY_REPO_RUNNER_PLAN (three chart bindings and seven turns) and "
-            "CURIE_LOCAL_STUB_HOST."
+            "CURIE_LOCAL_STUB_HOST. docker: run --scenario docker --context <context> with "
+            "CURIE_LOCAL_STUB_HOST and no model credential; builds the worktree HEAD into a "
+            "run-owned registry, needs linux/arm64 emulation on the Docker engine host (the "
+            "catalog rebuild builds both platforms), and exits 0 only when the docker judge "
+            "passes and teardown is verified."
         ),
     )
     scenario.add_argument("--scenario", required=True, choices=tuple(SCENARIOS))
     judge = sub.add_parser("judge-repo-runner", help="judge repository runner observations offline")
     judge.add_argument("--observation", type=Path, required=True)
+    judge_docker = sub.add_parser(
+        "judge-docker", help="judge a docker-scenario/v1 envelope offline"
+    )
+    judge_docker.add_argument("--envelope", type=Path, required=True)
     scenario.add_argument(
         "--forge",
         choices=tuple(FORGES),
@@ -6538,6 +6709,20 @@ def _repo_root() -> Path:
 
 def _images_published(commit: str) -> bool:
     return not unpublished_images(f"sha-{commit}")
+
+
+def _head_candidate(repo_root: Path, requested: str | None) -> str:
+    """The worktree HEAD commit; the docker scenario builds from it and nothing else."""
+
+    head = run(["git", "-C", str(repo_root), "rev-parse", "--verify", "HEAD^{commit}"]).strip()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+        raise ConfigError(f"cannot read the worktree HEAD commit: {head!r}")
+    if requested not in (None, "HEAD", head):
+        raise ConfigError(
+            "docker builds its candidate from the worktree HEAD; check out "
+            f"{requested!r} and pass --candidate HEAD (or omit it)"
+        )
+    return head
 
 
 def _resolve_candidate(
@@ -6984,6 +7169,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.mode == "judge-repo-runner":
         return int(load_repo_runner().main(["judge", str(args.observation)]))
+    if args.mode == "judge-docker":
+        return int(load_docker_scenario().main(["judge", str(args.envelope)]))
     if args.mode == "scripted":
         import importlib.util
 
@@ -7072,11 +7259,21 @@ def main(argv: list[str] | None = None) -> int:
         if whole_flow:
             if args.scenario == "repo-runner" and args.model_base_url:
                 raise ConfigError("repo-runner refuses an external model endpoint")
-            loaders = {
-                "tls-code-host": load_tls_code_host().load_tls_config,
-                "repo-runner": load_repo_runner().load_repo_runner_config,
-            }
-            config = loaders[args.scenario](os.environ, context=args.context)
+            if args.scenario == "docker":
+                if args.model_base_url:
+                    raise ConfigError("docker refuses an external model endpoint")
+                if args.candidate_images == "build":
+                    raise ConfigError(
+                        "docker builds its own images into a run-owned registry; "
+                        "drop --candidate-images build"
+                    )
+                config = load_docker_driver().load_docker_config(os.environ, context=args.context)
+            else:
+                loaders = {
+                    "tls-code-host": load_tls_code_host().load_tls_config,
+                    "repo-runner": load_repo_runner().load_repo_runner_config,
+                }
+                config = loaders[args.scenario](os.environ, context=args.context)
         else:
             config = load_config(os.environ, context=args.context)
         if args.model_base_url:
@@ -7101,11 +7298,12 @@ def main(argv: list[str] | None = None) -> int:
             curie_bin, curie_version = resolve_curie_binary(os.environ.get("CURIE_BIN") or "curie")
         config = dataclasses.replace(config, curie_bin=curie_bin)
         repo_root = _repo_root()
-        candidate = (
-            _resolve_candidate(repo_root, args.candidate, published=lambda _commit: True)
-            if args.candidate_images == "build"
-            else _resolve_candidate(repo_root, args.candidate)
-        )
+        if args.mode == "run" and args.scenario == "docker":
+            candidate = _head_candidate(repo_root, args.candidate)
+        elif args.candidate_images == "build":
+            candidate = _resolve_candidate(repo_root, args.candidate, published=lambda _c: True)
+        else:
+            candidate = _resolve_candidate(repo_root, args.candidate)
         namespace = (
             validate_namespace(args.namespace) if args.namespace else default_namespace(candidate)
         )
@@ -7229,6 +7427,28 @@ def load_repo_runner() -> Any:
 
 
 SCENARIOS["repo-runner"] = load_repo_runner().drive
+
+
+def load_docker_scenario() -> Any:
+    """Load the docker scenario offline judge once."""
+
+    return _load_by_path("docker_scenario", Path(__file__).with_name("docker_scenario.py"))
+
+
+def load_docker_driver() -> Any:
+    """Load the docker scenario's live driver once."""
+
+    return _load_by_path("docker_driver", Path(__file__).with_name("docker_driver.py"))
+
+
+def _drive_docker(p: Preflight) -> dict[str, Any]:
+    # Loaded at call time: docker_driver subclasses daemon_lifecycle.Lifecycle, and
+    # daemon_lifecycle imports this module, so an eager load here could see it half built.
+    return cast(dict[str, Any], load_docker_driver().drive(p))
+
+
+SCENARIOS["docker"] = _drive_docker
+
 
 if __name__ == "__main__":
     sys.exit(main())

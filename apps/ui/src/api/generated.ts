@@ -1575,6 +1575,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/attachment-access/authorize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Authorize */
+        post: operations["authorize_attachment_access_authorize_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/attachment-access/completion": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Completion */
+        post: operations["completion_attachment_access_completion_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/attachment-access/fetch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Fetch */
+        post: operations["fetch_attachment_access_fetch_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/attachment-access/list": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** List Files */
+        post: operations["list_files_attachment_access_list_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/channel-canvas": {
         parameters: {
             query?: never;
@@ -2926,6 +2994,108 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/attachment-access/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Complete */
+        post: operations["complete_v1_internal_attachment_access_complete_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/attachment-access/context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Context */
+        post: operations["context_v1_internal_attachment_access_context_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/attachment-access/redeem": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Redeem */
+        post: operations["redeem_v1_internal_attachment_access_redeem_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/attachment-access/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Register */
+        post: operations["register_v1_internal_attachment_access_register_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/attachment-access/renew": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Renew */
+        post: operations["renew_v1_internal_attachment_access_renew_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/attachment-access/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Revoke */
+        post: operations["revoke_v1_internal_attachment_access_revoke_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/channel-read/context": {
         parameters: {
             query?: never;
@@ -2988,6 +3158,88 @@ export interface paths {
         put?: never;
         /** Verify Review */
         post: operations["verify_review_v1_internal_github_reviews__event_id__verify_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/identity/approval-grant/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check Approval Grant
+         * @description @spec HTTP-APPROVAL-CONTINUITY-12.
+         */
+        post: operations["check_approval_grant_v1_internal_identity_approval_grant_check_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/identity/approvals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create Identity Approval
+         * @description @spec HTTP-APPROVAL-CONTINUITY-3.
+         */
+        post: operations["create_identity_approval_v1_internal_identity_approvals_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/identity/binding-classification/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check Binding Classification
+         * @description The worker's per-identity question. Writes and grants nothing.
+         *
+         *     @spec HTTP-INVOCATION-EXECUTION-22.
+         */
+        post: operations["check_binding_classification_v1_internal_identity_binding_classification_check_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/identity/turn-authority/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check Turn Authority
+         * @description @spec HTTP-INVOCATION-EXECUTION-8/16.
+         */
+        post: operations["check_turn_authority_v1_internal_identity_turn_authority_check_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3562,6 +3814,159 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/workspace-recovery/acquire-reader": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Acquire Reader */
+        post: operations["acquire_reader_v1_internal_workspace_recovery_acquire_reader_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/workspace-recovery/claim-collection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Claim Collection */
+        post: operations["claim_collection_v1_internal_workspace_recovery_claim_collection_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/workspace-recovery/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Complete */
+        post: operations["complete_v1_internal_workspace_recovery_complete_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/workspace-recovery/context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Context */
+        post: operations["context_v1_internal_workspace_recovery_context_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/workspace-recovery/fail": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Fail */
+        post: operations["fail_v1_internal_workspace_recovery_fail_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/workspace-recovery/finalize-collection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Finalize Collection */
+        post: operations["finalize_collection_v1_internal_workspace_recovery_finalize_collection_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/workspace-recovery/outcome": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Outcome */
+        post: operations["outcome_v1_internal_workspace_recovery_outcome_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/workspace-recovery/release-reader": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Release Reader */
+        post: operations["release_reader_v1_internal_workspace_recovery_release_reader_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/workspace-recovery/reserve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reserve */
+        post: operations["reserve_v1_internal_workspace_recovery_reserve_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/workspaces/{deployment_id}/credential": {
         parameters: {
             query?: never;
@@ -3723,6 +4128,57 @@ export interface paths {
         };
         /** Get Work Item */
         get: operations["get_work_item_work_items__work_item_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/work-items/{work_item_id}/recovery": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Checkpoints */
+        get: operations["list_checkpoints_work_items__work_item_id__recovery_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/work-items/{work_item_id}/recovery/{checkpoint_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Checkpoint Status */
+        get: operations["checkpoint_status_work_items__work_item_id__recovery__checkpoint_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/work-items/{work_item_id}/recovery/{checkpoint_id}/objects/{kind}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Object Download */
+        get: operations["object_download_work_items__work_item_id__recovery__checkpoint_id__objects__kind__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3980,6 +4436,11 @@ export interface components {
             execution_id: string;
             /** State */
             state: string;
+        };
+        /** Active */
+        Active: {
+            /** Active */
+            active: boolean;
         };
         /** Activity */
         Activity: {
@@ -4510,6 +4971,109 @@ export interface components {
             summary: string;
         };
         /**
+         * ApprovalCreationIdentityV1
+         * @description @spec HTTP-APPROVAL-CONTINUITY-3/4.
+         */
+        ApprovalCreationIdentityV1: {
+            /** Context */
+            context: string;
+            /** Payload */
+            payload: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            scope: components["schemas"]["TurnAuthorityScopeV1"];
+        };
+        /**
+         * ApprovalCreationRequestV1
+         * @description @spec HTTP-APPROVAL-CONTINUITY-3.
+         */
+        ApprovalCreationRequestV1: {
+            approval: components["schemas"]["ApprovalRequest"];
+            identity: components["schemas"]["ApprovalCreationIdentityV1"];
+            /** Request Id */
+            request_id: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+        };
+        /**
+         * ApprovalCreationResponseV1
+         * @description @spec HTTP-APPROVAL-CONTINUITY-3.
+         */
+        ApprovalCreationResponseV1: {
+            /** Duplicate */
+            duplicate: boolean;
+            /** Id */
+            id: string;
+            /** Request Id */
+            request_id: string;
+            /** Requested By */
+            requested_by: string | null;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "approved" | "rejected" | "expired";
+        };
+        /**
+         * ApprovalGrantAuthorityRequestV1
+         * @description @spec HTTP-APPROVAL-CONTINUITY-12.
+         */
+        ApprovalGrantAuthorityRequestV1: {
+            check: components["schemas"]["TurnAuthorityRequestV1"];
+            grant: components["schemas"]["ApprovalGrantExpectationV1"];
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+        };
+        /**
+         * ApprovalGrantAuthorityResponseV1
+         * @description @spec HTTP-APPROVAL-CONTINUITY-12.
+         */
+        ApprovalGrantAuthorityResponseV1: {
+            check: components["schemas"]["TurnAuthorityResponseV1"];
+            /** Grant Sha256 */
+            grant_sha256: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+        };
+        /**
+         * ApprovalGrantExpectationV1
+         * @description @spec HTTP-APPROVAL-CONTINUITY-12.
+         */
+        ApprovalGrantExpectationV1: {
+            /** Agent Id */
+            agent_id: string;
+            /** Approval Id */
+            approval_id: string;
+            /** Conversation Id */
+            conversation_id: string;
+            /**
+             * Gate Kind
+             * @enum {string}
+             */
+            gate_kind: "permission" | "policy";
+            /** Granted Arguments Json */
+            granted_arguments_json: string | null;
+            /** Granted Tool */
+            granted_tool: string | null;
+        };
+        /**
          * ApprovalIdentityFactsOut
          * @description Per-row FACTS about one pending approval (#2753).
          *
@@ -4995,6 +5559,36 @@ export interface components {
              */
             tips?: components["schemas"]["TipsPackConfig"];
         };
+        /**
+         * BindingClassificationRequestV1
+         * @description @spec HTTP-INVOCATION-EXECUTION-22.
+         */
+        BindingClassificationRequestV1: {
+            /** Request Id */
+            request_id: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            scope: components["schemas"]["TurnAuthorityScopeV1"];
+        };
+        /**
+         * BindingClassificationResponseV1
+         * @description Classification, not permission. @spec HTTP-INVOCATION-EXECUTION-22.
+         */
+        BindingClassificationResponseV1: {
+            /** Http Identity Required */
+            http_identity_required: boolean;
+            /** Request Id */
+            request_id: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            scope: components["schemas"]["TurnAuthorityScopeV1"];
+        };
         /** Body_confirm_connection_identity_connect__token__confirm_post */
         Body_confirm_connection_identity_connect__token__confirm_post: {
             /** Csrf */
@@ -5098,6 +5692,15 @@ export interface components {
             header: components["schemas"]["CanvasCell"][];
             /** Rows */
             rows: components["schemas"]["CanvasCell"][][];
+        };
+        /** Capability */
+        Capability: {
+            /** Expires At */
+            expires_at: number;
+            /** Lease Seconds */
+            lease_seconds: number;
+            /** Token */
+            token: string;
         };
         /** ChannelAddress */
         ChannelAddress: {
@@ -5524,6 +6127,30 @@ export interface components {
             /** Terminal */
             terminal: boolean;
         };
+        /** Completed */
+        Completed: {
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes: number;
+            /** Transfer Id */
+            transfer_id: string;
+        };
+        /** Completion */
+        Completion: {
+            /** Id */
+            id: string;
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes: number;
+            /**
+             * Status
+             * @default complete
+             * @constant
+             */
+            status?: "complete";
+        };
         /**
          * ConnectorManifests
          * @description Kubernetes objects derived from a version's ``connectors.yaml``.
@@ -5609,6 +6236,36 @@ export interface components {
             expires_at: string;
             /** Subject */
             subject: string | null;
+        };
+        /** Context */
+        Context: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /**
+             * Deployment Id
+             * Format: uuid
+             */
+            deployment_id: string;
+            /** Event Id */
+            event_id: string;
+            /** Owner */
+            owner: string;
+            /** Route Generation */
+            route_generation: number;
+            /** Sandbox Name */
+            sandbox_name: string;
+            /** Session Id */
+            session_id: string;
+            /** Thread Key */
+            thread_key: string;
+            /**
+             * Ttl S
+             * @default 3600
+             */
+            ttl_s?: number;
         };
         /**
          * CostReport
@@ -6476,6 +7133,21 @@ export interface components {
             /** Kind */
             kind: string;
         };
+        /** FileDescriptor */
+        FileDescriptor: {
+            /** Current */
+            current: boolean;
+            /** Id */
+            id: string;
+            /** Mime Type */
+            mime_type: string | null;
+            /** Name */
+            name: string;
+            /** Sha256 */
+            sha256: string | null;
+            /** Size Bytes */
+            size_bytes: number | null;
+        };
         /** FinishBody */
         FinishBody: {
             /** Cause */
@@ -6698,7 +7370,7 @@ export interface components {
             /** Outcome */
             outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
             /** Reason */
-            reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired") | null;
+            reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired" | "identity_refused") | null;
             /**
              * Slot Utc
              * Format: date-time
@@ -6945,6 +7617,16 @@ export interface components {
              * @default []
              */
             targets?: components["schemas"]["NamedTarget"][];
+        };
+        /** Listing */
+        Listing: {
+            /** Cursor */
+            cursor?: string | null;
+            /**
+             * Limit
+             * @default 50
+             */
+            limit?: number;
         };
         /**
          * LoadPackConfig
@@ -7245,12 +7927,33 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        /** Owner */
+        Owner: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Event Id */
+            event_id: string;
+            /** Owner */
+            owner: string;
+            /** Thread Key */
+            thread_key: string;
+        };
         /** OwnerLostBody */
         OwnerLostBody: {
             /** Owner */
             owner: string;
             /** Runtime Epoch */
             runtime_epoch: number;
+        };
+        /** Page */
+        Page: {
+            /** Files */
+            files: components["schemas"]["FileDescriptor"][];
+            /** Next Cursor */
+            next_cursor: string | null;
         };
         /** PhaseDeclaration */
         PhaseDeclaration: {
@@ -7301,6 +8004,16 @@ export interface components {
              * Format: uuid
              */
             tenant_id: string;
+        };
+        /**
+         * PrincipalRef
+         * @description Initiating principal provenance. @spec INITIATING-PRINCIPAL-1
+         */
+        PrincipalRef: {
+            /** Authorization Version */
+            authorization_version: number;
+            /** Principal Id */
+            principal_id: string;
         };
         /** PrincipalResolutionOut */
         PrincipalResolutionOut: {
@@ -7911,6 +8624,11 @@ export interface components {
          *     and one that does not drops it. It defaults to ``None``, today's
          *     unrestricted turn, so a pre-upgrade producer keeps decoding unchanged. No
          *     first-party ingress sets it.
+         *
+         *     ``author_principal`` is the initiating subject admission resolved ``author``
+         *     to (INITIATING-PRINCIPAL-1). ``author`` keeps its existing meaning. The
+         *     executing actor, the agent, is never this principal. This is provenance,
+         *     not authority: neither its presence nor its absence grants anything.
          */
         QueuedTurn: {
             /**
@@ -7920,6 +8638,7 @@ export interface components {
             attachments?: components["schemas"]["Attachment"][];
             /** Author */
             author: string;
+            author_principal?: components["schemas"]["PrincipalRef"] | null;
             /** Conversation Id */
             conversation_id: string;
             /** Event Id */
@@ -7952,6 +8671,470 @@ export interface components {
             pointer: string | null;
             /** Tool */
             tool: string;
+        };
+        /** RecoveryAcknowledged */
+        RecoveryAcknowledged: {
+            /**
+             * Released
+             * @default true
+             */
+            released?: boolean;
+        };
+        /** RecoveryAcquireReader */
+        RecoveryAcquireReader: {
+            /**
+             * Checkpoint Id
+             * Format: uuid
+             */
+            checkpoint_id: string;
+            /** Holder Id */
+            holder_id: string;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** RecoveryCaptureAuthority */
+        RecoveryCaptureAuthority: {
+            /** Dispatch Generation */
+            dispatch_generation: number;
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /**
+             * Source Request Id
+             * Format: uuid
+             */
+            source_request_id: string;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** RecoveryCaptureContext */
+        RecoveryCaptureContext: {
+            /** Base Commit */
+            base_commit: string;
+            repository: components["schemas"]["RecoveryRepository"];
+            /** Target Branch */
+            target_branch: string;
+        };
+        /** RecoveryCaptureFailure */
+        RecoveryCaptureFailure: {
+            /**
+             * Checkpoint Id
+             * Format: uuid
+             */
+            checkpoint_id: string;
+            /**
+             * Status
+             * @default tombstoned
+             * @enum {string}
+             */
+            status?: "tombstoned" | "retracted";
+        };
+        /** RecoveryClaimCollection */
+        RecoveryClaimCollection: {
+            /** Collector Id */
+            collector_id: string;
+            /**
+             * Limit
+             * @default 100
+             */
+            limit?: number;
+        };
+        /** RecoveryCollectionClaim */
+        RecoveryCollectionClaim: {
+            /**
+             * Claim Id
+             * Format: uuid
+             */
+            claim_id: string;
+            /**
+             * Claimed Until
+             * Format: date-time
+             */
+            claimed_until: string;
+            /** Key */
+            key: string;
+            /**
+             * Object Id
+             * Format: uuid
+             */
+            object_id: string;
+            /** Version */
+            version: number;
+        };
+        /** RecoveryCollectionClaims */
+        RecoveryCollectionClaims: {
+            /** Claims */
+            claims: components["schemas"]["RecoveryCollectionClaim"][];
+        };
+        /** RecoveryComplete */
+        RecoveryComplete: {
+            /**
+             * Checkpoint Id
+             * Format: uuid
+             */
+            checkpoint_id: string;
+            /** Dispatch Generation */
+            dispatch_generation: number;
+            /** Receipts */
+            receipts: components["schemas"]["RecoveryObjectReceipt"][];
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /**
+             * Source Request Id
+             * Format: uuid
+             */
+            source_request_id: string;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** RecoveryCompletion */
+        RecoveryCompletion: {
+            /**
+             * Checkpoint Id
+             * Format: uuid
+             */
+            checkpoint_id: string;
+            /**
+             * Completed At
+             * Format: date-time
+             */
+            completed_at: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /**
+             * Status
+             * @default complete
+             * @constant
+             */
+            status?: "complete";
+        };
+        /** RecoveryFail */
+        RecoveryFail: {
+            /**
+             * Checkpoint Id
+             * Format: uuid
+             */
+            checkpoint_id: string;
+            /** Dispatch Generation */
+            dispatch_generation: number;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "upload_failed" | "capture_failed" | "capture_timeout" | "torn_capture" | "lease_lost";
+            /**
+             * Retract
+             * @default false
+             */
+            retract?: boolean;
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /**
+             * Source Request Id
+             * Format: uuid
+             */
+            source_request_id: string;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** RecoveryFinalizeCollection */
+        RecoveryFinalizeCollection: {
+            /**
+             * Claim Id
+             * Format: uuid
+             */
+            claim_id: string;
+            /** Collector Id */
+            collector_id: string;
+            /**
+             * Object Id
+             * Format: uuid
+             */
+            object_id: string;
+            /** Version */
+            version: number;
+        };
+        /** RecoveryFinalized */
+        RecoveryFinalized: {
+            /**
+             * Finalized
+             * @default true
+             */
+            finalized?: boolean;
+        };
+        /** RecoveryObjectDeclaration */
+        RecoveryObjectDeclaration: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "base" | "patch" | "manifest";
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes: number;
+        };
+        /** RecoveryObjectReceipt */
+        RecoveryObjectReceipt: {
+            /** Key */
+            key: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "base" | "patch" | "manifest";
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes: number;
+        };
+        /** RecoveryOutcome */
+        RecoveryOutcome: {
+            /** Dispatch Generation */
+            dispatch_generation: number;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "torn_capture" | "capture_timeout" | "capture_failed" | "runner_unavailable" | "patch_too_large" | "manifest_too_large" | "base_mismatch";
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /**
+             * Source Request Id
+             * Format: uuid
+             */
+            source_request_id: string;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** RecoveryOutcomeRecorded */
+        RecoveryOutcomeRecorded: {
+            /** Recorded */
+            recorded: boolean;
+        };
+        /** RecoveryPublicCheckpoint */
+        RecoveryPublicCheckpoint: {
+            /** Age Seconds */
+            age_seconds: number;
+            /** Available */
+            available: boolean;
+            /** Base Commit */
+            base_commit: string;
+            /**
+             * Checkpoint Id
+             * Format: uuid
+             */
+            checkpoint_id: string;
+            /** Completed At */
+            completed_at: string | null;
+            /** Expires At */
+            expires_at: string | null;
+            /** Objects */
+            objects: components["schemas"]["RecoveryPublicObject"][];
+            repository: components["schemas"]["RecoveryRepository"];
+            /**
+             * Source Request Id
+             * Format: uuid
+             */
+            source_request_id: string;
+            /** Source Sequence */
+            source_sequence: number;
+            /** Source Status */
+            source_status: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "staging" | "complete" | "tombstoned";
+            /** Target Branch */
+            target_branch: string;
+            /** Total Bytes */
+            total_bytes: number;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** RecoveryPublicList */
+        RecoveryPublicList: {
+            /** Capture Outcome */
+            capture_outcome: string | null;
+            /** Capture Outcome At */
+            capture_outcome_at: string | null;
+            /** Checkpoints */
+            checkpoints: components["schemas"]["RecoveryPublicCheckpoint"][];
+            repository: components["schemas"]["RecoveryRepository"];
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** RecoveryPublicObject */
+        RecoveryPublicObject: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "base" | "patch" | "manifest";
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes: number;
+        };
+        /** RecoveryReader */
+        RecoveryReader: {
+            /**
+             * Checkpoint Id
+             * Format: uuid
+             */
+            checkpoint_id: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Holder Id */
+            holder_id: string;
+            /**
+             * Lease Id
+             * Format: uuid
+             */
+            lease_id: string;
+            /** Objects */
+            objects: components["schemas"]["RecoveryObjectReceipt"][];
+        };
+        /** RecoveryReleaseReader */
+        RecoveryReleaseReader: {
+            /** Holder Id */
+            holder_id: string;
+            /**
+             * Lease Id
+             * Format: uuid
+             */
+            lease_id: string;
+        };
+        /** RecoveryRepository */
+        RecoveryRepository: {
+            /** Host */
+            host: string;
+            /** Path */
+            path: string;
+            /** Project Id */
+            project_id: string;
+            /** Provider */
+            provider: string;
+        };
+        /** RecoveryReservation */
+        RecoveryReservation: {
+            /**
+             * Capture Deadline
+             * Format: date-time
+             */
+            capture_deadline: string;
+            /**
+             * Checkpoint Id
+             * Format: uuid
+             */
+            checkpoint_id: string;
+            /** Objects */
+            objects: components["schemas"]["RecoveryObjectReceipt"][];
+            /** Replayed */
+            replayed: boolean;
+            /**
+             * Staging Expires At
+             * Format: date-time
+             */
+            staging_expires_at: string;
+        };
+        /** RecoveryReserve */
+        RecoveryReserve: {
+            /** Base Archive Limit Bytes */
+            base_archive_limit_bytes: number;
+            /** Base Commit */
+            base_commit: string;
+            /**
+             * Capture Budget Seconds
+             * @default 60
+             */
+            capture_budget_seconds?: number;
+            /** Dispatch Generation */
+            dispatch_generation: number;
+            /** Idempotency Key */
+            idempotency_key: string;
+            /** Objects */
+            objects: components["schemas"]["RecoveryObjectDeclaration"][];
+            repository: components["schemas"]["RecoveryRepository"];
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /**
+             * Source Request Id
+             * Format: uuid
+             */
+            source_request_id: string;
+            /** Target Branch */
+            target_branch: string;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** Reference */
+        Reference: {
+            /** File Id */
+            file_id: string;
+            /** Mime Type */
+            mime_type?: string | null;
+            /** Name */
+            name: string;
+            /** Ordinal */
+            ordinal: number;
+            /** Route Adapter */
+            route_adapter?: string | null;
+            /** Route Identity */
+            route_identity: string;
+            /** Route Kind */
+            route_kind: string;
+            /** Size Bytes */
+            size_bytes?: number | null;
+        };
+        /** Registered */
+        Registered: {
+            /** Appended */
+            appended: number;
+        };
+        /** Registration */
+        Registration: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Event Id */
+            event_id: string;
+            /** Refs */
+            refs: components["schemas"]["Reference"][];
+            /** Thread Key */
+            thread_key: string;
         };
         /**
          * RemediationBreakerClose
@@ -8307,6 +9490,22 @@ export interface components {
              * @description A literal member of the action's target.allowed list.
              */
             target: string | number | boolean;
+        };
+        /** Renewal */
+        Renewal: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Current Event Id */
+            current_event_id?: string | null;
+            /** Event Id */
+            event_id: string;
+            /** Owner */
+            owner: string;
+            /** Thread Key */
+            thread_key: string;
         };
         /**
          * ReplyHandle
@@ -8726,11 +9925,11 @@ export interface components {
             /** Last Manual Outcome */
             last_manual_outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
             /** Last Manual Reason */
-            last_manual_reason: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired") | null;
+            last_manual_reason: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired" | "identity_refused") | null;
             /** Last Outcome */
             last_outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
             /** Last Reason */
-            last_reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired") | null;
+            last_reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired" | "identity_refused") | null;
             /** Name */
             name: string;
             /** Paused */
@@ -8749,6 +9948,14 @@ export interface components {
         ScheduleListOut: {
             /** Schedules */
             schedules: components["schemas"]["AgentSchedulesOut"][];
+        };
+        /** Selection */
+        Selection: {
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
         };
         /**
          * SettingConfig
@@ -8814,10 +10021,14 @@ export interface components {
          *     mapping does not use cannot be sent as if it were evidence.
          */
         SlackEvidence: {
+            /** Channel Type */
+            channel_type?: string | null;
             /** Delivery */
             delivery: string;
             /** Enterprise Ids */
             enterprise_ids?: string[];
+            /** Event Source Team */
+            event_source_team?: string | null;
             /** Event Team */
             event_team?: string | null;
             /** Event User Team */
@@ -9144,6 +10355,11 @@ export interface components {
             /** Route Existed */
             route_existed?: boolean | null;
         };
+        /** Ticket */
+        Ticket: {
+            /** Ticket */
+            ticket: string;
+        };
         /**
          * TipsPackConfig
          * @description Rotating capability tips for one agent (mirrors behaviorpacks.TipsPack).
@@ -9212,6 +10428,11 @@ export interface components {
             /** Scope Id */
             scope_id: string;
         };
+        /** Transfer */
+        Transfer: {
+            /** Transfer Id */
+            transfer_id: string;
+        };
         /**
          * TurnAccepted
          * @description The ingress receipt. `duplicate` says whether THIS request enqueued.
@@ -9225,8 +10446,84 @@ export interface components {
             duplicate: boolean;
             /** Event Id */
             event_id: string;
+            /** Reply Ref */
+            reply_ref?: string | null;
             /** Stream Id */
             stream_id: string | null;
+        };
+        /**
+         * TurnAuthorityRequestV1
+         * @description @spec HTTP-INVOCATION-EXECUTION-16.
+         */
+        TurnAuthorityRequestV1: {
+            /** Approval Id */
+            approval_id: string | null;
+            /** Context */
+            context: string;
+            /** Event Id */
+            event_id: string;
+            /** Payload Sha256 */
+            payload_sha256: string;
+            /** Request Id */
+            request_id: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            scope: components["schemas"]["TurnAuthorityScopeV1"];
+            /**
+             * Stage
+             * @enum {string}
+             */
+            stage: "prepare" | "claim_or_resume" | "start" | "steer";
+        };
+        /**
+         * TurnAuthorityResponseV1
+         * @description @spec HTTP-INVOCATION-EXECUTION-16.
+         */
+        TurnAuthorityResponseV1: {
+            /** Context Sha256 */
+            context_sha256: string;
+            /**
+             * Decision
+             * @enum {string}
+             */
+            decision: "continue" | "refuse" | "unavailable";
+            /** Event Id */
+            event_id: string;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "current_authority" | "caller_not_allowed" | "invalid_context" | "unsupported_resume" | "authority_unavailable";
+            /** Request Id */
+            request_id: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            scope: components["schemas"]["TurnAuthorityScopeV1"];
+            /**
+             * Stage
+             * @enum {string}
+             */
+            stage: "prepare" | "claim_or_resume" | "start" | "steer";
+        };
+        /**
+         * TurnAuthorityScopeV1
+         * @description @spec HTTP-INVOCATION-EXECUTION-16.
+         */
+        TurnAuthorityScopeV1: {
+            /** Agent Id */
+            agent_id: string;
+            /** Binding Generation */
+            binding_generation: number;
+            /** Binding Id */
+            binding_id: string;
+            /** Tenant Id */
+            tenant_id: string;
         };
         /**
          * TurnProgressBody
@@ -13295,6 +14592,146 @@ export interface operations {
             };
         };
     };
+    authorize_attachment_access_authorize_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Attachment-Access"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Selection"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FileDescriptor"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    completion_attachment_access_completion_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Attachment-Access"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Transfer"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Completion"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    fetch_attachment_access_fetch_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Attachment-Access"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Selection"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_files_attachment_access_list_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Attachment-Access"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Listing"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     channel_canvas_channel_canvas_post: {
         parameters: {
             query?: never;
@@ -13719,6 +15156,7 @@ export interface operations {
             query?: never;
             header?: {
                 "x-api-key"?: string | null;
+                "x-curie-receiver-proof"?: string | null;
             };
             path?: never;
             cookie?: never;
@@ -15952,6 +17390,218 @@ export interface operations {
             };
         };
     };
+    complete_v1_internal_attachment_access_complete_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Completed"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Completion"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    context_v1_internal_attachment_access_context_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Context"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Capability"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    redeem_v1_internal_attachment_access_redeem_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Ticket"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    register_v1_internal_attachment_access_register_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Registration"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Registered"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    renew_v1_internal_attachment_access_renew_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Renewal"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Active"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    revoke_v1_internal_attachment_access_revoke_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Owner"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Active"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     mint_channel_read_context_v1_internal_channel_read_context_post: {
         parameters: {
             query?: never;
@@ -16101,6 +17751,146 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ReviewVerificationOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    check_approval_grant_v1_internal_identity_approval_grant_check_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApprovalGrantAuthorityRequestV1"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApprovalGrantAuthorityResponseV1"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_identity_approval_v1_internal_identity_approvals_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApprovalCreationRequestV1"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApprovalCreationResponseV1"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    check_binding_classification_v1_internal_identity_binding_classification_check_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BindingClassificationRequestV1"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BindingClassificationResponseV1"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    check_turn_authority_v1_internal_identity_turn_authority_check_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TurnAuthorityRequestV1"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TurnAuthorityResponseV1"];
                 };
             };
             /** @description Validation Error */
@@ -17315,6 +19105,321 @@ export interface operations {
             };
         };
     };
+    acquire_reader_v1_internal_workspace_recovery_acquire_reader_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RecoveryAcquireReader"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryReader"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    claim_collection_v1_internal_workspace_recovery_claim_collection_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RecoveryClaimCollection"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryCollectionClaims"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    complete_v1_internal_workspace_recovery_complete_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RecoveryComplete"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryCompletion"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    context_v1_internal_workspace_recovery_context_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RecoveryCaptureAuthority"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryCaptureContext"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    fail_v1_internal_workspace_recovery_fail_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RecoveryFail"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryCaptureFailure"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    finalize_collection_v1_internal_workspace_recovery_finalize_collection_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RecoveryFinalizeCollection"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryFinalized"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    outcome_v1_internal_workspace_recovery_outcome_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RecoveryOutcome"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryOutcomeRecorded"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    release_reader_v1_internal_workspace_recovery_release_reader_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RecoveryReleaseReader"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryAcknowledged"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reserve_v1_internal_workspace_recovery_reserve_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RecoveryReserve"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryReservation"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     redeem_workspace_credential_v1_internal_workspaces__deployment_id__credential_post: {
         parameters: {
             query?: never;
@@ -17624,6 +19729,108 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["WorkItemOutcomeOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_checkpoints_work_items__work_item_id__recovery_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                work_item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryPublicList"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    checkpoint_status_work_items__work_item_id__recovery__checkpoint_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                work_item_id: string;
+                checkpoint_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryPublicCheckpoint"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    object_download_work_items__work_item_id__recovery__checkpoint_id__objects__kind__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                work_item_id: string;
+                checkpoint_id: string;
+                kind: "base" | "patch" | "manifest";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
                 };
             };
             /** @description Validation Error */

@@ -279,6 +279,45 @@ def test_repeat_report_is_idempotent(clean: None) -> None:
     assert _identity_row(identity_id)["provider_installation_id"] == first.provider_installation_id
 
 
+SYNTHETIC_ORG = "E0EXAMPLEORG"
+
+
+def test_grid_workspace_report_also_creates_its_organisation_namespace(clean: None) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-21: synthetic Grid ids; the answer is unchanged."""
+    tenant_id = _tenant()
+    _identity(tenant_id)
+    first = _report(tenant_id, enterprise_id=SYNTHETIC_ORG, is_enterprise_install=False)
+    second = _report(tenant_id, enterprise_id=SYNTHETIC_ORG, is_enterprise_install=False)
+    namespaces = {(row["kind"], row["key"]): row for row in _namespaces(tenant_id)}
+    assert set(namespaces) == {("slack_workspace", HOME), ("slack_enterprise", SYNTHETIC_ORG)}
+    organisation = namespaces[("slack_enterprise", SYNTHETIC_ORG)]
+    assert (organisation["provider"], organisation["authority"]) == ("slack", "")
+    assert organisation["status"] == "active"
+    assert first.namespace_id == second.namespace_id == namespaces[("slack_workspace", HOME)]["id"]
+    assert len(_installations(tenant_id)) == 1
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        {"enterprise_id": SYNTHETIC_ORG, "is_enterprise_install": True},
+        {"enterprise_id": SYNTHETIC_ORG, "is_enterprise_install": None},
+        {"enterprise_id": "not-an-organisation", "is_enterprise_install": False},
+        {"enterprise_id": None, "is_enterprise_install": False},
+    ],
+)
+def test_other_reports_create_no_organisation_namespace(
+    clean: None, report: dict[str, Any]
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-21: organisation-wide installs stay refused."""
+    tenant_id = _tenant()
+    _identity(tenant_id)
+    _report(tenant_id, **report)
+    assert [(row["kind"], row["key"]) for row in _namespaces(tenant_id)] == [
+        ("slack_workspace", HOME)
+    ]
+
+
 def test_report_reuses_an_existing_installation_and_namespace(clean: None) -> None:
     tenant_id = _tenant()
     installation_id = _installation(tenant_id, HOME)

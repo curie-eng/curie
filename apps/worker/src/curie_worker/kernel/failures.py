@@ -196,6 +196,7 @@ class TurnOutcome:
     terminal_ok: bool
     answer: ReplyUpdate | None = None
     saw_side_effect: bool = False
+    execution_uncertain: bool = False
     classification: str | None = None
     error_message: str | None = None
     workspace_stage_timeout: bool = False
