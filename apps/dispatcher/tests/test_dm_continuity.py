@@ -174,9 +174,11 @@ def _queued_text(redis_client: redis.Redis, config: DispatcherConfig) -> str:
 
 
 def _http_body(**changes: Any) -> dict[str, Any]:
-    # dm_native puts is_ext_shared_channel on the envelope only.
-    body, _event = dm_native(ts=CURRENT_TS, text=CURRENT_TEXT, **changes)
-    assert "is_ext_shared_channel" not in _event
+    # dm_native puts is_ext_shared_channel on the envelope only. Later keys
+    # override, so a reply can replace the text and set thread_ts.
+    fields = {"ts": CURRENT_TS, "text": CURRENT_TEXT, **changes}
+    body, event = dm_native(**fields)
+    assert "is_ext_shared_channel" not in event
     return body
 
 

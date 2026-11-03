@@ -393,10 +393,12 @@ class HttpReceiverRuntime:
 
     def prepare(
         self, *, body: dict[str, Any], event: dict[str, Any], slack_identity: str,
-        bot_user_id: str | None,
+        bot_user_id: str | None, dm_continuity: Callable[[str], str] | None = None,
     ) -> PreparedSubmission | None:
         """Every local check, before any placeholder; None is a local refusal.
 
+        ``dm_continuity``, when passed, amends the derived text before signing.
+        Its failure keeps that text and does not refuse the turn.
         @spec HTTP-INVOCATION-EXECUTION-2/3/19/26/27.
         """
         scope = self._scope
@@ -436,10 +438,21 @@ class HttpReceiverRuntime:
             if event.get("type") == "message":
                 evidence["channel_type"] = DIRECT_MESSAGE_CHANNEL_TYPE
             conversation = timestamp
+            # The except below treats ValueError, TypeError, AttributeError and
+            # RecursionError as a refusal. Continuity is optional context, so its
+            # failure has to be swallowed here or a history problem refuses the turn.
+            text = strip_self_mention(derive_text(event), bot_user_id)
+            if dm_continuity is not None:
+                try:
+                    continued = dm_continuity(text)
+                except Exception:  # noqa: BLE001 - history is optional; still sign the turn
+                    continued = text
+                if isinstance(continued, str):
+                    text = continued
             content = {
                 "kind": "slack", "address": channel, "adapter": scope.channel_identity_name,
                 "delivery_id": delivery, "conversation_id": conversation, "author": sender,
-                "text": strip_self_mention(derive_text(event), bot_user_id), "reply_ref": "",
+                "text": text, "reply_ref": "",
                 "attachments": [item.model_dump(mode="json") for item in derive_attachments(event)],
             }
             proof = {
