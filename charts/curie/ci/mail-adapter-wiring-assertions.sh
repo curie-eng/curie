@@ -1264,7 +1264,7 @@ python3 "$MATRIX_PY" \
 #     runner; asserting them here is what makes the adapter a fifth member of
 #     that boundary rather than a workload with its own private wiring.
 #     The set-wide gate that a sixth first-party workload cannot omit this env
-#     is ci/instrumented-workload-assertions.sh (#2360).
+#     is ci/policy/engine.py (P5) (#2360).
 # ---------------------------------------------------------------------------
 assert_env_value "$on_dir" OTEL_EXPORTER_OTLP_ENDPOINT "http://curie-otel-collector:4318" \
   "The in-chart Collector Service must be derived exactly as it is for the other instrumented workloads; an adapter that exports nowhere leaves its records outside the shared, redacted OTLP path."

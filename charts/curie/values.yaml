@@ -379,7 +379,7 @@ langfuse:
     # Probe cadences. Liveness must outlast readiness: this replicas:1 +
     # Recreate Deployment runs Prisma/ClickHouse boot migrations at container
     # start, and init containers do NOT re-run on a liveness restart. Cutoffs:
-    # readiness 310s, liveness 370s. Formula/rationale: ci/probe-window-assertions.sh header.
+    # readiness 310s, liveness 370s. Formula/rationale: ci/policy/engine.py (P3).
     readinessProbe:
       initialDelaySeconds: 20
       periodSeconds: 10
@@ -424,7 +424,7 @@ langfuse:
     # Probe cadences, deliberately equal to langfuse.web's above: same boot
     # migrations, same replicas:1 + Recreate constraint, cadence kept equal to
     # web's. Cutoffs: readiness 310s, liveness 370s. Formula/rationale:
-    # ci/probe-window-assertions.sh header.
+    # ci/policy/engine.py (P3).
     readinessProbe:
       initialDelaySeconds: 20
       periodSeconds: 10
@@ -495,7 +495,7 @@ postgres:
   # Probe cadences. Liveness MUST outlast readiness here because `pg_isready`
   # returns non-zero for the whole of WAL recovery after an unclean stop, and a
   # restart re-enters the same recovery. Cutoffs: readiness 60s, liveness 310s.
-  # Formula/rationale: ci/probe-window-assertions.sh header.
+  # Formula/rationale: ci/policy/engine.py (P3).
   readinessProbe:
     initialDelaySeconds: 5
     periodSeconds: 5
@@ -1457,7 +1457,7 @@ api:
   # Probe cadences. Database aware /ready keeps the API out of the Service until
   # Postgres responds, while process local /health keeps the process alive.
   # Liveness must outlast readiness. Cutoffs: readiness 120s, liveness 195s.
-  # Formula/rationale: ci/probe-window-assertions.sh header.
+  # Formula/rationale: ci/policy/engine.py (P3).
   # Kubelet withdrawal of a bounce shorter than the 120s readiness cutoff is
   # out of scope; the longer-outage proof covers endpoints.
   readinessProbe:

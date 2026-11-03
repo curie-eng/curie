@@ -32,8 +32,8 @@
 # `worker-uid` proves the helper reads the WORKER's context rather than web's,
 # and `root-worker-security` proves the 1001 non-root floor (#351: both Langfuse
 # images declare a NAMED user, so `runAsNonRoot` needs a numeric uid) still
-# applies on the worker. `langfuse-runasuser-assertions.sh` stays web-only; these
-# two renders are what makes that deferral safe.
+# applies on the worker. policy P4 covers the web and worker identities; these
+# two renders cover the helper context selection.
 #
 # The live delayed-start cluster scenario was removed. This render contract
 # is what still checks that both Langfuse Deployments carry the gate.
