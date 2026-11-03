@@ -20,7 +20,6 @@ import json
 import os
 import sys
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -630,11 +629,14 @@ class _ExternalAPI:
     def __init__(self, jobs):
         self.jobs = jobs
         self.requests = []
+        self.release = threading.Event()
 
     def __enter__(self):
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
+            release = fixture.release
+
             def log_message(self, format, *args):
                 pass  # keep pytest output clean
 
@@ -702,12 +704,22 @@ class _ExternalAPI:
                 self.respond(201, {"metadata": {"name": "sre-bot-self-upgrade-abc12"}})
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.server.daemon_threads = False
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        try:
+            self.thread.start()
+        except BaseException:
+            self.server.server_close()
+            raise
         return self
 
     def __exit__(self, *exc):
+        self.release.set()
         self.server.shutdown()
         self.server.server_close()
+        self.thread.join(timeout=5)
+        assert not self.thread.is_alive()
+        assert self.server.fileno() == -1
         return False
 
     @property
@@ -734,7 +746,7 @@ def _hang_up(handler):
 
 def _stall(handler):
     """A read that outlives the client's timeout: the reply is never seen."""
-    time.sleep(4.0)
+    handler.release.wait()
     handler.respond(200, {"items": []})
 
 
@@ -801,6 +813,8 @@ def test_a_failed_concurrency_read_refuses_rather_than_starting_a_job(
         # status or transport cause -- never the credential, never the raw body
         # the API sent.
         refusal = str(excinfo.value)
+        if case == "read_timeout":
+            assert "ReadTimeout" in refusal
         assert "upgrade-token" not in refusal
         if case == "malformed_json":
             assert "not a jobs list" not in refusal
