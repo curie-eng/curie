@@ -412,7 +412,7 @@ def test_ordinary_next_pr_still_omits_kind(
     ],
 )
 @pytest.mark.parametrize("train", ["main", "next"])
-def test_merge_group_payload_selects_the_same_diff_as_pull_request(
+def test_merge_group_payload_selects_pr_tiers_and_full_pytest(
     git_repo: tuple[Path, str], tmp_path: Path, changed: str, train: str,
 ) -> None:
     repo, base = git_repo
@@ -455,9 +455,22 @@ def test_merge_group_payload_selects_the_same_diff_as_pull_request(
             capture_output=True, text=True,
         )
         assert result.returncode == 0, result.stdout + result.stderr
-        selections.append(output.read_text())
-    assert selections[0] == selections[1]
-    outputs = dict(line.split("=", 1) for line in selections[1].splitlines())
+        selections.append(dict(line.split("=", 1) for line in output.read_text().splitlines()))
+    pull_request, outputs = selections
+    # Every tier matches the pull request's selection for the same diff.
+    tiers = {key for key in pull_request if not key.startswith("pytest")}
+    assert {key: outputs[key] for key in tiers} == {key: pull_request[key] for key in tiers}
+    # The queue is the deep lane: pytest runs whenever the pull request ran it,
+    # on the full scope and shard plan, never on the impact selection, so an
+    # impact-selection miss fails before main.
+    if pull_request["pytest"] == "true":
+        assert outputs["pytest"] == "true"
+    if outputs["pytest"] == "true":
+        assert outputs["pytest_scope"] == "full"
+        assert outputs["pytest_targets"] == ""
+        assert outputs["pytest_deselect"] == ""
+        assert (outputs["pytest_shards"], outputs["pytest_storage_shards"],
+                outputs["pytest_full_shards"]) == ("6", "6", "6")
     if changed == "tools/factory-e2e/queue-example.py":
         assert outputs["factory"] == outputs["cluster"] == "true"
     if changed in {

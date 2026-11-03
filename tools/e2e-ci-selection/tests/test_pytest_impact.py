@@ -1600,6 +1600,34 @@ def _commit(repo: Path, relative: str, content: str) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
+def test_merge_queue_revision_mode_keeps_the_full_pytest_plan(
+    revision_repo: tuple[Path, str], tmp_path: Path
+) -> None:
+    # The same hunk narrows a pull request to impact targets (see below).
+    repo, base = revision_repo
+    head = _commit(repo, WORKFLOW_PATH, _workflow(rust_lint="echo changed"))
+    targets_out = tmp_path / "targets.txt"
+
+    completed, output = _run_selector(
+        tmp_path,
+        "--base",
+        base,
+        "--head",
+        head,
+        "--full-pytest",
+        cwd=repo,
+        registry=repo / REGISTRY_PATH,
+        targets_out=targets_out,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert output["pytest"] == "true"
+    assert output["pytest_scope"] == "full"
+    assert output["pytest_targets"] == ""
+    assert _shard_outputs(output) == (6, 6, 6)
+    assert targets_out.read_text(encoding="utf-8") == ""
+
+
 @pytest.mark.parametrize(
     ("runs", "scope"),
     (
