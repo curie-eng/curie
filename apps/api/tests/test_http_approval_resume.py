@@ -344,10 +344,10 @@ def test_a_definitively_refused_expired_wake_is_not_reselected_on_every_pass(
             return await real(approval_id, **kwargs)
 
         monkeypatch.setattr(stores.queue, "enqueue_approval", counted)
+        # A negative grace admits the just-expired row without waiting on a clock.
         reconciler = ResumeReconciler(
-            stores.factory, stores.queue, interval_seconds=30, grace_seconds=0, batch_limit=10,
+            stores.factory, stores.queue, interval_seconds=30, grace_seconds=-5, batch_limit=10,
         )
-        await asyncio.sleep(0.01)
         assert await reconciler.reconcile_once() == 0
         assert len(attempts) == 1
         # The next pass does not re-evaluate the refused row.
