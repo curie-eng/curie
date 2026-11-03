@@ -570,9 +570,9 @@ class InMemoryCodeHost(_Declared):
         self._excerpts: dict[tuple[str, str], str] = {}
         self._feedback: dict[PullRequestRef, list[_Feedback]] = {}
         self._writers: dict[RepositoryRef, set[str]] = {}
-        # UI evidence: (project id, key) -> (commit, files), and every stored
-        # commit's files, which stay readable by URL as a host keeps objects.
-        self._evidence: dict[tuple[str, str], tuple[str, dict[str, bytes]]] = {}
+        # UI evidence refs: (project id, key) -> commit. Every stored commit's
+        # files stay readable by URL, as a host keeps objects.
+        self._evidence: dict[tuple[str, str], str] = {}
         self._evidence_objects: dict[str, dict[str, bytes]] = {}
         self._shas = itertools.count(1)
         self._ids = itertools.count(5001)
@@ -919,10 +919,7 @@ class InMemoryCodeHost(_Declared):
             digest.update(f"{item.path}\0{hashlib.sha256(item.content).hexdigest()}\0".encode())
         digest.update(f"{message}\0{stamp.isoformat()}".encode())
         commit_sha = digest.hexdigest()
-        self._evidence[(repository.project_id, key)] = (
-            commit_sha,
-            {item.path: item.content for item in files},
-        )
+        self._evidence[(repository.project_id, key)] = commit_sha
         self._evidence_objects[commit_sha] = {item.path: item.content for item in files}
         self.ledger.record()
         return StoredEvidence(
@@ -944,12 +941,10 @@ class InMemoryCodeHost(_Declared):
         """The bytes an evidence URL serves, or None (a test reader)."""
 
         prefix = f"https://{self.host}/"
-        if not url.startswith(prefix):
-            return None
         _, marker, rest = url.removeprefix(prefix).partition("/raw/")
-        commit_sha, _, path = rest.partition("/")
-        if not marker:
+        if not url.startswith(prefix) or not marker:
             return None
+        commit_sha, _, path = rest.partition("/")
         return self._evidence_objects.get(commit_sha, {}).get(path)
 
     async def list_review_feedback(

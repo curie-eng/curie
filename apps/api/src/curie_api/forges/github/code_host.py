@@ -93,8 +93,6 @@ _SHA = re.compile(r"[0-9a-f]{40,64}")
 # UI evidence lives outside every branch, under one ref per key.
 EVIDENCE_REF_PREFIX = "refs/curie/ui-evidence/"
 _EVIDENCE_KEY = re.compile(r"[0-9A-Za-z][0-9A-Za-z_-]{0,63}")
-_EVIDENCE_AUTHOR = "Curie"
-_EVIDENCE_EMAIL = "ui-evidence@users.noreply.invalid"
 _PER_PAGE = 100
 _MAX_PAGES = 50
 # The publication listing reads every pull request the repository has ever had;
@@ -512,13 +510,9 @@ class GitHubCodeHost:
 
     def marked_comments_for(self, repository: RepositoryRef) -> MarkedComments:
         """Marked comments on ``repository``'s pull requests: the configured
-        ones, else ones minted with this code host's own credential.
-
-        Only comments the configured App posted (``performed_via_github_app.id``)
-        are our own. Without a configured App id no comment can be told apart
-        from a person's, so upserting is refused with `Unsupported` rather than
-        posting one comment per write.
-        """
+        ones, else ones minted with this code host's own credential. Only the
+        configured App's comments are ours, so without an App id this refuses
+        with `Unsupported` rather than post one comment per write."""
 
         if self._marked_comments is not None:
             return self._marked_comments
@@ -779,13 +773,9 @@ class GitHubCodeHost:
         message: str,
         stamp: datetime,
     ) -> StoredEvidence:
-        """Blobs, one tree and one parentless commit through the Git Data API,
-        then ``refs/curie/ui-evidence/<key>`` created or force-moved to it.
-
-        The commit's author and committer are fixed and dated ``stamp`` to the
-        second, so the same files, message and stamp give the same commit.
-        Every call carries the installation token every other write carries.
-        """
+        """One parentless commit through the Git Data API, with the ref created
+        or force-moved to it. Author and committer are fixed and dated ``stamp``
+        to the second, so the same files, message and stamp give the same commit."""
 
         ref = self._evidence_ref(key)
         if not files:
@@ -802,11 +792,8 @@ class GitHubCodeHost:
             entries.append({"path": item.path, "mode": "100644", "type": "blob", "sha": blob})
         tree = await self._created_sha(f"{repo}/git/trees", token=token, body={"tree": entries})
         moment = (stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=UTC)).astimezone(UTC)
-        person = {
-            "name": _EVIDENCE_AUTHOR,
-            "email": _EVIDENCE_EMAIL,
-            "date": moment.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-        }
+        date = moment.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        person = {"name": "Curie", "email": "ui-evidence@users.noreply.invalid", "date": date}
         commit = await self._created_sha(
             f"{repo}/git/commits",
             token=token,

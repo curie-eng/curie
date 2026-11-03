@@ -1,9 +1,8 @@
 """The UI evidence comment: its marker, its text and how much of it fits (plan 5.5).
 
-The core owns the marker (`ui_evidence_marker`); each code host embeds it its
-own way through `MarkedComments.upsert_marked`. Image URLs come only from the
-code host's stored evidence, keyed by ordinal, so no manifest path or label
-ever becomes a URL. Labels and paths appear only as escaped text.
+The core owns the marker; each code host embeds it its own way. Image URLs come
+only from the code host's stored evidence, keyed by ordinal, so no manifest
+path or label ever becomes a URL. Labels and paths appear only as escaped text.
 """
 
 from __future__ import annotations
@@ -13,6 +12,7 @@ import unicodedata
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 # GitHub's comment body limit, in characters.
 MAX_COMMENT_CHARS = 65536
@@ -40,13 +40,11 @@ REFUSAL_TEXT: dict[str, str] = {
     "head_changed": "captured from a different candidate than this pull request head.",
     "not_shown_size": "it did not fit in this comment.",
 }
-_UNKNOWN_REFUSAL = "it could not be shown."
 # Why a revision's evidence was not published, for the stale notice.
 _FAILURE_TEXT: dict[str, str] = {
     "timeout": "the publish window ran out",
     "upload_incomplete": "the upload from the run did not finish",
 }
-_DEFAULT_FAILURE = "the code host could not store it"
 _FOOTER = "Screenshots were captured by the run and are not part of the code change."
 _MARKDOWN_SPECIAL = re.compile(r"([\\`*_{}\[\]()#+\-.!|~])")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -58,65 +56,45 @@ def ui_evidence_marker(lineage_id: uuid.UUID) -> str:
     return f"curie-ui-evidence:{lineage_id}"
 
 
-def body_limit(marker: str) -> int:
-    """The characters a body may use, leaving room for the embedded marker."""
-
-    return MAX_COMMENT_CHARS - len(f"\n\n<!-- {marker} -->\n") - _FRAMING_RESERVE
-
-
 def _plain(value: str | None, limit: int) -> str:
     text = unicodedata.normalize("NFC", value or "")
-    text = " ".join(_CONTROL.sub(" ", text).split())
-    return text[:limit]
+    return " ".join(_CONTROL.sub(" ", text).split())[:limit]
+
+
+def _html(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def escape_label(value: str | None, limit: int = _LABEL_CHARS) -> str:
-    text = _plain(value, limit)
-    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    return _MARKDOWN_SPECIAL.sub(r"\\\1", text)
+    return _MARKDOWN_SPECIAL.sub(r"\\\1", _html(_plain(value, limit)))
 
 
 def _alt(value: str | None) -> str:
     # Alt text closes at the first ']', so brackets never appear in it.
-    text = _plain(value, _LABEL_CHARS).replace("[", "(").replace("]", ")")
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return _html(_plain(value, _LABEL_CHARS).replace("[", "(").replace("]", ")"))
 
 
 def code_path(value: str | None) -> str:
     return "`" + (_plain(value, _PATH_CHARS).replace("`", "'") or "(no path)") + "`"
 
 
-def refusal_text(code: str) -> str:
-    return REFUSAL_TEXT.get(code, _UNKNOWN_REFUSAL)
-
-
-@dataclass(frozen=True)
-class Entry:
+class Entry(Protocol):
     """One manifest entry as the comment sees it."""
 
-    ordinal: int
-    state: str | None
-    label: str | None
-    path: str | None
-
-
-@dataclass(frozen=True)
-class Shown:
-    entry: Entry
-    url: str
-
-
-@dataclass(frozen=True)
-class NotShown:
-    entry: Entry
-    code: str
+    @property
+    def ordinal(self) -> int: ...
+    @property
+    def state(self) -> str | None: ...
+    @property
+    def label(self) -> str | None: ...
+    @property
+    def path(self) -> str | None: ...
 
 
 @dataclass(frozen=True)
 class Rendered:
     body: str
     outcome: str
-    shown: tuple[int, ...]
 
 
 def outcome_of(manifest_state: str, manifest_status: str | None, *, listed: int, shown: int) -> str:
@@ -129,61 +107,7 @@ def outcome_of(manifest_state: str, manifest_status: str | None, *, listed: int,
     if listed and not shown:
         return "unavailable"
     status = manifest_status or "failed"
-    if status == "complete" and shown < listed:
-        return "partial"
-    return status
-
-
-def _header(outcome: str, head_sha: str, revision: int, base_sha: str) -> list[str]:
-    return [
-        "### UI evidence",
-        "",
-        f"**Outcome:** {outcome}",
-        f"**Pull request head:** `{head_sha}` (revision {revision})",
-        f"**Base:** `{base_sha}`",
-    ]
-
-
-def _compose(
-    *,
-    outcome: str,
-    head_sha: str,
-    revision: int,
-    base_sha: str,
-    reason: str | None,
-    shown: Sequence[Shown],
-    not_shown: Sequence[NotShown],
-    listed_limit: int,
-) -> str:
-    lines = _header(outcome, head_sha, revision, base_sha)
-    if reason:
-        lines.append(f"**Reason:** {escape_label(reason, _REASON_CHARS)}")
-    for state, title in (("before", "Before"), ("after", "After")):
-        blocks = [item for item in shown if item.entry.state == state]
-        if not blocks:
-            continue
-        lines += ["", f"#### {title}"]
-        for item in blocks:
-            lines += [
-                "",
-                f"**{escape_label(item.entry.label)}** ({code_path(item.entry.path)})",
-                "",
-                f"![{_alt(item.entry.label)}]({item.url})",
-            ]
-    if not_shown:
-        lines += ["", "#### Not shown", ""]
-        listed = not_shown[:listed_limit]
-        for number, missing in enumerate(listed, start=1):
-            suffix = f" ({missing.entry.state})" if missing.entry.state else ""
-            lines.append(
-                f"{number}. {code_path(missing.entry.path)}{suffix}: {refusal_text(missing.code)}"
-            )
-        rest = len(not_shown) - len(listed)
-        if rest:
-            noun = "image is" if rest == 1 else "images are"
-            lines.append(f"{len(listed) + 1}. {rest} more {noun} not shown.")
-    lines += ["", _FOOTER]
-    return "\n".join(lines) + "\n"
+    return "partial" if status == "complete" and shown < listed else status
 
 
 def render_evidence(
@@ -200,50 +124,68 @@ def render_evidence(
     refusals: dict[int, str],
     outcome: str | None = None,
 ) -> Rendered:
-    """The evidence comment: every entry with a URL is shown in manifest order
-    (before, then after) while it fits; the rest are listed with their reason.
+    """Every entry with a URL is shown (before, then after, in manifest order)
+    while it fits; the rest are listed with their reason from ``refusals``.
+    ``outcome``, when given, replaces the outcome the shown images imply."""
 
-    ``refusals`` names why each entry without a URL is not shown. ``outcome``,
-    when given, replaces the outcome the manifest and the shown images imply.
-    """
-
-    limit = body_limit(marker)
-    candidates = [Shown(entry, urls[entry.ordinal]) for entry in entries if entry.ordinal in urls]
-    ordered = [item for item in candidates if item.entry.state == "before"] + [
-        item for item in candidates if item.entry.state != "before"
+    limit = MAX_COMMENT_CHARS - len(f"\n\n<!-- {marker} -->\n") - _FRAMING_RESERVE
+    with_url = [entry for entry in entries if entry.ordinal in urls]
+    ordered = [entry for entry in with_url if entry.state == "before"] + [
+        entry for entry in with_url if entry.state != "before"
     ]
     refused = [
-        NotShown(entry, refusals.get(entry.ordinal, "not_stored"))
+        (entry, refusals.get(entry.ordinal, "not_stored"))
         for entry in entries
         if entry.ordinal not in urls
     ]
-    listed = len(entries)
+
+    def outcome_for(count: int) -> str:
+        return outcome or outcome_of(
+            manifest_state, manifest_status, listed=len(entries), shown=count
+        )
 
     def build(count: int, listed_limit: int) -> str:
-        shown = ordered[:count]
-        overflow = [NotShown(item.entry, "not_shown_size") for item in ordered[count:]]
-        not_shown = sorted(refused + overflow, key=lambda item: item.entry.ordinal)
-        return _compose(
-            outcome=outcome
-            or outcome_of(manifest_state, manifest_status, listed=listed, shown=count),
-            head_sha=head_sha,
-            revision=revision,
-            base_sha=base_sha,
-            reason=reason,
-            shown=shown,
-            not_shown=not_shown,
-            listed_limit=listed_limit,
-        )
+        lines = [
+            "### UI evidence",
+            "",
+            f"**Outcome:** {outcome_for(count)}",
+            f"**Pull request head:** `{head_sha}` (revision {revision})",
+            f"**Base:** `{base_sha}`",
+        ]
+        if reason:
+            lines.append(f"**Reason:** {escape_label(reason, _REASON_CHARS)}")
+        for state, title in (("before", "Before"), ("after", "After")):
+            blocks = [entry for entry in ordered[:count] if entry.state == state]
+            if blocks:
+                lines += ["", f"#### {title}"]
+            for entry in blocks:
+                lines += [
+                    "",
+                    f"**{escape_label(entry.label)}** ({code_path(entry.path)})",
+                    "",
+                    f"![{_alt(entry.label)}]({urls[entry.ordinal]})",
+                ]
+        overflow = [(entry, "not_shown_size") for entry in ordered[count:]]
+        not_shown = sorted(refused + overflow, key=lambda item: item[0].ordinal)
+        if not_shown:
+            lines += ["", "#### Not shown", ""]
+            listed = not_shown[:listed_limit]
+            for number, (entry, code) in enumerate(listed, start=1):
+                suffix = f" ({entry.state})" if entry.state else ""
+                text = REFUSAL_TEXT.get(code, "it could not be shown.")
+                lines.append(f"{number}. {code_path(entry.path)}{suffix}: {text}")
+            rest = len(not_shown) - len(listed)
+            if rest:
+                noun = "image is" if rest == 1 else "images are"
+                lines.append(f"{len(listed) + 1}. {rest} more {noun} not shown.")
+        lines += ["", _FOOTER]
+        return "\n".join(lines) + "\n"
 
     total = len(refused) + len(ordered)
     for count in range(len(ordered), -1, -1):
         body = build(count, total)
         if len(body) <= limit:
-            return Rendered(
-                body,
-                outcome or outcome_of(manifest_state, manifest_status, listed=listed, shown=count),
-                tuple(item.entry.ordinal for item in ordered[:count]),
-            )
+            return Rendered(body, outcome_for(count))
     # Even without images the list is too long: list as many as fit, count the rest.
     low, high = 0, total
     while low < high:
@@ -252,11 +194,7 @@ def render_evidence(
             low = middle
         else:
             high = middle - 1
-    return Rendered(
-        build(0, low),
-        outcome or outcome_of(manifest_state, manifest_status, listed=listed, shown=0),
-        (),
-    )
+    return Rendered(build(0, low), outcome_for(0))
 
 
 def render_unsupported(*, head_sha: str, captured: int) -> str:
@@ -269,15 +207,10 @@ def render_unsupported(*, head_sha: str, captured: int) -> str:
 
 
 def render_stale(*, head_sha: str, revision: int, failure: str | None) -> str:
+    head = f"the current pull request head `{head_sha}` (revision {revision})"
     if failure is not None:
-        why = _FAILURE_TEXT.get(failure, _DEFAULT_FAILURE)
-        text = (
-            f"UI evidence for the current pull request head `{head_sha}` (revision {revision}) "
-            f"could not be published: {why}."
-        )
+        why = _FAILURE_TEXT.get(failure, "the code host could not store it")
+        text = f"UI evidence for {head} could not be published: {why}."
     else:
-        text = (
-            f"No UI evidence exists for the current pull request head `{head_sha}` "
-            f"(revision {revision}). Evidence from an earlier revision was removed."
-        )
+        text = f"No UI evidence exists for {head}. Evidence from an earlier revision was removed."
     return f"### UI evidence\n\n{text}\n"

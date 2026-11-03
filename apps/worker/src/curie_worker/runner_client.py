@@ -253,9 +253,8 @@ _CHECKPOINT_BODY_MAX_BYTES = (
 _CHECKPOINT_GRACE_S = 5.0
 
 # The runner's UI evidence index answer (one entry per manifest image) is read
-# bounded to this many bytes; the image route names its digest in this header.
+# bounded to this many bytes.
 UI_EVIDENCE_INDEX_MAX_BYTES = 8 * 1024 * 1024
-_EVIDENCE_SHA256_HEADER = "X-Curie-Evidence-Sha256"
 
 
 def _checkpoint_bytes(body: dict[str, Any], name: str, cap: int) -> bytes:
@@ -882,6 +881,41 @@ class RunnerClient:
                     f"after {len(raw)} bytes: {type(exc).__name__}: {str(exc)[:160]}"
                 ) from exc
 
+    async def _ui_evidence_post(
+        self,
+        route: str,
+        base_url: str,
+        token: str | None,
+        payload: dict[str, object],
+        remaining_s: float | None,
+        on_chunk: Callable[[bytes], object],
+        sha256: str | None = None,
+    ) -> None:
+        """Feed a token-authenticated evidence route's body to ``on_chunk``.
+
+        Every failure raises ``RunnerError`` naming a status or class, never the body.
+        """
+
+        if not token:
+            raise RunnerError(f"{route} requires a runner token")
+        try:
+            async with self._session.post(
+                f"{base_url}{route}",
+                json=payload,
+                headers=_auth_headers(token),
+                timeout=self._request_timeout(remaining_s),
+            ) as resp:
+                if resp.status != 200:
+                    raise RunnerError(f"{route} -> {resp.status}")
+                if sha256 is not None and resp.headers.get("X-Curie-Evidence-Sha256") != sha256:
+                    raise RunnerError(f"{route} answered for another digest")
+                async for chunk in resp.content.iter_chunked(65_536):
+                    on_chunk(chunk)
+        except aiohttp.ClientError as exc:
+            if isinstance(exc, TimeoutError):
+                raise
+            raise RunnerError(f"{route} transport failed: {type(exc).__name__}") from None
+
     async def ui_evidence_index(
         self,
         base_url: str,
@@ -891,43 +925,24 @@ class RunnerClient:
         budget_s: float,
         remaining_s: float | None = None,
     ) -> dict[str, object]:
-        """Read the runner's validated UI evidence index for ``base_sha``.
+        """The runner's UI evidence index for ``base_sha``: a bounded JSON object."""
 
-        Always runner-token authenticated, like ``snapshot``. The body is read
-        bounded to ``UI_EVIDENCE_INDEX_MAX_BYTES`` and must be a JSON object;
-        its fields are judged by ``curie_worker.ui_evidence``. Any other status,
-        an oversized or malformed body, or a transport fault raises
-        ``RunnerError`` naming the status or class, never the body.
-        """
-
-        if not token:
-            raise RunnerError("ui evidence index requires a runner token")
+        route = "/v1/ui-evidence/index"
         raw = bytearray()
-        try:
-            async with self._session.post(
-                f"{base_url}/v1/ui-evidence/index",
-                json={"base_sha": base_sha, "budget_seconds": budget_s},
-                headers=_auth_headers(token),
-                timeout=self._request_timeout(remaining_s),
-            ) as resp:
-                if resp.status != 200:
-                    raise RunnerError(f"/v1/ui-evidence/index -> {resp.status}")
-                async for chunk in resp.content.iter_chunked(65_536):
-                    raw.extend(chunk)
-                    if len(raw) > UI_EVIDENCE_INDEX_MAX_BYTES:
-                        raise RunnerError("/v1/ui-evidence/index answer exceeds its byte limit")
-        except aiohttp.ClientError as exc:
-            if isinstance(exc, TimeoutError):
-                raise
-            raise RunnerError(
-                f"/v1/ui-evidence/index transport failed: {type(exc).__name__}"
-            ) from None
+
+        def take(chunk: bytes) -> None:
+            raw.extend(chunk)
+            if len(raw) > UI_EVIDENCE_INDEX_MAX_BYTES:
+                raise RunnerError(f"{route} answer exceeds its byte limit")
+
+        payload: dict[str, object] = {"base_sha": base_sha, "budget_seconds": budget_s}
+        await self._ui_evidence_post(route, base_url, token, payload, remaining_s, take)
         try:
             body = json.loads(raw)
         except (ValueError, RecursionError):
-            raise RunnerError("/v1/ui-evidence/index returned malformed JSON") from None
+            raise RunnerError(f"{route} returned malformed JSON") from None
         if not isinstance(body, dict):
-            raise RunnerError("/v1/ui-evidence/index returned a non-object body")
+            raise RunnerError(f"{route} returned a non-object body")
         return body
 
     async def ui_evidence_image(
@@ -941,46 +956,29 @@ class RunnerClient:
         sink: IO[bytes],
         remaining_s: float | None = None,
     ) -> None:
-        """Stream one validated evidence image's bytes into ``sink``.
+        """Stream one image into ``sink``, refusing any size or sha256 mismatch.
 
-        The bytes are checked while streaming: more than ``size`` bytes, a
-        final count other than ``size``, a digest other than ``sha256`` or an
-        ``X-Curie-Evidence-Sha256`` header naming another digest raises
-        ``RunnerError``. ``sink`` may hold a partial image after a refusal; the
-        caller discards it.
+        ``sink`` may hold a partial image after a refusal; the caller discards it.
         """
 
-        if not token:
-            raise RunnerError("ui evidence image requires a runner token")
+        route = "/v1/ui-evidence/image"
         digest = hashlib.sha256()
         received = 0
-        try:
-            async with self._session.post(
-                f"{base_url}/v1/ui-evidence/image",
-                json={"index": index, "sha256": sha256},
-                headers=_auth_headers(token),
-                timeout=self._request_timeout(remaining_s),
-            ) as resp:
-                if resp.status != 200:
-                    raise RunnerError(f"/v1/ui-evidence/image -> {resp.status}")
-                if resp.headers.get(_EVIDENCE_SHA256_HEADER) != sha256:
-                    raise RunnerError("/v1/ui-evidence/image answered for another digest")
-                async for chunk in resp.content.iter_chunked(65_536):
-                    received += len(chunk)
-                    if received > size:
-                        raise RunnerError("/v1/ui-evidence/image sent more than its size")
-                    digest.update(chunk)
-                    sink.write(chunk)
-        except aiohttp.ClientError as exc:
-            if isinstance(exc, TimeoutError):
-                raise
-            raise RunnerError(
-                f"/v1/ui-evidence/image transport failed: {type(exc).__name__}"
-            ) from None
+
+        def take(chunk: bytes) -> None:
+            nonlocal received
+            received += len(chunk)
+            if received > size:
+                raise RunnerError(f"{route} sent more than its size")
+            digest.update(chunk)
+            sink.write(chunk)
+
+        payload: dict[str, object] = {"index": index, "sha256": sha256}
+        await self._ui_evidence_post(route, base_url, token, payload, remaining_s, take, sha256)
         if received != size:
-            raise RunnerError(f"/v1/ui-evidence/image sent {received} of {size} bytes")
+            raise RunnerError(f"{route} sent {received} of {size} bytes")
         if digest.hexdigest() != sha256:
-            raise RunnerError("/v1/ui-evidence/image bytes do not match their digest")
+            raise RunnerError(f"{route} bytes do not match their digest")
 
     async def checkpoint(
         self,

@@ -38,7 +38,7 @@ from curie_telemetry import inject_trace_context
 
 from .api_retry import DEFAULT_BUDGET_S, post_with_retry
 from .identity_authority import TurnAuthorityUnavailable, exchange_identity_json
-from .ui_evidence import UiEvidenceApi, UiEvidenceCapture
+from .ui_evidence import UiEvidenceCapture, upload_capture
 from .workspace import WorkspaceSelectionRefused
 
 # Re-exported so this module stays the kernel-facing seam for the approval
@@ -787,20 +787,18 @@ class ApprovalClient:
     async def upload_ui_evidence(
         self, publication_id: str, capture: UiEvidenceCapture, *, budget_s: float
     ) -> None:
-        """Upload a run's optional UI evidence for a created publication.
-
-        Uses the same dedicated worker credential as ``create_publication``;
-        without it, fail before any request. The caller treats every failure
-        as an evidence warning; nothing here changes the publication.
-        """
+        """Upload a created publication's optional UI evidence with the worker credential."""
 
         if not self._worker_headers:
             raise ApprovalBackendError("ui evidence upload requires internal worker auth")
-        await UiEvidenceApi(
-            client=self._client,
-            publication_url=self._publication_url,
-            worker_headers=self._worker_headers,
-        ).upload(publication_id, capture, budget_s=budget_s)
+        await upload_capture(
+            self._client,
+            self._publication_url,
+            self._worker_headers,
+            publication_id,
+            capture,
+            budget_s=budget_s,
+        )
 
     async def get_publication_precheck_context(
         self,

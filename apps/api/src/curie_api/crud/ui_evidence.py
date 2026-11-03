@@ -1,9 +1,9 @@
 """Database access for publication UI evidence (migration 0146).
 
-The upload half stores what the worker relays: one index per publication,
-then each expected image, then a seal. The reconciler half claims rows and
-lineages with leases and compare-and-set writes, and clears image bytes on
-every terminal row. Nothing here writes a publication or a lineage row.
+Uploads store one index per publication, then each expected image, then a
+seal. The reconciler claims rows and lineages with leases and CAS writes, and
+image bytes are cleared on every terminal row. Nothing here writes a
+publication or a lineage row.
 """
 
 from __future__ import annotations
@@ -12,9 +12,9 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
-from sqlalchemy import ColumnElement, and_, func, or_, select, update
+from sqlalchemy import ColumnElement, Update, and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,6 +34,12 @@ PUBLISH_WINDOW = timedelta(seconds=120)
 LEASE = timedelta(seconds=60)
 _REFUSED_PUBLICATION = frozenset({"denied", "expired", "failed"})
 _NON_TERMINAL = ("receiving", "ready", "publishing")
+# Index fields stored under their own name on the evidence row.
+_INDEX_COLUMNS = {
+    *("manifest_state", "manifest_refusal", "reason", "base_sha", "manifest_base_sha"),
+    *("manifest_head_sha", "manifest_candidate_tree", "candidate_tree", "head_tree"),
+    *("candidate_dirty", "warnings"),
+}
 
 
 class EvidenceRefused(Exception):
@@ -57,19 +63,12 @@ class IndexStored:
 class ExpectedImage:
     size: int
     sha256: str
-    stored: bool
-
-
-# --- the binding rule ----------------------------------------------------------
 
 
 def bound_by_rule(image: UiEvidenceImageIn, index: UiEvidenceIndexIn, base_sha: str) -> bool:
-    """Decision 2, as the API applies it against the publication's own base.
-
-    A ``before`` image is bound only to the publication base. An ``after``
-    image is bound only to the candidate tree the run computed, by the
-    manifest's tree or, for a clean candidate, by the tree of its head.
-    """
+    """Decision 2, against the publication's own base: a ``before`` image binds
+    only to that base, an ``after`` image only to the run's candidate tree (by
+    the manifest's tree or, for a clean candidate, by its head's tree)."""
 
     if image.state == "before":
         return index.manifest_base_sha is not None and index.manifest_base_sha == base_sha
@@ -89,36 +88,31 @@ def index_digest(index: UiEvidenceIndexIn) -> str:
 
 def _entry_row(
     publication_id: uuid.UUID, image: UiEvidenceImageIn, index: UiEvidenceIndexIn, base_sha: str
-) -> dict[str, object]:
+) -> PublicationUiEvidenceImage:
     refusal = image.refusal
     bound = image.bound and refusal is None and bound_by_rule(image, index, base_sha)
     if refusal is None and not bound:
         refusal = "unbound"
     if refusal is None and (image.size is None or image.sha256 is None):
         refusal, bound = "invalid_entry", False
-    return {
-        "publication_id": publication_id,
-        "ordinal": image.ordinal,
-        "path": image.path or "",
-        "label": image.label or "",
-        "state": image.state,
-        "size_bytes": image.size,
-        "sha256": image.sha256,
-        "refusal": refusal,
-        "bound": bound,
-    }
+    return PublicationUiEvidenceImage(
+        publication_id=publication_id,
+        ordinal=image.ordinal,
+        path=image.path or "",
+        label=image.label or "",
+        state=image.state,
+        size_bytes=image.size,
+        sha256=image.sha256,
+        refusal=refusal,
+        bound=bound,
+    )
 
 
-def _expected(rows: list[dict[str, object]]) -> list[int]:
-    return sorted(int(str(row["ordinal"])) for row in rows if row["refusal"] is None)
-
-
-# --- upload ----------------------------------------------------------------------
-
-
-async def _expected_ordinals(session: AsyncSession, publication_id: uuid.UUID) -> list[int]:
-    rows = await session.scalars(
-        select(PublicationUiEvidenceImage.ordinal)
+async def _expected_images(
+    session: AsyncSession, publication_id: uuid.UUID
+) -> list[tuple[int, datetime | None]]:
+    rows = await session.execute(
+        select(PublicationUiEvidenceImage.ordinal, PublicationUiEvidenceImage.stored_at)
         .where(
             PublicationUiEvidenceImage.publication_id == publication_id,
             PublicationUiEvidenceImage.refusal.is_(None),
@@ -126,7 +120,7 @@ async def _expected_ordinals(session: AsyncSession, publication_id: uuid.UUID) -
         )
         .order_by(PublicationUiEvidenceImage.ordinal)
     )
-    return list(rows)
+    return [(ordinal, stored_at) for ordinal, stored_at in rows]
 
 
 async def _existing(session: AsyncSession, publication_id: uuid.UUID, digest: str) -> IndexStored:
@@ -134,7 +128,8 @@ async def _existing(session: AsyncSession, publication_id: uuid.UUID, digest: st
     assert row is not None
     if row.index_sha256 != digest:
         raise EvidenceRefused(409, "index_conflict", "a different evidence index is stored")
-    return IndexStored(False, row.status, await _expected_ordinals(session, publication_id))
+    expected = [ordinal for ordinal, _ in await _expected_images(session, publication_id)]
+    return IndexStored(False, row.status, expected)
 
 
 async def store_index(
@@ -153,41 +148,30 @@ async def store_index(
     digest = index_digest(index)
     if await session.get(PublicationUiEvidence, publication_id) is not None:
         return await _existing(session, publication_id, digest)
-    rows = [
+    images = [
         _entry_row(publication_id, image, index, publication.base_sha) for image in index.images
     ]
-    expected_bytes = sum(int(str(row["size_bytes"])) for row in rows if row["refusal"] is None)
-    if expected_bytes > MAX_TOTAL_BYTES:
+    expected = [image for image in images if image.refusal is None]
+    if sum(image.size_bytes or 0 for image in expected) > MAX_TOTAL_BYTES:
         raise EvidenceRefused(422, "total_limit", "the evidence passes 100 MiB in total")
-    lineage_id = publication.lineage_id
+    ordinals = sorted(image.ordinal for image in expected)
     try:
         session.add(
             PublicationUiEvidence(
                 publication_id=publication_id,
-                lineage_id=lineage_id,
+                lineage_id=publication.lineage_id,
                 status="receiving",
                 index_sha256=digest,
-                manifest_state=index.manifest_state,
-                manifest_refusal=index.manifest_refusal,
                 manifest_status=index.status,
-                reason=index.reason,
-                base_sha=index.base_sha,
-                manifest_base_sha=index.manifest_base_sha,
-                manifest_head_sha=index.manifest_head_sha,
-                manifest_candidate_tree=index.manifest_candidate_tree,
-                candidate_tree=index.candidate_tree,
-                head_tree=index.head_tree,
-                candidate_dirty=index.candidate_dirty,
-                warnings=list(index.warnings),
                 upload_deadline_at=func.now() + UPLOAD_WINDOW,
+                **index.model_dump(include=_INDEX_COLUMNS),
             )
         )
         await session.flush()
-        for row in rows:
-            session.add(PublicationUiEvidenceImage(**row))
+        session.add_all(images)
         await session.execute(
             insert(PublicationLineageUiEvidence)
-            .values(lineage_id=lineage_id)
+            .values(lineage_id=publication.lineage_id)
             .on_conflict_do_nothing(index_elements=["lineage_id"])
         )
         await session.commit()
@@ -195,7 +179,7 @@ async def store_index(
         # A concurrent upload of the same publication won the insert.
         await session.rollback()
         return await _existing(session, publication_id, digest)
-    return IndexStored(True, "receiving", _expected(rows))
+    return IndexStored(True, "receiving", ordinals)
 
 
 async def expected_image(
@@ -208,20 +192,27 @@ async def expected_image(
         raise EvidenceRefused(404, "image_not_found", "no such evidence image")
     if image.refusal is not None or not image.bound or image.size_bytes is None or not image.sha256:
         raise EvidenceRefused(409, "image_not_expected", "this image is not expected")
-    return ExpectedImage(image.size_bytes, image.sha256, image.stored_at is not None)
+    return ExpectedImage(image.size_bytes, image.sha256)
+
+
+async def _locked_row(
+    session: AsyncSession, publication_id: uuid.UUID
+) -> PublicationUiEvidence | None:
+    # The row lock serializes image stores with the seal.
+    row: PublicationUiEvidence | None = await session.scalar(
+        select(PublicationUiEvidence)
+        .where(PublicationUiEvidence.publication_id == publication_id)
+        .with_for_update()
+    )
+    return row
 
 
 async def store_image(
     session: AsyncSession, publication_id: uuid.UUID, ordinal: int, content: bytes
 ) -> bool:
-    """Store one verified image. Returns True when stored now, False when the
-    same bytes were already stored. Serialized with the seal by a row lock."""
+    """Store one verified image: True when stored now, False when it already was."""
 
-    row = await session.scalar(
-        select(PublicationUiEvidence)
-        .where(PublicationUiEvidence.publication_id == publication_id)
-        .with_for_update()
-    )
+    row = await _locked_row(session, publication_id)
     image = await session.get(PublicationUiEvidenceImage, (publication_id, ordinal))
     if row is None or image is None:
         raise EvidenceRefused(404, "image_not_found", "no such evidence image")
@@ -246,11 +237,7 @@ async def seal(
 ) -> tuple[str, list[int], list[int]]:
     """Move ``receiving`` to ``ready``; any later state answers as it is."""
 
-    row = await session.scalar(
-        select(PublicationUiEvidence)
-        .where(PublicationUiEvidence.publication_id == publication_id)
-        .with_for_update()
-    )
+    row = await _locked_row(session, publication_id)
     if row is None:
         raise EvidenceRefused(404, "evidence_not_found", "no evidence index for the publication")
     if row.status == "receiving":
@@ -258,17 +245,7 @@ async def seal(
         row.version = PublicationUiEvidence.version + 1
         row.updated_at = func.now()
     status = row.status
-    images = list(
-        await session.execute(
-            select(PublicationUiEvidenceImage.ordinal, PublicationUiEvidenceImage.stored_at)
-            .where(
-                PublicationUiEvidenceImage.publication_id == publication_id,
-                PublicationUiEvidenceImage.refusal.is_(None),
-                PublicationUiEvidenceImage.bound.is_(True),
-            )
-            .order_by(PublicationUiEvidenceImage.ordinal)
-        )
-    )
+    images = await _expected_images(session, publication_id)
     await session.commit()
     stored = [ordinal for ordinal, at in images if at is not None]
     missing = [ordinal for ordinal, at in images if at is None]
@@ -293,43 +270,37 @@ def _terminal_values(status: str, **values: object) -> dict[str, object]:
 async def sweep(session: AsyncSession) -> None:
     """Close rows that can no longer publish and clear every terminal row's bytes.
 
-    Each step is one statement. A row whose publication was refused, or whose
-    lineage ended, is abandoned; a row whose publication is no longer the
-    lineage's latest revision is superseded.
+    A row whose publication was refused, or whose lineage ended, is abandoned;
+    a row whose publication is no longer the lineage's latest revision is
+    superseded.
     """
 
-    open_rows = PublicationUiEvidence.status.in_(_NON_TERMINAL)
-    await session.execute(
-        update(PublicationUiEvidence)
-        .where(
-            open_rows,
-            PublicationUiEvidence.publication_id == Publication.id,
-            Publication.status.in_(_REFUSED_PUBLICATION),
+    async def close(status: str, *where: ColumnElement[bool], **values: object) -> None:
+        await session.execute(
+            update(PublicationUiEvidence)
+            .where(PublicationUiEvidence.status.in_(_NON_TERMINAL), *where)
+            .values(**_terminal_values(status, **values))
+            .execution_options(synchronize_session=False)
         )
-        .values(**_terminal_values("abandoned", error="publication_not_published"))
-        .execution_options(synchronize_session=False)
+
+    await close(
+        "abandoned",
+        PublicationUiEvidence.publication_id == Publication.id,
+        Publication.status.in_(_REFUSED_PUBLICATION),
+        error="publication_not_published",
     )
-    await session.execute(
-        update(PublicationUiEvidence)
-        .where(
-            open_rows,
-            PublicationUiEvidence.lineage_id == ThreadPublicationLineage.id,
-            ThreadPublicationLineage.status != "open",
-        )
-        .values(**_terminal_values("abandoned", error="lineage_ended"))
-        .execution_options(synchronize_session=False)
+    await close(
+        "abandoned",
+        PublicationUiEvidence.lineage_id == ThreadPublicationLineage.id,
+        ThreadPublicationLineage.status != "open",
+        error="lineage_ended",
     )
-    await session.execute(
-        update(PublicationUiEvidence)
-        .where(
-            open_rows,
-            PublicationUiEvidence.publication_id == Publication.id,
-            Publication.lineage_id == ThreadPublicationLineage.id,
-            Publication.status == "succeeded",
-            ThreadPublicationLineage.latest_revision != Publication.revision_number,
-        )
-        .values(**_terminal_values("superseded"))
-        .execution_options(synchronize_session=False)
+    await close(
+        "superseded",
+        PublicationUiEvidence.publication_id == Publication.id,
+        Publication.lineage_id == ThreadPublicationLineage.id,
+        Publication.status == "succeeded",
+        ThreadPublicationLineage.latest_revision != Publication.revision_number,
     )
     await session.execute(
         update(PublicationUiEvidenceImage)
@@ -441,21 +412,21 @@ async def update_lineage(
     return changed
 
 
+def _row_cas(publication_id: uuid.UUID, version: int) -> Update:
+    return update(PublicationUiEvidence).where(
+        PublicationUiEvidence.publication_id == publication_id,
+        PublicationUiEvidence.version == version,
+        PublicationUiEvidence.status.not_in(UI_EVIDENCE_TERMINAL),
+    )
+
+
 async def update_row(
-    session: AsyncSession,
-    publication_id: uuid.UUID,
-    version: int,
-    **values: object,
+    session: AsyncSession, publication_id: uuid.UUID, version: int, **values: object
 ) -> int | None:
     """One CAS write to an evidence row; the new version, or None when it moved."""
 
     changed = await session.scalar(
-        update(PublicationUiEvidence)
-        .where(
-            PublicationUiEvidence.publication_id == publication_id,
-            PublicationUiEvidence.version == version,
-            PublicationUiEvidence.status.not_in(UI_EVIDENCE_TERMINAL),
-        )
+        _row_cas(publication_id, version)
         .values(version=PublicationUiEvidence.version + 1, updated_at=func.now(), **values)
         .returning(PublicationUiEvidence.version)
     )
@@ -469,12 +440,7 @@ async def finish_row(
     """Settle a row terminal by CAS and clear its image bytes in the same commit."""
 
     changed = await session.scalar(
-        update(PublicationUiEvidence)
-        .where(
-            PublicationUiEvidence.publication_id == publication_id,
-            PublicationUiEvidence.version == version,
-            PublicationUiEvidence.status.not_in(UI_EVIDENCE_TERMINAL),
-        )
+        _row_cas(publication_id, version)
         .values(**_terminal_values(status, **values))
         .returning(PublicationUiEvidence.version)
     )
@@ -488,3 +454,33 @@ async def finish_row(
     )
     await session.commit()
     return True
+
+
+async def claim_row(
+    session: AsyncSession, publication_id: uuid.UUID, version: int, owner: str
+) -> tuple[int, float] | None:
+    """Move the row to ``publishing`` under ``owner``: its new version and the
+    seconds left in its publish window, which starts at the first claim."""
+
+    claimed = (
+        await session.execute(
+            _row_cas(publication_id, version)
+            .values(
+                status="publishing",
+                attempts=PublicationUiEvidence.attempts + 1,
+                publish_deadline_at=func.coalesce(
+                    PublicationUiEvidence.publish_deadline_at, func.now() + PUBLISH_WINDOW
+                ),
+                lease_owner=owner,
+                lease_expires_at=func.now() + LEASE,
+                version=PublicationUiEvidence.version + 1,
+                updated_at=func.now(),
+            )
+            .returning(
+                PublicationUiEvidence.version,
+                func.extract("epoch", PublicationUiEvidence.publish_deadline_at - func.now()),
+            )
+        )
+    ).first()
+    await session.commit()
+    return None if claimed is None else (int(claimed[0]), float(claimed[1]))

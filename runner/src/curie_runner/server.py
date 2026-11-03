@@ -202,8 +202,8 @@ def create_app(
     boot tokenless otherwise (``curie_runner.config.require_serving_token``,
     #3821).
 
-    ``ui_evidence_workspace`` is the managed checkout the UI evidence routes
-    read; ``None`` makes both answer 409 ``no_managed_workspace``.
+    ``ui_evidence_workspace`` is the checkout the UI evidence routes read;
+    ``None`` makes both answer 409 ``no_managed_workspace``.
     """
 
     # A falsy token (None or empty string) means no enforcement, which
@@ -400,49 +400,40 @@ async def _snapshot(request: web.Request) -> web.Response:
     return web.json_response(captured.to_json())
 
 
-def _ui_evidence_workspace(request: web.Request) -> Path | None:
-    return cast("Path | None", request.app[UI_EVIDENCE_WORKSPACE])
-
-
-def _no_evidence_workspace() -> web.Response:
-    return web.json_response(
-        {"error": "this session has no managed workspace", "code": "no_managed_workspace"},
-        status=409,
-    )
+async def _serve_ui_evidence(
+    request: web.Request, serve: Callable[[Path, bytes], Awaitable[web.Response]]
+) -> web.Response:
+    workspace = cast("Path | None", request.app[UI_EVIDENCE_WORKSPACE])
+    if workspace is None:
+        return web.json_response(
+            {"error": "this session has no managed workspace", "code": "no_managed_workspace"},
+            status=409,
+        )
+    try:
+        return await serve(workspace, await request.read())
+    except ui_evidence.EvidenceRefusal as refusal:
+        return web.json_response(refusal.body(), status=refusal.status)
 
 
 async def _ui_evidence_index(request: web.Request) -> web.Response:
-    """The validated UI evidence index against the worker-named prepared base."""
+    async def serve(workspace: Path, raw: bytes) -> web.Response:
+        base_sha, budget_seconds = ui_evidence.parse_index_request(raw)
+        end = time.monotonic() + budget_seconds
+        # Git and the bounded file reads stay off the event loop.
+        index = await asyncio.to_thread(ui_evidence.build_index, workspace, base_sha, deadline=end)
+        return web.json_response(index)
 
-    workspace = _ui_evidence_workspace(request)
-    if workspace is None:
-        return _no_evidence_workspace()
-    try:
-        base_sha, budget_seconds = ui_evidence.parse_index_request(await request.read())
-    except ui_evidence.EvidenceRefusal as refusal:
-        return web.json_response(refusal.body(), status=refusal.status)
-    deadline = time.monotonic() + budget_seconds
-    # Git and the bounded file reads stay off the event loop.
-    index = await asyncio.to_thread(ui_evidence.build_index, workspace, base_sha, deadline=deadline)
-    return web.json_response(index)
+    return await _serve_ui_evidence(request, serve)
 
 
 async def _ui_evidence_image(request: web.Request) -> web.Response:
-    """The raw bytes of one indexed UI evidence image, revalidated and unchanged."""
-
-    workspace = _ui_evidence_workspace(request)
-    if workspace is None:
-        return _no_evidence_workspace()
-    try:
-        index, sha256 = ui_evidence.parse_image_request(await request.read())
+    async def serve(workspace: Path, raw: bytes) -> web.Response:
+        index, sha256 = ui_evidence.parse_image_request(raw)
         data = await asyncio.to_thread(ui_evidence.read_image, workspace, index, sha256)
-    except ui_evidence.EvidenceRefusal as refusal:
-        return web.json_response(refusal.body(), status=refusal.status)
-    return web.Response(
-        body=data,
-        content_type="image/png",
-        headers={"X-Curie-Evidence-Sha256": sha256},
-    )
+        headers = {"X-Curie-Evidence-Sha256": sha256}
+        return web.Response(body=data, content_type="image/png", headers=headers)
+
+    return await _serve_ui_evidence(request, serve)
 
 
 def _checkpoint_workspace(attestation: Mapping[str, object] | None) -> Path | None:
