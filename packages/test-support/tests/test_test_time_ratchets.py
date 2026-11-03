@@ -411,7 +411,11 @@ def test_train_promotion_accepts_existing_debt_and_refuses_new_growth(
     git(tmp_path, "update-ref", "refs/remotes/origin/main", "HEAD")
     git(tmp_path, "checkout", "-qb", "next")
     source(tmp_path, "tests/test_next.py", "import time\ntime.sleep(1)\n")
-    next_baseline = {**main_baseline, "sleeps": {**main_baseline["sleeps"], "tests/test_next.py": 1}}
+    source(tmp_path, "tests/test_main.py", "import time\ntime.sleep(1)\ntime.sleep(2)\n")
+    next_baseline = {
+        **main_baseline,
+        "sleeps": {"tests/test_main.py": 2, "tests/test_next.py": 1},
+    }
     if bootstrap:
         (tmp_path / BASELINE).unlink()
     else:
