@@ -178,7 +178,8 @@ It is an answer only when all of these hold:
 
 The adapter then calls `POST /approvals/{id}/resolve` with its credential and
 the sender's bare address (lowercased, never the display name) as
-`X-Curie-Approval-Actor`, and the platform decides: the binding's
+`X-Curie-Approval-Actor`, plus the signed answer proof when its email
+receiver is configured (see "Signed email senders"), and the platform decides: the binding's
 `allowed_callers` must admit the sender, and the address must be on the route's
 approver `emails` (ADR-0177 amendment). The person who asked is not admitted by default. A
 reply that is not an answer gets the instructions back; a sender the platform
@@ -261,6 +262,25 @@ startup with a fixed message that never echoes the key. Several mailboxes may
 trust the same sender domains under the same namespace ids (ADR 0266); each
 still has its own receiver id, key and bindings, so one mailbox's key never
 admits a turn on another's binding.
+
+An email approval answer is signed the same way (ADR 0267). With the receiver
+configured, the adapter serializes the resolve body (the decision and any note)
+once as compact JSON with sorted keys and signs an `EmailApprovalAnswerProofV1`
+with the same receiver key and the platform's shared signer: purpose
+`approval_answer`, operation `resolve`, its receiver, the binding named by its
+channel token, the approval id, the lowercased sender it also sends as
+`X-Curie-Approval-Actor`, and the SHA-256 of those exact bytes. It posts those
+bytes to `POST /approvals/{id}/resolve` with its adapter credential and the
+proof in `X-Curie-Approval-Receiver-Proof`. The answer proof has a signed
+prefix of its own, so it never verifies as a turn's proof, and a turn's proof
+never verifies as an answer. An answer that cannot be signed, for example
+because the channel token names no binding or the approval id is not the
+platform's UUID, is never posted unsigned: no approval is resolved, the
+sender is told the answer could not be accepted, and the log names the cause.
+With no receiver configured, an answer is posted without a proof, exactly as
+before, which the legacy approval path accepts and an approval under HTTP
+identity refuses; each such answer is logged as carried without an answer
+proof.
 
 ### Egress pinning and discovery readiness
 
