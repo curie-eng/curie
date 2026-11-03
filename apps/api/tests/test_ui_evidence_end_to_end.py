@@ -56,7 +56,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from forge_fakes.github import REPO, GitHubRepositoryFake
+from forge_fakes.github import (
+    APP_ID,
+    PRIVATE_KEY,
+    REPO,
+    GitHubRepositoryFake,
+    fake_installation_tokens,
+)
 from test_publications import (  # noqa: F401 - publication_stack is a fixture
     WORKER_HEADERS,
     WORKER_TOKEN,
@@ -119,16 +125,37 @@ class Checkout:
     """A real agent checkout: base P, an uncommitted change, two screenshots in
     the gitignored evidence directory and the manifest naming them."""
 
-    def __init__(self, root: Path, repo_path: str) -> None:
+    def __init__(self, root: Path, repo_path: str, *, clone_header: str | None = None) -> None:
+        """A fresh repository whose P commits ``_BASE_FILES``; with
+        ``clone_header`` (an ``Authorization`` value), a shallow clone of the
+        repository's default branch instead, so P is its current tip and the
+        evidence directory is ignored through ``.git/info/exclude``."""
+
         self.root = root / "workspace"
-        self.root.mkdir(parents=True)
         self.repo_path = repo_path
-        _git(self.root, "init", "--quiet")
-        _git(self.root, "remote", "add", "origin", f"{GITHUB}/{repo_path}.git")
-        for path, data in _BASE_FILES.items():
-            _write(self.root, path, data)
-        _git(self.root, "add", "-A")
-        _git(self.root, "commit", "--quiet", "-m", "Prepared base")
+        origin = f"{GITHUB}/{repo_path}.git"
+        if clone_header is None:
+            self.root.mkdir(parents=True)
+            _git(self.root, "init", "--quiet")
+            _git(self.root, "remote", "add", "origin", origin)
+            for path, data in _BASE_FILES.items():
+                _write(self.root, path, data)
+            _git(self.root, "add", "-A")
+            _git(self.root, "commit", "--quiet", "-m", "Prepared base")
+        else:
+            # The header is passed per command, so no credential is stored.
+            _git(
+                root,
+                "-c",
+                f"http.extraHeader=Authorization: {clone_header}",
+                "clone",
+                "--quiet",
+                "--depth",
+                "1",
+                origin,
+                str(self.root),
+            )
+            _write(self.root, ".git/info/exclude", b".curie/ui-evidence/\n")
         self.base_sha = _git(self.root, "rev-parse", "HEAD")
         self.base_tree = _git(self.root, "rev-parse", "HEAD^{tree}")
         # The agent's change, left uncommitted as a turn leaves it.
@@ -154,9 +181,7 @@ class Checkout:
                 {"path": "after/home.png", "label": "Home page", "state": "after"},
             ],
         }
-        _write(
-            self.root, ".curie/ui-evidence/manifest.json", json.dumps(manifest).encode()
-        )
+        _write(self.root, ".curie/ui-evidence/manifest.json", json.dumps(manifest).encode())
 
     def _candidate_tree(self, root: Path) -> str:
         """C, computed independently of runner code: P's index plus every
@@ -176,18 +201,6 @@ class Checkout:
             self.root, "commit-tree", self.candidate_tree, "-p", self.base_sha, "-m", message
         )
         return sha, message
-
-    def files_of(self, tree: str) -> dict[str, bytes]:
-        listed = _git(self.root, "ls-tree", "-r", "--name-only", tree).splitlines()
-        return {
-            path: subprocess.run(
-                ["git", "cat-file", "blob", f"{tree}:{path}"],
-                cwd=self.root,
-                check=True,
-                capture_output=True,
-            ).stdout
-            for path in listed
-        }
 
 
 # --- the runner, worker and API -------------------------------------------------------
@@ -426,6 +439,10 @@ def evidence_api(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("UI_EVIDENCE_RECONCILE_INTERVAL_S", "0")
+    # The App the fake authors comments as, so comment ownership holds.
+    monkeypatch.setenv("GITHUB_APP_ID", APP_ID)
+    monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", PRIVATE_KEY)
+    fake_installation_tokens(monkeypatch)
 
 
 def test_png_fixtures_reach_one_bound_comment_on_the_published_pull_request(
@@ -437,7 +454,29 @@ def test_png_fixtures_reach_one_bound_comment_on_the_published_pull_request(
 ) -> None:
     client, _ = publication_stack
     checkout = Checkout(tmp_path, REPO)
+    fake = GitHubRepositoryFake()
+    fake.seed_commit(
+        checkout.base_sha, parents=[], message="Prepared base", tree=checkout.base_tree
+    )
+    fake.branches[fake.default_branch] = checkout.base_sha
+    # Every GitHub call the API makes goes to the fake, never the network.
+    http = httpx.AsyncClient(transport=httpx.MockTransport(fake.handle))
+    original = client.app.state.http_client
+    client.app.state.http_client = http
+    try:
+        _drive_hermetic(client, auth_headers, checkout, fake, http)
+    finally:
+        client.app.state.http_client = original
+        client.portal.call(http.aclose)
 
+
+def _drive_hermetic(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    checkout: Checkout,
+    fake: GitHubRepositoryFake,
+    http: httpx.AsyncClient,
+) -> None:
     snapshot, capture = client.portal.call(_capture, checkout)
     _assert_no_evidence_in_the_code_change(snapshot)
     assert capture is not None
@@ -451,11 +490,6 @@ def test_png_fixtures_reach_one_bound_comment_on_the_published_pull_request(
 
     # The unchanged push Job's half: H (tree C on P) lands, with its branch and
     # pull request, and its result is recorded through the real route.
-    fake = GitHubRepositoryFake()
-    fake.seed_commit(
-        checkout.base_sha, parents=[], message="Prepared base", tree=checkout.base_tree
-    )
-    fake.branches[fake.default_branch] = checkout.base_sha
     head_sha, message = checkout.head_commit(publication_id)
     fake.seed_commit(
         head_sha, parents=[checkout.base_sha], message=message, tree=checkout.candidate_tree
@@ -466,19 +500,12 @@ def test_png_fixtures_reach_one_bound_comment_on_the_published_pull_request(
     number = fake.seed_pull(facts["branch"], fake.default_branch, title=TITLE, body=BODY)
     pr_url = f"{GITHUB}/{REPO}/pull/{number}"
     pull = json.loads(json.dumps(fake.pulls[number]))
-    http = httpx.AsyncClient(transport=httpx.MockTransport(fake.handle))
-    original = client.app.state.http_client
-    client.app.state.http_client = http
-    try:
-        _record_lineage(client, publication_id, head_sha=head_sha, pr_number=number, pr_url=pr_url)
-        _mark_outcome_history_ready(publication_id)
-        code_pr = _code_pr(publication_id)
-        assert code_pr["status"] == "succeeded" and code_pr["result_url"] == pr_url
+    _record_lineage(client, publication_id, head_sha=head_sha, pr_number=number, pr_url=pr_url)
+    _mark_outcome_history_ready(publication_id)
+    code_pr = _code_pr(publication_id)
+    assert code_pr["status"] == "succeeded" and code_pr["result_url"] == pr_url
 
-        client.portal.call(_reconcile, http)
-    finally:
-        client.app.state.http_client = original
-        client.portal.call(http.aclose)
+    client.portal.call(_reconcile, http)
 
     marker = f"<!-- {ui_evidence_marker(lineage_id)} -->"
     assert marker == f"<!-- curie-ui-evidence:{lineage_id} -->"
@@ -546,34 +573,36 @@ def live_stack(
 
 class _LiveGitHub:
     """The push Job's half and the observations, through GitHub's REST API with
-    the test App's installation token."""
+    the test App's installation token. Every ref and pull request it creates is
+    recorded at once, so cleanup finds it whatever fails afterwards."""
 
     def __init__(self, http: httpx.AsyncClient, repo: str, token: str) -> None:
         self._http = http
         self.repo = repo
-        self._headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
         self.token = token
+        self.refs: list[str] = []
+        self.pulls: list[int] = []
 
     async def call(
         self, method: str, path: str, *, body: Any = None, accept: str | None = None
     ) -> httpx.Response:
-        headers = dict(self._headers)
-        if accept:
-            headers["Accept"] = accept
         return await self._http.request(
             method,
             f"https://api.github.com/repos/{self.repo}{path}",
             json=body,
-            headers=headers,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Accept": accept or "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
             timeout=30.0,
         )
 
-    async def commit(self, files: dict[str, bytes], *, parents: list[str], message: str) -> str:
-        """Blobs, one tree and one commit with these files; returns the commit."""
+    async def commit_over(
+        self, base_tree: str, files: dict[str, bytes], *, parent: str, message: str
+    ) -> str:
+        """``files`` laid over ``base_tree`` as one commit on ``parent``, the way
+        the push Job's commit lands; returns the commit."""
 
         entries = []
         for path, content in sorted(files.items()):
@@ -586,7 +615,7 @@ class _LiveGitHub:
             entries.append(
                 {"path": path, "mode": "100644", "type": "blob", "sha": blob.json()["sha"]}
             )
-        tree = await self.call("POST", "/git/trees", body={"tree": entries})
+        tree = await self.call("POST", "/git/trees", body={"base_tree": base_tree, "tree": entries})
         assert tree.status_code == 201, tree.text
         stamp = {
             "name": IDENTITY["GIT_AUTHOR_NAME"],
@@ -599,7 +628,7 @@ class _LiveGitHub:
             body={
                 "message": message,
                 "tree": tree.json()["sha"],
-                "parents": parents,
+                "parents": [parent],
                 "author": stamp,
                 "committer": stamp,
             },
@@ -611,43 +640,56 @@ class _LiveGitHub:
         ref = {"ref": f"refs/heads/{name}", "sha": sha}
         created = await self.call("POST", "/git/refs", body=ref)
         assert created.status_code == 201, created.text
+        self.refs.append(f"heads/{name}")
 
-    async def delete_ref(self, ref: str) -> None:
-        await self.call("DELETE", f"/git/refs/{ref}")
+    async def cleanup(self, extra_refs: list[str]) -> list[str]:
+        """Close every pull request and delete every ref; returns what failed."""
+
+        failures: list[str] = []
+        for number in self.pulls:
+            closed = await self.call("PATCH", f"/pulls/{number}", body={"state": "closed"})
+            if closed.status_code != 200:
+                failures.append(f"close pull {number}: {closed.status_code}")
+        for ref in [*extra_refs, *self.refs]:
+            deleted = await self.call("DELETE", f"/git/refs/{ref}")
+            if deleted.status_code not in {204, 404, 422}:
+                failures.append(f"delete {ref}: {deleted.status_code}")
+        return failures
 
 
 def test_live_github_round_trip(
     live_stack: tuple[TestClient, str], auth_headers: dict[str, str], tmp_path: Path
 ) -> None:
+    """The hermetic path against a real throwaway repository and test App.
+
+    P is the default branch's current tip (a shallow clone). The pull request
+    targets the default branch, the base the commit proof records, as
+    production does; that branch is only read and named as a base, never
+    pushed to or changed. H lands on its own publication branch through the
+    Git Data API, and the result is recorded through the same lineage PATCH
+    route the hermetic test uses.
+    """
+
     client, repo = live_stack
     settings = get_settings()
     http: httpx.AsyncClient = client.app.state.http_client
-    checkout = Checkout(tmp_path, repo)
     host = code_host_for(settings, http)
-    repository = client.portal.call(host.resolve_repository, f"{PATH_ID_PREFIX}{repo}")
-    suffix = uuid.uuid4().hex[:10]
-    base_branch = f"curie-evidence-base-{suffix}"
-    created_refs: list[str] = []
-    pr_number: int | None = None
+    live: _LiveGitHub | None = None
     lineage_id: uuid.UUID | None = None
+    reconciled_closed = False
     gone: httpx.Response | None = None
-
-    async def token() -> str:
-        header = await host._token(repo)  # noqa: SLF001 - the adapter's own credential
-        _, _, encoded = header.partition(" ")
-        return base64.b64decode(encoded).decode().split(":", 1)[1]
-
-    live = _LiveGitHub(http, repo, client.portal.call(token))
+    failures: list[str] = []
     try:
-        # P lands on a throwaway base branch: the same files, so the same tree.
-        base_sha = client.portal.call(
-            lambda: live.commit(
-                checkout.files_of(checkout.base_tree), parents=[], message="Prepared base\n"
-            )
+        header = client.portal.call(host._token, repo)  # noqa: SLF001 - its own credential
+        _, _, encoded = header.partition(" ")
+        live = _LiveGitHub(http, repo, base64.b64decode(encoded).decode().split(":", 1)[1])
+        repository = client.portal.call(host.resolve_repository, f"{PATH_ID_PREFIX}{repo}")
+        checkout = Checkout(tmp_path, repo, clone_header=header)
+        base_sha = checkout.base_sha
+        tip = client.portal.call(
+            live.call, "GET", f"/git/ref/heads/{repository.default_branch}"
         )
-        assert base_sha == checkout.base_sha
-        client.portal.call(live.branch, base_branch, base_sha)
-        created_refs.append(f"heads/{base_branch}")
+        assert tip.json()["object"]["sha"] == base_sha
 
         snapshot, capture = client.portal.call(_capture, checkout)
         _assert_no_evidence_in_the_code_change(snapshot)
@@ -658,31 +700,33 @@ def test_live_github_round_trip(
         )
         facts = _publication_facts(publication_id)
         lineage_id = uuid.UUID(str(facts["lineage_id"]))
-        # The publication's base is the throwaway branch, not the default one.
-        _execute(
-            "UPDATE curie.thread_publication_lineages SET base_ref = :ref WHERE id = :id",
-            {"ref": base_branch, "id": lineage_id},
-        )
         assert _resolve(client, auth_headers, approval_id).status_code == 200
 
         _, message = checkout.head_commit(publication_id)
         head_sha = client.portal.call(
-            lambda: live.commit(
-                checkout.files_of(checkout.candidate_tree), parents=[base_sha], message=message
+            lambda: live.commit_over(
+                checkout.base_tree, checkout.changed, parent=base_sha, message=message
             )
         )
-        tree = client.portal.call(live.call, "GET", f"/git/commits/{head_sha}")
-        assert tree.json()["tree"]["sha"] == checkout.candidate_tree
+        pushed = client.portal.call(live.call, "GET", f"/git/commits/{head_sha}")
+        assert pushed.json()["tree"]["sha"] == checkout.candidate_tree
         client.portal.call(live.branch, facts["branch"], head_sha)
-        created_refs.append(f"heads/{facts['branch']}")
         pull = client.portal.call(
             lambda: host.open_pull_request(
-                repository, head_ref=facts["branch"], base_ref=base_branch, title=TITLE, body=BODY
+                repository,
+                head_ref=facts["branch"],
+                base_ref=repository.default_branch,
+                title=TITLE,
+                body=BODY,
             )
         )
-        pr_number = int(pull.ref.number)
+        live.pulls.append(int(pull.ref.number))
         _record_lineage(
-            client, publication_id, head_sha=head_sha, pr_number=pr_number, pr_url=pull.url
+            client,
+            publication_id,
+            head_sha=head_sha,
+            pr_number=int(pull.ref.number),
+            pr_url=pull.url,
         )
         _mark_outcome_history_ready(publication_id)
         code_pr = _code_pr(publication_id)
@@ -699,7 +743,7 @@ def test_live_github_round_trip(
             app_id=settings.github_app_id,
         )
         target = ReplyTarget(
-            "pull_request", pull_request=PullRequestRef(repository, str(pr_number))
+            "pull_request", pull_request=PullRequestRef(repository, pull.ref.number)
         )
         found = client.portal.call(comments.find_marked, target, ui_evidence_marker(lineage_id))
         assert found is not None
@@ -720,25 +764,24 @@ def test_live_github_round_trip(
             )
             assert served.status_code == 200 and served.content == expected
         assert _code_pr(publication_id) == code_pr
-    finally:
-        if pr_number is not None:
-            client.portal.call(
-                live.call, "PATCH", f"/pulls/{pr_number}", body={"state": "closed"}
-            )
-        if lineage_id is not None:
-            # The lineage reconciler's record of the closed pull request; the
-            # evidence reconciler then deletes the ref on its own.
-            _execute(
-                "UPDATE curie.thread_publication_lineages SET status = 'closed' WHERE id = :id",
-                {"id": lineage_id},
-            )
-            client.portal.call(_reconcile, http)
-            gone = client.portal.call(
-                live.call, "GET", f"/git/ref/curie/ui-evidence/{lineage_id}"
-            )
-            # Never leave the throwaway repository holding a ref, whatever the run did.
-            client.portal.call(live.delete_ref, f"curie/ui-evidence/{lineage_id}")
-        for ref in created_refs:
-            client.portal.call(live.delete_ref, ref)
-    assert gone is not None and gone.status_code == 404
 
+        # The pull request ends; the lineage reconciler's record of it lets the
+        # evidence reconciler delete its ref on its own.
+        closed = client.portal.call(
+            lambda: live.call("PATCH", f"/pulls/{pull.ref.number}", body={"state": "closed"})
+        )
+        assert closed.status_code == 200, closed.text
+        _execute(
+            "UPDATE curie.thread_publication_lineages SET status = 'closed' WHERE id = :id",
+            {"id": lineage_id},
+        )
+        client.portal.call(_reconcile, http)
+        reconciled_closed = True
+        gone = client.portal.call(live.call, "GET", f"/git/ref/curie/ui-evidence/{lineage_id}")
+    finally:
+        if live is not None:
+            evidence_refs = [f"curie/ui-evidence/{lineage_id}"] if lineage_id else []
+            failures = client.portal.call(live.cleanup, evidence_refs)
+    assert not failures, failures
+    if reconciled_closed:
+        assert gone is not None and gone.status_code == 404
