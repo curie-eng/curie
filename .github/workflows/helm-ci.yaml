@@ -190,6 +190,11 @@ jobs:
       - name: Reject chart-owned extraEnv duplicates
         run: bash charts/curie/ci/reserved-env-assertions.sh
 
+      # A Service named <release>-<x> injects CURIE_<X>_PORT as a URL into any
+      # pod with service links on, which broke the drain hook (#5350).
+      - name: helm render assertions (service links off)
+        run: bash charts/curie/ci/service-links-assertions.sh
+
       # Prove the HTTP identity operator files are off by default and, when
       # selected, mount read-only into the API or dispatcher container alone.
       - name: helm render assertions (HTTP identity operator files)
