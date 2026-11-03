@@ -14972,6 +14972,74 @@
         "title": "TurnSource",
         "type": "string"
       },
+      "UiEvidenceImageOut": {
+        "properties": {
+          "ordinal": {
+            "title": "Ordinal",
+            "type": "integer"
+          },
+          "stored": {
+            "title": "Stored",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ordinal",
+          "stored"
+        ],
+        "title": "UiEvidenceImageOut",
+        "type": "object"
+      },
+      "UiEvidenceIndexOut": {
+        "properties": {
+          "expected": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Expected",
+            "type": "array"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "expected"
+        ],
+        "title": "UiEvidenceIndexOut",
+        "type": "object"
+      },
+      "UiEvidenceSealOut": {
+        "properties": {
+          "missing": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Missing",
+            "type": "array"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "stored": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Stored",
+            "type": "array"
+          }
+        },
+        "required": [
+          "status",
+          "stored",
+          "missing"
+        ],
+        "title": "UiEvidenceSealOut",
+        "type": "object"
+      },
       "UsageReport": {
         "additionalProperties": false,
         "properties": {
@@ -30542,6 +30610,206 @@
           }
         },
         "summary": "Verify Publication Revision",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/publications/{publication_id}/ui-evidence": {
+      "put": {
+        "description": "Store the evidence index once; an identical replay answers 200.",
+        "operationId": "put_publication_ui_evidence_v1_internal_publications__publication_id__ui_evidence_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UiEvidenceIndexOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Publication Ui Evidence",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/publications/{publication_id}/ui-evidence/images/{ordinal}": {
+      "put": {
+        "description": "Store one expected image whose bytes match its entry exactly.",
+        "operationId": "put_publication_ui_evidence_image_v1_internal_publications__publication_id__ui_evidence_images__ordinal__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ordinal",
+            "required": true,
+            "schema": {
+              "title": "Ordinal",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Evidence-Sha256",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 64,
+              "title": "X-Curie-Evidence-Sha256",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UiEvidenceImageOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Publication Ui Evidence Image",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/publications/{publication_id}/ui-evidence/seal": {
+      "post": {
+        "description": "Close the upload; the reconciler may publish it from now on.",
+        "operationId": "seal_publication_ui_evidence_v1_internal_publications__publication_id__ui_evidence_seal_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UiEvidenceSealOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Seal Publication Ui Evidence",
         "tags": [
           "internal-publications"
         ]

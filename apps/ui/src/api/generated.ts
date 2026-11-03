@@ -3482,6 +3482,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/publications/{publication_id}/ui-evidence": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Put Publication Ui Evidence
+         * @description Store the evidence index once; an identical replay answers 200.
+         */
+        put: operations["put_publication_ui_evidence_v1_internal_publications__publication_id__ui_evidence_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publications/{publication_id}/ui-evidence/images/{ordinal}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Put Publication Ui Evidence Image
+         * @description Store one expected image whose bytes match its entry exactly.
+         */
+        put: operations["put_publication_ui_evidence_image_v1_internal_publications__publication_id__ui_evidence_images__ordinal__put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publications/{publication_id}/ui-evidence/seal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Seal Publication Ui Evidence
+         * @description Close the upload; the reconciler may publish it from now on.
+         */
+        post: operations["seal_publication_ui_evidence_v1_internal_publications__publication_id__ui_evidence_seal_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/remediation/nominations": {
         parameters: {
             query?: never;
@@ -10580,6 +10640,29 @@ export interface components {
          * @enum {string}
          */
         TurnSource: "slack" | "webhook" | "cron";
+        /** UiEvidenceImageOut */
+        UiEvidenceImageOut: {
+            /** Ordinal */
+            ordinal: number;
+            /** Stored */
+            stored: boolean;
+        };
+        /** UiEvidenceIndexOut */
+        UiEvidenceIndexOut: {
+            /** Expected */
+            expected: number[];
+            /** Status */
+            status: string;
+        };
+        /** UiEvidenceSealOut */
+        UiEvidenceSealOut: {
+            /** Missing */
+            missing: number[];
+            /** Status */
+            status: string;
+            /** Stored */
+            stored: number[];
+        };
         /** UsageReport */
         UsageReport: {
             /** Models */
@@ -18360,6 +18443,107 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PublicationRevisionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_publication_ui_evidence_v1_internal_publications__publication_id__ui_evidence_put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                publication_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UiEvidenceIndexOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_publication_ui_evidence_image_v1_internal_publications__publication_id__ui_evidence_images__ordinal__put: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Curie-Evidence-Sha256": string;
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                publication_id: string;
+                ordinal: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UiEvidenceImageOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    seal_publication_ui_evidence_v1_internal_publications__publication_id__ui_evidence_seal_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                publication_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UiEvidenceSealOut"];
                 };
             };
             /** @description Validation Error */

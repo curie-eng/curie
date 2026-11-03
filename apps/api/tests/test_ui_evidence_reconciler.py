@@ -37,7 +37,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from forge_fakes.github import REPO, GitHubRepositoryFake
+from forge_fakes.github import (
+    APP_ID,
+    PRIVATE_KEY,
+    REPO,
+    GitHubRepositoryFake,
+    fake_installation_tokens,
+)
 from test_publications import (  # noqa: F401 - publication_stack is a fixture
     BASE_SHA,
     WORKER_HEADERS,
@@ -52,14 +58,13 @@ from test_publications import (  # noqa: F401 - publication_stack is a fixture
     _rows,
     publication_stack,
 )
-from test_ui_evidence_corpus import corpus_cases, load_corpus, resolve_index
+from test_ui_evidence_corpus import corpus_cases, load_corpus, resolve_index, stand_in_checkout
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # The candidate tree C every pushed head carries unless a case says otherwise,
 # and two other object ids that are neither P nor C.
 CANDIDATE_TREE = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00"
 OTHER_OID = "0be70be70be70be70be70be70be70be70be70be7"
-HEAD_OID = "4ead4ead4ead4ead4ead4ead4ead4ead4ead4ead"
 BASE_TREE = "ba5e0000ba5e0000ba5e0000ba5e0000ba5e0000"
 _IMAGE_URL = re.compile(
     r"!\[[^\]]*\]\((https://github\.com/"
@@ -99,12 +104,25 @@ class Stack:
     client: TestClient
     fake: GitHubRepositoryFake
     http: httpx.AsyncClient
+    # One deployment per test: every thread is a new conversation on it, as the
+    # publication suite does (a second agent on the same channel is refused).
+    deployment: dict[str, Any] | None = None
 
 
 @pytest.fixture
-def _evidence_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _evidence_env(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     # Zero disables the background loop, so each test drives `run_once` itself.
     monkeypatch.setenv("UI_EVIDENCE_RECONCILE_INTERVAL_S", "0")
+    # The GitHub App the fake authors every comment as (`CONTRACT_APP_ID`), so
+    # marked-comment ownership finds the evidence comment. Parametrized False,
+    # the install has no App id and only the operator token.
+    if getattr(request, "param", True):
+        monkeypatch.setenv("GITHUB_APP_ID", APP_ID)
+        monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", PRIVATE_KEY)
+        fake_installation_tokens(monkeypatch)
+    else:
+        monkeypatch.setenv("GITHUB_APP_ID", "")
+        monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", "")
 
 
 @pytest.fixture
@@ -119,9 +137,13 @@ def stack(
     fake.seed_commit(BASE_SHA, parents=[], message="Base", tree=BASE_TREE)
     fake.branches[fake.default_branch] = BASE_SHA
     http = httpx.AsyncClient(transport=httpx.MockTransport(fake.handle))
+    # Every GitHub read the API makes goes to the fake, never the network.
+    original = client.app.state.http_client
+    client.app.state.http_client = http
     try:
         yield Stack(client, fake, http)
     finally:
+        client.app.state.http_client = original
         asyncio.run(http.aclose())
 
 
@@ -194,7 +216,9 @@ def create_revision(
 ) -> Revision:
     """A pending publication: the first of a new thread, or the next on ``previous``'s."""
 
-    deployment = previous.deployment if previous else _create_deployment(stack.client, auth_headers)
+    if stack.deployment is None:
+        stack.deployment = _create_deployment(stack.client, auth_headers)
+    deployment = stack.deployment
     conversation_id = previous.conversation_id if previous else f"evidence-{uuid.uuid4().hex[:8]}"
     payload = _publication_payload(
         deployment["id"],
@@ -387,9 +411,7 @@ def published_with_evidence(
         base, {0: ("before", before), 1: ("after", after)}, candidate_tree=candidate_tree
     )
     upload(stack, revision, index, {0: before, 1: after})
-    return approve_and_push(
-        stack, auth_headers, revision, head_tree=head_tree, previous=previous
-    )
+    return approve_and_push(stack, auth_headers, revision, head_tree=head_tree, previous=previous)
 
 
 # --- observations -------------------------------------------------------------
@@ -518,58 +540,85 @@ def assert_shows(stack: Stack, revision: Revision, body: str, shown: set[int]) -
 
 # --- AC2: the shared corpus at the API boundary -------------------------------
 
-_SELECTORS = {"P": BASE_SHA, "C": CANDIDATE_TREE, "other": OTHER_OID, "HEAD": HEAD_OID}
 _GIT_DATA_WRITES = r"^(POST|PATCH) /repos/[^ ]+/git/(blobs|trees|commits|refs)"
 _COMMENT_WRITES = r"^(POST|PATCH) /repos/[^ ]+/issues/(\d+/comments|comments/\d+)$"
 
 
 def _case_upload(case: Mapping[str, Any]) -> tuple[dict[str, Any], dict[int, bytes]]:
-    """The case's normalized index with real ids, and the bytes of every image
-    the worker fetched (bound and unrefused), as valid PNGs of the fixture path."""
+    """The case's index with every placeholder resolved (P is the publication
+    base, C the candidate the pushed head carries), and the exact fixture bytes
+    of every image the worker fetched: bound and unrefused."""
 
-    index = resolve_index(case["index"], _SELECTORS)
-    images: dict[int, bytes] = {}
-    for entry in index["images"]:
-        if entry.get("refusal") is None and entry.get("bound") is True:
-            content = png_bytes(f"{case['id']} {entry['path']}")
-            entry["size"], entry["sha256"] = len(content), sha256(content)
-            images[int(entry["ordinal"])] = content
+    checkout = stand_in_checkout(case, base=BASE_SHA, candidate_tree=CANDIDATE_TREE)
+    index = resolve_index(case, checkout)
+    images = {
+        int(entry["ordinal"]): checkout.originals[entry["path"]]
+        for entry in index["images"]
+        if entry.get("refusal") is None and entry.get("bound") is True
+    }
     return index, images
+
+
+@contextmanager
+def failing_image_storage(ordinal: int) -> Iterator[None]:
+    """Postgres refuses to store image ``ordinal``'s bytes, a real storage fault
+    on the API's own write; every other row is written as usual."""
+
+    _execute(
+        "CREATE OR REPLACE FUNCTION curie.test_refuse_evidence_bytes() RETURNS trigger "
+        "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected storage fault'; END $$"
+    )
+    _execute(
+        "CREATE TRIGGER test_refuse_evidence_bytes BEFORE INSERT OR UPDATE "
+        "ON curie.publication_ui_evidence_images FOR EACH ROW "
+        f"WHEN (NEW.ordinal = {int(ordinal)} AND NEW.content IS NOT NULL) "
+        "EXECUTE FUNCTION curie.test_refuse_evidence_bytes()"
+    )
+    try:
+        yield
+    finally:
+        _execute(
+            "DROP TRIGGER IF EXISTS test_refuse_evidence_bytes "
+            "ON curie.publication_ui_evidence_images"
+        )
+        _execute("DROP FUNCTION IF EXISTS curie.test_refuse_evidence_bytes()")
 
 
 def _upload_case(
     stack: Stack, revision: Revision, case: Mapping[str, Any], kind: str | None
 ) -> None:
     index, images = _case_upload(case)
+    if kind == "upload_rejection":
+        # The API refuses the index PUT with a 4xx (here: a base that is not the
+        # publication's), and the worker sends nothing else.
+        refused = put_index(stack.client, revision.id, {**index, "base_sha": OTHER_OID})
+        assert refused.status_code == 409, refused.text
+        assert code(refused) == "ui_evidence.base_mismatch"
+        return
     created = put_index(stack.client, revision.id, index)
     assert created.status_code == 201, created.text
-    revision.images.update(images)
-    if kind == "upload_rejection" and images:
-        # The API refuses the first image (its digest header is not the entry's)
-        # and the worker stops on the 4xx: no other image and no seal follow.
-        first = min(images)
-        refused = put_image(stack.client, revision.id, first, images[first], digest="0" * 64)
-        assert refused.status_code == 409, refused.text
-        _execute(
-            "UPDATE curie.publication_ui_evidence "
-            "SET upload_deadline_at = now() - interval '1 second' WHERE publication_id = :id",
-            {"id": uuid.UUID(revision.id)},
-        )
-        return
     for ordinal in sorted(images):
+        if kind == "storage" and ordinal == 1:
+            # Ordinal 1's bytes fail to store on every attempt; ordinal 0 stores.
+            with failing_image_storage(1):
+                for _attempt in range(3):
+                    failed = put_image(stack.client, revision.id, 1, images[1])
+                    assert failed.status_code == 503, failed.text
+                    assert code(failed) == "ui_evidence.storage_unavailable"
+            continue
         stored = put_image(stack.client, revision.id, ordinal, images[ordinal])
         assert stored.status_code == 201, stored.text
+        revision.images[ordinal] = images[ordinal]
     assert seal(stack.client, revision.id).status_code == 200
 
 
 def _drive_case(stack: Stack, revision: Revision, fault: Mapping[str, Any]) -> None:
     kind = fault.get("kind") if fault.get("boundary") == "api" else None
-    if kind in {"storage", "comment", "publish_timeout"}:
-        if kind == "storage":
-            stack.fake.fail_writes(_GIT_DATA_WRITES, 500, count=10_000)
-        elif kind == "comment":
+    if kind in {"comment", "publish_timeout"}:
+        if kind == "comment":
             stack.fake.fail_writes(_COMMENT_WRITES, 500, count=10_000)
         else:
+            # Hosting the images never completes before the publish budget ends.
             stack.fake.fail_writes(_GIT_DATA_WRITES, 503, count=10_000)
         reconcile(stack.http)
         # The 120 s publish window runs out with the fault still in place.
@@ -607,7 +656,7 @@ def test_corpus_case_at_the_api(
     found = marked_comments(stack, revision)
     if expected["comment"] == "none":
         assert found == []
-        if case.get("index") is None:
+        if case.get("index") is None or kind == "upload_rejection":
             assert evidence_row(revision) is None
             assert not stack.fake.blobs
         return
@@ -741,7 +790,7 @@ def test_terminal_rows_clear_image_bytes(stack: Stack, auth_headers: dict[str, s
     content = png_bytes("denied before")
     upload(stack, denied, complete_index(BASE_SHA, {0: ("before", content)}), {0: content})
     refused = _resolve(
-        stack.client, auth_headers, denied.publication["approval_id"], decision="denied"
+        stack.client, auth_headers, denied.publication["approval_id"], decision="rejected"
     )
     assert refused.status_code == 200, refused.text
 
@@ -937,7 +986,66 @@ def test_merged_or_closed_lineage_deletes_the_evidence_ref(
     assert stack.fake.writes == writes
 
 
+def test_an_index_with_no_image_stored_by_the_deadline_gets_a_failed_outcome(
+    stack: Stack, auth_headers: dict[str, str]
+) -> None:
+    # The worker sent the index and died before any image or the seal.
+    revision = create_revision(stack, auth_headers)
+    before, after = png_bytes("never stored before"), png_bytes("never stored after")
+    index = complete_index(BASE_SHA, {0: ("before", before), 1: ("after", after)})
+    assert put_index(stack.client, revision.id, index).status_code == 201
+    approve_and_push(stack, auth_headers, revision)
+    pull_request = code_pr(stack, revision)
+
+    # Liveness: inside the upload window the missing images may still arrive.
+    reconcile(stack.http)
+    assert marked_comments(stack, revision) == []
+
+    _execute(
+        "UPDATE curie.publication_ui_evidence "
+        "SET upload_deadline_at = now() - interval '1 second' WHERE publication_id = :id",
+        {"id": uuid.UUID(revision.id)},
+    )
+    reconcile(stack.http)
+
+    body = only_comment(stack, revision)
+    assert "**Outcome:** failed" in body
+    assert body.count(load_corpus()["texts"]["not_stored"]) == 2
+    assert image_urls(body) == {}
+    assert not stack.fake.blobs
+    assert code_pr(stack, revision) == pull_request
+
+
+@pytest.mark.parametrize("_evidence_env", [True, False], ids=["app", "no-app"], indirect=True)
+def test_without_a_github_app_id_no_evidence_comment_is_written(
+    _evidence_env: None, stack: Stack, auth_headers: dict[str, str], request: pytest.FixtureRequest
+) -> None:
+    # Ownership of a marked comment is the App id that posted it; without one
+    # the reconciler cannot tell its own comment from a pasted marker, so it
+    # records the row unsupported and writes nothing. The App variant is the
+    # liveness half: the same publication gets its comment.
+    app = request.node.callspec.params["_evidence_env"]
+    revision = published_with_evidence(stack, auth_headers)
+    pull_request = code_pr(stack, revision)
+    writes = stack.fake.writes
+
+    reconcile(stack.http)
+
+    row = evidence_row(revision)
+    assert row is not None
+    if app:
+        assert_shows(stack, revision, only_comment(stack, revision), {0, 1})
+        assert row["status"] == "published"
+    else:
+        assert marked_comments(stack, revision) == []
+        assert row["status"] == "unsupported"
+        assert "comment_ownership_unavailable" in {row["outcome"], row["error"]}
+        assert stack.fake.writes == writes
+        assert not stack.fake.blobs
+        assert set(stored_contents(revision).values()) == {None}
+    assert code_pr(stack, revision) == pull_request
+
+
 def test_the_marker_is_the_lineage_marker() -> None:
     lineage_id = uuid.uuid4()
     assert ui_evidence_marker(lineage_id) == f"curie-ui-evidence:{lineage_id}"
-

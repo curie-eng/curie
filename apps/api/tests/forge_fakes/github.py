@@ -714,9 +714,7 @@ class GitHubRepositoryFake:
         self.reviews.append(review)
         return review
 
-    def push_head(
-        self, branch: str, *, tree: str | None = None, message: str | None = None
-    ) -> str:
+    def push_head(self, branch: str, *, tree: str | None = None, message: str | None = None) -> str:
         """A new commit on ``branch``; returns its sha.
 
         ``tree`` is the commit's tree id. Without it the commit payload carries
@@ -870,10 +868,12 @@ class GitHubRepositoryFake:
 
     def _pull_payload(self, number: int) -> dict[str, Any]:
         pull = self.pulls[number]
-        side = {"repo": {"full_name": REPO}}
+        side = {"repo": {"id": REPO_ID, "full_name": REPO}}
         return {
             "number": number,
+            "node_id": f"PR_fixture_{number}",
             "html_url": f"https://github.com/{REPO}/pull/{number}",
+            "merged": pull["merged_at"] is not None,
             # The App's installation token opened it.
             "user": dict(APP_BOT_USER),
             "state": pull["state"],

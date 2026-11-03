@@ -19,6 +19,7 @@ import uuid
 from typing import Any
 
 import pytest
+from curie_test_support.ui_evidence import png
 from curie_worker.runner_client import RunnerWorkspaceSnapshot
 from curie_worker.workspace import WorkspacePreparationError
 
@@ -37,7 +38,6 @@ from apps.worker.tests.kernel.test_work_item_early_stop import (
     _turn,
     _WorkItems,
 )
-from runner.tests.test_ui_evidence import png
 
 CANDIDATE_TREE = "c3" * 20
 IMAGES = {0: png("before/home.png"), 1: png("after/home.png")}
@@ -233,6 +233,25 @@ def _assert_paused(view: dict[str, Any]) -> None:
     assert ("failed", "approval_create_failed") not in view["finishes"]
 
 
+async def _baseline(
+    h: Any, items: _WorkItems, publications: _PublicationApi, routes: _EvidenceRoutes
+) -> dict[str, Any]:
+    """A no-evidence pause that compares like with like against a later turn.
+
+    The first pause in a harness claims a fresh sandbox; every later pause
+    resumes the thread and retires the previous turn's suspended claim. So a
+    warm-up pause runs first, and the baseline is the second plain pause: it and
+    the evidence pause that follows both take the resume path.
+    """
+
+    routes.mode = "absent"
+    first = await _pause_once(h, items, publications)
+    _assert_paused(first)
+    second = await _pause_once(h, items, publications)
+    _assert_paused(second)
+    return second
+
+
 def test_capture_follows_the_validated_snapshot_and_upload_follows_create(
     make_harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -325,8 +344,7 @@ def test_a_hanging_capture_is_cut_at_its_budget_and_the_pause_is_unchanged(
             h.kernel._work_items = items
             routes = _install(h, monkeypatch, events)
 
-            routes.mode = "absent"
-            baseline = await _pause_once(h, items, publications)
+            baseline = await _baseline(h, items, publications, routes)
 
             routes.mode = "hang"
             started = time.monotonic()
@@ -335,7 +353,6 @@ def test_a_hanging_capture_is_cut_at_its_budget_and_the_pause_is_unchanged(
 
             assert routes.hung.is_set(), "the capture never reached the image fetch"
             assert elapsed < HANG_BUDGET_S + 20
-            _assert_paused(baseline)
             assert hung == baseline
             # The cut capture still reports what happened, after the publication exists.
             assert events[-2:] == ["create", "upload"]
@@ -371,15 +388,13 @@ def test_a_failing_upload_leaves_creation_suspend_and_reply_unchanged(
             h.kernel._work_items = items
             routes = _install(h, monkeypatch, events)
 
-            routes.mode = "absent"
-            baseline = await _pause_once(h, items, publications)
+            baseline = await _baseline(h, items, publications, routes)
             assert publications.uploads == []
 
             routes.mode = "evidence"
             publications.upload_error = error
             failed = await _pause_once(h, items, publications)
 
-            _assert_paused(baseline)
             assert len(publications.uploads) == 1
             assert publications.uploads[0]["publication_id"] == "publication-1"
             assert failed == baseline
@@ -403,14 +418,12 @@ def test_a_creator_without_evidence_upload_is_untouched(
             h.kernel._work_items = items
             routes = _install(h, monkeypatch, events)
 
-            routes.mode = "absent"
-            baseline = await _pause_once(h, items, publications)
+            baseline = await _baseline(h, items, publications, routes)
 
             routes.mode = "evidence"
             del events[:]
             with_evidence = await _pause_once(h, items, publications)
 
-            _assert_paused(baseline)
             assert with_evidence == baseline
             # The capture ran and its files were simply dropped after creation.
             assert events[:3] == ["snapshot", "validate", "evidence_index"]

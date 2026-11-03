@@ -13,6 +13,7 @@ Every port call that changes forge state counts one write in a shared
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import re
 from collections.abc import Collection, Mapping, Sequence
@@ -43,6 +44,7 @@ from curie_api.forges.types import (
     CredentialHeader,
     CredentialScope,
     Disposition,
+    EvidenceFile,
     FactoryPublication,
     FeedbackKind,
     FeedbackPage,
@@ -61,6 +63,7 @@ from curie_api.forges.types import (
     RerunOutcome,
     RerunRecord,
     ReviewFeedback,
+    StoredEvidence,
     TicketLabels,
     TrackerIssueRef,
     UpsertResult,
@@ -567,6 +570,10 @@ class InMemoryCodeHost(_Declared):
         self._excerpts: dict[tuple[str, str], str] = {}
         self._feedback: dict[PullRequestRef, list[_Feedback]] = {}
         self._writers: dict[RepositoryRef, set[str]] = {}
+        # UI evidence: (project id, key) -> (commit, files), and every stored
+        # commit's files, which stay readable by URL as a host keeps objects.
+        self._evidence: dict[tuple[str, str], tuple[str, dict[str, bytes]]] = {}
+        self._evidence_objects: dict[str, dict[str, bytes]] = {}
         self._shas = itertools.count(1)
         self._ids = itertools.count(5001)
         self._comments = InMemoryMarkedComments(
@@ -601,12 +608,19 @@ class InMemoryCodeHost(_Declared):
         writers = self._writers[repository]
         (writers.add if allowed else writers.discard)(actor.id)
 
-    def push(self, repository: RepositoryRef, branch: str, message: str = "change") -> str:
-        """A new commit on ``branch``; returns its sha."""
+    def push(
+        self,
+        repository: RepositoryRef,
+        branch: str,
+        message: str = "change",
+        *,
+        tree: str | None = None,
+    ) -> str:
+        """A new commit on ``branch``, with tree id ``tree`` when given; returns its sha."""
 
         parent = self._branches.get((repository, branch))
         sha = f"{next(self._shas):040x}"
-        self._commits[sha] = Commit(sha, (parent,) if parent else (), message)
+        self._commits[sha] = Commit(sha, (parent,) if parent else (), message, tree=tree)
         self._branches[(repository, branch)] = sha
         return sha
 
@@ -886,6 +900,57 @@ class InMemoryCodeHost(_Declared):
         self._gate(Operation.REQUIRED_CHECKS)
         self._repository(repository)
         return frozenset()
+
+    async def store_evidence(
+        self,
+        repository: RepositoryRef,
+        *,
+        key: str,
+        files: Sequence[EvidenceFile],
+        message: str,
+        stamp: datetime,
+    ) -> StoredEvidence:
+        self._gate(Operation.STORE_EVIDENCE)
+        repository = self._repository(repository)
+        if not files:
+            raise NotFound("evidence_empty")
+        digest = hashlib.sha1()
+        for item in sorted(files, key=lambda item: item.path):
+            digest.update(f"{item.path}\0{hashlib.sha256(item.content).hexdigest()}\0".encode())
+        digest.update(f"{message}\0{stamp.isoformat()}".encode())
+        commit_sha = digest.hexdigest()
+        self._evidence[(repository.project_id, key)] = (
+            commit_sha,
+            {item.path: item.content for item in files},
+        )
+        self._evidence_objects[commit_sha] = {item.path: item.content for item in files}
+        self.ledger.record()
+        return StoredEvidence(
+            ref=f"refs/curie/ui-evidence/{key}",
+            commit_sha=commit_sha,
+            urls={
+                item.path: f"https://{self.host}/{repository.path}/raw/{commit_sha}/{item.path}"
+                for item in files
+            },
+        )
+
+    async def delete_evidence(self, repository: RepositoryRef, *, key: str) -> bool:
+        self._gate(Operation.DELETE_EVIDENCE)
+        repository = self._repository(repository)
+        self.ledger.record()
+        return self._evidence.pop((repository.project_id, key), None) is not None
+
+    def raw(self, url: str) -> bytes | None:
+        """The bytes an evidence URL serves, or None (a test reader)."""
+
+        prefix = f"https://{self.host}/"
+        if not url.startswith(prefix):
+            return None
+        _, marker, rest = url.removeprefix(prefix).partition("/raw/")
+        commit_sha, _, path = rest.partition("/")
+        if not marker:
+            return None
+        return self._evidence_objects.get(commit_sha, {}).get(path)
 
     async def list_review_feedback(
         self, pull_request: PullRequestRef, cursor: str | None

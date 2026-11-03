@@ -2,10 +2,10 @@
 
 The runner side is the real ``curie_runner.create_app(..., ui_evidence_workspace=)``
 over a real checkout built from the shared corpus
-``tests/vectors/ui-evidence-cases.json`` (builders shared with
-``runner/tests/test_ui_evidence.py``), reached through the real
-``RunnerClient``. The API side is an ``httpx.MockTransport`` stand-in behind the
-real ``ApprovalClient`` (whose ``upload_ui_evidence`` drives the real
+``tests/vectors/ui-evidence-cases.json`` (builders from
+``curie_test_support.ui_evidence``, shared with the runner tests), reached
+through the real ``RunnerClient``. The API side is an ``httpx.MockTransport``
+stand-in behind the real ``ApprovalClient`` (whose ``upload_ui_evidence`` drives the real
 ``UiEvidenceApi``); it answers per the case ``fault`` and records every request,
 so the assertions read the exact routes, headers and bodies of the upload.
 
@@ -30,25 +30,27 @@ import httpx
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from curie_runner import RunTracer, SideEffectClassifier, create_app, workspace_snapshot
+from curie_runner.fake import FakeModelSession
+from curie_runner.session import SessionRunner
+from curie_test_support.ui_evidence import (
+    CASES,
+    CORPUS,
+    GITHUB,
+    MAX_IMAGE_BYTES,
+    MAX_TOTAL_BYTES,
+    REPO,
+    CaseCheckout,
+    build_case_checkout,
+    png,
+    resolve,
+)
 from curie_worker import ui_evidence
 from curie_worker.approvals import ApprovalBackendError, ApprovalClient
 from curie_worker.runner_client import RunnerClient
 from curie_worker.ui_evidence import capture_ui_evidence, relay_ui_evidence
 
-from runner.tests.test_ui_evidence import (
-    CASES,
-    CORPUS,
-    MAX_IMAGE_BYTES,
-    MAX_TOTAL_BYTES,
-    TOKEN,
-    CaseCheckout,
-    build_case_checkout,
-    png,
-    resolve,
-    runner_app,
-    session_runner,
-)
-
+TOKEN = "runner-token-value"
 API = "http://api.test"
 WORKER_TOKEN = "worker-token-value"
 PUBLICATION_ID = str(uuid.UUID("33333333-3333-4333-8333-333333333333"))
@@ -89,9 +91,7 @@ class ApiStandIn:
         path = request.url.path
         if request.method == "PUT" and path == EVIDENCE_PREFIX:
             if self.fault == "upload_rejection":
-                return httpx.Response(
-                    409, json={"detail": {"code": "ui_evidence.index_conflict"}}
-                )
+                return httpx.Response(409, json={"detail": {"code": "ui_evidence.index_conflict"}})
             body = json.loads(content)
             expected = [
                 image["ordinal"]
@@ -125,6 +125,35 @@ def _creator(http: httpx.AsyncClient, *, worker_token: str = WORKER_TOKEN) -> Ap
 
 
 # --- Runner side ---------------------------------------------------------------
+
+
+def session_runner() -> SessionRunner:
+    fake = FakeModelSession()
+    return SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
+        session_factory=lambda: fake,
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="ui-evidence-worker-test",
+    )
+
+
+def runner_app(runner: SessionRunner, repo: Path) -> web.Application:
+    """The production runner app with the production snapshotter and evidence workspace."""
+
+    return create_app(
+        runner,
+        token=TOKEN,
+        snapshotter=workspace_snapshot.workspace_snapshotter(
+            repo,
+            trusted_origin=GITHUB,
+            repository_path=REPO,
+            proposal=lambda: ("Publish the agent change", "Carries every local change."),
+        ),
+        ui_evidence_workspace=repo,
+    )
 
 
 Wrap = Callable[[RunnerClient, CaseCheckout], None]
@@ -348,9 +377,7 @@ def test_corpus_case_at_the_worker(
         "complete",
     ],
 )
-def test_the_worker_rebinds_a_runner_claim_it_cannot_confirm(
-    case_id: str, tmp_path: Path
-) -> None:
+def test_the_worker_rebinds_a_runner_claim_it_cannot_confirm(case_id: str, tmp_path: Path) -> None:
     """A runner index that claims every image bound is re-judged by the worker's rule."""
 
     case = CASES[case_id]
@@ -430,11 +457,7 @@ def test_capture_total_is_bounded_to_100_mib(
     # The next image passes the total and is never fetched, whatever the runner said.
     assert images[count]["refusal"] == "total_limit"
     assert count not in run.image_calls
-    stored = [
-        len(request.content)
-        for request in run.api.requests
-        if "/images/" in request.path
-    ]
+    stored = [len(request.content) for request in run.api.requests if "/images/" in request.path]
     assert sum(stored) == MAX_TOTAL_BYTES
 
 
@@ -581,4 +604,3 @@ def test_relay_of_no_capture_sends_nothing() -> None:
 
     asyncio.run(go())
     assert api.requests == []
-

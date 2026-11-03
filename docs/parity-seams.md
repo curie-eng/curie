@@ -184,6 +184,18 @@ as a whole; remembered only):
   (`charts/curie/ci/attachment-init-behavior-assertions.sh` and
   `apps/worker/tests/sandbox/test_docker_attachment_claim.py`).
   [vector: `tests/vectors/attachment-init-outcomes.json`]
+29. UI evidence refusals: runner vs worker vs API -- the runner
+  (`runner/src/curie_runner/ui_evidence.py`) validates the gitignored
+  `.curie/ui-evidence/` manifest and PNGs and applies the before and after
+  binding rule, the worker (`apps/worker/src/curie_worker/ui_evidence.py`)
+  re-derives that binding and adds transfer and timeout refusals, and the API
+  (`apps/api/src/curie_api/crud/ui_evidence.py`,
+  `apps/api/src/curie_api/ui_evidence_reconciler.py`) applies the binding a
+  third time against the publication base and adds the stored, head and size
+  refusals. The refusal codes, their comment sentences and the limits (10 MiB
+  per image, 1 MiB manifest, 100 MiB per publication) are one corpus driven at
+  each boundary.
+  [vector: `tests/vectors/ui-evidence-cases.json`]
 
 A PR touching one side of a seam must route the behavior through a shared helper
 both sides call, change both sides in the same PR, or name the sibling in the PR

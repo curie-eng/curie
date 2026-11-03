@@ -16,7 +16,6 @@ import pytest
 from curie_api.forges.capabilities import Operation, supports
 from curie_api.forges.errors import Unsupported
 from curie_api.forges.types import EvidenceFile, StoredEvidence
-
 from forge_fakes.contract_harness import AdapterHarness
 
 STAMP = datetime(2026, 11, 3, 12, 0, tzinfo=UTC)

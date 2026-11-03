@@ -15,6 +15,7 @@ import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlencode
 
@@ -46,6 +47,7 @@ from curie_api.forges.types import (
     Commit,
     Credential,
     CredentialScope,
+    EvidenceFile,
     FactoryPublication,
     FeedbackPage,
     PullRequest,
@@ -56,6 +58,7 @@ from curie_api.forges.types import (
     RerunObserver,
     RerunRecord,
     ReviewFeedback,
+    StoredEvidence,
     publication_body,
     publication_url,
 )
@@ -66,6 +69,9 @@ logger = logging.getLogger(__name__)
 CODE_HOST_CAPABILITIES: Mapping[Operation, Support] = {
     **dict.fromkeys(CODE_HOST_OPERATIONS, Support.SUPPORTED),
     Operation.REQUIRED_CHECKS: Support.UNSUPPORTED,
+    # UI evidence hosting is GitHub only (ADR 0197).
+    Operation.STORE_EVIDENCE: Support.UNSUPPORTED,
+    Operation.DELETE_EVIDENCE: Support.UNSUPPORTED,
 }
 _STATES = {
     "opened": PullRequestState.OPEN,
@@ -440,6 +446,20 @@ class GitLabCodeHost:
 
     async def required_checks(self, repository: RepositoryRef, branch: str) -> frozenset[str]:
         raise Unsupported(Operation.REQUIRED_CHECKS)
+
+    async def store_evidence(
+        self,
+        repository: RepositoryRef,
+        *,
+        key: str,
+        files: Sequence[EvidenceFile],
+        message: str,
+        stamp: datetime,
+    ) -> StoredEvidence:
+        raise Unsupported(Operation.STORE_EVIDENCE)
+
+    async def delete_evidence(self, repository: RepositoryRef, *, key: str) -> bool:
+        raise Unsupported(Operation.DELETE_EVIDENCE)
 
     async def ci_diagnostics(
         self, repository: RepositoryRef, head_sha: str, *, base_ref: str | None

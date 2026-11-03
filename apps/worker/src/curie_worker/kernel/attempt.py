@@ -72,6 +72,7 @@ from ..turn_progress import (
     deactivate_turn_progress,
     start_progress_pump,
 )
+from ..ui_evidence import capture_ui_evidence
 from ..workitem_dispatch import (
     WorkItemConflict,
     parse_work_item_event_id,
@@ -973,6 +974,17 @@ async def _attempt_turn(
                         allow_dependency_additions=self._config.publication_allow_dependency_additions,
                     )
                     outcome.publication_snapshot = snapshot
+                    outcome.ui_evidence = await capture_ui_evidence(
+                        self._runner,
+                        routed.handle.base_url,
+                        routed.handle.token or None,
+                        base_sha=snapshot.base_sha,
+                        remaining_s=(
+                            None
+                            if snapshot_budget_s is None
+                            else snapshot_budget_s - (clock.time.monotonic() - snapshot_started)
+                        ),
+                    )
                 except WorkspacePreparationError as exc:
                     outcome.publication_snapshot_error = f"publication snapshot failed: {exc}"
         return outcome

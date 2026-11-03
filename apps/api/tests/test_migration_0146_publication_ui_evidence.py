@@ -39,7 +39,7 @@ def _constraints(table: str, kind: str) -> list[str]:
             "SELECT pg_get_constraintdef(c.oid) AS definition FROM pg_constraint c "
             "JOIN pg_class t ON t.oid = c.conrelid "
             "JOIN pg_namespace n ON n.oid = t.relnamespace "
-            "WHERE n.nspname = 'curie' AND t.relname = :table AND c.contype = :kind",
+            "WHERE n.nspname = 'curie' AND t.relname = :table AND c.contype::text = :kind",
             {"table": table, "kind": kind},
         )
     ]
@@ -130,10 +130,7 @@ def _assert_created() -> None:
         assert f"'{kind}'" in lineage, kind
 
     # Every row is owned by its publication or lineage and goes with it.
-    foreign = {
-        table: "\n".join(_constraints(table, "f"))
-        for table in TABLES
-    }
+    foreign = {table: "\n".join(_constraints(table, "f")) for table in TABLES}
     assert "publications(id)" in foreign["publication_ui_evidence"]
     assert "thread_publication_lineages(id)" in foreign["publication_ui_evidence"]
     assert "publication_ui_evidence(publication_id)" in foreign["publication_ui_evidence_images"]

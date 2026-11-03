@@ -9,6 +9,7 @@ contract suite under ``apps/api/tests/forges/contract``.
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping, Sequence
+from datetime import datetime
 from typing import Protocol
 
 from curie_api.forges.capabilities import Operation, Support
@@ -19,6 +20,7 @@ from curie_api.forges.types import (
     Commit,
     Credential,
     CredentialScope,
+    EvidenceFile,
     FactoryPublication,
     FeedbackPage,
     MarkedComment,
@@ -32,6 +34,7 @@ from curie_api.forges.types import (
     RerunObserver,
     RerunRecord,
     ReviewFeedback,
+    StoredEvidence,
     TicketLabels,
     TrackerIssueRef,
     UpsertResult,
@@ -326,6 +329,30 @@ class CodeHost(Protocol):
 
     async def user_can_write(self, repository: RepositoryRef, actor: Actor) -> bool:
         """Optional: whether ``actor`` may write to ``repository``."""
+        ...
+
+    async def store_evidence(
+        self,
+        repository: RepositoryRef,
+        *,
+        key: str,
+        files: Sequence[EvidenceFile],
+        message: str,
+        stamp: datetime,
+    ) -> StoredEvidence:
+        """Optional: host ``files`` outside every branch under one ref named by
+        ``key``, creating or replacing it, and return each path's image URL at
+        the stored commit.
+
+        The same inputs give the same commit, so a replay moves nothing.
+        ``stamp`` dates the commit. Raises `Unsupported` where declared
+        unsupported; such a host writes nothing.
+        """
+        ...
+
+    async def delete_evidence(self, repository: RepositoryRef, *, key: str) -> bool:
+        """Optional: remove ``key``'s evidence ref; True when one was deleted,
+        False when none existed."""
         ...
 
 

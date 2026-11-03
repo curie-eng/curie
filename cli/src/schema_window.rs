@@ -762,8 +762,9 @@ print(json.dumps(graph))
         // @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
         // Factory ORM reads require the transition table introduced by 0144.
         // The 0145 join also requires the stable deadline backport (0140).
-        assert_eq!(candidate.schema_min, "0145");
-        assert_eq!(candidate.schema_head, "0145");
+        // The UI evidence reconciler reads the tables 0146 introduces.
+        assert_eq!(candidate.schema_min, "0146");
+        assert_eq!(candidate.schema_head, "0146");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -799,7 +800,8 @@ print(json.dumps(graph))
         assert!(!live_in_window("0141", &current));
         assert!(!live_in_window("0143", &current));
         assert!(!live_in_window("0144", &current));
-        assert!(live_in_window("0145", &current));
+        assert!(!live_in_window("0145", &current));
+        assert!(live_in_window("0146", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

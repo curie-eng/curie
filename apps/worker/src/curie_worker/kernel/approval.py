@@ -53,6 +53,7 @@ from ..sandbox.types import (
 from ..turn_progress import (
     link_progress_resume,
 )
+from ..ui_evidence import relay_ui_evidence
 from ..workitem_dispatch import (
     parse_work_item_event_id,
 )
@@ -811,6 +812,7 @@ async def _pause_for_approval(
                 id=published.approval_id,
                 status=published.status,
             )
+            await relay_ui_evidence(publication_creator, published.id, outcome.ui_evidence)
         else:
             assert self._approvals is not None
             # @spec HTTP-APPROVAL-CONTINUITY-3/4: only the live owner supplies identity.

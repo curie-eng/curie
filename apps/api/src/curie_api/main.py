@@ -104,6 +104,7 @@ from .routers import (
     provider_installations,
     publication_code_host,
     publication_precheck,
+    publication_ui_evidence,
     publications,
     remediation_nominations,
     remediation_policy,
@@ -127,6 +128,7 @@ from .slack_approvers import build_approver_set_selector
 from .storage import BundleStore
 from .sweeper import run_expiry_sweeper
 from .threadreset import ThreadResetRequests
+from .ui_evidence_reconciler import start_ui_evidence_reconciler
 from .workitem_reconciler import WorkItemReconciler
 
 _LOG = logging.getLogger("curie_api")
@@ -274,6 +276,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.lineage_reconciler_task = start_lineage_reconciler(
         app.state.sessionmaker, settings, http_client
     )
+    app.state.ui_evidence_reconciler_task = start_ui_evidence_reconciler(
+        app.state.sessionmaker, settings, http_client
+    )
     # The expiry sweeper (#412) flips lapsed pending approvals and resumes their
     # stranded sessions. It shares this lifecycle's resources (sessionmaker,
     # resume_queue); interval <= 0 disables it (no task started).
@@ -418,6 +423,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 work_item_task.cancel()
                 try:
                     await work_item_task
+                except asyncio.CancelledError:
+                    pass
+            evidence_task = getattr(app.state, "ui_evidence_reconciler_task", None)
+            if evidence_task is not None:
+                evidence_task.cancel()
+                try:
+                    await evidence_task
                 except asyncio.CancelledError:
                     pass
             lineage_task = getattr(app.state, "lineage_reconciler_task", None)
@@ -715,6 +727,7 @@ def create_app(
     app.include_router(publications.router)
     app.include_router(publications.internal_router)
     app.include_router(publication_code_host.router)
+    app.include_router(publication_ui_evidence.router)
     app.include_router(work_item_issue.router)
     app.include_router(work_item_issue.internal_router)
     app.include_router(attachment_access.router)

@@ -17,9 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from curie_api.schemas.ui_evidence import UiEvidenceIndexIn
-
-ROOT = Path(__file__).resolve().parents[3]
-CORPUS_PATH = ROOT / "tests/vectors/ui-evidence-cases.json"
+from curie_test_support.ui_evidence import CORPUS_PATH, OIDS, CaseCheckout, png, resolve
 
 # The boundary keys a case may carry; each is consumed by one boundary test:
 # ``runner`` by runner/tests/test_ui_evidence.py, ``index`` by
@@ -72,22 +70,14 @@ REFUSAL_CODES = {
     "not_shown_size",
 }
 
-# Stand-ins for the fixture selectors when a case's index names one instead of
-# an object id. The API boundary replaces "P" with the publication base.
-SELECTOR_OIDS = {
-    "P": "0123456789abcdef0123456789abcdef01234567",
-    "C": "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00",
-    "other": "0be70be70be70be70be70be70be70be70be70be7",
-    "HEAD": "4ead4ead4ead4ead4ead4ead4ead4ead4ead4ead",
+# Stand-ins for the checkout object ids, for a boundary that builds no checkout.
+# The API boundary passes the publication base as P.
+STAND_INS = {
+    "base": "0123456789abcdef0123456789abcdef01234567",
+    "head": "4ead4ead4ead4ead4ead4ead4ead4ead4ead4ead",
+    "head_tree": "7ee07ee07ee07ee07ee07ee07ee07ee07ee07ee0",
+    "candidate_tree": "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00",
 }
-_OID_FIELDS = (
-    "base_sha",
-    "manifest_base_sha",
-    "manifest_head_sha",
-    "manifest_candidate_tree",
-    "candidate_tree",
-    "head_tree",
-)
 
 
 def load_corpus() -> dict[str, Any]:
@@ -98,16 +88,47 @@ def corpus_cases() -> list[dict[str, Any]]:
     return list(load_corpus()["cases"])
 
 
-def resolve_index(index: Mapping[str, Any], oids: Mapping[str, str]) -> dict[str, Any]:
-    """``index`` with each fixture selector in an object id field replaced by
-    the id ``oids`` gives it; a field that already holds an id is kept."""
+def stand_in_checkout(
+    case: Mapping[str, Any],
+    *,
+    base: str = STAND_INS["base"],
+    candidate_tree: str = STAND_INS["candidate_tree"],
+) -> CaseCheckout:
+    """The case's checkout values without building one: stand-in object ids
+    (a clean checkout's C is its HEAD tree, as the corpus states) and the exact
+    fixture bytes of every PNG file, so ``$size`` and ``$sha256`` resolve."""
 
-    resolved = json.loads(json.dumps(index))
-    for field in _OID_FIELDS:
-        value = resolved.get(field)
-        if isinstance(value, str) and value in oids:
-            resolved[field] = oids[value]
-    return resolved
+    fixture = case["fixture"]
+    clean = fixture["checkout"] == "clean"
+    originals = {
+        path: png(path, spec["png"], size=spec.get("size"))
+        for path, spec in fixture["files"].items()
+        if "png" in spec
+    }
+    return CaseCheckout(
+        repo=Path("."),
+        base=base,
+        head=STAND_INS["head"],
+        head_tree=candidate_tree if clean else STAND_INS["head_tree"],
+        candidate_tree=candidate_tree,
+        originals=originals,
+    )
+
+
+def resolve_index(case: Mapping[str, Any], checkout: CaseCheckout) -> dict[str, Any]:
+    """The case's index with every corpus placeholder replaced."""
+
+    return resolve(json.loads(json.dumps(case["index"])), checkout)
+
+
+def _placeholders(node: Any) -> set[str]:
+    if isinstance(node, str):
+        return {node} if node.startswith("$") else set()
+    if isinstance(node, list):
+        return set().union(*(_placeholders(item) for item in node))
+    if isinstance(node, dict):
+        return set().union(*(_placeholders(item) for item in node.values()))
+    return set()
 
 
 def expected_codes(case: Mapping[str, Any]) -> set[str]:
@@ -152,11 +173,15 @@ def test_every_case_is_driven_at_a_boundary() -> None:
 
 
 def test_every_index_round_trips_through_the_api_schema() -> None:
+    defined = set(load_corpus()["conventions"]["placeholders"])
+    assert set(OIDS) == {"other_base", "other_tree"}
     for case in corpus_cases():
         index = case.get("index")
         if index is None:
             continue
-        resolved = resolve_index(index, SELECTOR_OIDS)
+        assert _placeholders(index) <= defined, case["id"]
+        resolved = resolve_index(case, stand_in_checkout(case))
+        assert not _placeholders(resolved), case["id"]
 
         parsed = UiEvidenceIndexIn.model_validate(resolved)
         again = UiEvidenceIndexIn.model_validate(parsed.model_dump(mode="json"))
@@ -185,4 +210,3 @@ def test_the_limits_are_the_ticket_numbers() -> None:
     limits = load_corpus()["limits"]
     values = set(limits.values()) if isinstance(limits, Mapping) else set()
     assert {10 * 1024 * 1024, 1024 * 1024, 100 * 1024 * 1024} <= values
-

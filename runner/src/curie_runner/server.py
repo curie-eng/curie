@@ -22,6 +22,9 @@ Productizes the prototype's aiohttp ``/run`` into the ACI session channel:
 - ``POST /v1/checkpoint`` capture the managed checkout against a worker-named
                          trusted base commit as a patch plus manifest (ADR
                          0251); optional and runner-private, carries no ACI frame
+- ``POST /v1/ui-evidence/index`` the validated index of the optional gitignored UI
+                         screenshot evidence, bound to the worker-named base
+- ``POST /v1/ui-evidence/image`` the raw bytes of one indexed, unchanged image
 
 One turn consumes the SDK generator at a time (enforced by the runner's turn
 lock); steer and interrupt are side-channel injections whose output surfaces on
@@ -37,6 +40,7 @@ import inspect
 import json
 import re
 import secrets
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from types import MappingProxyType
@@ -56,6 +60,7 @@ from aiohttp.typedefs import Handler, Middleware
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
 from pydantic import ValidationError
 
+from . import ui_evidence
 from .executor import EXECUTOR_MODE, ExecuteRefusal, Executor
 from .executor import RUNNER_MODE_ENV as RUNNER_MODE_ENV
 from .final_answer import FINAL_ANSWER_HEADER
@@ -87,6 +92,8 @@ _GATED_PATHS = frozenset(
         "/v1/reset",
         "/v1/snapshot",
         "/v1/checkpoint",
+        "/v1/ui-evidence/index",
+        "/v1/ui-evidence/image",
         "/v1/status",
         # @spec ACTION-EXECUTOR-6: served only in executor mode; an ordinary
         # runner answers 404 behind the same bearer.
@@ -99,6 +106,8 @@ RUNNER: web.AppKey[SessionRunner] = web.AppKey("runner", SessionRunner)
 # Called with the prepared base commit the worker named in the request.
 Snapshotter = Callable[[str], WorkspaceSnapshot | Awaitable[WorkspaceSnapshot]]
 SNAPSHOTTER: web.AppKey[object] = web.AppKey("snapshotter", object)
+# The managed checkout the UI evidence routes read, set by the process entrypoint.
+UI_EVIDENCE_WORKSPACE: web.AppKey[object] = web.AppKey("ui_evidence_workspace", object)
 _SNAPSHOT_BASE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 _SNAPSHOT_REQUEST_REFUSAL = "snapshot request must name the prepared base_sha"
 STATUS_ATTESTATION: web.AppKey[object] = web.AppKey("status_attestation", object)
@@ -176,6 +185,8 @@ def create_app(
     runner: SessionRunner,
     token: str | None = None,
     snapshotter: Snapshotter | None = None,
+    *,
+    ui_evidence_workspace: Path | None = None,
 ) -> web.Application:
     """Build the aiohttp application that starts ``runner`` in the background.
 
@@ -190,6 +201,9 @@ def create_app(
     ``CURIE_RUNNER_ALLOW_TOKENLESS`` dev flag: the process entrypoint refuses to
     boot tokenless otherwise (``curie_runner.config.require_serving_token``,
     #3821).
+
+    ``ui_evidence_workspace`` is the managed checkout the UI evidence routes
+    read; ``None`` makes both answer 409 ``no_managed_workspace``.
     """
 
     # A falsy token (None or empty string) means no enforcement, which
@@ -201,6 +215,7 @@ def create_app(
     app = web.Application(middlewares=middlewares)
     app[RUNNER] = runner
     app[SNAPSHOTTER] = snapshotter
+    app[UI_EVIDENCE_WORKSPACE] = ui_evidence_workspace
     # An identity-bearing response exists only when middleware above enforces a
     # non-empty bearer. Tokenless apps (dev flag or in-process tests) keep both
     # status routes probe-only.
@@ -221,6 +236,8 @@ def create_app(
             web.post("/v1/reset", _reset),
             web.post("/v1/snapshot", _snapshot),
             web.post("/v1/checkpoint", _checkpoint),
+            web.post("/v1/ui-evidence/index", _ui_evidence_index),
+            web.post("/v1/ui-evidence/image", _ui_evidence_image),
         ]
     )
     app.on_startup.append(_on_startup)
@@ -239,6 +256,8 @@ _EXECUTOR_REFUSED_ROUTES = (
     "/v1/reset",
     "/v1/snapshot",
     "/v1/checkpoint",
+    "/v1/ui-evidence/index",
+    "/v1/ui-evidence/image",
 )
 
 
@@ -379,6 +398,51 @@ async def _snapshot(request: web.Request) -> web.Response:
     except WorkspaceSnapshotError as exc:
         return web.json_response({"error": str(exc)}, status=422)
     return web.json_response(captured.to_json())
+
+
+def _ui_evidence_workspace(request: web.Request) -> Path | None:
+    return cast("Path | None", request.app[UI_EVIDENCE_WORKSPACE])
+
+
+def _no_evidence_workspace() -> web.Response:
+    return web.json_response(
+        {"error": "this session has no managed workspace", "code": "no_managed_workspace"},
+        status=409,
+    )
+
+
+async def _ui_evidence_index(request: web.Request) -> web.Response:
+    """The validated UI evidence index against the worker-named prepared base."""
+
+    workspace = _ui_evidence_workspace(request)
+    if workspace is None:
+        return _no_evidence_workspace()
+    try:
+        base_sha, budget_seconds = ui_evidence.parse_index_request(await request.read())
+    except ui_evidence.EvidenceRefusal as refusal:
+        return web.json_response(refusal.body(), status=refusal.status)
+    deadline = time.monotonic() + budget_seconds
+    # Git and the bounded file reads stay off the event loop.
+    index = await asyncio.to_thread(ui_evidence.build_index, workspace, base_sha, deadline=deadline)
+    return web.json_response(index)
+
+
+async def _ui_evidence_image(request: web.Request) -> web.Response:
+    """The raw bytes of one indexed UI evidence image, revalidated and unchanged."""
+
+    workspace = _ui_evidence_workspace(request)
+    if workspace is None:
+        return _no_evidence_workspace()
+    try:
+        index, sha256 = ui_evidence.parse_image_request(await request.read())
+        data = await asyncio.to_thread(ui_evidence.read_image, workspace, index, sha256)
+    except ui_evidence.EvidenceRefusal as refusal:
+        return web.json_response(refusal.body(), status=refusal.status)
+    return web.Response(
+        body=data,
+        content_type="image/png",
+        headers={"X-Curie-Evidence-Sha256": sha256},
+    )
 
 
 def _checkpoint_workspace(attestation: Mapping[str, object] | None) -> Path | None:

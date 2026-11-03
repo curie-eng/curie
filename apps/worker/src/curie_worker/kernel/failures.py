@@ -21,7 +21,7 @@ from ..sandbox.types import (
 )
 
 if TYPE_CHECKING:
-    pass
+    from ..ui_evidence import UiEvidenceCapture
 
 from . import constants
 
@@ -223,6 +223,7 @@ class TurnOutcome:
     approval_display: str | None = None
     publication_snapshot: RunnerWorkspaceSnapshot | None = None
     publication_snapshot_error: str | None = None
+    ui_evidence: UiEvidenceCapture | None = None
     review_origin_key: str | None = None
     # The repository this turn attached because its own message named it
     # (#2659). Read by `_pause_for_approval` for the notice composition. None on
