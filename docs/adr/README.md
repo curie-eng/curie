@@ -285,4 +285,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0263 | [HTTP identity accepts a one-to-one direct message to a registered receiver's bot](0263-http-identity-accepts-a-one-to-one-direct-message-to-a-registered-receivers-bot.md) | Accepted |
 | 0264 | [A selected delivery's reply slot is authenticated but outside its delivery intent](0264-a-selected-deliverys-reply-slot-is-authenticated-but-outside-its-delivery-intent.md) | Accepted |
 | 0265 | [A file-bearing Slack message's sender team may come from the sender's own files](0265-a-file-bearing-slack-messages-sender-team-may-come-from-the-senders-own-files.md) | Accepted |
+| 0266 | [Email receivers share a trusted sender domain under one namespace](0266-email-receivers-share-a-trusted-sender-domain-under-one-namespace.md) | Accepted |
 <!-- END GENERATED: adr-index -->
