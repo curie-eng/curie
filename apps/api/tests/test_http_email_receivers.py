@@ -517,7 +517,7 @@ def test_defective_email_receivers_refuse_as_documents(
 
 
 def test_conflicting_email_receivers_refuse_as_runtime(tmp_path: Path) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-29: keys, domains and ids unique across the file."""
+    """@spec HTTP-INVOCATION-EXECUTION-29: keys and ids unique; one namespace id per domain."""
     module = initializer.api()
     slack = initializer.document()["receivers"][0]["registration"]
     second = email_entry(
@@ -544,8 +544,16 @@ def test_conflicting_email_receivers_refuse_as_runtime(tmp_path: Path) -> None:
         "same-receiver": [email_entry(), {**second, "registration": {
             **second["registration"], "receiver_id": EMAIL_RECEIVER, "generation": 2,
         }}],
-        "same-domain": [email_entry(), {**second, "registration": {
-            **second["registration"], "domains": email_entry()["registration"]["domains"],
+        # A shared domain loads (ADR 0266); one domain under two ids does not.
+        "domain-under-two-ids": [email_entry(), {**second, "registration": {
+            **second["registration"], "domains": [{
+                **second["registration"]["domains"][0], "key": DOMAIN,
+            }],
+        }}],
+        "id-for-two-domains": [email_entry(), {**second, "registration": {
+            **second["registration"], "domains": [{
+                **second["registration"]["domains"][0], "id": EMAIL_NAMESPACE,
+            }],
         }}],
         "same-binding": [email_entry(), {**second, "registration": {
             **second["registration"], "binding_ids": [EMAIL_BINDING],
@@ -558,6 +566,11 @@ def test_conflicting_email_receivers_refuse_as_runtime(tmp_path: Path) -> None:
         initializer.write(tmp_path, initializer.document(email_receivers=copy.deepcopy(entries)))
         assert initializer.refused(module, tmp_path) == "invalid_runtime", name
     initializer.write(tmp_path, initializer.document(email_receivers=[email_entry(), second]))
+    assert type(module.load_http_identity_runtime(str(tmp_path))) is HttpInvocationRuntime
+    shared = {**second, "registration": {
+        **second["registration"], "domains": email_entry()["registration"]["domains"],
+    }}
+    initializer.write(tmp_path, initializer.document(email_receivers=[email_entry(), shared]))
     assert type(module.load_http_identity_runtime(str(tmp_path))) is HttpInvocationRuntime
 
 
