@@ -962,7 +962,6 @@ def test_elapsed_and_expired_capacity_wait_name_the_previous_start_failure(
     monkeypatch.setenv("CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS", "3")
     get_settings.cache_clear()
     facts = _facts(agent["agent_id"])
-    admitted_at = time.monotonic()
     seeded = _admit(facts)
     _defer_once(
         facts.request_id,
@@ -971,7 +970,11 @@ def test_elapsed_and_expired_capacity_wait_name_the_previous_start_failure(
         detail=START_FAILURE_DETAIL,
     )
     _defer_once(facts.request_id, reason="capacity", capacity=True, detail=None)
-    time.sleep(max(0.0, 3.5 - (time.monotonic() - admitted_at)))
+    _execute(
+        "SELECT pg_sleep(GREATEST(0, EXTRACT(EPOCH FROM (wait_deadline - clock_timestamp())))) "
+        "FROM curie.execution_requests WHERE id = :id",
+        {"id": facts.request_id},
+    )
 
     elapsed = _detail(stack, auth_headers, seeded.work_item_id)
     assert elapsed["state"] == "waiting"
@@ -1998,7 +2001,7 @@ def test_ci_unavailable_when_the_token_mint_fails(
     ("status", "reason"),
     [
         (401, "github_unauthorized"),
-        (403, "github_forbidden"),
+        (403, "github_forbidden_list_check_runs"),
         (404, "github_not_found"),
         (429, "github_rate_limited"),
         (500, "github_error"),
@@ -3378,7 +3381,11 @@ def test_ci_detail_uses_the_statuses_list_not_the_combined_state(
 
 @pytest.mark.parametrize(
     ("status", "reason"),
-    [(401, "github_unauthorized"), (403, "github_forbidden"), (404, "github_not_found")],
+    [
+        (401, "github_unauthorized"),
+        (403, "github_forbidden_list_check_runs"),
+        (404, "github_not_found"),
+    ],
 )
 def test_ci_detail_refusals_map_to_fixed_reasons(
     monkeypatch: pytest.MonkeyPatch, status: int, reason: str
