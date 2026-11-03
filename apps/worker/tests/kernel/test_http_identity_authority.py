@@ -7,6 +7,7 @@ Opaque capsules here exercise transport ownership, not MAC/current-policy proof.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import inspect
 import json
@@ -26,6 +27,7 @@ from curie_worker.hook_runs import HookRunRecorderError
 from curie_worker.identity_authority import HttpTurnAuthorityClient, TurnAuthorityUnavailable
 from curie_worker.kernel.core import Kernel
 from curie_worker.sandbox import SuspendedThreadError
+from sqlalchemy import text
 
 from .. import test_workspace as workspace_tests
 from ..queue_fixtures import qevent, wait_until
@@ -1088,3 +1090,160 @@ def test_local_binding_cron_control_still_runs_and_closes_ran(make_harness, make
                 assert h.runner.opened == [event.text]
                 assert (await run.state() or (None,))[0] == "ran"
     asyncio.run(run_case())
+
+
+@contextlib.asynccontextmanager
+async def _active_deployments(run: Any) -> Any:
+    """Owned deployment rows for the seeded agent; ``deploy`` adds one, newest last."""
+    deployment_ids: list[uuid.UUID] = []
+    version_ids: list[uuid.UUID] = []
+
+    async def deploy(version_id: uuid.UUID | None = None) -> uuid.UUID:
+        if version_id is None:
+            version_id = uuid.uuid4()
+            version_ids.append(version_id)
+            async with run.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.agent_versions "
+                        "(id, agent_id, version_label, created_by) "
+                        "VALUES (:id, :agent_id, :label, 'kernel-test')"
+                    ),
+                    {"id": version_id, "agent_id": run.agent_id, "label": f"v-{version_id.hex}"},
+                )
+        deployment_id = uuid.uuid4()
+        deployment_ids.append(deployment_id)
+        async with run.engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO curie.deployments "
+                    "(id, agent_id, version_id, environment, status, deployed_at) "
+                    "VALUES (:id, :agent_id, :version_id, "
+                    "CAST('prod' AS curie.environment), 'active', "
+                    "now() + make_interval(secs => :order))"
+                ),
+                {
+                    "id": deployment_id, "agent_id": run.agent_id,
+                    "version_id": version_id, "order": len(deployment_ids),
+                },
+            )
+        return version_id
+
+    try:
+        yield deploy
+    finally:
+        async with run.engine.begin() as conn:
+            for deployment_id in deployment_ids:
+                await conn.execute(
+                    text("DELETE FROM curie.deployments WHERE id = :id"), {"id": deployment_id},
+                )
+            for version_id in version_ids:
+                await conn.execute(
+                    text("DELETE FROM curie.agent_versions WHERE id = :id"), {"id": version_id},
+                )
+
+
+def test_scheduled_turn_with_deployment_authority_runs_on_an_http_binding(
+    make_harness, make_hook_run,
+):
+    """#5304 @spec HTTP-INVOCATION-EXECUTION-23: the open run row at the active version runs."""
+    async def run_case() -> None:
+        async with make_hook_run() as run, _active_deployments(run) as deploy:
+            await deploy(run.version_id)
+            binding, core = _cron_binding(run), Core()
+            async with make_harness(
+                binding=binding, identity_authority=core, hook_runs=run.recorder(),
+            ) as h:
+                h.runner.default_script = [Final(text="complete", status=SessionStatus.DONE)]
+                event = _cron_event(hook_run=run.ref)
+                await h.kernel.process_event(event)
+                assert h.runner.opened == [event.text]
+                assert (await run.state() or (None,))[0] == "ran"
+                assert core.requests == [], "scheduled authority asks no HTTP principal check"
+    asyncio.run(run_case())
+
+
+@pytest.mark.parametrize("defect", ["replaced-deployment", "other-agent", "no-deployment"])
+def test_scheduled_turn_without_deployment_authority_refuses_before_boot(
+    make_harness, make_hook_run, defect: str,
+):
+    """#5304 @spec HTTP-INVOCATION-EXECUTION-23: payload fields alone never authorize."""
+    async def run_case() -> None:
+        async with make_hook_run() as run, _active_deployments(run) as deploy:
+            if defect != "no-deployment":
+                await deploy(run.version_id)
+            if defect == "replaced-deployment":
+                await deploy()
+            binding = Binding() if defect == "other-agent" else _cron_binding(run)
+            async with make_harness(binding=binding, hook_runs=run.recorder()) as h:
+                event = _cron_event(hook_run=run.ref)
+                await h.kernel.process_event(event)
+                assert h.runner.opened == [] and binding.boots == []
+                assert h.fake_k8s.claim_envs == []
+                assert await h.async_redis.exists(h.config.done_key(event.event_id))
+                if defect != "other-agent":
+                    assert (await run.state() or (None,))[0] == "failed"
+                    assert await run.reason() == "identity_refused"
+    asyncio.run(run_case())
+
+
+def test_scheduled_turn_for_a_closed_run_refuses_without_changing_it(make_harness, make_hook_run):
+    """#5304 @spec HTTP-INVOCATION-EXECUTION-23: a closed run grants nothing."""
+    async def run_case() -> None:
+        async with make_hook_run(outcome="ran") as run, _active_deployments(run) as deploy:
+            await deploy(run.version_id)
+            before = await run.state()
+            binding = _cron_binding(run)
+            async with make_harness(binding=binding, hook_runs=run.recorder()) as h:
+                await h.kernel.process_event(_cron_event(hook_run=run.ref))
+                assert h.runner.opened == [] and binding.boots == []
+                assert await run.state() == before
+    asyncio.run(run_case())
+
+
+@pytest.mark.parametrize("revocation", ["deployment", "binding-generation"])
+def test_scheduled_authority_revoked_after_prepare_refuses_before_the_claim(
+    make_harness, make_hook_run, revocation: str,
+):
+    """#5304 @spec HTTP-INVOCATION-EXECUTION-23: claim_or_resume rechecks durable state."""
+    async def run_case() -> None:
+        async with make_hook_run() as run, _active_deployments(run) as deploy:
+            await deploy(run.version_id)
+            newer = await deploy() if revocation == "deployment" else None
+            if newer is not None:
+                await _set_deployment_status(run, newer, "inactive")
+            binding = _cron_binding(run)
+            classify = binding.identity_binding
+
+            async def revoking_classify(*route: Any) -> Any:
+                # The first classification is prepare's; revoke before the next.
+                if len(binding.classifications) == 1:
+                    if newer is not None:
+                        await _set_deployment_status(run, newer, "active")
+                    else:
+                        binding.identity = binding.identity.model_copy(update={
+                            "binding_generation": binding.identity.binding_generation + 1,
+                        })
+                return await classify(*route)
+
+            binding.identity_binding = revoking_classify  # type: ignore[method-assign]
+            async with make_harness(binding=binding, hook_runs=run.recorder()) as h:
+                event = _cron_event(hook_run=run.ref)
+                await h.kernel.process_event(event)
+                assert len(binding.classifications) >= 2, "the claim boundary reclassified"
+                assert len(binding.boots) == 1, "preparation passed before the revocation"
+                assert h.fake_k8s.claim_envs == [] and h.runner.opened == []
+                assert (await run.state() or (None,))[0] == "failed"
+                assert await run.reason() == "identity_refused"
+    asyncio.run(run_case())
+
+
+async def _set_deployment_status(run: Any, version_id: uuid.UUID, status: str) -> None:
+    async with run.engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE curie.deployments SET status = :status "
+                "WHERE agent_id = :agent_id AND version_id = :version_id"
+            ),
+            {"status": status, "agent_id": run.agent_id, "version_id": version_id},
+        )
