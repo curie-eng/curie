@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from channel_protocol import SettledOutcome
-from curie_internal import identity_context
+from curie_internal import identity_approval, identity_context
 from curie_internal.operator_file import decode_key_material
 
 from .agentmail import AgentMailClient, AgentMailProvider, request
@@ -119,6 +119,8 @@ APPROVAL_NOTE_MAX_CHARS = 4000
 DECISIONS = {"APPROVE": "approved", "REJECT": "rejected"}
 APPROVAL_ACTOR_HEADER = "X-Curie-Approval-Actor"
 ADAPTER_PRINCIPAL_HEADER = "X-Curie-Adapter-Principal"
+# The email approval answer proof (ADR 0267), the API's existing answer header.
+APPROVAL_PROOF_HEADER = "X-Curie-Approval-Receiver-Proof"
 # RFC 3834 section 5 (Auto-Submitted), plus the de facto markers vacation
 # responders and list managers set. Header names compare case-insensitively.
 _AUTO_PRECEDENCE = frozenset({"bulk", "junk", "list", "auto_reply"})
@@ -776,6 +778,40 @@ class MailAdapter:
         except (ValueError, TypeError, KeyError):
             return None
 
+    def _signed_answer(
+        self,
+        approval_id: str,
+        actor: str,
+        body: dict[str, Any],
+        keys: identity_context.IdentityKeyring,
+    ) -> tuple[bytes, str] | None:
+        """The exact resolve bytes and their email approval answer proof, or None.
+
+        Compact JSON with sorted keys, like a turn, so a retried answer posts the
+        same bytes. The proof is the shared signer's, over those bytes, and names
+        the same lowercased sender the actor header carries.
+        @spec HTTP-APPROVAL-CONTINUITY-15.
+        """
+        payload = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        binding = _token_claims(self.config.channel_token).get("channel_id")
+        if not isinstance(binding, str):
+            return None
+        try:
+            proof = identity_approval.EmailApprovalAnswerProofV1(
+                schema_version=1,
+                purpose="approval_answer",
+                operation="resolve",
+                receiver_id=self.config.receiver_id,
+                receiver_generation=int(self.config.receiver_generation or 0),
+                binding_id=binding,
+                approval_id=approval_id,
+                sender=actor,
+                body_sha256=hashlib.sha256(payload).hexdigest(),
+            )
+            return payload, identity_approval.sign_email_approval_answer_proof(proof, keys)
+        except (ValueError, TypeError):
+            return None
+
     # -- approvals by email (ADR-0177) ---------------------------------------
 
     def _handle_approval_reply(
@@ -875,14 +911,38 @@ class MailAdapter:
         body: dict[str, Any] = {"decision": decision}
         if note:
             body["note"] = note
-        result = request(
-            "POST",
-            url,
-            body,
-            {ADAPTER_PRINCIPAL_HEADER: self.config.adapter_principal, APPROVAL_ACTOR_HEADER: actor},
-            max_response_bytes=self.config.max_body_bytes,
-        )
         correlation = _correlation(message_id)
+        headers = {
+            ADAPTER_PRINCIPAL_HEADER: self.config.adapter_principal,
+            APPROVAL_ACTOR_HEADER: actor,
+        }
+        payload: dict[str, Any] | bytes = body
+        if self.receiver_keys is None:
+            # A legacy approval accepts this; one under HTTP identity refuses it.
+            logger.info(
+                "approval answer correlation=%s carried without an email approval answer "
+                "proof: no CURIE_MAIL_RECEIVER_* is configured",
+                correlation,
+            )
+        else:
+            signed = self._signed_answer(
+                str(ref["approval_id"]), actor, body, self.receiver_keys
+            )
+            if signed is None:
+                logger.warning(
+                    "approval answer correlation=%s refused: it cannot be signed for the "
+                    "configured email receiver; nothing was resolved",
+                    correlation,
+                )
+                self._notify(
+                    message_id, "Your answer could not be accepted for this approval.",
+                    correlation,
+                )
+                return "not_an_answer"
+            payload, headers[APPROVAL_PROOF_HEADER] = signed
+        result = request(
+            "POST", url, payload, headers, max_response_bytes=self.config.max_body_bytes,
+        )
         logger.info("approval answer correlation=%s status=%s", correlation, result.status)
         if result.status == 200:
             self.state.record_approval_answer(
