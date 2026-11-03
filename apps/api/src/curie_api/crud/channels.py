@@ -313,6 +313,33 @@ def matching_bindings(
     return matching_routes(bindings, kind, address, adapter)
 
 
+async def bindings_for_route(
+    session: AsyncSession,
+    kind: str,
+    adapter: str | None,
+    address: str,
+    *,
+    agent_id: uuid.UUID | None = None,
+    for_update: bool = False,
+) -> list[AgentChannel]:
+    """Every binding row the route `(kind, adapter, address)` selects.
+
+    The same SQL narrowing and `matching_bindings` rule as `binding_for_route`,
+    without choosing among them: an omitted non-Slack adapter may select several.
+    """
+
+    stmt = select(AgentChannel).where(AgentChannel.kind == kind, AgentChannel.address == address)
+    wanted = route_identity(kind, adapter)
+    if wanted is not None:
+        stmt = stmt.where(AgentChannel.adapter == wanted)
+    if agent_id is not None:
+        stmt = stmt.where(AgentChannel.agent_id == agent_id)
+    if for_update:
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
+    rows = list(await session.scalars(stmt))
+    return matching_bindings(rows, kind, address, adapter)
+
+
 async def binding_for_route(
     session: AsyncSession,
     kind: str,
@@ -339,16 +366,9 @@ async def binding_for_route(
     commit.
     """
 
-    stmt = select(AgentChannel).where(AgentChannel.kind == kind, AgentChannel.address == address)
-    wanted = route_identity(kind, adapter)
-    if wanted is not None:
-        stmt = stmt.where(AgentChannel.adapter == wanted)
-    if agent_id is not None:
-        stmt = stmt.where(AgentChannel.agent_id == agent_id)
-    if for_update:
-        stmt = stmt.with_for_update().execution_options(populate_existing=True)
-    rows = list(await session.scalars(stmt))
-    matches = matching_bindings(rows, kind, address, adapter)
+    matches = await bindings_for_route(
+        session, kind, adapter, address, agent_id=agent_id, for_update=for_update,
+    )
     if len(matches) > 1:
         raise AmbiguousRoute(
             f"{len(matches)} routes are bound to {kind}:{address}; pass adapter to name one"

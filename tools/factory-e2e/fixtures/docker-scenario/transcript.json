@@ -1,0 +1,851 @@
+{
+  "version": 1,
+  "exchanges": [
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 0,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "end=$(( $(date +%s) + 580 )); while [ ! -e /tmp/fd-release ] && [ \"$(date +%s)\" -lt \"$end\" ] && docker info > /dev/null 2>&1; do sleep 2; done; exit 0",
+              "description": "Hold the Docker scenario run",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 1,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "end=$(( $(date +%s) + 580 )); while [ ! -e /tmp/fd-release ] && [ \"$(date +%s)\" -lt \"$end\" ] && docker info > /dev/null 2>&1; do sleep 2; done; exit 0",
+              "description": "Hold the Docker scenario run",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 2,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "end=$(( $(date +%s) + 580 )); while [ ! -e /tmp/fd-release ] && [ \"$(date +%s)\" -lt \"$end\" ] && docker info > /dev/null 2>&1; do sleep 2; done; exit 0",
+              "description": "Hold the Docker scenario run",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 3,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "end=$(( $(date +%s) + 580 )); while [ ! -e /tmp/fd-release ] && [ \"$(date +%s)\" -lt \"$end\" ] && docker info > /dev/null 2>&1; do sleep 2; done; exit 0",
+              "description": "Hold the Docker scenario run",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 4,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "end=$(( $(date +%s) + 580 )); while [ ! -e /tmp/fd-release ] && [ \"$(date +%s)\" -lt \"$end\" ] && docker info > /dev/null 2>&1; do sleep 2; done; exit 0",
+              "description": "Hold the Docker scenario run",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 5,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "end=$(( $(date +%s) + 580 )); while [ ! -e /tmp/fd-release ] && [ \"$(date +%s)\" -lt \"$end\" ] && docker info > /dev/null 2>&1; do sleep 2; done; exit 0",
+              "description": "Hold the Docker scenario run",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 6,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "text",
+            "text": "Docker scenario run finished."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 0,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "end=$(( $(date +%s) + 580 )); while [ ! -e /tmp/fd-release ] && [ \"$(date +%s)\" -lt \"$end\" ] && docker info > /dev/null 2>&1; do sleep 2; done; exit 0",
+              "description": "Hold the Docker scenario run",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 1,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "end=$(( $(date +%s) + 580 )); while [ ! -e /tmp/fd-release ] && [ \"$(date +%s)\" -lt \"$end\" ] && docker info > /dev/null 2>&1; do sleep 2; done; exit 0",
+              "description": "Hold the Docker scenario run",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 2,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "end=$(( $(date +%s) + 580 )); while [ ! -e /tmp/fd-release ] && [ \"$(date +%s)\" -lt \"$end\" ] && docker info > /dev/null 2>&1; do sleep 2; done; exit 0",
+              "description": "Hold the Docker scenario run",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 3,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "end=$(( $(date +%s) + 580 )); while [ ! -e /tmp/fd-release ] && [ \"$(date +%s)\" -lt \"$end\" ] && docker info > /dev/null 2>&1; do sleep 2; done; exit 0",
+              "description": "Hold the Docker scenario run",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 4,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "end=$(( $(date +%s) + 580 )); while [ ! -e /tmp/fd-release ] && [ \"$(date +%s)\" -lt \"$end\" ] && docker info > /dev/null 2>&1; do sleep 2; done; exit 0",
+              "description": "Hold the Docker scenario run",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 5,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "end=$(( $(date +%s) + 580 )); while [ ! -e /tmp/fd-release ] && [ \"$(date +%s)\" -lt \"$end\" ] && docker info > /dev/null 2>&1; do sleep 2; done; exit 0",
+              "description": "Hold the Docker scenario run",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 6,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "text",
+            "text": "Docker scenario run finished."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 0,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "i=0; while [ ! -s /tmp/fd-go ] && [ \"$i\" -lt 270 ]; do sleep 1; i=$((i+1)); done; N=$(cat /tmp/fd-go 2>/dev/null); if [ -n \"$N\" ]; then { docker run --name \"fd-run-$N\" --label \"factory-tools/nonce=$N\" busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662 echo ran; docker ps -a --filter \"label=factory-tools/nonce=$N\" --format '{{.ID}} {{.Label \"factory-tools/nonce\"}}'; } > /tmp/fd-run.tmp 2>&1; mv /tmp/fd-run.tmp /tmp/fd-run; docker info --format '{{.ID}} {{.Name}}' > /tmp/fd-info.tmp 2>&1; mv /tmp/fd-info.tmp /tmp/fd-info; i=0; while [ ! -e /tmp/fd-release ] && [ \"$i\" -lt 135 ] && docker info > /dev/null 2>&1; do sleep 2; i=$((i+1)); done; fi; exit 0",
+              "description": "Run the Docker lifecycle probe",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 1,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "text",
+            "text": "Docker lifecycle probe finished."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 0,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "i=0; while [ ! -s /tmp/fd-go ] && [ \"$i\" -lt 270 ]; do sleep 1; i=$((i+1)); done; N=$(cat /tmp/fd-go 2>/dev/null); if [ -n \"$N\" ]; then { docker run --name \"fd-run-$N\" --label \"factory-tools/nonce=$N\" busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662 echo ran; docker ps -a --filter \"label=factory-tools/nonce=$N\" --format '{{.ID}} {{.Label \"factory-tools/nonce\"}}'; } > /tmp/fd-run.tmp 2>&1; mv /tmp/fd-run.tmp /tmp/fd-run; docker info --format '{{.ID}} {{.Name}}' > /tmp/fd-info.tmp 2>&1; mv /tmp/fd-info.tmp /tmp/fd-info; i=0; while [ ! -e /tmp/fd-release ] && [ \"$i\" -lt 135 ] && docker info > /dev/null 2>&1; do sleep 2; i=$((i+1)); done; fi; exit 0",
+              "description": "Run the Docker lifecycle probe",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 1,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "text",
+            "text": "Docker lifecycle probe finished."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 0,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "i=0; while [ ! -s /tmp/fd-go ] && [ \"$i\" -lt 270 ]; do sleep 1; i=$((i+1)); done; N=$(cat /tmp/fd-go 2>/dev/null); if [ -n \"$N\" ]; then { docker run --name \"fd-run-$N\" --label \"factory-tools/nonce=$N\" busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662 echo ran; docker ps -a --filter \"label=factory-tools/nonce=$N\" --format '{{.ID}} {{.Label \"factory-tools/nonce\"}}'; } > /tmp/fd-run.tmp 2>&1; mv /tmp/fd-run.tmp /tmp/fd-run; docker info --format '{{.ID}} {{.Name}}' > /tmp/fd-info.tmp 2>&1; mv /tmp/fd-info.tmp /tmp/fd-info; i=0; while [ ! -e /tmp/fd-release ] && [ \"$i\" -lt 135 ] && docker info > /dev/null 2>&1; do sleep 2; i=$((i+1)); done; fi; exit 0",
+              "description": "Run the Docker lifecycle probe",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 1,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "text",
+            "text": "Docker lifecycle probe finished."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 0,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "i=0; while [ ! -s /tmp/fd-go ] && [ \"$i\" -lt 270 ]; do sleep 1; i=$((i+1)); done; N=$(cat /tmp/fd-go 2>/dev/null); if [ -n \"$N\" ]; then { docker run --name \"fd-run-$N\" --label \"factory-tools/nonce=$N\" busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662 echo ran; docker ps -a --filter \"label=factory-tools/nonce=$N\" --format '{{.ID}} {{.Label \"factory-tools/nonce\"}}'; } > /tmp/fd-run.tmp 2>&1; mv /tmp/fd-run.tmp /tmp/fd-run; docker info --format '{{.ID}} {{.Name}}' > /tmp/fd-info.tmp 2>&1; mv /tmp/fd-info.tmp /tmp/fd-info; i=0; while [ ! -e /tmp/fd-release ] && [ \"$i\" -lt 135 ] && docker info > /dev/null 2>&1; do sleep 2; i=$((i+1)); done; fi; exit 0",
+              "description": "Run the Docker lifecycle probe",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 1,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "text",
+            "text": "Docker lifecycle probe finished."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 0,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "i=0; while [ ! -s /tmp/fd-go ] && [ \"$i\" -lt 270 ]; do sleep 1; i=$((i+1)); done; N=$(cat /tmp/fd-go 2>/dev/null); if [ -n \"$N\" ]; then { docker run --name \"fd-run-$N\" --label \"factory-tools/nonce=$N\" busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662 echo ran; docker ps -a --filter \"label=factory-tools/nonce=$N\" --format '{{.ID}} {{.Label \"factory-tools/nonce\"}}'; } > /tmp/fd-run.tmp 2>&1; mv /tmp/fd-run.tmp /tmp/fd-run; docker info --format '{{.ID}} {{.Name}}' > /tmp/fd-info.tmp 2>&1; mv /tmp/fd-info.tmp /tmp/fd-info; i=0; while [ ! -e /tmp/fd-release ] && [ \"$i\" -lt 135 ] && docker info > /dev/null 2>&1; do sleep 2; i=$((i+1)); done; fi; exit 0",
+              "description": "Run the Docker lifecycle probe",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 1,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "text",
+            "text": "Docker lifecycle probe finished."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 0,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "i=0; while [ ! -s /tmp/fd-go ] && [ \"$i\" -lt 270 ]; do sleep 1; i=$((i+1)); done; N=$(cat /tmp/fd-go 2>/dev/null); if [ -n \"$N\" ]; then { docker run --name \"fd-run-$N\" --label \"factory-tools/nonce=$N\" busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662 echo ran; docker ps -a --filter \"label=factory-tools/nonce=$N\" --format '{{.ID}} {{.Label \"factory-tools/nonce\"}}'; } > /tmp/fd-run.tmp 2>&1; mv /tmp/fd-run.tmp /tmp/fd-run; docker info --format '{{.ID}} {{.Name}}' > /tmp/fd-info.tmp 2>&1; mv /tmp/fd-info.tmp /tmp/fd-info; i=0; while [ ! -e /tmp/fd-release ] && [ \"$i\" -lt 135 ] && docker info > /dev/null 2>&1; do sleep 2; i=$((i+1)); done; fi; exit 0",
+              "description": "Run the Docker lifecycle probe",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 1,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "text",
+            "text": "Docker lifecycle probe finished."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 0,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "i=0; while [ ! -s /tmp/fd-go ] && [ \"$i\" -lt 270 ]; do sleep 1; i=$((i+1)); done; N=$(cat /tmp/fd-go 2>/dev/null); if [ -n \"$N\" ]; then { docker run --name \"fd-run-$N\" --label \"factory-tools/nonce=$N\" busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662 echo ran; docker ps -a --filter \"label=factory-tools/nonce=$N\" --format '{{.ID}} {{.Label \"factory-tools/nonce\"}}'; } > /tmp/fd-run.tmp 2>&1; mv /tmp/fd-run.tmp /tmp/fd-run; docker info --format '{{.ID}} {{.Name}}' > /tmp/fd-info.tmp 2>&1; mv /tmp/fd-info.tmp /tmp/fd-info; i=0; while [ ! -e /tmp/fd-release ] && [ \"$i\" -lt 135 ] && docker info > /dev/null 2>&1; do sleep 2; i=$((i+1)); done; fi; exit 0",
+              "description": "Run the Docker lifecycle probe",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 1,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "text",
+            "text": "Docker lifecycle probe finished."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 0,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "i=0; while [ ! -s /tmp/fd-go ] && [ \"$i\" -lt 270 ]; do sleep 1; i=$((i+1)); done; N=$(cat /tmp/fd-go 2>/dev/null); if [ -n \"$N\" ]; then { docker run --name \"fd-run-$N\" --label \"factory-tools/nonce=$N\" busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662 echo ran; docker ps -a --filter \"label=factory-tools/nonce=$N\" --format '{{.ID}} {{.Label \"factory-tools/nonce\"}}'; } > /tmp/fd-run.tmp 2>&1; mv /tmp/fd-run.tmp /tmp/fd-run; docker info --format '{{.ID}} {{.Name}}' > /tmp/fd-info.tmp 2>&1; mv /tmp/fd-info.tmp /tmp/fd-info; i=0; while [ ! -e /tmp/fd-release ] && [ \"$i\" -lt 135 ] && docker info > /dev/null 2>&1; do sleep 2; i=$((i+1)); done; fi; exit 0",
+              "description": "Run the Docker lifecycle probe",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 1,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "text",
+            "text": "Docker lifecycle probe finished."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 0,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "i=0; while [ ! -s /tmp/fd-go ] && [ \"$i\" -lt 270 ]; do sleep 1; i=$((i+1)); done; N=$(cat /tmp/fd-go 2>/dev/null); if [ -n \"$N\" ]; then { docker run --name \"fd-run-$N\" --label \"factory-tools/nonce=$N\" busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662 echo ran; docker ps -a --filter \"label=factory-tools/nonce=$N\" --format '{{.ID}} {{.Label \"factory-tools/nonce\"}}'; } > /tmp/fd-run.tmp 2>&1; mv /tmp/fd-run.tmp /tmp/fd-run; docker info --format '{{.ID}} {{.Name}}' > /tmp/fd-info.tmp 2>&1; mv /tmp/fd-info.tmp /tmp/fd-info; i=0; while [ ! -e /tmp/fd-release ] && [ \"$i\" -lt 135 ] && docker info > /dev/null 2>&1; do sleep 2; i=$((i+1)); done; fi; exit 0",
+              "description": "Run the Docker lifecycle probe",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 1,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "text",
+            "text": "Docker lifecycle probe finished."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 0,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted",
+            "name": "Bash",
+            "input": {
+              "command": "i=0; while [ ! -s /tmp/fd-go ] && [ \"$i\" -lt 270 ]; do sleep 1; i=$((i+1)); done; N=$(cat /tmp/fd-go 2>/dev/null); if [ -n \"$N\" ]; then { docker run --name \"fd-run-$N\" --label \"factory-tools/nonce=$N\" busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662 echo ran; docker ps -a --filter \"label=factory-tools/nonce=$N\" --format '{{.ID}} {{.Label \"factory-tools/nonce\"}}'; } > /tmp/fd-run.tmp 2>&1; mv /tmp/fd-run.tmp /tmp/fd-run; docker info --format '{{.ID}} {{.Name}}' > /tmp/fd-info.tmp 2>&1; mv /tmp/fd-info.tmp /tmp/fd-info; i=0; while [ ! -e /tmp/fd-release ] && [ \"$i\" -lt 135 ] && docker info > /dev/null 2>&1; do sleep 2; i=$((i+1)); done; fi; exit 0",
+              "description": "Run the Docker lifecycle probe",
+              "timeout": 600000
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 1,
+      "message": {
+        "id": "msg_scripted",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "text",
+            "text": "Docker lifecycle probe finished."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    }
+  ]
+}

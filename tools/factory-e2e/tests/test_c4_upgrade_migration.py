@@ -1237,8 +1237,16 @@ class _Installation:
             "'host', w.tracker_host, 'repository_id', w.repository_project_id, "
             "'repository', w.repository_path, 'agent_id', w.agent_id, "
             "'base', w.base_branch, 'conversation', w.conversation_id, "
+            "'source', w.base_source, 'commit', w.base_commit, "
+            "'status', r.status, 'owner', r.acquire_owner, "
+            "'deferral', r.last_deferral_reason, "
+            "'started', (SELECT count(*) FROM curie.execution_requests q "
+            "WHERE q.work_item_id=w.id AND q.started_at IS NOT NULL), "
             "'requests', (SELECT count(*) FROM curie.execution_requests r "
-            "WHERE r.work_item_id=w.id))), '[]'::json) FROM curie.work_items w"
+            "WHERE r.work_item_id=w.id))), '[]'::json) FROM curie.work_items w "
+            "LEFT JOIN LATERAL (SELECT status, acquire_owner, last_deferral_reason "
+            "FROM curie.execution_requests WHERE work_item_id=w.id "
+            "ORDER BY sequence DESC LIMIT 1) r ON true"
         )
 
     def poll_observations(self, after: float, minimum: int = 2) -> list[dict[str, list[str]]]:
@@ -1250,13 +1258,19 @@ class _Installation:
             time.sleep(1)
         return []
 
-    def wait_items(self, numbers: set[str]) -> list[dict[str, Any]]:
-        deadline = time.monotonic() + 90
-        rows = self.work_items()
-        while time.monotonic() < deadline and not numbers <= {row["issue"] for row in rows}:
-            time.sleep(1)
+    def wait_base_selections(self) -> list[dict[str, Any]]:
+        # ADR 0253 resolves after the default 60-second label settling interval.
+        deadline = time.monotonic() + 180
+        while True:
             rows = self.work_items()
-        return rows
+            try:
+                _assert_base_selections(rows)
+            except AssertionError:
+                if time.monotonic() >= deadline:
+                    return rows
+            else:
+                return rows
+            time.sleep(1)
 
     def runtime_images(self) -> dict[str, dict[str, Any]]:
         """Link each Docker build identity and running pod through verified content."""
@@ -1546,6 +1560,27 @@ def test_v0125_factory_without_required_ci_upgrade_dry_run(
     assert not run.stub.unknown_requests
 
 
+def _assert_base_selections(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """ADR 0253 defers branch refusal until claim, after intake creates a row."""
+    by_number = {row["issue"]: row for row in rows}
+    assert {"4701", "4704", "4705"} <= by_number.keys()
+    assert not {"4702", "4703"} & by_number.keys()
+    assert by_number["4701"]["base"] == "maint"
+    assert by_number["4701"]["source"] == "default"
+    assert by_number["4704"]["base"] == "release"
+    assert by_number["4704"]["source"] == "label"
+    for number in ("4701", "4704"):
+        assert re.fullmatch(r"[0-9a-f]{40}", by_number[number]["commit"] or "")
+    refused = by_number["4705"]
+    assert (refused["base"], refused["source"], refused["commit"]) == (None, None, None)
+    assert refused["requests"] == 1
+    assert refused["started"] == 0
+    assert refused["status"] == "waiting"
+    assert refused["owner"] is None
+    assert refused["deferral"] == "base_not_allowed"
+    return by_number
+
+
 def test_v0125_factory_upgrade_uses_supported_flow(released_factory: _Installation) -> None:
     run = released_factory
     before = run.snapshot()
@@ -1651,17 +1686,21 @@ def test_v0125_factory_upgrade_uses_supported_flow(released_factory: _Installati
     run.stub.issue(4704, [LABEL, "base:release"])
     run.stub.issue(4705, [LABEL, "base:unapproved"])
     run.stub.issue(4701, [LABEL])
-    rows = run.wait_items({"4701", "4704"})
+    rows = run.wait_base_selections()
     polls = run.poll_observations(stamp)
     assert len(polls) >= 2
     assert any(query.get("labels") == [LABEL] for query in polls)
-    by_number = {row["issue"]: row for row in rows}
-    assert {"4701", "4704"} <= by_number.keys()
-    assert not {"4702", "4703", "4705"} & by_number.keys()
-    assert by_number["4701"]["base"] == "maint"
-    assert by_number["4704"]["base"] == "release"
+    by_number = _assert_base_selections(rows)
+    refusal_comments = [
+        row["body"] for row in run.stub._rows("comment")
+        if row["issue_number"] == 4705 and "<!-- curie-factory-base-refusal -->" in row["body"]
+    ]
+    assert len(refusal_comments) == 1
+    assert "unapproved" in refusal_comments[0]
+    assert "not an allowed base" in refusal_comments[0]
     for number in ("4701", "4704"):
         item = by_number[number]
+        assert item["commit"] == run.stub._ref("main")
         assert item["scope"] == item["repository_id"] == str(REPOSITORY_ID)
         assert item["repository"] == REPOSITORY
         assert item["agent_id"] == run.agent_id
@@ -1717,6 +1756,7 @@ def test_v0125_factory_upgrade_uses_supported_flow(released_factory: _Installati
         assert metadata["verdict"]["kind"] == ("green" if fresh else "pending")
         if not fresh:
             assert metadata["verdict"]["reason"] == "checks_awaiting_metadata_rerun"
+    _assert_base_selections(run.work_items())
     assert not run.stub.unknown_requests
 
 

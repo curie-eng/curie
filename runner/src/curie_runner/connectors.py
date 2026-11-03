@@ -136,6 +136,25 @@ def _allowlist(plugin_dir: str | Path, agent: str) -> frozenset[str] | None:
     return connectors_for_agent(parsed, agent)
 
 
+def declared_connectors(
+    plugin_dir: str | Path | None, *, agent: str | None
+) -> dict[str, ConnectorSpec]:
+    """The validated connectors this agent runs, restricted by deploy.yaml.
+
+    The same declaration ``derive_mcp_servers`` mounts, for a reader that
+    needs the specs rather than the entries (ADR 0240's route callers).
+    """
+
+    if plugin_dir is None:
+        return {}
+    declared = _read(plugin_dir)
+    if declared is None:
+        return {}
+    if agent:
+        declared = restrict_connectors(declared, _allowlist(plugin_dir, agent))
+    return dict(declared.connectors)
+
+
 def derive_mcp_servers(
     plugin_dir: str | Path | None,
     *,

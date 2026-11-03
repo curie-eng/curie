@@ -67,6 +67,7 @@ async def expire_capacity_wait(
     lease: DeliveryLease,
     cause: str,
     grant_epoch: str | None,
+    send_notice: bool = True,
 ) -> tuple[bool, str | None]:
     lease.raise_if_lost()
     # A wait without a recorded grant never started work. A later message
@@ -74,6 +75,12 @@ async def expire_capacity_wait(
     if grant_epoch is not None:
         await self._quiesce_capacity_epoch(routing._thread_key_for(qevent), grant_epoch)
     lease.raise_if_lost()
+    if not send_notice:
+        # @spec HTTP-INVOCATION-EXECUTION-18: settle without unverified reply/outbox writes.
+        await self._markers.mark_done(qevent.event_id, marker_value="1")
+        self._minted_refs.pop(qevent.event_id, None)
+        self._terminal_reply_attempted.discard(qevent.event_id)
+        return False, None
     route = routing._route_from_handle(qevent)
     delivered = False
     reply_ref: str | None = None

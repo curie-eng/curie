@@ -32,6 +32,12 @@ so the project's own pipeline decides green (a job that also fails on the
 default branch is pre-existing and does not fail the factory gate). A token is
 read from its file for each request and goes only into that request's
 ``PRIVATE-TOKEN`` header: never into argv, evidence, logs or an error.
+
+The tracker evidence also records, for both targets (#4867): how long after
+the labeler's label the issue first carried the in-progress state label
+(``curie-factory:running``, asserted within one tracker poll interval plus 30
+seconds), and whether exactly one factory note on the issue links the merge
+request's web URL, read before the teardown closes the issue.
 """
 
 from __future__ import annotations
@@ -78,7 +84,13 @@ RATE_LIMIT_RETRIES = 5
 # The tracker label `curie factory quickstart --tracker gitlab` writes.
 QUICKSTART_LABEL = "curie-factory"
 STATE_LABEL_PREFIX = "curie-factory:"
+# The in-progress state label of the pass's four (curie_api.factory_notices
+# STATE_LABELS): the one a running WorkItem's issue carries.
+IN_PROGRESS_LABEL = "curie-factory:running"
 TRACKER_POLL_SECONDS = 45
+# #4867 decision 1: one configured tracker poll interval, plus 30 seconds for
+# one poll tick and the API latency.
+IN_PROGRESS_LABEL_BOUND_SECONDS = TRACKER_POLL_SECONDS + 30
 REPORTER_PROBE_SECONDS = 3 * TRACKER_POLL_SECONDS
 ADMISSION_POLL_SECONDS = 5
 MERGE_ATTEMPTS = 12
@@ -228,6 +240,31 @@ def closes_issue(description: str | None, iid: int) -> bool:
     """Whether a merge request description closes issue ``iid``. Pure."""
 
     return bool(re.search(rf"(?im)\bcloses #{iid}\b", description or ""))
+
+
+def factory_note_links_mr(
+    notes: Sequence[Mapping[str, Any]], mr_url: Any, factory: str
+) -> bool | None:
+    """Whether exactly one factory note on the issue carries the MR's URL. Pure.
+
+    True only when exactly one note is a human note (not system) from the
+    factory account whose body contains ``mr_url``; None when the merge request
+    or its URL was unreadable.
+    """
+
+    if not isinstance(mr_url, str) or not mr_url.strip():
+        return None
+    links = [
+        note
+        for note in notes
+        if isinstance(note, Mapping)
+        and not note.get("system")
+        and isinstance(note.get("body"), str)
+        and mr_url in note["body"]
+        and isinstance(note.get("author"), Mapping)
+        and note["author"].get("username") == factory
+    ]
+    return len(links) == 1
 
 
 # --- the fixture: bring up, read, tear down ---------------------------------------------
@@ -386,6 +423,9 @@ class GitLabDriver:
         self.iid: int | None = None
         self.discussion_id: str | None = None
         self.created: list[int] = []
+        # #4867: seconds from the labeler's label to the in-progress state
+        # label first appearing on the issue; None when it never appeared.
+        self._in_progress_label_seconds: float | None = None
         if target == "fixture":
             named = os.environ.get(FIXTURE_VAR)
             if not named:
@@ -601,6 +641,30 @@ class GitLabDriver:
                 f"labelling GitLab issue #{iid} as the {actor} failed (HTTP {status})"
             )
 
+    def _issue_labels(self, iid: int) -> list[str] | None:
+        """The issue's labels, or None when the read failed."""
+
+        status, issue = self._json(self.admin, "GET", f"/projects/{self.pid}/issues/{iid}")
+        labels = issue.get("labels") if status == 200 and isinstance(issue, dict) else None
+        return [str(label) for label in labels] if isinstance(labels, list) else None
+
+    def _await_in_progress_label(self, iid: int, labelled: float) -> float | None:
+        """Seconds from the labeler's label to the in-progress label appearing.
+
+        Polls the issue until ``curie-factory:running`` is among its labels,
+        within IN_PROGRESS_LABEL_BOUND_SECONDS of ``labelled`` (#4867 decision 1:
+        one tracker poll interval plus 30 seconds), else None.
+        """
+
+        deadline = labelled + IN_PROGRESS_LABEL_BOUND_SECONDS
+        while True:
+            labels = self._issue_labels(iid) or []
+            if IN_PROGRESS_LABEL in labels:
+                return round(time.monotonic() - labelled, 1)
+            if time.monotonic() > deadline:
+                return None
+            time.sleep(ADMISSION_POLL_SECONDS)
+
     # -- the ticket --
 
     def open_and_label_ticket(self, title: str, body: str, since: float) -> str:
@@ -611,6 +675,7 @@ class GitLabDriver:
         self.iid = iid
         self.p.evidence["gitlab_issue_iid"] = iid
         self._label(self.labeler, iid)
+        labelled = time.monotonic()
         self.p.step(f"GitLab issue opened and labelled by the {self.labeler}", iid=iid)
 
         def admitted() -> list[dict[str, Any]] | None:
@@ -628,6 +693,14 @@ class GitLabDriver:
             )
         work_item_id = str(items[0]["id"])
         self.p.evidence["work_item_id"] = work_item_id
+        # The WorkItem runs from here: its issue should show the in-progress
+        # state label within one tracker poll interval of the label (#4867).
+        self._in_progress_label_seconds = self._await_in_progress_label(iid, labelled)
+        self.p.step(
+            "GitLab issue shows the in-progress label",
+            seconds=self._in_progress_label_seconds,
+            iid=iid,
+        )
         self.p.step("WorkItem admitted", work_item_id=work_item_id, iid=iid)
         return work_item_id
 
@@ -972,6 +1045,25 @@ class GitLabDriver:
             return None
         return closes_issue(mr.get("description"), self.iid)
 
+    def _status_note_links_mr(self, change: fe.ChangeRef | None) -> bool | None:
+        """Whether exactly one factory note on the issue links the merge request.
+
+        #4867 decision 2, read before the teardown closes the issue: False when
+        there is no change or issue, None when the merge request or the notes
+        were unreadable.
+        """
+
+        if change is None or self.iid is None:
+            return False
+        mr = self._merge_request(change.number)
+        if mr is None:
+            return None
+        try:
+            notes = self._paged(self.admin, f"/projects/{self.pid}/issues/{self.iid}/notes")
+        except fe.PreflightFailed:
+            return None
+        return factory_note_links_mr(notes, mr.get("web_url"), self.factory_username)
+
     def _reporter_probe(self) -> dict[str, Any]:
         """Open and label a second issue as reporter; nothing may be admitted or labelled."""
 
@@ -1009,6 +1101,8 @@ class GitLabDriver:
             "iid": self.iid,
             "closes_issue": self._closes_issue(change),
             "thread_replies": self._thread_replies(change),
+            "in_progress_label_seconds": self._in_progress_label_seconds,
+            "status_note_links_mr": self._status_note_links_mr(change),
         }
         if self.target == "fixture":
             evidence.update(self._reporter_probe())
@@ -1021,6 +1115,25 @@ class GitLabDriver:
         replies = evidence.get("thread_replies")
         if replies != 1:
             failures.append(f"the review thread has {replies} factory replies, expected 1")
+        seconds = evidence.get("in_progress_label_seconds")
+        if not isinstance(seconds, (int, float)) or seconds < 0:
+            failures.append(
+                "the issue never showed the in-progress label "
+                f"({IN_PROGRESS_LABEL}) within one tracker poll interval plus 30 seconds: "
+                f"{seconds!r}"
+            )
+        elif seconds > IN_PROGRESS_LABEL_BOUND_SECONDS:
+            failures.append(
+                f"the issue showed the in-progress label ({IN_PROGRESS_LABEL}) after "
+                f"{seconds} seconds, expected within one tracker poll interval "
+                f"({TRACKER_POLL_SECONDS}) plus 30"
+            )
+        links = evidence.get("status_note_links_mr")
+        if links is not True:
+            failures.append(
+                f"exactly one factory status note on the issue should link the merge request: "
+                f"{links!r}"
+            )
         if self.target == "fixture":
             admitted = evidence.get("reporter_label_admitted")
             if admitted is not False:

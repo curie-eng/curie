@@ -110,6 +110,11 @@ pub struct ConnectorSpecDecl {
     /// written; the quantity and request-within-limit rules are Python's.
     #[serde(default)]
     pub resources: Option<ConnectorResourcesDecl>,
+    /// Non-MCP routes the caller proxy admits a connector-scoped route token
+    /// on (ADR 0240). Carried as written; `plugin_format.validate_connectors`
+    /// and `validate_bundle` own the path, method, size and caller rules.
+    #[serde(default)]
+    pub routes: Vec<ConnectorRouteDecl>,
 
     // -- remote form --
     pub url: Option<String>,
@@ -138,6 +143,21 @@ pub struct ConnectorSpecDecl {
     /// sandbox. See [`declared_secret_names`] and [`bearer_secret_name`].
     #[serde(default)]
     pub config: Vec<String>,
+}
+
+/// One entry of `routes:` on a hosted connector (ADR 0240).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorRouteDecl {
+    pub path: String,
+    #[serde(default = "default_route_methods")]
+    pub methods: Vec<String>,
+    pub max_body_bytes: u64,
+    pub callers: Vec<String>,
+}
+
+fn default_route_methods() -> Vec<String> {
+    vec!["POST".to_string()]
 }
 
 /// `resources:` on a hosted connector: either side may be omitted.
@@ -211,6 +231,7 @@ impl Default for ConnectorSpecDecl {
             proxy_upstream_host: None,
             readiness_path: None,
             resources: None,
+            routes: Vec::new(),
             url: None,
             headers: BTreeMap::new(),
             secrets: Vec::new(),
@@ -2476,6 +2497,35 @@ connectors:
 "#,
         );
         assert_eq!(hosted_env_secret_names(&decl), vec!["A".to_string()]);
+    }
+
+    #[test]
+    fn an_agent_scoped_secret_reference_is_refused_not_resolved_locally() {
+        // `${CURIE_AGENT}` is expanded by the cluster render only. Locally
+        // there is no out-of-band Secret to point at, so the templated form is
+        // refused like any other reference and its placeholder text never
+        // stands in for a Secret name or a bound env var.
+        let decl = decl(
+            r#"
+connectors:
+  reader:
+    image: ghcr.io/example/reader:1
+    secrets:
+      - name: EXAMPLE_TOKEN
+        from_secret: example-read-${CURIE_AGENT}
+"#,
+        );
+        assert!(hosted_env_secret_names(&decl).is_empty());
+        let spec = &decl.connectors["reader"];
+        let text = format!(
+            "{:#}",
+            refuse_out_of_band_secrets("reader", spec)
+                .expect_err("an agent-scoped reference has no local equivalent")
+        );
+        assert!(
+            text.contains("`example-read-${CURIE_AGENT}`") && text.contains("EXAMPLE_TOKEN"),
+            "the refusal names the reference as written: {text}"
+        );
     }
 
     #[test]

@@ -144,7 +144,7 @@ def test_a_running_card_is_an_uncached_svg_behind_no_auth(admitted: Any) -> None
     number = 9801
     _label(client, github, number)
     request_id = _request(number)["id"]
-    _start_running(request_id)
+    _start_running(client, request_id)
     token = _token(request_id)
     assert re.fullmatch(r"[0-9a-f]{64}", token)
 
@@ -194,7 +194,7 @@ def test_the_card_escapes_the_issue_title_and_shows_the_note_in_italics(
     sink.titles[number] = HOSTILE_TITLE
     _label(client, github, number)
     request_id = _request(number)["id"]
-    _start_running(request_id)
+    _start_running(client, request_id)
     note = "Reading <the> issue & its comments"
     assert report(client, request_id, "read_issue", note=note).status_code == 201
     _reconcile()  # fetches and stores the title once
@@ -221,7 +221,7 @@ def test_a_card_with_a_kickback_badges_the_plan_arc(admitted: Any) -> None:  # n
     number = 9806
     _label(client, github, number)
     request_id = _request(number)["id"]
-    _start_running(request_id)
+    _start_running(client, request_id)
     for phase, loop_round in (("read_issue", None), ("plan", 1), ("plan_review", 1)):
         assert (
             report(client, request_id, phase, round=loop_round, declaration=STAGED_DECLARATION)
@@ -252,7 +252,7 @@ def test_platform_wait_ci_keeps_the_latest_agent_note_in_the_card(admitted: Any)
     number = 9808
     _label(client, github, number)
     request_id = _request(number)["id"]
-    _start_running(request_id)
+    _start_running(client, request_id)
     note = "Review passed and publication requested"
     for phase, loop_round, progress_note in (
         ("implement", 1, None),
@@ -307,7 +307,7 @@ def test_terminal_cause_selects_the_card_pill_at_the_route(
     number = 9807
     _label(client, github, number)
     request_id = _request(number)["id"]
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     assert (
         report(client, request_id, "implement", round=1, declaration=STAGED_DECLARATION)
         .status_code

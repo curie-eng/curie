@@ -322,4 +322,3 @@ stack runs on the baked defaults without one). Load-bearing facts:
   and keys `pk-lf-curie-dev` / `sk-lf-curie-dev`, so the OTel path
   authenticates on first boot with no manual key-minting. Read traces back via
   `curl -u pk-lf-curie-dev:sk-lf-curie-dev http://localhost:23000/api/public/...`. <!-- gitleaks:allow -->
-

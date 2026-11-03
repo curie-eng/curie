@@ -116,6 +116,12 @@ class LockLease:
         self.token = token
         self._lost = False
 
+    @property
+    def lost(self) -> bool:
+        """True once a renewal or fence found the token gone; never resets."""
+
+        return self._lost
+
     def mark_lost(self) -> None:
         self._lost = True
 

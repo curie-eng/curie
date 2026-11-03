@@ -35,7 +35,7 @@ from channel_protocol import work_item_events
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker.approvals import PublicationLineage
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.binding import FactoryContext, FactoryWake
+from curie_worker.binding import FactoryContext, FactoryWake, HttpIdentityBinding
 from curie_worker.delivery_lease import DeliveryLease, DeliveryLeaseStore
 from curie_worker.kernel import routing as kernel_routing
 from curie_worker.sandbox import MissingAgentPoolError, QuotaRejection
@@ -106,6 +106,19 @@ def _ci_text(round_: int = 2) -> str:
 
 
 class _Binding:
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = AGENT_ID
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
     def _deployment(self) -> object:
         return SimpleNamespace(
             agent_id=AGENT_ID,

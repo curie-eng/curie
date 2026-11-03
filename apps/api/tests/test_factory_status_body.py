@@ -605,3 +605,12 @@ def test_github_follow_up_recognition_is_unchanged() -> None:
         issue_link=_RELABEL_URL,
         comment_prefix=_GITHUB_PREFIX,
     )
+
+
+def test_admission_wait_expiry_result_uses_neutral_wording() -> None:
+    body = result_section("capacity_wait_expired", pr_url=None)
+    assert body.splitlines()[0] == (
+        "Could not complete: sandbox admission did not complete before the wait expired."
+    )
+    assert "Cause: capacity_wait_expired" in body
+    assert "no runner capacity" not in body

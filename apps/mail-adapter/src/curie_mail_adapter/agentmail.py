@@ -174,7 +174,7 @@ class HttpResult:
 def request(
     method: str,
     url: str,
-    body: dict[str, Any] | None = None,
+    body: dict[str, Any] | bytes | None = None,
     headers: dict[str, str] | None = None,
     *,
     max_response_bytes: int = 1_048_576,
@@ -184,8 +184,13 @@ def request(
 
     A 3xx is never followed; it comes back as its own status, which every caller
     already treats as a failure. ``opener`` defaults to the module's unpinned one.
+    A ``bytes`` body is sent exactly as given, for a request whose signature
+    covers its bytes.
     """
-    data = json.dumps(body).encode() if body is not None else None
+    if isinstance(body, bytes):
+        data: bytes | None = body
+    else:
+        data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Content-Type", "application/json")
     for key, value in (headers or {}).items():

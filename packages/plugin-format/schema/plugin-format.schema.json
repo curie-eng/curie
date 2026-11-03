@@ -251,6 +251,41 @@
       "title": "ConnectorResources",
       "type": "object"
     },
+    "ConnectorRoute": {
+      "additionalProperties": false,
+      "description": "One non-MCP route a hosted connector serves its bundle's stdio servers.\n\nADR 0240 decision 1. ``callers`` names stdio servers in the bundle's own MCP\nconfig; ``validate_bundle`` checks them, because this file cannot see that\nconfig.",
+      "properties": {
+        "callers": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Callers",
+          "type": "array"
+        },
+        "max_body_bytes": {
+          "title": "Max Body Bytes",
+          "type": "integer"
+        },
+        "methods": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Methods",
+          "type": "array"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "max_body_bytes",
+        "callers"
+      ],
+      "title": "ConnectorRoute",
+      "type": "object"
+    },
     "ConnectorSpec": {
       "additionalProperties": false,
       "description": "One declared connector. Exactly one of ``image``, ``build`` or ``url``.\n\nStrict, unlike the rest of this package. The leniency mandate exists because\nreal Claude Code plugin bundles carry keys this MVP does not model, and\nrejecting them would reject valid bundles. ``connectors.yaml`` is not a\nClaude Code artifact -- it is Curie's own file with no external producer, so\nan unrecognised key is a typo, and silently ignoring it would mean a\nconnector that renders subtly wrong with no diagnostic.",
@@ -384,6 +419,13 @@
             }
           ],
           "default": null
+        },
+        "routes": {
+          "items": {
+            "$ref": "#/$defs/ConnectorRoute"
+          },
+          "title": "Routes",
+          "type": "array"
         },
         "sealed_secrets": {
           "additionalProperties": {

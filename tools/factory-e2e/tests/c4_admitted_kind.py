@@ -29,8 +29,15 @@ import httpx
 import scripted_kind as sk
 from aci_protocol import RUNS_STREAM_DEFAULT, STREAM_PAYLOAD_FIELD, QueuedTurn
 from c4_admitted_http import gitlab, jira, marker_model_type, tracker_stub_type
-from c4_shared_install import CaseIsolationError, InstallSnapshot, leftover_state
+from c4_shared_install import (
+    CaseIsolationError,
+    InstallSnapshot,
+    case_owned_streams,
+    leftover_state,
+)
 from curie_telemetry.redact import redact_text
+
+_SCRIPTED_INPUTS = (sk._module, sk.scripted_values, sk.tempfile.mkdtemp)
 
 ROOT = Path(__file__).resolve().parents[3]
 REPOSITORY = "acme-corp/acme-bot"
@@ -635,7 +642,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
             "curie",
             "--locked",
             "-j",
-            "2",
+            self.env.get("CARGO_BUILD_JOBS", "2"),
             timeout=1800,
         )
         for name in ("api", "worker", "ui"):
@@ -655,7 +662,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         values = original(**kwargs)
         host = urlsplit(self.stub.base_url).netloc
         factory = values["factory"]
-        # Matches the GitLab and Jira trackers below; shortens each case's admission and reset wait.
+        factory["baseLabelSettleSeconds"] = 0
         for tracker in factory["trackers"]:
             if tracker.get("kind") == "github":
                 tracker["pollIntervalSeconds"] = 1
@@ -990,7 +997,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
             keys.update(str(key) for key in batch)
             cursor = str(cursor)
             if cursor == "0":
-                return frozenset(keys)
+                return case_owned_streams(keys)
 
     def table_rows(self) -> tuple[tuple[str, int], ...]:
         counts = self.sql(TABLE_ROWS_QUERY)
@@ -1786,9 +1793,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
 
 
 def configure_harness(monkeypatch: Any, run: AdmittedKind) -> None:
-    load_module = sk._module
-    values = sk.scripted_values
-    mkdtemp = sk.tempfile.mkdtemp
+    load_module, values, mkdtemp = _SCRIPTED_INPUTS
 
     def external_module(name: str, path: Path) -> Any:
         loaded = load_module(name, path)

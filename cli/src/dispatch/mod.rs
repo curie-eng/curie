@@ -676,6 +676,22 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
         Some(Command::Skill { action }) => skill_action::run(action).await,
         Some(Command::Local { action }) => local_action::run(action).await,
         Some(Command::Factory { action }) => match action {
+            FactoryAction::Skills {
+                action:
+                    AgentSkillsAction::Install {
+                        agent,
+                        global,
+                        dir,
+                        dry_run,
+                    },
+            } => emit_boxed(curie::examples::install_curie_skills(
+                curie::agent_skills::InstallOptions {
+                    agent,
+                    global,
+                    dir,
+                    dry_run,
+                },
+            )?),
             FactoryAction::Quickstart {
                 repos,
                 app_id,

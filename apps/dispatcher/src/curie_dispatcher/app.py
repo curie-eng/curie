@@ -24,6 +24,7 @@ from slack_sdk.web import WebClient
 from .admission import AdmissionGate
 from .config import DispatcherConfig, release_identity
 from .handlers import Clock, register_handlers
+from .http_receiver import HttpReceiverRuntime
 from .identities import SlackIdentityCredentials, default_identity_credentials
 from .identity import IdentityResolver
 from .socket_presence import SocketPresence
@@ -92,6 +93,7 @@ def build_app(
     identity_bots: Mapping[str, str] | None = None,
     admission: AdmissionGate | None = None,
     identity_client: IdentityResolver | None = None,
+    http_receiver: HttpReceiverRuntime | None = None,
 ) -> App:
     """Build one identity's Bolt App with the dispatcher's handlers registered.
 
@@ -108,6 +110,11 @@ def build_app(
     the production one from config in ``register_handlers``.
     """
     credentials = identity if identity is not None else default_identity_credentials(config)
+    # @spec HTTP-INVOCATION-EXECUTION-19: qualify the actual configured connection.
+    if http_receiver is not None:
+        if type(http_receiver) is not HttpReceiverRuntime:
+            raise ValueError("invalid_http_receiver_runtime")
+        http_receiver.validate_connection(credentials.name, web_client)
     signing = credentials.signing_secret or _SOCKET_MODE_SIGNING_PLACEHOLDER
     app_kwargs: dict[str, Any] = {}
     app_kwargs["signing_secret"] = signing
@@ -142,6 +149,8 @@ def build_app(
         register_kwargs["admission"] = admission
     if identity_client is not None:
         register_kwargs["identity_client"] = identity_client
+    if http_receiver is not None:
+        register_kwargs["http_receiver"] = http_receiver
     register_handlers(app, **register_kwargs)
     return app
 

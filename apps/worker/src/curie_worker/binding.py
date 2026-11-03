@@ -70,7 +70,7 @@ import urllib.request
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from urllib.parse import quote
 
 import aiohttp
@@ -84,9 +84,15 @@ from aci_protocol.turn import (
     matching_routes,
 )
 from curie_internal import sandbox_token
+from curie_internal.identity_approval import ApprovalGrantExpectationV1
+from curie_internal.identity_authority import (
+    BindingClassificationRequestV1,
+    BindingClassificationResponseV1,
+    TurnAuthorityScopeV1,
+)
 from curie_internal.sealing_key import is_sealing_key_name
 from plugin_format import is_reserved_boot_env_name
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -115,6 +121,9 @@ PLUGIN_DIR_ENV = BootEnv.env_key("plugin_dir")
 BUDGET_ENV = BootEnv.env_key("budget")
 MAX_TURNS_ENV = BootEnv.env_key("max_turns")
 CONNECTOR_CALLER_TOKEN_ENV = BootEnv.env_key("connector_caller_token")
+# ADR 0240 decision 2. Not a BootEnv field: the worker writes it beside the
+# render, like CURIE_CONNECTOR_TOOL_GRANT. A JSON object, connector -> ccr.
+CONNECTOR_ROUTE_TOKENS_ENV = "CURIE_CONNECTOR_ROUTE_TOKENS"
 SESSION_ID_ENV = BootEnv.env_key("session_id")
 FAKE_MODEL_ENV = BootEnv.env_key("fake_model")
 CREDENTIALS_ENV = BootEnv.env_key("credentials_ref")
@@ -310,6 +319,20 @@ def _parse_resume_event_id(event_id: str) -> uuid.UUID | None:
 # a second tenant exists. A frozen copy: this package does not import the API's.
 DEFAULT_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
+# @spec HTTP-INVOCATION-EXECUTION-17 HTTP-INVOCATION-EXECUTION-22
+# The SQL non-nullness of the tenant's selection only says whether to ask the
+# API: the registered identity decides whether this binding requires HTTP.
+_IDENTITY_BINDING_SQL = """
+SELECT c.id AS binding_id, c.agent_id, c.tenant_id,
+       c.generation AS binding_generation, c.kind, c.address, c.endpoint, c.adapter,
+       (i.http_selection IS NOT NULL) AS http_selected
+FROM {schema}.agent_channels c
+JOIN {schema}.agents a ON a.id = c.agent_id AND a.tenant_id = c.tenant_id
+LEFT JOIN {schema}.tenant_identity_providers i ON i.tenant_id = c.tenant_id
+WHERE c.kind = :kind AND c.address = :address AND c.tenant_id = :tenant_id
+"""
+
+
 # The trailing `d.id DESC` carries no meaning of its own -- id order is not a
 # precedence rule and nothing may start reading one into it. It exists only to
 # make the order TOTAL: two active deployments in the same environment with an
@@ -434,6 +457,18 @@ WHERE c.kind = :kind AND lower(c.address) = lower(:address) AND c.adapter IS NOT
 ORDER BY c.adapter
 LIMIT 1
 """
+
+
+class HttpIdentityBinding(BaseModel):
+    """Classification, not permission. @spec HTTP-INVOCATION-EXECUTION-17."""
+
+    model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
+
+    tenant_id: uuid.UUID
+    agent_id: uuid.UUID
+    binding_id: uuid.UUID
+    binding_generation: int = Field(strict=True, ge=0, le=2**63 - 1)
+    http_identity_required: bool
 
 
 class ResolvedDeployment(BaseModel):
@@ -677,6 +712,16 @@ class ChannelReadGrantAbsent(Exception):
     and stop asking; every other refusal or failure is None."""
 
 
+class BindingIdentityClassifier(Protocol):
+    """The API's per-identity answer. @spec HTTP-INVOCATION-EXECUTION-22."""
+
+    async def classify_binding(
+        self, request: BindingClassificationRequestV1,
+    ) -> BindingClassificationResponseV1:
+        """Whether this exact binding's identity is HTTP-registered."""
+        ...
+
+
 class BindingResolver:
     """Resolves a channel address to its active agent deployment (read-only).
 
@@ -698,17 +743,76 @@ class BindingResolver:
         config: WorkerConfig,
         *,
         tenant_id: uuid.UUID = DEFAULT_TENANT_ID,
+        identity_classifier: BindingIdentityClassifier | None = None,
     ) -> None:
         self._engine = engine
         self._config = config
         self._tenant_id = tenant_id
+        self._identity_classifier = identity_classifier
         # Table identifiers are not user input; the schema comes from config.
         self._sql = text(_RESOLVE_SQL.format(schema=config.db_schema))
+        self._identity_binding_sql = text(_IDENTITY_BINDING_SQL.format(schema=config.db_schema))
         self._resolve_factory_sql = text(_RESOLVE_FACTORY_SQL.format(schema=config.db_schema))
         self._factory_binding_sql = text(_FACTORY_BINDING_SQL.format(schema=config.db_schema))
         self._undeployed_binding_sql = text(_UNDEPLOYED_BINDING_SQL.format(schema=config.db_schema))
         self._resolve_agent_sql = text(_RESOLVE_AGENT_SQL.format(schema=config.db_schema))
         self._address_identity_sql = text(_ADDRESS_IDENTITY_SQL.format(schema=config.db_schema))
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-9 HTTP-INVOCATION-EXECUTION-17."""
+        if not _valid_slack_selector(kind, adapter):
+            return None
+        params = {"kind": kind, "address": address, "tenant_id": self._tenant_id}
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(self._identity_binding_sql, params)).all()
+        matches = matching_routes(rows, kind, address, adapter)
+        if not matches:
+            return None
+        mapped = [dict(row._mapping) for row in matches]
+        for row in mapped:
+            row["http_identity_required"] = await self._requires_http_identity(row)
+        if len({row["agent_id"] for row in mapped}) > 1:
+            # Every candidate is classified: an HTTP-selected one is a definitive
+            # refusal; otherwise, as for trigger-labelled trackers, no HTTP binding.
+            if any(row["http_identity_required"] for row in mapped):
+                refuse_several_agents(kind, address, mapped)
+            return None
+        current = mapped[0]
+        return HttpIdentityBinding(
+            tenant_id=current["tenant_id"], agent_id=current["agent_id"],
+            binding_id=current["binding_id"], binding_generation=current["binding_generation"],
+            http_identity_required=current["http_identity_required"],
+        )
+
+    async def _requires_http_identity(self, row: Mapping[str, Any]) -> bool:
+        """Ask the API only for a selected tenant. @spec HTTP-INVOCATION-EXECUTION-22.
+
+        Without a classifier a selected tenant still requires HTTP identity, as
+        before per-identity application. A classifier failure propagates, so the
+        kernel treats it as unavailable and never as legacy.
+        """
+        if row["http_selected"] is not True:
+            return False
+        if self._identity_classifier is None:
+            return True
+        request = BindingClassificationRequestV1(
+            schema_version=1,
+            request_id=str(uuid.uuid4()),
+            scope=TurnAuthorityScopeV1(
+                tenant_id=str(row["tenant_id"]), agent_id=str(row["agent_id"]),
+                binding_id=str(row["binding_id"]),
+                binding_generation=row["binding_generation"],
+            ),
+        )
+        result = await self._identity_classifier.classify_binding(request)
+        if (
+            type(result) is not BindingClassificationResponseV1
+            or result.request_id != request.request_id or result.scope != request.scope
+        ):
+            raise ValueError("invalid_binding_classification")
+        return result.http_identity_required
 
     async def resolve(
         self, kind: str, adapter: str | None, address: str
@@ -830,11 +934,13 @@ class BindingResolver:
         A re-fetch of an earlier attachment resolves its route from these and
         never from anything recorded with the file, so a removed binding makes
         the file unavailable and a moved adapter endpoint is followed. Read
-        only; the address is not returned because no re-fetch needs it.
+        only. The private lazy broker also matches the exact binding identity,
+        generation and address authorized by the API.
         """
 
         sql = text(
-            f"SELECT kind, adapter, endpoint FROM {self._config.db_schema}.agent_channels "
+            f"SELECT id, generation, address, kind, adapter, endpoint "
+            f"FROM {self._config.db_schema}.agent_channels "
             "WHERE agent_id = :id AND tenant_id = :tenant_id "
             "ORDER BY kind, adapter NULLS FIRST, endpoint NULLS FIRST"
         )
@@ -842,7 +948,10 @@ class BindingResolver:
             result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             rows = result.all()
         return [
-            AgentRoute(kind=str(row.kind), adapter=row.adapter, endpoint=row.endpoint)
+            AgentRoute(
+                kind=str(row.kind), adapter=row.adapter, endpoint=row.endpoint,
+                binding_id=row.id, generation=row.generation, address=row.address,
+            )
             for row in rows
         ]
 
@@ -972,6 +1081,47 @@ class BindingResolver:
             return None
         arguments: Any = row["granted_arguments"]
         return arguments if isinstance(arguments, dict) else None
+
+    async def approval_grant_snapshot(
+        self, event_id: str, agent_id: uuid.UUID
+    ) -> ApprovalGrantExpectationV1 | None:
+        """One coherent detached read of an approved row's effect fields.
+
+        A value to submit to the current core check, never a grant by itself.
+        A malformed approved row raises ``ValueError("invalid_approval_grant")``
+        rather than degrading to no grant. @spec HTTP-APPROVAL-CONTINUITY-12.
+        """
+        approval_id = _parse_resume_event_id(event_id)
+        if approval_id is None:
+            return None
+        sql = text(
+            f"SELECT status, agent_id, conversation_id, gate_kind, granted_tool, "
+            f"granted_arguments FROM {self._config.db_schema}.approvals WHERE id = :id"
+        )
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": approval_id})
+            row = result.mappings().first()
+            if row is None or row["status"] != "approved":
+                return None
+            if row["agent_id"] is None or row["agent_id"] != agent_id:
+                return None
+            try:
+                arguments: Any = row["granted_arguments"]
+                if arguments is not None and type(arguments) is not dict:
+                    raise ValueError
+                return ApprovalGrantExpectationV1(
+                    approval_id=str(approval_id),
+                    agent_id=str(row["agent_id"]),
+                    conversation_id=row["conversation_id"],
+                    gate_kind=row["gate_kind"],
+                    granted_tool=row["granted_tool"],
+                    granted_arguments_json=None if arguments is None else json.dumps(
+                        arguments, sort_keys=True, separators=(",", ":"),
+                        ensure_ascii=False, allow_nan=False,
+                    ),
+                )
+            except (ValueError, TypeError, RecursionError):
+                raise ValueError("invalid_approval_grant") from None
 
     async def approval_resumed_kind(self, event_id: str, agent_id: uuid.UUID) -> str | None:
         """The gate provenance of the approval a resume turn is resuming (#544,
@@ -1231,6 +1381,7 @@ class BindingResolver:
         caller_work_item: str | None = None,
         caller_exp_ceiling: int | None = None,
         token_ttl_s: float | None = None,
+        route_connectors: frozenset[str] = frozenset(),
     ) -> dict[str, str]:
         """The env injected into the sandbox claim for a bound run.
 
@@ -1365,6 +1516,9 @@ class BindingResolver:
         # which is the stock install. render_worker emits it only with the
         # connector scope.
         connector_caller_token: str | None = None
+        # ADR 0240 decision 2: one ccr per hosted connector that declares
+        # routes, with the caller token's own claims and expiry.
+        route_tokens: dict[str, str] = {}
         if self._config.connector_caller_signing_key.strip():
             caller_exp = int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS
             if caller_exp_ceiling is not None:
@@ -1376,6 +1530,15 @@ class BindingResolver:
                 run=caller_run,
                 work_item=caller_work_item,
             )
+            for connector in sorted(route_connectors):
+                route_tokens[connector] = caller_token.mint_route(
+                    self._config.connector_caller_signing_key,
+                    agent=resolved.agent_name,
+                    connector=connector,
+                    exp=caller_exp,
+                    run=caller_run,
+                    work_item=caller_work_item,
+                )
         env = BootEnv.render_worker(
             plugin_dir=self._config.bundle_plugin_dir,
             session_id=f"agent-{resolved.agent_id}-thread-{thread_key}",
@@ -1412,6 +1575,11 @@ class BindingResolver:
             or None,
             deployment_environment=resolved.deployment_environment or None,
             fake_model=self._config.fake_model,
+            attachment_access_enabled=(
+                True
+                if self._config.attachment_enabled and self._config.attachment_mode == "lazy"
+                else None
+            ),
             credentials_ref=self._config.credentials,
             base_url=self._config.model_base_url,
             # The endpoint's declared wire protocol and credential key(s) (#514).
@@ -1456,6 +1624,13 @@ class BindingResolver:
         # keys, and stays the marker's sole writer -- see the
         # inject_connector_secrets docstring for the #457/#429 rationale.
         inject_connector_secrets(env, resolved.secrets, agent_label=resolved.agent_id)
+        # ADR 0240 decision 2. Only beside a rendered caller token, which
+        # render_worker emits with the connector scope or not at all, so a
+        # route token never reaches a sandbox that has no Service to call.
+        if route_tokens and CONNECTOR_CALLER_TOKEN_ENV in env:
+            env[CONNECTOR_ROUTE_TOKENS_ENV] = json.dumps(
+                route_tokens, sort_keys=True, separators=(",", ":")
+            )
         # #1909: default local/cluster eval is a static bundle-plus-cases gate.
         # Ambient durable memory is per-agent, so a fresh thread still loaded
         # it and could change a committed case. The CLI marks those turns with

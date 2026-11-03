@@ -47,7 +47,7 @@ from channel_protocol.reply import (
     TurnCompleted,
 )
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.binding import BUDGET_ENV, BUNDLE_REF_ENV, ResolvedDeployment
+from curie_worker.binding import BUDGET_ENV, BUNDLE_REF_ENV, HttpIdentityBinding, ResolvedDeployment
 from curie_worker.reply_sink import TargetRoute
 
 # importlib import mode does not add the test root to sys.path.
@@ -77,6 +77,21 @@ class OneAgentTwoBindings:
     the agent to decide where to reply would have exactly one answer to give and
     would give it to both turns.
     """
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        if (kind, address) not in (("slack", CHANNEL_A), ("slack", CHANNEL_B)):
+            return None
+        agent_id = self.agent_id
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
 
     def __init__(self) -> None:
         self.agent_id = uuid.uuid4()

@@ -138,7 +138,7 @@ def test_label_routing_poll_one_pass_reads_the_repository_once_and_lists_each_la
         (request, *_rest) = _work(number)
         pull = factory.github.plant_pull()
         _own_pull_request(request["work_item_id"], pull)
-        _complete(request["id"])
+        _complete(factory.client, request["id"])
         factory.github.add_review(pull, next(_REVIEW_IDS), f"@{MENTION} rename it")
         pulls.append(pull)
     _seed_pre_label_cursor()

@@ -37,10 +37,11 @@ import uuid
 from collections.abc import Awaitable, Callable
 
 from curie_telemetry import operation_span
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from opentelemetry.trace import SpanKind
 from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import errors as crud_errors
@@ -52,13 +53,27 @@ from curie_api.schemas.approvals import (
     ApprovalReplyIdentityDeclaration,
 )
 
-from ..approval_auth import ApprovalPrincipalDep
+from ..approval_auth import (
+    APPROVAL_PRINCIPAL_HEADER,
+    ApprovalPrincipalDep,
+    AuthenticatedApprovalPrincipal,
+)
+from ..approvers import ApproverSetSelector
 from ..auth import require_platform_key
 from ..config import get_settings
-from ..deps import ResumeQueueDep, SessionDep
+from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep
+from ..identity.http_approval import approval_is_selected, identity_runtime
+from ..identity.http_approval_answer import (
+    PROOF_HEADER,
+    ApprovalAnswer,
+    ApprovalSettled,
+    answer_http_approval,
+    publish_answered_resume,
+)
+from ..identity_fence import lock_identity_reader
 from ..models import AgentChannel, Approval, ApprovalAuditEntry, ApprovalStatus
 from ..remediation_approvals import REMEDIATION_PURPOSE, settle_remediation_approval
-from ..resumequeue import approval_trace_context, build_resume_turn
+from ..resumequeue import ResumeQueue, approval_trace_context, build_resume_turn
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +271,8 @@ async def recover_approval(
     session: SessionDep,
     resume_queue: ResumeQueueDep,
     principal: ApprovalPrincipalDep,
+    request: Request,
+    approver_sets: ApproverSetSelectorDep,
 ) -> ApprovalRecoveryOut:
     """Settle a stranded approval as ``rejected`` and wake its session.
 
@@ -272,6 +289,15 @@ async def recover_approval(
     approval = await crud_approvals.get_approval(session, approval_id)
     if approval is None:
         raise _not_found()
+    # @spec HTTP-APPROVAL-CONTINUITY-7/10: a selected row additionally needs an
+    # authenticated Slack actor with current approver and original-invoker
+    # authority; platform-key-only recovery refuses before any mutation.
+    if await approval_is_selected(
+        session, approval, runtime=identity_runtime(request.app.state),
+    ):
+        return await _recover_selected(
+            approval, data, session, principal, request, approver_sets, resume_queue,
+        )
     recorded = await crud_approvals.find_recovery_audit(session, data.recovery_key)
     if recorded is not None:
         return _replayed_recovery(approval, recorded, data.recovery_key)
@@ -280,6 +306,18 @@ async def recover_approval(
     # Release the read transaction: the atomic function below opens one of its
     # own, and a session already inside a transaction cannot begin another.
     await session.commit()
+
+    async def still_legacy(settling: AsyncSession) -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-14: classify again in the settling transaction.
+
+        A role change or adoption committed since the classification above
+        refuses as a selected row without an authenticated actor does.
+        """
+        await lock_identity_reader(settling)
+        if await approval_is_selected(
+            settling, approval, runtime=identity_runtime(request.app.state),
+        ):
+            raise HTTPException(status.HTTP_409_CONFLICT, "unsupported_approval")
 
     try:
         with operation_span(
@@ -297,6 +335,7 @@ async def recover_approval(
                 actor_channel=principal.actor_channel,
                 principal_kind=principal.kind,
                 facts=facts,
+                guard=still_legacy,
             )
     except crud_errors.PublicationSettlementConflict as exc:
         # The approval's publication moved between the read and the settlement.
@@ -337,6 +376,64 @@ async def recover_approval(
         await resume_queue.enqueue(build_resume_turn(recovered), parent=stored_parent)
         await crud_approvals.mark_approval_resumed(session, approval_id)
     return _recovery_out(recovered, data.recovery_key)
+
+
+async def _recover_selected(
+    approval: Approval,
+    data: ApprovalRecover,
+    session: SessionDep,
+    principal: AuthenticatedApprovalPrincipal,
+    request: Request,
+    approver_sets: ApproverSetSelector,
+    resume_queue: ResumeQueue,
+) -> ApprovalRecoveryOut:
+    """Recovery of a selected row through the approval commit owner.
+
+    Eligibility and recovery-key replay are unchanged; the actor is recorded and
+    the row resealed in the same recovery/audit commit, and the wake stays owed.
+    @spec HTTP-APPROVAL-CONTINUITY-10.
+    """
+
+    proof = request.headers.get(PROOF_HEADER)
+    attestation = request.headers.get(APPROVAL_PRINCIPAL_HEADER)
+    if proof is None or attestation is None or principal.kind != "chat":
+        raise HTTPException(status.HTTP_409_CONFLICT, "unsupported_approval")
+    recorded = await crud_approvals.find_recovery_audit(session, data.recovery_key)
+    if recorded is not None:
+        return _replayed_recovery(approval, recorded, data.recovery_key)
+    facts = await _observed_facts(session, approval)
+    await session.commit()
+    try:
+        recovered = await answer_http_approval(
+            request, approval.id, principal=principal, approver_sets=approver_sets,
+            answer=ApprovalAnswer(
+                operation="recover", decision="rejected", note=data.reason,
+                body=await request.body(), attestation=attestation, proof=proof,
+                recovery_key=data.recovery_key, recovery_facts=tuple(facts),
+            ),
+        )
+    except ApprovalSettled:
+        current = await crud_approvals.reread_approval(session, approval.id)
+        if current is None:
+            raise _not_found() from None
+        recorded = await crud_approvals.find_recovery_audit(session, data.recovery_key)
+        if recorded is not None:
+            return _replayed_recovery(current, recorded, data.recovery_key)
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"approval is already {current.status} and was not recovered under this recovery_key",
+        ) from None
+    logger.warning(
+        "approval %s administratively recovered as rejected by %s (key %s)",
+        approval.id, principal.subject, data.recovery_key,
+    )
+    # @spec HTTP-APPROVAL-CONTINUITY-10/11: the wake publishes only after the commit.
+    out = _recovery_out(recovered, data.recovery_key)
+    await publish_answered_resume(
+        session, resume_queue, recovered,
+        reconciler_enabled=get_settings().resume_reconciler_enabled,
+    )
+    return out
 
 
 def _recovery_out(approval: Approval, recovery_key: str) -> ApprovalRecoveryOut:

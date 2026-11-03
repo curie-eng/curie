@@ -53,6 +53,7 @@ pub const NOMINATION_REFUSALS: &[&str] = &[
     "arguments_schema_mismatch",
     "agent_stopped",
     "reply_surface_unavailable",
+    "http_identity_selected",
     "tune_execution_not_automated",
 ];
 

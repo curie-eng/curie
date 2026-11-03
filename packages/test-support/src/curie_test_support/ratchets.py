@@ -105,6 +105,32 @@ def ancestor_baseline(root: Path, reference: str | None = None) -> dict[str, Any
     return baseline_value(json.loads(content.stdout))
 
 
+def authority_baseline(
+    root: Path, ancestor: dict[str, Any] | None, previous: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    baselines = [ancestor or previous]
+    for reference in ("origin/main", "origin/next"):
+        exists = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/{reference}^{{commit}}"],
+            cwd=root,
+            capture_output=True,
+        )
+        if exists.returncode == 0:
+            baselines.append(ancestor_baseline(root, reference))
+    accepted = [value for value in baselines if value is not None]
+    if not accepted:
+        return None
+    sleeps: dict[str, int] = {}
+    for value in accepted:
+        for path, count in value["sleeps"].items():
+            sleeps[path] = max(sleeps.get(path, 0), count)
+    return {
+        "sleeps": sleeps,
+        "fixtures": sorted({item for value in accepted for item in value["fixtures"]}),
+        "durations": sorted({item for value in accepted for item in value["durations"]}),
+    }
+
+
 def python_files(root: Path) -> list[Path]:
     tracked = subprocess.run(
         ["git", "ls-files", "--cached", "--others", "--exclude-standard", "--", "*.py"],
@@ -447,7 +473,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         previous = read_baseline(path) if args.regenerate and path.exists() else None
         if not args.regenerate:
             previous = read_baseline(path)
-        ancestor = ancestor_baseline(root, args.base_ref)
+        base_ancestor = ancestor_baseline(root, args.base_ref)
+        ancestor = authority_baseline(root, base_ancestor, previous)
         inventory = scan(root)
         observations = duration_observations(args.durations) if args.durations else Durations()
         durations = set(previous["durations"]) if previous else set()
@@ -470,7 +497,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         repository = subprocess.run(
             ["git", "rev-parse", "--git-dir"], cwd=root, capture_output=True
         )
-        establishing_baseline = args.regenerate and ancestor is None and repository.returncode == 0
+        establishing_baseline = (
+            args.regenerate and base_ancestor is None and repository.returncode == 0
+        )
         authority = None if establishing_baseline else ancestor or previous
         errors = growth(actual, authority) if authority else []
         if previous and ancestor:

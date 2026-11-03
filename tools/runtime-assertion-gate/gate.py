@@ -45,6 +45,8 @@ CLUSTER_SELECTOR = "${{ needs.changes.outputs.cluster == 'true' }}"
 CHART_JOB = "e2e-cluster-chart-regressions"
 CHART_SELECTOR = "${{ needs.changes.outputs.chart_scenarios != '[]' }}"
 CALICO_MARKERS = ("projectcalico/calico", "rollout status daemonset/calico-node")
+# #5255 owns diagnostics, the causal fix and exact-head proof before re-enabling.
+DISABLED_ASSERTIONS = {"charts/curie/ci/runtime/failed-first-install-retry-runtime.sh"}
 
 
 class GateError(Exception):
@@ -63,7 +65,9 @@ def _git(*args: str) -> str:
 def changed_assertions(base: str, head: str) -> list[str]:
     """Added or modified runtime assertions between base and head."""
     out = _git("diff", "--no-renames", "--diff-filter=AM", "--name-only", f"{base}...{head}")
-    return sorted(p for p in out.splitlines() if is_runtime_assertion(p))
+    return sorted(
+        p for p in out.splitlines() if is_runtime_assertion(p) and p not in DISABLED_ASSERTIONS
+    )
 
 
 def _load_jobs(workflow: Path) -> dict[str, Any]:

@@ -19,8 +19,10 @@ from curie_worker.sandbox import (
     SandboxHandle,
     SandboxSubstrate,
 )
+from curie_worker.sandbox.types import AdmissionUnavailableError, SandboxError, ToolDaemonMount
 
 from .conftest import FakeSandboxClient
+from .test_tool_daemon import BASE, BASE_POOL, REPO, _entry
 
 HARD = {
     "pods": "2",
@@ -145,21 +147,25 @@ class AdmissionClient(FakeSandboxClient):
         name: str,
         *,
         pool: str,
+        deadline: float,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
         runner_resources: dict[str, object] | None = None,
         agent_name: str | None = None,
         executor_secret_names: frozenset[str] | None = None,
+        tool_daemon: ToolDaemonMount | None = None,
     ) -> None:
         with self.lock:
             super().create_claim(
                 name,
                 pool=pool,
+                deadline=deadline,
                 env=env,
                 labels=labels,
                 runner_resources=runner_resources,
                 agent_name=agent_name,
                 executor_secret_names=executor_secret_names,
+                tool_daemon=tool_daemon,
             )
             footprint = self.claim_resources(
                 pool=pool,
@@ -396,7 +402,7 @@ def test_unreadable_capacity_fails_closed_before_credentials(
     substrate = make_substrate(client, affinity, key_prefix)
     minted: list[object] = []
     substrate.set_boot_credential_minter(lambda env: minted.append(env) or dict(env))
-    with pytest.raises(TimeoutError, match="capacity read unavailable"):
+    with pytest.raises(AdmissionUnavailableError, match="admission inventory unavailable"):
         substrate.claim("unreadable", env={})
     assert client.created == minted == []
     setattr(client, f"{failure}_error", None)
@@ -438,3 +444,34 @@ def test_selected_larger_agent_footprint_limits_mixed_claims(
     substrate.claim("small-a", agent_name="small-agent")
     substrate.claim("small-b", agent_name="small-agent")
     assert len(client.created) == 3
+
+
+def test_a_daemon_provisioning_failure_releases_its_reservation_at_once(
+    affinity: AffinityStore, key_prefix: str
+) -> None:
+    """Admission with a Docker-enabled repository (ADR 0217): no claim was submitted."""
+    client = AdmissionClient()
+    client.hard = dict(SMALL)
+    base = make_substrate(client, affinity, key_prefix, hard=SMALL)
+    substrate = SandboxSubstrate(
+        client,
+        affinity,
+        replace(
+            base._config,  # noqa: SLF001
+            warm_pool=BASE_POOL,
+            repo_runner_pools={REPO: _entry()},
+            platform_runner_digest=BASE,
+        ),
+    )
+    boom = SandboxError("admission refused the Pod")
+    client.daemon_failures[("create", "Pod")] = boom
+
+    with pytest.raises(SandboxError) as raised:
+        substrate.claim("daemon-fails", workspace_repo=REPO)
+
+    assert raised.value is boom
+    assert client.created == []
+    assert affinity.admission_entries("test-ns", "acme-sandbox-quota") == {}
+    # The quota fits one claim, so a reservation kept until the reconcile
+    # grace would refuse this one.
+    assert substrate.claim("next").claim_name in client.claims

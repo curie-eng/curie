@@ -4,6 +4,7 @@
 //! local runner container (via the generated `curie-aci-protocol` crate) and
 //! the platform API's committed OpenAPI surface. Task I1.
 
+pub mod agent_skills;
 pub mod api;
 pub mod api_requests;
 pub mod approval_wording;

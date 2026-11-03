@@ -21,6 +21,7 @@ from ..models import (
     AgentVersion,
     Deployment,
     WorkItem,
+    WorkspaceRecoveryGroup,
 )
 from ..publication_policy import PublicationPolicyConflict
 
@@ -108,7 +109,21 @@ async def get_agent(session: AsyncSession, agent_id: uuid.UUID) -> Agent | None:
     return await session.get(Agent, agent_id)
 
 
+class RecoveryRetained(Exception):
+    pass
+
+
 async def delete_agent(session: AsyncSession, agent_id: uuid.UUID) -> None:
+    await session.scalar(select(Agent).where(Agent.id == agent_id).with_for_update())
+    item_ids = list(await session.scalars(
+        select(WorkItem.id).where(WorkItem.agent_id == agent_id)
+        .order_by(WorkItem.id).with_for_update()
+    ))
+    if item_ids and await session.scalar(
+        select(WorkspaceRecoveryGroup.work_item_id)
+        .where(WorkspaceRecoveryGroup.work_item_id.in_(item_ids)).limit(1)
+    ):
+        raise RecoveryRetained()
     # Remove child rows first, then the agent. Bulk deletes bypass the ORM
     # relationship cascade (which would emit an async lazy-load during flush) and
     # match the FK ondelete=CASCADE already declared on every child table. Bundle

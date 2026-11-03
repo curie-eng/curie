@@ -68,6 +68,7 @@ class ChannelCampaignGuard:
         phase: PhaseSource,
         transport: ObservationTransport,
         deadline_s: float = 30.0,
+        acl_deadline_s: float | None = None,
     ) -> None:
         try:
             _require(
@@ -76,6 +77,10 @@ class ChannelCampaignGuard:
             _require(type(control) is ReobservationSet and type(acl) is AclPrincipalStateProducer)
             _require(callable(phase) and callable(getattr(transport, "require", None)))
             _require(type(deadline_s) in (int, float) and 0 < deadline_s <= 120)
+            _require(
+                acl_deadline_s is None
+                or (type(acl_deadline_s) in (int, float) and 0 < acl_deadline_s <= deadline_s)
+            )
             expected = {name: premeasured[name] for name in OBSERVATION_FACTS}
             _require(all(type(v) is str and len(v) == 64 for v in expected.values()))
             # The ACL baseline belongs to the installation whose bootstrap B is measured.
@@ -86,6 +91,7 @@ class ChannelCampaignGuard:
             _refuse()
         self._expected, self._control, self._acl = expected, control, acl
         self._phase, self._transport, self._deadline = phase, transport, deadline_s
+        self._acl_deadline = acl_deadline_s
         self._gate = asyncio.Lock()
         self._failed = False
         self._latencies: list[int] = []
@@ -115,11 +121,16 @@ class ChannelCampaignGuard:
             async with self._gate:
                 _require(not self._failed)
                 started = time.monotonic()
-                async with asyncio.timeout(self._deadline):
+                async with asyncio.timeout(self._deadline) as aggregate:
                     observed = await self._control.reobserve()
                     _require(observed == self._expected)
-                    await self._acl.require(self._phase())
+                    # The ACL stage has its own optional budget; the aggregate
+                    # also covers producers and the signed provisioner roundtrip.
+                    async with asyncio.timeout(self._acl_deadline) as acl_limit:
+                        await self._acl.require(self._phase())
+                    _require(not acl_limit.expired())
                     await self._transport.require(observed)
+                _require(not aggregate.expired())
                 self._latencies.append(round((time.monotonic() - started) * 1000))
         except BaseException as error:
             self._failed = True

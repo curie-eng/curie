@@ -59,6 +59,7 @@ from ..runner_client import (
 )
 from ..sandbox.quota import capacity_rejection_is_valid
 from ..sandbox.types import (
+    AdmissionUnavailableError,
     CapacityExhaustedError,
     MissingAgentPoolError,
     SandboxError,
@@ -86,6 +87,7 @@ if TYPE_CHECKING:
 
 from . import (
     approval,
+    attachment_access,
     channel_read,
     claim,
     clock,
@@ -178,6 +180,8 @@ async def _attempt(
 
     record = memory._AttemptMemoryTurns(agent_id=agent_id)
     reset = constants._MEMORY_TURNS.set(record)
+    aa_record = attachment_access.AttemptAttachmentAccess()
+    aa_reset = constants._ATTACHMENT_ACCESS_ATTEMPT.set(aa_record)
     cr_record = channel_read._AttemptChannelRead()
     cr_reset = constants._CHANNEL_READ_TURNS.set(cr_record)
     try:
@@ -199,6 +203,7 @@ async def _attempt(
             channel_read_grant=channel_read_grant,
         )
     finally:
+        constants._ATTACHMENT_ACCESS_ATTEMPT.reset(aa_reset)
         constants._MEMORY_TURNS.reset(reset)
         constants._CHANNEL_READ_TURNS.reset(cr_reset)
         # The lease heartbeat is a child of this attempt: it stops here, so a
@@ -209,6 +214,7 @@ async def _attempt(
             self._settle_memory_turns(record)
         if cr_record.pending():
             self._settle_channel_read(cr_record)
+        await attachment_access.close_attachment_access(self, aa_record)
 
 
 async def _attempt_turn(
@@ -252,8 +258,14 @@ async def _attempt_turn(
     placeholder = None if handle is None else handle.placeholder
     defer_job_booting = placeholder is None and qevent.source.is_job
     defer_review_booting = placeholder is None and review_candidate
+    # @spec HTTP-INVOCATION-EXECUTION-3/18: adopted work posts only after actual start.
+    from .identity import CURRENT
+
+    identity_carry = CURRENT.get()
+    http_delivery = identity_carry is not None and identity_carry.context is not None
     if (
-        handle is not None
+        not http_delivery
+        and handle is not None
         and not self._config.slack_no_edit_streaming
         and not (defer_job_booting or defer_review_booting)
     ):
@@ -278,7 +290,16 @@ async def _attempt_turn(
         else channel_read._ChannelReadMint(qevent=qevent, grant=channel_read_grant)
     )
 
-    attachment_intent = self._attachments is not None and bool(qevent.attachments)
+    lazy = self._config.attachment_enabled and self._config.attachment_mode == "lazy"
+    attachment_turn = (
+        attachment_access.AttachmentAccessTurn(
+            str(agent_id), str(workspace_deployment_id), thread_key, qevent.event_id
+        )
+        if lazy and agent_id is not None and workspace_deployment_id is not None
+        else None
+    )
+    aa_turn = constants._ATTACHMENT_ACCESS_TURN.set(attachment_turn)
+    attachment_intent = not lazy and self._attachments is not None and bool(qevent.attachments)
 
     # Critical section: decide steer-vs-new-turn and, if new, open the turn so
     # it is active before we release the Valkey lock (rule 1: no two live
@@ -344,6 +365,48 @@ async def _attempt_turn(
                     )
                 verified_review = verified
                 review_receipt = verified.receipt
+            if lazy:
+                if (
+                    self._attachment_access is None
+                    or agent_id is None
+                    or workspace_deployment_id is None
+                ):
+                    from ..attachment_access_client import AttachmentAccessUnavailable
+
+                    raise AttachmentAccessUnavailable(
+                        "On-demand attachments require a bound agent and compatible API."
+                    )
+                from aci_protocol.turn import route_identity
+
+                from ..binding import binding_adapter_for_handle
+
+                inbound = qevent.reply_handle
+                refs = []
+                if qevent.attachments:
+                    if inbound is None:
+                        raise ValueError("attachment references require an inbound route")
+                    adapter = binding_adapter_for_handle(inbound)
+                    refs = [
+                        dict(
+                            file_id=ref.id,
+                            ordinal=index,
+                            name=ref.name,
+                            mime_type=ref.mime_type,
+                            size_bytes=ref.size_bytes,
+                            route_kind=inbound.kind,
+                            route_adapter=adapter,
+                            route_identity=route_identity(inbound.kind, adapter),
+                        )
+                        for index, ref in enumerate(qevent.attachments)
+                    ]
+                # Empty registration establishes the current catalog incarnation
+                # after a reset, without reading any provider body or adding files.
+                await self._attachment_access.register(
+                    agent_id=str(agent_id),
+                    thread_key=thread_key,
+                    event_id=qevent.event_id,
+                    refs=refs,
+                )
             if attachment_intent:
                 routed = await self._route_attachment_and_start(
                     qevent,
@@ -390,28 +453,36 @@ async def _attempt_turn(
             await close_routed_turn()
             raise
         finally:
+            constants._ATTACHMENT_ACCESS_TURN.reset(aa_turn)
             constants._MEMORY_MINT.reset(memory_mint)
             constants._CHANNEL_READ_MINT.reset(cr_mint)
-    except CapacityExhaustedError as exc:
-        rejection = exc.rejection
-        logger.warning(
-            "sandbox capacity exhausted for event %s: quota=%s requested=%s used=%s hard=%s",
-            qevent.event_id,
-            rejection.quota_name,
-            rejection.requested,
-            rejection.used,
-            rejection.hard,
-        )
+    except (CapacityExhaustedError, AdmissionUnavailableError) as exc:
+        rejection = exc.rejection if isinstance(exc, CapacityExhaustedError) else None
+        if rejection is None:
+            logger.warning("sandbox admission inventory unavailable for event %s", qevent.event_id)
+        else:
+            logger.warning(
+                "sandbox capacity exhausted for event %s: quota=%s requested=%s used=%s hard=%s",
+                qevent.event_id,
+                rejection.quota_name,
+                rejection.requested,
+                rejection.used,
+                rejection.hard,
+            )
         parsed_execute = parse_work_item_event_id(qevent.event_id)
         if parsed_execute is not None and parsed_execute.kind in {"execute"}:
             run = self._work_item_runs.get(parsed_execute.request_id)
             if run is not None and not run.started:
                 release_order()
                 try:
-                    await run.defer("capacity", capacity=True, start_failure_detail=None)
+                    await run.defer(
+                        "admission_unavailable" if rejection is None else "capacity",
+                        capacity=rejection is not None,
+                        start_failure_detail=None,
+                    )
                 except WorkItemConflict as exc:
                     logger.info(
-                        "work-item capacity defer refused for %s: %s",
+                        "work-item admission defer refused for %s: %s",
                         qevent.event_id,
                         exc.code,
                     )
@@ -429,6 +500,17 @@ async def _attempt_turn(
                 release_order()
                 return failures.TurnOutcome(terminal_ok=False, classification="sandbox-capacity")
             return await capacity_response()
+
+        if rejection is None:
+            release_order()
+            if (
+                qevent.source is TurnSource.SLACK
+                and handle is not None
+                and not self._is_approval_resume(qevent.event_id)
+                and (parsed_execute is None or not parsed_execute.is_ci_fix)
+            ):
+                raise CapacityWaitRequested() from None
+            raise
 
         if pressure_retried:
             self._record_pressure_outcome("reclaimed-retry-refused")
@@ -779,6 +861,7 @@ async def _attempt_turn(
                 ),
                 memory_grant=memory_grant,
                 channel_read_grant=channel_read_grant,
+                attachment_turn=attachment_turn,
             )
         outcome.workspace_inferred_repo = inferred
         if verified_review is not None:

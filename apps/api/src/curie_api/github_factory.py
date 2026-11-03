@@ -26,7 +26,7 @@ from curie_api.workitems.lifecycle import (
     same_repository,
 )
 
-from . import factory_base, factory_rediscovery, workitem_dispatch
+from . import factory_rediscovery, workitem_dispatch
 from .config import Settings
 from .factory_admission import (
     LABEL_REFUSAL_MARKER,
@@ -35,8 +35,6 @@ from .factory_admission import (
     label_refusal,
     label_span,
 )
-from .factory_base import BaseRefusal
-from .factory_notices import mark_status_comment_stale
 from .forges.errors import ForgeError, Unavailable
 from .forges.github.binding import GITHUB_CHANNEL_KIND, resolve_binding
 from .forges.github.comments import static_token
@@ -65,11 +63,7 @@ from .github_factory_events import (
 )
 from .github_review_audit import claim_review_delivery, settle_review_delivery
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
-from .models import (
-    AgentChannel,
-    ThreadPublicationLineage,
-    WorkItem,
-)
+from .models import AgentChannel, WorkItem
 from .workitem_dispatch import Admission, DispatchConflict
 from .workspace_policy import repository_is_allowed
 
@@ -281,62 +275,6 @@ def admission_result(
     return ignored(code)
 
 
-async def _has_open_pr(session: AsyncSession, item: WorkItem) -> bool:
-    if item.publication_lineage_id is None:
-        return False
-    status = await session.scalar(
-        select(ThreadPublicationLineage.status).where(
-            ThreadPublicationLineage.id == item.publication_lineage_id
-        )
-    )
-    return status == "open"
-
-
-async def _record_label(
-    session: AsyncSession, item: WorkItem, verified: VerifiedIssue, settings: Settings
-) -> None:
-    """Note a ``base:`` label that disagrees with the frozen base. Never move it."""
-
-    if item.base_branch is None:
-        # A legacy WorkItem keeps the repository default branch and says nothing.
-        return
-    ignored = factory_base.label_disagreement(
-        verified.labels,
-        factory_base.bases_for(
-            forges_registry(settings).github_repository_policy(item.repository_path)
-        ),
-        verified.default_branch,
-        item.base_branch,
-    )
-    if ignored == item.base_label_ignored:
-        return
-    item.base_label_ignored = ignored
-    await mark_status_comment_stale(session, item.id)
-
-
-async def _fresh_base(
-    notice: FactoryNotice,
-    verified: VerifiedIssue,
-    settings: Settings,
-) -> factory_base.ResolvedBase:
-    """Resolve the base for a fresh admission, or comment and refuse."""
-
-    tracker = verified.tracker
-    resolved = await factory_base.resolve_base(
-        policy=forges_registry(settings).github_repository_policy(notice.repo_full_name),
-        labels=verified.labels,
-        default_branch=verified.default_branch,
-        code_host=verified.code_host,
-        repository=verified.repository,
-    )
-    if isinstance(resolved, BaseRefusal):
-        await factory_base.comment_refusal(
-            tracker.marked_comments, tracker.issue(notice.issue_number), resolved
-        )
-        raise FactoryRefused(resolved.code)
-    return resolved
-
-
 def admitting_label(registry: ForgeRegistry, item: WorkItem) -> str | None:
     """The label whose removal cancels ``item`` (#4361 decision 10).
 
@@ -500,18 +438,6 @@ async def admit_notice(
         # No local history: the code host's own publications decide (#4629).
         await _refuse_rediscovered(notice, settings, client, verified)
     facts = _facts(notice, binding, registry)
-    if existing is not None and (
-        notice.disposition == "mention" or await _has_open_pr(session, existing)
-    ):
-        # A revision, or work with an open PR, keeps its recorded base; no
-        # branch is read.
-        await _record_label(session, existing, verified, settings)
-    else:
-        # The fresh base travels with the admission facts. Dispatch validates
-        # ownership first, then writes it with the request that runs on it: at
-        # once for a fresh admission, or when a stopping run's replacement is
-        # admitted (ADR 0186 decision 5).
-        facts = replace(facts, base=await _fresh_base(notice, verified, settings))
     # Dispatch helpers commit between WorkItem creation and request creation.
     # Keep those commits inside savepoints so the caller's issue lock remains
     # held until admission and delivery settlement commit together.
@@ -535,9 +461,14 @@ async def admit_notice(
 
 
 async def record_base_label_notice(
-    session: AsyncSession, notice: FactoryNotice, verified: VerifiedIssue, settings: Settings
+    session: AsyncSession,
+    notice: FactoryNotice,
+    verified: VerifiedIssue,
+    settings: Settings,
+    *,
+    client: httpx.AsyncClient,
 ) -> WebhookResult:
-    """A ``base:`` label changed: record whether it now disagrees (ADR 0186)."""
+    """Reconcile a verified change to the current base selection."""
 
     registry = forges_registry(settings)
     item = await work_item_for(session, notice_issue(notice, registry))
@@ -545,7 +476,17 @@ async def record_base_label_notice(
         raise FactoryRefused("work_item_absent")
     if not _same_notice_identity(item, notice, registry):
         raise FactoryRefused("identity_mismatch")
-    await _record_label(session, item, verified, settings)
+    from .factory_base_reconcile import observe_base_labels
+
+    await observe_base_labels(
+        session,
+        item=item,
+        labels=verified.labels,
+        default_branch=verified.default_branch,
+        event_identity=str(notice.request_id),
+        settings=settings,
+        client=client,
+    )
     return ignored("base_label_recorded")
 
 
@@ -667,7 +608,9 @@ async def handle_factory_delivery(
         if notice.disposition == "cancel":
             outcome = await cancel_notice(session, notice, settings)
         elif notice.disposition == "base_label":
-            outcome = await record_base_label_notice(session, notice, verified, settings)
+            outcome = await record_base_label_notice(
+                session, notice, verified, settings, client=client
+            )
         else:
             outcome = await admit_notice(session, notice, settings, verified, client=client)
     except FeedbackUnavailable as exc:

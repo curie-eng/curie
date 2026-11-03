@@ -395,6 +395,50 @@ def git(root: Path, *argv: str) -> str:
     return result.stdout.strip()
 
 
+@pytest.mark.parametrize("bootstrap", [False, True])
+def test_train_promotion_accepts_existing_debt_and_refuses_new_growth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bootstrap: bool
+) -> None:
+    pin_main_pr(monkeypatch)
+    git(tmp_path, "init", "-q", "-b", "main")
+    git(tmp_path, "config", "user.name", "Example")
+    git(tmp_path, "config", "user.email", "test@example.com")
+    git(tmp_path, "config", "core.hooksPath", os.devnull)
+    source(tmp_path, "tests/test_main.py", "import time\ntime.sleep(1)\n")
+    main_baseline = generate(tmp_path)
+    git(tmp_path, "add", ".")
+    git(tmp_path, "commit", "-qm", "Accepted main debt")
+    git(tmp_path, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(tmp_path, "checkout", "-qb", "next")
+    source(tmp_path, "tests/test_next.py", "import time\ntime.sleep(1)\n")
+    source(tmp_path, "tests/test_main.py", "import time\ntime.sleep(1)\ntime.sleep(2)\n")
+    next_baseline = {
+        **main_baseline,
+        "sleeps": {"tests/test_main.py": 2, "tests/test_next.py": 1},
+    }
+    if bootstrap:
+        (tmp_path / BASELINE).unlink()
+    else:
+        source(tmp_path, BASELINE, json.dumps(next_baseline))
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-qm", "Accepted next debt")
+    git(tmp_path, "update-ref", "refs/remotes/origin/next", "HEAD")
+    git(tmp_path, "checkout", "-qb", "task/promotion")
+    base = "origin/next" if bootstrap else "origin/main"
+    if bootstrap:
+        source(tmp_path, BASELINE, json.dumps(next_baseline))
+    result = command(tmp_path, "--base-ref", base)
+    assert result.returncode == 0, result.stdout + result.stderr
+    source(tmp_path, "tests/test_new.py", "import time\ntime.sleep(1)\n")
+    result = command(tmp_path, "--base-ref", base)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "tests/test_new.py" in result.stdout
+    if not bootstrap:
+        next_baseline["sleeps"]["tests/test_new.py"] = 1
+        source(tmp_path, BASELINE, json.dumps(next_baseline))
+        assert command(tmp_path, "--base-ref", base).returncode == 1
+
+
 def test_ci_ratchets_compare_merge_base_not_advanced_tip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -841,3 +885,193 @@ def test_each_conditional_definition_can_select_the_same_test_name(
     )
     nodeid = file + "::test_case"
     assert budget_targets(tmp_path, [nodeid]) == {nodeid}
+
+
+@pytest.mark.parametrize(
+    ("base", "accepted_ref"),
+    [("main", "next"), ("next", "main"), ("release/example", "release/example")],
+)
+def test_budget_promotion_intersects_each_train_and_pr_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base: str, accepted_ref: str
+) -> None:
+    from curie_test_support.duration_budget import budget_targets
+
+    original = "def test_neighbor(): pass\n"
+    promoted = original + "\ndef test_slow():\n    assert True\n    assert 1\n"
+    file = duration_history(tmp_path, monkeypatch, original, promoted)
+    promoted_nodeid = "tests/test_promoted.py::test_promoted"
+    new_nodeid = "tests/test_added.py::test_added"
+    source(tmp_path, "tests/test_promoted.py", "def test_promoted(): pass\n")
+    observed = [file + "::test_slow", promoted_nodeid]
+    source(
+        tmp_path,
+        BASELINE,
+        json.dumps({"sleeps": {}, "fixtures": [], "durations": sorted(observed)}),
+    )
+    source(
+        tmp_path,
+        "conftest.py",
+        """import pytest
+@pytest.hookimpl(wrapper=True, trylast=True)
+def pytest_runtest_makereport(item, call):
+    report = yield
+    if report.when == "call":
+        report.duration = 40.01
+    return report
+""",
+    )
+    git(tmp_path, "add", ".")
+    git(tmp_path, "commit", "-qm", "Accept train tests and duration observations")
+    initial = git(tmp_path, "rev-parse", "origin/main")
+    for reference in ("main", "next", base):
+        git(tmp_path, "update-ref", f"refs/remotes/origin/{reference}", initial)
+    git(tmp_path, "update-ref", f"refs/remotes/origin/{accepted_ref}", "HEAD")
+    git(tmp_path, "checkout", "-qb", "task/release")
+    monkeypatch.setenv("GITHUB_BASE_REF", base)
+    argv = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "curie_test_support.duration_budget",
+        "--test-duration-budget",
+        "--test-time-baseline",
+        str(tmp_path / BASELINE),
+    ]
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"PYTEST_ADDOPTS", "PYTEST_PLUGINS"}
+    }
+    environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    collected = [file + "::test_neighbor", file + "::test_slow", promoted_nodeid]
+    for edited in (False, True):
+        expected: set[str] = set()
+        if edited:
+            source(
+                tmp_path,
+                file,
+                promoted.replace("assert 1", "assert 2") + "\ndef test_new(): pass\n",
+            )
+            source(tmp_path, "tests/test_added.py", "def test_added(): pass\n")
+            source(
+                tmp_path,
+                BASELINE,
+                json.dumps(
+                    {
+                        "sleeps": {},
+                        "fixtures": [],
+                        "durations": sorted([*observed, file + "::test_new", new_nodeid]),
+                    }
+                ),
+            )
+            git(tmp_path, "add", file, "tests/test_added.py", BASELINE)
+            git(tmp_path, "commit", "-qm", "Edit a promoted test and add tests")
+            collected.extend([file + "::test_new", new_nodeid])
+            expected = {file + "::test_slow", file + "::test_new", new_nodeid}
+        targets = budget_targets(tmp_path, collected)
+        assert targets == expected
+        for nodeid in collected:
+            failure = budget_failure(nodeid, 40.01, targets)
+            if nodeid in expected:
+                assert "exceeds" in (failure or "")
+            else:
+                assert failure is None
+        result = subprocess.run(argv, cwd=tmp_path, env=environment, capture_output=True, text=True)
+        assert result.returncode == (1 if edited else 0), result.stdout + result.stderr
+        assert ("3 failed, 2 passed" if edited else "3 passed") in result.stdout
+        for nodeid in collected:
+            assert f"40.010000s call {nodeid}" in result.stdout
+        for nodeid in expected:
+            assert f"FAILED {nodeid}" in result.stdout
+
+
+@pytest.mark.parametrize("edit", ["decorator", "statement", "trivia", "parameters"])
+def test_budget_promotion_preserves_changed_function_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, edit: str
+) -> None:
+    from curie_test_support.duration_budget import budget_targets
+
+    before = (
+        "import pytest\n\nVALUES = [1]\n\n"
+        '@pytest.mark.parametrize("value", VALUES)\n'
+        "def test_slow(value):\n    assert value\n    assert value > 0\n\n\n"
+        "def test_neighbor(): pass\n"
+    )
+    file = duration_history(tmp_path, monkeypatch, "def test_neighbor(): pass\n", before)
+    git(tmp_path, "update-ref", "refs/remotes/origin/next", "HEAD")
+    after = {
+        "decorator": before.replace("VALUES)", "[1, 2])"),
+        "statement": before.replace("    assert value > 0\n", ""),
+        "trivia": before.replace("\n\n\ndef test_neighbor", "\ndef test_neighbor"),
+        "parameters": before.replace("VALUES = [1]", "VALUES = [1, 2]"),
+    }[edit]
+    source(tmp_path, file, after)
+    git(tmp_path, "commit", "-qam", "Update promoted test inputs")
+    cases = [file + "::test_slow[1]"]
+    if edit in {"decorator", "parameters"}:
+        cases.append(file + "::test_slow[2]")
+    targets = budget_targets(tmp_path, [*cases, file + "::test_neighbor"])
+    assert targets == (set(cases) if edit in {"decorator", "statement"} else set())
+
+
+@pytest.mark.parametrize("base", ["main", "next", "release/example"])
+def test_budget_absent_optional_train_refs_preserve_current_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base: str
+) -> None:
+    from curie_test_support.duration_budget import budget_targets
+
+    before = "def test_slow():\n    assert 1\n\ndef test_neighbor(): pass\n"
+    file = duration_history(tmp_path, monkeypatch, before, before.replace("assert 1", "assert 2"))
+    if base != "main":
+        git(tmp_path, "update-ref", f"refs/remotes/origin/{base}", "origin/main")
+        git(tmp_path, "update-ref", "-d", "refs/remotes/origin/main")
+    monkeypatch.setenv("GITHUB_BASE_REF", base)
+    nodeid = file + "::test_slow"
+    targets = budget_targets(tmp_path, [nodeid, file + "::test_neighbor"])
+    assert targets == {nodeid}
+    assert "exceeds" in (budget_failure(nodeid, 40.01, targets) or "")
+
+
+@pytest.mark.parametrize("reference", ["main", "next", "release/example"])
+def test_budget_existing_ref_without_merge_base_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reference: str
+) -> None:
+    from curie_test_support.duration_budget import budget_targets
+
+    unchanged = "def test_slow(): pass\n"
+    file = duration_history(tmp_path, monkeypatch, unchanged, unchanged)
+    for train in ("next", "release/example"):
+        git(tmp_path, "update-ref", f"refs/remotes/origin/{train}", "origin/main")
+    monkeypatch.setenv("GITHUB_BASE_REF", "release/example")
+    git(tmp_path, "checkout", "-q", "--orphan", "unrelated")
+    git(tmp_path, "rm", "-qrf", ".")
+    source(tmp_path, "README.md", "Unrelated history\n")
+    git(tmp_path, "add", ".")
+    git(tmp_path, "commit", "-qm", "Create unrelated history")
+    git(tmp_path, "update-ref", f"refs/remotes/origin/{reference}", "HEAD")
+    git(tmp_path, "checkout", "-q", "main")
+    with pytest.raises(ValueError, match="merge-base"):
+        budget_targets(tmp_path, [file + "::test_slow"])
+
+
+@pytest.mark.parametrize("reference", ["main", "next"])
+def test_budget_train_authority_uses_merge_base_instead_of_advanced_tip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reference: str
+) -> None:
+    from curie_test_support.duration_budget import budget_targets
+
+    before = "def test_slow():\n    assert 1\n"
+    after = before.replace("assert 1", "assert 2")
+    file = duration_history(tmp_path, monkeypatch, before, after)
+    git(tmp_path, "update-ref", "refs/remotes/origin/next", "origin/main")
+    git(tmp_path, "checkout", "-qb", "train-tip", f"origin/{reference}")
+    source(tmp_path, file, after)
+    git(tmp_path, "commit", "-qam", "Independently edit the same test")
+    git(tmp_path, "update-ref", f"refs/remotes/origin/{reference}", "HEAD")
+    git(tmp_path, "checkout", "-q", "main")
+    nodeid = file + "::test_slow"
+    targets = budget_targets(tmp_path, [nodeid])
+    assert targets == {nodeid}
+    assert "exceeds" in (budget_failure(nodeid, 40.01, targets) or "")

@@ -5,10 +5,18 @@ from __future__ import annotations
 import uuid
 from typing import TYPE_CHECKING
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 if TYPE_CHECKING:
     from curie_api.workitem_dispatch import FactoryWake
+
+
+def no_external_calls() -> httpx.AsyncClient:
+    def unexpected(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected external request: {request.method} {request.url.path}")
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(unexpected), timeout=5)
 
 
 async def factory_wake(session: AsyncSession, request_id: uuid.UUID) -> FactoryWake:
