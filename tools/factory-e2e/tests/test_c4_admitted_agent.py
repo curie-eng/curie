@@ -272,15 +272,6 @@ def execution_observed(run: AdmittedKind, ticket: Ticket) -> dict[str, Any] | No
 def assert_started(run: AdmittedKind, ticket: Ticket) -> dict[str, Any]:
     row = observe_until(lambda: execution_observed(run, ticket))
     assert row is not None, f"{ticket.kind}: admitted request produced no execution disposition"
-    # #5294: a waiting acquire_lost row is a transient redispatch, not a final
-    # miss. #5275 keeps observing that row on main. That harness change does
-    # not apply onto next, so this assertion is skipped instead of failing.
-    if (
-        row["started_at"] is None
-        and row["status"] == "waiting"
-        and row["last_deferral_reason"] == "acquire_lost"
-    ):
-        pytest.skip("waiting acquire_lost is not a final start failure (#5294)")
     ambiguous_execute_drop = False
     if row["started_at"] is None:
         event_prefix = f"work-item-{row['id']}-execute-"
