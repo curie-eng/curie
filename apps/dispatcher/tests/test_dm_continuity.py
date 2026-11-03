@@ -629,7 +629,12 @@ def _assert_failure_log(
     """The log names the error class and does not carry the page or the exception text."""
 
     assert "malformed payload secret" not in caplog.text
+    assert "channel_not_found" not in caplog.text
     if error is None:
+        # A page that does not raise is still a validation failure. The class
+        # name is the only record. The page text stays out of the log.
+        assert "_MalformedHistoryPage" in caplog.text
+        assert "not-a-payload" not in caplog.text
         return
     assert type(error).__name__ in caplog.text
     if isinstance(error, SlackApiError):
