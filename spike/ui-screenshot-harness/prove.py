@@ -168,7 +168,10 @@ def main() -> None:
     run(["git", "commit", "-m", "base ui"], origin)
 
     work = root / "work"
-    run(["git", "clone", "--depth=1", "--single-branch", "--no-tags", origin.as_uri(), str(work)], root)
+    run(
+        ["git", "clone", "--depth=1", "--single-branch", "--no-tags", origin.as_uri(), str(work)],
+        root,
+    )
     shallow = (work / ".git" / "shallow").read_text(encoding="utf-8").split()
     if len(shallow) != 1:
         raise SystemExit(f"expected one shallow root, got {shallow!r}")
@@ -186,7 +189,7 @@ def main() -> None:
         "<!doctype html><meta charset=utf-8><title>story</title>"
         "<body style='margin:0;background:#111;color:#9cf;font-family:sans-serif'>"
         "<p style='margin:8px'>static story frame</p>"
-        f"<iframe src='/after.html' width='320' height='140' style='border:0'></iframe>"
+        "<iframe src='/after.html' width='320' height='140' style='border:0'></iframe>"
         "</body>"
     )
     _thread, port = serve(
