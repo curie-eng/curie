@@ -259,7 +259,7 @@ spec:
           # Deployments declare `timeoutSeconds` explicitly rather than taking
           # the kubelet's invisible 1s default, and on each container the
           # liveness failure cutoff must outlive the readiness one, pinned by
-          # ci/probe-window-assertions.sh.
+          # ci/policy/engine.py (P3).
           readinessProbe:
             httpGet:
               path: /api/ready

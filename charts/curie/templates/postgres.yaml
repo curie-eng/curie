@@ -94,7 +94,7 @@ spec:
           # unclean stop, so the liveness cutoff must outlive the readiness one
           # -- otherwise the kubelet restarts a Postgres that is still replaying
           # and the restart re-enters the same recovery. Cadence from values;
-          # ordering pinned by ci/probe-window-assertions.sh.
+          # ordering pinned by ci/policy/engine.py (P3).
           livenessProbe:
             exec:
               command: ["sh", "-c", "pg_isready -U {{ .Values.postgres.auth.username }}"]
