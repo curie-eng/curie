@@ -481,10 +481,83 @@ def test_ci_event_base_resolution(
     monkeypatch.setenv("GITHUB_EVENT_NAME", event)
     monkeypatch.setenv("GITHUB_BASE_REF", base)
     monkeypatch.setenv("GITHUB_REF_NAME", ref)
+    monkeypatch.setenv("GITHUB_REF_TYPE", "branch")
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/" + ref)
     payload = tmp_path / "event.json"
     payload.write_text(json.dumps({"merge_group": {"base_ref": "refs/heads/next"}}))
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(payload))
     assert base_reference() == expected
+
+
+def tag_repository(root: Path) -> dict[str, str]:
+    """A main commit, a later next-only commit, and a commit on neither train."""
+    git(root, "init", "-q", "-b", "main")
+    git(root, "config", "user.name", "Example")
+    git(root, "config", "user.email", "test@example.com")
+    git(root, "config", "core.hooksPath", os.devnull)
+    source(root, "tests/test_case.py", "def test_case(): pass\n")
+    generate(root)
+    git(root, "add", ".")
+    git(root, "commit", "-qm", "Release")
+    released = git(root, "rev-parse", "HEAD")
+    git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(root, "commit", "-q", "--allow-empty", "-m", "Next only")
+    on_next = git(root, "rev-parse", "HEAD")
+    git(root, "update-ref", "refs/remotes/origin/next", "HEAD")
+    git(root, "commit", "-q", "--allow-empty", "-m", "On no train")
+    stray = git(root, "rev-parse", "HEAD")
+    return {"main": released, "next": on_next, "stray": stray}
+
+
+def dispatch_on_tag(monkeypatch: pytest.MonkeyPatch, tag: str, *, ref_type: bool = True) -> None:
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_REF_NAME", tag)
+    monkeypatch.setenv("GITHUB_BASE_REF", "")
+    if ref_type:
+        monkeypatch.setenv("GITHUB_REF_TYPE", "tag")
+        monkeypatch.delenv("GITHUB_REF", raising=False)
+    else:
+        monkeypatch.delenv("GITHUB_REF_TYPE", raising=False)
+        monkeypatch.setenv("GITHUB_REF", "refs/tags/" + tag)
+
+
+@pytest.mark.parametrize("ref_type", [True, False])
+@pytest.mark.parametrize(("commit", "train"), [("main", "origin/main"), ("next", "origin/next")])
+def test_tag_dispatch_compares_with_the_train_that_contains_the_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, commit: str, train: str, ref_type: bool
+) -> None:
+    from curie_test_support.ratchets import base_reference, merge_base
+
+    commits = tag_repository(tmp_path)
+    git(tmp_path, "checkout", "-q", "--detach", commits[commit])
+    git(tmp_path, "tag", "v9.9.9")
+    dispatch_on_tag(monkeypatch, "v9.9.9", ref_type=ref_type)
+    assert base_reference(tmp_path) == train
+    assert merge_base(tmp_path) == commits[commit]
+
+
+def test_tag_on_no_train_names_the_tag_instead_of_a_missing_remote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_test_support.ratchets import merge_base
+
+    commits = tag_repository(tmp_path)
+    git(tmp_path, "checkout", "-q", "--detach", commits["stray"])
+    dispatch_on_tag(monkeypatch, "v9.9.9")
+    with pytest.raises(ValueError, match="tagged commit v9.9.9 is on no train branch"):
+        merge_base(tmp_path)
+
+
+def test_ratchet_gate_passes_on_a_release_tag_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commits = tag_repository(tmp_path)
+    git(tmp_path, "checkout", "-q", "--detach", commits["main"])
+    git(tmp_path, "tag", "v9.9.9")
+    dispatch_on_tag(monkeypatch, "v9.9.9")
+    result = command(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "merge-base is unavailable" not in result.stdout + result.stderr
 
 
 def test_stale_sleep_is_written_to_step_summary(
