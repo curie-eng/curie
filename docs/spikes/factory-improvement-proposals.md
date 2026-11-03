@@ -9,10 +9,6 @@ Can an administrator review a concrete, evidence-backed suggestion to improve a 
 
 This spike scopes the first suggestion to reviewer model selection. The same proposal format could later cover bundle instructions, review gates, repository runner images, and sandbox configuration.
 
-## Relation to agent learning on `next`
-
-The work in #4780 covers an agent learning skills, scheduling its own turns, and keeping memory across conversations. This spike addresses a different operator workflow: analyzing completed Software Factory work items, proposing a versioned bundle or operator-configuration change, and measuring the effect on accepted engineering outcomes. It should use the same agent and deployment identities where available, but it must not treat a learned skill as authority to change a model, sandbox, or release gate.
-
 ## Findings from the current tree
 
 - `GET /work-items`, `GET /work-items/{id}`, and `GET /work-items/{id}/usage` expose work item state, requests, progress, PR and CI observations, and usage. The list is newest-first, capped at 200, and reports `truncated`. It is not a complete historical export. See `apps/api/src/curie_api/routers/work_item_outcomes.py` and `docs/guides/measuring-factory-outcomes.md`.
