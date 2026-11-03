@@ -85,6 +85,9 @@ generic endpoints as a plugin API:
   retries the refusal forever;
   `apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.post_turn`
   is the worked example of settling on the code and only on it.
+  The [common API admission extraction contract](../../superpowers/specs/2026-10-23-common-admission-extraction.md)
+  preserves this marker and pre-claim refusal boundary while sharing the existing
+  list and invocation-team composition.
 - **Binding and reply-route facts are server controlled.** A binding is the
   neutral `{kind, address}` pair (`ChannelBinding`) on `AgentChannel`; its write
   form also records the paired `endpoint` and `adapter` facts an operator sets at

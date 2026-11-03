@@ -32,13 +32,16 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import httpx
 from aiohttp import web
 from curie_api.action_execution_codes import CodeRejected, outcome_code
 from curie_worker import connector_grant
 from curie_worker.sandbox.types import ClaimView, QuotaRejection, SandboxView
+
+if TYPE_CHECKING:
+    from curie_worker.sandbox.types import ToolDaemonMount
 
 _VECTORS = Path(__file__).resolve().parents[3] / "tests" / "vectors"
 RUNNER_VECTOR: dict[str, Any] = json.loads((_VECTORS / "runner-execute.json").read_text("utf-8"))
@@ -819,9 +822,12 @@ class FakeSandboxes:
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
         runner_resources: dict[str, object] | None = None,
+        deadline: float,
         agent_name: str | None = None,
         executor_secret_names: frozenset[str] | None = None,
+        tool_daemon: ToolDaemonMount | None = None,
     ) -> None:
+        assert deadline > 0 and tool_daemon is None
         del pool, runner_resources, agent_name
         with self._lock:
             claim = _Claim(
@@ -890,6 +896,23 @@ class FakeSandboxes:
         self, name: str, *, request_timeout_seconds: float, since: datetime
     ) -> Any | None:
         return None
+
+    # No Docker repository pool is configured in this suite, so the substrate
+    # never reaches the tool-daemon seam (ADR 0217); any call is a test bug.
+    def create_daemon_object(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is provisioned in this suite")
+
+    def list_daemon_objects(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is listed in this suite")
+
+    def delete_daemon_object(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is retired in this suite")
+
+    def get_daemon_pod(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon pod is read in this suite")
+
+    def open_daemon_stream(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is pinged in this suite")
 
     def set_sandbox_mode(self, name: str, mode: str) -> None:
         raise AssertionError("an executor sandbox is never suspended")

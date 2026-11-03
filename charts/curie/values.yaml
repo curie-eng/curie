@@ -379,7 +379,7 @@ langfuse:
     # Probe cadences. Liveness must outlast readiness: this replicas:1 +
     # Recreate Deployment runs Prisma/ClickHouse boot migrations at container
     # start, and init containers do NOT re-run on a liveness restart. Cutoffs:
-    # readiness 310s, liveness 370s. Formula/rationale: ci/probe-window-assertions.sh header.
+    # readiness 310s, liveness 370s. Formula/rationale: ci/policy/engine.py (P3).
     readinessProbe:
       initialDelaySeconds: 20
       periodSeconds: 10
@@ -424,7 +424,7 @@ langfuse:
     # Probe cadences, deliberately equal to langfuse.web's above: same boot
     # migrations, same replicas:1 + Recreate constraint, cadence kept equal to
     # web's. Cutoffs: readiness 310s, liveness 370s. Formula/rationale:
-    # ci/probe-window-assertions.sh header.
+    # ci/policy/engine.py (P3).
     readinessProbe:
       initialDelaySeconds: 20
       periodSeconds: 10
@@ -495,7 +495,7 @@ postgres:
   # Probe cadences. Liveness MUST outlast readiness here because `pg_isready`
   # returns non-zero for the whole of WAL recovery after an unclean stop, and a
   # restart re-enters the same recovery. Cutoffs: readiness 60s, liveness 310s.
-  # Formula/rationale: ci/probe-window-assertions.sh header.
+  # Formula/rationale: ci/policy/engine.py (P3).
   readinessProbe:
     initialDelaySeconds: 5
     periodSeconds: 5
@@ -1296,6 +1296,7 @@ codeHostTrust:
 factory:
   enabled: false
   intake: poll  # or webhook
+  baseLabelSettleSeconds: 60
   cardBaseUrl: ""
   ciWaitSeconds: 3600
   codeHosts: []
@@ -1319,8 +1320,8 @@ factory:
     # when the operator creates it; it must then carry
     # pod-security.kubernetes.io/enforce: privileged.
     createNamespace: true
-    # The daemon's mutual TLS port. The Rail 1 sandbox allow opens only this
-    # port toward the daemon namespace.
+    # The daemon's mutual TLS API port. Rail 1 opens TCP 1 through 65535 to
+    # this release's daemons; each daemon admits only its own claim's runner.
     port: 2376
     # Individual daemon Pod sizing, separate from namespace quota and limits.
     resources:
@@ -1439,10 +1440,24 @@ api:
   # values-dev.yaml keeps the published deterministic default. Read it back with
   # kubectl get secret <release>-secrets -o jsonpath='{.data.remediationAuthorityKey}'.
   remediationAuthorityKey: curie-dev-remediation-authority
+  # HTTP identity operator file (HTTP-INVOCATION-EXECUTION-20), off by default.
+  # existingSecret names an operator-created Secret whose api-runtime.json key
+  # holds the provider bearers, receiver registrations and keys, and the core
+  # context sealing keys. It is mounted read-only at 0440 into the API
+  # container alone and read once at startup; the chart never creates, reads or
+  # checksums it, so roll the API after changing it. No chart NetworkPolicy
+  # restricts API egress, so the provider lookup needs no extra rule (api.egress
+  # is the runner's route and does not apply). Rendering this is wiring, not
+  # activation: see charts/curie/README.md. providerCaBundle: true also mounts
+  # that Secret's provider-ca.pem key, the private CA bundle that then becomes
+  # the only trust anchor for provider lookups (hostnames are still verified).
+  httpIdentity:
+    existingSecret: ""
+    providerCaBundle: false
   # Probe cadences. Database aware /ready keeps the API out of the Service until
   # Postgres responds, while process local /health keeps the process alive.
   # Liveness must outlast readiness. Cutoffs: readiness 120s, liveness 195s.
-  # Formula/rationale: ci/probe-window-assertions.sh header.
+  # Formula/rationale: ci/policy/engine.py (P3).
   # Kubelet withdrawal of a bounce shorter than the 120s readiness cutoff is
   # out of scope; the longer-outage proof covers endpoints.
   readinessProbe:
@@ -1737,6 +1752,14 @@ dispatcher:
   # first deadline; the startup probe below outlasts both phases plus the final
   # bounded two-second Slack call.
   apiPreflightTimeoutSeconds: 120
+  # Selected HTTP receivers (HTTP-INVOCATION-EXECUTION-20), off by default.
+  # existingSecret names an operator-created Secret whose receivers.json key
+  # holds each selected identity's receiver scope, bindings with their pinned
+  # channel credentials, and that receiver's key; never a core context key. It
+  # is mounted read-only at 0440 into the dispatcher container alone. Selecting
+  # a receiver requires api.httpIdentity.existingSecret.
+  httpIdentity:
+    existingSecret: ""
   # Startup uses the same heartbeat freshness check as readiness/liveness. The
   # kubelet can count its first failure at t=0, so 27 samples every 10 seconds
   # make the earliest fast-failure 260s -- strictly after the maximum 242s
@@ -1903,6 +1926,19 @@ mailAdapter:
   otelEgress:
     httpsCidrs: []
     port: ""
+  # Email receiver proof (ADR 0260). The receiver key is held only by the API
+  # and this adapter, and is distinct from the platform key and the channel
+  # token. Set receiverId and keyExistingSecret together to make the adapter
+  # sign every turn; the key is read by reference only from that Secret.
+  # generation is the registration's positive integer generation. An empty
+  # receiverId renders none of CURIE_MAIL_RECEIVER_ID, _GENERATION and _KEY, so
+  # legacy bindings are unchanged; setting only one of receiverId and
+  # keyExistingSecret fails the render.
+  emailReceiver:
+    receiverId: ""
+    generation: 1
+    keyExistingSecret: ""
+    keyExistingSecretKey: emailReceiverKey
   image:
     repository: ghcr.io/curie-eng/curie-mail-adapter
     # Empty -> chart appVersion (immutable). Set to pin an explicit version tag.
@@ -2130,6 +2166,14 @@ worker:
     bucket: curie-workspaces
     cloneVolumeSize: 4Gi
     mountPath: /var/lib/curie/workspaces
+    # Workspace recovery capture (ADR 0251). Off by default. Enabling it keeps
+    # a checkpoint of a terminated turn's workspace for 24 hours and requires
+    # maxBytes, a positive installation-wide cap that counts every recovery
+    # byte; the render fails without it. The API also receives
+    # maxArchiveBytes above so its ledger matches the worker's limit.
+    recovery:
+      enabled: false
+      maxBytes: null
   # Inbound channel attachments (#2567). The worker downloads a referenced file
   # with the channel bot token (Slack) or from the adapter that sent it, with
   # that adapter's adapterCredentials secret (any other kind, ADR-0153), parks
@@ -2153,7 +2197,16 @@ worker:
     # not refuse). Gates agentSandbox.runner.attachments too; that key is only a
     # sandbox-side sub-gate and cannot turn the lane on by itself.
     enabled: false
-    # Per-file ceiling, enforced while streaming in the worker (nothing is
+    # Explicit opt-in. Lazy mode requires compatible API/worker/runner images.
+    mode: eager
+    broker:
+      port: 8093
+      maxConcurrent: 8
+      transferTimeoutSeconds: 300
+
+    # Legacy eager-only per-file ceiling. Lazy catalog entries and selected
+    # transfers ignore this policy; finite cache/resource capacity still applies.
+    # Enforced while streaming in the eager worker (nothing is
     # buffered past the crossing chunk) and again in the init container. A zero
     # is refused rather than read as "unlimited".
     maxFileBytes: 33554432
@@ -2163,7 +2216,8 @@ worker:
     # How long the parked bytes are retained so a redelivery of the same turn can
     # still fetch them. Swept by the worker's existing reap_orphans tick.
     retentionTtlSeconds: 3600
-    # ADR 0205 decision 7: every boot of a thread rebuilds the thread's whole
+    # Legacy eager-only budgets (ADR 0205 decision 7). Lazy catalogs do not
+    # filter by these byte budgets. In eager mode every boot rebuilds the thread's whole
     # file set, so it is bounded per thread, separately from the per-message
     # cap. Over either bound the newest files are kept and the omitted ones are
     # named to the agent. threadMaxBytes must fit

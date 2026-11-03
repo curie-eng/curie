@@ -27,6 +27,7 @@ from curie_telemetry import (
 from fastapi import FastAPI, HTTPException, Request
 from opentelemetry.trace import SpanKind, StatusCode
 from starlette.routing import Match
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from curie_api.crud import agents as crud_agents
 
@@ -47,6 +48,15 @@ from .github_app import credentials_for, log_credential_path
 from .github_checks import GitHubStatusReporter
 from .github_review_store import GitHubReviewReconciler
 from .graveyardwatcher import GraveyardWatcher
+from .identity.http_approval import http_expiry_owner, identity_runtime
+from .identity.http_approval_answer import approved_resume_authority
+from .identity.http_initializer import (
+    configured_http_identity_runtime,
+    load_provider_tls_context,
+)
+from .identity.http_invocation import HttpInvocationRuntime
+from .identity.http_resume_publication import http_resume_owner
+from .identity.http_transport import HttpIdentityClient
 from .identity_fence import IdentityFenceMiddleware
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
@@ -63,6 +73,7 @@ from .routers import (
     agents,
     approval_recovery,
     approvals,
+    attachment_access,
     bundles,
     channel_identities,
     channel_read,
@@ -85,6 +96,8 @@ from .routers import (
     hooks,
     identity,
     identity_admin,
+    identity_approvals,
+    identity_authority,
     identity_connect,
     memory,
     observability,
@@ -105,6 +118,8 @@ from .routers import (
     work_item_issue,
     work_item_outcomes,
     work_items,
+    workspace_recovery,
+    workspace_recovery_access,
     workspaces,
 )
 from .schema_compat import assert_servable
@@ -176,7 +191,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         valkey,
         stream=settings.runs_stream,
         dead_letter_stream=settings.resume_dead_letter_stream or settings.dead_letter_stream_name(),
+        # @spec HTTP-APPROVAL-CONTINUITY-8/11: selected resumes are built and
+        # authorized by the API owner; an approved row also needs the preserved
+        # answering actor's fresh approver authority.
+        approvals=http_resume_owner(app.state, approved=approved_resume_authority(app.state)),
     )
+    # @spec HTTP-APPROVAL-CONTINUITY-10: the only writer that may expire a selected row.
+    app.state.http_approval_expiry = http_expiry_owner(app.state)
     app.state.github_review_reconciler = GitHubReviewReconciler(
         app.state.sessionmaker,
         valkey,
@@ -226,6 +247,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         grace_seconds=settings.resume_reconciler_grace_seconds,
         batch_limit=settings.resume_reconciler_batch_limit,
         dead_letter_scan_limit=settings.resume_dead_letter_scan_limit,
+        identity_runtime=identity_runtime(app.state),
     )
     app.state.resume_reconciler = reconciler
     work_item_reconciler = WorkItemReconciler(
@@ -265,11 +287,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 settings.approval_sweep_interval_s,
                 sweeper_stop,
                 publication_patch_retention_seconds=(settings.publication_patch_retention_seconds),
+                http_expiry=app.state.http_approval_expiry,
+                identity_runtime=identity_runtime(app.state),
                 remediation_admissions=(
                     partial(
                         reconcile_admissions,
                         store=app.state.bundle_store,
                         kill_switch=app.state.kill_switch,
+                        identity_runtime=identity_runtime(app.state),
                     )
                     if settings.remediation_enabled and settings.action_executor_enabled
                     else None
@@ -506,7 +531,109 @@ def _metric_http_method(method: str) -> str:
     return normalized if normalized in _HTTP_METHOD_DOMAIN else "OTHER"
 
 
-def create_app() -> FastAPI:
+class HttpTelemetryMiddleware:
+    def __init__(self, app: ASGIApp, *, application: FastAPI) -> None:
+        self.app = app
+        self.application = application
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope)
+        operation = _route_template(self.application, request)
+        inbound_traceparent = request.headers.get(TRACEPARENT_STREAM_FIELD)
+        canonical_traceparent = canonicalize_traceparent(inbound_traceparent)
+        parent = extract_trace_context(
+            {TRACEPARENT_STREAM_FIELD: canonical_traceparent}
+            if canonical_traceparent is not None
+            else {}
+        )
+        diagnostic = (
+            "trace.context.missing"
+            if inbound_traceparent is None
+            else "trace.context.malformed"
+            if canonical_traceparent is None
+            else None
+        )
+        active_attributes = {
+            "service.name": "curie-api",
+            "operation": operation,
+            "role": "server",
+            "source": _metric_http_method(request.method),
+        }
+        started = time.monotonic()
+        status_code = 500
+        record_metric("curie.http.server.active", 1, attributes=active_attributes)
+        try:
+            with operation_span(
+                "http.server.request",
+                kind=SpanKind.SERVER,
+                parent=parent,
+                attributes=active_attributes,
+            ) as span:
+                if diagnostic is not None:
+                    span.add_event(diagnostic)
+
+                async def observe_send(message: Message) -> None:
+                    nonlocal status_code
+                    if message["type"] == "http.response.start":
+                        status_code = message["status"]
+                        if status_code >= 500 and hasattr(span, "set_status"):
+                            span.set_status(StatusCode.ERROR)
+                        _LOG.info(
+                            "http request completed method=%s route=%s status_class=%s",
+                            _metric_http_method(request.method),
+                            operation,
+                            f"{status_code // 100}xx",
+                        )
+                    await send(message)
+
+                await self.app(scope, receive, observe_send)
+        finally:
+            outcome = f"{status_code // 100}xx" if 100 <= status_code < 600 else "5xx"
+            completed_attributes = {**active_attributes, "outcome": outcome}
+            record_metric("curie.http.server.request", attributes=completed_attributes)
+            record_metric(
+                "curie.http.server.request.duration",
+                time.monotonic() - started,
+                attributes=completed_attributes,
+            )
+            record_metric("curie.http.server.active", -1, attributes=active_attributes)
+
+
+# @spec HTTP-INVOCATION-EXECUTION-15
+def create_app(
+    *, http_identity_runtime: HttpInvocationRuntime | None = None,
+    http_identity_client: HttpIdentityClient | None = None,
+) -> FastAPI:
+    if (
+        (
+            http_identity_runtime is not None
+            and type(http_identity_runtime) is not HttpInvocationRuntime
+        )
+        or (
+            http_identity_client is not None
+            and type(http_identity_client) is not HttpIdentityClient
+        )
+        or (http_identity_client is not None and http_identity_runtime is None)
+    ):
+        raise ValueError("invalid_http_invocation_runtime") from None
+
+    @asynccontextmanager
+    async def initialized_lifespan(app: FastAPI) -> AsyncIterator[None]:
+        """@spec HTTP-INVOCATION-EXECUTION-15."""
+        client = http_identity_client
+        if http_identity_runtime is not None and client is None:
+            client = HttpIdentityClient()
+        app.state.http_identity_runtime = http_identity_runtime
+        app.state.http_identity_client = client
+        async with AsyncExitStack() as resources:
+            if client is not None:
+                await resources.enter_async_context(client)
+            async with lifespan(app):
+                yield
+
     configure_logging()
     # Which credential the platform will clone with (ADR-0092, #1262). One
     # line, no secret, and a warning when the App is set up only halfway.
@@ -519,7 +646,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Curie API",
         version="0.1.0",
-        lifespan=lifespan,
+        lifespan=initialized_lifespan,
         telemetry={
             "tracing": False,
             "metrics": False,
@@ -590,6 +717,8 @@ def create_app() -> FastAPI:
     app.include_router(publication_code_host.router)
     app.include_router(work_item_issue.router)
     app.include_router(work_item_issue.internal_router)
+    app.include_router(attachment_access.router)
+    app.include_router(attachment_access.internal_router)
     app.include_router(channel_read.router)
     app.include_router(channel_read.internal_router)
     app.include_router(work_items.router)
@@ -599,11 +728,17 @@ def create_app() -> FastAPI:
     app.include_router(work_item_outcomes.router)
     app.include_router(cluster_message_replies.router)
     app.include_router(cluster_message_replies.internal_router)
+    app.include_router(workspace_recovery.router)
+    app.include_router(workspace_recovery_access.router)
     app.include_router(workspaces.router)
     app.include_router(channels.router)
     app.include_router(provider_installations.router)
     app.include_router(channel_identities.router)
     app.include_router(identity_admin.router)
+    app.include_router(identity_authority.router)
+    app.include_router(identity_authority.grant_router)
+    app.include_router(identity_authority.classification_router)
+    app.include_router(identity_approvals.router)
     app.include_router(directory.router)
     app.include_router(identity_connect.router)
     app.include_router(identity.router)
@@ -614,64 +749,28 @@ def create_app() -> FastAPI:
     # @spec IDENTITY-WRITER-LIFETIME-V1-8. Telemetry stays outside preparation.
     app.add_middleware(IdentityFenceMiddleware)
 
-    @app.middleware("http")
-    async def observe_http(request: Request, call_next):  # type: ignore[no-untyped-def]
-        operation = _route_template(app, request)
-        inbound_traceparent = request.headers.get(TRACEPARENT_STREAM_FIELD)
-        canonical_traceparent = canonicalize_traceparent(inbound_traceparent)
-        parent = extract_trace_context(
-            {TRACEPARENT_STREAM_FIELD: canonical_traceparent}
-            if canonical_traceparent is not None
-            else {}
-        )
-        diagnostic = (
-            "trace.context.missing"
-            if inbound_traceparent is None
-            else "trace.context.malformed"
-            if canonical_traceparent is None
-            else None
-        )
-        active_attributes = {
-            "service.name": "curie-api",
-            "operation": operation,
-            "role": "server",
-            "source": _metric_http_method(request.method),
-        }
-        started = time.monotonic()
-        status_code = 500
-        record_metric("curie.http.server.active", 1, attributes=active_attributes)
-        try:
-            with operation_span(
-                "http.server.request",
-                kind=SpanKind.SERVER,
-                parent=parent,
-                attributes=active_attributes,
-            ) as span:
-                if diagnostic is not None:
-                    span.add_event(diagnostic)
-                response = await call_next(request)
-                status_code = response.status_code
-                if status_code >= 500 and hasattr(span, "set_status"):
-                    span.set_status(StatusCode.ERROR)
-                _LOG.info(
-                    "http request completed method=%s route=%s status_class=%s",
-                    _metric_http_method(request.method),
-                    operation,
-                    f"{status_code // 100}xx",
-                )
-                return response
-        finally:
-            outcome = f"{status_code // 100}xx" if 100 <= status_code < 600 else "5xx"
-            completed_attributes = {**active_attributes, "outcome": outcome}
-            record_metric("curie.http.server.request", attributes=completed_attributes)
-            record_metric(
-                "curie.http.server.request.duration",
-                time.monotonic() - started,
-                attributes=completed_attributes,
-            )
-            record_metric("curie.http.server.active", -1, attributes=active_attributes)
+    app.add_middleware(HttpTelemetryMiddleware, application=app)
 
     return app
 
 
-app = create_app()
+def create_configured_app() -> FastAPI:
+    """The served app; operator HTTP identity only when configured.
+
+    @spec HTTP-INVOCATION-EXECUTION-20: unconfigured startup calls create_app() exactly as
+    before, and a configured directory either initializes completely or stops startup.
+    """
+    settings = get_settings()
+    runtime = configured_http_identity_runtime(settings)
+    if runtime is None or settings.http_identity_dir is None:
+        return create_app()
+    # The optional private trust anchor is the only one for provider lookups.
+    tls = load_provider_tls_context(settings.http_identity_dir)
+    if tls is None:
+        return create_app(http_identity_runtime=runtime)
+    return create_app(
+        http_identity_runtime=runtime, http_identity_client=HttpIdentityClient(tls_context=tls),
+    )
+
+
+app = create_configured_app()

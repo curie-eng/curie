@@ -191,4 +191,3 @@ body with a follow-up issue number. Prefer parity by construction over remembere
 duplication. Ship a test that arms the behavior via the secondary path only
 (bundle-manifest-only gate, fake-tier-only, minimal-profile-only) and asserts it
 matches the primary path.
-

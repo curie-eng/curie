@@ -13,6 +13,7 @@ import signal
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import redis
 from curie_telemetry import bootstrap_service_telemetry
@@ -24,6 +25,13 @@ from .admission import build_admission
 from .app import SocketModeConnection, build_app, build_redis, build_web_client
 from .config import DispatcherConfig
 from .heartbeat import start_heartbeat
+from .http_receiver import HttpReceiverRuntime
+from .http_receiver_initializer import (
+    HttpReceiverInitializationError,
+    build_selected_receivers,
+    load_http_receiver_registrations,
+    log_receiver_exclusion,
+)
 from .identities import (
     SlackBotIds,
     SlackIdentityCredentials,
@@ -89,6 +97,8 @@ def build_identity_connections(
     redis_client: redis.Redis,
     logger: logging.Logger,
     declared_count: int | None = None,
+    http_receivers: tuple[HttpReceiverRuntime, ...] = (),
+    excluded_identities: frozenset[str] = frozenset(),
 ) -> tuple[IdentityConnection, ...]:
     """One connection per identity, all feeding the one stream ``redis_client`` writes.
 
@@ -102,6 +112,20 @@ def build_identity_connections(
     preflight leaves one survivor of a larger count, that survivor still names
     itself.
     """
+    # @spec HTTP-INVOCATION-EXECUTION-19: invalid selection never starts legacy sockets.
+    if type(http_receivers) is not tuple or type(excluded_identities) is not frozenset:
+        raise ValueError("invalid_http_receiver_runtime")
+    selected: dict[str, HttpReceiverRuntime] = {}
+    names = {item.credentials.name for item in identities}
+    for receiver in http_receivers:
+        if (
+            type(receiver) is not HttpReceiverRuntime or receiver.identity_name not in names
+            or receiver.identity_name in selected
+        ):
+            raise ValueError("invalid_http_receiver_runtime")
+        selected[receiver.identity_name] = receiver
+    # @spec HTTP-INVOCATION-EXECUTION-25: an excluded identity opens no connection on any path.
+    live = [item for item in identities if item.credentials.name not in excluded_identities]
     configured = declared_count if declared_count is not None else len(identities)
     several = configured > 1
     presence = SocketPresence(configured=configured)
@@ -115,7 +139,7 @@ def build_identity_connections(
     # declaration of several asks auth.test, so a stock install maps nothing.
     identity_bots = {
         ids.bot_id: ids.bot_user_id
-        for preflighted in identities
+        for preflighted in live
         if (ids := preflighted.bot_ids) is not None and ids.bot_id and ids.bot_user_id
     }
     connections: list[IdentityConnection] = []
@@ -123,31 +147,42 @@ def build_identity_connections(
     # the identity, so sharing it costs nothing and saves each identity's app
     # from asking the API about a route another identity already asked about.
     admission = build_admission(config, redis_client)
-    for preflighted in identities:
+    for preflighted in live:
         credentials = preflighted.credentials
-        web_client = build_web_client(config, credentials)
-        app = build_app(
-            config,
-            identity=credentials,
-            web_client=web_client,
-            redis_client=redis_client,
-            logger=logger,
-            identity_bots=identity_bots,
-            admission=admission,
-        )
-        connect = _socket_mode_connector(
-            app,
-            credentials,
-            logger=logger,
-            slack_identity=credentials.name if several else None,
-            presence=presence,
-        )
-        supervisor = Supervisor(
-            connect,
-            backoff=backoff,
-            logger=logger,
-            label=f"Slack identity {credentials.name}" if several else None,
-        )
+        try:
+            web_client = build_web_client(config, credentials)
+            receiver_kwargs: dict[str, Any] = {}
+            if credentials.name in selected:
+                receiver_kwargs["http_receiver"] = selected[credentials.name]
+            app = build_app(
+                config,
+                identity=credentials,
+                web_client=web_client,
+                redis_client=redis_client,
+                logger=logger,
+                identity_bots=identity_bots,
+                admission=admission,
+                **receiver_kwargs,
+            )
+            connect = _socket_mode_connector(
+                app,
+                credentials,
+                logger=logger,
+                slack_identity=credentials.name if several else None,
+                presence=presence,
+            )
+            supervisor = Supervisor(
+                connect,
+                backoff=backoff,
+                logger=logger,
+                label=f"Slack identity {credentials.name}" if several else None,
+            )
+        except Exception:  # noqa: BLE001 - the log names the stage, never Slack or secret bytes.
+            # @spec HTTP-INVOCATION-EXECUTION-25: only a selected receiver has a boundary.
+            if credentials.name not in selected:
+                raise
+            log_receiver_exclusion(logger, credentials.name, "app")
+            continue
         connections.append(
             IdentityConnection(
                 name=credentials.name,
@@ -167,6 +202,8 @@ def build_supervisor(
     logger: logging.Logger,
     identities: Sequence[PreflightedIdentity] | None = None,
     declared_count: int | None = None,
+    http_receivers: tuple[HttpReceiverRuntime, ...] = (),
+    excluded_identities: frozenset[str] = frozenset(),
 ) -> SupervisorGroup:
     """Assemble one supervisor per admitted identity, run together.
 
@@ -176,6 +213,8 @@ def build_supervisor(
     the number of identities resolved before preflight. It defaults to the
     number of ``identities`` (1, for the stock default).
     """
+    if type(http_receivers) is not tuple or type(excluded_identities) is not frozenset:
+        raise ValueError("invalid_http_receiver_runtime")
     admitted = (
         tuple(identities)
         if identities is not None
@@ -186,12 +225,18 @@ def build_supervisor(
         max_seconds=config.backoff_max_seconds,
         multiplier=config.backoff_multiplier,
     )
+    receiver_kwargs: dict[str, Any] = {}
+    if http_receivers:
+        receiver_kwargs["http_receivers"] = http_receivers
+    if excluded_identities:
+        receiver_kwargs["excluded_identities"] = excluded_identities
     connections = build_identity_connections(
         config,
         admitted,
         redis_client=build_redis(config),
         logger=logger,
         declared_count=declared_count if declared_count is not None else len(admitted),
+        **receiver_kwargs,
     )
     group = SupervisorGroup(
         {c.name: c.supervisor for c in connections},
@@ -246,8 +291,30 @@ def main() -> None:
             logger.error("%s", exc)
             raise SystemExit(1) from exc
 
+        # @spec HTTP-INVOCATION-EXECUTION-20/25: only a configured selection passes receivers.
+        # A defective file stops startup before any Socket Mode connection; one receiver's
+        # failure excludes only its own identity.
+        receiver_kwargs: dict[str, Any] = {}
+        if config.http_receiver_dir is not None:
+            try:
+                selection = build_selected_receivers(
+                    config,
+                    admitted,
+                    load_http_receiver_registrations(config.http_receiver_dir),
+                    web_client_factory=build_web_client,
+                    logger=logger,
+                )
+                receiver_kwargs["http_receivers"] = selection.receivers
+                receiver_kwargs["excluded_identities"] = selection.excluded
+            except HttpReceiverInitializationError as exc:
+                logger.error("%s", exc)
+                raise SystemExit(1) from None
         supervisor = build_supervisor(
-            config, logger=logger, identities=admitted, declared_count=len(identities)
+            config,
+            logger=logger,
+            identities=admitted,
+            declared_count=len(identities),
+            **receiver_kwargs,
         )
         # Looked up as a module global so tests can keep the reports offline.
         reports_stop = threading.Event()

@@ -1365,4 +1365,3 @@ def test_the_route_answers_422_for_a_history_refusal(tmp_path: Path, history: st
 
     assert calls == [base]
     assert responses == [(422, {"error": str(direct.value)})]
-

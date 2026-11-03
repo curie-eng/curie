@@ -192,6 +192,7 @@ def test_the_tool_is_named_report_progress_and_enumerates_the_phases() -> None:
         ({"phase": "explore_repo"}, "read_issue"),
         ({"phase": "read_issue", "round": 2}, "round"),
         ({"phase": "plan", "round": 4}, "round"),
+        ({"phase": "plan", "round": 2}, "round"),
         ({"phase": "plan", "round": 0}, "round"),
     ],
 )

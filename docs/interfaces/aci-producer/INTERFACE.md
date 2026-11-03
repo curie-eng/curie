@@ -33,15 +33,16 @@ redefine them.
 ## Current contract
 
 A second implementation is an **ACI server**, an HTTP process serving eight required authenticated
-control routes (seven POSTs and `GET /v1/status`) plus one optional executor route. The eight POST endpoints (`runner/src/curie_runner/server.py`, seven every
-server serves plus one optional executor route): `POST /v1/event` opens a
+control routes (seven POSTs and `GET /v1/status`) plus two optional runner-private routes. The nine POST endpoints (`runner/src/curie_runner/server.py`, seven every
+server serves plus two optional runner-private routes, the executor route and the checkpoint route): `POST /v1/event` opens a
 turn, `POST /v1/steer` injects into the live turn (409 if none running),
 `POST /v1/interrupt` hard-stops it, `POST /v1/reset` discards the conversation so the
 next turn starts fresh (409 while a turn is active), `POST /v1/snapshot` captures a
 bounded managed-workspace snapshot for publication, `POST /v1/timeout` stops the
 exact open turn named by the event response epoch, and `POST /v1/turn-admit` grants or denies
 the exact waiting turn epoch; only in executor mode, the optional `POST /v1/execute` runs one
-connector action for the worker's executor. Two GETs sit alongside them and stay
+connector action for the worker's executor, and the optional `POST /v1/checkpoint` captures the
+managed workspace against a worker-supplied trusted base commit. Two GETs sit alongside them and stay
 unauthenticated, `GET /healthz` and `GET /status`, because the chart's readiness probe
 sends no auth header. The eighth authenticated control route, `GET /v1/status`, returns
 the credential-free boot attestation (`session_id`, `sandbox_id`, `managed_workspace`,
@@ -73,7 +74,16 @@ change superseded its action. The request shape and refusal codes are frozen in 
 the sample kinds and the predicate they feed in `tests/vectors/remediation-predicate.json`. In that mode the runner serves only `/healthz`, `/status`,
 `/v1/status` and `/v1/execute`, and answers every other control route `409` naming the mode.
 `run_conformance` does not cover it, and a server without it answers `404`, which the worker
-maps to `runner_unavailable`. The timeout
+maps to `runner_unavailable`. `POST /v1/checkpoint` is likewise an optional, runner-private,
+bearer-authenticated control route, like `/v1/turn-admit` and `/v1/execute`: it carries no ACI
+frame and changes no ACI wire frame. It captures the managed workspace against a worker-supplied
+trusted base commit within a budget of at most 60 seconds and returns a patch and a manifest,
+bounded at 900000 and 1048576 bytes, with `409` when the session has no managed workspace. It
+stores nothing and conveys no credentials or authority
+([ADR 0251](../../adr/0251-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md));
+`run_conformance` does not cover it, a server without it answers `404`, and executor mode answers
+`409` naming the mode
+([`runner/src/curie_runner/workspace_checkpoint.py`](../../../runner/src/curie_runner/workspace_checkpoint.py)). The timeout
 and `/v1/status` are runner-private, bearer-authenticated control routes. A server that
 omits the epoch response header is simply not notified, and worker timeout classification
 remains unaffected. `/v1/reset` carries no ACI wire frame (it is a runner control route,

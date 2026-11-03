@@ -119,6 +119,7 @@ impl RunnerClient {
             memory_token: None,
             // The kernel alone issues channel read capabilities.
             channel_read: None,
+            attachment_access: None,
         };
         let resp = self
             .http

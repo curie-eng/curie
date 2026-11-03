@@ -49,7 +49,7 @@ import re
 import sys
 import uuid
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -58,7 +58,7 @@ import pytest
 import redis
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from channel_protocol.work_item_events import execute_event_id
-from curie_api import factory_base, factory_notices, workitem_dispatch
+from curie_api import factory_notices, workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER
@@ -150,6 +150,7 @@ class Write:
 class Pair(Protocol):
     """What one adapter pairing supplies to the shared lifecycle."""
 
+    client: TestClient
     tracker_kind: str
     tracker_issue_id: str
     # Whether the status sink records the posted reply on its notice row, so a
@@ -257,7 +258,7 @@ def _execute_wake(request_id: uuid.UUID) -> dict[str, Any]:
     return wakes[0]
 
 
-def _start(request_id: uuid.UUID) -> None:
+def _start(client: TestClient, request_id: uuid.UUID) -> None:
     """A worker acquires the published generation and starts the runtime."""
 
     generation = _rows(
@@ -266,29 +267,49 @@ def _start(request_id: uuid.UUID) -> None:
     )[0]["dispatch_generation"]
 
     async def go() -> None:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with AsyncSession(engine) as session:
-                acquired = await acquire(
-                    session, request_id, owner="factory-owner", generation=generation,
-                    wake=await factory_wake(session, request_id),
-                    context=None,
-                )
-                assert not isinstance(acquired, DispatchConflict), acquired
-                started = await start(
-                    session,
-                    request_id,
-                    owner="factory-owner",
-                    generation=generation,
-                    claim_name="claim-factory",
-                    sandbox_name="sbx-factory",
-                    context=acquired.context,
-                )
-                assert not isinstance(started, DispatchConflict), started
-        finally:
-            await engine.dispose()
+        async with client.app.state.sessionmaker() as session:
+            acquired = await acquire(
+                session, request_id, owner="factory-owner", generation=generation,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=client.app.state.http_client,
+            )
+            diagnostic: object = acquired
+            if isinstance(acquired, DispatchConflict):
+                persisted = (
+                    await session.execute(
+                        text(
+                            "SELECT r.status, r.wait_deadline, r.base_settle_until, "
+                            "r.dispatch_not_before, r.last_deferral_reason, "
+                            "r.version AS request_version, r.dispatch_generation, "
+                            "r.published_generation, r.acquired_generation, "
+                            "r.published_generation IS DISTINCT FROM "
+                            "r.dispatch_generation AS dispatch_pending, "
+                            "w.version AS work_item_version, clock_timestamp() AS database_now "
+                            "FROM curie.execution_requests r JOIN curie.work_items w "
+                            "ON w.id = r.work_item_id WHERE r.id = :id"
+                        ),
+                        {"id": request_id},
+                    )
+                ).mappings().one_or_none()
+                diagnostic = {
+                    "code": acquired.code,
+                    "expected_generation": generation,
+                    "persisted": dict(persisted) if persisted is not None else None,
+                }
+            assert not isinstance(acquired, DispatchConflict), diagnostic
+            started = await start(
+                session,
+                request_id,
+                owner="factory-owner",
+                generation=generation,
+                claim_name="claim-factory",
+                sandbox_name="sbx-factory",
+                context=acquired.context,
+            )
+            assert not isinstance(started, DispatchConflict), started
 
-    asyncio.run(go())
+    client.portal.call(go)
 
 
 def _ci_turns(request_id: uuid.UUID) -> list[dict[str, Any]]:
@@ -355,7 +376,7 @@ def _lifecycle(pair: Pair) -> None:
         str(REPO_ID),
         REPO,
     )
-    assert item["base_branch"] == "main" and item["base_commit"] is not None
+    assert (item["base_branch"], item["base_commit"]) == (None, None)
     assert [r["id"] for r in _requests(work_item_id)] == [first]
     assert _status(first) == ("waiting", None)
     assert _notice(first)["terminal_cause"] is None
@@ -368,7 +389,9 @@ def _lifecycle(pair: Pair) -> None:
     assert [w.op for w in pair.writes(first)] == ["create"]
 
     # 3. A worker starts the run.
-    _start(first)
+    _start(pair.client, first)
+    item = _work_item(pair)
+    assert item["base_branch"] == "main" and item["base_commit"] is not None
     _reconcile()
     assert _status(first) == ("running", None)
     assert pair.state_labels() == {"curie-factory:running"}
@@ -435,7 +458,7 @@ def _lifecycle(pair: Pair) -> None:
     _reconcile()
     assert _execute_wake(revision)["text"] == rows[1]["objective"]
     assert pair.state_labels() == {"curie-factory:queued"}
-    _start(revision)
+    _start(pair.client, revision)
     _reconcile()
     assert _status(revision) == ("running", None)
     assert pair.state_labels() == {"curie-factory:running"}
@@ -654,20 +677,27 @@ def _replace_everywhere(monkeypatch: pytest.MonkeyPatch, seams: dict[str, Any]) 
                 monkeypatch.setattr(module, name, replacement)
 
 
+class _LifecycleCodeHost(InMemoryCodeHost):
+    async def resolve_repository(self, project_id: str) -> types.RepositoryRef:
+        repository = await super().resolve_repository(project_id)
+        return replace(repository, default_branch="main")
+
+
 class _JiraPair:
     tracker_kind = types.JIRA_CLOUD
     # The port branch skips an unchanged rendered digest; it does not freeze a
     # final reply the way the GitHub sink's finalized row does.
     finalizes = False
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def __init__(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
         settings = get_settings()
         self.binding = forges_registry(settings).binding(JIRA_BINDING)
+        self.client = client
         self.tracker = InMemoryTracker(
             kind=types.JIRA_CLOUD, host=JIRA_HOST, scope_id=JIRA_SCOPE, label=LABEL, mention=MENTION
         )
         # A code host with nothing it can rerun: a red check goes straight to a fix round.
-        self.code_host = InMemoryCodeHost(
+        self.code_host = _LifecycleCodeHost(
             kind=types.GITHUB,
             host=github_host(settings),
             capabilities={
@@ -781,16 +811,6 @@ class _JiraPair:
                 self.binding.start_authority, self.issue, actor, tracker=self.tracker
             )
             self.cursor = page.cursor
-            base = await factory_base.resolve_base(
-                policy=forges_registry(get_settings()).binding_repository_policy(
-                    self.binding, self.repository
-                ),
-                labels=set(),
-                default_branch="main",
-                code_host=self.code_host,
-                repository=self.repository,
-            )
-            assert isinstance(base, factory_base.ResolvedBase), base
             return await self._dispatch(
                 Admission(
                     agent_id=agent_id,
@@ -803,7 +823,7 @@ class _JiraPair:
                     objective=self.tracker.issue_url(self.issue),
                     requester=f"{types.JIRA_CLOUD}:{actor.id}:{actor.login}",
                     request_id=notice_request_id(notice),
-                    base=base,
+                    trigger_label=LABEL,
                 ),
                 revision=False,
             )
@@ -983,6 +1003,7 @@ def _jira_pair(monkeypatch: pytest.MonkeyPatch, key_dir: Path) -> Iterator[Pair]
         "APPROVAL_SWEEP_INTERVAL_S": "0",
         "DEAD_LETTER_WATCH_INTERVAL_S": "0",
         # No GitHub intake: the reconciler must not poll a GitHub tracker.
+        "FACTORY_BASE_LABEL_SETTLE_S": "0",
         "FACTORY_ENABLED": "false",
         "CURIE_FORGES": forges_env_json(document, key_dir),
         "GITHUB_REVIEW_INGRESS_ENABLED": "false",
@@ -998,7 +1019,7 @@ def _jira_pair(monkeypatch: pytest.MonkeyPatch, key_dir: Path) -> Iterator[Pair]
         with TestClient(create_app()) as client:
             _create_agent(client, kind="jira", address=JIRA_BINDING)
             try:
-                yield _JiraPair(monkeypatch)
+                yield _JiraPair(client, monkeypatch)
             finally:
                 _clear_ci_keys()
                 _drop_stream()

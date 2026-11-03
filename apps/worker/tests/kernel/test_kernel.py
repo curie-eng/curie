@@ -40,6 +40,7 @@ from channel_protocol.reply import ReplyAck, ReplyEvent, ReplyTarget
 from curie_worker.actions import ActionClient
 from curie_worker.attachments import PreparedAttachments
 from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.binding import HttpIdentityBinding
 from curie_worker.capacity_wait import CapacityWaitRequested
 from curie_worker.kernel import attempt as kernel_attempt
 from curie_worker.kernel import clock as kernel_clock
@@ -117,6 +118,19 @@ def _safe_candidate_status(candidate: SandboxHandle) -> dict[str, object]:
 
 
 class _HistoryBinding:
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
     async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _FakeResolved:
         return _FakeResolved(uuid.UUID("22222222-2222-4222-8222-222222222222"))
 
@@ -399,6 +413,19 @@ def test_cancellation_during_deferred_job_boot_reply_releases_runner_response(
 
 class _BuiltInCodingBinding:
     """Resolved deployment facts for the built-in claim-time coding path."""
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
 
     def __init__(
         self,
@@ -1158,6 +1185,19 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
             self.workspace_enabled = False
 
     class WorkspaceBinding:
+
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> HttpIdentityBinding | None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            agent_id = WorkspaceResolved().agent_id
+            return HttpIdentityBinding(
+                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+                agent_id=agent_id,
+                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+                binding_generation=1, http_identity_required=False,
+            )
+
         async def resolve(
             self, _kind: str, _adapter: str | None, _channel: str
         ) -> WorkspaceResolved:
@@ -1293,6 +1333,19 @@ def test_workspace_capability_without_selection_keeps_fresh_thread_generic(
             self.workspace_enabled = False
 
     class WorkspaceBinding:
+
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> HttpIdentityBinding | None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            agent_id = WorkspaceResolved().agent_id
+            return HttpIdentityBinding(
+                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+                agent_id=agent_id,
+                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+                binding_generation=1, http_identity_required=False,
+            )
+
         async def resolve(
             self, _kind: str, _adapter: str | None, _channel: str
         ) -> WorkspaceResolved:
@@ -2252,6 +2305,19 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(make_harness, 
             self.workspace_enabled = True
 
     class WorkspaceBinding:
+
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> HttpIdentityBinding | None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            agent_id = WorkspaceResolved().agent_id
+            return HttpIdentityBinding(
+                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+                agent_id=agent_id,
+                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+                binding_generation=1, http_identity_required=False,
+            )
+
         async def resolve(
             self, _kind: str, _adapter: str | None, _channel: str
         ) -> WorkspaceResolved:
@@ -2322,6 +2388,19 @@ def _workspace_binding(
             self.workspace_enabled = True
 
     class WorkspaceBinding:
+
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> HttpIdentityBinding | None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            agent_id = WorkspaceResolved().agent_id
+            return HttpIdentityBinding(
+                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+                agent_id=agent_id,
+                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+                binding_generation=1, http_identity_required=False,
+            )
+
         async def resolve(
             self, _kind: str, _adapter: str | None, _channel: str
         ) -> WorkspaceResolved:
@@ -4349,6 +4428,19 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
     from curie_worker.sandbox.k8s import _claim_view
 
     class HistoryBinding:
+
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> HttpIdentityBinding | None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            agent_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+            return HttpIdentityBinding(
+                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+                agent_id=agent_id,
+                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+                binding_generation=1, http_identity_required=False,
+            )
+
         async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _FakeResolved:
             return _FakeResolved(uuid.UUID("22222222-2222-4222-8222-222222222222"))
 
@@ -6256,6 +6348,19 @@ class _TokenBinding:
     so the test can assert the exact value the worker delivers as the Bearer
     header. The claim-time minting itself is covered by the binding unit tests;
     this proves the claim->handle->kernel->runner delivery path."""
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = self._agent_id
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
 
     def __init__(self, token: str, agent_id: uuid.UUID) -> None:
         self._token = token

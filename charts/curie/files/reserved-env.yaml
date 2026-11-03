@@ -9,6 +9,11 @@ worker:
   CURIE_ADAPTER_CREDENTIALS: worker.adapterCredentialsExistingSecret
   CURIE_AGENT_CONNECTOR_SECRET_POOLS: agentSandbox.connectorSecrets
   CURIE_AGENT_SANDBOX_POOLS: agentSandbox.connectorSecrets or agentSandbox.registryEgress
+  CURIE_ATTACHMENT_BROKER_HOST: worker.attachments.broker
+  CURIE_ATTACHMENT_BROKER_PORT: worker.attachments.broker.port
+  CURIE_ATTACHMENT_BROKER_MAX_CONCURRENT: worker.attachments.broker.maxConcurrent
+  CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS: worker.attachments.broker.transferTimeoutSeconds
+  CURIE_ATTACHMENT_MODE: worker.attachments.mode
   CURIE_ATTACHMENT_ENABLED: worker.attachments.enabled
   CURIE_ATTACHMENT_MAX_FILE_BYTES: worker.attachments.maxFileBytes
   CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS: worker.attachments.referenceTtlSeconds
@@ -95,6 +100,7 @@ worker:
   CURIE_WORKSPACE_MAX_COMPRESSION_RATIO: worker.workspace.maxCompressionRatio
   CURIE_WORKSPACE_MAX_CONCURRENT_CLONES: worker.workspace.maxConcurrentClones
   CURIE_WORKSPACE_MAX_MEMBERS: worker.workspace.maxMembers
+  CURIE_WORKSPACE_RECOVERY_ENABLED: worker.workspace.recovery.enabled
   CURIE_WORKSPACE_REFERENCE_TTL_SECONDS: worker.workspace.referenceTtlSeconds
   CURIE_WORKSPACE_SCRATCH_ROOT: worker.workspace.mountPath
   CURIE_WORKSPACE_TOTAL_TIMEOUT_SECONDS: worker.workspace.totalTimeoutSeconds
@@ -115,6 +121,9 @@ worker:
   VALKEY_PORT: valkey.port
   VALKEY_TLS: valkey.tls
 api:
+  ATTACHMENT_TRANSFER_TIMEOUT_SECONDS: worker.attachments.broker.transferTimeoutSeconds
+  ATTACHMENT_ACCESS_ENABLED: worker.attachments.enabled and worker.attachments.mode
+  ATTACHMENT_BROKER_URL: worker.attachments.broker
   API_KEY: api.apiKey
   APPROVAL_SWEEP_INTERVAL_S: api.approvalSweepIntervalSeconds
   BUNDLE_BUCKET: agentSandbox.runner.bundleFetch.bucket
@@ -150,12 +159,16 @@ api:
   CURIE_E2E_WORKER_CLUSTER_ROLE: e2eConnector.workerClusterRole
   CURIE_FACTORY_PUBLICATION_LABELS: api.factoryPublicationLabels
   CURIE_FORGES: factory.codeHosts / factory.trackers / factory.bindings
+  CURIE_HTTP_IDENTITY_DIR: api.httpIdentity.existingSecret
   CURIE_INSTALLATION_ID: the release-managed installation identity (remove this override)
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
   CURIE_PUBLICATION_PATCH_MAX_BYTES: worker.publication.patchMaxBytes
   CURIE_PUBLICATION_RETENTION_SECONDS: worker.publication.retentionSeconds
   CURIE_REMEDIATION_AUTHORITY_KEY: api.remediationAuthorityKey
   CURIE_REMEDIATION_ENABLED: remediation.enabled
+  CURIE_WORKSPACE_MAX_ARCHIVE_BYTES: worker.workspace.maxArchiveBytes
+  CURIE_WORKSPACE_RECOVERY_ENABLED: worker.workspace.recovery.enabled
+  CURIE_WORKSPACE_RECOVERY_MAX_BYTES: worker.workspace.recovery.maxBytes
   CURIE_SANDBOX_QUOTA_LIMITS_CPU: resourceQuota.hard.limitsCpu
   CURIE_SANDBOX_QUOTA_LIMITS_MEMORY: resourceQuota.hard.limitsMemory
   CURIE_SANDBOX_QUOTA_REQUESTS_CPU: resourceQuota.hard.requestsCpu
@@ -169,6 +182,7 @@ api:
   FACTORY_CI_WAIT_S: factory.ciWaitSeconds
   FACTORY_ENABLED: factory.enabled
   FACTORY_INTAKE: factory.intake
+  FACTORY_BASE_LABEL_SETTLE_S: factory.baseLabelSettleSeconds
   GITHUB_API_URL: api.githubApiUrl
   GITHUB_APP_ID: api.githubAppId
   GITHUB_APP_PRIVATE_KEY: api.githubAppExistingSecret
@@ -207,6 +221,7 @@ dispatcher:
   CURIE_API_URL: dispatcher.apiBaseUrl
   CURIE_APPROVAL_CHAT_ATTESTER_SECRET: api.approvalChatAttesterSecret
   CURIE_HEARTBEAT_FILE: the chart-managed heartbeat path (remove this override)
+  CURIE_HTTP_RECEIVER_DIR: dispatcher.httpIdentity.existingSecret
   CURIE_SLACK_IDENTITIES: dispatcher.slack.identities
   CURIE_TEST_INSTALLATION_DRIVERS: testInstallation.drivers
   CURIE_TEST_INSTALLATION_ENABLED: testInstallation.enabled
@@ -218,6 +233,7 @@ dispatcher:
   VALKEY_PORT: valkey.port
   VALKEY_TLS: valkey.tls
 agentSandbox.runner:
+  CURIE_ATTACHMENT_ACCESS_ENABLED: worker.attachments.enabled and worker.attachments.mode
   ANTHROPIC_BASE_URL: inference.service.port
   CURIE_ATTACHMENTS_MANIFEST: the claim's attachment manifest, filled per boot (remove this override)
   CURIE_BUDGET: agentSandbox.runner.budget.maxOutputTokensPerRun

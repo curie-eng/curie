@@ -22,7 +22,7 @@ from pydantic import ValidationError
 
 from .connectors import CONNECTORS_FILE, validate_connectors
 from .manifest import resolve_manifest
-from .models import ApprovalGate, McpConfig, PluginManifest
+from .models import ApprovalGate, McpConfig, McpServer, PluginManifest
 from .yaml_loader import safe_load_unique
 
 # The live name of the platform-mounted publication tool (#2776). The runner
@@ -145,12 +145,19 @@ def _mcp_server_names(obj: object) -> set[str] | None:
     declared-server union.
     """
 
+    servers = _mcp_servers(obj)
+    return None if servers is None else set(servers)
+
+
+def _mcp_servers(obj: object) -> dict[str, McpServer] | None:
+    """``_mcp_server_names`` with each server's declaration kept."""
+
     payload = obj if isinstance(obj, dict) and "mcpServers" in obj else {"mcpServers": obj}
     try:
         config = McpConfig.model_validate(payload)
     except ValidationError:
         return None
-    return set(config.mcpServers)
+    return dict(config.mcpServers)
 
 
 def declared_mcp_server_names(root: str | Path) -> set[str] | None:
@@ -165,8 +172,36 @@ def declared_mcp_server_names(root: str | Path) -> set[str] | None:
     set is the distinct fact that a declaration was read and named no servers.
     """
 
+    servers = declared_mcp_servers(root)
+    return None if servers is None else set(servers)
+
+
+def declared_stdio_server_names(root: str | Path) -> set[str] | None:
+    """The declared servers a stdio transport runs, or ``None`` when unknowable.
+
+    A stdio server carries ``command`` and no remote ``type``. These are the
+    only servers that may call a connector route (ADR 0240 decision 1).
+    """
+
+    servers = declared_mcp_servers(root)
+    if servers is None:
+        return None
+    return {
+        name
+        for name, server in servers.items()
+        if server.command is not None and server.type in (None, "stdio")
+    }
+
+
+def declared_mcp_servers(root: str | Path) -> dict[str, McpServer] | None:
+    """``declared_mcp_server_names`` with each server's declaration kept.
+
+    Where both surfaces name one server, the root ``.mcp.json`` entry is kept,
+    the order the runner mounts them in.
+    """
+
     root = Path(root)
-    servers: set[str] = set()
+    servers: dict[str, McpServer] = {}
     unreadable = False
 
     manifest_path = resolve_manifest(root)
@@ -180,11 +215,11 @@ def declared_mcp_server_names(root: str | Path) -> set[str] | None:
             return None
         declared = manifest.mcpServers
         if isinstance(declared, dict):
-            result = _mcp_server_names(declared)
+            result = _mcp_servers(declared)
             if result is None:
                 unreadable = True
             else:
-                servers |= result
+                servers.update(result)
         elif isinstance(declared, str):
             # The path-string form parses but the real loader ignores it, so the
             # servers never register: unknowable, not empty.
@@ -197,11 +232,11 @@ def declared_mcp_server_names(root: str | Path) -> set[str] | None:
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             unreadable = True
         else:
-            result = _mcp_server_names(data)
+            result = _mcp_servers(data)
             if result is None:
                 unreadable = True
             else:
-                servers |= result
+                servers.update(result)
 
     if unreadable:
         return None

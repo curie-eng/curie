@@ -475,7 +475,13 @@ async def delete_agent(agent_id: uuid.UUID, session: SessionDep) -> None:
             status.HTTP_409_CONFLICT,
             "agent has an active deployment; stop it before deleting",
         )
-    await crud_agents.delete_agent(session, agent_id)
+    try:
+        await crud_agents.delete_agent(session, agent_id)
+    except crud_agents.RecoveryRetained:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"code": "workspace_recovery.retained_objects"},
+        ) from None
 
 
 # --- the channel-binding subresource (ADR-0118, #1525) ------------------------

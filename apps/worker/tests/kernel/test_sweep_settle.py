@@ -569,7 +569,9 @@ def test_uncommitted_publication_with_a_lost_reply_redelivers_to_the_side_effect
             assert h.runner.opened == [PROMPT]
             assert await run_outcome(c.run) == "failed"
             texts = reply_texts(h)
-            assert any("prior attempt started an action" in t for t in texts), texts
+            assert any(
+                "prior attempt may already have executed an action" in t for t in texts
+            ), texts
             assert [n.text for n in notices(h)] == [
                 f'Scheduled sweep "{c.run.ref.name}" for 2026-09-21 stopped before it '
                 "finished (run outcome: failed). Not covered: github, notes."

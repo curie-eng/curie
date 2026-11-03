@@ -237,6 +237,30 @@ stray generic `PORT` or `POLL_INTERVAL` in the pod environment cannot reach one.
 | `CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS` | "" | comma-separated CIDRs the egress policy admits for AgentMail. When set, the AgentMail client dials only addresses inside them (see below). Empty dials whatever DNS returns |
 | `CURIE_MAIL_DISCOVERY_UNREADY_AFTER_SECONDS` | `120` | how long a continuous discovery failure run lasts before `/readyz` reports 503. Must be greater than zero |
 | `CURIE_MAIL_PROVIDER` | `agentmail` | the mail provider (ADR 0228). `agentmail` is built in; any other name is a provider package registered in the `curie.mail_provider` entry-point group (see "Mail providers"). The state file records its provider on first boot, and a different provider refuses to start on it |
+| `CURIE_MAIL_RECEIVER_ID` | "" | the email receiver registration this adapter signs for (ADR 0260, ADR 0266): its `receiver_id` in the API's HTTP identity runtime file. Set together with the next two, or not at all |
+| `CURIE_MAIL_RECEIVER_GENERATION` | unset | that registration's positive `generation` |
+| `CURIE_MAIL_RECEIVER_KEY` | "" | that registration's 32-byte key as unpadded base64url, the same spelling as the runtime file. Held only by the API and this adapter; it differs from the platform key and every channel token. See "Signed email senders" |
+
+### Signed email senders
+
+An agent whose binding requires HTTP identity admits an email sender only on
+a signed email receiver proof (ADR 0260). With all three
+`CURIE_MAIL_RECEIVER_*` settings set, the adapter serializes each turn once as
+compact JSON with sorted keys, signs an `EmailReceiverProofV1` over its
+receiver, the binding named by its channel token, the lowercased sender, the
+delivery id and the SHA-256 of those exact bytes with the platform's shared
+signer, and posts those bytes with the proof in `X-Curie-Receiver-Proof`. A
+stored turn re-posted after a restart has the same bytes and the same proof,
+so the platform sees a duplicate. A turn that cannot be signed, for example
+because the channel token names no binding, is settled without a turn and is
+never posted unsigned.
+
+With none of them set, the adapter posts exactly as it always has, which is
+what a binding on the legacy path expects. A partial or invalid set refuses
+startup with a fixed message that never echoes the key. Several mailboxes may
+trust the same sender domains under the same namespace ids (ADR 0266); each
+still has its own receiver id, key and bindings, so one mailbox's key never
+admits a turn on another's binding.
 
 ### Egress pinning and discovery readiness
 

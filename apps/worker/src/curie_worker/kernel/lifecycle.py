@@ -70,6 +70,7 @@ from . import (
     delivery,
     failures,
     hooks,
+    identity,
     log,
     memory,
     routing,
@@ -79,7 +80,9 @@ from .log import logger
 
 
 async def process_event(
-    self: Kernel, qevent: QueuedTurn, *, lease: DeliveryLease | None = None
+    self: Kernel, qevent: QueuedTurn, *, lease: DeliveryLease | None = None,
+    http_identity_context: str | None = None, original_payload_sha256: str | None = None,
+    original_payload: str | None = None,
 ) -> None:
     """Observe one kernel lifecycle while preserving its ``None`` result.
 
@@ -92,6 +95,11 @@ async def process_event(
 
     routing._check_targetless_shape(qevent)
     error: BaseException | None = None
+    identity_carry = identity.HttpTurnCarry(
+        qevent, http_identity_context, original_payload_sha256,
+        original_payload=original_payload,
+    )
+    identity_token = identity.CURRENT.set(identity_carry)
     hook_token = constants._HOOK_RUN_CARRY.set(hooks._HookRunCarry())
     lease_token = constants._DELIVERY_LEASE.set(lease)
     termination_carry = constants._SandboxTerminationCarry()
@@ -116,6 +124,19 @@ async def process_event(
                 await self._process_event(qevent)
             else:
                 await self._process_event(qevent, lease=lease)
+        except identity.HttpIdentityRefused:
+            if lease is not None:
+                lease.raise_if_lost()
+            try:
+                # The run closes before the marker, so a failed close leaves
+                # the delivery pending rather than terminal and open (#5305).
+                await self._close_hook_run_after_refusal(qevent)
+            except HookRunRecorderError as exc:
+                error = exc
+            else:
+                await self._markers.mark_done(qevent.event_id, marker_value="1")
+                constants._LIFECYCLE_OUTCOME.set("classified_failure")
+                logger.info("HTTP invocation refused before further execution")
         except asyncio.CancelledError as exc:
             error = exc
             await self._close_hook_run_after_error(
@@ -180,6 +201,8 @@ async def process_event(
                     else StatusCode.OK
                 )
             span.add_event("turn.processing.completed", {"outcome": outcome})
+            identity_carry.active = False
+            identity.CURRENT.reset(identity_token)
             constants._LIFECYCLE_OUTCOME.reset(outcome_token)
             constants._TURN_AGENT.reset(agent_token)
             constants._LIFECYCLE_SPAN.reset(token)
@@ -248,6 +271,9 @@ async def _process_event(
             # Completion emit stays at-least-once; turn side effects stay
             # at-most-once for the whole outbox retention period.
             logger.info("event %s already done; skipping", event_id)
+            # @spec HTTP-INVOCATION-EXECUTION-18: the terminal caption clear below
+            # stays a legacy courtesy, so classify before skipping.
+            await identity.classify_skip(self)
             # The skip holds no resolved route of its own and must not
             # invent one, so it makes no sink call -- except to hand off a
             # completion an earlier delivery durably owed and never
@@ -255,6 +281,7 @@ async def _process_event(
             await self._reemit_pending_completion(event_id)
             return
 
+        await identity.prepare(self)
         if qevent.source is TurnSource.CRON:
             if self._hook_runs is None or qevent.hook_run is None:
                 logger.error(
@@ -497,8 +524,8 @@ async def _process_event(
             # A targetless turn owns no card: it never paused for approval.
             await self._finalize_settled_card(qevent, route)
 
-        # Crash-safety: a prior attempt executed a side effect but never
-        # reached done (worker died mid-run). Do not auto-retry the action.
+        # Crash-safety: prior observed or unconfirmed execution latched the
+        # retry fence but never reached done. Do not auto-retry the action.
         if await self._markers.saw_side_effect(event_id):
             # This path is NOT silent: it is the one message a human most
             # needs to see. It runs before binding resolution, so it emits
@@ -520,7 +547,7 @@ async def _process_event(
             await self._escalate(
                 qevent,
                 route,
-                "A prior attempt started an action before the worker restarted; "
+                "A prior attempt may already have executed an action; "
                 "not retrying automatically. Flagging for a human.",
                 failure_class="prior-side-effect",
             )
@@ -615,10 +642,19 @@ async def _process_event(
             # No kind/address: there is no binding to scope the state
             # namespace to. No approval grant, resumed kind or decision
             # either: a targetless turn is never a resume.
+            # ADR 0240 decision 2: passed only when the bundle declares
+            # routes, so a binding that predates the keyword still boots.
+            route_connectors = await self._route_connectors(
+                getattr(resolved, "bundle_ref", None), str(agent_name or "")
+            )
+            targetless_kwargs: dict[str, Any] = (
+                {"route_connectors": route_connectors} if route_connectors else {}
+            )
             boot_env = binding.boot_env(
                 resolved,
                 thread_key,
                 token_ttl_s=self._runner.turn_deadline_s(claim._remaining_budget(lease)),
+                **targetless_kwargs,
             )
             workspace_deployment_id = resolved.deployment_id
             if resolved.deployment_id is not None:
@@ -860,6 +896,21 @@ async def _process_event(
                 boot_env_kwargs["caller_run"] = str(caller_for_boot.request_id)
                 boot_env_kwargs["caller_work_item"] = str(caller_for_boot.work_item_id)
                 boot_env_kwargs["caller_exp_ceiling"] = caller_ceiling
+            # ADR 0240 decision 2, passed only when the bundle declares routes.
+            route_connectors = await self._route_connectors(
+                getattr(resolved, "bundle_ref", None), str(getattr(resolved, "agent_name", ""))
+            )
+            if route_connectors:
+                boot_env_kwargs["route_connectors"] = route_connectors
+            # @spec HTTP-APPROVAL-CONTINUITY-12: a selected HTTP resume grants only
+            # the one snapshot a fresh core check continued for, checked before
+            # boot_env runs; legacy readers and summary fallbacks never run for it.
+            selected = identity.selected()
+            checked_grant = (
+                await identity.approval_grant(self, resolved.agent_id)
+                if selected and qevent.tool_access is None
+                else None
+            )
             boot_env = self._binding.boot_env(
                 resolved,
                 thread_key,
@@ -878,14 +929,25 @@ async def _process_event(
             # on the next claim. Server-side and tool-name-scoped; never minted by the
             # sandbox. getattr: binding doubles may not carry the method, like the
             # approval_routes probe below. See docs/interfaces/approval/INTERFACE.md.
-            grant_fn = getattr(self._binding, "approval_grant_tool", None)
+            grant_fn = None if selected else getattr(self._binding, "approval_grant_tool", None)
             # @spec WORKER-TOOL-ACCESS-4: never a grant for a restricted turn.
             grant_tool = (
                 await grant_fn(qevent.event_id, resolved.agent_id)
                 if grant_fn is not None and qevent.tool_access is None
                 else None
             )
-            if grant_tool:
+            grant_arguments: dict[str, Any] | None = None
+            if checked_grant is not None and checked_grant.granted_tool is not None:
+                grant_tool = checked_grant.granted_tool
+                boot_env[GRANT_TOOL_ENV] = grant_tool
+                if checked_grant.gate_kind == "permission":
+                    exact = checked_grant.granted_arguments_json
+                    assert exact is not None
+                    # The exact checked string crosses unchanged; the parsed copy
+                    # only names the connector grant and is never written back.
+                    boot_env[GRANT_ARGUMENTS_ENV] = exact
+                    grant_arguments = json.loads(exact)
+            elif grant_tool:
                 boot_env[GRANT_TOOL_ENV] = grant_tool
                 grant_arguments = await self._binding.approval_grant_arguments(
                     qevent.event_id, resolved.agent_id
@@ -894,6 +956,7 @@ async def _process_event(
                     boot_env[GRANT_ARGUMENTS_ENV] = json.dumps(
                         grant_arguments, sort_keys=True, separators=(",", ":")
                     )
+            if grant_tool:
                 # A connector live name is mcp__<server>__<tool>. Plugin
                 # tools and a resume with no arguments mint no connector grant.
                 connector_grant = claim._connector_tool_grant(
@@ -950,11 +1013,15 @@ async def _process_event(
             # ran); a 'permission' marker is inert there. Grants nothing
             # (contrast the grant above); getattr-tolerant of binding doubles
             # that do not carry the method, like the grant.
-            resumed_kind_fn = getattr(self._binding, "approval_resumed_kind", None)
+            # A selected HTTP resume names the checked snapshot's own gate kind
+            # rather than rereading the row. @spec HTTP-APPROVAL-CONTINUITY-12.
+            resumed_kind_fn = (
+                None if selected else getattr(self._binding, "approval_resumed_kind", None)
+            )
             resumed_kind = (
                 await resumed_kind_fn(qevent.event_id, resolved.agent_id)
                 if resumed_kind_fn is not None
-                else None
+                else None if checked_grant is None else checked_grant.gate_kind
             )
             if resumed_kind:
                 boot_env[RESUMED_KIND_ENV] = resumed_kind
@@ -1432,8 +1499,13 @@ async def _process_event(
                     failures._escalation_text(
                         qevent,
                         lead=failures._with_guidance(
-                            f"The run hit an error ({token}) after starting an action; "
-                            "not retrying automatically.",
+                            (
+                                "The runner accepted a continuation whose execution could not be "
+                                "confirmed; not retrying automatically."
+                                if outcome.execution_uncertain
+                                else f"The run hit an error ({token}) after starting an action; "
+                                "not retrying automatically."
+                            ),
                             token,
                             delivered_max_turns=(boot_env or {}).get(MAX_TURNS_ENV),
                         ),

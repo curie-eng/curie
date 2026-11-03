@@ -17,6 +17,15 @@ class CaseIsolationError(RuntimeError):
     """The shared install is not in its verified clean baseline state."""
 
 
+LANGFUSE_EVENT_STREAMS = frozenset(
+    {"bull:ingestion-queue:events", "bull:otel-ingestion-queue:events"}
+)
+
+
+def case_owned_streams(keys: set[str]) -> frozenset[str]:
+    return frozenset(keys) - LANGFUSE_EVENT_STREAMS
+
+
 @dataclass(frozen=True)
 class InstallSnapshot:
     agents: int

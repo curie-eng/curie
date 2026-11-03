@@ -22,7 +22,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import aiohttp
 import pytest
@@ -63,7 +63,7 @@ from curie_worker.sandbox import (
     QuotaRejection,
     SandboxSubstrate,
 )
-from curie_worker.sandbox.types import ClaimView, SandboxView
+from curie_worker.sandbox.types import ClaimView, SandboxClient, SandboxView
 from curie_worker.threadlock import ThreadLock
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
@@ -71,6 +71,9 @@ from redis.backoff import NoBackoff
 from redis.maint_notifications import MaintNotificationsConfig
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+
+if TYPE_CHECKING:
+    from curie_worker.sandbox.types import ToolDaemonMount
 
 # ``sync_redis`` and ``names`` (the per-test-unique stream / group / key
 # prefixes on the shared Valkey) live in ``tests/conftest.py``: they are used
@@ -528,10 +531,13 @@ class FakeK8s:
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        deadline: float,
         runner_resources: dict[str, object] | None = None,
         agent_name: str | None = None,
+        tool_daemon: ToolDaemonMount | None = None,
         executor_secret_names: frozenset[str] | None = None,
     ) -> None:
+        assert deadline > 0 and tool_daemon is None
         self.claim_envs.append(env)
         sandbox_name = f"sbx-{name}"
         quota_rejection = self.quota_rejection
@@ -708,6 +714,23 @@ class FakeK8s:
         self.termination_queries.append(name)
         return self.termination
 
+    # No Docker repository pool is configured in this suite, so the substrate
+    # never reaches the tool-daemon seam (ADR 0217); any call is a test bug.
+    def create_daemon_object(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is provisioned in this suite")
+
+    def list_daemon_objects(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is listed in this suite")
+
+    def delete_daemon_object(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is retired in this suite")
+
+    def get_daemon_pod(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon pod is read in this suite")
+
+    def open_daemon_stream(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is pinged in this suite")
+
     def set_sandbox_mode(self, name: str, mode: str) -> None:
         self.sandboxes[name].operating_mode = mode
 
@@ -764,6 +787,7 @@ class FakeRunner:
         # None omits the key, as a runner that predates it does; anything else
         # is sent as is, so a test can advertise ``False`` or ``"true"``.
         self.channel_read_enforced: object = None
+        self.attachment_access_enforced: object = None
         # When set, /status answers 200 with no ``turn_active`` field.
         self.status_malformed = False
         self.status_delay_seconds = 0.0
@@ -819,6 +843,8 @@ class FakeRunner:
         }
         if self.tool_access_enforced is not None:
             body["tool_access"] = list(self.tool_access_enforced)
+        if self.attachment_access_enforced is not None:
+            body["attachment_access"] = self.attachment_access_enforced
         if self.channel_read_enforced is not None:
             body["channel_read"] = self.channel_read_enforced
         if request.path == "/v1/status":
@@ -1134,15 +1160,19 @@ async def kernel_harness(
     runner_app: web.Application | None = None,
     claim_timeout_seconds: float = 3.0,
     substrate_env: Mapping[str, str] | None = None,
+    sandbox_client: SandboxClient | None = None,
     per_sandbox_runners: int = 0,
     hook_runs: object | None = None,
     sibling_limit_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
     progress_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
     sweep_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
+    identity_authority: object | None = None,
     pod_termination_wait_s: float = 0.0,
+    attachment_access: object | None = None,
+    recovery_factory: Callable[[object | None], object] | None = None,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
-    """Assemble a live kernel wired to a fake runner and real Valkey."""
+    """Assemble a live kernel. @spec HTTP-INVOCATION-EXECUTION-18."""
     config = make_config(names, **config_overrides)
     if binding_factory is not None:
         assert binding is None
@@ -1192,7 +1222,7 @@ async def kernel_harness(
         maint_notifications_config=MaintNotificationsConfig(enabled=False),
     )
     substrate = SandboxSubstrate(
-        fake_k8s,  # type: ignore[arg-type]
+        sandbox_client if sandbox_client is not None else fake_k8s,  # type: ignore[arg-type]
         AffinityStore(
             sync_redis,
             pressure_client=pressure_async_redis,
@@ -1221,6 +1251,7 @@ async def kernel_harness(
     # delivery_budget_s`` validator, which now couples the two.
     runner_client = RunnerClient(total_timeout_s=config.runner_total_timeout_s)
     card_store = ApprovalCardStore(async_redis, config)
+    workspace = workspace_factory(substrate) if workspace_factory else None
     kernel = Kernel(
         substrate=substrate,
         runner=runner_client,
@@ -1241,11 +1272,12 @@ async def kernel_harness(
         markers=Markers(async_redis, config),
         config=config,
         binding=binding,  # type: ignore[arg-type]
+        attachment_access=attachment_access,  # type: ignore[arg-type]
         approvals=approvals,  # type: ignore[arg-type]
         approval_reader=approval_reader,  # type: ignore[arg-type]
         actions=actions,  # type: ignore[arg-type]
         publication_creator=publication_creator,  # type: ignore[arg-type]
-        workspace=(workspace_factory(substrate) if workspace_factory else None),  # type: ignore[arg-type]
+        workspace=workspace,  # type: ignore[arg-type]
         work_items=work_items,  # type: ignore[arg-type]
         card_store=card_store,
         route_ttl_seconds=substrate._config.route_ttl_seconds,
@@ -1262,6 +1294,10 @@ async def kernel_harness(
             else {}
         ),
         **({"sweep": sweep_factory(async_redis, config)} if sweep_factory is not None else {}),
+        **({"identity_authority": identity_authority} if identity_authority is not None else {}),
+        # The terminal recovery capture (#5143) is built over the same workspace
+        # coordinator the kernel releases through; omitted, the kernel has none.
+        **({"recovery": recovery_factory(workspace)} if recovery_factory is not None else {}),
     )
     killswitch = None
     if with_killswitch:

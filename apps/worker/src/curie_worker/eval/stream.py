@@ -72,7 +72,7 @@ from ..config import WorkerConfig
 from ..consumer_liveness import ConsumerLivenessStore
 from ..delivery_lease import DeliveryLeaseStore, LeaseLostError
 from ..sandbox import SandboxSubstrate
-from ..sandbox.types import SandboxError
+from ..sandbox.types import AdmissionUnavailableError, SandboxError
 from ..stream_consumer import DeliverySpec, ReadLoopSpec, StreamConsumer
 from ..upgrade_drain import UpgradeDrainGate
 from .models import EvalCaseResult, EvalOutcome, EvalRunResult, EvalScorer, EvalSuite
@@ -743,6 +743,8 @@ class EvalStreamConsumer(StreamConsumer):
                     agent_name=agent_name,
                     runner_resources=runner_resources,
                 )
+        except AdmissionUnavailableError:
+            raise
         except SandboxError:
             logger.exception("could not provision a runner for eval %s", item.sha)
             return None, None, None

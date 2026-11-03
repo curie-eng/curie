@@ -57,6 +57,18 @@ _OVERRIDES: dict[str, tuple[str, str, object]] = {
         "alice@example.com,example.org",
         ("alice@example.com", "example.org"),
     ),
+    # The three receiver settings are all or nothing, so they are set together.
+    "CURIE_MAIL_RECEIVER_ID": (
+        "receiver_id",
+        "00000000-0000-4000-8000-0000000000a1",
+        "00000000-0000-4000-8000-0000000000a1",
+    ),
+    "CURIE_MAIL_RECEIVER_GENERATION": ("receiver_generation", "3", 3),
+    "CURIE_MAIL_RECEIVER_KEY": (
+        "receiver_key",
+        "c2VudGluZWwtcmVjZWl2ZXIta2V5LW9mLTMyLWJ5dGU",
+        "c2VudGluZWwtcmVjZWl2ZXIta2V5LW9mLTMyLWJ5dGU",
+    ),
 }
 
 _DEFAULTS: dict[str, object] = {
@@ -82,6 +94,9 @@ _DEFAULTS: dict[str, object] = {
     "agentmail_egress_cidrs": (),
     "discovery_unready_after_seconds": 120.0,
     "mail_provider": "agentmail",
+    "receiver_id": "",
+    "receiver_generation": None,
+    "receiver_key": "",
 }
 
 

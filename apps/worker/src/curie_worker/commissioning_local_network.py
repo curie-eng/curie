@@ -1,4 +1,4 @@
-"""The local Cilium network producer and its per-call network fact, ADR 0236.
+"""The local Cilium network producer and its three per-call peer facts, ADR 0236.
 
 @spec PROTECTED-COMMISSIONING-5. The local Cilium producer measures preventive
 network enforcement of a disposable local installation. It reuses the managed
@@ -12,20 +12,24 @@ encoding unchanged, and adds what is local to Cilium:
   measured against an owned fixture on the node network, supplied as the
   ``cloud_network`` destination.
 
-ADR 0236 binds the network fact into every signed guard reply. Re-running the
-behavioral cases takes minutes, so each fact call reobserves what binds the
-measurement instead: the engine identity and the policy set. Any difference,
-or a measurement that did not pass every local entry, refuses. This module
-implements the commissioning ``FactProducer`` protocol structurally;
-production composition never imports it.
+ADR 0236 binds the network, hostile-peer and retained-peer facts into every
+signed guard reply. Re-running the behavioral cases takes minutes, so each fact
+call reobserves what binds the measurement instead: the engine identity and the
+policy set. Any difference refuses every fact. Each fact then judges only its
+own channel's entries, so evidence shows which fact refused: an unavailable
+spoof or address-reuse entry refuses the hostile-peer fact, and an unavailable
+fresh-connection entry refuses the retained-peer fact. The producer's own verdict
+still refuses while any local entry is not ``pass``. This module implements the commissioning
+``FactProducer`` protocol structurally; production composition never imports
+it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from .commissioning_local_cilium import (
@@ -47,24 +51,62 @@ from .managed_cni_cases import (
 )
 from .managed_cni_probe_kit import (
     PRODUCER_CONSTANTS,
+    SUB_CASES,
     Measurement,
     ObservationEntry,
     PolicySet,
     ProbeKitRefused,
     accepts,
     channel_digest,
+    measurement_binding_matches,
+    producer_constants_digest,
     refuse,
     require,
+    sha256_canonical,
 )
 
-LOCAL_PRODUCER_KIND = "local-cilium-v1"
+LOCAL_PRODUCER_KIND = "local-cilium-v2"
+# Sub-cases this producer does not measure even within its own cases: a local
+# Docker-driver install has no instance metadata service.
 NOT_APPLICABLE_SUB_CASES = frozenset({"instance_metadata"})
-# ADR 0236 fact name -> probe kit channel and the cases this producer measures
-# for it. Case 7 joins the network fact with its slice; the hostile and
-# retained-peer facts follow with the peer slice.
-FACTS = {"network": ("network", (1, 6, 8))}
+# ADR 0236 fact -> probe kit channel and the cases this producer measures for it.
+# Case 7 (node-local traffic) is not wired locally yet.
+FACTS = {
+    "network": ("network", (1, 6, 8)),
+    "hostile_peer": ("hostile", (2, 3, 4)),
+    "retained_peer": ("retained_peer", (5,)),
+}
+LOCAL_CASES = tuple(sorted({case for _channel, cases in FACTS.values() for case in cases}))
+# Allowlist, not a denylist: exactly the sub-cases of those cases. Everything else
+# the shared kit returns -- case 7 and any future kit case -- is dropped before the
+# digests and before the verdict, so a later kit case cannot leak into a local fact
+# or its refusal.
+_LOCAL_SUB_CASES = frozenset(
+    (case, sub_case)
+    for case in LOCAL_CASES
+    for sub_case in SUB_CASES[case]
+    if sub_case not in NOT_APPLICABLE_SUB_CASES
+)
+
+
+def _in_local_scope(case: int, sub_case: str) -> bool:
+    return (case, sub_case) in _LOCAL_SUB_CASES
+
+
+def _keep_entry(item: ObservationEntry) -> bool:
+    """Keep only this producer's cases. Case 7 and any future kit case are dropped
+    unconditionally. Instance metadata is not measured on a local
+    install, so an ``unavailable``/``destination_unknown`` entry is dropped, but a
+    real observation is kept so a metadata leak still fails the measurement."""
+    if _in_local_scope(item.case, item.sub_case):
+        return True
+    if item.case == 6 and item.sub_case == "instance_metadata":
+        return (item.outcome, item.reason) != ("unavailable", "destination_unknown")
+    return False
+
+
 # Kit refusals that stop before the remaining cases; the local filter keeps them.
-_EARLY = ("enforcement_absent", "non_vacuity_unavailable")
+_EARLY = ("enforcement_absent", "non_vacuity_unavailable", "cleanup_unconfirmed")
 
 
 class LocalCluster(ProbeCluster, CiliumReader, Protocol):
@@ -79,17 +121,7 @@ class _Kit(Protocol):
 
 
 def local_required_entries(layout: ProbeLayout) -> frozenset[EntryKey]:
-    return frozenset(
-        key for key in required_entries(layout) if key[1] not in NOT_APPLICABLE_SUB_CASES
-    )
-
-
-def _not_applicable(item: ObservationEntry) -> bool:
-    # Dropped only when nothing was observed; any observation is kept and judged.
-    return item.sub_case in NOT_APPLICABLE_SUB_CASES and (item.outcome, item.reason) == (
-        "unavailable",
-        "destination_unknown",
-    )
+    return frozenset(key for key in required_entries(layout) if _in_local_scope(key[0], key[1]))
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +130,9 @@ class LocalResult:
     identity: CiliumIdentity | None
     policies: PolicySet | None
     kit: KitResult | None
+    # A refusal of the measurement as a whole (engine, policies, cleanup or an
+    # early kit stop); it refuses every fact, unlike a refused entry.
+    bracket: str | None = None
 
 
 class LocalCiliumNetworkProducer:
@@ -148,35 +183,44 @@ class LocalCiliumNetworkProducer:
         try:
             before = await self._identity()
         except ProbeKitRefused:
-            return LocalResult(Measurement((), "cni_unavailable"), None, None, None)
+            return LocalResult(Measurement((), "cni_unavailable"), None, None, None, "cni")
         if set(before.families) != set(self._layout.families):
-            return LocalResult(Measurement((), "families_unserved"), before, None, None)
+            return LocalResult(Measurement((), "families_unserved"), before, None, None, "cni")
         policies = await self._policies()
         if policies is None:
-            return LocalResult(Measurement((), "policy_set_unavailable"), before, None, None)
+            refused = Measurement((), "policy_set_unavailable")
+            return LocalResult(refused, before, policies, None, "policies")
         kit = await self._kit.measure()
         report = self._kit.last
-        entries = tuple(item for item in kit.entries if not _not_applicable(item))
+        # Keep only this producer's own cases; drop every other kit case (including
+        # future ones) before the digest and the verdict.
+        entries = tuple(item for item in kit.entries if _keep_entry(item))
         try:
             after: CiliumIdentity | None = await self._identity()
         except ProbeKitRefused:
             after = None
-        refusal = self._refusal(
-            kit, report, entries, before, after, await self._policies() == policies
-        )
-        return LocalResult(Measurement(entries, refusal), before, policies, report)
+        bracket = self._bracket(kit, report, before, after, await self._policies() == policies)
+        refusal = bracket or self._entry_refusal(entries, local_required_entries(self._layout))
+        from .managed_cni_probe_programs import probe_kit_digest
 
-    def _refusal(
-        self,
+        return LocalResult(Measurement(entries, refusal, LOCAL_PRODUCER_KIND,
+                                       producer_constants_digest(), probe_kit_digest()),
+                           before, policies, report, bracket)
+
+    @staticmethod
+    def _bracket(
         kit: Measurement,
         report: KitResult | None,
-        entries: tuple[ObservationEntry, ...],
         before: CiliumIdentity,
         after: CiliumIdentity | None,
         policies_unchanged: bool,
     ) -> str | None:
+        if not measurement_binding_matches(kit):
+            return "producer_binding_unavailable"
         if report is None or report.leftovers:
             return "cleanup_unconfirmed"
+        if report.measurement != kit or not measurement_binding_matches(report.measurement):
+            return "producer_binding_unavailable"
         if after is None:
             return "cni_unavailable"
         if after.digest != before.digest:
@@ -185,11 +229,16 @@ class LocalCiliumNetworkProducer:
             return "policy_set_changed"
         if kit.refusal in _EARLY:
             return kit.refusal
+        return None
+
+    @staticmethod
+    def _entry_refusal(
+        entries: Sequence[ObservationEntry], required: frozenset[EntryKey] | set[EntryKey]
+    ) -> str | None:
         failed = next((item for item in entries if item.outcome != "pass"), None)
         if failed is not None:
             return failed.reason
-        required = local_required_entries(self._layout)
-        # Exactly the local entries: none missing, none repeated, none extra.
+        # Exactly the required entries: none missing, none repeated, none extra.
         if not accepts(entries, required) or len(entries) != len(required):
             return "incomplete"
         return None
@@ -203,15 +252,29 @@ class LocalCiliumNetworkProducer:
         result = self.last
         require(result is not None)
         assert result is not None
-        require(result.measurement.refusal is None and result.identity is not None)
+        require(result.bracket is None and result.identity is not None)
         assert result.identity is not None
         entries = [item for item in result.measurement.entries if item.case in cases]
         required = {key for key in local_required_entries(self._layout) if key[0] in cases}
-        require(accepts(entries, required))
+        require(self._entry_refusal(entries, required) is None)
         current = await self._identity()
         require(current.digest == result.identity.digest)
         require(await self._policies() == result.policies)
-        return channel_digest(entries, channel)
+        require(result.kit is not None and measurement_binding_matches(result.kit.measurement))
+        assert result.kit is not None
+        return local_channel_digest(
+            replace(result.kit.measurement, entries=tuple(entries), refusal=None), channel
+        )
+
+
+def local_channel_digest(measurement: Measurement, channel: str) -> str:
+    """Fixed local identity around the shared v2 behavioral execution binding."""
+    return sha256_canonical(
+        {
+            "producer_kind": LOCAL_PRODUCER_KIND,
+            "behavioral_digest": channel_digest(measurement, channel),
+        }
+    )
 
 
 class LocalNetworkFact:
