@@ -38,13 +38,16 @@ EXPIRES = datetime(2027, 1, 31, tzinfo=UTC)
 DC_API_URL = "https://bitbucket-dc.example.invalid/bitbucket"
 
 # Decision 3: every mandatory operation supported; diagnostics, rerun and the
-# write check unsupported on both kinds.
+# write check unsupported on both kinds, as is UI evidence hosting.
 EXPECTED_CAPABILITIES = {
     **dict.fromkeys(CODE_HOST_OPERATIONS, Support.SUPPORTED),
     Operation.CI_DIAGNOSTICS: Support.UNSUPPORTED,
     Operation.RERUN_FAILED: Support.UNSUPPORTED,
     Operation.USER_CAN_WRITE: Support.UNSUPPORTED,
     Operation.REQUIRED_CHECKS: Support.UNSUPPORTED,
+    # UI evidence hosting is GitHub only: both kinds declare it unsupported.
+    Operation.STORE_EVIDENCE: Support.UNSUPPORTED,
+    Operation.DELETE_EVIDENCE: Support.UNSUPPORTED,
 }
 
 KINDS = [
