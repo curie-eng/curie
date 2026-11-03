@@ -14,6 +14,7 @@ from curie_api.schemas.channels import BUILTIN_CLUSTER_MESSAGE_ADAPTER
 from curie_api.schemas.publications import PublicationCreate
 
 from ..config import get_settings
+from ..identity.http_invocation import HttpInvocationRuntime
 from ..identity.writer_selection import http_selected_scope
 from ..models import (
     Approval,
@@ -344,8 +345,12 @@ async def create_publication(
     patch: bytes,
     metadata_check: Callable[[], Awaitable[None]],
     traceparent: str | None = None,
+    identity_runtime: HttpInvocationRuntime | None = None,
 ) -> tuple[Publication, bool]:
     """Atomically create the durable approval and its private publication.
+
+    ``identity_runtime`` is the app's HTTP invocation runtime, which the approval
+    scope is classified with (HTTP-APPROVAL-CONTINUITY-14).
 
     ``dedupe_key`` belongs to Approval, so the replay lookup starts there. An
     exact replay adopts both rows; a changed patch or snapshot fact is a hard
@@ -381,7 +386,7 @@ async def create_publication(
     if agent is None:
         raise LookupError("agent not found")
     auto = agent.publication_policy == POLICY_AUTO
-    # Before any lineage or reservation change. @spec HTTP-APPROVAL-CONTINUITY-1.
+    # Before any lineage or reservation change. @spec HTTP-APPROVAL-CONTINUITY-1/14.
     if await http_selected_scope(
         session,
         Approval(
@@ -393,6 +398,7 @@ async def create_publication(
                 data.reply_kind, data.reply_adapter, data.reply_identity
             ),
         ),
+        runtime=identity_runtime,
     ):
         raise PublicationLineageConflict(
             "publication.unsupported_approval",

@@ -51,6 +51,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .action_forward import ForwardCreated, ForwardRefused, arguments_sha256
 from .config import get_settings
+from .identity.http_invocation import HttpInvocationRuntime
 from .identity.writer_selection import http_selected_scope
 from .models import (
     Agent,
@@ -214,6 +215,7 @@ async def request_remediation_approval(
     check: str,
     observed: Any = None,
     store: ObjectStore | None = None,
+    identity_runtime: HttpInvocationRuntime | None = None,
 ) -> RemediationApprovalRequested:
     """Raise, attach to, or replay the approval of a not-admitted nomination.
 
@@ -299,7 +301,7 @@ async def request_remediation_approval(
         await session.commit()
         return RemediationApprovalRequested(approval_id=approval_id, created=False)
 
-    # Before the card's reads or any insert. @spec HTTP-APPROVAL-CONTINUITY-1.
+    # Before the card's reads or any insert. @spec HTTP-APPROVAL-CONTINUITY-1/14.
     try:
         selected = await http_selected_scope(
             session,
@@ -309,6 +311,7 @@ async def request_remediation_approval(
                 reply_channel=handle.channel,
                 reply_adapter=handle.adapter,
             ),
+            runtime=identity_runtime,
         )
     except HTTPException:
         # Unavailable classification never selects the legacy writer.

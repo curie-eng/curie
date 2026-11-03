@@ -1,6 +1,7 @@
 """Database access for approvals."""
 
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -901,8 +902,12 @@ async def recover_approval_atomic(
     actor_channel: str | None,
     principal_kind: str | None,
     facts: list[str],
+    guard: Callable[[AsyncSession], Awaitable[None]] | None = None,
 ) -> Approval | None:
     """Administratively settle a pending approval as ``rejected``, atomically.
+
+    ``guard``, when given, runs first inside the settling transaction and may
+    raise to refuse before any write (HTTP-APPROVAL-CONTINUITY-14).
 
     The CAS is guarded on ``status = 'pending'`` exactly as the ordinary
     resolve-once claim is, so an approval is settled at most once. Returns None
@@ -917,6 +922,8 @@ async def recover_approval_atomic(
 
     recovered: uuid.UUID | None
     async with session.begin():
+        if guard is not None:
+            await guard(session)
         # The associated publication, read inside the SAME transaction that
         # settles the approval. ``claim_approval_resolution`` settles it too,
         # but it commits internally, so it cannot be reused here: composing it

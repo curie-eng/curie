@@ -81,6 +81,7 @@ from . import bundles
 from .action_execution_codes import NOT_REVERSIBLE_NOW_CODE
 from .action_undoable import in_force_bundle_refs
 from .config import get_settings
+from .identity.http_invocation import HttpInvocationRuntime
 from .models import (
     ActionExecution,
     AgentAction,
@@ -327,6 +328,7 @@ async def _write_outcome(
     connector: str | None,
     tool: str | None,
     store: ObjectStore | None = None,
+    identity_runtime: HttpInvocationRuntime | None = None,
 ) -> None:
     """@spec AUTOMATED-REMEDIATION-18: the one outcome, on the record and the nomination.
 
@@ -359,7 +361,8 @@ async def _write_outcome(
     await _end_the_rest(session, nomination_id, forward_id, now)
     await outcome_written(session, nomination_id, outcome, connector=connector, tool=tool)
     await escalate(
-        session, nomination_id=nomination_id, outcome=outcome, action_id=action_id, store=store
+        session, nomination_id=nomination_id, outcome=outcome, action_id=action_id, store=store,
+        identity_runtime=identity_runtime,
     )
     logger.info("remediation verification ended nomination=%s outcome=%s", nomination_id, outcome)
 
@@ -413,7 +416,8 @@ async def _observable(
 
 
 async def finish_unverified(
-    session: AsyncSession, execution: ActionExecution, now: datetime
+    session: AsyncSession, execution: ActionExecution, now: datetime,
+    *, identity_runtime: HttpInvocationRuntime | None = None,
 ) -> bool:
     """Finish a remediation whose forward execution ended without confirming.
 
@@ -474,6 +478,7 @@ async def finish_unverified(
             nomination_id=nomination.id,
             outcome=NOT_RECOVERED,
             action_id=execution.subject_action_id,
+            identity_runtime=identity_runtime,
         )
         logger.info(
             "remediation verification ended nomination=%s outcome=%s", nomination.id, NOT_RECOVERED
@@ -486,6 +491,8 @@ async def schedule_verification(
     store: ObjectStore,
     execution: ActionExecution,
     now: datetime,
+    *,
+    identity_runtime: HttpInvocationRuntime | None = None,
 ) -> None:
     """Start, or decide at once, the verification of a remediation's forward execution.
 
@@ -494,7 +501,7 @@ async def schedule_verification(
     Commits nothing.
     """
 
-    if await finish_unverified(session, execution, now):
+    if await finish_unverified(session, execution, now, identity_runtime=identity_runtime):
         return
     if execution.kind != ExecutionKind.forward or execution.subject_action_id is None:
         return
@@ -521,6 +528,7 @@ async def schedule_verification(
             connector=execution.connector,
             tool=execution.tool,
             store=store,
+            identity_runtime=identity_runtime,
         )
 
     if execution.state != ExecutionState.confirmed:
@@ -719,7 +727,8 @@ def _consecutive(verifier: Mapping[str, Any]) -> int:
 
 
 async def _evaluate(
-    session: AsyncSession, nomination_id: uuid.UUID, forward_id: uuid.UUID, now: datetime
+    session: AsyncSession, nomination_id: uuid.UUID, forward_id: uuid.UUID, now: datetime,
+    *, identity_runtime: HttpInvocationRuntime | None = None,
 ) -> None:
     forward = await session.get(ActionExecution, forward_id)
     if forward is None or forward.subject_action_id is None or forward.dispatched_at is None:
@@ -773,6 +782,7 @@ async def _evaluate(
             now=now,
             connector=forward.connector,
             tool=forward.tool,
+            identity_runtime=identity_runtime,
         )
 
     if await _superseded(session, action, nomination, declared, observes):
@@ -814,7 +824,10 @@ async def _evaluate(
         await decide(NOT_RECOVERED if successful else UNAVAILABLE)
 
 
-async def reads_ended(session: AsyncSession, keys: Iterable[str | None], now: datetime) -> None:
+async def reads_ended(
+    session: AsyncSession, keys: Iterable[str | None], now: datetime,
+    *, identity_runtime: HttpInvocationRuntime | None = None,
+) -> None:
     """Evaluate each verification one of these ended reads belongs to.
 
     @spec AUTOMATED-REMEDIATION-18. ``keys`` are the ended reads' idempotency
@@ -827,7 +840,9 @@ async def reads_ended(session: AsyncSession, keys: Iterable[str | None], now: da
         key=lambda pair: (str(pair[1]), str(pair[0])),
     )
     for nomination_id, forward_id in verifications:
-        await _evaluate(session, nomination_id, forward_id, now)
+        await _evaluate(
+            session, nomination_id, forward_id, now, identity_runtime=identity_runtime,
+        )
 
 
 def is_observe_only(execution: ActionExecution) -> bool:

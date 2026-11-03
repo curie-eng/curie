@@ -23,6 +23,7 @@ from curie_api.crud import approvals as approvals_crud
 from curie_api.crud import channels as channels_crud
 from curie_api.models import (
     Agent,
+    AgentChannel,
     Approval,
     ApprovalAuditEntry,
     ApprovalStatus,
@@ -34,6 +35,7 @@ from curie_api.schemas.http_authority import HttpSelectionV1
 
 from .http_invocation import (
     HttpInvocationRuntime,
+    binding_requires_http_identity,
     current_http_approval_caller,
     revalidate_http_approval_caller,
 )
@@ -150,54 +152,95 @@ async def _http_tenant(session: AsyncSession, tenant_id: uuid.UUID) -> bool:
     return isinstance(configuration.selection, HttpSelectionV1)
 
 
-async def _selected(session: AsyncSession, source: ApprovalRequest | Approval) -> bool:
-    """Stored provenance, the agent and every route candidate. @spec HTTP-APPROVAL-CONTINUITY-1."""
+async def _selected(
+    session: AsyncSession, runtime: HttpInvocationRuntime | None,
+    source: ApprovalRequest | Approval,
+) -> bool:
+    """Stored provenance, then every route candidate by binding.
+
+    A candidate in an adopted tenant selects when it requires HTTP identity
+    (the one per-binding owner), or when it is not the approval agent's own
+    binding in the agent's tenant, which is every candidate of an agent-less
+    approval. An agent in an adopted tenant is selected
+    unless its route resolves to exactly one binding, its own there: only that
+    shows its approver role is legacy-evaluable, and an ambiguous route is
+    refused strictly. A tenant without HTTP selection keeps
+    agent/route disagreement and ambiguity. @spec HTTP-APPROVAL-CONTINUITY-1/14.
+    """
     if isinstance(source, Approval) and source.identity_context is not None:
         return True
     agent = None if source.agent_id is None else await session.get(Agent, source.agent_id)
-    if agent is not None and await _http_tenant(session, agent.tenant_id):
-        return True
     adapter = (
         source.reply_identity
         if source.reply_kind == "slack" and source.reply_adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER
         else source.reply_adapter
     )
-    # Every candidate, so an ambiguous route cannot hide an adopted one. A tenant
-    # without HTTP selection keeps agent/route disagreement and ambiguity.
-    for binding in await channels_crud.bindings_for_route(
+
+    def own(binding: AgentChannel) -> bool:
+        """@spec HTTP-APPROVAL-CONTINUITY-14."""
+        return agent is not None and (binding.agent_id, binding.tenant_id) == (
+            agent.id, agent.tenant_id,
+        )
+
+    # Every candidate, so an ambiguous route cannot hide an adopted one.
+    candidates = await channels_crud.bindings_for_route(
         session, source.reply_kind, adapter, source.reply_channel,
-    ):
-        if await _http_tenant(session, binding.tenant_id):
+    )
+    for binding in candidates:
+        if not await _http_tenant(session, binding.tenant_id):
+            continue
+        # Without an agent there is no approver role to read: any adopted candidate selects.
+        if not own(binding) or await binding_requires_http_identity(
+            session, runtime, binding,
+        ):
             return True
-    return False
+    if agent is None or not await _http_tenant(session, agent.tenant_id):
+        return False
+    # Strict: an ambiguous route refuses even when no candidate needs HTTP facts.
+    return len(candidates) != 1 or not own(candidates[0])
 
 
-async def approval_is_selected(session: AsyncSession, approval: Approval) -> bool:
+async def approval_is_selected(
+    session: AsyncSession, approval: Approval, *, runtime: HttpInvocationRuntime | None,
+) -> bool:
     """Classify a stored row before any legacy mutation or wake.
 
     Null provenance is not legacy authority; unavailable classification raises
-    the fixed 503 rather than selecting legacy. @spec HTTP-APPROVAL-CONTINUITY-1/10.
+    the fixed 503 rather than selecting legacy. Runtime None registers no
+    identity. @spec HTTP-APPROVAL-CONTINUITY-1/10/14.
     """
     try:
-        return await _selected(session, approval)
+        return await _selected(session, runtime, approval)
     except HTTPException:
         raise
     except Exception:  # noqa: BLE001 - classification failure cannot select legacy.
         _refuse(503, "authority_unavailable")
 
 
-async def require_legacy_approval_creation(session: AsyncSession, data: ApprovalRequest) -> None:
-    """No provenance-free adopted creation. @spec HTTP-APPROVAL-CONTINUITY-1/5."""
+async def require_legacy_approval_creation(
+    session: AsyncSession, data: ApprovalRequest, *, runtime: HttpInvocationRuntime | None,
+) -> None:
+    """No provenance-free selected creation. @spec HTTP-APPROVAL-CONTINUITY-1/5/14."""
     try:
         await identity_fence.lock_identity_reader(session)
         existing = await approvals_crud.get_approval_by_dedupe_key(session, data.dedupe_key)
         for source in (data,) if existing is None else (data, existing):
-            if await _selected(session, source):
+            if await _selected(session, runtime, source):
                 _refuse(409, "unsupported_approval")
     except HTTPException:
         raise
     except Exception:  # noqa: BLE001 - classification failure cannot select legacy.
         _refuse(503, "authority_unavailable")
+
+
+def identity_runtime(state: Any) -> HttpInvocationRuntime | None:
+    """The app's HTTP invocation runtime for classification; absent registers nothing.
+
+    create_app validates the stored value, and anything else fails the
+    classification closed. @spec HTTP-APPROVAL-CONTINUITY-14.
+    """
+    runtime: HttpInvocationRuntime | None = getattr(state, "http_identity_runtime", None)
+    return runtime
 
 
 def verified_capsule(

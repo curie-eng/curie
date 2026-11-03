@@ -41,6 +41,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from opentelemetry.trace import SpanKind
 from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import errors as crud_errors
@@ -61,7 +62,7 @@ from ..approvers import ApproverSetSelector
 from ..auth import require_platform_key
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep
-from ..identity.http_approval import approval_is_selected
+from ..identity.http_approval import approval_is_selected, identity_runtime
 from ..identity.http_approval_answer import (
     PROOF_HEADER,
     ApprovalAnswer,
@@ -69,6 +70,7 @@ from ..identity.http_approval_answer import (
     answer_http_approval,
     publish_answered_resume,
 )
+from ..identity_fence import lock_identity_reader
 from ..models import AgentChannel, Approval, ApprovalAuditEntry, ApprovalStatus
 from ..remediation_approvals import REMEDIATION_PURPOSE, settle_remediation_approval
 from ..resumequeue import ResumeQueue, approval_trace_context, build_resume_turn
@@ -290,7 +292,9 @@ async def recover_approval(
     # @spec HTTP-APPROVAL-CONTINUITY-7/10: a selected row additionally needs an
     # authenticated Slack actor with current approver and original-invoker
     # authority; platform-key-only recovery refuses before any mutation.
-    if await approval_is_selected(session, approval):
+    if await approval_is_selected(
+        session, approval, runtime=identity_runtime(request.app.state),
+    ):
         return await _recover_selected(
             approval, data, session, principal, request, approver_sets, resume_queue,
         )
@@ -302,6 +306,18 @@ async def recover_approval(
     # Release the read transaction: the atomic function below opens one of its
     # own, and a session already inside a transaction cannot begin another.
     await session.commit()
+
+    async def still_legacy(settling: AsyncSession) -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-14: classify again in the settling transaction.
+
+        A role change or adoption committed since the classification above
+        refuses as a selected row without an authenticated actor does.
+        """
+        await lock_identity_reader(settling)
+        if await approval_is_selected(
+            settling, approval, runtime=identity_runtime(request.app.state),
+        ):
+            raise HTTPException(status.HTTP_409_CONFLICT, "unsupported_approval")
 
     try:
         with operation_span(
@@ -319,6 +335,7 @@ async def recover_approval(
                 actor_channel=principal.actor_channel,
                 principal_kind=principal.kind,
                 facts=facts,
+                guard=still_legacy,
             )
     except crud_errors.PublicationSettlementConflict as exc:
         # The approval's publication moved between the read and the settlement.

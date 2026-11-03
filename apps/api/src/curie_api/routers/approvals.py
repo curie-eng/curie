@@ -64,7 +64,11 @@ from ..auth import require_api_key, require_platform_key
 from ..authorizer import AuthzDecision, authorize_approval
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep, get_store
-from ..identity.http_approval import approval_is_selected, require_legacy_approval_creation
+from ..identity.http_approval import (
+    approval_is_selected,
+    identity_runtime,
+    require_legacy_approval_creation,
+)
 from ..identity.http_approval_answer import (
     PROOF_HEADER,
     ApprovalAnswer,
@@ -289,7 +293,9 @@ async def create_approval(
     runner, so a sandbox cannot talk its way past it.
     """
 
-    await require_legacy_approval_creation(session, data)
+    await require_legacy_approval_creation(
+        session, data, runtime=identity_runtime(request.app.state),
+    )
     traceparent = canonicalize_traceparent(
         request.headers.get(TRACEPARENT_STREAM_FIELD)
     )
@@ -540,7 +546,9 @@ async def resolve_approval(
     # admission, team lookup or CAS. Its deadline expiry goes through the sealing
     # owner, and an authenticated Slack answer through the approval commit owner;
     # either way its wake stays owed rather than context-free.
-    if await approval_is_selected(session, approval):
+    if await approval_is_selected(
+        session, approval, runtime=identity_runtime(request.app.state),
+    ):
         await session.commit()
         gone: Approval | None = approval if approval.status == ApprovalStatus.expired else None
         if approval.status == ApprovalStatus.pending and _expired(approval):
@@ -681,6 +689,17 @@ async def resolve_approval(
         # refresh re-acquires the fence and reads the current actor and policy.
         was_restricted = team_decision.restricted
         await lock_identity_reader(session)
+        # @spec HTTP-APPROVAL-CONTINUITY-14: a role change or adoption committed
+        # since the first classification (say, during the approver lookup) is
+        # seen here, under the lock the expiry and claim below commit under. It
+        # is a denial: the caller audits it and refuses 403 before any write.
+        if await approval_is_selected(
+            session, approval, runtime=identity_runtime(request.app.state),
+        ):
+            decision = AuthzDecision(
+                False, "unsupported_approval", evidence={"kind": "http_selection"},
+            )
+            return
         team_decision = await approval_team_decision(session, approval, principal)
         current_binding = await crud_approvals.get_approval_route_binding(session, approval)
         if (was_restricted != team_decision.restricted
