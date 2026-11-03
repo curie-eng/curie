@@ -395,6 +395,46 @@ def git(root: Path, *argv: str) -> str:
     return result.stdout.strip()
 
 
+@pytest.mark.parametrize("bootstrap", [False, True])
+def test_train_promotion_accepts_existing_debt_and_refuses_new_growth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bootstrap: bool
+) -> None:
+    pin_main_pr(monkeypatch)
+    git(tmp_path, "init", "-q", "-b", "main")
+    git(tmp_path, "config", "user.name", "Example")
+    git(tmp_path, "config", "user.email", "test@example.com")
+    git(tmp_path, "config", "core.hooksPath", os.devnull)
+    source(tmp_path, "tests/test_main.py", "import time\ntime.sleep(1)\n")
+    main_baseline = generate(tmp_path)
+    git(tmp_path, "add", ".")
+    git(tmp_path, "commit", "-qm", "Accepted main debt")
+    git(tmp_path, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(tmp_path, "checkout", "-qb", "next")
+    source(tmp_path, "tests/test_next.py", "import time\ntime.sleep(1)\n")
+    next_baseline = {**main_baseline, "sleeps": {**main_baseline["sleeps"], "tests/test_next.py": 1}}
+    if bootstrap:
+        (tmp_path / BASELINE).unlink()
+    else:
+        source(tmp_path, BASELINE, json.dumps(next_baseline))
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-qm", "Accepted next debt")
+    git(tmp_path, "update-ref", "refs/remotes/origin/next", "HEAD")
+    git(tmp_path, "checkout", "-qb", "task/promotion")
+    base = "origin/next" if bootstrap else "origin/main"
+    if bootstrap:
+        source(tmp_path, BASELINE, json.dumps(next_baseline))
+    result = command(tmp_path, "--base-ref", base)
+    assert result.returncode == 0, result.stdout + result.stderr
+    source(tmp_path, "tests/test_new.py", "import time\ntime.sleep(1)\n")
+    result = command(tmp_path, "--base-ref", base)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "tests/test_new.py" in result.stdout
+    if not bootstrap:
+        next_baseline["sleeps"]["tests/test_new.py"] = 1
+        source(tmp_path, BASELINE, json.dumps(next_baseline))
+        assert command(tmp_path, "--base-ref", base).returncode == 1
+
+
 def test_ci_ratchets_compare_merge_base_not_advanced_tip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
