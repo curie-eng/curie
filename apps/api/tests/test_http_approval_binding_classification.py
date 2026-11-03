@@ -405,9 +405,30 @@ def test_approver_migration_during_legacy_resolve_refuses_before_the_claim(
         assert response.status_code == 403, response.text
         assert response.json() == {"detail": "unsupported_approval"}
         assert _status(approval_id) == "pending"
-        assert audits(approval_id) == []
+        # The refusal is audited like the route's other denials, with no claim.
+        assert _audit_rows(approval_id) == [
+            {"action": "denied", "authorized": False, "reason": "unsupported_approval"},
+        ]
         assert _selected(client, approval_id) is True
     assert synthetic_provider.requests == []
+
+
+def _audit_rows(approval_id: uuid.UUID) -> list[dict[str, Any]]:
+    """@spec HTTP-APPROVAL-CONTINUITY-14: committed audit action, outcome and reason."""
+    found: list[dict[str, Any]] = []
+
+    async def read(factory: async_sessionmaker[AsyncSession]) -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-14."""
+        async with factory() as session:
+            result = await session.execute(
+                text(f'SELECT action, authorized, reason FROM "{SCHEMA}".approval_audit_entries '
+                     "WHERE approval_id = :id ORDER BY created_at"),
+                {"id": approval_id},
+            )
+            found.extend(dict(row) for row in result.mappings())
+
+    run(read)
+    return found
 
 
 def test_approver_migration_during_legacy_recovery_refuses_before_the_settlement(
