@@ -1390,6 +1390,9 @@ async def _process_event(
             dependency_retry = (
                 outcome.workspace_dependency_unavailable and self._markers.supports_answer_outbox
             )
+            if not dependency_retry:
+                dependency_deadline = None
+                dependency_refusals = 0
             dependency_remaining = 0.0
             if dependency_retry and not dependency_expired:
                 if dependency_deadline is None:

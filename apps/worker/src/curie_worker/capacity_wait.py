@@ -136,7 +136,10 @@ local deferrals = tonumber(redis.call('HGET', record, 'deferrals')) or 0
 deferrals = deferrals + 1
 local retry_ms = tonumber(ARGV[12])
 local dependency_deadline = tonumber(redis.call('HGET', record, 'dependency_deadline_ms'))
-if not dependency_deadline and tonumber(ARGV[15]) > 0 then
+if tonumber(ARGV[15]) == 0 then
+  redis.call('HDEL', record, 'dependency_first_ms', 'dependency_deadline_ms')
+  dependency_deadline = nil
+elseif not dependency_deadline then
   dependency_deadline = math.min(deadline, now + tonumber(ARGV[15]))
   redis.call('HSET', record, 'dependency_first_ms', now,
     'dependency_deadline_ms', dependency_deadline)
@@ -451,6 +454,7 @@ if redis.call('GET', KEYS[4]) ~= ARGV[7] then return 0 end
 if redis.call('HGET', KEYS[5], 'gen') ~= ARGV[8] then return 0 end
 redis.call('HSET', KEYS[1], 'grant_confirmed', '1',
   'ever_granted', '1', 'grant_unknown', '0')
+redis.call('HDEL', KEYS[1], 'dependency_first_ms', 'dependency_deadline_ms')
 if state == 'woken' then redis.call('HSET', KEYS[1], 'cause', 'delivery_exhausted') end
 return 1
 """

@@ -440,3 +440,72 @@ def test_workspace_dependency_classification_covers_selection_and_redemption(
             )
 
     asyncio.run(go())
+
+
+@pytest.mark.parametrize("recovery", ["capacity", "grant"])
+def test_recovered_dependency_deadline_does_not_expire_a_healthy_wait(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    recovery: str,
+) -> None:
+    from curie_worker.kernel import clock
+
+    async def go() -> None:
+        async with _selection_server() as (deployment, credentials, state):
+            async with make_harness(
+                binding=_workspace_binding(deployment),
+                slack_no_edit_streaming=True,
+                claim_timeout_seconds=0.02,
+            ) as h:
+                h.kernel._workspace = WorkspaceClaimCoordinator(
+                    preparer=SimpleNamespace(credentials=credentials),
+                    substrate=h.substrate,
+                )
+                consumer = _capacity_consumer(h)
+                await consumer.ensure_group()
+                state["status"] = 503
+                event = _qevent("original", event_id="recovered-dependency")
+                await _deliver(h, consumer, event)
+                first = await consumer._waits.get(event.event_id)
+                assert first is not None and first.dependency_deadline_ms is not None
+                state["status"] = 200
+                h.runner.default_script = [
+                    Final(text="healthy recovery", status=SessionStatus.DONE)
+                ]
+                if recovery == "capacity":
+                    h.fake_k8s.quota_rejection = QuotaRejection(
+                        quota_name="acme-quota",
+                        requested={"pods": "1"},
+                        used={"pods": "1"},
+                        hard={"pods": "1"},
+                    )
+                entry, fields = await _wake(h, consumer, event.event_id)
+                await consumer._sem.acquire()
+                await consumer._handle(entry, fields)
+                recovered = await consumer._waits.get(event.event_id)
+                assert recovered is not None
+                assert recovered.dependency_deadline_ms is None
+                assert not await h.async_redis.hexists(
+                    consumer._waits._record(event.event_id),
+                    "dependency_first_ms",
+                )
+                if recovery == "capacity":
+                    assert recovered.state == "waiting" and h.runner.opened == []
+                    assert recovered.deadline_ms == first.deadline_ms
+                    h.fake_k8s.quota_rejection = None
+                    monkeypatch.setattr(
+                        clock,
+                        "time",
+                        SimpleNamespace(
+                            time=lambda: first.dependency_deadline_ms / 1000 + 1,
+                            monotonic=time.monotonic,
+                        ),
+                    )
+                    entry, fields = await _wake(h, consumer, event.event_id)
+                    await consumer._sem.acquire()
+                    await consumer._handle(entry, fields)
+                assert h.runner.opened == ["original"]
+                assert h.sink.last_text == "healthy recovery"
+                assert h.sink.completions[-1].outcome == "delivered"
+
+    asyncio.run(go())
