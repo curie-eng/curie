@@ -266,7 +266,8 @@ def test_type_cap_and_per_text_500_count() -> None:
 
 def test_known_class_prefix_and_unqualified_type() -> None:
     log = (
-        "sqlalchemy.exc.ProgrammingError: <class 'asyncpg.exceptions.InsufficientPrivilegeError'>"
+        "sqlalchemy.exc.ProgrammingError: private value"
+        "\n| <class 'asyncpg.exceptions.InsufficientPrivilegeError'>"
         "\n| <class 'ValueError'>"
     )
     assert parse(log)["api_exception_types"] == [
@@ -418,4 +419,38 @@ def test_shell_diagnostic_failure_preserves_recovery_failure(
 def test_traceback_preserves_application_exception_types() -> None:
     assert parse("| curie_api.errors.InternalError: private value")["api_exception_types"] == [
         "curie_api.errors.InternalError"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("ValueError: could not reach (db.ProdError)", ["ValueError"]),
+        ("ValueError: bad <class 'Acme'> and <class 'asyncpg.Foo'>", ["ValueError"]),
+        ("acme_corp.billing.CustomerError: boom", []),
+        ("acme.Customer.WidgetError: nope", []),
+        ("    | acme.Customer.WidgetError: nope", []),
+    ],
+)
+@pytest.mark.parametrize("field", [None, "message", "exception"])
+def test_exception_payload_and_customer_prefixes_are_not_types(
+    text: str, expected: list[str], field: str | None
+) -> None:
+    log = text if field is None else json.dumps({field: text})
+    summary = parse(log, log, 1)
+    expected_types = [] if field == "message" else expected
+    assert summary["api_exception_types"] == expected_types
+    assert summary["api_previous_exception_types"] == expected_types
+
+
+def test_exception_group_keeps_allowed_qualified_types() -> None:
+    text = (
+        "  + ExceptionGroup: private group\n"
+        "    | asyncpg.exceptions.InsufficientPrivilegeError: private value\n"
+        "    | curie.errors.InternalError: private value"
+    )
+    assert parse(text)["api_exception_types"] == [
+        "ExceptionGroup",
+        "asyncpg.exceptions.InsufficientPrivilegeError",
+        "curie.errors.InternalError",
     ]

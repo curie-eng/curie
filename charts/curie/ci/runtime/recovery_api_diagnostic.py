@@ -12,14 +12,14 @@ _UNQUALIFIED_TYPE = (
     rf"{_IDENTIFIER}(?:Error|Exception|Timeout|Exit|ExceptionGroup)"
     r"|Exception|ExceptionGroup|KeyboardInterrupt"
 )
-_KNOWN_QUALIFIED_TYPE = rf"(?:asyncpg|psycopg|sqlalchemy|builtins)\.(?:{_IDENTIFIER}\.)*[A-Z]\w*"
-_TYPE = rf"(?:(?:{_IDENTIFIER}\.)*(?:{_UNQUALIFIED_TYPE})|{_KNOWN_QUALIFIED_TYPE})"
+_KNOWN_QUALIFIED_TYPE = (
+    rf"(?:asyncpg|psycopg|sqlalchemy|builtins|curie_api|curie)\.(?:{_IDENTIFIER}\.)*[A-Z]\w*"
+)
+_TYPE = rf"(?:{_UNQUALIFIED_TYPE}|{_KNOWN_QUALIFIED_TYPE})"
 _CLASS_TYPE = rf"(?:{_KNOWN_QUALIFIED_TYPE}|[A-Z]\w*)"
 _TRACEBACK_LINE = re.compile(
     rf"^[\s|+\-]*(?:({_TYPE}):|\(({_TYPE})\)|<class ['\"]({_CLASS_TYPE})['\"]>)"
 )
-_PAREN_TYPE = re.compile(rf"\(({_TYPE})\)")
-_CLASS_PATTERN = re.compile(rf"<class ['\"]({_CLASS_TYPE})['\"]>")
 _COMPLETED = re.compile(
     r"^http request completed method=[A-Z]+ route=(/[^\s?#]*) status_class=5xx$"
 )
@@ -37,8 +37,6 @@ def exception_types(text: str) -> list[str]:
         match = _TRACEBACK_LINE.match(line)
         if match:
             types.update(name for name in match.groups() if name)
-            types.update(_PAREN_TYPE.findall(line))
-            types.update(_CLASS_PATTERN.findall(line))
     return sorted(types)
 
 
