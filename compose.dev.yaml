@@ -302,18 +302,13 @@ services:
 
   # The Collector image runs as UID 10001. Prepare its task-owned named volume
   # before boot so the persistent queue stays writable without running the
-  # Collector itself as root. The RustFS image also declares VOLUME /data,
-  # which this one-shot never uses. A named project volume covers that path
-  # so a wipe still removes it after the container is gone. An anonymous
-  # volume there has no project label, and compose deletes those only while
-  # the container still exists.
+  # Collector itself as root.
   otel-collector-perms:
     image: rustfs/rustfs:1.0.0-beta.12
     profiles: *full_profiles
     user: "0"
     volumes:
       - otel_collector_storage:/var/lib/otelcol/storage
-      - otel_collector_perms_data:/data
     entrypoint: ["/bin/sh", "-ec"]
     command: ["chown -R 10001:10001 /var/lib/otelcol/storage"]
     restart: "no"
@@ -813,4 +808,3 @@ volumes:
   rustfs_logs:
   ollama_data:
   otel_collector_storage:
-  otel_collector_perms_data:
