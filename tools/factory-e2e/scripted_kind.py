@@ -861,7 +861,8 @@ class ScriptedRun:
         self.evidence["agent_id"] = agent["id"]
         bundle = self.workdir / "bundle"
         shutil.copytree(REPO_ROOT / "examples/dark-factory", bundle)
-        self.check_disk("building the runner layer")
+        layer_bytes = kind_images.runner_layer_budget(self.command, "curie-runner:latest")
+        self.check_disk("building the runner layer", required_bytes=layer_bytes)
         runner_base = f"{registry_ref}/curie-runner:latest"
         self.command(
             self.curie,
@@ -876,7 +877,7 @@ class ScriptedRun:
             "linux/amd64",
             timeout=900,
         )
-        self.check_disk("built runner layer")
+        self.check_disk("built runner layer", required_bytes=layer_bytes)
         common = ["--namespace", self.namespace, "--release", "curie", "--api-url", api_url]
         self.command(
             self.curie,
