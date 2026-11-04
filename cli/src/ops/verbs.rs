@@ -2848,9 +2848,24 @@ fn render_pod_table(ui: &crate::ui::Ui, pods: &[PodRow]) {
     ui.payload_plain(&crate::ui::table(&["pod", "ready", "status"], &rows, &[]));
 }
 
-/// The operator remedy for a status convergence failure.
-fn status_convergence_fix(_unhealthy: &[String]) -> String {
-    "inspect the unhealthy rollout reasons, correct the target configuration and rerun `curie cluster up`".to_string()
+/// The operator remedy for a status convergence failure. A rejected static
+/// token is repaired by the Secret merge patch. Any other remaining reason
+/// keeps the rollout sentence. When both are present, the token sentence
+/// comes first.
+fn status_convergence_fix(unhealthy: &[String]) -> String {
+    const ROLLOUT_FIX: &str = "inspect the unhealthy rollout reasons, correct the target configuration and rerun `curie cluster up`";
+    const TOKEN_FIX: &str = "replace the rejected static token with the Secret merge patch in docs/guides/dark-factory-quickstart.md#replace-a-static-token, then rerun `curie cluster status`";
+    let token = unhealthy
+        .iter()
+        .any(|reason| reason.contains("authentication rejected"));
+    let rollout = unhealthy
+        .iter()
+        .any(|reason| !reason.contains("authentication rejected"));
+    match (token, rollout) {
+        (true, false) => TOKEN_FIX.to_string(),
+        (true, true) => format!("{TOKEN_FIX} {ROLLOUT_FIX}"),
+        _ => ROLLOUT_FIX.to_string(),
+    }
 }
 
 /// Summarise `kubectl get pods` output into (rows, ready count, steady-state
@@ -2858,14 +2873,16 @@ fn status_convergence_fix(_unhealthy: &[String]) -> String {
 /// printing, so the caller can render or serialize it (#485). Terminal
 /// (`Succeeded`, `Failed`, `Completed`) and terminating pods stay in the rows
 /// but are excluded from the tally; a kubelet eviction leaves a `Failed` pod
-/// its ReplicaSet never deletes (#4496).
+/// its ReplicaSet never deletes (#4496). A `curie-thread-` pod is a runtime
+/// sandbox: it stays in the rows, and a not-ready one is warned, but it is
+/// left out of the tally and the convergence list.
 fn collect_pod_summary(
     pods: &[serde_json::Value],
 ) -> (Vec<PodRow>, usize, usize, Vec<String>, Vec<String>) {
     let mut ready = 0usize;
     let mut total = 0usize;
     let mut unhealthy: Vec<String> = Vec::new();
-    let sandbox_warnings: Vec<String> = Vec::new();
+    let mut sandbox_warnings: Vec<String> = Vec::new();
     let mut table_rows: Vec<PodRow> = Vec::new();
     for pod in pods {
         let name = pod
@@ -2920,8 +2937,14 @@ fn collect_pod_summary(
         if phase == "Succeeded" || phase == "Failed" || reason == "Completed" || terminating {
             continue;
         }
-        total += 1;
         let all_ready = total_m > 0 && ready_n == total_m;
+        if name.starts_with("curie-thread-") {
+            if phase != "Running" || !all_ready {
+                sandbox_warnings.push(format!("{name} is a runtime sandbox that is not ready"));
+            }
+            continue;
+        }
+        total += 1;
         if all_ready {
             ready += 1;
         }
