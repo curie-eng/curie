@@ -896,7 +896,7 @@ def _without_shard_report_arguments(argv: list[str], *, tiers: str | None = None
 
     Every shard writes the JUnit report with xunit1 timings exactly once.
     ``--ci-shard-tiers`` must carry ``tiers`` exactly once, or be absent when
-    ``tiers`` is None (every event other than a pull request or the merge queue).
+    ``tiers`` is None (every event other than a pull request).
     """
     remaining: list[str] = []
     reports: list[str] = []
@@ -1254,7 +1254,10 @@ def _admitted_agent_runtime_owner(runtime: str) -> tuple[dict[str, Any], dict[st
 @pytest.mark.parametrize("runtime", ADMITTED_AGENT_RUNTIMES)
 def test_admitted_agent_runtime_has_one_required_provisioned_factory_owner(runtime: str) -> None:
     job, step = _admitted_agent_runtime_owner(runtime)
-    assert job["if"] == "${{ needs.changes.outputs.factory == 'true' }}"
+    # Deferred to the merge queue on an unlabeled pull request.
+    assert job["if"] == (
+        "${{ needs.changes.outputs.factory == 'true' && needs.changes.outputs.deep == 'true' }}"
+    )
     assert "changes" in set(_needs(job))
     assert not job.get("continue-on-error", False)
     # Every leg must run to completion: one red leg cannot cancel the others,
@@ -2597,6 +2600,9 @@ def test_shards_partition_the_unfiltered_collection(tmp_path: Path) -> None:
 def test_commissioning_runner_peer_shares_the_protected_xdist_group() -> None:
     files = (
         "apps/worker/tests/test_commissioning_record_refusal.py",
+        "apps/worker/tests/test_commissioning_launch.py",
+        "apps/worker/tests/test_commissioning_cleanup.py",
+        "apps/worker/tests/test_commissioning_supervisor.py",
         "apps/worker/tests/test_protected_retirement_server.py",
         "apps/worker/tests/test_protected_recovery_source.py",
         "apps/worker/tests/test_delivery_lease.py",
@@ -2631,8 +2637,8 @@ raise SystemExit(pytest.main(sys.argv[1:], plugins=[Groups()]))
         if (fields := line.split()) and fields[0] == "RUNNER_GROUP"
     }
     assert set(groups) == set(files)
-    assert groups[files[0]] == groups[files[1]] == groups[files[2]]
-    assert groups[files[3]] != groups[files[0]]
+    assert len({groups[path] for path in files[:-1]}) == 1
+    assert groups[files[-1]] != groups[files[0]]
 
 
 # Shard plan wiring: `changes` and each shard's decision step agree on how many
@@ -2790,22 +2796,20 @@ def test_shard_plan_flows_from_decision_through_steps_and_records_to_the_aggrega
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-# The merge queue selects exactly what the pull request did (#5262).
-@pytest.mark.parametrize("event", ["pull_request", "merge_group"])
 @pytest.mark.parametrize("scope", ["full", "cli", "impact"])
 def test_pull_request_pytest_passes_the_shard_count_and_tier_limits(
-    tmp_path: Path, scope: str, event: str
+    tmp_path: Path, scope: str
 ) -> None:
     targets, _ = _plan_targets(scope)
     argv = _run_pytest_step(
-        tmp_path, shard=2, deselect="", scope=scope, plan=(3, 2, 1), event=event,
+        tmp_path, shard=2, deselect="", scope=scope, plan=(3, 2, 1), event="pull_request",
         targets=targets if scope == "impact" else None,
     )
     argv = _without_shard_report_arguments(argv, tiers="2,1")
     assert argv[argv.index("--ci-shard") + 1] == "2/3"
 
 
-@pytest.mark.parametrize("event", ["push", "workflow_dispatch", "schedule"])
+@pytest.mark.parametrize("event", ["push", "workflow_dispatch", "merge_group", "schedule"])
 @pytest.mark.parametrize("scope", ["full", "cli"])
 def test_non_pull_request_pytest_omits_the_tier_limits(
     tmp_path: Path, event: str, scope: str
@@ -3140,8 +3144,8 @@ def test_decision_steps_use_queue_sha_bounds(tmp_path: Path, job_id: str) -> Non
     assert "--base " + "a" * 40 in calls[0]
     assert "--head " + "b" * 40 in calls[0]
     assert "--push" not in calls[0]
-    # The queue runs the pull request's impact selection, so it needs the targets.
-    assert "--pytest-targets-out pytest-targets.txt" in calls[0]
+    # The queue keeps pytest on its full scope and shard plan.
+    assert "--full-pytest" in calls[0].split()
 
 
 @pytest.mark.parametrize("train,other", [("main", "next"), ("next", "main")])

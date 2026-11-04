@@ -187,6 +187,13 @@ stale-version conflict test (match the CAS pattern in
 bounded delivery + dead-letter from the shared transport; a lane without a
 delivery cap is a bug.
 
+### CI gates
+
+Pull requests run the fast tiers and defer the kind, upgrade and convergence
+tiers to the merge queue, which runs them on the exact merge combination before
+anything lands; add the `ci:deep` label (then push) to run the deep tiers on the
+pull request too.
+
 ## Test policy
 
 Generated test-time ratchets reject growth from the merge-base in real sleeps and per-case provisioning fixtures; PR shards observe call phases over 30 seconds and fail only PR test functions changed in the diff above 40 seconds, including parameterization decorators and excluding parameter values changed only in module-level lists. Regenerate baselines with `curie dev test-ratchets --regenerate`, supplying `--durations <artifact>` from at least two CI runs to prune slow observations whose maximum call time is under 10 seconds; stale entries are reported without failing CI.

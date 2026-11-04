@@ -54,6 +54,8 @@ patch lives in the template layer alongside the #66 RBAC patch below.
 {{- $controllerManifest = $controllerManifest | replace $controllerMetadataAnchor $controllerMetadata }}
 {{- $controllerServiceAccount := "      serviceAccountName: agent-sandbox-controller" }}
 {{- $controllerPodFields := $controllerServiceAccount }}
+{{- /* Service links off on every chart pod (#5350; see CLAUDE.md). */}}
+{{- $controllerPodFields = printf "%s\n      enableServiceLinks: false" $controllerPodFields }}
 {{- with .Values.priorityClasses.platform.name }}
 {{- $controllerPodFields = printf "%s\n      priorityClassName: %s" $controllerPodFields . }}
 {{- end }}
@@ -905,6 +907,7 @@ spec:
             {{- toYaml $env.resources | nindent 12 }}
         {{- end }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: runner
           image: {{ $runnerImageRef | quote }}

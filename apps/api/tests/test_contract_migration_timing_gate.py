@@ -71,9 +71,14 @@ def _write_kinds(root: Path, kinds: dict[str, str]) -> None:
     _write(root, KINDS_PATH, json.dumps(kinds, indent=2) + "\n")
 
 
-def _revision_module(revision: str, down_revision: str | None, body: str) -> str:
+def _revision_module(
+    revision: str,
+    down_revision: str | None,
+    body: str,
+    imports: str = "from alembic import op",
+) -> str:
     return (
-        "from alembic import op\n"
+        f"{imports}\n"
         "\n"
         f'revision: str = "{revision}"\n'
         f"down_revision = {down_revision!r}\n"
@@ -81,8 +86,14 @@ def _revision_module(revision: str, down_revision: str | None, body: str) -> str
     )
 
 
-def _write_revision(root: Path, revision: str, down_revision: str | None, body: str) -> str:
-    text = _revision_module(revision, down_revision, body)
+def _write_revision(
+    root: Path,
+    revision: str,
+    down_revision: str | None,
+    body: str,
+    imports: str = "from alembic import op",
+) -> str:
+    text = _revision_module(revision, down_revision, body, imports)
     _write(root, f"{VERSIONS_DIR}/{revision}_x.py", text)
     return text
 
@@ -107,10 +118,13 @@ def _scenario(
     tag_kinds: dict[str, str] | None = None,
     head_kinds: dict[str, str] | None = None,
     annotated: bool = False,
+    imports: str = "from alembic import op",
 ) -> tuple[Path, str]:
     """Commit 1 (tagged v0.1.0) holds the sources; commit 2 adds revision 0002.
 
-    Returns the repo root and the text of the 0002 revision module.
+    Returns the repo root and the text of the 0002 revision module. ``imports``
+    is the 0002 module's import block, so a scenario can bind the Alembic op
+    namespace under an alias instead of the name ``op``.
     """
     root = tmp_path / "repo"
     _init(root)
@@ -121,7 +135,7 @@ def _scenario(
     _commit(root, "release")
     _tag(root, "v0.1.0", annotated=annotated)
     _write_kinds(root, head_kinds or HEAD_KINDS)
-    module = _write_revision(root, "0002", "0001", body)
+    module = _write_revision(root, "0002", "0001", body, imports)
     _commit(root, "contract")
     return root, module
 
@@ -756,3 +770,114 @@ def test_global_declared_constant_still_resolves_referenced_fails(tmp_path: Path
 def test_global_declared_constant_still_resolves_unreferenced_passes(tmp_path: Path) -> None:
     root, _ = _scenario(tmp_path, _global_constant_body(), sources=UNUSED_SOURCES)
     _assert_ok(_run(root))
+
+
+# An import alias may not hide the Alembic op namespace (#5279). Both import
+# forms bind the same namespace wherever the import statement sits, so the
+# drops, renames and batch receivers must be recognized through the alias, and
+# the nonliteral/unpacked argument refusals must survive it.
+
+ALIASED_OP_IMPORTS = ("from alembic import op as ddl", "import alembic.op as ddl")
+ALIASED_IMPORT_IDS = ["from-alembic-import", "import-alembic-op"]
+ALIASED_PLACEMENTS = ("module", "upgrade", "helper")
+ALIASED_PLACEMENT_IDS = ["module-level", "inside-upgrade", "inside-helper"]
+WIDGETS_SOURCES = {CRUD: "import os\n\nTABLE = widgets\n"}
+
+
+def _aliased_parts(
+    import_line: str,
+    placement: str,
+    op_lines: tuple[str, ...],
+) -> tuple[str, str]:
+    """The 0002 module's import block and migration body for one aliased case.
+
+    ``placement`` says where the aliased import statement sits: at module
+    level, as the first statement of ``upgrade()``, or inside a helper that
+    ``upgrade()`` reaches.
+    """
+    if placement == "module":
+        return import_line, _upgrade(*op_lines)
+    if placement == "upgrade":
+        return "from alembic import op", _upgrade(import_line, *op_lines)
+    helper = (
+        "def _contract() -> None:\n"
+        f"    {import_line}\n"
+        + "\n".join(f"    {line}" for line in op_lines)
+        + "\n\n\n"
+    )
+    return "from alembic import op", helper + _upgrade("_contract()")
+
+
+@pytest.mark.parametrize("import_line", ALIASED_OP_IMPORTS, ids=ALIASED_IMPORT_IDS)
+@pytest.mark.parametrize("placement", ALIASED_PLACEMENTS, ids=ALIASED_PLACEMENT_IDS)
+@pytest.mark.parametrize(
+    ("op_lines", "needle", "sources"),
+    [
+        (('ddl.drop_column("t", "old_col")',), "old_col", None),
+        (('ddl.drop_table("widgets")',), "widgets", WIDGETS_SOURCES),
+        (('ddl.alter_column("t", "old_col", new_column_name="new_col")',), "old_col", None),
+        (
+            ('with ddl.batch_alter_table("t") as batch_op:', '    batch_op.drop_column("old_col")'),
+            "old_col",
+            None,
+        ),
+    ],
+    ids=["drop-column", "drop-table", "rename-column", "batch-drop"],
+)
+def test_aliased_alembic_namespace_cannot_hide_referenced_drop(
+    tmp_path: Path,
+    import_line: str,
+    placement: str,
+    op_lines: tuple[str, ...],
+    needle: str,
+    sources: dict[str, str] | None,
+) -> None:
+    imports, body = _aliased_parts(import_line, placement, op_lines)
+    root, _ = _scenario(tmp_path, body, sources=sources, imports=imports)
+    _assert_violation(_run(root), "0002", needle, "v0.1.0", f"{CRUD}:3")
+
+
+@pytest.mark.parametrize("import_line", ALIASED_OP_IMPORTS, ids=ALIASED_IMPORT_IDS)
+@pytest.mark.parametrize("placement", ALIASED_PLACEMENTS, ids=ALIASED_PLACEMENT_IDS)
+@pytest.mark.parametrize(
+    ("op_lines", "sources"),
+    [
+        (('ddl.alter_column("t", "old_col", nullable=False)',), None),
+        (('ddl.add_column("t", "new_col")',), None),
+        (('ddl.drop_column("t", "old_col")',), UNUSED_SOURCES),
+    ],
+    ids=["alter-without-rename", "add-column", "unreferenced-drop"],
+)
+def test_aliased_alembic_namespace_controls_stay_green(
+    tmp_path: Path,
+    import_line: str,
+    placement: str,
+    op_lines: tuple[str, ...],
+    sources: dict[str, str] | None,
+) -> None:
+    imports, body = _aliased_parts(import_line, placement, op_lines)
+    root, _ = _scenario(tmp_path, body, sources=sources, imports=imports)
+    _assert_ok(_run(root))
+
+
+@pytest.mark.parametrize("import_line", ALIASED_OP_IMPORTS, ids=ALIASED_IMPORT_IDS)
+@pytest.mark.parametrize("placement", ALIASED_PLACEMENTS, ids=ALIASED_PLACEMENT_IDS)
+@pytest.mark.parametrize(
+    "op_lines",
+    [
+        ('for name in ("a", "b"):', '    ddl.drop_column("t", name)'),
+        ('with ddl.batch_alter_table("t") as batch_op:', '    batch_op.drop_column(name)'),
+        ('ddl.drop_column(*("t", "old_col"))',),
+        ('ddl.alter_column("t", "old_col", **{"new_column_name": "new_col"})',),
+    ],
+    ids=["loop-variable", "batch-variable", "unpacked-positional", "unpacked-keyword"],
+)
+def test_aliased_alembic_namespace_fails_closed_on_nonliteral_or_unpacked(
+    tmp_path: Path,
+    import_line: str,
+    placement: str,
+    op_lines: tuple[str, ...],
+) -> None:
+    imports, body = _aliased_parts(import_line, placement, op_lines)
+    root, _ = _scenario(tmp_path, body, sources={}, imports=imports)
+    _assert_violation(_run(root), "0002", "literal")

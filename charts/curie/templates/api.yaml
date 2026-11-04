@@ -193,6 +193,7 @@ spec:
           env:
             {{- include "curie.env.postgres" . | nindent 12 }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: api
           image: {{ include "curie.image" (dict "repository" .Values.api.image.repository "tag" .Values.api.image.tag "digest" .Values.api.image.digest "defaultTag" .Chart.AppVersion) | quote }}

@@ -152,6 +152,7 @@ spec:
           emptyDir:
             sizeLimit: {{ .Values.otelCollector.persistence.size }}
           {{- end }}
+      enableServiceLinks: false
       containers:
         - name: otel-collector
           image: {{ .Values.otelCollector.image }}

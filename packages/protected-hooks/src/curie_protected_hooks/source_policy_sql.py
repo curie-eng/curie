@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections.abc import AsyncIterator, Mapping
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
 from weakref import WeakKeyDictionary
@@ -68,10 +69,17 @@ class SourceGate:
     ) -> AsyncIterator[SourceGateContext]:
         """Hold one agent's source gate.
 
-        ``wait_seconds`` bounds the advisory lock wait server side: a gate not
-        acquired in time raises ``SourceSnapshotUnavailable`` before the body
-        runs, and the bound is lifted once the lock is held. Without it the
-        wait is unbounded, as ingress uses it.
+        ``wait_seconds`` is one monotonic acquisition budget covering gate
+        pool checkout, connection and transaction setup and the advisory
+        lock acquisition: it starts before checkout, the server side lock
+        timeout is the budget remaining when the lock is requested, and the
+        budget ends before the context is yielded. Pool and lock waits share
+        one budget instead of adding up, and the guarded body, SQL
+        registration and commit are never time limited. A gate not acquired
+        in time raises ``SourceSnapshotUnavailable`` before the body runs,
+        after releasing its connection and transaction, and external
+        cancellation still propagates. Without ``wait_seconds`` every wait
+        is unbounded, as ingress uses it.
         @spec PROTECTED-HOOK-SOURCE-2 @spec PROTECTED-HOOK-SOURCE-10.
         """
         task = asyncio.current_task()
@@ -81,6 +89,7 @@ class SourceGate:
             type(wait_seconds) not in (int, float) or not 0 < wait_seconds <= 60
         ):
             raise SourceGateInvalid("invalid_source_gate")
+        deadline = None if wait_seconds is None else time.monotonic() + wait_seconds
         tasks = _HELD.setdefault(self.engine.pool, WeakKeyDictionary())
         agents = tasks.setdefault(task, set())
         if agent_id in agents:
@@ -89,31 +98,45 @@ class SourceGate:
         try:
             async with AsyncExitStack() as stack:
                 try:
-                    connection = await stack.enter_async_context(self.engine.connect())
+                    # One budget across checkout, setup and lock acquisition
+                    # (SOURCE-2); it is spent once the context is yielded.
+                    async with (
+                        nullcontext(None)
+                        if deadline is None
+                        else asyncio.timeout_at(deadline)
+                    ):
+                        connection = await stack.enter_async_context(self.engine.connect())
+                        await connection.execution_options(isolation_level="READ COMMITTED")
+                        transaction = await stack.enter_async_context(connection.begin())
+                        if deadline is not None:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise SourceSnapshotUnavailable("source_gate_unavailable")
+                            await connection.execute(
+                                text("SELECT set_config('lock_timeout', :bound, true)"),
+                                {"bound": f"{max(1, int(remaining * 1000))}ms"},
+                            )
+                        await connection.execute(
+                            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                            {"lock_key": "hook-source:" + str(agent_id)},
+                        )
+                        if deadline is not None:
+                            await connection.execute(
+                                text("SELECT set_config('lock_timeout', '0', true)")
+                            )
+                except TimeoutError:
+                    # The acquisition budget expired: sanitize it the way the
+                    # route already reports a refused gate (SOURCE-2).
+                    raise SourceSnapshotUnavailable("source_gate_unavailable") from None
                 except Exception:  # noqa: BLE001  SQLAlchemy leaves some driver connect errors unwrapped (SOURCE-2).
                     # SQLAlchemy leaves some driver connect errors unwrapped (SOURCE-2).
                     raise SourceSnapshotUnavailable("source_gate_unavailable") from None
-                await connection.execution_options(isolation_level="READ COMMITTED")
-                async with connection.begin() as transaction:
-                    if wait_seconds is not None:
-                        await connection.execute(
-                            text("SELECT set_config('lock_timeout', :bound, true)"),
-                            {"bound": f"{max(1, int(wait_seconds * 1000))}ms"},
-                        )
-                    await connection.execute(
-                        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-                        {"lock_key": "hook-source:" + str(agent_id)},
-                    )
-                    if wait_seconds is not None:
-                        await connection.execute(
-                            text("SELECT set_config('lock_timeout', '0', true)")
-                        )
-                    context = SourceGateContext(agent_id, self, task, connection, transaction)
-                    self._contexts.add(context)
-                    try:
-                        yield context
-                    finally:
-                        self._contexts.discard(context)
+                context = SourceGateContext(agent_id, self, task, connection, transaction)
+                self._contexts.add(context)
+                try:
+                    yield context
+                finally:
+                    self._contexts.discard(context)
         except SQLAlchemyError:
             raise SourceSnapshotUnavailable("source_gate_unavailable") from None
         finally:

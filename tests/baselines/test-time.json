@@ -57,7 +57,6 @@
     "examples/tests/test_dark_factory_review_policy.py::test_round_cap_an_edit_after_the_fifth_approve_meets_the_cap_at_the_next_review",
     "examples/tests/test_dark_factory_review_policy.py::test_round_cap_five_changes_log_one_review_refused_line",
     "examples/tests/test_dark_factory_review_policy.py::test_unchanged_candidate_restored_to_the_rejected_bytes_is_refused_again",
-    "packages/test-support/tests/test_authority_default_collection.py::test_default_pytest_actually_collects_each_authority_grammar_test",
     "runner/tests/test_tool_access_real_cli.py::test_a_read_only_prompt_a_bundle_hook_delayed_never_runs_unrestricted",
     "tests/test_wire_state.py::test_all_existing_wire_sites_are_declared",
     "tools/preflight/tests/test_preflight.py::test_tracked_hook_installs_ui_dependencies_and_runs_real_lint"

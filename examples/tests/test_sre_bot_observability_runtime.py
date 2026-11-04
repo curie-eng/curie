@@ -1109,6 +1109,9 @@ def _trace_query_for_session(session_id: str) -> str:
     )
 
 
+@pytest.mark.skip(
+    reason="Loki answers pushes with 'Ingester is shutting down' intermittently (#5338)"
+)
 def test_candidate_runner_derives_and_probes_both_pod_credential_connectors(
     observability_runtime: RuntimeStack,
 ) -> None:
@@ -1197,6 +1200,9 @@ def test_candidate_runner_derives_and_probes_both_pod_credential_connectors(
     assert trace_marker in trace
 
 
+@pytest.mark.skip(
+    reason="Loki answers pushes with 'Ingester is shutting down' intermittently (#5338)"
+)
 def test_logql_through_the_bots_real_grafana_connector_returns_a_curie_log(
     observability_runtime: RuntimeStack,
 ) -> None:
