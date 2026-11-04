@@ -933,6 +933,7 @@ def sandbox_template(name, image):
         "metadata": {
             "name": name,
             "namespace": NAMESPACE,
+            "annotations": {"meta.helm.sh/release-name": RELEASE},
             "labels": {
                 "app.kubernetes.io/name": "curie",
                 "app.kubernetes.io/instance": RELEASE,
@@ -978,7 +979,10 @@ def sandbox_templates():
         layer = layers.get(agent)
         agent_image = platform if scenario["template_ignores_runner_images"] or not layer else layer
         agent_image = stale.get(agent, agent_image)
-        items.append(sandbox_template(f"{prefix}-agent-{agent}-runner", agent_image))
+        item = sandbox_template(f"{prefix}-agent-{agent}-runner", agent_image)
+        item["metadata"]["annotations"] = {"meta.helm.sh/release-name": RELEASE}
+        item["spec"]["podTemplate"]["metadata"] = {"labels": {"curietech.ai/agent": agent}}
+        items.append(item)
     return items
 
 
@@ -1190,6 +1194,18 @@ if program == "helm":
         print(f'Rollback to {requested} was a success')
         sys.exit(0)
     if args[:2] == ["get", "values"]:
+        if "--all" in args and (upgraded or converged):
+            def coalesce(defaults, supplied):
+                result = copy.deepcopy(defaults)
+                for key, value in supplied.items():
+                    if value is None:
+                        result.pop(key, None)
+                    elif isinstance(value, dict) and isinstance(result.get(key), dict):
+                        result[key] = coalesce(result[key], value)
+                    else:
+                        result[key] = copy.deepcopy(value)
+                return result
+            emit(coalesce(chart_values(), release_values(flag_value("--revision"))))
         # An absent Helm release cannot have retained values. GetValues.Run
         # uses the same revision lookup as GetMetadata.Run:
         # https://github.com/helm/helm/blob/v3.20.0/pkg/action/get_values.go

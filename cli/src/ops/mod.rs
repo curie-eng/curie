@@ -16,6 +16,7 @@ mod command;
 mod convergence;
 mod lint_values;
 mod providers;
+mod runner_templates;
 mod up;
 mod upgrade;
 mod verbs;

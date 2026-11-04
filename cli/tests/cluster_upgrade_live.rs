@@ -980,7 +980,9 @@ fn release_channel_dry_run_plans_target_cache_and_url_without_fetching() {
         fixture
             .argv()
             .iter()
-            .filter(|call| call.len() >= 3 && call[..3] == ["helm", "get", "values"])
+            .filter(|call| call.len() >= 3
+                && call[..3] == ["helm", "get", "values"]
+                && !call.iter().any(|arg| arg == "--all"))
             .count(),
         1,
         "retained configuration must still be read exactly once: {:?}",
@@ -3850,7 +3852,11 @@ fn the_overlay_is_read_once_and_apply_uses_the_stored_one() {
     let reads = fixture
         .argv()
         .into_iter()
-        .filter(|call| call.len() >= 3 && call[..3] == ["helm", "get", "values"])
+        .filter(|call| {
+            call.len() >= 3
+                && call[..3] == ["helm", "get", "values"]
+                && !call.iter().any(|arg| arg == "--all")
+        })
         .count();
     assert_eq!(
         reads,
@@ -8120,7 +8126,8 @@ fn repository_runner_upgrade_null_dockerfile_is_catalog_in_plan_and_canary() {
 fn platform_canary_fixture(image: &str) -> Fixture {
     let fixture = Fixture::new(None);
     let objects = serde_json::json!({"items": [
-        {"metadata": {"name": "rel-curie-runner", "labels": {
+        {"metadata": {"name": "rel-curie-runner", "annotations": {
+            "meta.helm.sh/release-name": "rel"}, "labels": {
             "app.kubernetes.io/instance": "rel"}},
          "spec": {"podTemplate": {"spec": {"containers": [
             {"name": "runner", "image": "acme-runner:candidate"}]}}}},
@@ -8129,7 +8136,11 @@ fn platform_canary_fixture(image: &str) -> Fixture {
          "spec": {"podTemplate": {"metadata": {"labels": {"curietech.ai/agent": "acme-bot"}},
             "spec": {"containers": [{"name": "runner", "image": image}]}}}}
     ]});
-    fs::write(fixture.0.path().join("platform-canary.json"), objects.to_string()).unwrap();
+    fs::write(
+        fixture.0.path().join("platform-canary.json"),
+        objects.to_string(),
+    )
+    .unwrap();
     fixture
 }
 
@@ -8147,7 +8158,11 @@ fn platform_agent_template_canary_rejects_stale_image_without_layers() {
 #[test]
 fn platform_agent_template_canary_fails_closed_on_unreadable_list() {
     let fixture = platform_canary_fixture("acme-runner:candidate");
-    fs::write(fixture.0.path().join("platform-canary.json"), "\"unreadable\"").unwrap();
+    fs::write(
+        fixture.0.path().join("platform-canary.json"),
+        "\"unreadable\"",
+    )
+    .unwrap();
     let output = fixture.local("healthy");
     let body = json(&output);
     assert_eq!(body["canary"]["passed"], false, "{body}");
