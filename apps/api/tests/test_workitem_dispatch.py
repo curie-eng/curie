@@ -3349,8 +3349,9 @@ def test_held_cancel_leaves_a_live_unheld_lease_alone(clean_db: None, allowliste
     with_session(body)
 
 
+@pytest.mark.parametrize("cause", ["issue_cancelled", "issue_deleted"])
 def test_held_cancel_with_stale_version_leaves_the_held_row_untouched(
-    clean_db: None, allowlisted: None
+    clean_db: None, allowlisted: None, cause: workitems.CancellationCause
 ) -> None:
     # #4627: a refused cancel must not release the parked lease.
     async def body(session: AsyncSession) -> None:
@@ -3362,6 +3363,7 @@ def test_held_cancel_with_stale_version_leaves_the_held_row_untouched(
             session,
             work_item_id=held.work_item_id,
             expected_version=held.work_item_version - 1,
+            cause=cause,
         )
         assert _code(refused) == "stale_version"
         assert await _full_request(session, facts.request_id) == before

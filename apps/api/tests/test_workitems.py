@@ -1330,26 +1330,36 @@ def test_nonrunning_publication_link_preserves_cancellation_ownership_and_versio
     with_session(body)
 
 
+@pytest.mark.parametrize("cause", ["issue_cancelled", "issue_deleted"])
 def test_cancellation_seals_idle_waiting_terminal_and_running_work(
-    clean_db: None,
+    clean_db: None, cause: workitems.CancellationCause,
 ) -> None:
     async def body(session: AsyncSession) -> None:
         agent_id = await _agent(session)
         idle = (await _item(session, agent_id)).work_item
         cancelled = await workitems.request_cancellation(
-            session, work_item_id=idle.id, expected_work_item_version=1
+            session,
+            work_item_id=idle.id,
+            expected_work_item_version=1,
+            cause=cause,
         )
         assert isinstance(cancelled, workitems.WorkItemOutcome), cancelled
         assert cancelled.request is None and cancelled.work_item.cancelled_at is not None
         assert cancelled.work_item.version == 2
         replay = await workitems.request_cancellation(
-            session, work_item_id=idle.id, expected_work_item_version=2
+            session,
+            work_item_id=idle.id,
+            expected_work_item_version=2,
+            cause=cause,
         )
         assert isinstance(replay, workitems.WorkItemOutcome), replay
         assert replay.replayed is True and replay.work_item == cancelled.work_item
         _conflict(
             await workitems.request_cancellation(
-                session, work_item_id=idle.id, expected_work_item_version=1
+                session,
+                work_item_id=idle.id,
+                expected_work_item_version=1,
+                cause=cause,
             ),
             "stale_version",
         )
@@ -1366,7 +1376,10 @@ def test_cancellation_seals_idle_waiting_terminal_and_running_work(
 
         waiting = await _request(session, (await _item(session, agent_id, issue=2574)).work_item)
         stopped = await workitems.request_cancellation(
-            session, work_item_id=waiting.work_item.id, expected_work_item_version=2
+            session,
+            work_item_id=waiting.work_item.id,
+            expected_work_item_version=2,
+            cause=cause,
         )
         assert isinstance(stopped, workitems.WorkItemOutcome), stopped
         assert stopped.request is not None
@@ -1376,7 +1389,7 @@ def test_cancellation_seals_idle_waiting_terminal_and_running_work(
             stopped.request.termination_observation,
             stopped.request.version,
             stopped.work_item.version,
-        ) == ("cancelled", "issue_cancelled", None, 2, 3)
+        ) == ("cancelled", cause, None, 2, 3)
 
         terminal = await _start(
             session,
@@ -1407,6 +1420,7 @@ def test_cancellation_seals_idle_waiting_terminal_and_running_work(
             session,
             work_item_id=terminal.work_item.id,
             expected_work_item_version=terminal.work_item.version,
+            cause=cause,
         )
         assert isinstance(sealed, workitems.WorkItemOutcome), sealed
         assert sealed.request is None and sealed.work_item.version == 4
@@ -1426,7 +1440,10 @@ def test_cancellation_seals_idle_waiting_terminal_and_running_work(
         assert isinstance(linked, workitems.WorkItemOutcome), linked
         assert linked.request is not None
         requested = await workitems.request_cancellation(
-            session, work_item_id=linked.work_item.id, expected_work_item_version=3
+            session,
+            work_item_id=linked.work_item.id,
+            expected_work_item_version=3,
+            cause=cause,
         )
         assert isinstance(requested, workitems.WorkItemOutcome), requested
         assert requested.request is not None
@@ -1436,7 +1453,7 @@ def test_cancellation_seals_idle_waiting_terminal_and_running_work(
             requested.request.version,
             requested.work_item.version,
             requested.work_item.publication_lineage_id,
-        ) == ("cancellation_requested", "issue_cancelled", 3, 4, lineage_id)
+        ) == ("cancellation_requested", cause, 3, 4, lineage_id)
         for result in (
             await workitems.complete_execution(
                 session,

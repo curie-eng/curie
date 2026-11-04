@@ -49,7 +49,7 @@ from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, PhaseView, phase_vie
 from .factory_reply_target import stored_reply_target
 from .factory_usage import format_usd, usage_line, work_item_usage
 from .forges.capabilities import Operation, Support
-from .forges.errors import ForgeError, Unauthorized
+from .forges.errors import ForgeError, NotFound, Unauthorized
 from .forges.github.comments import static_token
 from .forges.github.marked_comments import (
     GitHubCalls,
@@ -149,6 +149,7 @@ _CAUSE_TEXT = {
     "start_failed": "the sandbox did not start.",
     "owner_lost": "the worker running this request stopped responding.",
     "issue_cancelled": "the request was cancelled.",
+    "issue_deleted": "the tracker issue no longer exists.",
     "publication_denied": "a person denied the request to open the pull request.",
     "publication_expired": (
         "the request to open the pull request expired before anyone approved it."
@@ -912,12 +913,24 @@ async def _release_sync_claim(
         await session.commit()
 
 
+def _skip_deleted_issue_comment(row: FactoryStatusComment, now: datetime) -> None:
+    row.applied_label = ""
+    if row.posted_at is not None:
+        row.finalized_at = now
+    else:
+        row.refusal = "issue_deleted"
+        row.refused_at = now
+
+
 async def _sync_one(
     client: httpx.AsyncClient,
     settings: Settings,
     claim: _StatusClaim,
 ) -> int:
     row = claim.row
+    if row.terminal_cause == "issue_deleted":
+        _skip_deleted_issue_comment(row, claim.now)
+        return 0
     if claim.tracker_issue.kind != GITHUB:
         return await _sync_through_ports(client, settings, claim)
     if claim.code_host_installation_id is None:
@@ -1011,6 +1024,9 @@ async def _sync_port_comment(tracker: Tracker, code_host: CodeHost, claim: _Stat
         result = await comments_for(target, tracker, code_host).upsert_marked(
             target, status_marker(row.execution_request_id), body
         )
+    except NotFound:
+        _skip_deleted_issue_comment(row, now)
+        return 0
     except Unauthorized:
         row.comment_id = None
         row.posted_at = None
