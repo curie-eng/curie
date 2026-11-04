@@ -138,6 +138,7 @@ spec:
     fsGroup: {{ $h.fsGroup }}
     seccompProfile:
       type: RuntimeDefault
+  enableServiceLinks: false
   containers:
     - name: hardening
       image: {{ .Values.security.probe.busyboxImage }}
@@ -302,6 +303,7 @@ spec:
       {{- with .Values.priorityClasses.platform.name }}
       priorityClassName: {{ . }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: probe
           image: {{ .Values.security.probe.kubectlImage }}

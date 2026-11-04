@@ -80,6 +80,7 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+      enableServiceLinks: false
       containers:
         - name: ollama
           image: {{ .Values.inference.image | quote }}
