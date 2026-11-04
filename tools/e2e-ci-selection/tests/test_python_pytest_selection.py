@@ -2602,6 +2602,7 @@ def test_commissioning_runner_peer_shares_the_protected_xdist_group() -> None:
         "apps/worker/tests/test_commissioning_record_refusal.py",
         "apps/worker/tests/test_commissioning_launch.py",
         "apps/worker/tests/test_commissioning_cleanup.py",
+        "apps/worker/tests/test_commissioning_supervisor.py",
         "apps/worker/tests/test_protected_retirement_server.py",
         "apps/worker/tests/test_protected_recovery_source.py",
         "apps/worker/tests/test_delivery_lease.py",

@@ -70,6 +70,7 @@ PROTECTED_RUNNER_FILES = frozenset(
         "apps/worker/tests/test_commissioning_cleanup.py",
         "apps/worker/tests/test_commissioning_launch.py",
         "apps/worker/tests/test_commissioning_record_refusal.py",
+        "apps/worker/tests/test_commissioning_supervisor.py",
         "apps/worker/tests/test_protected_consumer_recovery.py",
         "apps/worker/tests/test_protected_entry_runtime.py",
         "apps/worker/tests/test_protected_launch_server_integration.py",
