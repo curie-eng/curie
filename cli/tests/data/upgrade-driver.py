@@ -1235,6 +1235,9 @@ if program == "helm":
         print(json.dumps(expected))
         sys.exit(0)
     if args[:2] == ["show", "chart"]:
+        if os.environ.get("UPGRADE_DRIVER_REAL_HELM"):
+            import subprocess
+            sys.exit(subprocess.call([os.environ["UPGRADE_DRIVER_REAL_HELM"], *args]))
         print(
             "name: curie\nversion: {v}\nappVersion: {v}".format(v=scenario["show_chart"])
         )

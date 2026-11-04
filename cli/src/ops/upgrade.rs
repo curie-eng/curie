@@ -3483,8 +3483,6 @@ impl LiveHost {
                     plain("<chart-directory>"),
                     plain("--version"),
                     plain(&example_version),
-                    plain("--app-version"),
-                    plain(&example_version),
                 ],
             )
             .display();

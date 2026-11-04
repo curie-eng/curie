@@ -8130,6 +8130,96 @@ fn image_pins(fixture: &Fixture, requested: &str, installed: &str, running: &str
     .unwrap();
 }
 
+fn assert_prerelease_recovery(fixture: &Fixture, refusal: &str) {
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(
+        helm.status.success(),
+        "real Helm required for chart packaging"
+    );
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    let chart = fixture.0.path().join("chart");
+    fs::create_dir(&chart).unwrap();
+    fs::write(
+        chart.join("Chart.yaml"),
+        "apiVersion: v2\nname: curie\nversion: 0.9.0\nappVersion: 0.9.0\n",
+    )
+    .unwrap();
+    let package = refusal
+        .split('`')
+        .find(|command| command.starts_with("helm package "))
+        .expect("refusal supplies a packaging command");
+    let package = package
+        .replacen("helm ", "\"$RECOVERY_HELM\" ", 1)
+        .replace("'<chart-directory>'", "\"$RECOVERY_CHART\"");
+    let output = Command::new("sh")
+        .args(["-c", &package])
+        .current_dir(fixture.0.path())
+        .env("RECOVERY_HELM", helm.trim())
+        .env("RECOVERY_CHART", &chart)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", visible(&output));
+    let upgrade = refusal
+        .split('`')
+        .find(|command| command.starts_with("curie cluster upgrade "))
+        .expect("refusal supplies an upgrade command");
+    let version = upgrade
+        .split("--to ")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    assert_eq!(version, "0.9.0-pins.1");
+    let packaged = fixture.0.path().join(format!("curie-{version}.tgz"));
+    let metadata = Command::new(helm.trim())
+        .args(["show", "chart"])
+        .arg(&packaged)
+        .output()
+        .unwrap();
+    assert!(metadata.status.success(), "{}", visible(&metadata));
+    let metadata: Value = serde_norway::from_slice(&metadata.stdout).unwrap();
+    assert_eq!(metadata["version"], version);
+    assert_eq!(
+        metadata["appVersion"], "0.9.0",
+        "recovery must preserve image-tag defaults"
+    );
+    fs::write(
+        fixture.0.path().join("image-pins.json"),
+        serde_json::json!({
+            "requested_image": PIN_NEW,
+            "installed_image": PIN_OLD,
+            "running_image": PIN_NEW,
+            "after": version,
+            "target": version,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let upgrade = upgrade.replacen("curie ", "\"$RECOVERY_CURIE\" --json ", 1);
+    let output = Command::new("sh")
+        .args(["-c", &format!("{upgrade} --yes")])
+        .current_dir(fixture.0.path())
+        .env("RECOVERY_CURIE", env!("CARGO_BIN_EXE_curie"))
+        .env(
+            "PATH",
+            crate::support::executable::isolated_fixture_path(fixture.0.path()),
+        )
+        .env("KUBECONFIG", fixture.0.path().join("kubeconfig"))
+        .env("UPGRADE_DRIVER_ROOT", fixture.0.path())
+        .env("UPGRADE_DRIVER_SCENARIO", "healthy")
+        .env("UPGRADE_DRIVER_REAL_HELM", helm.trim())
+        .output()
+        .unwrap();
+    let body = json(&output);
+    assert!(output.status.success(), "{body}");
+    assert_eq!(body["convergence"]["exact"], true, "{body}");
+    assert_eq!(fixture.helm_upgrades().len(), 1);
+}
+
 #[test]
 fn same_version_chart_digest_difference_refuses() {
     for extra in [vec![], vec!["--dry-run"]] {
@@ -8150,6 +8240,9 @@ fn same_version_chart_digest_difference_refuses() {
         );
         assert!(text.contains("distinct chart version"), "{body}");
         assert!(fixture.helm_upgrades().is_empty());
+        if extra.is_empty() {
+            assert_prerelease_recovery(&fixture, body["error"].as_str().unwrap());
+        }
         if !extra.is_empty() {
             assert!(
                 body["plan"]
@@ -8269,7 +8362,10 @@ fn same_version_values_image_change_reports_bounded_recovery() {
             refusal.contains(PIN_OLD) && refusal.contains(PIN_NEW),
             "{refusal}"
         );
-        assert!(refusal.contains("helm package '<chart-directory>' --version 0.9.0-pins.1 --app-version 0.9.0-pins.1"), "{refusal}");
+        assert!(
+            refusal.contains("helm package '<chart-directory>' --version 0.9.0-pins.1"),
+            "{refusal}"
+        );
         assert!(refusal.contains("curie cluster upgrade --to 0.9.0-pins.1 --release rel --namespace ns --chart ./curie-0.9.0-pins.1.tgz"), "{refusal}");
         assert!(
             refusal.contains("drop the image change from --values-file"),
