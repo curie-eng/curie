@@ -249,7 +249,8 @@ class WorkItemReconciler:
                 )
             if isinstance(result, lifecycle.WorkItemOutcome):
                 logger.warning(
-                    "work item request %s expired waiting for capacity after %d deferrals",
+                    "work item request %s expired waiting for sandbox admission "
+                    "after %d capacity deferrals",
                     row.id,
                     row.capacity_deferrals,
                 )

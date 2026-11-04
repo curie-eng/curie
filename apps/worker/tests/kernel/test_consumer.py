@@ -1116,7 +1116,9 @@ def test_interactive_capacity_wait_acks_without_completing_the_turn(make_harness
             task = asyncio.create_task(consumer.run())
             try:
                 await _wait_until(lambda: bool(h.sink.updates))
-                assert "queued" in h.sink.updates[-1][2].lower()
+                assert h.sink.updates[-1][2] == (
+                    "Your request is queued while sandbox admission is pending."
+                )
                 assert h.sink.updates[-1][:2] == ("C1", "p-1")
                 assert h.runner.opened == []
                 assert not await h.async_redis.exists(h.config.done_key(event.event_id))
@@ -1320,6 +1322,11 @@ def test_inventory_timeout_capacity_wait_preserves_delivery_bound(
                         entry_id, fields = rows[0][1][0]
                         await consumer._sem.acquire()
                         await consumer._handle(entry_id, fields)
+            queued_updates = [text for _, _, text in h.sink.updates if "queued" in text]
+            assert queued_updates
+            assert set(queued_updates) == {
+                "Your request is queued while sandbox admission is pending."
+            }
             if restore:
                 assert h.runner.queried == ["hello"]
                 assert h.sink.last_text == "inventory restored"
@@ -2713,7 +2720,7 @@ def test_active_wait_delivery_recovers_after_deadline_without_expiry(
             await recovery._handle(wake_id, wake_fields)
             assert h.sink.last_text == "recovered answer"
             assert [text for _, _, text in h.sink.updates].count(
-                "The agent is busy. Your request is queued and will start when space opens."
+                "Your request is queued while sandbox admission is pending."
             ) == 1
             # A queued edit that loses the race with this answer must not
             # replace it. The notice path is the same one the first consumer
