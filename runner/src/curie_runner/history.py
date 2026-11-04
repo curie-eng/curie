@@ -62,7 +62,7 @@ class UnprovableAssistantGroupingError(HistoryError):
 
 
 class HistoryAppendError(HistoryError):
-    """The state API refused a transcript append."""
+    """The state API refused a transcript read or write."""
 
     def __init__(self, status: int) -> None:
         self.status = status
@@ -490,6 +490,10 @@ class TurnRecord:
     status: str = "done"
     approval: ApprovalContext | None = None
     harness_replay: HarnessReplayState | None = None
+    # Minted once per turn, so a retried append of the same turn is recognized
+    # by the state API and stored once (#5366). Empty means no id: emitted
+    # only when set, so a record without one keeps its earlier item shape.
+    record_id: str = ""
 
     def __post_init__(self) -> None:
         if not self.messages:
@@ -506,7 +510,7 @@ class TurnRecord:
             )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "type": "turn",
             "user": self.user,
             "assistant": self.assistant,
@@ -518,6 +522,9 @@ class TurnRecord:
                 self.harness_replay.to_dict() if self.harness_replay is not None else None
             ),
         }
+        if self.record_id:
+            data["record_id"] = self.record_id
+        return data
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> TurnRecord:
@@ -547,6 +554,7 @@ class TurnRecord:
                 if isinstance(raw_harness_replay, Mapping)
                 else None
             ),
+            record_id=str(data.get("record_id") or ""),
         )
 
 
@@ -1071,7 +1079,9 @@ class StateApiTranscriptStore:
         self._max_value_bytes = None
         async with session.get(self._key_url, headers=self._headers()) as resp:
             if resp.status not in (200, 404):
-                raise HistoryError(resp.status)
+                # Status-carrying, so a 5xx read during an append is retried
+                # like a 5xx write (#5366).
+                raise HistoryAppendError(resp.status)
             advertised_cap = resp.headers.get("X-Curie-Transcript-Max-Bytes")
             try:
                 cap = int(advertised_cap) if advertised_cap is not None else 0
@@ -1142,6 +1152,14 @@ class StateApiTranscriptStore:
                     # an empty key is the cap itself, not something to compact.
                     raise HistoryCapacityError(413)
                 value, version = snapshot
+                record_id = item.get("record_id")
+                if record_id and any(
+                    isinstance(stored, dict) and stored.get("record_id") == record_id
+                    for stored in value
+                ):
+                    # An earlier attempt of this turn already landed (#5366).
+                    # Whether it kept native replay is unknown, so report not.
+                    return False
                 assert self._max_value_bytes is not None
                 status = await self._put(
                     session,
@@ -1287,6 +1305,8 @@ def _make_summary(
     for turn in compacted:
         portable = turn.to_dict()
         portable.pop("harness_replay", None)
+        # A per-attempt identity, not conversation content (#5366).
+        portable.pop("record_id", None)
         portable_turns.append(portable)
     source = {
         "prior_digest": prior.digest if prior is not None else None,

@@ -1671,8 +1671,17 @@ async fn remove_claim_input_volume(
     {
         return Ok(());
     }
-    docker(&["volume".into(), "rm".into(), volume.into()]).await?;
-    Ok(())
+    // Inspect and rm are separate daemon calls. The worker's
+    // reap_claim_templates sweep volume-rms the same claim input once this
+    // process has removed the runner and the volume is older than the claim
+    // timeout plus grace. "no such volume" is that race already won by the
+    // other remover, which is the state this call wants.
+    let (status, _stdout, stderr) =
+        docker_capture(&["volume".into(), "rm".into(), volume.into()]).await?;
+    if status.success() || stderr.to_ascii_lowercase().contains("no such volume") {
+        return Ok(());
+    }
+    bail!("docker volume failed ({status}): {stderr}");
 }
 
 async fn remove_container_claim_inputs(inputs: ClaimContainerInputs) -> Result<()> {
@@ -3306,6 +3315,135 @@ driver failed programming external connectivity: port is already allocated."
         let joined = s.run_args(SNAPSHOT_VOLUME).join(" ");
         assert!(joined.contains("-e ANTHROPIC_BASE_URL=http://x-ollama:11434"));
         assert!(!joined.contains("CURIE_FAKE_MODEL"));
+    }
+
+    const CLAIM_INPUT_VOLUME: &str = "curie-input-acme";
+
+    fn owned_claim_input_labels() -> serde_json::Value {
+        serde_json::json!({
+            "curietech.ai/managed-by": "curie-sandbox-substrate",
+            "curietech.ai/claim": "claim-acme",
+            "curietech.ai/claim-attempt": "11111111-1111-4111-8111-111111111111",
+            "curietech.ai/component": "claim-bundle",
+        })
+    }
+
+    struct VolumeDockerGuard {
+        path: Option<std::ffi::OsString>,
+        log: Option<std::ffi::OsString>,
+        labels: Option<std::ffi::OsString>,
+        rm_stderr: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for VolumeDockerGuard {
+        fn drop(&mut self) {
+            for (name, previous) in [
+                ("PATH", &self.path),
+                ("CURIE_TEST_DOCKER_LOG", &self.log),
+                ("CURIE_TEST_VOLUME_LABELS", &self.labels),
+                ("CURIE_TEST_VOLUME_RM_STDERR", &self.rm_stderr),
+            ] {
+                match previous {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    /// Fake `docker` that answers claim-input inspect from the environment and
+    /// fails `volume rm` with the configured stderr. Records every argv line.
+    fn install_volume_rm_docker(
+        tools: &std::path::Path,
+        log: &std::path::Path,
+    ) -> VolumeDockerGuard {
+        let docker = tools.join("docker");
+        std::fs::write(
+            &docker,
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"$CURIE_TEST_DOCKER_LOG\"\n\
+             if [ \"$1\" = volume ] && [ \"$2\" = inspect ]; then\n\
+               printf '%s\\n' \"$CURIE_TEST_VOLUME_LABELS\"\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = volume ] && [ \"$2\" = rm ]; then\n\
+               printf '%s\\n' \"$CURIE_TEST_VOLUME_RM_STDERR\" >&2\n\
+               exit 1\n\
+             fi\n\
+             printf 'unexpected docker command: %s\\n' \"$*\" >&2\n\
+             exit 91\n",
+        )
+        .expect("write fake docker");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&docker)
+            .expect("read fake docker metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&docker, permissions).expect("make fake docker runnable");
+        let guard = VolumeDockerGuard {
+            path: std::env::var_os("PATH"),
+            log: std::env::var_os("CURIE_TEST_DOCKER_LOG"),
+            labels: std::env::var_os("CURIE_TEST_VOLUME_LABELS"),
+            rm_stderr: std::env::var_os("CURIE_TEST_VOLUME_RM_STDERR"),
+        };
+        let mut path = vec![tools.to_path_buf()];
+        path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        std::env::set_var("PATH", std::env::join_paths(path).expect("join test PATH"));
+        std::env::set_var("CURIE_TEST_DOCKER_LOG", log);
+        std::env::set_var(
+            "CURIE_TEST_VOLUME_LABELS",
+            owned_claim_input_labels().to_string(),
+        );
+        guard
+    }
+
+    async fn assert_claim_input_rm(stderr: &str) -> Result<()> {
+        let tools = tempfile::tempdir().expect("fake docker directory");
+        let log = tempfile::NamedTempFile::new().expect("docker argv log");
+        let _guard = install_volume_rm_docker(tools.path(), log.path());
+        std::env::set_var("CURIE_TEST_VOLUME_RM_STDERR", stderr);
+        let labels = owned_claim_input_labels();
+        let owner = ClaimInputOwner::from_labels(&labels).expect("fixture labels are owned");
+        let removal = remove_claim_input_volume(CLAIM_INPUT_VOLUME, &owner, None).await;
+        let recorded = std::fs::read_to_string(log.path()).expect("read docker argv log");
+        assert!(
+            recorded.contains(&format!(
+                "volume inspect --format {{{{json .Labels}}}} {CLAIM_INPUT_VOLUME}"
+            )),
+            "inspect must see the volume before rm: {recorded}"
+        );
+        assert!(
+            recorded.contains(&format!("volume rm {CLAIM_INPUT_VOLUME}")),
+            "rm must be attempted after a successful inspect: {recorded}"
+        );
+        removal
+    }
+
+    #[tokio::test]
+    async fn claim_input_volume_rm_treats_no_such_volume_as_already_removed() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        assert_claim_input_rm(&format!(
+            "Error response from daemon: get {CLAIM_INPUT_VOLUME}: no such volume"
+        ))
+        .await
+        .expect("a volume another cleanup already removed is the desired end state");
+    }
+
+    #[tokio::test]
+    async fn claim_input_volume_rm_reports_a_volume_that_is_in_use() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let err = assert_claim_input_rm(&format!(
+            "Error response from daemon: remove {CLAIM_INPUT_VOLUME}: volume is in use"
+        ))
+        .await
+        .expect_err("a volume that is still mounted must stay an error");
+        let text = err.to_string();
+        assert!(
+            text.contains("volume is in use"),
+            "busy volume rm must surface: {text}"
+        );
     }
 }
 

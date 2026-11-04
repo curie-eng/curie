@@ -24,6 +24,7 @@ import contextlib
 import hmac
 import logging
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import replace
@@ -73,6 +74,7 @@ from .history import (
     ApprovalContext,
     ConversationMessage,
     HarnessReplayState,
+    HistoryAppendError,
     HistoryCapacityError,
     NullTranscriptStore,
     TranscriptStore,
@@ -126,8 +128,8 @@ SessionFactory = Callable[[], ModelSession]
 _CONNECTOR_RECOVERY_BUDGET_SECONDS = 20.0
 _HISTORY_PERSISTENCE_BUDGET_SECONDS = 15.0
 _HISTORY_REPLAY_EXPORT_BUDGET_SECONDS = 5.0
-# Backoff for retrying transcript appends that never reached the state API
-# (#5354): the first retry waits the initial delay, each later one doubles it,
+# Backoff for retrying transcript appends whose outcome is unknown (#5354,
+# #5366): the first retry waits the initial delay, each later one doubles it,
 # up to the cap.
 _HISTORY_RETRY_INITIAL_S = 0.5
 _HISTORY_RETRY_MAX_S = 5.0
@@ -291,6 +293,23 @@ _HISTORY_CAPACITY_FINAL = Final(
     text="run failed: conversation history could not be persisted",
     status=SessionStatus.CLASSIFIED_FAILURE,
 )
+
+
+def _append_outcome_unknown(exc: BaseException) -> bool:
+    """Whether a failed transcript append may land if it is sent again (#5366).
+
+    A connect failure, a cut or timed out connection, a 5xx, a 408 or a 429 says
+    nothing final about the request: it may not have been written, or it may
+    have committed before the response failed. Each turn record carries a
+    ``record_id`` the state API replays, so a retry cannot store it twice. A
+    capacity refusal, any other 4xx and every other error are final.
+    """
+
+    if isinstance(exc, aiohttp.ClientError | TimeoutError):
+        return True
+    if isinstance(exc, HistoryAppendError) and not isinstance(exc, HistoryCapacityError):
+        return exc.status >= 500 or exc.status in (408, 429)
+    return False
 
 
 def _history_capacity_lines(detail: str | None = None) -> tuple[str, str]:
@@ -545,16 +564,18 @@ class SessionRunner:
         # transcript append re-authorizes replacement, unless an earlier turn
         # was already lost by this process. Later appends cannot repair that
         # missing prefix, so the loss remains sticky for this runner's lifetime.
-        # An append that never reached the state API (a connect failure) is not
-        # a loss (#5354): nothing was written, so the record is deferred and
-        # retried in order until it lands, and the fence stays shut until then.
+        # An append whose outcome is unknown (a connect failure, a cut
+        # connection, a timeout, a 5xx, a cancellation after the request was
+        # sent) is not a loss (#5354, #5366): the state API replays a known
+        # ``record_id``, so the record is deferred and retried in order until it
+        # lands, and the fence stays shut until then.
         # A turn whose terminal the transcript never records (failed, budget,
         # interrupted, result-less) re-authorizes it too (#4188): replay
         # already holds everything it ever will, and leaving the fence shut
         # would lock the thread, since only another turn could reopen it.
         self._history_durable = True
         self._history_loss_observed = False
-        # Records whose append never reached the state API, oldest first. The
+        # Records whose append has not yet landed, oldest first. The
         # lock serializes every transcript append, from a turn or the retry
         # task, so records land in turn order. asyncio.Lock has no owner, so a
         # turn generator finalized on another task still releases it.
@@ -707,8 +728,10 @@ class SessionRunner:
         and idle turns leave it None and are not persisted. A capacity refusal
         propagates to the prepublication terminal decision. Other failures keep
         the candidate terminal under the best effort history policy. A record
-        whose append never reached the state API, or that would land ahead of
-        an earlier such record, is deferred for the retry task (#5354).
+        whose append outcome is unknown, or that would land ahead of an earlier
+        such record, is deferred for the retry task (#5354, #5366); the
+        ``record_id`` minted here lets the state API store it once however
+        often it is sent.
         """
 
         if state.final_text is None:
@@ -773,12 +796,13 @@ class SessionRunner:
                     else None
                 ),
                 harness_replay=harness_replay,
+                record_id=uuid.uuid4().hex,
             )
             async with self._history_append_lock:
                 await self._flush_deferred_history()
                 if self._deferred_history:
-                    # An earlier record still cannot reach the API; this one
-                    # must not land ahead of it.
+                    # An earlier record has not landed yet; this one must
+                    # not land ahead of it.
                     self._deferred_history.append(record)
                     logger.warning(
                         "history append deferred session=%s behind=%d",
@@ -789,9 +813,12 @@ class SessionRunner:
                     own_append_started = True
                     try:
                         await self._append_history(record)
-                    except aiohttp.ClientConnectorError as exc:
-                        # The request never reached the API, so nothing was
-                        # written and a retry cannot duplicate the record.
+                    except Exception as exc:
+                        if not _append_outcome_unknown(exc):
+                            raise
+                        # The request may or may not have been written. The
+                        # API replays a known record_id, so a retry cannot
+                        # duplicate the record (#5366).
                         self._deferred_history.append(record)
                         logger.warning(
                             "history append deferred session=%s error_class=%s",
@@ -812,9 +839,11 @@ class SessionRunner:
             raise
         except BaseException as exc:
             self._history_durable = False
-            if record is not None and not own_append_started:
-                # This turn's request never started, so nothing was written:
-                # keep the record for the retry instead of losing it.
+            cancelled = isinstance(exc, anyio.get_cancelled_exc_class())
+            if record is not None and (not own_append_started or cancelled):
+                # This turn's request never started, or was cancelled with its
+                # outcome unknown: keep the record for the retry instead of
+                # losing it. A replayed record_id cannot land twice (#5366).
                 if all(item is not record for item in self._deferred_history):
                     self._deferred_history.append(record)
                 self._ensure_history_retry()
@@ -823,13 +852,11 @@ class SessionRunner:
                     self._session_id,
                     type(exc).__name__,
                 )
-                if isinstance(exc, anyio.get_cancelled_exc_class()) or not isinstance(
-                    exc, Exception
-                ):
+                if cancelled or not isinstance(exc, Exception):
                     raise
                 return
             self._history_loss_observed = True
-            if isinstance(exc, anyio.get_cancelled_exc_class()) or not isinstance(exc, Exception):
+            if not isinstance(exc, Exception):
                 raise
             status = getattr(exc, "status", None)
             if isinstance(status, int):
@@ -853,22 +880,29 @@ class SessionRunner:
 
         return not self._history_loss_observed and not self._deferred_history
 
-    async def _append_history(self, record: TurnRecord) -> None:
-        """Append one record, resetting the native checkpoint if it was dropped."""
+    async def _append_history(self, record: TurnRecord, *, retried: bool = False) -> None:
+        """Append one record, resetting the native checkpoint if it was dropped.
+
+        A ``retried`` record may have landed on an earlier attempt through
+        capacity compaction, which drops native replay, and the replayed
+        answer cannot say so; its checkpoint is reset too (#5366).
+        """
 
         native_retained = await self._history.append(record)
-        if record.harness_replay is not None and not native_retained:
+        if record.harness_replay is not None and (retried or not native_retained):
             requester = getattr(self._session, "request_full_checkpoint", None)
             if not callable(requester):
                 raise RuntimeError("native replay exporter cannot reset its checkpoint")
             requester()
 
     async def _flush_deferred_history(self) -> None:
-        """Append deferred records in order, stopping at one that cannot connect.
+        """Append deferred records in order, stopping at one whose outcome is unknown.
 
-        The caller holds the append lock. A record the API answered with a
-        refusal, or one cut off mid-request, may or may not have been written,
-        so it is never retried: it becomes a sticky loss, as on the turn path.
+        The caller holds the append lock. A record that again fails with an
+        unknown outcome, or whose attempt is cancelled, stays at the head for
+        the next retry: the API replays its ``record_id``, so it lands once
+        (#5366). A final refusal (a 4xx, a capacity refusal) cannot succeed on
+        retry, so it becomes a sticky loss, as on the turn path.
         """
 
         persisted = 0
@@ -877,20 +911,22 @@ class SessionRunner:
             # the fence reads it as not yet durable until it lands.
             record = self._deferred_history[0]
             try:
-                await self._append_history(record)
-            except aiohttp.ClientConnectorError:
-                logger.debug(
-                    "deferred history append still unreachable session=%s pending=%d",
-                    self._session_id,
-                    len(self._deferred_history),
-                )
-                break
+                await self._append_history(record, retried=True)
             except BaseException as exc:
+                if isinstance(exc, anyio.get_cancelled_exc_class()):
+                    raise
+                if _append_outcome_unknown(exc):
+                    logger.debug(
+                        "deferred history append still pending session=%s error_class=%s "
+                        "pending=%d",
+                        self._session_id,
+                        type(exc).__name__,
+                        len(self._deferred_history),
+                    )
+                    break
                 self._history_loss_observed = True
                 del self._deferred_history[0]
-                if isinstance(exc, anyio.get_cancelled_exc_class()) or not isinstance(
-                    exc, Exception
-                ):
+                if not isinstance(exc, Exception):
                     raise
                 logger.warning(
                     "deferred history append failed session=%s error_class=%s",
@@ -913,7 +949,7 @@ class SessionRunner:
             self._history_retry_task = asyncio.create_task(self._retry_deferred_history())
 
     async def _retry_deferred_history(self) -> None:
-        """Retry deferred records with backoff until none remain (#5354)."""
+        """Retry deferred records with backoff until none remain (#5354, #5366)."""
 
         delay = _HISTORY_RETRY_INITIAL_S
         while self._deferred_history:
