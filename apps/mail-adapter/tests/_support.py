@@ -356,6 +356,7 @@ class IngressState:
         # every resolve call as (path, headers, body), and what to answer.
         self.resolves: list[tuple[str, Any, dict[str, Any]]] = []
         self.resolve_responses: list[tuple[int, dict[str, Any]]] = []
+        self.resolve_raw_bodies: list[bytes] = []  # the exact bytes of each resolve
 
     def delivery_ids(self) -> list[str]:
         return [body["delivery_id"] for _headers, body in self.requests]
@@ -516,7 +517,9 @@ class IngressHandler(_JsonHandler):
     def do_POST(self) -> None:
         state = self.state
         if self.path.startswith("/approvals/"):
-            body = self._read_body()
+            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            state.resolve_raw_bodies.append(raw)
+            body = json.loads(raw.decode()) if raw else {}
             state.resolves.append((self.path, self.headers, body))
             if state.resolve_responses:
                 status, payload = state.resolve_responses.pop(0)

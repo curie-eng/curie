@@ -13,9 +13,11 @@ the enforceable-rule summary.
   presented only on `POST /approvals/{id}/resolve` when carrying an answer). The
   optional `CURIE_MAIL_RECEIVER_KEY` is its email receiver key (ADR 0260): it
   signs the sender of each turn through the shared
-  `curie_internal.identity_context` signer and authorizes nothing alone. Never
-  add a second canonicalisation or MAC here, and never post unsigned when the
-  receiver is configured. Do not add `CURIE_API_KEY`, a Valkey client, or a DB
+  `curie_internal.identity_context` signer and authorizes nothing alone. It also
+  signs each email approval answer it carries, as the shared
+  `EmailApprovalAnswerProofV1` (ADR 0267), over the exact resolve bytes. Never
+  add a second canonicalisation or MAC here, and never post a turn or an answer unsigned when
+  the receiver is configured. Do not add `CURIE_API_KEY`, a Valkey client, or a DB
   session to the platform here; a capability the adapter does not hold cannot be
   stolen from it, and re-minting an expired `chn` token is an operator step for
   exactly that reason. Its local SQLite file is delivery state, not a platform
