@@ -422,18 +422,26 @@ if isinstance(payload, dict):
 print("Recovery diagnostic: " + json.dumps(summary, sort_keys=True))
 PY
     # Project logs onto fixed metadata; raw messages and tracebacks stay private.
+    # items[0] assumes this scenario's single API replica.
     api_pod="$(kc get pods -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=api" \
-        -o jsonpath='{.items[0].metadata.name}')"
-    api_restarts="$(kc get pod "$api_pod" \
-        -o jsonpath='{.status.containerStatuses[?(@.name=="api")].restartCount}')"
-    kc logs "$api_pod" -c api --since-time="$RECOVERY_SINCE" >"$WORKDIR/recovery-api.log" 2>&1 || true
+        -o jsonpath='{.items[0].metadata.name}')" || api_pod=""
+    api_restarts=""
+    if [[ -n "$api_pod" ]]; then
+        api_restarts="$(kc get pod "$api_pod" \
+            -o jsonpath='{.status.containerStatuses[?(@.name=="api")].restartCount}')" || api_restarts=""
+        kc logs "$api_pod" -c api --since-time="$RECOVERY_SINCE" >"$WORKDIR/recovery-api.log" 2>&1 || true
+    else
+        : >"$WORKDIR/recovery-api.log" || true
+    fi
+    api_restarts=${api_restarts:-0}
+    [[ "$api_restarts" =~ ^(0|[1-9][0-9]*)$ ]] || api_restarts=0
     previous_args=()
     if (( api_restarts > 0 )); then
         kc logs "$api_pod" -c api --previous >"$WORKDIR/recovery-api-previous.log" 2>&1 || true
         previous_args=(--previous-log "$WORKDIR/recovery-api-previous.log")
     fi
     python3 "$REPO_ROOT/charts/curie/ci/runtime/recovery_api_diagnostic.py" \
-        "$WORKDIR/recovery-api.log" --restart-count "$api_restarts" "${previous_args[@]}"
+        "$WORKDIR/recovery-api.log" --restart-count "$api_restarts" "${previous_args[@]}" || true
 fi
 [[ "$TURN_STATUS" == 0 ]] || fail "recovery CLI turn failed"
 python3 - "$WORKDIR/recovery.json" <<'PY'

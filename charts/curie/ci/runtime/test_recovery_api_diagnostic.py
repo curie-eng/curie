@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -229,3 +230,192 @@ def test_access_logs_never_promote_identifier_paths_to_templates() -> None:
         ]
     )
     assert parse(log)["api_5xx_routes"] == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "user alice.Smith: denied for acme.Corp)",
+        "/home/alice/Workspace.Customer: failed",
+        "connect to db.Example failed (db.Prod)",
+        "<class 'acme_corp.secret_name'>",
+    ],
+)
+@pytest.mark.parametrize("field", [None, "message", "exception"])
+def test_arbitrary_identifiers_never_become_exception_types(text: str, field: str | None) -> None:
+    log = text if field is None else json.dumps({field: text})
+    summary = parse(log, log, 1)
+    assert summary["api_exception_types"] == []
+    assert summary["api_previous_exception_types"] == []
+
+
+def test_traceback_shaped_messages_are_not_exceptions() -> None:
+    summary = parse(json.dumps({"message": "ValueError: private message"}))
+    assert summary["api_exception_types"] == []
+
+
+def test_type_cap_and_per_text_500_count() -> None:
+    exceptions = "\n".join(f"Failure{i:02}Error: private" for i in range(15))
+    log = json.dumps({"message": '" 500 twice " 500', "exception": exceptions + '\n" 500 " 500'})
+    summary = parse(log, log, 1)
+    expected = [f"Failure{i:02}Error" for i in range(12)]
+    assert summary["api_exception_types"] == expected
+    assert summary["api_previous_exception_types"] == expected
+    assert summary["api_http_500_lines"] == 2
+
+
+def test_known_class_prefix_and_unqualified_type() -> None:
+    log = (
+        "sqlalchemy.exc.ProgrammingError: <class 'asyncpg.exceptions.InsufficientPrivilegeError'>"
+        "\n| <class 'ValueError'>"
+    )
+    assert parse(log)["api_exception_types"] == [
+        "ValueError",
+        "asyncpg.exceptions.InsufficientPrivilegeError",
+        "sqlalchemy.exc.ProgrammingError",
+    ]
+
+
+KUBECTL_STUB = r"""
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+with Path(os.environ["CALL_LOG"]).open("a") as log:
+    log.write(json.dumps(args) + "\n")
+if "get" in args:
+    if "pods" in args:
+        if os.environ["POD_FAILURE"] == "1":
+            raise SystemExit(1)
+        print(os.environ["POD_NAME"])
+    elif "pod" in args:
+        if os.environ["COUNT_FAILURE"] == "1":
+            raise SystemExit(1)
+        print(os.environ["RESTART_COUNT"])
+    else:
+        raise SystemExit(90)
+elif "logs" in args:
+    if os.environ["UNREADABLE_LOG"] == "1" and "--previous" not in args:
+        path = Path(os.environ["WORKDIR"]) / "recovery-api.log"
+        path.unlink()
+        path.mkdir()
+    else:
+        name = "PREVIOUS_LOG" if "--previous" in args else "CURRENT_LOG"
+        print(Path(os.environ[name]).read_text())
+else:
+    raise SystemExit(91)
+"""
+
+
+def run_shell_parse_step(
+    tmp_path: Path,
+    restart_count: str = "0",
+    *,
+    pod_name: str = "acme-api",
+    pod_failure: bool = False,
+    count_failure: bool = False,
+    unreadable_log: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    kubectl = tools / "kubectl"
+    kubectl.write_text(f"#!{sys.executable}\n" + KUBECTL_STUB)
+    kubectl.chmod(0o755)
+    current, previous, calls = tmp_path / "current", tmp_path / "previous", tmp_path / "calls"
+    current.write_text(json.dumps({"exception": "| ValueError: private value"}))
+    previous.write_text(json.dumps({"exception": "| psycopg.OperationalError: private value"}))
+    calls.touch()
+    script = PARSER.with_name("workspace-dependency-diagnostic-runtime.sh").read_text()
+    start = script.index("    # Project logs onto fixed metadata;")
+    final_assertion = '[[ "$TURN_STATUS" == 0 ]] || fail "recovery CLI turn failed"'
+    end = script.index(final_assertion, start) + len(final_assertion)
+    # Execute the production shell block, retaining its original failure assertion.
+    program = """set -euo pipefail
+fail() { echo "FAIL: $*" >&2; exit 1; }
+kc() { kubectl --context kind-acme-test -n test-acme "$@"; }
+TURN_STATUS=1
+if [[ "$TURN_STATUS" != 0 ]]; then
+""" + script[start:end]
+    environment = {
+        "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+        "WORKDIR": str(tmp_path),
+        "REPO_ROOT": str(PARSER.parents[4]),
+        "RELEASE": "acme",
+        "RECOVERY_SINCE": "2026-01-01T00:00:00Z",
+        "CURRENT_LOG": str(current),
+        "PREVIOUS_LOG": str(previous),
+        "CALL_LOG": str(calls),
+        "RESTART_COUNT": restart_count,
+        "POD_NAME": pod_name,
+        "POD_FAILURE": str(int(pod_failure)),
+        "COUNT_FAILURE": str(int(count_failure)),
+        "UNREADABLE_LOG": str(int(unreadable_log)),
+    }
+    completed = subprocess.run(
+        ["bash", "-c", program],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed, [json.loads(line) for line in calls.read_text().splitlines()]
+
+
+@pytest.mark.parametrize("restarts", ["0", "2"])
+def test_shell_collects_current_and_previous_container_metadata(
+    tmp_path: Path, restarts: str
+) -> None:
+    completed, calls = run_shell_parse_step(tmp_path, restarts)
+    assert completed.returncode == 1
+    assert completed.stderr == "FAIL: recovery CLI turn failed\n"
+    summary = json.loads(completed.stdout.removeprefix("Recovery API diagnostic: "))
+    assert summary["api_restart_count"] == int(restarts)
+    assert summary["api_exception_types"] == ["ValueError"]
+    assert summary["api_previous_exception_types"] == (
+        ["psycopg.OperationalError"] if restarts == "2" else []
+    )
+    assert calls[0] == [
+        "--context",
+        "kind-acme-test",
+        "-n",
+        "test-acme",
+        "get",
+        "pods",
+        "-l",
+        "app.kubernetes.io/instance=acme,app.kubernetes.io/component=api",
+        "-o",
+        "jsonpath={.items[0].metadata.name}",
+    ]
+    assert any("pod" in call and "acme-api" in call for call in calls)
+    log_calls = [call for call in calls if "logs" in call]
+    assert len(log_calls) == (2 if restarts == "2" else 1)
+    assert any("--previous" in call for call in log_calls) == (restarts == "2")
+    assert all("acme-api" in call and "-c" in call and "api" in call for call in log_calls)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"pod_failure": True},
+        {"pod_name": ""},
+        {"restart_count": ""},
+        {"restart_count": "not-an-integer"},
+        {"count_failure": True},
+        {"unreadable_log": True},
+    ],
+)
+def test_shell_diagnostic_failure_preserves_recovery_failure(
+    tmp_path: Path, settings: dict
+) -> None:
+    completed, calls = run_shell_parse_step(tmp_path, **settings)
+    assert completed.returncode == 1
+    assert completed.stderr.endswith("FAIL: recovery CLI turn failed\n")
+    assert not any("--previous" in call for call in calls)
+    if not settings.get("unreadable_log"):
+        summary = json.loads(completed.stdout.removeprefix("Recovery API diagnostic: "))
+        assert summary["api_restart_count"] == 0
+
+
+def test_traceback_preserves_application_exception_types() -> None:
+    assert parse("| curie_api.errors.InternalError: private value")["api_exception_types"] == [
+        "curie_api.errors.InternalError"
+    ]
