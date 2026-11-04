@@ -189,7 +189,7 @@ class _ExecutingRunner:
         self.app.router.add_route("*", "/{path:.*}", self.handle)
         self.app.on_cleanup.append(self.cleanup)
 
-    async def handle(self, request: web.Request) -> web.Response:
+    async def handle(self, request: web.Request) -> web.StreamResponse:
         if self.server is None:
             claims = [obj for (kind, _), obj in self.api.objects.items() if kind == "sandboxclaims"]
             assert len(claims) == 1
@@ -209,7 +209,8 @@ class _ExecutingRunner:
             self.runner = runner_main.build_runner(config, fake_model=True)
             self.server = TestServer(create_runner_app(self.runner))
             await self.server.start_server()
-        async with aiohttp.ClientSession() as client:
+        transport_headers = {"host", "connection", "transfer-encoding", "content-length"}
+        async with aiohttp.ClientSession(auto_decompress=False) as client:
             async with client.request(
                 request.method,
                 self.server.make_url(request.path_qs),
@@ -217,14 +218,22 @@ class _ExecutingRunner:
                 headers={
                     key: value
                     for key, value in request.headers.items()
-                    if key.lower() in {"authorization", "content-type"}
+                    if key.lower() not in transport_headers
                 },
             ) as response:
-                return web.Response(
-                    body=await response.read(),
+                downstream = web.StreamResponse(
                     status=response.status,
-                    headers={"Content-Type": response.headers["Content-Type"]},
+                    headers={
+                        key: value
+                        for key, value in response.headers.items()
+                        if key.lower() not in transport_headers
+                    },
                 )
+                await downstream.prepare(request)
+                async for chunk in response.content.iter_any():
+                    await downstream.write(chunk)
+                await downstream.write_eof()
+                return downstream
 
     async def cleanup(self, _app: web.Application) -> None:
         if self.server is not None:

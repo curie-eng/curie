@@ -491,14 +491,17 @@ async def _settled_from_record(
     return _settled_outcome(record)
 
 
-async def _place_the_resumed_reply(self: Kernel, qevent: QueuedTurn) -> QueuedTurn:
+async def _place_the_resumed_reply(
+    self: Kernel, qevent: QueuedTurn, *, wait_reply_ref: str | None
+) -> QueuedTurn:
     """Choose where a resumed approval turn answers (ADR-0179 decision 3).
 
     When the pause remembered that its card sits in this thread below the
     notice, the turn drops the placeholder the API replays, so its first
     delivery posts a new message after the card (the ADR-0079 path) and the
-    rest of the turn edits that message. Otherwise the answer stays on the
-    pending notice, adopting its remembered ref when the row carries none.
+    rest of the turn edits that message. A durable wait's posted reply stays
+    in place for completion to edit. Otherwise the answer stays on the pending
+    notice, adopting its remembered ref when the row carries none.
     The returned turn replaces the caller's for the rest of the turn; the
     durable row and the stream entry are untouched.
     """
@@ -515,7 +518,7 @@ async def _place_the_resumed_reply(self: Kernel, qevent: QueuedTurn) -> QueuedTu
             below = False
         if below:
             return qevent.model_copy(
-                update={"reply_handle": handle.model_copy(update={"placeholder": None})}
+                update={"reply_handle": handle.model_copy(update={"placeholder": wait_reply_ref})}
             )
     await self._adopt_remembered_notice_ref(qevent)
     return qevent

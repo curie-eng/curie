@@ -2731,7 +2731,7 @@ def test_active_wait_delivery_recovers_after_deadline_without_expiry(
             # replace it. The notice path is the same one the first consumer
             # used; after the answer it has to no-op.
             before = list(h.sink.updates)
-            await h.kernel.notify_capacity_queued(event)
+            await h.kernel.notify_capacity_queued(event, wait_reply_ref=None)
             assert h.sink.updates == before
             assert h.sink.last_text == "recovered answer"
             done = await _wait_capacity_state(recovery, event.event_id, "done")

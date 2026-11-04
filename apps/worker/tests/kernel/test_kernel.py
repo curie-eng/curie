@@ -5815,7 +5815,7 @@ def test_capacity_queued_notice_keeps_operator_accounting_out_of_the_reply(
             with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
                 with pytest.raises(CapacityWaitRequested):
                     await h.kernel.process_event(event)
-            await h.kernel.notify_capacity_queued(event)
+            await h.kernel.notify_capacity_queued(event, wait_reply_ref=None)
 
             # Read off the rejection rather than retyping literals, so the two
             # halves of the boundary cannot drift apart.
