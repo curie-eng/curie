@@ -55,6 +55,7 @@ from curie_telemetry import (
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind, StatusCode
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 
 from . import capacity_wait as capacity_wait_module
 from .capacity_wait import (
@@ -65,6 +66,7 @@ from .capacity_wait import (
     CapacityWaitRecord,
     CapacityWaitRequested,
     CapacityWaitStore,
+    WorkspaceDependencyWaitRequested,
     wait_delivery_scope,
 )
 from .completion_health import observe_completion_outbox
@@ -614,15 +616,18 @@ class Consumer(StreamConsumer):
                                     qevent.event_id, wait_generation
                                 ):
                                     return
+                            await self._kernel._reemit_pending_completion(qevent.event_id)
                             lease.raise_if_lost()
                             await self._ack(entry_id)
                             await self._settle_delivery_best_effort(entry_id)
                             return
                         if wait_state == "expired":
-                            await self._expire_wait_delivery(
-                                entry_id, qevent, wait_generation, lease
-                            )
-                            return
+                            expired = await self._waits.get(qevent.event_id)
+                            if expired is None or expired.dependency_deadline_ms is None:
+                                await self._expire_wait_delivery(
+                                    entry_id, qevent, wait_generation, lease
+                                )
+                                return
 
                     if self._leases is not None and self._kernel._is_approval_resume(
                         qevent.event_id
@@ -720,6 +725,17 @@ class Consumer(StreamConsumer):
                                 if wait_generation is not None
                                 else nullcontext()
                             ):
+                                if self._kernel._can_park(qevent):
+                                    try:
+                                        predecessor = await self._waits.predecessor(
+                                            _thread_key_for(qevent),
+                                            qevent.event_id,
+                                            entry_id,
+                                        )
+                                    except RedisError as exc:
+                                        raise CapacityWaitRequested() from exc
+                                    if predecessor is not None:
+                                        raise CapacityWaitRequested()
                                 await self._kernel.process_event(
                                     qevent, lease=lease, **identity_arguments,
                                 )
@@ -739,10 +755,25 @@ class Consumer(StreamConsumer):
                                 entry_id, qevent, wait_generation, lease
                             )
                             return
-                        except CapacityWaitRequested:
+                        except CapacityWaitRequested as wait_requested:
                             try:
                                 record = await self._waits.park(
-                                    entry_id, fields, qevent.event_id, lease
+                                    entry_id,
+                                    fields,
+                                    qevent.event_id,
+                                    lease,
+                                    thread_key=(
+                                        _thread_key_for(qevent)
+                                        if self._kernel._can_park(qevent)
+                                        else None
+                                    ),
+                                    dependency_budget_s=(
+                                        self._config.workspace_total_timeout_seconds
+                                        if isinstance(
+                                            wait_requested, WorkspaceDependencyWaitRequested
+                                        )
+                                        else None
+                                    ),
                                 )
                             except Exception:
                                 logger.exception(

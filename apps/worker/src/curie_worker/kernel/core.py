@@ -286,6 +286,7 @@ class Kernel:
     _escalate = attempt._escalate
     _backoff = attempt._backoff
     _to_event = staticmethod(attempt._to_event)
+    _can_park = capacity.can_park
     notify_capacity_queued = capacity.notify_capacity_queued
     expire_capacity_wait = capacity.expire_capacity_wait
     resolve_capacity_grant = capacity.resolve_capacity_grant

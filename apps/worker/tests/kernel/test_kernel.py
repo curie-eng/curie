@@ -2506,8 +2506,8 @@ def test_workspace_preparation_failure_escalates_by_its_own_name(make_harness, c
         pytest.param(
             500,
             "workspace repository-selection failed: API returned HTTP 500",
-            3,
-            id="fault-exhausts-retry-budget",
+            1,
+            id="dependency-fault-enters-durable-wait",
         ),
         pytest.param(
             403,
@@ -2562,6 +2562,16 @@ def test_workspace_selection_http_failure_preserves_diagnostic_and_retry_policy(
                     "Fix https://github.com/acme-corp/acme-bot",
                     thread=f"tWorkspaceSelection{status}",
                 )
+                if status == 500:
+                    from curie_worker.capacity_wait import WorkspaceDependencyWaitRequested
+
+                    with pytest.raises(WorkspaceDependencyWaitRequested):
+                        await h.kernel.process_event(event)
+                    assert len(requests) == expected_attempts
+                    assert h.runner.opened == h.runner.steers == []
+                    assert h.sink.completions == []
+                    assert not await h.kernel._markers.is_terminal(event.event_id)
+                    return
                 await h.kernel.process_event(event)
 
                 assert len(requests) == expected_attempts

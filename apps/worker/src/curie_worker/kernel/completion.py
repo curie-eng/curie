@@ -11,6 +11,7 @@ from aci_protocol import (
 from channel_protocol.reply import (
     REPLY_WIRE_VERSION,
     ReplyTarget,
+    ReplyUpdate,
     TurnCompleted,
     TurnStatus,
 )
@@ -21,6 +22,7 @@ from ..behaviorpacks import (
     sample_load,
     sample_tip,
 )
+from ..capacity_wait import current_wait
 from ..delivery_lease import DeliveryLease
 from ..hook_runs import HookRunOutcome, HookRunReason
 from ..markers import (
@@ -28,6 +30,7 @@ from ..markers import (
     DoneMarkerValue,
     MalformedCompletionError,
     completion_generation,
+    delivery_order_token,
 )
 from ..reply_sink import (
     DeletedReplyTargetError,
@@ -60,6 +63,7 @@ async def _complete(
     hook_reason: HookRunReason | None = None,
     turn: failures.TurnOutcome | None = None,
     successor: QueuedTurn | None = None,
+    escalation_update: ReplyUpdate | None = None,
 ) -> None:
     """The terminal ordering, at every durable ``mark_done`` call site.
 
@@ -286,6 +290,15 @@ async def _complete(
         and turn.classification == "history-persistence-error"
     )
     marker_value: DoneMarkerValue = "history_capacity" if history_capacity_review else "1"
+    thread_order = None
+    if outcome == "escalated" and self._can_park(qevent) and lease is not None:
+        waiting = current_wait()
+        member = (
+            await waiting[0].order_member(event_id, lease.entry_id)
+            if waiting is not None
+            else f"{delivery_order_token(lease.entry_id)}|{event_id}"
+        )
+        thread_order = (routing._thread_key_for(qevent), member)
     record = CompletionRecord(
         event_id=event_id,
         event=TurnCompleted(
@@ -296,12 +309,18 @@ async def _complete(
             outcome=cast("Any", outcome),
         ),
         route=route,
-        answer=turn.answer if turn is not None and outcome == "delivered" else None,
-        answer_best_effort=(
-            turn is not None
-            and turn.answer is not None
-            and self._is_approval_resume(qevent.event_id)
+        answer=(
+            escalation_update
+            if outcome == "escalated"
+            else turn.answer
+            if turn is not None and outcome == "delivered"
+            else None
         ),
+        answer_best_effort=(
+            self._is_approval_resume(qevent.event_id)
+            and (escalation_update is not None or (turn is not None and turn.answer is not None))
+        ),
+        thread_order=thread_order,
         created_at=clock.time.time(),
         done=False,
     )
@@ -360,13 +379,19 @@ async def _complete(
             await self._markers.publish_successor(self._config.stream, successor.model_dump_json())
         await self._markers.mark_done(event_id, marker_value=marker_value, generation=generation)
     constants._LIFECYCLE_OUTCOME.set(telemetry_outcome)
-    if notice is not None:
-        # Claimed before the post, so a cancellation during or after it can
-        # never make the error close post the same notice again.
-        if hook_carry is not None:
-            hook_carry.notice_pending = None
-        await self._post_coverage_notice(qevent, route, notice)
-    await self._deliver_completion(record, generation=generation)
+    if notice is not None and hook_carry is not None:
+        hook_carry.notice_pending = None
+    if record.answer is not None:
+        delivered = await self._deliver_completion(record, generation=generation)
+        if notice is not None:
+            if delivered:
+                await self._post_coverage_notice(qevent, route, notice)
+            else:
+                logger.warning("coverage notice dropped while terminal answer remains owed")
+    else:
+        if notice is not None:
+            await self._post_coverage_notice(qevent, route, notice)
+        await self._deliver_completion(record, generation=generation)
     attributes = {
         "service.name": "curie-worker",
         "source": "worker",

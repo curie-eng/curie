@@ -8,6 +8,7 @@ import aiohttp
 from aci_protocol import (
     QueuedTurn,
     SessionStatus,
+    TurnSource,
 )
 from channel_protocol.reply import (
     ReplyAck,
@@ -33,6 +34,16 @@ from .log import logger
 class _PressureResult:
     reclaimed: bool
     outcome: str
+
+
+def can_park(self: Kernel, qevent: QueuedTurn) -> bool:
+    return (
+        self._markers.supports_answer_outbox
+        and qevent.source is TurnSource.SLACK
+        and qevent.reply_handle is not None
+        and not self._is_approval_resume(qevent.event_id)
+        and not self._is_factory_work_item_turn(qevent.event_id)
+    )
 
 
 async def notify_capacity_queued(self: Kernel, qevent: QueuedTurn) -> ReplyAck:
