@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import unicodedata
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -181,20 +181,24 @@ def render_evidence(
         lines += ["", _FOOTER]
         return "\n".join(lines) + "\n"
 
-    total = len(refused) + len(ordered)
-    for count in range(len(ordered), -1, -1):
-        body = build(count, total)
-        if len(body) <= limit:
-            return Rendered(body, outcome_for(count))
-    # Even without images the list is too long: list as many as fit, count the rest.
-    low, high = 0, total
-    while low < high:
-        middle = (low + high + 1) // 2
-        if len(build(0, middle)) <= limit:
-            low = middle
-        else:
-            high = middle - 1
-    return Rendered(build(0, low), outcome_for(0))
+    def most(high: int, fits: Callable[[int], bool]) -> int:
+        """The largest n in [0, high] that fits; fitting is monotone in n."""
+
+        low = 0
+        while low < high:
+            middle = (low + high + 1) // 2
+            if fits(middle):
+                low = middle
+            else:
+                high = middle - 1
+        return low
+
+    # As many images as fit beside a summarized not-shown list, then as many
+    # not-shown lines as still fit beside those images; the rest are counted.
+    count = most(len(ordered), lambda n: len(build(n, 0)) <= limit)
+    remaining = len(refused) + len(ordered) - count
+    listed = most(remaining, lambda n: len(build(count, n)) <= limit)
+    return Rendered(build(count, listed), outcome_for(count))
 
 
 def render_unsupported(*, head_sha: str, captured: int) -> str:

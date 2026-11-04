@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import httpx
-from sqlalchemy import ColumnElement, func, or_, select, update
+from sqlalchemy import ColumnElement, and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from curie_api.crud import ui_evidence as crud
@@ -225,9 +225,16 @@ class UiEvidenceReconciler:
                 ThreadPublicationLineage.status == "open",
                 ThreadPublicationLineage.pr_number.is_not(None),
                 ThreadPublicationLineage.head_sha.is_not(None),
-                PublicationLineageUiEvidence.comment_revision.is_not(None),
-                PublicationLineageUiEvidence.comment_revision
-                < ThreadPublicationLineage.latest_revision,
+                # A comment is recorded for an earlier revision, or one was
+                # posted and never recorded.
+                or_(
+                    PublicationLineageUiEvidence.comment_pending,
+                    and_(
+                        PublicationLineageUiEvidence.comment_revision.is_not(None),
+                        PublicationLineageUiEvidence.comment_revision
+                        < ThreadPublicationLineage.latest_revision,
+                    ),
+                ),
                 or_(no_evidence, failed),
             )
             ended = await lineages(
@@ -283,7 +290,11 @@ class UiEvidenceReconciler:
                 state.version,
                 status,
                 (lease.lineage_id, self._owner, lease.version),
-                {"comment_revision": state.revision, "comment_kind": kind},
+                {
+                    "comment_revision": state.revision,
+                    "comment_kind": kind,
+                    "comment_pending": False,
+                },
                 comment_written_at=func.now(),
                 **values,
             )
@@ -453,7 +464,9 @@ class UiEvidenceReconciler:
         await self._write_lineage(lease)
         async with asyncio.timeout(_PHASE_CAP_S):
             await post(body)
-        await self._write_lineage(lease, comment_revision=lineage.revision, comment_kind="stale")
+        await self._write_lineage(
+            lease, comment_revision=lineage.revision, comment_kind="stale", comment_pending=False
+        )
         result.rewritten += 1
 
     async def _load(self, publication_id: uuid.UUID) -> _Publish | None:
@@ -542,6 +555,7 @@ class UiEvidenceReconciler:
             return
         expected = [image for image in state.images if image.refusal is None and image.bound]
         if not supports(code_host.capabilities, Operation.STORE_EVIDENCE):
+            await self._write_lineage(lease, comment_pending=True)
             await post(render_unsupported(head_sha=state.head_sha, captured=len(expected)))
             await self._finish_with_comment(
                 state, lease, "unsupported", "unsupported", outcome="unsupported"
@@ -580,7 +594,7 @@ class UiEvidenceReconciler:
             return
 
         rendered = _render(state, urls, refusals, "failed" if incomplete else None)
-        await self._write_lineage(lease)
+        await self._write_lineage(lease, comment_pending=True)
         await post(rendered.body)
         if incomplete:
             await self._finish_with_comment(
@@ -648,10 +662,10 @@ class UiEvidenceReconciler:
         return urls
 
     async def _timed_out(self, state: _Publish, lease: _Lease) -> None:
-        """The publish window closed. A row whose comment is written is
-        published; otherwise one last outcome comment says the images ran out
-        of time, and the row fails."""
+        """The publish window closed: one last outcome comment says the images
+        ran out of time, and the row fails."""
 
+        await self._write_lineage(lease, comment_pending=True)
         rendered = _render(
             state,
             {},

@@ -102,6 +102,7 @@ def _assert_created() -> None:
         "ref_commit_sha",
         "ref_pending",
         "comment_revision",
+        "comment_pending",
         "comment_kind",
         "lease_owner",
         "lease_expires_at",

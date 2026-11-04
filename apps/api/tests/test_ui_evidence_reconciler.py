@@ -30,7 +30,7 @@ import pytest
 from curie_api.config import get_settings
 from curie_api.forges.capabilities import Operation, Support
 from curie_api.forges.github.code_host import GitHubCodeHost
-from curie_api.ui_evidence_comment import ui_evidence_marker
+from curie_api.ui_evidence_comment import MAX_COMMENT_CHARS, render_evidence, ui_evidence_marker
 from curie_api.ui_evidence_reconciler import UiEvidenceReconciler
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -1009,7 +1009,7 @@ def _crash_once(client: httpx.AsyncClient) -> None:
 
 def lineage_evidence(revision: Revision) -> dict[str, Any]:
     rows = _rows(
-        "SELECT ref_commit_sha, ref_pending, comment_revision, comment_kind "
+        "SELECT ref_commit_sha, ref_pending, comment_revision, comment_kind, comment_pending "
         "FROM curie.publication_lineage_ui_evidence WHERE lineage_id = :id",
         {"id": revision.lineage_id},
     )
@@ -1088,6 +1088,40 @@ def test_a_crash_after_the_comment_records_neither_half_and_restart_settles_both
     assert stack.fake.evidence_ref(str(first.lineage_id)) is None
 
 
+def test_a_crash_after_the_comment_then_a_newer_revision_without_evidence_gets_the_notice(
+    stack: Stack, auth_headers: dict[str, str]
+) -> None:
+    first = published_with_evidence(stack, auth_headers)
+    _crash_once(_dies_after(stack, _COMMENT_WRITES))
+    assert_shows(stack, first, only_comment(stack, first), {0, 1})
+    held = lineage_evidence(first)
+    assert held["comment_revision"] is None and held["comment_pending"] is True
+
+    # Revision 2 lands with no evidence before the reconciler ever recovers.
+    second = create_revision(stack, auth_headers, previous=first)
+    approve_and_push(stack, auth_headers, second, head_tree=OTHER_OID, previous=first)
+    pull_request = code_pr(stack, second)
+    _execute(
+        "UPDATE curie.publications SET created_at = created_at - interval '5 minutes' "
+        "WHERE id = :id",
+        {"id": uuid.UUID(second.id)},
+    )
+    expire_leases()
+    reconcile(stack.http, passes=2)
+
+    body = only_comment(stack, second)
+    assert f"No UI evidence exists for the current pull request head `{second.head_sha}`" in body
+    assert image_urls(body) == {}
+    assert stack.fake.evidence_ref(str(first.lineage_id)) is None
+    assert evidence_row(first)["status"] == "superseded"
+    settled = lineage_evidence(first)
+    assert settled["comment_revision"] == 2 and settled["comment_pending"] is False
+    assert code_pr(stack, second) == pull_request
+    writes = stack.fake.writes
+    reconcile(stack.http)
+    assert stack.fake.writes == writes
+
+
 def test_an_index_with_no_image_stored_by_the_deadline_gets_a_failed_outcome(
     stack: Stack, auth_headers: dict[str, str]
 ) -> None:
@@ -1151,3 +1185,40 @@ def test_without_a_github_app_id_no_evidence_comment_is_written(
 def test_the_marker_is_the_lineage_marker() -> None:
     lineage_id = uuid.uuid4()
     assert ui_evidence_marker(lineage_id) == f"curie-ui-evidence:{lineage_id}"
+
+
+@dataclass(frozen=True)
+class _Entry:
+    ordinal: int
+    state: str | None
+    label: str | None
+    path: str | None
+
+
+def test_many_long_path_images_show_as_many_as_fit_and_count_the_rest() -> None:
+    # 300 small images with 200-character paths: listing every image not shown
+    # on its own line could never fit, but images plus a counted remainder do.
+    entries = [
+        _Entry(n, "before" if n < 150 else "after", f"screen {n}", f"{n:04d}/" + "p" * 195)
+        for n in range(300)
+    ]
+    raw = f"https://github.com/{REPO}/raw/{'a' * 40}"
+    urls = {entry.ordinal: f"{raw}/{entry.state}/{entry.ordinal:04d}.png" for entry in entries}
+    rendered = render_evidence(
+        marker=ui_evidence_marker(uuid.uuid4()),
+        manifest_state="valid",
+        manifest_status="complete",
+        reason=None,
+        head_sha="b" * 40,
+        revision=1,
+        base_sha="c" * 40,
+        entries=entries,
+        urls=urls,
+        refusals={},
+    )
+
+    shown = len(_IMAGE_URL.findall(rendered.body))
+    assert 100 < shown < 300
+    assert len(rendered.body) <= MAX_COMMENT_CHARS
+    assert rendered.outcome == "partial"
+    assert re.search(r"\d+ more images are not shown\.", rendered.body)

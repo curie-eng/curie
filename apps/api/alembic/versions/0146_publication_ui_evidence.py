@@ -170,6 +170,9 @@ def upgrade() -> None:
         # ref_commit_sha is recorded still leaves the ref findable for cleanup.
         sa.Column("ref_pending", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.Column("comment_revision", sa.Integer(), nullable=True),
+        # Set before a comment is posted and cleared when it is recorded, so a
+        # crash between the two still lets a later revision replace it.
+        sa.Column("comment_pending", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.Column("comment_kind", sa.Text(), nullable=True),
         sa.Column("lease_owner", sa.Text(), nullable=True),
         sa.Column("lease_expires_at", sa.DateTime(timezone=True), nullable=True),

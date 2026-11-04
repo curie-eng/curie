@@ -353,7 +353,8 @@ async def _create_and_relay(
                 body=snapshot.publication_body,
             )
         )
-        await relay_ui_evidence(creator, created.id, capture)
+        # A leaseless delivery, as the kernel relays without a delivery lease.
+        await relay_ui_evidence(creator, created.id, capture, remaining_s=None)
         return created.id, created.approval_id
 
 

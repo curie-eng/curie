@@ -1946,6 +1946,9 @@ class PublicationLineageUiEvidence(Base):
     # is deleted: a ref the code host may hold that cleanup must still delete.
     ref_pending: Mapped[bool] = mapped_column(default=False, server_default="false")
     comment_revision: Mapped[int | None] = mapped_column(default=None)
+    # True from just before a comment post until it is recorded: a comment the
+    # pull request may carry that a later revision's stale notice must replace.
+    comment_pending: Mapped[bool] = mapped_column(default=False, server_default="false")
     comment_kind: Mapped[str | None] = mapped_column(Text, default=None)
     lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
