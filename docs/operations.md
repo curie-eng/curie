@@ -2024,7 +2024,7 @@ converter decodes entities and backslash escapes only in prose after parsing,
 leaving code content escaped. Within blockquotes it converts headings to
 paragraphs, rules to literal `---` paragraphs, and flattens nested quote content.
 A last `Cause:` line names the platform cause code
-(`capacity_wait_expired`, `start_failed`, `execution_deadline`, `issue_cancelled`,
+(`capacity_wait_expired`, `start_failed`, `execution_deadline`, `issue_cancelled`, `issue_deleted`,
 `owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
 `no_pull_request`, `revision_unchanged`,
 `early_stop`, `publication_denied`, `publication_expired`, `publication_failed`,
