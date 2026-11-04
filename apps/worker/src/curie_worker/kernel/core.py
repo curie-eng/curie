@@ -361,6 +361,7 @@ class Kernel:
     _run_for_event = work_items._run_for_event
     _is_factory_work_item_turn = work_items._is_factory_work_item_turn
     _work_item_repository = work_items._work_item_repository
+    _execution_deadline_for = work_items._execution_deadline_for
     _adopt_resumed_work_item = work_items._adopt_resumed_work_item
     reap_orphans = work_items.reap_orphans
     _preflight_reclaimed_delivery = work_items._preflight_reclaimed_delivery

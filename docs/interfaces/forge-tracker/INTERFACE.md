@@ -75,15 +75,34 @@ marked and described:
 
 `CodeHost` (`apps/api/src/curie_api/forges/ports.py::CodeHost`) is where code,
 pull requests, CI and review live: `resolve_repository` from an immutable id;
-`credential` for clone or push scope; `branch_head` and `read_commit`;
+`credential` for clone or push scope; `branch_head` and `read_commit` (whose
+`Commit.tree` is the commit's tree id where the host reports one: the GitHub
+adapter fills it, every other adapter leaves it None);
 `is_ancestor`, one forge request asking whether a commit is another's ancestor;
 `find_pull_request`, `open_pull_request`, `update_pull_request`,
 `retarget_pull_request` and `read_pull_request`; `list_factory_publications`;
 `observe_ci` on an exact head; `list_review_feedback` since a cursor and
 `verify_feedback`. Optional:
-`ci_diagnostics`, `rerun_failed`, `user_can_write` and `required_checks`
-(GitHub only among the shipped code hosts; GitLab and both Bitbucket adapters
-raise `Unsupported`).
+`ci_diagnostics`, `rerun_failed`, `user_can_write`, `required_checks`,
+`store_evidence` and `delete_evidence` (GitHub only among the shipped code
+hosts; GitLab and both Bitbucket adapters raise `Unsupported`).
+
+UI evidence. `store_evidence(repository, *, key, files, message, stamp)` hosts
+image files (`EvidenceFile`: a path, its bytes and their sha256) outside every
+branch under one ref named by `key`, creating or replacing it, and returns a
+`StoredEvidence` with the ref, the commit and each path's image URL pinned to
+that commit. The same inputs give the same commit, so a replay moves nothing.
+`delete_evidence(repository, *, key)` removes the ref and answers whether one
+existed. The GitHub adapter uses the Git Data API with the installation token
+every other write carries: blobs, one tree, a parentless commit dated `stamp`
+with a fixed author, then `refs/curie/ui-evidence/<key>` created or force
+moved. The core (`apps/api/src/curie_api/ui_evidence_reconciler.py`) keys the
+ref by lineage, publishes only after the code publication is recorded, and
+shows an `after` image only when `read_commit` of the pull request head reports
+the captured candidate tree. A host that declares the operations unsupported
+gets a comment saying it cannot show evidence. A GitHub install with no
+configured App id cannot tell its own comment apart, so the core writes
+nothing for it: no ref and no comment.
 
 `retarget_pull_request(ref, *, base_ref, expected_head_sha)` is the mandatory
 operation for changing only an open pull request's base. `update_pull_request`
@@ -215,6 +234,10 @@ comments, injects a page failure and counts writes. One module per behavior:
    raises `Unsupported`, and the allowlist fallback answers.
 10. `test_issue_url.py`: an issue link names the issue on the tracker host,
     writes nothing, and an issue in another scope has no link.
+11. `test_ui_evidence_hosting.py`: storing the same evidence twice gives the
+    same commit and URLs, different evidence moves the one ref, a delete
+    answers True then False, an unsupported host raises and writes nothing, and
+    `read_commit` reports the tree where the host carries one.
 
 The GitHub identity golden test is
 `apps/api/tests/forges/test_identity_golden.py`.

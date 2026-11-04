@@ -344,6 +344,10 @@ class Settings(BaseSettings):
     # lineage, to record one merged or closed outside a publication (#3831).
     # Runs with the work item reconciler and factory ingress; 0 disables it.
     factory_lineage_reconcile_interval_s: float = Field(default=60, ge=0, allow_inf_nan=False)
+    # How often the API publishes optional UI evidence a worker uploaded for a
+    # recorded publication, as one marked pull request comment. It reads the
+    # code publication and never changes it; 0 disables it.
+    ui_evidence_reconcile_interval_s: float = Field(default=10, ge=0, allow_inf_nan=False)
     # How long a published factory run waits on its pull request's CI, from the
     # push (#3162). The execution deadline still caps it; the wait stays at most
     # 10800 s, a separate bound from the execution deadline, which ADR 0249

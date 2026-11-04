@@ -1792,6 +1792,172 @@ class Publication(Base):
         return self.lineage.pr_url if self.lineage is not None else None
 
 
+UI_EVIDENCE_STATUSES = (
+    "receiving",
+    "ready",
+    "publishing",
+    "published",
+    "unsupported",
+    "failed",
+    "superseded",
+    "abandoned",
+)
+UI_EVIDENCE_TERMINAL = frozenset({"published", "unsupported", "failed", "superseded", "abandoned"})
+
+
+def _sql_column_in(column: str, values: tuple[str, ...]) -> str:
+    return f"{column} IN ({', '.join(repr(value) for value in values)})"
+
+
+class PublicationUiEvidence(Base):
+    """Optional UI evidence one publication's worker uploaded (migration 0146).
+
+    It is bonus evidence: nothing here is read by the code publication path.
+    The image bytes in `PublicationUiEvidenceImage.content` are cleared once
+    the row is terminal, as ``publications.patch_bytes`` is.
+    """
+
+    __tablename__ = "publication_ui_evidence"
+    __table_args__ = (
+        CheckConstraint(
+            _sql_column_in("status", UI_EVIDENCE_STATUSES), name="publication_ui_evidence_status_ck"
+        ),
+        CheckConstraint(
+            _sql_column_in("manifest_state", ("valid", "invalid")),
+            name="publication_ui_evidence_manifest_state_ck",
+        ),
+        CheckConstraint(
+            "manifest_status IS NULL OR "
+            + _sql_column_in("manifest_status", ("complete", "partial", "skipped", "failed")),
+            name="publication_ui_evidence_manifest_status_ck",
+        ),
+        CheckConstraint(
+            "total_bytes >= 0 AND total_bytes <= 104857600",
+            name="publication_ui_evidence_total_bytes_ck",
+        ),
+        CheckConstraint(
+            "version >= 1 AND attempts >= 0", name="publication_ui_evidence_version_ck"
+        ),
+        Index("ix_publication_ui_evidence_status_lease", "status", "lease_expires_at"),
+        Index("ix_publication_ui_evidence_lineage_id", "lineage_id"),
+    )
+
+    publication_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.publications.id", ondelete="CASCADE"), primary_key=True
+    )
+    lineage_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="CASCADE")
+    )
+    status: Mapped[str] = mapped_column(Text)
+    index_sha256: Mapped[str] = mapped_column(Text)
+    manifest_state: Mapped[str] = mapped_column(Text)
+    manifest_refusal: Mapped[str | None] = mapped_column(Text, default=None)
+    manifest_status: Mapped[str | None] = mapped_column(Text, default=None)
+    reason: Mapped[str | None] = mapped_column(Text, default=None)
+    base_sha: Mapped[str] = mapped_column(Text)
+    manifest_base_sha: Mapped[str | None] = mapped_column(Text, default=None)
+    manifest_head_sha: Mapped[str | None] = mapped_column(Text, default=None)
+    manifest_candidate_tree: Mapped[str | None] = mapped_column(Text, default=None)
+    candidate_tree: Mapped[str | None] = mapped_column(Text, default=None)
+    head_tree: Mapped[str | None] = mapped_column(Text, default=None)
+    candidate_dirty: Mapped[bool | None] = mapped_column(default=None)
+    warnings: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default="[]")
+    total_bytes: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    upload_deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    publish_deadline_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    outcome: Mapped[str | None] = mapped_column(Text, default=None)
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    evidence_commit_sha: Mapped[str | None] = mapped_column(Text, default=None)
+    comment_written_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class PublicationUiEvidenceImage(Base):
+    """One manifest entry of a publication's UI evidence, with its stored bytes."""
+
+    __tablename__ = "publication_ui_evidence_images"
+    __table_args__ = (
+        CheckConstraint("ordinal >= 0", name="publication_ui_evidence_images_ordinal_ck"),
+        CheckConstraint("char_length(path) <= 512", name="publication_ui_evidence_images_path_ck"),
+        CheckConstraint(
+            "char_length(label) <= 200", name="publication_ui_evidence_images_label_ck"
+        ),
+        CheckConstraint(
+            _sql_column_in("state", ("before", "after")),
+            name="publication_ui_evidence_images_state_ck"
+        ),
+        CheckConstraint(
+            "size_bytes IS NULL OR (size_bytes >= 0 AND size_bytes <= 10485760)",
+            name="publication_ui_evidence_images_size_ck",
+        ),
+    )
+
+    publication_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.publication_ui_evidence.publication_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    ordinal: Mapped[int] = mapped_column(primary_key=True)
+    # A refused entry whose manifest path or label was ill-typed stores "".
+    path: Mapped[str] = mapped_column(Text)
+    label: Mapped[str] = mapped_column(Text)
+    # Null only on a refused entry whose manifest state was ill-typed.
+    state: Mapped[str | None] = mapped_column(Text, default=None)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    sha256: Mapped[str | None] = mapped_column(Text, default=None)
+    refusal: Mapped[str | None] = mapped_column(Text, default=None)
+    bound: Mapped[bool]
+    # Deliberately excluded from every DTO; cleared on every terminal transition.
+    content: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
+    stored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    url: Mapped[str | None] = mapped_column(Text, default=None)
+
+
+class PublicationLineageUiEvidence(Base):
+    """The evidence comment and ref one lineage's pull request carries."""
+
+    __tablename__ = "publication_lineage_ui_evidence"
+    __table_args__ = (
+        CheckConstraint(
+            "comment_kind IS NULL OR "
+            + _sql_column_in("comment_kind", ("evidence", "unsupported", "stale", "failed")),
+            name="publication_lineage_ui_evidence_comment_kind_ck",
+        ),
+        CheckConstraint("version >= 1", name="publication_lineage_ui_evidence_version_ck"),
+    )
+
+    lineage_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    ref_commit_sha: Mapped[str | None] = mapped_column(Text, default=None)
+    # True from just before a ref store until its commit is recorded or the ref
+    # is deleted: a ref the code host may hold that cleanup must still delete.
+    ref_pending: Mapped[bool] = mapped_column(default=False, server_default="false")
+    comment_revision: Mapped[int | None] = mapped_column(default=None)
+    # True from just before a comment post until it is recorded: a comment the
+    # pull request may carry that a later revision's stale notice must replace.
+    comment_pending: Mapped[bool] = mapped_column(default=False, server_default="false")
+    comment_kind: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class CredentialRedemptionAuditEntry(Base):
     """Credential-boundary audit containing names and outcomes, never material."""
 

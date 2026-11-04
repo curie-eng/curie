@@ -20,7 +20,12 @@ import pytest
 from curie_api import factory_ci
 from curie_api.config import Settings
 from curie_api.forges import types
-from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Support, validate_declaration
+from curie_api.forges.capabilities import (
+    CODE_HOST_OPERATIONS,
+    Operation,
+    Support,
+    validate_declaration,
+)
 from curie_api.forges.errors import Ambiguous, NotFound, Unauthorized, Unavailable
 from curie_api.forges.github import code_host as code_host_module
 from curie_api.forges.github.code_host import GitHubCodeHost
@@ -175,6 +180,9 @@ def test_every_operation_is_declared_supported() -> None:
         port: CodeHost = host
         validate_declaration(port.capabilities, CODE_HOST_OPERATIONS)
         assert set(port.capabilities.values()) == {Support.SUPPORTED}
+        # UI evidence hosting (the Git Data API) is declared like every other op.
+        assert port.capabilities[Operation.STORE_EVIDENCE] is Support.SUPPORTED
+        assert port.capabilities[Operation.DELETE_EVIDENCE] is Support.SUPPORTED
         assert (port.kind, port.host) == (types.GITHUB, "github.com")
 
     _with_host(lambda request: httpx.Response(500), body)

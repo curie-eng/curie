@@ -2020,7 +2020,12 @@ def _serve() -> None:
     )
 
     # create_app schedules the runner's start on startup without awaiting it.
-    app = create_app(runner, token=serving_token, snapshotter=snapshot_callback)
+    app = create_app(
+        runner,
+        token=serving_token,
+        snapshotter=snapshot_callback,
+        ui_evidence_workspace=workspace_path,
+    )
     web.run_app(app, host="0.0.0.0", port=config.port)
 
 

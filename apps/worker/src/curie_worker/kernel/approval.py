@@ -53,6 +53,7 @@ from ..sandbox.types import (
 from ..turn_progress import (
     link_progress_resume,
 )
+from ..ui_evidence import relay_ui_evidence
 from ..workitem_dispatch import (
     parse_work_item_event_id,
 )
@@ -815,6 +816,14 @@ async def _pause_for_approval(
             created = CreatedApproval(
                 id=published.approval_id,
                 status=published.status,
+            )
+            lease = constants._DELIVERY_LEASE.get()
+            await relay_ui_evidence(
+                publication_creator,
+                published.id,
+                outcome.ui_evidence,
+                remaining_s=None if lease is None else lease.remaining_s(),
+                execution_deadline=self._execution_deadline_for(qevent.event_id),
             )
         else:
             assert self._approvals is not None

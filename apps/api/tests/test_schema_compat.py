@@ -65,7 +65,8 @@ CONTRACT = "0041"
 # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
 # Factory base transition ORM reads require the 0144 transition table.
 # The 0145 join requires both the stable deadline backport (0140) and 0144.
-APP_SCHEMA_MIN = "0145"
+# The UI evidence reconciler reads the 0146 evidence tables.
+APP_SCHEMA_MIN = "0146"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -169,6 +170,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0143",
             "0144",
             "0145",
+            "0146",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -202,8 +204,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0143",
             "0144",
             "0145",
+            "0146",
         }
-    assert current_revision() == "0145"
+    assert current_revision() == "0146"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -227,6 +230,12 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
         ("factory_base_transitions", "ci_request_id"),
         ("remediation_nominations", "execution_code"),
         ("remediation_nominations", "approval_reason"),
+        ("publication_ui_evidence", "status"),
+        ("publication_ui_evidence", "candidate_tree"),
+        ("publication_ui_evidence_images", "content"),
+        ("publication_ui_evidence_images", "sha256"),
+        ("publication_lineage_ui_evidence", "ref_commit_sha"),
+        ("publication_lineage_ui_evidence", "comment_revision"),
     } <= columns
 
 
@@ -294,14 +303,16 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # Migration expand compatibility for older images does not mean this image
     # can serve an older database.
     # Factory base transition reads require the 0144 table, and the 0145 join
-    # also requires the stable deadline backport (0140).
-    for revision in sorted(known - {"0145"}):
+    # also requires the stable deadline backport (0140). The UI evidence
+    # reconciler reads the 0146 tables.
+    for revision in sorted(known - {"0146"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
     assert can_serve("0143", window, known) is False
     assert can_serve("0144", window, known) is False
-    assert can_serve("0145", window, known) is True
+    assert can_serve("0145", window, known) is False
+    assert can_serve("0146", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

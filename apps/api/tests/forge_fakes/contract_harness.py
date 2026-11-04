@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any, Protocol
 
 import httpx
@@ -41,12 +42,14 @@ from curie_api.forges.ports import CodeHost, Tracker
 from curie_api.forges.types import (
     Actor,
     CheckState,
+    EvidenceFile,
     FeedbackKind,
     PullRequest,
     PullRequestRef,
     PullRequestState,
     ReplyTarget,
     RepositoryRef,
+    StoredEvidence,
     TrackerIssueRef,
 )
 
@@ -122,6 +125,18 @@ class AdapterHarness(Protocol):
     def write_count(self) -> int:
         """Forge writes made through port calls so far."""
 
+    def push_head_with_tree(self, branch: str, tree: str) -> str | None:
+        """Push a commit to ``branch`` whose tree id is ``tree``; returns its sha,
+        or None on a host whose commit read reports no tree."""
+
+    def evidence_ref(self, key: str) -> str | None:
+        """The commit the UI evidence ref named by ``key`` points to, read from
+        outside the port, or None when no such ref exists."""
+
+    def evidence_raw(self, url: str) -> bytes | None:
+        """The bytes an image URL `CodeHost.store_evidence` returned serves, or
+        None when it serves nothing."""
+
 
 async def open_pull(harness: AdapterHarness, branch: str) -> PullRequest:
     """Push ``branch`` and open a pull request from it through the port."""
@@ -167,6 +182,8 @@ class InMemoryHarness:
             code_caps[Operation.CI_DIAGNOSTICS] = Support.UNSUPPORTED
             code_caps[Operation.USER_CAN_WRITE] = Support.UNSUPPORTED
             code_caps[Operation.REQUIRED_CHECKS] = Support.UNSUPPORTED
+            code_caps[Operation.STORE_EVIDENCE] = Support.UNSUPPORTED
+            code_caps[Operation.DELETE_EVIDENCE] = Support.UNSUPPORTED
         self._tracker = InMemoryTracker(
             kind=types.MEMORY_TRACKER_ONLY if minimal else types.MEMORY,
             label=LABEL,
@@ -174,7 +191,7 @@ class InMemoryHarness:
             ledger=self._ledger,
             faults=self._faults,
         )
-        self._code_host = InMemoryCodeHost(
+        self._code_host = _ObservedEvidenceCodeHost(
             capabilities=code_caps, ledger=self._ledger, faults=self._faults
         )
         self.tracker: Tracker = self._tracker
@@ -246,6 +263,45 @@ class InMemoryHarness:
 
     def write_count(self) -> int:
         return self._ledger.writes
+
+    def push_head_with_tree(self, branch: str, tree: str) -> str | None:
+        return self._code_host.push(self.repository, branch, tree=tree)
+
+    def evidence_ref(self, key: str) -> str | None:
+        return self._code_host.evidence_commits.get(key)
+
+    def evidence_raw(self, url: str) -> bytes | None:
+        return self._code_host.raw(url)
+
+
+class _ObservedEvidenceCodeHost(InMemoryCodeHost):
+    """The in-memory code host, unchanged, noting which commit each evidence
+    key's ref names after every successful store or delete. The in-memory host
+    keeps no ref the harness can read from outside, so this is its stand-in."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.evidence_commits: dict[str, str] = {}
+
+    async def store_evidence(
+        self,
+        repository: RepositoryRef,
+        *,
+        key: str,
+        files: Sequence[EvidenceFile],
+        message: str,
+        stamp: datetime,
+    ) -> StoredEvidence:
+        stored = await super().store_evidence(
+            repository, key=key, files=files, message=message, stamp=stamp
+        )
+        self.evidence_commits[key] = stored.commit_sha
+        return stored
+
+    async def delete_evidence(self, repository: RepositoryRef, *, key: str) -> bool:
+        deleted = await super().delete_evidence(repository, key=key)
+        self.evidence_commits.pop(key, None)
+        return deleted
 
 
 def _github_user(actor: Actor) -> dict[str, Any]:
@@ -411,6 +467,16 @@ class GitHubHarness:
     def write_count(self) -> int:
         return self.fake.writes
 
+    def push_head_with_tree(self, branch: str, tree: str) -> str | None:
+        return self.fake.push_head(branch, tree=tree)
+
+    def evidence_ref(self, key: str) -> str | None:
+        return self.fake.evidence_ref(key)
+
+    def evidence_raw(self, url: str) -> bytes | None:
+        response = self.fake.handle(httpx.Request("GET", url))
+        return response.content if response.status_code == 200 else None
+
 
 class JiraGitHubHarness:
     """The Jira Cloud tracker over `jira_fake.JiraFake`, paired with the GitHub
@@ -512,6 +578,15 @@ class JiraGitHubHarness:
 
     def write_count(self) -> int:
         return self.jira.writes + self._github.write_count()
+
+    def push_head_with_tree(self, branch: str, tree: str) -> str | None:
+        return self._github.push_head_with_tree(branch, tree)
+
+    def evidence_ref(self, key: str) -> str | None:
+        return self._github.evidence_ref(key)
+
+    def evidence_raw(self, url: str) -> bytes | None:
+        return self._github.evidence_raw(url)
 
 
 def _conforms(harness: InMemoryHarness | GitHubHarness | JiraGitHubHarness) -> AdapterHarness:

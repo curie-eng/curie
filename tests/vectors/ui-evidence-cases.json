@@ -1,0 +1,2867 @@
+{
+  "version": 1,
+  "limits": {
+    "max_image_bytes": 10485760,
+    "max_manifest_bytes": 1048576,
+    "max_total_bytes": 104857600,
+    "capture_budget_s": 120,
+    "upload_budget_s": 60,
+    "publish_budget_s": 120,
+    "max_comment_chars": 65536
+  },
+  "texts": {
+    "traversal": "its path leaves the evidence directory.",
+    "invalid_entry": "its manifest entry is incomplete or malformed.",
+    "symlink": "it is a symbolic link or sits under one.",
+    "missing": "the file was not found.",
+    "not_regular": "it is not a regular file.",
+    "not_png": "it is not a PNG image.",
+    "corrupt_png": "the PNG file is damaged.",
+    "too_large": "it is larger than 10 MiB.",
+    "total_limit": "the run's evidence passed 100 MiB in total.",
+    "unbound": "captured from a different base or candidate than this pull request.",
+    "transfer_failed": "it could not be copied out of the run.",
+    "timeout": "it ran out of time before it could be published.",
+    "not_stored": "it was not stored before publishing.",
+    "head_changed": "captured from a different candidate than this pull request head.",
+    "not_shown_size": "it did not fit in this comment."
+  },
+  "conventions": {
+    "checkout": "A git repository whose prepared base P commits .gitignore (exactly '.curie/ui-evidence/\\n'), README.md and src/app.py. HEAD is one more commit on P changing src/app.py. 'clean' leaves the worktree at HEAD, so C equals HEAD's tree; 'dirty' adds an uncommitted README.md edit and an untracked src/feature.py, so C differs from HEAD's tree. C is computed independently of runner code: GIT_INDEX_FILE=<scratch> git read-tree HEAD, git add -A, git write-tree.",
+    "manifest": "fixture.manifest is written to .curie/ui-evidence/manifest.json as JSON after the selectors add base_sha (base), head_sha (head), candidate_dirty and candidate_tree (tree); a null selector omits the key. fixture.manifest_raw, when a string, is written verbatim instead. Both null: no manifest file.",
+    "selectors": {
+      "base": "P = the prepared base, other = oids.other_base, null = omitted",
+      "head": "HEAD = the checkout's HEAD commit, null = omitted",
+      "candidate_dirty": "the literal value, null = omitted",
+      "tree": "C = the candidate tree, other = oids.other_tree, null = omitted"
+    },
+    "files": "Paths are relative to .curie/ui-evidence/. {png: valid} is a real PNG (signature, IHDR, zlib IDAT, IEND, correct CRCs) whose pixels differ per path; crc corrupts one chunk CRC; ihdr_not_first puts a valid tEXt chunk before IHDR; iend_not_last appends a valid tEXt chunk after IEND; not_png has no PNG signature; oversized is a valid PNG padded with a tEXt chunk to max_image_bytes + 1. {symlink: t} is a symbolic link to t; {dir_symlink: t} is a directory symbolic link to t.",
+    "placeholders": {
+      "$P": "the prepared base commit",
+      "$HEAD": "the HEAD commit",
+      "$HEAD_TREE": "the tree of HEAD",
+      "$C": "the candidate tree",
+      "$OTHER_BASE": "oids.other_base",
+      "$OTHER_TREE": "oids.other_tree",
+      "$size": "byte length of this image entry's fixture file",
+      "$sha256": "lowercase hex sha256 of this image entry's fixture file"
+    },
+    "image_entries": "size and sha256 are null unless the PNG passed validation (refusal null, unbound, total_limit, transfer_failed or timeout). bound is false for every refusal up to and including unbound, true otherwise. An invalid or absent manifest computes no binding, so its candidate_tree and head_tree are null. head_tree is computed only when candidate_dirty is exactly false and head_sha is present.",
+    "runner": "A subset of the /v1/ui-evidence/index 200 body: every key listed must match.",
+    "index": "The full worker-to-API index (PUT .../ui-evidence body), or null when nothing is uploaded.",
+    "api": "comment: none (no evidence comment), evidence (at least one image shown), outcome (an outcome comment showing no image), unsupported (the host cannot show evidence). shown: ordinals rendered as images. not_shown: ordinal (as a string) to refusal code, rendered with texts[code].",
+    "faults": {
+      "transfer": "worker and runner: after the index is read, the after image file (ordinal 1) is rewritten with a different valid PNG, so the image route answers 409 image_changed.",
+      "capture_timeout": "worker: the runner's image route stalls past the capture budget, so no image is fetched.",
+      "upload_rejection": "API: the index PUT is refused with a 4xx; the worker sends nothing else.",
+      "storage": "API: storing ordinal 1's bytes fails with 503 ui_evidence.storage_unavailable on every attempt; ordinal 0 stores.",
+      "host_unsupported": "API: the code host declares store_evidence unsupported.",
+      "comment": "API: every evidence comment write fails until the publish deadline.",
+      "publish_timeout": "API: hosting the images outlasts the publish budget before any image is stored."
+    },
+    "oids": {
+      "other_base": "1111111111111111111111111111111111111111",
+      "other_tree": "2222222222222222222222222222222222222222"
+    }
+  },
+  "cases": [
+    {
+      "id": "missing-manifest",
+      "summary": "No manifest: the run produced no evidence, nothing is uploaded or commented.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": null,
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "valid"
+          }
+        }
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "absent",
+        "manifest_refusal": null,
+        "status": null,
+        "reason": null,
+        "base_sha": "$P",
+        "images": []
+      },
+      "index": null,
+      "api": {
+        "comment": "none",
+        "outcome": null,
+        "shown": [],
+        "not_shown": {}
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "malformed-manifest",
+      "summary": "A manifest that is not JSON is reported as an invalid manifest with no images.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": null,
+        "manifest_raw": "{\"version\": 1, \"status\": \"complete\", \"images\": [",
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "valid"
+          }
+        }
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "invalid",
+        "manifest_refusal": "not_json",
+        "status": null,
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": null,
+        "manifest_head_sha": null,
+        "candidate_dirty": null,
+        "manifest_candidate_tree": null,
+        "candidate_tree": null,
+        "head_tree": null,
+        "candidate_error": null,
+        "images": []
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "invalid",
+        "manifest_refusal": "not_json",
+        "status": null,
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": null,
+        "manifest_head_sha": null,
+        "candidate_dirty": null,
+        "manifest_candidate_tree": null,
+        "candidate_tree": null,
+        "head_tree": null,
+        "warnings": [],
+        "images": []
+      },
+      "api": {
+        "comment": "outcome",
+        "outcome": "failed",
+        "shown": [],
+        "not_shown": {}
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "traversal",
+      "summary": "Entries whose path leaves the evidence directory are refused; the valid before image still binds.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "../outside.png",
+              "label": "Outside",
+              "state": "after"
+            },
+            {
+              "path": "/after/home.png",
+              "label": "Absolute",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          }
+        }
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "../outside.png",
+            "label": "Outside",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "traversal",
+            "bound": false
+          },
+          {
+            "ordinal": 2,
+            "path": "/after/home.png",
+            "label": "Absolute",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "traversal",
+            "bound": false
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "../outside.png",
+            "label": "Outside",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "traversal",
+            "bound": false
+          },
+          {
+            "ordinal": 2,
+            "path": "/after/home.png",
+            "label": "Absolute",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "traversal",
+            "bound": false
+          }
+        ]
+      },
+      "api": {
+        "comment": "evidence",
+        "outcome": "partial",
+        "shown": [
+          0
+        ],
+        "not_shown": {
+          "1": "traversal",
+          "2": "traversal"
+        }
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "symlink-file",
+      "summary": "An image that is a symbolic link to a valid PNG is refused.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "symlink": "../before/home.png"
+          }
+        }
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "symlink",
+            "bound": false
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "symlink",
+            "bound": false
+          }
+        ]
+      },
+      "api": {
+        "comment": "evidence",
+        "outcome": "partial",
+        "shown": [
+          0
+        ],
+        "not_shown": {
+          "1": "symlink"
+        }
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "symlink-dir-component",
+      "summary": "An image under a directory that is a symbolic link is refused even though the target is a valid PNG.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "real/home.png": {
+            "png": "valid"
+          },
+          "after": {
+            "dir_symlink": "real"
+          }
+        }
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "symlink",
+            "bound": false
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "symlink",
+            "bound": false
+          }
+        ]
+      },
+      "api": {
+        "comment": "evidence",
+        "outcome": "partial",
+        "shown": [
+          0
+        ],
+        "not_shown": {
+          "1": "symlink"
+        }
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "non-png",
+      "summary": "A file without the PNG signature is refused.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "not_png"
+          }
+        }
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "not_png",
+            "bound": false
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "not_png",
+            "bound": false
+          }
+        ]
+      },
+      "api": {
+        "comment": "evidence",
+        "outcome": "partial",
+        "shown": [
+          0
+        ],
+        "not_shown": {
+          "1": "not_png"
+        }
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "corrupt-png-crc",
+      "summary": "A PNG whose chunk CRC does not match is refused.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "crc"
+          }
+        }
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "corrupt_png",
+            "bound": false
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "corrupt_png",
+            "bound": false
+          }
+        ]
+      },
+      "api": {
+        "comment": "evidence",
+        "outcome": "partial",
+        "shown": [
+          0
+        ],
+        "not_shown": {
+          "1": "corrupt_png"
+        }
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "corrupt-png-ihdr-not-first",
+      "summary": "A PNG whose first chunk is not IHDR is refused.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "ihdr_not_first"
+          }
+        }
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "corrupt_png",
+            "bound": false
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "corrupt_png",
+            "bound": false
+          }
+        ]
+      },
+      "api": {
+        "comment": "evidence",
+        "outcome": "partial",
+        "shown": [
+          0
+        ],
+        "not_shown": {
+          "1": "corrupt_png"
+        }
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "corrupt-png-iend-not-last",
+      "summary": "A PNG with a chunk after IEND is refused.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "iend_not_last"
+          }
+        }
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "corrupt_png",
+            "bound": false
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "corrupt_png",
+            "bound": false
+          }
+        ]
+      },
+      "api": {
+        "comment": "evidence",
+        "outcome": "partial",
+        "shown": [
+          0
+        ],
+        "not_shown": {
+          "1": "corrupt_png"
+        }
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "oversized-image",
+      "summary": "A structurally valid PNG one byte over 10 MiB is refused.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "oversized"
+          }
+        }
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "too_large",
+            "bound": false
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "too_large",
+            "bound": false
+          }
+        ]
+      },
+      "api": {
+        "comment": "evidence",
+        "outcome": "partial",
+        "shown": [
+          0
+        ],
+        "not_shown": {
+          "1": "too_large"
+        }
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "one-side-missing",
+      "summary": "The manifest lists an after image whose file does not exist; only the before image is shown.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "partial",
+          "reason": "the after render did not finish",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          }
+        }
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "partial",
+        "reason": "the after render did not finish",
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "missing",
+            "bound": false
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "partial",
+        "reason": "the after render did not finish",
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": null,
+            "sha256": null,
+            "refusal": "missing",
+            "bound": false
+          }
+        ]
+      },
+      "api": {
+        "comment": "evidence",
+        "outcome": "partial",
+        "shown": [
+          0
+        ],
+        "not_shown": {
+          "1": "missing"
+        }
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "unbound-before",
+      "summary": "A before image captured against another base is unbound; the after image bound to C is shown.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "other",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "valid"
+          }
+        }
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$OTHER_BASE",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": "unbound",
+            "bound": false
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$OTHER_BASE",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": "unbound",
+            "bound": false
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "api": {
+        "comment": "evidence",
+        "outcome": "partial",
+        "shown": [
+          1
+        ],
+        "not_shown": {
+          "0": "unbound"
+        }
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "unbound-after-dirty-head-only",
+      "summary": "candidate_dirty true with head_sha = HEAD and no candidate_tree: after is unbound even though the checkout is clean and HEAD's tree equals C, because head_sha is never consulted unless candidate_dirty is exactly false.",
+      "fixture": {
+        "checkout": "clean",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": "HEAD",
+        "candidate_dirty": true,
+        "tree": null,
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "valid"
+          }
+        }
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": "$HEAD",
+        "candidate_dirty": true,
+        "manifest_candidate_tree": null,
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": "unbound",
+            "bound": false
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": "$HEAD",
+        "candidate_dirty": true,
+        "manifest_candidate_tree": null,
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": "unbound",
+            "bound": false
+          }
+        ]
+      },
+      "api": {
+        "comment": "evidence",
+        "outcome": "partial",
+        "shown": [
+          0
+        ],
+        "not_shown": {
+          "1": "unbound"
+        }
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "unbound-after-dirty-unknown-head-only",
+      "summary": "candidate_dirty omitted with head_sha = HEAD and no candidate_tree: after is unbound on a clean checkout whose HEAD tree equals C.",
+      "fixture": {
+        "checkout": "clean",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": "HEAD",
+        "candidate_dirty": null,
+        "tree": null,
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "valid"
+          }
+        }
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": "$HEAD",
+        "candidate_dirty": null,
+        "manifest_candidate_tree": null,
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": "unbound",
+            "bound": false
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": "$HEAD",
+        "candidate_dirty": null,
+        "manifest_candidate_tree": null,
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": "unbound",
+            "bound": false
+          }
+        ]
+      },
+      "api": {
+        "comment": "evidence",
+        "outcome": "partial",
+        "shown": [
+          0
+        ],
+        "not_shown": {
+          "1": "unbound"
+        }
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "unbound-after-clean-claim-on-dirty-checkout",
+      "summary": "candidate_dirty false with head_sha = HEAD on a checkout with uncommitted changes: HEAD's tree differs from C, so after is unbound.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": "HEAD",
+        "candidate_dirty": false,
+        "tree": null,
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "valid"
+          }
+        }
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": "$HEAD",
+        "candidate_dirty": false,
+        "manifest_candidate_tree": null,
+        "candidate_tree": "$C",
+        "head_tree": "$HEAD_TREE",
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": "unbound",
+            "bound": false
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": "$HEAD",
+        "candidate_dirty": false,
+        "manifest_candidate_tree": null,
+        "candidate_tree": "$C",
+        "head_tree": "$HEAD_TREE",
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": "unbound",
+            "bound": false
+          }
+        ]
+      },
+      "api": {
+        "comment": "evidence",
+        "outcome": "partial",
+        "shown": [
+          0
+        ],
+        "not_shown": {
+          "1": "unbound"
+        }
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "bound-after-clean-head",
+      "summary": "candidate_dirty false with head_sha = HEAD on a clean checkout: HEAD's tree equals C, so after binds.",
+      "fixture": {
+        "checkout": "clean",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": "HEAD",
+        "candidate_dirty": false,
+        "tree": null,
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "valid"
+          }
+        }
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": "$HEAD",
+        "candidate_dirty": false,
+        "manifest_candidate_tree": null,
+        "candidate_tree": "$C",
+        "head_tree": "$HEAD_TREE",
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": "$HEAD",
+        "candidate_dirty": false,
+        "manifest_candidate_tree": null,
+        "candidate_tree": "$C",
+        "head_tree": "$HEAD_TREE",
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "api": {
+        "comment": "evidence",
+        "outcome": "complete",
+        "shown": [
+          0,
+          1
+        ],
+        "not_shown": {}
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "transfer-failure",
+      "summary": "The after file is rewritten between the index and the image read, so the runner answers image_changed and the worker reports transfer_failed.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "valid"
+          }
+        }
+      },
+      "fault": {
+        "boundary": "worker",
+        "kind": "transfer"
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": "transfer_failed",
+            "bound": true
+          }
+        ]
+      },
+      "api": {
+        "comment": "evidence",
+        "outcome": "partial",
+        "shown": [
+          0
+        ],
+        "not_shown": {
+          "1": "transfer_failed"
+        }
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "storage-failure",
+      "summary": "The API cannot store the after image (503 ui_evidence.storage_unavailable on every attempt), so it is reported not_stored.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "valid"
+          }
+        }
+      },
+      "fault": {
+        "boundary": "api",
+        "kind": "storage"
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "api": {
+        "comment": "evidence",
+        "outcome": "partial",
+        "shown": [
+          0
+        ],
+        "not_shown": {
+          "1": "not_stored"
+        }
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "upload-rejection",
+      "summary": "The API refuses the index with a 4xx; nothing else is uploaded and no comment is written.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "valid"
+          }
+        }
+      },
+      "fault": {
+        "boundary": "api",
+        "kind": "upload_rejection"
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "api": {
+        "comment": "none",
+        "outcome": null,
+        "shown": [],
+        "not_shown": {}
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "unsupported-host",
+      "summary": "The code host declares store_evidence unsupported; the comment says it cannot show evidence.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "valid"
+          }
+        }
+      },
+      "fault": {
+        "boundary": "api",
+        "kind": "host_unsupported"
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "api": {
+        "comment": "unsupported",
+        "outcome": null,
+        "shown": [],
+        "not_shown": {}
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "comment-failure",
+      "summary": "Every comment write fails through the publish deadline; no comment exists.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "valid"
+          }
+        }
+      },
+      "fault": {
+        "boundary": "api",
+        "kind": "comment"
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "api": {
+        "comment": "none",
+        "outcome": null,
+        "shown": [],
+        "not_shown": {}
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "timeout-capture",
+      "summary": "The runner's image route stalls past the capture budget; every unfetched image is timeout.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "valid"
+          }
+        }
+      },
+      "fault": {
+        "boundary": "worker",
+        "kind": "capture_timeout"
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [
+          "capture_timeout"
+        ],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": "timeout",
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": "timeout",
+            "bound": true
+          }
+        ]
+      },
+      "api": {
+        "comment": "outcome",
+        "outcome": "unavailable",
+        "shown": [],
+        "not_shown": {
+          "0": "timeout",
+          "1": "timeout"
+        }
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "timeout-publish",
+      "summary": "Hosting the images outlasts the publish budget; the outcome comment reports them as timed out.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "valid"
+          }
+        }
+      },
+      "fault": {
+        "boundary": "api",
+        "kind": "publish_timeout"
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "api": {
+        "comment": "outcome",
+        "outcome": "unavailable",
+        "shown": [],
+        "not_shown": {
+          "0": "timeout",
+          "1": "timeout"
+        }
+      },
+      "code_pr_unchanged": true
+    },
+    {
+      "id": "complete",
+      "summary": "Before bound to P and after bound to C: both are shown.",
+      "fixture": {
+        "checkout": "dirty",
+        "manifest": {
+          "version": 1,
+          "status": "complete",
+          "images": [
+            {
+              "path": "before/home.png",
+              "label": "Home page",
+              "state": "before"
+            },
+            {
+              "path": "after/home.png",
+              "label": "Home page",
+              "state": "after"
+            }
+          ]
+        },
+        "manifest_raw": null,
+        "base": "P",
+        "head": null,
+        "candidate_dirty": true,
+        "tree": "C",
+        "files": {
+          "before/home.png": {
+            "png": "valid"
+          },
+          "after/home.png": {
+            "png": "valid"
+          }
+        }
+      },
+      "runner": {
+        "version": 1,
+        "manifest": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "candidate_error": null,
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "index": {
+        "version": 1,
+        "manifest_state": "valid",
+        "manifest_refusal": null,
+        "status": "complete",
+        "reason": null,
+        "base_sha": "$P",
+        "manifest_base_sha": "$P",
+        "manifest_head_sha": null,
+        "candidate_dirty": true,
+        "manifest_candidate_tree": "$C",
+        "candidate_tree": "$C",
+        "head_tree": null,
+        "warnings": [],
+        "images": [
+          {
+            "ordinal": 0,
+            "path": "before/home.png",
+            "label": "Home page",
+            "state": "before",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          },
+          {
+            "ordinal": 1,
+            "path": "after/home.png",
+            "label": "Home page",
+            "state": "after",
+            "size": "$size",
+            "sha256": "$sha256",
+            "refusal": null,
+            "bound": true
+          }
+        ]
+      },
+      "api": {
+        "comment": "evidence",
+        "outcome": "complete",
+        "shown": [
+          0,
+          1
+        ],
+        "not_shown": {}
+      },
+      "code_pr_unchanged": true
+    }
+  ]
+}

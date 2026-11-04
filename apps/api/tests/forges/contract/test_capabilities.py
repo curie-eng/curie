@@ -3,7 +3,9 @@ raise, and the caller's fallback answers in their place."""
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -18,6 +20,7 @@ from curie_api.forges.capabilities import (
 from curie_api.forges.errors import Unsupported
 from curie_api.forges.types import (
     CheckState,
+    EvidenceFile,
     RerunOutcome,
     RerunRecord,
     RollupState,
@@ -44,7 +47,21 @@ async def _optional_calls(harness: AdapterHarness) -> dict[Operation, Call]:
         Operation.RERUN_FAILED: lambda: code_host.rerun_failed(repository, jobs),
         Operation.USER_CAN_WRITE: lambda: code_host.user_can_write(repository, harness.writer),
         Operation.REQUIRED_CHECKS: lambda: code_host.required_checks(repository, "main"),
+        Operation.STORE_EVIDENCE: lambda: code_host.store_evidence(
+            repository,
+            key="capabilities",
+            files=[EvidenceFile("before/0000.png", _IMAGE, hashlib.sha256(_IMAGE).hexdigest())],
+            message="Curie UI evidence for publication capabilities\n",
+            stamp=datetime(2026, 11, 3, tzinfo=UTC),
+        ),
+        Operation.DELETE_EVIDENCE: lambda: code_host.delete_evidence(
+            repository, key="capabilities"
+        ),
     }
+
+
+# Bytes only: the port stores what it is given, and validation is the runner's.
+_IMAGE = b"\x89PNG\r\n\x1a\ncapabilities"
 
 
 def _declared(harness: AdapterHarness, operation: Operation) -> Support:

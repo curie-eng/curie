@@ -32,7 +32,14 @@ from starlette.concurrency import run_in_threadpool
 
 from curie_api.forges import types
 from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Operation, Support
-from curie_api.forges.errors import Ambiguous, ForgeError, NotFound, Unauthorized, Unavailable
+from curie_api.forges.errors import (
+    Ambiguous,
+    ForgeError,
+    NotFound,
+    Unauthorized,
+    Unavailable,
+    Unsupported,
+)
 from curie_api.forges.github import ci
 from curie_api.forges.ports import MarkedComments
 from curie_api.forges.retarget import retarget_checked
@@ -49,6 +56,7 @@ from curie_api.forges.types import (
     CredentialExpiry,
     CredentialHeader,
     CredentialScope,
+    EvidenceFile,
     FactoryPublication,
     FeedbackKind,
     FeedbackPage,
@@ -63,6 +71,7 @@ from curie_api.forges.types import (
     RerunOutcome,
     RerunRecord,
     ReviewFeedback,
+    StoredEvidence,
     check_run_key,
     publication_body,
     status_key,
@@ -81,6 +90,9 @@ _TRANSIENT_MINT_REASONS = frozenset(
     {"timeout", "observation_busy", "github_rate_limited", "github_error"}
 )
 _SHA = re.compile(r"[0-9a-f]{40,64}")
+# UI evidence lives outside every branch, under one ref per key.
+EVIDENCE_REF_PREFIX = "refs/curie/ui-evidence/"
+_EVIDENCE_KEY = re.compile(r"[0-9A-Za-z][0-9A-Za-z_-]{0,63}")
 _PER_PAGE = 100
 _MAX_PAGES = 50
 # The publication listing reads every pull request the repository has ever had;
@@ -496,6 +508,35 @@ class GitHubCodeHost:
             raise RuntimeError("GitHubCodeHost was built without its marked comments")
         return self._marked_comments
 
+    def marked_comments_for(self, repository: RepositoryRef) -> MarkedComments:
+        """Marked comments on ``repository``'s pull requests: the configured
+        ones, else ones minted with this code host's own credential. Only the
+        configured App's comments are ours, so without an App id this refuses
+        with `Unsupported` rather than post one comment per write."""
+
+        if self._marked_comments is not None:
+            return self._marked_comments
+        auth = getattr(self._credentials, "auth", None)
+        app_id = str(getattr(auth, "app_id", "") or "").strip()
+        if not app_id:
+            raise Unsupported(Operation.UPSERT_MARKED)
+        if repository.kind != self.kind or not repository.project_id.isdigit():
+            raise NotFound("repository_id_invalid")
+        from curie_api.forges.github.comments import GitHubMarkedComments
+
+        async def token() -> str:
+            return (await self.credential(repository, CredentialScope.CLONE)).secret
+
+        return GitHubMarkedComments(
+            self._client,
+            api=self._api,
+            host=self.host,
+            repo_full_name=repository.path,
+            repository_id=int(repository.project_id),
+            token=token,
+            app_id=app_id,
+        )
+
     def _resolve_credential(self, path: str) -> tuple[str, str]:
         return resolve_repository_credential(
             path, html_base=self._html, credentials=self._credentials
@@ -696,9 +737,104 @@ class GitHubCodeHost:
         payload = await self._json("GET", path, token=await self._token(repository.path))
         try:
             parents = tuple(str(parent["sha"]) for parent in payload["parents"])
-            return Commit(sha=str(payload["sha"]), parents=parents, message=str(payload["message"]))
+            tree = payload.get("tree")
+            tree_sha = tree.get("sha") if isinstance(tree, dict) else None
+            return Commit(
+                sha=str(payload["sha"]),
+                parents=parents,
+                message=str(payload["message"]),
+                # A payload without a well-formed tree id leaves it unknown.
+                tree=tree_sha if isinstance(tree_sha, str) and _SHA.fullmatch(tree_sha) else None,
+            )
         except (KeyError, TypeError):
             raise Unavailable("malformed_response") from None
+
+    # UI evidence -------------------------------------------------------------
+
+    @staticmethod
+    def _evidence_ref(key: str) -> str:
+        if _EVIDENCE_KEY.fullmatch(key) is None:
+            raise NotFound("evidence_key_invalid")
+        return f"{EVIDENCE_REF_PREFIX}{key}"
+
+    async def _created_sha(self, path: str, *, token: str, body: Mapping[str, Any]) -> str:
+        payload = await self._json("POST", path, token=token, body=body, ok=frozenset({201}))
+        sha = payload.get("sha") if isinstance(payload, dict) else None
+        if not isinstance(sha, str) or _SHA.fullmatch(sha) is None:
+            raise Unavailable("malformed_response")
+        return sha
+
+    async def store_evidence(
+        self,
+        repository: RepositoryRef,
+        *,
+        key: str,
+        files: Sequence[EvidenceFile],
+        message: str,
+        stamp: datetime,
+    ) -> StoredEvidence:
+        """One parentless commit through the Git Data API, with the ref created
+        or force-moved to it. Author and committer are fixed and dated ``stamp``
+        to the second, so the same files, message and stamp give the same commit."""
+
+        ref = self._evidence_ref(key)
+        if not files:
+            raise NotFound("evidence_empty")
+        repo = self._repo(repository.path)
+        token = await self._token(repository.path)
+        entries = []
+        for item in files:
+            blob = await self._created_sha(
+                f"{repo}/git/blobs",
+                token=token,
+                body={"content": base64.b64encode(item.content).decode(), "encoding": "base64"},
+            )
+            entries.append({"path": item.path, "mode": "100644", "type": "blob", "sha": blob})
+        tree = await self._created_sha(f"{repo}/git/trees", token=token, body={"tree": entries})
+        moment = (stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=UTC)).astimezone(UTC)
+        date = moment.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        person = {"name": "Curie", "email": "ui-evidence@users.noreply.invalid", "date": date}
+        commit = await self._created_sha(
+            f"{repo}/git/commits",
+            token=token,
+            body={
+                "message": message,
+                "tree": tree,
+                "parents": [],
+                "author": person,
+                "committer": person,
+            },
+        )
+        created = await self._send(
+            "POST",
+            f"{repo}/git/refs",
+            token=token,
+            body={"ref": ref, "sha": commit},
+            ok=frozenset({201, 422}),
+        )
+        if created.status_code == 422:
+            # The ref exists: move it to this commit.
+            await self._send(
+                "PATCH",
+                f"{repo}/git/{quote(ref, safe='/')}",
+                token=token,
+                body={"sha": commit, "force": True},
+            )
+        urls = {
+            item.path: f"{self._html}/{repository.path}/raw/{commit}/{quote(item.path, safe='/')}"
+            for item in files
+        }
+        return StoredEvidence(ref=ref, commit_sha=commit, urls=urls)
+
+    async def delete_evidence(self, repository: RepositoryRef, *, key: str) -> bool:
+        ref = self._evidence_ref(key)
+        response = await self._send(
+            "DELETE",
+            f"{self._repo(repository.path)}/git/{quote(ref, safe='/')}",
+            token=await self._token(repository.path),
+            ok=frozenset({204, 404, 422}),
+        )
+        return response.status_code == 204
 
     async def is_ancestor(self, repository: RepositoryRef, ancestor: str, descendant: str) -> bool:
         if ancestor == descendant:

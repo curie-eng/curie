@@ -6,6 +6,7 @@ https://docs.github.com/en/webhooks/webhook-events-and-payloads
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import itertools
@@ -15,7 +16,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 from curie_api.config import get_settings
@@ -476,6 +477,27 @@ def _comment_event(number: int, body: str, comment_id: int) -> dict[str, Any]:
 # https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
 # https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-specific-reference
 # https://docs.github.com/en/rest/actions/workflow-runs#re-run-failed-jobs-from-a-workflow-run
+# https://docs.github.com/en/rest/git/blobs#create-a-blob
+# https://docs.github.com/en/rest/git/trees#create-a-tree
+# https://docs.github.com/en/rest/git/commits#create-a-commit
+# https://docs.github.com/en/rest/git/refs#create-a-reference
+#
+# The Git Data API shapes below (blobs, trees, parentless commits, and refs
+# outside refs/heads) replay what was observed against api.github.com with a
+# GitHub App installation token, 2026-11-03:
+#   POST git/blobs {content, encoding: "base64"} -> 201 {sha, url}
+#   POST git/trees {tree: [{path, mode: "100644", type: "blob", sha}]}
+#       -> 201 {sha, url, tree: [...]}
+#   POST git/commits {message, tree, parents: [], author, committer}
+#       -> 201 {sha, tree: {sha}, parents: []}
+#   POST git/refs {ref, sha} -> 201 {ref, object: {sha, type: "commit"}},
+#       422 {"message": "Reference already exists"} when present
+#   PATCH git/refs/<name> {sha, force} -> 200
+#   DELETE git/refs/<name> -> 204, 422 {"message": "Reference does not exist"}
+#       when absent
+#   GET https://github.com/<repo>/raw/<commit sha>/<path> -> 200 image/png
+# Object ids are content addressed exactly as git computes them, so replaying
+# the same blobs, tree and dated commit yields the same SHAs.
 
 CONTRACT_APP_ID = 51
 CONTRACT_BOT = {"id": 1000, "login": "curie-factory", "type": "Bot"}
@@ -496,6 +518,59 @@ _RUN_STATES = {
     "pending": ("in_progress", None),
 }
 _STATUS_STATES = {"success": "success", "failure": "failure", "cancelled": "error"}
+
+
+def git_object_sha(kind: str, payload: bytes) -> str:
+    """The git object id of ``payload`` stored as a ``kind`` object."""
+
+    return hashlib.sha1(f"{kind} {len(payload)}\0".encode() + payload).hexdigest()
+
+
+def git_blob_sha(content: bytes) -> str:
+    """The git blob id of ``content``: sha1 of ``"blob <len>\\0"`` and the bytes."""
+
+    return git_object_sha("blob", content)
+
+
+def _git_tree_payload(entries: list[dict[str, str]]) -> bytes:
+    # Git sorts tree entries by name, a directory as if its name ended in "/".
+    def key(entry: dict[str, str]) -> bytes:
+        name = entry["name"].encode()
+        return name + b"/" if entry["type"] == "tree" else name
+
+    payload = b""
+    for entry in sorted(entries, key=key):
+        mode = "40000" if entry["type"] == "tree" else entry["mode"]
+        payload += f"{mode} {entry['name']}".encode() + b"\0" + bytes.fromhex(entry["sha"])
+    return payload
+
+
+def _git_signature(person: dict[str, Any]) -> str:
+    stamp = datetime.fromisoformat(str(person["date"]).replace("Z", "+00:00"))
+    offset = stamp.utcoffset() or timedelta(0)
+    minutes = int(offset.total_seconds() // 60)
+    sign = "-" if minutes < 0 else "+"
+    zone = f"{sign}{abs(minutes) // 60:02d}{abs(minutes) % 60:02d}"
+    return f"{person['name']} <{person['email']}> {int(stamp.timestamp())} {zone}"
+
+
+def git_commit_sha(
+    *,
+    tree: str,
+    parents: list[str],
+    message: str,
+    author: dict[str, Any],
+    committer: dict[str, Any],
+) -> str:
+    """The git commit id of a commit object with these fields."""
+
+    lines = [f"tree {tree}"]
+    lines += [f"parent {parent}" for parent in parents]
+    lines += [f"author {_git_signature(author)}", f"committer {_git_signature(committer)}"]
+    return git_object_sha("commit", ("\n".join(lines) + "\n\n" + message).encode())
+
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def _stamp(second: int) -> str:
@@ -523,6 +598,14 @@ class GitHubRepositoryFake:
         self.statuses: dict[str, dict[str, dict[str, Any]]] = {}
         self.default_branch = "main"
         self.writes = 0
+        # Git Data API state: blob id -> bytes, tree id -> its entries
+        # ({name, mode, type, sha}), and every ref outside refs/heads (the UI
+        # evidence refs, ``refs/curie/ui-evidence/<key>``) -> commit id.
+        self.blobs: dict[str, bytes] = {}
+        self.trees: dict[str, list[dict[str, str]]] = {}
+        self.evidence_refs: dict[str, str] = {}
+        self.raw_requests: list[httpx.Request] = []
+        self._write_faults: list[list[Any]] = []
         self.label_requests: list[httpx.Request] = []
         self._event_ids = itertools.count(70001)
         self._comment_ids = itertools.count(80001)
@@ -631,18 +714,87 @@ class GitHubRepositoryFake:
         self.reviews.append(review)
         return review
 
-    def push_head(self, branch: str) -> str:
-        """A new commit on ``branch``; returns its sha."""
+    def push_head(self, branch: str, *, tree: str | None = None, message: str | None = None) -> str:
+        """A new commit on ``branch``; returns its sha.
+
+        ``tree`` is the commit's tree id. Without it the commit payload carries
+        no ``tree`` field at all, a shape readers must still accept.
+        """
 
         sha = f"{next(self._shas):040x}"
         parent = self.branches.get(branch)
-        self.commits[sha] = {
-            "sha": sha,
-            "message": f"change {sha[-4:]}",
-            "parents": [{"sha": parent}] if parent else [],
-        }
+        self.seed_commit(
+            sha,
+            parents=[parent] if parent else [],
+            message=message if message is not None else f"change {sha[-4:]}",
+            tree=tree,
+        )
         self.branches[branch] = sha
         return sha
+
+    def seed_commit(
+        self, sha: str, *, parents: list[str], message: str, tree: str | None = None
+    ) -> None:
+        """A commit with an exact id, as a push from outside the adapters lands
+        it. ``tree`` None leaves the ``tree`` field out of the commit payload."""
+
+        commit: dict[str, Any] = {
+            "sha": sha,
+            "message": message,
+            "parents": [{"sha": parent} for parent in parents],
+        }
+        if tree is not None:
+            commit["tree"] = {"sha": tree}
+        self.commits[sha] = commit
+
+    def seed_pull(self, head: str, base: str, *, title: str = "Change", body: str = "") -> int:
+        """An open pull request from ``head`` into ``base``, opened from outside
+        the adapters (the publication push Job's half); returns its number."""
+
+        number = self._number()
+        self.issues[number] = {"number": number, "state": "open", "pull_request": {}, "labels": []}
+        self.pulls[number] = {
+            "head": head,
+            "base": base,
+            "title": title,
+            "body": body,
+            "draft": False,
+            "state": "open",
+            "merged_at": None,
+        }
+        return number
+
+    def fail_writes(self, pattern: str, status: int, count: int = 1) -> None:
+        """The next ``count`` writes whose ``"<METHOD> <path>"`` matches the
+        regular expression ``pattern`` answer ``status`` without changing state.
+        Each refused write still counts in ``writes``: it reached GitHub."""
+
+        self._write_faults.append([re.compile(pattern), status, count])
+
+    def raw(self, commit_sha: str, path: str) -> bytes | None:
+        """The bytes ``path`` names in ``commit_sha``'s tree, or None."""
+
+        commit = self.commits.get(commit_sha)
+        tree = (commit or {}).get("tree", {}).get("sha")
+        parts = path.split("/")
+        for depth, name in enumerate(parts):
+            entries = self.trees.get(tree or "")
+            if entries is None:
+                return None
+            found = next((entry for entry in entries if entry["name"] == name), None)
+            if found is None:
+                return None
+            if depth == len(parts) - 1:
+                return self.blobs.get(found["sha"]) if found["type"] == "blob" else None
+            if found["type"] != "tree":
+                return None
+            tree = found["sha"]
+        return None
+
+    def evidence_ref(self, key: str) -> str | None:
+        """The commit ``refs/curie/ui-evidence/<key>`` points to, or None."""
+
+        return self.evidence_refs.get(f"refs/curie/ui-evidence/{key}")
 
     def report_check(self, sha: str, key: str, state: str) -> None:
         """A GitHub Actions check run named ``key``, or a commit status for a
@@ -716,10 +868,12 @@ class GitHubRepositoryFake:
 
     def _pull_payload(self, number: int) -> dict[str, Any]:
         pull = self.pulls[number]
-        side = {"repo": {"full_name": REPO}}
+        side = {"repo": {"id": REPO_ID, "full_name": REPO}}
         return {
             "number": number,
+            "node_id": f"PR_fixture_{number}",
             "html_url": f"https://github.com/{REPO}/pull/{number}",
+            "merged": pull["merged_at"] is not None,
             # The App's installation token opened it.
             "user": dict(APP_BOT_USER),
             "state": pull["state"],
@@ -757,6 +911,8 @@ class GitHubRepositoryFake:
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        if request.url.host == "github.com":
+            return self._raw(request, path)
         if self._listing_fails(path):
             return httpx.Response(502, json={"message": "injected"})
         if request.method != "GET":
@@ -821,6 +977,14 @@ class GitHubRepositoryFake:
             if commit is None:
                 return httpx.Response(404, json={"message": "Not Found"})
             return httpx.Response(200, json=commit)
+        matched = re.fullmatch(rf"{repo}/git/refs?/(.+)", path)
+        if matched and not matched[1].startswith("heads/"):
+            # https://docs.github.com/en/rest/git/refs#get-a-reference
+            ref = f"refs/{unquote(matched[1])}"
+            sha = self.evidence_refs.get(ref)
+            if sha is None:
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(200, json=self._ref_payload(ref, sha))
         matched = re.fullmatch(rf"{repo}/compare/([0-9a-f]+)\.\.\.([0-9a-f]+)", path)
         if matched:
             return self._compare(matched[1], matched[2])
@@ -875,8 +1039,32 @@ class GitHubRepositoryFake:
         # No job log is kept, so diagnostics report it unavailable.
         return httpx.Response(404, json={"message": "missing fixture"})
 
+    def _raw(self, request: httpx.Request, path: str) -> httpx.Response:
+        # GET https://github.com/<owner>/<repo>/raw/<commit sha>/<path>
+        self.raw_requests.append(request)
+        matched = re.fullmatch(rf"/{REPO}/raw/([0-9a-f]{{40}})/(.+)", path)
+        content = None
+        if request.method == "GET" and matched:
+            content = self.raw(matched[1], unquote(matched[2]))
+        if content is None:
+            return httpx.Response(404, text="Not Found")
+        kind = "image/png" if content.startswith(_PNG_SIGNATURE) else "application/octet-stream"
+        return httpx.Response(200, content=content, headers={"Content-Type": kind})
+
+    def _injected_failure(self, request: httpx.Request, path: str) -> httpx.Response | None:
+        subject = f"{request.method} {path}"
+        for fault in self._write_faults:
+            pattern, status, remaining = fault
+            if remaining > 0 and pattern.search(subject):
+                fault[2] = remaining - 1
+                return httpx.Response(status, json={"message": "injected"})
+        return None
+
     def _write(self, request: httpx.Request, path: str) -> httpx.Response:
         self.writes += 1
+        injected = self._injected_failure(request, path)
+        if injected is not None:
+            return injected
         body = json.loads(request.content) if request.content else {}
         matched = re.fullmatch(rf"/repos/{REPO}/issues/(\d+)/comments", path)
         if request.method == "POST" and matched:
@@ -942,6 +1130,9 @@ class GitHubRepositoryFake:
                 int(matched[1]), CONTRACT_BOT, body["body"], app=True, in_reply_to=int(matched[2])
             )
             return httpx.Response(201, json={"id": reply["id"]})
+        evidence = self._write_git_data(request, path, body)
+        if evidence is not None:
+            return evidence
         matched = re.fullmatch(rf"{repo}/actions/runs/(\d+)/rerun-failed-jobs", path)
         if request.method == "POST" and matched:
             for runs in self.check_runs.values():
@@ -953,3 +1144,158 @@ class GitHubRepositoryFake:
                         run.update(status="queued", conclusion=None)
             return httpx.Response(201)
         return httpx.Response(404, json={"message": "missing fixture"})
+
+    # Git Data API ---------------------------------------------------------
+
+    @staticmethod
+    def _ref_payload(ref: str, sha: str) -> dict[str, Any]:
+        return {
+            "ref": ref,
+            "url": f"{GITHUB_API}/repos/{REPO}/git/{ref}",
+            "object": {
+                "sha": sha,
+                "type": "commit",
+                "url": f"{GITHUB_API}/repos/{REPO}/git/commits/{sha}",
+            },
+        }
+
+    def _store_tree(self, entries: list[dict[str, str]]) -> str:
+        sha = git_object_sha("tree", _git_tree_payload(entries))
+        self.trees[sha] = entries
+        return sha
+
+    def _build_tree(self, blobs: dict[str, str]) -> str:
+        """Nested git trees for ``path -> blob id``, as GitHub builds them from
+        slash separated paths; returns the root tree id."""
+
+        files: dict[str, str] = {}
+        directories: dict[str, dict[str, str]] = {}
+        for path, sha in blobs.items():
+            head, _, rest = path.partition("/")
+            if rest:
+                directories.setdefault(head, {})[rest] = sha
+            else:
+                files[head] = sha
+        entries = [
+            {"name": name, "mode": "100644", "type": "blob", "sha": sha}
+            for name, sha in files.items()
+        ]
+        entries += [
+            {"name": name, "mode": "040000", "type": "tree", "sha": self._build_tree(inner)}
+            for name, inner in directories.items()
+        ]
+        return self._store_tree(entries)
+
+    def _write_git_data(
+        self, request: httpx.Request, path: str, body: dict[str, Any]
+    ) -> httpx.Response | None:
+        repo = f"/repos/{REPO}"
+        api = f"{GITHUB_API}{repo}"
+        invalid = httpx.Response(422, json={"message": "Validation Failed"})
+        if request.method == "POST" and path == f"{repo}/git/blobs":
+            encoding = body.get("encoding", "utf-8")
+            if encoding == "base64":
+                content = base64.b64decode(body["content"])
+            elif encoding == "utf-8":
+                content = str(body["content"]).encode()
+            else:
+                return invalid
+            sha = git_blob_sha(content)
+            self.blobs[sha] = content
+            return httpx.Response(201, json={"sha": sha, "url": f"{api}/git/blobs/{sha}"})
+        if request.method == "POST" and path == f"{repo}/git/trees":
+            blobs: dict[str, str] = {}
+            for entry in body.get("tree", []):
+                if (
+                    entry.get("type") != "blob"
+                    or entry.get("mode") != "100644"
+                    or entry.get("sha") not in self.blobs
+                ):
+                    return invalid
+                blobs[str(entry["path"])] = str(entry["sha"])
+            if not blobs or "base_tree" in body:
+                return invalid
+            sha = self._build_tree(blobs)
+            listed = [
+                {
+                    "path": entry["name"],
+                    "mode": entry["mode"],
+                    "type": entry["type"],
+                    "sha": entry["sha"],
+                    "url": f"{api}/git/{entry['type']}s/{entry['sha']}",
+                }
+                for entry in self.trees[sha]
+            ]
+            payload = {"sha": sha, "url": f"{api}/git/trees/{sha}", "tree": listed}
+            return httpx.Response(201, json={**payload, "truncated": False})
+        if request.method == "POST" and path == f"{repo}/git/commits":
+            tree, parents = body.get("tree"), list(body.get("parents", []))
+            if tree not in self.trees or any(parent not in self.commits for parent in parents):
+                return invalid
+            when = _stamp(0)
+            author = dict(body.get("author") or {"name": APP_SLUG, "email": "", "date": when})
+            committer = dict(body.get("committer") or author)
+            sha = git_commit_sha(
+                tree=tree,
+                parents=parents,
+                message=str(body["message"]),
+                author=author,
+                committer=committer,
+            )
+            self.seed_commit(sha, parents=parents, message=str(body["message"]), tree=tree)
+            return httpx.Response(
+                201,
+                json={
+                    "sha": sha,
+                    "url": f"{api}/git/commits/{sha}",
+                    "html_url": f"https://github.com/{REPO}/commit/{sha}",
+                    "message": body["message"],
+                    "author": author,
+                    "committer": committer,
+                    "tree": {"sha": tree, "url": f"{api}/git/trees/{tree}"},
+                    "parents": [
+                        {"sha": parent, "url": f"{api}/git/commits/{parent}"} for parent in parents
+                    ],
+                },
+            )
+        if request.method == "POST" and path == f"{repo}/git/refs":
+            ref, sha = str(body.get("ref", "")), body.get("sha")
+            if not ref.startswith("refs/") or ref.count("/") < 2 or sha not in self.commits:
+                return invalid
+            if ref.startswith("refs/heads/"):
+                if ref.removeprefix("refs/heads/") in self.branches:
+                    return httpx.Response(422, json={"message": "Reference already exists"})
+                self.branches[ref.removeprefix("refs/heads/")] = sha
+            else:
+                if ref in self.evidence_refs:
+                    return httpx.Response(422, json={"message": "Reference already exists"})
+                self.evidence_refs[ref] = sha
+            return httpx.Response(201, json=self._ref_payload(ref, sha))
+        matched = re.fullmatch(rf"{repo}/git/refs/(.+)", path)
+        if matched and request.method in {"PATCH", "DELETE"}:
+            ref = f"refs/{unquote(matched[1])}"
+            branch = ref.removeprefix("refs/heads/") if ref.startswith("refs/heads/") else None
+            present = branch in self.branches if branch is not None else ref in self.evidence_refs
+            if not present:
+                return httpx.Response(422, json={"message": "Reference does not exist"})
+            if request.method == "DELETE":
+                if branch is not None:
+                    del self.branches[branch]
+                else:
+                    del self.evidence_refs[ref]
+                return httpx.Response(204)
+            sha = body.get("sha")
+            if sha not in self.commits:
+                return invalid
+            if branch is not None:
+                self.branches[branch] = sha
+            else:
+                self.evidence_refs[ref] = sha
+            return httpx.Response(200, json=self._ref_payload(ref, sha))
+        return None
+
+
+def evidence_raw_url(commit_sha: str, path: str) -> str:
+    """The raw URL GitHub serves ``path`` at ``commit_sha`` under."""
+
+    return f"https://github.com/{REPO}/raw/{commit_sha}/{quote(path)}"
