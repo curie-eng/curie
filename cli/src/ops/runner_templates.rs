@@ -6,8 +6,47 @@ use super::{plain, run_capture, CommonOpts, OpsCommand};
 struct AgentTemplate<'a> {
     object: &'a Value,
     name: &'a str,
-    runner_index: usize,
+    images: Vec<ImageField<'a>>,
+}
+
+struct ImageField<'a> {
+    path: String,
+    kind: &'static str,
+    name: &'a str,
     image: &'a str,
+}
+
+fn image_fields(object: &Value) -> Result<Vec<ImageField<'_>>> {
+    let mut fields = Vec::new();
+    for kind in ["containers", "initContainers"] {
+        let Some(containers) = object.pointer(&format!("/spec/podTemplate/spec/{kind}")) else {
+            continue;
+        };
+        for (index, container) in containers
+            .as_array()
+            .context("SandboxTemplate container list is malformed")?
+            .iter()
+            .enumerate()
+        {
+            let name = container
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .context("SandboxTemplate container has no name")?;
+            let image = container
+                .get("image")
+                .and_then(Value::as_str)
+                .filter(|image| !image.is_empty())
+                .context("SandboxTemplate container has no image")?;
+            fields.push(ImageField {
+                path: format!("/spec/podTemplate/spec/{kind}/{index}/image"),
+                kind,
+                name,
+                image,
+            });
+        }
+    }
+    Ok(fields)
 }
 
 fn runner(object: &Value) -> Result<(usize, &str)> {
@@ -65,6 +104,11 @@ fn platform_templates<'a>(
         bail!("the platform SandboxTemplate has ambiguous release ownership");
     }
     let (_, target) = runner(generic)?;
+    let platform_fields = image_fields(generic)?;
+    let runner_slots: Vec<_> = platform_fields
+        .iter()
+        .filter(|field| field.image == target)
+        .collect();
     let prefix = format!("{fullname}-agent-");
     let layers = values
         .pointer("/agentSandbox/runnerImages")
@@ -107,13 +151,20 @@ fn platform_templates<'a>(
         if !matches!(managed_by, Some("curie-cli" | "Helm")) {
             bail!("SandboxTemplate {name} has ambiguous manager ownership; refusing to adopt it");
         }
-        let (runner_index, image) =
-            runner(object).with_context(|| format!("SandboxTemplate {name}"))?;
+        let (_, image) = runner(object).with_context(|| format!("SandboxTemplate {name}"))?;
+        let images = image_fields(object)?
+            .into_iter()
+            .filter(|field| {
+                field.image == image
+                    || runner_slots
+                        .iter()
+                        .any(|slot| slot.kind == field.kind && slot.name == field.name)
+            })
+            .collect();
         agents.push(AgentTemplate {
             object,
             name,
-            runner_index,
-            image,
+            images,
         });
     }
     Ok((target, agents))
@@ -169,13 +220,17 @@ pub(super) async fn verify(common: &CommonOpts) -> Result<()> {
     };
     let (target, templates) = platform_templates(&list, &values, &common.release)?;
     for template in templates {
-        if template.image != target {
-            bail!(
-                "SandboxTemplate {} still renders {}, expected the platform runner {}",
-                template.name,
-                template.image,
-                target
-            );
+        for field in template.images {
+            if field.image != target {
+                bail!(
+                    "SandboxTemplate {} {} {} still renders {}, expected the platform runner {}",
+                    template.name,
+                    field.kind,
+                    field.name,
+                    field.image,
+                    target
+                );
+            }
         }
     }
     Ok(())
@@ -187,7 +242,12 @@ pub(super) async fn reconcile(common: &CommonOpts) -> Result<()> {
     };
     let (target, templates) = platform_templates(&list, &values, &common.release)?;
     for template in templates {
-        if template.image == target {
+        let replacements: Vec<_> = template
+            .images
+            .iter()
+            .filter(|field| field.image != target)
+            .collect();
+        if replacements.is_empty() {
             continue;
         }
         let version = template
@@ -195,10 +255,14 @@ pub(super) async fn reconcile(common: &CommonOpts) -> Result<()> {
             .pointer("/metadata/resourceVersion")
             .and_then(Value::as_str)
             .context("deployment-created SandboxTemplate has no resourceVersion")?;
-        let patch = json!([
-            {"op": "test", "path": "/metadata/resourceVersion", "value": version},
-            {"op": "replace", "path": format!("/spec/podTemplate/spec/containers/{}/image", template.runner_index), "value": target}
-        ]);
+        let mut patch =
+            vec![json!({"op": "test", "path": "/metadata/resourceVersion", "value": version})];
+        patch.extend(replacements.into_iter().map(|field| {
+            json!({
+                "op": "replace", "path": field.path, "value": target
+            })
+        }));
+        let patch = Value::Array(patch);
         let command = OpsCommand::new(
             "kubectl",
             vec![
@@ -282,7 +346,8 @@ mod tests {
                 "acme-curie-agent-acme-legacy-runner"
             ]
         );
-        assert!(selected.iter().all(|template| template.runner_index == 1));
+        assert!(selected.iter().all(|template| template.images.len() == 1
+            && template.images[0].path == "/spec/podTemplate/spec/containers/1/image"));
     }
 
     #[test]

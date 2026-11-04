@@ -119,6 +119,9 @@ def clean(namespace, release):
     worker = kc(namespace, "get", "deployment/" + release + "-curie-worker", "--ignore-not-found", "-o", "name").stdout.strip()
     if worker:
         kc(namespace, "scale", worker, "--replicas=0")
+        kc(namespace, "delete", "pods", "-l",
+           f"app.kubernetes.io/instance={release},app.kubernetes.io/component=worker",
+           "--grace-period=1", "--wait=true", "--timeout=120s", timeout=140)
     for kind in ("sandboxwarmpools", "sandboxclaims", "sandboxes"):
         kc(namespace, "delete", kind, "--all", "--ignore-not-found", "--wait=true", "--timeout=120s", timeout=140)
     run(["helm", "--kube-context", context, "-n", namespace, "uninstall", release,
