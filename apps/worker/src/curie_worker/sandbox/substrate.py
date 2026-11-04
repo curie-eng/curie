@@ -347,16 +347,16 @@ class SandboxSubstrate:
         config = self._config.admission
         if config is None:
             return None
-        requested = resource_vector(self._k8s.claim_resources(
-            pool=pool, runner_resources=runner_resources, agent_name=agent_name,
-            executor_secret_names=executor_secret_names,
-        ))
-        if set(requested) != set(config.hard):
-            raise ValueError("sandbox admission footprint is incomplete")
         try:
+            requested = resource_vector(self._k8s.claim_resources(
+                pool=pool, runner_resources=runner_resources, agent_name=agent_name,
+                executor_secret_names=executor_secret_names,
+            ))
+            if set(requested) != set(config.hard):
+                raise ValueError("sandbox admission footprint is incomplete")
             inventory = self._reconcile_admission()
             quota = self._k8s.read_quota(config.quota_name, request_timeout_seconds=1.0)
-        except (TimeoutError, HTTPTimeoutError) as exc:
+        except (TimeoutError, HTTPTimeoutError, KubeTransientError) as exc:
             raise AdmissionUnavailableError("sandbox admission inventory unavailable") from exc
         except MaxRetryError as exc:
             if not isinstance(exc.reason, HTTPTimeoutError):
