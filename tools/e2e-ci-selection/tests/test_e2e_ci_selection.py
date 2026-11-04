@@ -230,6 +230,15 @@ CHART_SETUP_FIXTURES = {
 
 
 CHART_SCENARIOS: dict[str, _ChartScenario] = {
+    "platform-runner-upgrade": {
+        "step": "Deployed platform runners survive both upgrade entry points",
+        "leg": "workload",
+        "inputs": [
+            "charts/curie/ci/runtime/platform-runner-upgrade-runtime.sh",
+            "cli/src/ops", "cli/src/connectors.rs", "apps/api", "apps/worker", "runner", "packages",
+            "pyproject.toml", "uv.lock",
+        ],
+    },
     "failed-first-install-retry": {
         "step": "Failed first install retry recreates data volumes",
         "inputs": [
@@ -364,6 +373,7 @@ WORKLOAD_SCENARIOS = frozenset(
         "connector-apply-race",
         "failed-first-install-retry",
         "factory-resource-profile",
+        "platform-runner-upgrade",
     }
 )
 
@@ -2066,6 +2076,7 @@ def test_mixed_root_documentation_and_runtime_diff_selects_runtime_tiers(
             "connector-apply-race",
             "connector-secret-rotation",
             "factory-resource-profile",
+            "platform-runner-upgrade",
             "quota-progress",
             "workspace-diagnostic",
         ),
@@ -4483,7 +4494,8 @@ WORKLOAD_STAGING_IF = (
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') "
-    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile')) }}"
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile') "
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade')) }}"
 )
 
 
@@ -5512,6 +5524,7 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
                 "connector-apply-race",
                 "connector-secret-rotation",
                 "factory-resource-profile",
+                "platform-runner-upgrade",
                 "quota-progress",
                 "workspace-diagnostic",
             ),
@@ -5538,6 +5551,7 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
                 "connector-readiness",
                 "connector-secret-rotation",
                 "factory-resource-profile",
+                "platform-runner-upgrade",
                 "quota-progress",
                 "workspace-diagnostic",
             ),
@@ -5551,6 +5565,7 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
                 "connector-readiness",
                 "connector-secret-rotation",
                 "factory-resource-profile",
+                "platform-runner-upgrade",
                 "quota-progress",
                 "workspace-diagnostic",
             ),
@@ -5645,6 +5660,7 @@ def test_chart_scenarios_follow_changed_inputs_and_final_tiers(
                 "connector-apply-race",
                 "connector-secret-rotation",
                 "factory-resource-profile",
+                "platform-runner-upgrade",
                 "quota-progress",
                 "workspace-diagnostic",
             ),
@@ -5758,6 +5774,7 @@ def test_chart_scenario_union_is_sorted_and_deduplicated(tmp_path: Path) -> None
         "connector-secret-rotation",
         "factory-resource-profile",
         "failed-first-install-retry",
+        "platform-runner-upgrade",
         "quota-progress",
         "workspace-diagnostic",
     ]
@@ -6102,6 +6119,7 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
                 "connector-apply-race",
                 "connector-secret-rotation",
                 "factory-resource-profile",
+                "platform-runner-upgrade",
                 "quota-progress",
                 "workspace-diagnostic",
             )
@@ -6263,7 +6281,10 @@ def test_chart_shared_workload_order_preserves_scenario_isolation() -> None:
     shared = [
         step for step in steps
         if step.get("name") in scenario_names
-        and step["name"] != CHART_SCENARIOS["failed-first-install-retry"]["step"]
+        and step["name"] not in {
+            CHART_SCENARIOS[item]["step"]
+            for item in ("failed-first-install-retry", "platform-runner-upgrade")
+        }
         and step.get("if", "").startswith("${{ matrix.leg == 'workload' && ")
     ]
     chart = [
@@ -6273,7 +6294,9 @@ def test_chart_shared_workload_order_preserves_scenario_isolation() -> None:
     ]
     assert {step["name"] for step in shared} == {
         CHART_SCENARIOS[scenario]["step"]
-        for scenario in WORKLOAD_SCENARIOS - {"failed-first-install-retry"}
+        for scenario in WORKLOAD_SCENARIOS - {
+            "failed-first-install-retry", "platform-runner-upgrade"
+        }
     }
     assert shared[0]["name"] == CHART_SCENARIOS["quota-progress"]["step"]
     assert shared[-1]["name"] == CHART_SCENARIOS["workspace-diagnostic"]["step"]
@@ -6306,3 +6329,24 @@ def test_chart_shared_workload_order_preserves_scenario_isolation() -> None:
     setup = steps[install]
     assert shlex.split(setup["run"]) == CHART_SETUP_FIXTURES[setup["name"]]
     assert "continue-on-error" not in setup and "continue-on-error" not in cleanup
+
+
+def test_platform_runner_upgrade_stages_candidate_artifacts_before_own_lifecycle() -> None:
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"][CHART_JOB]["steps"]
+    positions = {step.get("name"): index for index, step in enumerate(steps)}
+    name = CHART_SCENARIOS["platform-runner-upgrade"]["step"]
+    scenario = steps[positions[name]]
+    assert scenario["if"] == _chart_step_if("platform-runner-upgrade")
+    assert shlex.split(scenario["run"]) == [
+        "bash", "tools/runtime-assertion-gate/run.sh",
+        "charts/curie/ci/runtime/platform-runner-upgrade-runtime.sh",
+    ]
+    assert scenario["env"]["CURIE_SCENARIO_RUNNER_IMAGE"] == "curie-runner:wsdiag-${{ github.sha }}"
+    assert positions["Stage the workspace diagnostic images in kind"] < positions[name]
+    assert positions[name] < positions["Install the shared workload platform"]
+    for staging in (
+        "Download the workspace diagnostic CLI",
+        "Load the workspace diagnostic candidate images",
+        "Stage the workspace diagnostic images in kind",
+    ):
+        assert steps[positions[staging]]["if"] == WORKLOAD_STAGING_IF
