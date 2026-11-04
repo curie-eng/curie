@@ -14,63 +14,25 @@ down_revision: str = "0145"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
-_OLD_SHAPE = (
-    "((status = 'failed' AND started_at IS NULL AND execution_deadline IS NULL AND terminal_at "
-    "IS NOT NULL AND terminal_cause = 'start_failed' AND termination_observation IS NULL) OR "
-    "(status = 'queued' AND wait_deadline IS NULL AND started_at IS NULL AND execution_deadline"
-    " IS NULL AND terminal_at IS NULL AND terminal_cause IS NULL AND termination_observation IS"
-    " NULL) OR (status = 'waiting' AND wait_deadline IS NOT NULL AND started_at IS NULL AND "
-    "execution_deadline IS NULL AND terminal_at IS NULL AND terminal_cause IS NULL AND "
-    "termination_observation IS NULL) OR (status = 'running' AND started_at IS NOT NULL AND "
-    "execution_deadline IS NOT NULL AND terminal_at IS NULL AND terminal_cause IS NULL AND "
-    "termination_observation IS NULL) OR (status = 'cancellation_requested' AND started_at IS "
-    "NOT NULL AND execution_deadline IS NOT NULL AND terminal_at IS NULL AND terminal_cause IS "
-    "NOT NULL AND terminal_cause IN ('issue_cancelled', 'execution_deadline', 'owner_lost') AND"
-    " termination_observation IS NULL) OR (status = 'completed' AND started_at IS NOT NULL AND "
-    "execution_deadline IS NOT NULL AND terminal_at IS NOT NULL AND terminal_cause IS NOT NULL "
-    "AND terminal_cause = 'completed' AND termination_observation IS NULL) OR (status = "
-    "'failed' AND started_at IS NOT NULL AND execution_deadline IS NOT NULL AND terminal_at IS "
-    "NOT NULL AND terminal_cause IS NOT NULL AND ((terminal_cause = 'owner_lost' AND "
-    "termination_observation IS NOT NULL) OR (terminal_cause <> 'owner_lost' AND "
-    "termination_observation IS NULL))) OR (status = 'expired' AND terminal_at IS NOT NULL AND "
-    "((started_at IS NULL AND execution_deadline IS NULL AND terminal_cause IS NOT NULL AND "
-    "terminal_cause = 'capacity_wait_expired' AND termination_observation IS NULL) OR "
-    "(started_at IS NOT NULL AND execution_deadline IS NOT NULL AND terminal_cause IS NOT NULL "
-    "AND terminal_cause = 'execution_deadline' AND termination_observation IS NOT NULL))) OR "
-    "(status = 'cancelled' AND terminal_at IS NOT NULL AND terminal_cause IS NOT NULL AND "
-    "terminal_cause IN ('issue_cancelled', 'lineage_closed') AND ((started_at IS NULL AND "
-    "execution_deadline IS NULL AND termination_observation IS NULL) OR (started_at IS NOT NULL"
-    " AND execution_deadline IS NOT NULL AND termination_observation IS NOT NULL)))) IS TRUE"
+_ARRAY_CAUSE = "('issue_cancelled'::character varying)::text"
+_DELETED_ARRAY_CAUSE = ", ('issue_deleted'::character varying)::text"
+_CANCELLED_EQUALITY = "((terminal_cause)::text = 'issue_cancelled'::text)"
+_DELETED_EQUALITY = (
+    "((terminal_cause)::text = ANY (ARRAY['issue_cancelled'::text, 'issue_deleted'::text]))"
 )
-_NEW_SHAPE = (
-    "((status = 'failed' AND started_at IS NULL AND execution_deadline IS NULL AND terminal_at "
-    "IS NOT NULL AND terminal_cause = 'start_failed' AND termination_observation IS NULL) OR "
-    "(status = 'queued' AND wait_deadline IS NULL AND started_at IS NULL AND execution_deadline"
-    " IS NULL AND terminal_at IS NULL AND terminal_cause IS NULL AND termination_observation IS"
-    " NULL) OR (status = 'waiting' AND wait_deadline IS NOT NULL AND started_at IS NULL AND "
-    "execution_deadline IS NULL AND terminal_at IS NULL AND terminal_cause IS NULL AND "
-    "termination_observation IS NULL) OR (status = 'running' AND started_at IS NOT NULL AND "
-    "execution_deadline IS NOT NULL AND terminal_at IS NULL AND terminal_cause IS NULL AND "
-    "termination_observation IS NULL) OR (status = 'cancellation_requested' AND started_at IS "
-    "NOT NULL AND execution_deadline IS NOT NULL AND terminal_at IS NULL AND terminal_cause IS "
-    "NOT NULL AND terminal_cause IN ('issue_cancelled', 'issue_deleted', 'execution_deadline', "
-    "'owner_lost') AND termination_observation IS NULL) OR (status = 'completed' AND started_at"
-    " IS NOT NULL AND execution_deadline IS NOT NULL AND terminal_at IS NOT NULL AND "
-    "terminal_cause IS NOT NULL AND terminal_cause = 'completed' AND termination_observation IS"
-    " NULL) OR (status = 'failed' AND started_at IS NOT NULL AND execution_deadline IS NOT NULL"
-    " AND terminal_at IS NOT NULL AND terminal_cause IS NOT NULL AND ((terminal_cause = "
-    "'owner_lost' AND termination_observation IS NOT NULL) OR (terminal_cause <> 'owner_lost' "
-    "AND termination_observation IS NULL))) OR (status = 'expired' AND terminal_at IS NOT NULL "
-    "AND ((started_at IS NULL AND execution_deadline IS NULL AND terminal_cause IS NOT NULL AND"
-    " terminal_cause = 'capacity_wait_expired' AND termination_observation IS NULL) OR "
-    "(started_at IS NOT NULL AND execution_deadline IS NOT NULL AND terminal_cause IS NOT NULL "
-    "AND terminal_cause = 'execution_deadline' AND termination_observation IS NOT NULL))) OR "
-    "(status = 'cancelled' AND terminal_at IS NOT NULL AND terminal_cause IS NOT NULL AND "
-    "terminal_cause IN ('issue_cancelled', 'issue_deleted', 'lineage_closed') AND ((started_at "
-    "IS NULL AND execution_deadline IS NULL AND termination_observation IS NULL) OR (started_at"
-    " IS NOT NULL AND execution_deadline IS NOT NULL AND termination_observation IS NOT "
-    "NULL)))) IS TRUE"
-)
+
+
+def _shape() -> str:
+    shape = op.get_bind().scalar(
+        sa.text(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conrelid = 'curie.execution_requests'::regclass "
+            "AND conname = 'execution_requests_state_shape_ck'"
+        )
+    )
+    if not isinstance(shape, str) or not shape.startswith("CHECK (") or not shape.endswith(")"):
+        raise RuntimeError("execution request state shape is unavailable")
+    return shape[len("CHECK (") : -1]
 
 
 def _replace_shape(shape: str) -> None:
@@ -83,7 +45,12 @@ def _replace_shape(shape: str) -> None:
 
 
 def upgrade() -> None:
-    _replace_shape(_NEW_SHAPE)
+    prior = _shape()
+    shape = prior.replace(_ARRAY_CAUSE, _ARRAY_CAUSE + _DELETED_ARRAY_CAUSE)
+    shape = shape.replace(_CANCELLED_EQUALITY, _DELETED_EQUALITY)
+    if shape == prior:
+        raise RuntimeError("execution request state shape has no issue cancellation")
+    _replace_shape(shape)
 
 
 def downgrade() -> None:
@@ -95,4 +62,6 @@ def downgrade() -> None:
         )
     ):
         raise RuntimeError("cannot downgrade while deleted-issue cancellation records exist")
-    _replace_shape(_OLD_SHAPE)
+    shape = _shape().replace(_DELETED_ARRAY_CAUSE, "")
+    shape = shape.replace(_DELETED_EQUALITY, _CANCELLED_EQUALITY)
+    _replace_shape(shape)

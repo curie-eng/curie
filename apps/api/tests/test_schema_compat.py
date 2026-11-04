@@ -1188,6 +1188,11 @@ def test_deleted_issue_migration_refuses_to_discard_cancellation_records(
     from test_workitems import _agent, _item, _request, with_session
 
     isolated_migration_db.at("0145")
+    original_shape = sql_rows(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+        "WHERE conrelid = 'curie.execution_requests'::regclass "
+        "AND conname = 'execution_requests_state_shape_ck'"
+    )
     command.upgrade(alembic_config(), "0147")
     if deleted_rows:
 
@@ -1210,3 +1215,27 @@ def test_deleted_issue_migration_refuses_to_discard_cancellation_records(
     else:
         command.downgrade(alembic_config(), "0145")
         assert current_revision() == "0145"
+        assert (
+            sql_rows(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conrelid = 'curie.execution_requests'::regclass "
+                "AND conname = 'execution_requests_state_shape_ck'"
+            )
+            == original_shape
+        )
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_deleted_issue_migration_refuses_an_unrecognized_state_shape(
+    isolated_migration_db: IsolatedMigrationDb, missing: bool
+) -> None:
+    isolated_migration_db.at("0145")
+    _exec("ALTER TABLE curie.execution_requests DROP CONSTRAINT execution_requests_state_shape_ck")
+    if not missing:
+        _exec(
+            "ALTER TABLE curie.execution_requests "
+            "ADD CONSTRAINT execution_requests_state_shape_ck CHECK (true)"
+        )
+    with pytest.raises(RuntimeError, match="state shape"):
+        command.upgrade(alembic_config(), "0147")
+    assert current_revision() == "0145"
