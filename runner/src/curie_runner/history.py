@@ -1152,6 +1152,14 @@ class StateApiTranscriptStore:
                     # an empty key is the cap itself, not something to compact.
                     raise HistoryCapacityError(413)
                 value, version = snapshot
+                record_id = item.get("record_id")
+                if record_id and any(
+                    isinstance(stored, dict) and stored.get("record_id") == record_id
+                    for stored in value
+                ):
+                    # An earlier attempt of this turn already landed (#5366).
+                    # Whether it kept native replay is unknown, so report not.
+                    return False
                 assert self._max_value_bytes is not None
                 status = await self._put(
                     session,
