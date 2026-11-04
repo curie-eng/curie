@@ -8130,11 +8130,17 @@ fn platform_canary_fixture(image: &str) -> Fixture {
             "meta.helm.sh/release-name": "rel"}, "labels": {
             "app.kubernetes.io/instance": "rel"}},
          "spec": {"podTemplate": {"spec": {"containers": [
-            {"name": "runner", "image": "acme-runner:candidate"}]}}}},
+            {"name": "runner", "image": "acme-runner:candidate"}],
+            "initContainers": [{"name": "workspace-init", "image": "acme-runner:candidate"},
+                               {"name": "attachments-init", "image": "acme-runner:candidate"},
+                               {"name": "bundle-fetch", "image": "acme-fetch:stable"}]}}}},
         {"metadata": {"name": "rel-curie-agent-acme-bot-runner", "labels": {
             "app.kubernetes.io/instance": "rel", "app.kubernetes.io/managed-by": "curie-cli"}},
          "spec": {"podTemplate": {"metadata": {"labels": {"curietech.ai/agent": "acme-bot"}},
-            "spec": {"containers": [{"name": "runner", "image": image}]}}}}
+            "spec": {"containers": [{"name": "runner", "image": image}],
+                     "initContainers": [{"name": "bundle-fetch", "image": "acme-fetch:stable"},
+                                        {"name": "attachments-init", "image": image},
+                                        {"name": "workspace-init", "image": image}]}}}}
     ]});
     fs::write(
         fixture.0.path().join("platform-canary.json"),
@@ -8178,4 +8184,22 @@ fn platform_agent_template_canary_accepts_matching_image_without_layers() {
     assert_eq!(body["status"], "succeeded", "{body}");
     assert_eq!(body["canary"]["passed"], true, "{body}");
     assert_eq!(body["known_good_version"], "0.9.0", "{body}");
+}
+
+#[test]
+fn platform_agent_template_canary_rejects_stale_init_images_without_layers() {
+    for index in [1, 2] {
+        let fixture = platform_canary_fixture("acme-runner:candidate");
+        let path = fixture.0.path().join("platform-canary.json");
+        let mut objects: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        objects["items"][1]["spec"]["podTemplate"]["spec"]["initContainers"][index]["image"] =
+            serde_json::json!("acme-runner:previous");
+        fs::write(path, objects.to_string()).unwrap();
+        let body = json(&fixture.local("healthy"));
+        assert_eq!(body["canary"]["passed"], false, "{body}");
+        assert_eq!(body["status"], "failed", "{body}");
+        assert_eq!(body["phase"], "canary", "{body}");
+        assert_ne!(body["known_good_version"], "0.9.0", "{body}");
+    }
 }
