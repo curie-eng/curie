@@ -40,10 +40,14 @@ locally in Docker.
   structured replay; oversized text payloads are replaced with stable digest
   markers before the per-thread transcript cap the state API advertises
   (`api.transcriptMaxThreadBytes`, 16 MiB by default) while tool-call
-  structure remains intact. An append that never reached the state API (a
-  connect failure) is kept and retried in order until it lands, and
-  `history_durable` stays false until then. Any other append failure makes the
-  runner's `history_durable` status fail closed for the rest of that process.
+  structure remains intact. Each turn record carries a `record_id`, and the
+  state API stores a record with a known `record_id` only once. An append whose
+  outcome is unknown (a 5xx, a 408 or 429, a connect failure, a cut connection,
+  a timeout, or a cancellation after the request was sent) is therefore kept
+  and retried in order until it lands, and `history_durable` stays false until
+  then (#5354, #5366). Any other append failure, such as a 4xx refusal, makes
+  the runner's `history_durable` status fail closed for the rest of that
+  process.
 
 ## HTTP surface (ACI channel)
 
