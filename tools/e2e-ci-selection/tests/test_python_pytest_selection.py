@@ -2600,6 +2600,9 @@ def test_shards_partition_the_unfiltered_collection(tmp_path: Path) -> None:
 def test_commissioning_runner_peer_shares_the_protected_xdist_group() -> None:
     files = (
         "apps/worker/tests/test_commissioning_record_refusal.py",
+        "apps/worker/tests/test_commissioning_launch.py",
+        "apps/worker/tests/test_commissioning_cleanup.py",
+        "apps/worker/tests/test_commissioning_supervisor.py",
         "apps/worker/tests/test_protected_retirement_server.py",
         "apps/worker/tests/test_protected_recovery_source.py",
         "apps/worker/tests/test_delivery_lease.py",
@@ -2634,8 +2637,8 @@ raise SystemExit(pytest.main(sys.argv[1:], plugins=[Groups()]))
         if (fields := line.split()) and fields[0] == "RUNNER_GROUP"
     }
     assert set(groups) == set(files)
-    assert groups[files[0]] == groups[files[1]] == groups[files[2]]
-    assert groups[files[3]] != groups[files[0]]
+    assert len({groups[path] for path in files[:-1]}) == 1
+    assert groups[files[-1]] != groups[files[0]]
 
 
 # Shard plan wiring: `changes` and each shard's decision step agree on how many
