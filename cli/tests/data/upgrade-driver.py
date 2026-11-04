@@ -1119,6 +1119,9 @@ if program == "helm":
     # numeric release revision at version:
     # https://github.com/helm/helm/blob/v3.20.0/cmd/helm/status.go
     if args[0] == "history":
+        if (root / "runner-rollback").exists():
+            emit([{"revision": 1, "status": "superseded", "chart": "curie-0.8.6", "app_version": "0.8.6"},
+                  {"revision": 3 if rolled_back else 2, "status": "deployed", "chart": "curie-0.8.6", "app_version": "0.8.6"}])
         history = release_history()
         if history is None:
             print("Error: release: not found", file=sys.stderr)
@@ -1182,6 +1185,10 @@ if program == "helm":
             metadata["version"] = 2
         emit(metadata)
     if args[0] == "rollback":
+        if (root / "runner-rollback").exists():
+            assert args[2] == "1"
+            print("Rollback to 1 was a success")
+            sys.exit(0)
         history = release_history() or []
         requested = args[2] if len(args) > 2 else ""
         serving = next((row for row in history if row["status"] == "deployed"), None)
@@ -1194,6 +1201,8 @@ if program == "helm":
         print(f'Rollback to {requested} was a success')
         sys.exit(0)
     if args[:2] == ["get", "values"]:
+        if "--all" in args and (root / "runner-reconcile.json").exists():
+            emit({"agentSandbox": {"deploy": True}})
         if "--all" in args and (upgraded or converged):
             def coalesce(defaults, supplied):
                 result = copy.deepcopy(defaults)
@@ -1402,7 +1411,27 @@ if program == "kubectl":
             sys.exit(1)
         print("sandboxclaim deleted")
         sys.exit(0)
+    if args[:2] == ["-n", NAMESPACE] and args[2:4] == ["patch", SANDBOX_TEMPLATES]:
+        path = root / "runner-reconcile.json"
+        document = json.loads(path.read_text())
+        target = next(item for item in document["items"] if item["metadata"]["name"] == args[4])
+        operations = json.loads(flag_value("-p"))
+        for operation in operations:
+            node = target
+            parts = operation["path"].strip("/").split("/")
+            for key in parts[:-1]:
+                node = node[int(key)] if isinstance(node, list) else node[key]
+            key = int(parts[-1]) if isinstance(node, list) else parts[-1]
+            if operation["op"] == "test":
+                assert node[key] == operation["value"]
+            else:
+                assert operation["op"] == "replace"
+                node[key] = operation["value"]
+        path.write_text(json.dumps(document))
+        emit(target)
     if args[:2] == ["-n", NAMESPACE] and args[2:4] == ["get", SANDBOX_TEMPLATES]:
+        if (root / "runner-reconcile.json").exists():
+            emit(json.loads((root / "runner-reconcile.json").read_text()))
         platform_control = root / "platform-canary.json"
         if converged and platform_control.exists():
             control = json.loads(platform_control.read_text())

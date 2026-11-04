@@ -8159,6 +8159,7 @@ fn platform_agent_template_canary_rejects_stale_image_without_layers() {
     assert_eq!(body["status"], "failed", "{body}");
     assert_eq!(body["phase"], "canary", "{body}");
     assert_ne!(body["known_good_version"], "0.9.0", "{body}");
+    assert!(body["fail_forward"]["reason"].as_str().unwrap().contains("curie cluster up"), "{body}");
 }
 
 #[test]
@@ -8202,4 +8203,158 @@ fn platform_agent_template_canary_rejects_stale_init_images_without_layers() {
         assert_eq!(body["phase"], "canary", "{body}");
         assert_ne!(body["known_good_version"], "0.9.0", "{body}");
     }
+}
+
+fn runner_reconciliation_fixture(image: &str, target: &str) -> Fixture {
+    let fixture = platform_canary_fixture(image);
+    let path = fixture.0.path().join("platform-canary.json");
+    let mut objects: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    objects["items"][1]["metadata"]["resourceVersion"] = serde_json::json!("17");
+    for kind in ["containers", "initContainers"] {
+        for container in objects["items"][0]["spec"]["podTemplate"]["spec"][kind]
+            .as_array_mut()
+            .unwrap()
+        {
+            if container["image"] == "acme-runner:candidate" {
+                container["image"] = serde_json::json!(target);
+            }
+        }
+    }
+    fs::remove_file(path).unwrap();
+    fs::write(
+        fixture.0.path().join("runner-reconcile.json"),
+        objects.to_string(),
+    )
+    .unwrap();
+    fixture
+}
+
+fn runner_template_patches(fixture: &Fixture) -> Vec<Vec<String>> {
+    fixture
+        .argv()
+        .into_iter()
+        .filter(|call| {
+            argv_starts(
+                call,
+                &[
+                    "kubectl",
+                    "-n",
+                    "ns",
+                    "patch",
+                    "sandboxtemplates.extensions.agents.x-k8s.io",
+                ],
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn platform_agent_template_canary_reconciliation_patches_images_with_resource_version_and_skips_matching(
+) {
+    for image in ["acme-runner:previous", "acme-runner:candidate"] {
+        let fixture = runner_reconciliation_fixture(image, "acme-runner:candidate");
+        let body = json(&fixture.local("healthy"));
+        assert_eq!(body["status"], "succeeded", "{body}");
+        let patches = runner_template_patches(&fixture);
+        if image == "acme-runner:candidate" {
+            assert!(patches.is_empty(), "{patches:?}");
+            continue;
+        }
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        assert_eq!(
+            &patches[0][..8],
+            &[
+                "kubectl",
+                "-n",
+                "ns",
+                "patch",
+                "sandboxtemplates.extensions.agents.x-k8s.io",
+                "rel-curie-agent-acme-bot-runner",
+                "--type=json",
+                "-p"
+            ]
+        );
+        let patch: Value = serde_json::from_str(&patches[0][8]).unwrap();
+        assert_eq!(
+            patch,
+            serde_json::json!([
+                {"op":"test","path":"/metadata/resourceVersion","value":"17"},
+                {"op":"replace","path":"/spec/podTemplate/spec/containers/0/image","value":"acme-runner:candidate"},
+                {"op":"replace","path":"/spec/podTemplate/spec/initContainers/1/image","value":"acme-runner:candidate"},
+                {"op":"replace","path":"/spec/podTemplate/spec/initContainers/2/image","value":"acme-runner:candidate"}
+            ])
+        );
+    }
+}
+
+#[test]
+fn platform_agent_template_canary_rollback_reconciles_to_the_restored_runner() {
+    let fixture = runner_reconciliation_fixture("acme-runner:candidate", "acme-runner:previous");
+    fs::write(fixture.0.path().join("runner-rollback"), "").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_curie"))
+        .args([
+            "--json",
+            "cluster",
+            "rollback",
+            "--namespace",
+            "ns",
+            "--release",
+            "rel",
+            "--yes",
+            "--live-schema-revision",
+            "0039",
+        ])
+        .env(
+            "PATH",
+            crate::support::executable::isolated_fixture_path(fixture.0.path()),
+        )
+        .env("KUBECONFIG", fixture.0.path().join("kubeconfig"))
+        .env("UPGRADE_DRIVER_ROOT", fixture.0.path())
+        .env("UPGRADE_DRIVER_SCENARIO", "healthy")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let patches = runner_template_patches(&fixture);
+    assert_eq!(patches.len(), 1, "{patches:?}");
+    let patch: Value = serde_json::from_str(&patches[0][8]).unwrap();
+    assert_eq!(
+        patch[0],
+        serde_json::json!({"op":"test","path":"/metadata/resourceVersion","value":"17"})
+    );
+    assert!(patch.as_array().unwrap()[1..]
+        .iter()
+        .all(|operation| operation["value"] == "acme-runner:previous"));
+    let templates: Value = serde_json::from_str(
+        &fs::read_to_string(fixture.0.path().join("runner-reconcile.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        templates["items"][1]["spec"]["podTemplate"]["spec"]["initContainers"][2]["image"],
+        "acme-runner:previous"
+    );
+    let calls = fixture.argv();
+    let rollback = calls
+        .iter()
+        .position(|call| argv_starts(call, &["helm", "rollback"]))
+        .unwrap();
+    let patch = calls
+        .iter()
+        .position(|call| {
+            argv_starts(
+                call,
+                &[
+                    "kubectl",
+                    "-n",
+                    "ns",
+                    "patch",
+                    "sandboxtemplates.extensions.agents.x-k8s.io",
+                ],
+            )
+        })
+        .unwrap();
+    assert!(rollback < patch);
 }
