@@ -166,6 +166,9 @@ def upgrade() -> None:
             primary_key=True,
         ),
         sa.Column("ref_commit_sha", sa.Text(), nullable=True),
+        # Set before the code host is asked to store a ref, so a crash before
+        # ref_commit_sha is recorded still leaves the ref findable for cleanup.
+        sa.Column("ref_pending", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.Column("comment_revision", sa.Integer(), nullable=True),
         sa.Column("comment_kind", sa.Text(), nullable=True),
         sa.Column("lease_owner", sa.Text(), nullable=True),

@@ -100,6 +100,7 @@ def _assert_created() -> None:
     assert {
         "lineage_id",
         "ref_commit_sha",
+        "ref_pending",
         "comment_revision",
         "comment_kind",
         "lease_owner",

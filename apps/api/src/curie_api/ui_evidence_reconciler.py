@@ -30,7 +30,13 @@ from curie_api.forges.capabilities import Operation, supports
 from curie_api.forges.errors import ForgeError, Unavailable, Unsupported
 from curie_api.forges.hosts import resolve_stored
 from curie_api.forges.ports import CodeHost, MarkedComments
-from curie_api.forges.types import EvidenceFile, PullRequestRef, ReplyTarget, RepositoryRef
+from curie_api.forges.types import (
+    EvidenceFile,
+    PullRequestRef,
+    PullRequestState,
+    ReplyTarget,
+    RepositoryRef,
+)
 
 from .config import Settings
 from .models import (
@@ -99,6 +105,9 @@ class _Publish:
     stamp: datetime
     repository: RepositoryRef
     ref_commit_sha: str | None
+    # The code host may hold this lineage's ref: one is recorded, or a store
+    # began and its commit was never recorded.
+    ref_held: bool
 
 
 @dataclass(frozen=True)
@@ -109,6 +118,7 @@ class _Lineage:
     revision: int
     repository: RepositoryRef
     ref_commit_sha: str | None
+    ref_held: bool
     failure: str | None
 
 
@@ -222,7 +232,10 @@ class UiEvidenceReconciler:
             )
             ended = await lineages(
                 ThreadPublicationLineage.status.in_(("merged", "closed")),
-                PublicationLineageUiEvidence.ref_commit_sha.is_not(None),
+                or_(
+                    PublicationLineageUiEvidence.ref_commit_sha.is_not(None),
+                    PublicationLineageUiEvidence.ref_pending,
+                ),
             )
         work: dict[uuid.UUID, uuid.UUID | str] = {}
         for lineage_id, publication_id in publish:
@@ -256,6 +269,40 @@ class UiEvidenceReconciler:
                 session, state.row.publication_id, state.version, status, **values
             ):
                 raise _LeaseLost
+
+    async def _finish_with_comment(
+        self, state: _Publish, lease: _Lease, status: str, kind: str, **values: object
+    ) -> None:
+        """The comment is written: record it on the lineage and settle the row
+        in one commit."""
+
+        async with self._sessionmaker() as session:
+            version = await crud.finish_row_with_comment(
+                session,
+                state.row.publication_id,
+                state.version,
+                status,
+                (lease.lineage_id, self._owner, lease.version),
+                {"comment_revision": state.revision, "comment_kind": kind},
+                comment_written_at=func.now(),
+                **values,
+            )
+        if version is None:
+            raise _LeaseLost
+        lease.version = version
+
+    @staticmethod
+    async def _head_is_candidate(code_host: CodeHost, state: _Publish) -> bool:
+        """An after image is current only when the pull request is open, its
+        live head is the recorded head, and that commit's tree is the candidate."""
+
+        pull = await code_host.read_pull_request(
+            PullRequestRef(state.repository, str(state.pr_number))
+        )
+        if pull.state is not PullRequestState.OPEN or pull.head_sha != state.head_sha:
+            return False
+        head_tree = (await code_host.read_commit(state.repository, pull.head_sha)).tree
+        return head_tree is not None and head_tree == state.row.candidate_tree
 
     async def run_once(self) -> PassResult:
         """One bounded pass over the lineages with evidence work."""
@@ -354,6 +401,7 @@ class UiEvidenceReconciler:
                 revision=lineage.latest_revision,
                 repository=await lineage_repository(session, self._settings, lineage),
                 ref_commit_sha=evidence.ref_commit_sha,
+                ref_held=evidence.ref_commit_sha is not None or evidence.ref_pending,
                 failure=(failed[0] or "failed") if failed is not None else None,
             )
 
@@ -364,14 +412,14 @@ class UiEvidenceReconciler:
             return False
         async with asyncio.timeout(_PHASE_CAP_S):
             await code_host.delete_evidence(repository, key=str(lease.lineage_id))
-        await self._write_lineage(lease, ref_commit_sha=None)
+        await self._write_lineage(lease, ref_commit_sha=None, ref_pending=False)
         return True
 
     async def _ended(self, lease: _Lease, result: PassResult) -> None:
         """A merged or closed lineage keeps its comment and loses its ref."""
 
         lineage = await self._lineage_now(lease.lineage_id)
-        if lineage is None or lineage.status == "open" or lineage.ref_commit_sha is None:
+        if lineage is None or lineage.status == "open" or not lineage.ref_held:
             return
         if await self._delete_ref(
             self._code_host_for(lineage.repository), lease, lineage.repository
@@ -397,7 +445,7 @@ class UiEvidenceReconciler:
             )
         except Unsupported:
             return
-        if lineage.ref_commit_sha is not None:
+        if lineage.ref_held:
             await self._delete_ref(code_host, lease, lineage.repository)
         body = render_stale(
             head_sha=lineage.head_sha, revision=lineage.revision, failure=lineage.failure
@@ -452,6 +500,7 @@ class UiEvidenceReconciler:
                 stamp=publication.created_at,
                 repository=await lineage_repository(session, self._settings, lineage),
                 ref_commit_sha=evidence.ref_commit_sha,
+                ref_held=evidence.ref_commit_sha is not None or evidence.ref_pending,
             )
 
     async def _claim_row(self, state: _Publish) -> float:
@@ -494,11 +543,8 @@ class UiEvidenceReconciler:
         expected = [image for image in state.images if image.refusal is None and image.bound]
         if not supports(code_host.capabilities, Operation.STORE_EVIDENCE):
             await post(render_unsupported(head_sha=state.head_sha, captured=len(expected)))
-            await self._write_lineage(
-                lease, comment_revision=state.revision, comment_kind="unsupported"
-            )
-            await self._finish(
-                state, "unsupported", outcome="unsupported", comment_written_at=func.now()
+            await self._finish_with_comment(
+                state, lease, "unsupported", "unsupported", outcome="unsupported"
             )
             result.published += 1
             return
@@ -509,11 +555,8 @@ class UiEvidenceReconciler:
             for image in state.images
             if image.state == "after" and image.ordinal not in refusals
         ]
-        if after:
-            # An after image is current only when the pushed head's tree is the candidate.
-            head_tree = (await code_host.read_commit(repository, state.head_sha)).tree
-            if head_tree is None or head_tree != state.row.candidate_tree:
-                refusals.update({image.ordinal: "head_changed" for image in after})
+        if after and not await self._head_is_candidate(code_host, state):
+            refusals.update({image.ordinal: "head_changed" for image in after})
         shown = [image for image in state.images if image.ordinal not in refusals]
         # An index arrived but no image was stored: the outcome comment says
         # so, and no ref is stored.
@@ -522,7 +565,7 @@ class UiEvidenceReconciler:
         urls: dict[int, str] = {}
         if shown:
             urls = await self._stored_urls(state, lease, code_host, shown)
-        elif state.ref_commit_sha is not None:
+        elif state.ref_held:
             await self._delete_ref(code_host, lease, repository)
 
         current = await self._lineage_now(state.row.lineage_id)
@@ -539,16 +582,19 @@ class UiEvidenceReconciler:
         rendered = _render(state, urls, refusals, "failed" if incomplete else None)
         await self._write_lineage(lease)
         await post(rendered.body)
-        await self._write_row(state, comment_written_at=func.now())
-        await self._write_lineage(
-            lease,
-            comment_revision=state.revision,
-            comment_kind="failed" if incomplete else "evidence",
-        )
         if incomplete:
-            await self._finish(state, "failed", error="upload_incomplete", outcome=rendered.outcome)
+            await self._finish_with_comment(
+                state,
+                lease,
+                "failed",
+                "failed",
+                error="upload_incomplete",
+                outcome=rendered.outcome,
+            )
         else:
-            await self._finish(state, "published", outcome=rendered.outcome)
+            await self._finish_with_comment(
+                state, lease, "published", "evidence", outcome=rendered.outcome
+            )
         result.published += 1
 
     async def _stored_urls(
@@ -575,7 +621,9 @@ class UiEvidenceReconciler:
             )
             for image in shown
         }
-        await self._write_lineage(lease)
+        # Durable before the store: a crash after it still leaves the ref
+        # findable by ended-lineage cleanup.
+        await self._write_lineage(lease, ref_pending=True)
         stored = await code_host.store_evidence(
             state.repository,
             key=str(state.row.lineage_id),
@@ -596,7 +644,7 @@ class UiEvidenceReconciler:
                 )
             await session.commit()
         await self._write_row(state, evidence_commit_sha=stored.commit_sha)
-        await self._write_lineage(lease, ref_commit_sha=stored.commit_sha)
+        await self._write_lineage(lease, ref_commit_sha=stored.commit_sha, ref_pending=False)
         return urls
 
     async def _timed_out(self, state: _Publish, lease: _Lease) -> None:
@@ -604,9 +652,6 @@ class UiEvidenceReconciler:
         published; otherwise one last outcome comment says the images ran out
         of time, and the row fails."""
 
-        if state.row.comment_written_at is not None:
-            await self._finish(state, "published", error="timeout")
-            return
         rendered = _render(
             state,
             {},
@@ -633,13 +678,8 @@ class UiEvidenceReconciler:
             )
             await self._finish(state, "failed", error="timeout")
             return
-        await self._write_lineage(lease, comment_revision=state.revision, comment_kind="failed")
-        await self._finish(
-            state,
-            "failed",
-            error="timeout",
-            outcome=rendered.outcome,
-            comment_written_at=func.now(),
+        await self._finish_with_comment(
+            state, lease, "failed", "failed", error="timeout", outcome=rendered.outcome
         )
 
 

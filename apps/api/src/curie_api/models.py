@@ -1942,6 +1942,9 @@ class PublicationLineageUiEvidence(Base):
         primary_key=True,
     )
     ref_commit_sha: Mapped[str | None] = mapped_column(Text, default=None)
+    # True from just before a ref store until its commit is recorded or the ref
+    # is deleted: a ref the code host may hold that cleanup must still delete.
+    ref_pending: Mapped[bool] = mapped_column(default=False, server_default="false")
     comment_revision: Mapped[int | None] = mapped_column(default=None)
     comment_kind: Mapped[str | None] = mapped_column(Text, default=None)
     lease_owner: Mapped[str | None] = mapped_column(Text, default=None)

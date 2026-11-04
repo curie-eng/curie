@@ -986,6 +986,108 @@ def test_merged_or_closed_lineage_deletes_the_evidence_ref(
     assert stack.fake.writes == writes
 
 
+def _dies_after(stack: Stack, pattern: str) -> httpx.AsyncClient:
+    """GitHub applies the first matching write, then the process dies before
+    it hears the answer."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = stack.fake.handle(request)
+        if re.search(pattern, f"{request.method} {request.url.path}"):
+            raise _Crash
+        return response
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def _crash_once(client: httpx.AsyncClient) -> None:
+    try:
+        with pytest.raises(_Crash):
+            reconcile(client)
+    finally:
+        asyncio.run(client.aclose())
+
+
+def lineage_evidence(revision: Revision) -> dict[str, Any]:
+    rows = _rows(
+        "SELECT ref_commit_sha, ref_pending, comment_revision, comment_kind "
+        "FROM curie.publication_lineage_ui_evidence WHERE lineage_id = :id",
+        {"id": revision.lineage_id},
+    )
+    assert len(rows) == 1
+    return rows[0]
+
+
+def test_a_head_pushed_after_the_recorded_one_marks_after_images_unavailable(
+    stack: Stack, auth_headers: dict[str, str]
+) -> None:
+    # Someone pushed to the pull request branch after Curie recorded its head;
+    # the recorded head's tree is still the candidate, the live head is not.
+    revision = published_with_evidence(stack, auth_headers)
+    stack.fake.branches[stack.fake.pulls[revision.pr_number]["head"]] = "f" * 40
+
+    reconcile(stack.http)
+
+    body = only_comment(stack, revision)
+    assert_shows(stack, revision, body, {0})
+    assert load_corpus()["texts"]["head_changed"] in body
+    assert revision.images[1] not in stack.fake.blobs.values()
+
+
+@pytest.mark.parametrize("merged", [True, False], ids=["merged", "closed"])
+def test_a_ref_stored_before_a_crash_is_deleted_when_the_lineage_ends(
+    stack: Stack, auth_headers: dict[str, str], merged: bool
+) -> None:
+    revision = published_with_evidence(stack, auth_headers)
+    # The ref is written on GitHub, then the process dies before recording it.
+    _crash_once(_dies_after(stack, r"^(POST|PATCH) /repos/[^ ]+/git/refs"))
+    assert stack.fake.evidence_ref(str(revision.lineage_id)) is not None
+    held = lineage_evidence(revision)
+    assert held["ref_commit_sha"] is None and held["ref_pending"] is True
+
+    stack.fake.set_pull_state(revision.pr_number, merged=merged)
+    _execute(
+        "UPDATE curie.thread_publication_lineages SET status = :status WHERE id = :id",
+        {"status": "merged" if merged else "closed", "id": revision.lineage_id},
+    )
+    expire_leases()
+    reconcile(stack.http)
+
+    assert stack.fake.evidence_ref(str(revision.lineage_id)) is None
+    cleaned = lineage_evidence(revision)
+    assert cleaned["ref_commit_sha"] is None and cleaned["ref_pending"] is False
+
+
+def test_a_crash_after_the_comment_records_neither_half_and_restart_settles_both(
+    stack: Stack, auth_headers: dict[str, str]
+) -> None:
+    first = published_with_evidence(stack, auth_headers)
+    _crash_once(_dies_after(stack, _COMMENT_WRITES))
+    assert len(marked_comments(stack, first)) == 1
+    # The comment and its record land in one commit: neither half is recorded.
+    assert evidence_row(first)["comment_written_at"] is None
+    assert lineage_evidence(first)["comment_revision"] is None
+
+    expire_leases()
+    reconcile(stack.http)
+    assert_shows(stack, first, only_comment(stack, first), {0, 1})
+    assert evidence_row(first)["status"] == "published"
+    assert lineage_evidence(first)["comment_revision"] == 1
+
+    # So a later revision without evidence still gets the current-head notice.
+    second = create_revision(stack, auth_headers, previous=first)
+    approve_and_push(stack, auth_headers, second, head_tree=OTHER_OID, previous=first)
+    _execute(
+        "UPDATE curie.publications SET created_at = created_at - interval '5 minutes' "
+        "WHERE id = :id",
+        {"id": uuid.UUID(second.id)},
+    )
+    reconcile(stack.http)
+    body = only_comment(stack, second)
+    assert f"No UI evidence exists for the current pull request head `{second.head_sha}`" in body
+    assert image_urls(body) == {}
+    assert stack.fake.evidence_ref(str(first.lineage_id)) is None
+
+
 def test_an_index_with_no_image_stored_by_the_deadline_gets_a_failed_outcome(
     stack: Stack, auth_headers: dict[str, str]
 ) -> None:

@@ -388,6 +388,20 @@ async def update_lineage(
     """One CAS write to the lineage's evidence row under its lease; renews the
     lease unless released. The new version, or None when the lease was lost."""
 
+    changed = await _cas_lineage(session, lineage_id, owner, version, renew=renew, **values)
+    await session.commit()
+    return changed
+
+
+async def _cas_lineage(
+    session: AsyncSession,
+    lineage_id: uuid.UUID,
+    owner: str,
+    version: int,
+    *,
+    renew: bool,
+    **values: object,
+) -> int | None:
     lease: dict[str, object] = (
         {"lease_expires_at": func.now() + LEASE}
         if renew
@@ -408,7 +422,6 @@ async def update_lineage(
         )
         .returning(PublicationLineageUiEvidence.version)
     )
-    await session.commit()
     return changed
 
 
@@ -439,20 +452,53 @@ async def finish_row(
 ) -> bool:
     """Settle a row terminal by CAS and clear its image bytes in the same commit."""
 
+    if not await _settle_row(session, publication_id, version, status, **values):
+        await session.rollback()
+        return False
+    await session.commit()
+    return True
+
+
+async def finish_row_with_comment(
+    session: AsyncSession,
+    publication_id: uuid.UUID,
+    version: int,
+    status: str,
+    lineage: tuple[uuid.UUID, str, int],
+    lineage_values: dict[str, object],
+    **values: object,
+) -> int | None:
+    """Record a written comment on the lineage (``lineage`` is its id, lease
+    owner and version) and settle the row terminal in one commit, so a crash
+    never leaves one recorded without the other. The lineage's new version, or
+    None when either CAS lost."""
+
+    lineage_id, owner, lineage_version = lineage
+    changed = await _cas_lineage(
+        session, lineage_id, owner, lineage_version, renew=True, **lineage_values
+    )
+    if changed is None or not await _settle_row(session, publication_id, version, status, **values):
+        await session.rollback()
+        return None
+    await session.commit()
+    return changed
+
+
+async def _settle_row(
+    session: AsyncSession, publication_id: uuid.UUID, version: int, status: str, **values: object
+) -> bool:
     changed = await session.scalar(
         _row_cas(publication_id, version)
         .values(**_terminal_values(status, **values))
         .returning(PublicationUiEvidence.version)
     )
     if changed is None:
-        await session.rollback()
         return False
     await session.execute(
         update(PublicationUiEvidenceImage)
         .where(PublicationUiEvidenceImage.publication_id == publication_id)
         .values(content=None)
     )
-    await session.commit()
     return True
 
 
