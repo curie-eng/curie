@@ -177,6 +177,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0145 | [A labelled issue is a backlog item and the stream is its queue](0145-a-labelled-issue-is-a-backlog-item-and-the-stream-is-its-queue.md) | Accepted |
 | 0146 | [For a headless lane, at capacity means wait, not reply](0146-headless-capacity-is-a-wait-not-a-reply.md) | Accepted |
 | 0147 | [Publication approval is a per-agent operator policy, not a platform constant](0147-publication-approval-is-a-per-agent-operator-policy.md) | Accepted |
+| 0148 | [Personal subscription execution and its acceptance contract](0148-personal-subscription-execution-and-acceptance-contract.md) | Draft |
 | 0151 | [A permission-gate card shows a bundle-authored sentence; the machine summary stays the audit record](0151-bundle-authored-human-approval-summary.md) | Draft |
 | 0152 | [Registry destinations are operator-declared, not a platform preset](0152-no-cidr-trusted-registries-preset.md) | Draft |
 | 0153 | [A channel-port turn carries its attachments, and the worker fetches them from the adapter that produced them](0153-a-channel-port-turn-carries-its-attachments.md) | Accepted |
