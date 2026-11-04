@@ -93,7 +93,16 @@ conversation, reconstructed through the selected harness adapter.
    Classified failures, budget/auth halts, idle outcomes, and synthetic
    incomplete fallback finals are not recorded. Best effort applies only to
    ordinary persistence failures: they retain the candidate final while marking
-   history durability lost. Every runner append sends `reserve_bytes` (8192), so
+   history durability lost. Each turn record carries a `record_id` minted once
+   per turn. For an item whose `record_id` it already stores, the state API
+   returns the stored entry unchanged with 200 and no version bump, checked
+   before the cap, so sending the same turn again cannot store it twice
+   (#5366). The runner therefore retries, in order and until it lands, any
+   append whose outcome is unknown: a 5xx, a 408 or 429, a connect failure, a
+   cut connection, a timeout, or a cancellation after the request was sent.
+   Until it lands, history durability reads as not yet durable rather than
+   lost. A 4xx refusal is final and stays a durability loss for the process,
+   since a retry cannot succeed. Every runner append sends `reserve_bytes` (8192), so
    the state API refuses with 413 any append that would leave less than that free
    under the value cap. The reserve keeps room for the worker's publication
    outcome append, which sends no reserve. A 413 on a turn append is not a
