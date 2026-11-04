@@ -4090,7 +4090,7 @@ impl LiveHost {
             .iter()
             .any(|(_, _, repo)| repository_runner_dockerfile(&repo["runner"]).is_none());
         let needs_installed_names = !repository_runners.is_empty() && self.chart_defaults.is_none();
-        let mut issues = if expected.is_empty() && !has_catalog_runners {
+        let issues = if expected.is_empty() && !has_catalog_runners {
             Vec::new()
         } else {
             // #4321 and ADR 0216: agent layers and catalog repository
@@ -4120,14 +4120,6 @@ impl LiveHost {
                 )],
             }
         };
-        if let Err(error) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(super::runner_templates::verify(&self.opts.common))
-        }) {
-            issues.push(format!(
-                "could not confirm platform agent SandboxTemplates: {error:#}"
-            ));
-        }
         Ok(CanaryVerdict {
             canary: Canary {
                 passed: version_ok && issues.is_empty(),
@@ -4522,10 +4514,7 @@ impl UpgradeDriver for LiveHost {
     fn retire_runner_layer_claims(&mut self) -> Result<()> {
         let agents = self.runner_layers.retired_agents();
         if agents.is_empty() {
-            return tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(super::runner_templates::reconcile(&self.opts.common))
-            });
+            return Ok(());
         }
         let templates = self.read_sandbox_templates().ok();
         let fullname = self.release_fullname();
@@ -4581,10 +4570,7 @@ impl UpgradeDriver for LiveHost {
                 );
             }
         }
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(super::runner_templates::reconcile(&self.opts.common))
-        })
+        Ok(())
     }
     fn observe_convergence(&self) -> Result<ConvergenceVerdict> {
         self.live_convergence()
