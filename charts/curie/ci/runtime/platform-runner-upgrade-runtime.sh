@@ -313,7 +313,9 @@ with urllib.request.urlopen(request,timeout=30) as response:
                 next(c for c in stale["podTemplate"]["spec"][kind] if c["name"] == name)["image"] = old_image
             patch(namespace, "sandboxtemplate", source_name, {"spec": stale})
             rollback_since = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-            result = cli(binary, namespace, release, chart, "rollback", "--revision", revision, "--yes", timeout=900)
+            result = run([binary, "--json", "cluster", "--context", context, "rollback",
+                          "--namespace", namespace, "--release", release, "--revision", revision, "--yes"],
+                         "cluster rollback", timeout=900)
             require(json.loads(result.stdout)["rolled_back"] is True, "rollback did not succeed")
             restored = read(namespace, "sandboxtemplate/" + source_name)
             require(restored["spec"] == expected_spec, "rollback left a stale runner image or changed agent settings")

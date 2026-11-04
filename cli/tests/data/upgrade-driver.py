@@ -1120,8 +1120,12 @@ if program == "helm":
     # https://github.com/helm/helm/blob/v3.20.0/cmd/helm/status.go
     if args[0] == "history":
         if (root / "runner-rollback").exists():
-            emit([{"revision": 1, "status": "superseded", "chart": "curie-0.8.6", "app_version": "0.8.6"},
-                  {"revision": 3 if rolled_back else 2, "status": "deployed", "chart": "curie-0.8.6", "app_version": "0.8.6"}])
+            emit([
+                {"revision": 1, "status": "superseded",
+                 "chart": "curie-0.8.6", "app_version": "0.8.6"},
+                {"revision": 3 if rolled_back else 2, "status": "deployed",
+                 "chart": "curie-0.8.6", "app_version": "0.8.6"},
+            ])
         history = release_history()
         if history is None:
             print("Error: release: not found", file=sys.stderr)
