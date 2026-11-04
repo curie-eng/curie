@@ -242,7 +242,7 @@ def _drive(
             release.set()
             second = await client.snapshot(base_url, token=TOKEN, base_sha=checkout.base)
             async with httpx.AsyncClient(transport=httpx.MockTransport(api.handle)) as http:
-                await relay_ui_evidence(_creator(http), PUBLICATION_ID, capture)
+                await relay_ui_evidence(_creator(http), PUBLICATION_ID, capture, remaining_s=None)
         finally:
             release.set()
             await client.close()
@@ -474,8 +474,13 @@ def test_capture_skips_when_the_attempt_budget_is_spent(tmp_path: Path) -> None:
     assert spent.image_calls == []
     assert spent.api.requests == []
 
+    # The publication create's whole API write budget is also left untouched.
+    reserved = _drive(checkout, wrap=count_index, remaining_s=129.0)
+    assert reserved.capture is None
+    assert calls == []
+
     # Liveness: a realistic remaining budget captures.
-    live = _drive(checkout, wrap=count_index, remaining_s=60.0)
+    live = _drive(checkout, wrap=count_index, remaining_s=200.0)
     assert calls == ["index"]
     assert live.capture is not None
     assert sorted(live.image_calls) == [0, 1]
@@ -562,7 +567,9 @@ def test_relay_never_raises_and_closes_its_files(
             else:
                 creator = _creator(http)
             started = time.monotonic()
-            assert await relay_ui_evidence(creator, PUBLICATION_ID, capture) is None
+            assert (
+                await relay_ui_evidence(creator, PUBLICATION_ID, capture, remaining_s=None) is None
+            )
             if isinstance(creator, (_RaisingCreator, _HangingCreator)):
                 assert creator.calls == 1
             return time.monotonic() - started
@@ -600,7 +607,40 @@ def test_relay_of_no_capture_sends_nothing() -> None:
 
     async def go() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(api.handle)) as http:
-            assert await relay_ui_evidence(_creator(http), PUBLICATION_ID, None) is None
+            assert (
+                await relay_ui_evidence(_creator(http), PUBLICATION_ID, None, remaining_s=None)
+                is None
+            )
 
     asyncio.run(go())
     assert api.requests == []
+
+
+def test_relay_is_bounded_by_the_delivery_lease_and_skips_when_it_is_spent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ui_evidence, "UPLOAD_BUDGET_S", 10_000.0)
+
+    def relay(remaining_s: float) -> tuple[int, float, bool]:
+        capture, _checkout = _fresh_capture(tmp_path / str(remaining_s))
+        creator = _HangingCreator()
+
+        async def go() -> float:
+            started = time.monotonic()
+            await relay_ui_evidence(creator, PUBLICATION_ID, capture, remaining_s=remaining_s)
+            return time.monotonic() - started
+
+        elapsed = asyncio.run(go())
+        return creator.calls, elapsed, all(handle.closed for handle in capture.files.values())
+
+    # The upload stops 5 s before the delivery deadline, whatever its own cap.
+    calls, elapsed, closed = relay(8.0)
+    assert calls == 1
+    assert 2.5 <= elapsed < 5.0
+    assert closed
+
+    # Nothing is sent once what remains is the settle floor.
+    calls, elapsed, closed = relay(4.9)
+    assert calls == 0
+    assert elapsed < 1.0
+    assert closed

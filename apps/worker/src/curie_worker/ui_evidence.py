@@ -36,6 +36,8 @@ from urllib.parse import quote
 import httpx
 from curie_telemetry import inject_trace_context
 
+from .api_retry import DEFAULT_BUDGET_S as _API_WRITE_BUDGET_S
+
 if TYPE_CHECKING:
     from .runner_client import RunnerClient
 
@@ -44,8 +46,11 @@ logger = logging.getLogger(__name__)
 # Budgets in seconds. Read at call time so tests may shorten them.
 CAPTURE_BUDGET_S = 120.0
 UPLOAD_BUDGET_S = 60.0
-# The capture leaves this much of the attempt's remaining budget untouched and
-# is skipped when what it may spend is this much or less.
+# Evidence work never spends what the publication still needs. The capture
+# runs before the publication is created, so it leaves the create's whole API
+# write budget plus the settle floor untouched, and is skipped when what it may
+# spend is _MIN_CAPTURE_S or less; the upload runs after, so it stops the
+# settle floor before the delivery deadline, and is skipped when nothing is left.
 _ATTEMPT_RESERVE_S = 5.0
 _MIN_CAPTURE_S = 5.0
 # A runner request's own HTTP bound sits just past the capture deadline so the
@@ -266,15 +271,16 @@ async def capture_ui_evidence(
 ) -> UiEvidenceCapture | None:
     """Copy this run's bound evidence images out of the sandbox, best effort.
 
-    Bounded to ``min(CAPTURE_BUDGET_S, remaining_s - 5 s)`` and skipped when
-    that is 5 s or less. Returns None when there is nothing to relay (no
-    manifest, an unreachable or older runner, or a malformed index). Never
+    Bounded to ``min(CAPTURE_BUDGET_S, remaining_s - 5 s - the publication
+    create's API write budget)`` and skipped when that is 5 s or less. Returns
+    None when there is nothing to relay (no manifest, an unreachable or older
+    runner, or a malformed index). Never
     raises except ``asyncio.CancelledError``, after closing its files.
     """
 
     budget = float(CAPTURE_BUDGET_S)
     if remaining_s is not None:
-        budget = min(budget, remaining_s - _ATTEMPT_RESERVE_S)
+        budget = min(budget, remaining_s - _ATTEMPT_RESERVE_S - _API_WRITE_BUDGET_S)
     if budget <= _MIN_CAPTURE_S:
         logger.info("ui evidence capture skipped: the attempt budget is spent")
         return None
@@ -342,11 +348,17 @@ async def capture_ui_evidence(
 
 
 async def relay_ui_evidence(
-    creator: object, publication_id: str, capture: UiEvidenceCapture | None
+    creator: object,
+    publication_id: str,
+    capture: UiEvidenceCapture | None,
+    *,
+    remaining_s: float | None,
 ) -> None:
     """Upload ``capture`` for ``publication_id``, best effort, then close it.
 
-    Bounded to ``UPLOAD_BUDGET_S``. A None capture or a creator without
+    Bounded to ``min(UPLOAD_BUDGET_S, remaining_s - 5 s)``, where
+    ``remaining_s`` is the delivery lease's remaining time, and skipped when
+    nothing is left. A None capture or a creator without
     ``upload_ui_evidence`` sends nothing. Never raises except
     ``asyncio.CancelledError``; the capture's files are closed on every path.
     """
@@ -358,6 +370,11 @@ async def relay_ui_evidence(
         if upload is None:
             return
         budget = float(UPLOAD_BUDGET_S)
+        if remaining_s is not None:
+            budget = min(budget, remaining_s - _ATTEMPT_RESERVE_S)
+        if budget <= 0:
+            logger.info("ui evidence upload skipped: the delivery budget is spent")
+            return
         async with asyncio.timeout(budget):
             await upload(publication_id, capture, budget_s=budget)
     except Exception as exc:  # noqa: BLE001 - evidence never fails the publication

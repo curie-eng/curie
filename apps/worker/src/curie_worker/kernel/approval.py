@@ -812,7 +812,13 @@ async def _pause_for_approval(
                 id=published.approval_id,
                 status=published.status,
             )
-            await relay_ui_evidence(publication_creator, published.id, outcome.ui_evidence)
+            lease = constants._DELIVERY_LEASE.get()
+            await relay_ui_evidence(
+                publication_creator,
+                published.id,
+                outcome.ui_evidence,
+                remaining_s=None if lease is None else lease.remaining_s(),
+            )
         else:
             assert self._approvals is not None
             # @spec HTTP-APPROVAL-CONTINUITY-3/4: only the live owner supplies identity.

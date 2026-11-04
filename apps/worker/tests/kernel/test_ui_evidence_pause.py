@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 from curie_test_support.ui_evidence import png
+from curie_worker.delivery_lease import DeliveryBudget, DeliveryLease
 from curie_worker.runner_client import RunnerWorkspaceSnapshot
 from curie_worker.workspace import WorkspacePreparationError
 
@@ -124,9 +125,11 @@ class _EvidencePublicationApi(_PublicationApi):
         self.events = events
         self.upload_error = upload_error
         self.uploads: list[dict[str, Any]] = []
+        self.create_budgets: list[float] = []
 
     async def create_publication(self, request: object, *, budget_s: float = 120) -> object:
         self.events.append("create")
+        self.create_budgets.append(budget_s)
         return await super().create_publication(request, budget_s=budget_s)
 
     async def upload_ui_evidence(
@@ -198,7 +201,33 @@ def _creation_view(request: Any) -> tuple[object, ...]:
     )
 
 
-async def _pause_once(h: Any, items: _WorkItems, publications: _PublicationApi) -> dict[str, Any]:
+def _delivery_lease(budget_s: float) -> DeliveryLease:
+    """A delivery lease with ``budget_s`` left and no fencing authority (empty
+    owner, generation 0), so only its budget differs from a leaseless call."""
+
+    lease = DeliveryLease(
+        stream="",
+        group="",
+        entry_id="",
+        owner="",
+        generation=0,
+        budget=DeliveryBudget(
+            deadline_ms=int(budget_s * 1000),
+            anchor_server_ms=0,
+            anchor_monotonic=time.monotonic(),
+        ),
+    )
+    lease.local_deadline_monotonic += budget_s
+    return lease
+
+
+async def _pause_once(
+    h: Any,
+    items: _WorkItems,
+    publications: _PublicationApi,
+    *,
+    lease: DeliveryLease | None = None,
+) -> dict[str, Any]:
     """Drive one factory execute turn to the publication pause; what the world saw."""
 
     marks = {
@@ -211,7 +240,9 @@ async def _pause_once(h: Any, items: _WorkItems, publications: _PublicationApi) 
         "deleted": len(h.fake_k8s.deleted_claims),
     }
     h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
-    await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
+    await h.kernel.process_event(
+        _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT), lease=lease
+    )
     return {
         "calls": items.calls[marks["calls"] :],
         "finishes": [
@@ -428,5 +459,64 @@ def test_a_creator_without_evidence_upload_is_untouched(
             # The capture ran and its files were simply dropped after creation.
             assert events[:3] == ["snapshot", "validate", "evidence_index"]
             assert events[-1] == "create"
+
+    asyncio.run(exercise())
+
+
+def test_a_tight_delivery_budget_skips_capture_and_leaves_create_its_budget(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 80 s of delivery budget: the capture may not spend what the publication
+    # create (up to its 120 s API write budget) still needs, so it never starts,
+    # and a stalled evidence route cannot shrink the create's budget.
+    async def exercise() -> None:
+        events: list[str] = []
+        publications = _EvidencePublicationApi(events)
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_RetainedBaseWorkspace,
+            publication_creator=publications,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            routes = _install(h, monkeypatch, events)
+            routes.mode = "hang"
+
+            view = await _pause_once(h, items, publications, lease=_delivery_lease(80.0))
+
+            _assert_paused(view)
+            assert "evidence_index" not in events
+            assert publications.uploads == []
+            (budget,) = publications.create_budgets
+            assert budget > 70.0
+
+    asyncio.run(exercise())
+
+
+def test_the_upload_is_bounded_by_the_delivery_lease(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With the fixed upload cap lifted, the lease alone bounds the upload, and
+    # it leaves the settle floor before the delivery deadline.
+    monkeypatch.setattr("curie_worker.ui_evidence.UPLOAD_BUDGET_S", 10_000.0)
+
+    async def exercise() -> None:
+        events: list[str] = []
+        publications = _EvidencePublicationApi(events)
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_RetainedBaseWorkspace,
+            publication_creator=publications,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            _install(h, monkeypatch, events)
+
+            view = await _pause_once(h, items, publications, lease=_delivery_lease(300.0))
+
+            _assert_paused(view)
+            (upload,) = publications.uploads
+            assert upload["files"] == IMAGES
+            assert 250.0 < upload["budget_s"] <= 295.0
 
     asyncio.run(exercise())
