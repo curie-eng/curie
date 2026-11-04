@@ -722,6 +722,10 @@ class SessionRunner:
             and state.approval_gate_kind == "permission"
         ):
             messages = close_suspended_tool_calls(messages)
+        record: TurnRecord | None = None
+        # Set just before this turn's own request starts. A cancellation before
+        # then (waiting for the lock, or flushing older records) sent nothing.
+        own_append_started = False
         try:
             harness_replay: HarnessReplayState | None = None
             # Once a channel read body reached this SDK session, its native
@@ -782,6 +786,7 @@ class SessionRunner:
                         len(self._deferred_history) - 1,
                     )
                 else:
+                    own_append_started = True
                     try:
                         await self._append_history(record)
                     except aiohttp.ClientConnectorError as exc:
@@ -806,8 +811,24 @@ class SessionRunner:
             )
             raise
         except BaseException as exc:
-            self._history_loss_observed = True
             self._history_durable = False
+            if record is not None and not own_append_started:
+                # This turn's request never started, so nothing was written:
+                # keep the record for the retry instead of losing it.
+                if all(item is not record for item in self._deferred_history):
+                    self._deferred_history.append(record)
+                self._ensure_history_retry()
+                logger.warning(
+                    "history append deferred session=%s error_class=%s",
+                    self._session_id,
+                    type(exc).__name__,
+                )
+                if isinstance(exc, anyio.get_cancelled_exc_class()) or not isinstance(
+                    exc, Exception
+                ):
+                    raise
+                return
+            self._history_loss_observed = True
             if isinstance(exc, anyio.get_cancelled_exc_class()) or not isinstance(exc, Exception):
                 raise
             status = getattr(exc, "status", None)
@@ -852,11 +873,12 @@ class SessionRunner:
 
         persisted = 0
         while self._deferred_history:
-            record = self._deferred_history.pop(0)
+            # The record stays at the head while its request is in flight, so
+            # the fence reads it as not yet durable until it lands.
+            record = self._deferred_history[0]
             try:
                 await self._append_history(record)
             except aiohttp.ClientConnectorError:
-                self._deferred_history.insert(0, record)
                 logger.debug(
                     "deferred history append still unreachable session=%s pending=%d",
                     self._session_id,
@@ -865,6 +887,7 @@ class SessionRunner:
                 break
             except BaseException as exc:
                 self._history_loss_observed = True
+                del self._deferred_history[0]
                 if isinstance(exc, anyio.get_cancelled_exc_class()) or not isinstance(
                     exc, Exception
                 ):
@@ -875,6 +898,7 @@ class SessionRunner:
                     type(exc).__name__,
                 )
             else:
+                del self._deferred_history[0]
                 persisted += 1
         if persisted:
             logger.info(

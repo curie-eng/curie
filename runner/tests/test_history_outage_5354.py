@@ -24,9 +24,10 @@ import anyio
 import pytest
 from aci_protocol import Event, Final, SessionStatus, parse_ndjson
 from aiohttp import web
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner import session as session_module
-from curie_runner.fake import FakeModelSession
+from curie_runner.fake import FakeModelSession, default_turn
 from curie_runner.history import HistoryRecord, StateApiTranscriptStore
 from curie_runner.session import SessionRunner
 from runner_state_fake import TRANSCRIPT_KEY, CappedCasState
@@ -109,8 +110,49 @@ def _fast_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(session_module, "_HISTORY_RETRY_MAX_S", 0.05, raising=False)
 
 
-def _runner(store: StateApiTranscriptStore) -> SessionRunner:
-    fake = FakeModelSession()
+class _HeldStore(StateApiTranscriptStore):
+    """The real store, holding one chosen record's next append until released.
+
+    The hold sits where the request would start, so while it is held the
+    runner sees that append as in flight and nothing has reached the API.
+    """
+
+    def __init__(self, key_url: str) -> None:
+        super().__init__(key_url, token=None)
+        self.hold: str | None = None
+        self.held = anyio.Event()
+        self.release = anyio.Event()
+
+    async def append(self, record: HistoryRecord) -> bool:
+        if self.hold is not None and getattr(record, "user", None) == self.hold:
+            self.hold = None
+            self.held.set()
+            await self.release.wait()
+        return await super().append(record)
+
+    async def wait_held(self, *, timeout: float = 5.0) -> None:
+        with anyio.fail_after(timeout):
+            await self.held.wait()
+
+
+def _max_turns_turn() -> list:
+    """A turn that ends in a max-turns failure, which the transcript never records."""
+    return [
+        AssistantMessage(content=[TextBlock(text="still probing")], model="stub-model"),
+        ResultMessage(
+            subtype="error_max_turns",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=True,
+            num_turns=20,
+            session_id="sdk-session",
+            result=None,
+        ),
+    ]
+
+
+def _runner(store: StateApiTranscriptStore, script_factory=default_turn) -> SessionRunner:
+    fake = FakeModelSession(script_factory)
     return SessionRunner(
         max_usd_per_day=None,
         held_secrets=frozenset(),
@@ -328,5 +370,86 @@ def test_close_during_an_outage_stops_the_retry_promptly(
             await anyio.sleep(0)
         assert len(store.attempted) == attempts
         assert runner.history_durable is False
+
+    anyio.run(go)
+
+
+def test_an_unrecorded_turn_during_an_in_flight_retry_keeps_the_fence_shut(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred record whose retry is in flight is still not durable.
+
+    A later turn that ends without recording a terminal (a max-turns failure)
+    settles the fence from what is deferred; the in-flight record must count.
+    """
+    _fast_retry(monkeypatch)
+    api = _StateApi()
+    scripts = iter((default_turn(), _max_turns_turn()))
+
+    async def go() -> None:
+        store = _HeldStore(api.key_url)
+        await _booted_store(api, store)
+        await api.stop()
+        runner = _runner(store, script_factory=lambda: next(scripts))
+        await runner.start()
+        try:
+            assert await _turn(runner, "first question") is SessionStatus.DONE
+            store.hold = "first question"
+            await store.wait_held()
+
+            await _turn(runner, "probe until done")
+            assert runner.history_durable is False
+
+            await api.start()
+            store.release.set()
+            await _retry_settled(runner)
+            assert api.posted_users() == ["first question"]
+            assert runner.history_durable is True
+        finally:
+            store.release.set()
+            await runner.close()
+            await api.stop()
+
+    anyio.run(go)
+
+
+def test_a_turn_cut_off_while_waiting_to_append_is_deferred_not_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The persistence budget can expire before this turn's request starts.
+
+    Here the retry holds the append lock with an earlier record in flight, so
+    the second turn's append waits and its budget cancels it. Nothing was sent,
+    so the record is kept and lands after the earlier one.
+    """
+    _fast_retry(monkeypatch)
+    api = _StateApi()
+
+    async def go() -> None:
+        store = _HeldStore(api.key_url)
+        await _booted_store(api, store)
+        await api.stop()
+        runner = _runner(store)
+        await runner.start()
+        try:
+            assert await _turn(runner, "first question") is SessionStatus.DONE
+            store.hold = "first question"
+            await store.wait_held()
+
+            monkeypatch.setattr(session_module, "_HISTORY_PERSISTENCE_BUDGET_SECONDS", 0.05)
+            assert await _turn(runner, "second question") is SessionStatus.DONE
+            assert runner.history_durable is False
+            monkeypatch.setattr(session_module, "_HISTORY_PERSISTENCE_BUDGET_SECONDS", 15.0)
+
+            await api.start()
+            store.release.set()
+            await _retry_settled(runner)
+            assert api.posted_users() == ["first question", "second question"]
+            assert api.stored_users() == ["first question", "second question"]
+            assert runner.history_durable is True
+        finally:
+            store.release.set()
+            await runner.close()
+            await api.stop()
 
     anyio.run(go)
