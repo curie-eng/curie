@@ -1387,6 +1387,13 @@ if program == "kubectl":
         print("sandboxclaim deleted")
         sys.exit(0)
     if args[:2] == ["-n", NAMESPACE] and args[2:4] == ["get", SANDBOX_TEMPLATES]:
+        platform_control = root / "platform-canary.json"
+        if converged and platform_control.exists():
+            control = json.loads(platform_control.read_text())
+            if control == "unreadable":
+                print("Error from server (Forbidden): templates is forbidden", file=sys.stderr)
+                sys.exit(1)
+            emit(control)
         inputs = retirement_inputs()
         prior_reads = sum(
             call[:5] == ["kubectl", "-n", NAMESPACE, "get", SANDBOX_TEMPLATES]

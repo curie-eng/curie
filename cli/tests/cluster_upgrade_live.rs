@@ -8116,3 +8116,51 @@ fn repository_runner_upgrade_null_dockerfile_is_catalog_in_plan_and_canary() {
         assert_ownership_released(&fixture);
     }
 }
+
+fn platform_canary_fixture(image: &str) -> Fixture {
+    let fixture = Fixture::new(None);
+    let objects = serde_json::json!({"items": [
+        {"metadata": {"name": "rel-curie-runner", "labels": {
+            "app.kubernetes.io/instance": "rel"}},
+         "spec": {"podTemplate": {"spec": {"containers": [
+            {"name": "runner", "image": "acme-runner:candidate"}]}}}},
+        {"metadata": {"name": "rel-curie-agent-acme-bot-runner", "labels": {
+            "app.kubernetes.io/instance": "rel", "app.kubernetes.io/managed-by": "curie-cli"}},
+         "spec": {"podTemplate": {"metadata": {"labels": {"curietech.ai/agent": "acme-bot"}},
+            "spec": {"containers": [{"name": "runner", "image": image}]}}}}
+    ]});
+    fs::write(fixture.0.path().join("platform-canary.json"), objects.to_string()).unwrap();
+    fixture
+}
+
+#[test]
+fn platform_agent_template_canary_rejects_stale_image_without_layers() {
+    let fixture = platform_canary_fixture("acme-runner:previous");
+    let output = fixture.local("healthy");
+    let body = json(&output);
+    assert_eq!(body["canary"]["passed"], false, "{body}");
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "canary", "{body}");
+    assert_ne!(body["known_good_version"], "0.9.0", "{body}");
+}
+
+#[test]
+fn platform_agent_template_canary_fails_closed_on_unreadable_list() {
+    let fixture = platform_canary_fixture("acme-runner:candidate");
+    fs::write(fixture.0.path().join("platform-canary.json"), "\"unreadable\"").unwrap();
+    let output = fixture.local("healthy");
+    let body = json(&output);
+    assert_eq!(body["canary"]["passed"], false, "{body}");
+    assert_eq!(body["phase"], "canary", "{body}");
+    assert_ne!(body["known_good_version"], "0.9.0", "{body}");
+}
+
+#[test]
+fn platform_agent_template_canary_accepts_matching_image_without_layers() {
+    let fixture = platform_canary_fixture("acme-runner:candidate");
+    let output = fixture.local("healthy");
+    let body = json(&output);
+    assert_eq!(body["status"], "succeeded", "{body}");
+    assert_eq!(body["canary"]["passed"], true, "{body}");
+    assert_eq!(body["known_good_version"], "0.9.0", "{body}");
+}
