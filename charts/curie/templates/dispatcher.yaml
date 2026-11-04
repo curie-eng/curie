@@ -83,6 +83,7 @@ spec:
       securityContext:
         fsGroup: 1000
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: dispatcher
           image: {{ include "curie.image" (dict "repository" .Values.dispatcher.image.repository "tag" .Values.dispatcher.image.tag "digest" .Values.dispatcher.image.digest "defaultTag" .Chart.AppVersion) | quote }}

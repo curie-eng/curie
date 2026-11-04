@@ -119,6 +119,7 @@ spec:
         fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
+      enableServiceLinks: false
       containers:
         - name: claim-check
           image: {{ .Values.security.probe.kubectlImage }}

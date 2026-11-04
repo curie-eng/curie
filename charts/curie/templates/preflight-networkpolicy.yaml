@@ -99,6 +99,7 @@ spec:
       {{- with .Values.priorityClasses.platform.name }}
       priorityClassName: {{ . }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: netpol-probe
           image: {{ .Values.preflights.networkPolicyProbe.image }}

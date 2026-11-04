@@ -279,6 +279,7 @@ spec:
       {{- $hasWorkerApiKey = true }}
       {{- end }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: worker
           image: {{ include "curie.image" (dict "repository" .Values.worker.image.repository "tag" .Values.worker.image.tag "digest" .Values.worker.image.digest "defaultTag" .Chart.AppVersion) | quote }}

@@ -90,6 +90,7 @@ spec:
         - name: data
           emptyDir: {}
         {{- end }}
+      enableServiceLinks: false
       containers:
         - name: clickhouse
           # Pinned tag (coupled to langfuse.image.tag); the AVX preflight

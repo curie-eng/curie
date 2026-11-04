@@ -49,6 +49,7 @@ spec:
       priorityClassName: {{ . }}
       {{- end }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: avx-check
           image: {{ .Values.preflights.avxCheck.image }}
