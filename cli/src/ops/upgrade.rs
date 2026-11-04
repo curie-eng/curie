@@ -766,12 +766,12 @@ fn plan_lines(
 
 /// The runner reference the upgraded release will render (#3218): the
 /// retained overlay's `agentSandbox.runner` fields over the target chart's
-/// defaults, with an empty tag meaning the target chart's appVersion, which
-/// the release train holds equal to `--to`. `None` when no image is known.
+/// defaults, with an empty tag meaning the target chart's appVersion.
+/// `None` when no image is known.
 pub(crate) fn target_runner_ref(
     chart_default: Option<&serde_json::Value>,
     overlay: &serde_json::Value,
-    to: &str,
+    app_version: Option<&str>,
 ) -> Option<String> {
     let mut runner = serde_json::Map::new();
     for source in [chart_default, Some(overlay)].into_iter().flatten() {
@@ -789,7 +789,7 @@ pub(crate) fn target_runner_ref(
         }
     }
     let values = serde_json::json!({"agentSandbox": {"runner": runner}});
-    crate::cluster_secrets::effective_runner_ref(&values, Some(to))
+    crate::cluster_secrets::effective_runner_ref(&values, app_version)
 }
 
 /// Retained repository declarations, with the indices used to replace only
@@ -2914,23 +2914,18 @@ impl LiveHost {
         Ok(())
     }
 
-    /// The version an available local chart declares for itself.
-    fn declared_chart_version(&self, chart: &str) -> Result<Option<String>> {
-        let cmd = OpsCommand::new(
-            "helm",
-            vec![plain("show"), plain("chart"), plain(chart.to_string())],
-        );
-        let (ok, out, err) = self.run(&cmd)?;
+    fn target_chart_metadata(&self) -> Result<serde_json::Value> {
+        let chart = self.chart_ref();
+        let mut args = vec![plain("show"), plain("chart"), plain(chart)];
+        if self.opts.chart.uses_helm_version() {
+            args.push(plain("--version"));
+            args.push(plain(&self.opts.to));
+        }
+        let (ok, out, err) = self.run(&OpsCommand::new("helm", args))?;
         if !ok {
             bail!("could not read chart metadata for {chart}: {}", err.trim());
         }
-        let doc: serde_json::Value =
-            serde_norway::from_str(&out).context("chart metadata is malformed")?;
-        Ok(match doc.get("version") {
-            Some(serde_json::Value::String(version)) => Some(version.clone()),
-            Some(serde_json::Value::Number(version)) => Some(version.to_string()),
-            _ => None,
-        })
+        serde_norway::from_str(&out).context("chart metadata is malformed")
     }
 
     /// R1: the pre-mutation half of the target pin, for a local chart only.
@@ -2940,7 +2935,14 @@ impl LiveHost {
             return None;
         }
         let to = &self.opts.to;
-        match self.declared_chart_version(chart) {
+        let version = self
+            .target_chart_metadata()
+            .map(|doc| match doc.get("version") {
+                Some(serde_json::Value::String(version)) => Some(version.clone()),
+                Some(serde_json::Value::Number(version)) => Some(version.to_string()),
+                _ => None,
+            });
+        match version {
             Ok(Some(version)) if version == *to => None,
             Ok(Some(version)) => Some(format!(
                 "chart {chart} declares version {version}, so it cannot install the requested {to}; \
@@ -3113,7 +3115,21 @@ impl LiveHost {
         if has_repository_runners {
             self.chart_defaults = self.target_chart_values();
         }
-        let raw_target = target_runner_ref(self.chart_defaults.as_ref(), &overlay, &self.opts.to);
+        let app_version = if self.opts.chart.pending_release().is_none() {
+            self.target_chart_metadata().ok().and_then(|metadata| {
+                metadata
+                    .get("appVersion")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            })
+        } else {
+            None
+        };
+        let raw_target = target_runner_ref(
+            self.chart_defaults.as_ref(),
+            &overlay,
+            app_version.as_deref(),
+        );
         if self.opts.chart.pending_release().is_some() && raw_target.is_none() {
             let stock_agents: Vec<_> = bindings
                 .iter()
@@ -5120,7 +5136,7 @@ mod runner_layer_guard_tests {
         // The overlay only sets a digest; the image field must still come
         // from the chart default underneath it.
         let overlay = runner_values(serde_json::json!({"digest": "sha256:aaaa"}));
-        let reference = target_runner_ref(Some(&chart_default), &overlay, "0.9.0")
+        let reference = target_runner_ref(Some(&chart_default), &overlay, Some("0.9.0"))
             .expect("image known from chart default");
         assert_eq!(reference, "ghcr.io/curie-eng/curie-runner@sha256:aaaa");
     }
@@ -5133,20 +5149,21 @@ mod runner_layer_guard_tests {
             "digest": "sha256:aaaa",
         }));
         // An explicit null in the overlay clears the chart default's digest,
-        // so the tag (falling back to `to`) takes over.
+        // so the tag takes over.
         let overlay = runner_values(serde_json::json!({"digest": null}));
-        let reference = target_runner_ref(Some(&chart_default), &overlay, "0.9.9")
+        let reference = target_runner_ref(Some(&chart_default), &overlay, Some("0.9.9"))
             .expect("tag known from chart default");
         assert_eq!(reference, "ghcr.io/curie-eng/curie-runner:0.9.0");
     }
 
     #[test]
-    fn target_runner_ref_empty_tag_falls_back_to_to() {
+    fn target_runner_ref_empty_tag_uses_chart_app_version() {
         let overlay = runner_values(serde_json::json!({
             "image": "ghcr.io/curie-eng/curie-runner",
             "tag": "",
         }));
-        let reference = target_runner_ref(None, &overlay, "0.9.5").expect("to backs an empty tag");
+        let reference = target_runner_ref(None, &overlay, Some("0.9.5"))
+            .expect("chart appVersion backs an empty tag");
         assert_eq!(reference, "ghcr.io/curie-eng/curie-runner:0.9.5");
     }
 
@@ -5157,14 +5174,14 @@ mod runner_layer_guard_tests {
             "tag": "0.9.0",
             "digest": "sha256:bbbb",
         }));
-        let reference = target_runner_ref(None, &overlay, "0.9.0").expect("digest known");
+        let reference = target_runner_ref(None, &overlay, Some("0.9.0")).expect("digest known");
         assert_eq!(reference, "ghcr.io/curie-eng/curie-runner@sha256:bbbb");
     }
 
     #[test]
     fn target_runner_ref_none_when_no_image_known() {
         let overlay = serde_json::json!({});
-        assert_eq!(target_runner_ref(None, &overlay, "0.9.0"), None);
+        assert_eq!(target_runner_ref(None, &overlay, Some("0.9.0")), None);
     }
 
     const STOCK_OLD: &str = "ghcr.io/curie-eng/curie-dark-factory-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

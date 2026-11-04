@@ -190,6 +190,7 @@ BASE = {
     "installed_image": None,
     "running_image": None,
     "show_chart": "0.9.0",
+    "app_version": None,
     "ready": 1,
     "updated": 1,
     "unavailable": 0,
@@ -974,7 +975,8 @@ def sandbox_templates():
     if runner.get("digest"):
         platform = f"{image}@{runner['digest']}"
     else:
-        platform = f"{image}:{runner.get('tag') or scenario['show_chart']}"
+        tag = runner.get("tag") or scenario["app_version"] or scenario["show_chart"]
+        platform = f"{image}:{tag}"
     agents = set()
     for key in POOL_AGENT_MAPS:
         if isinstance(sandbox.get(key), dict):
@@ -1177,7 +1179,7 @@ if program == "helm":
             "name": RELEASE,
             "chart": "curie",
             "version": chart_version,
-            "appVersion": chart_version,
+            "appVersion": scenario["app_version"] or chart_version,
             "namespace": NAMESPACE,
             "revision": row["revision"],
             "status": row["status"],
@@ -1242,6 +1244,9 @@ if program == "helm":
             "name: curie\nversion: {v}\nappVersion: {v}".format(v=scenario["show_chart"])
         )
         sys.exit(0)
+    if args[:2] == ["show", "values"] and os.environ.get("UPGRADE_DRIVER_REAL_HELM"):
+        import subprocess
+        sys.exit(subprocess.call([os.environ["UPGRADE_DRIVER_REAL_HELM"], *args]))
     if args[:2] == ["show", "values"] and (root / "chart-values.json").exists():
         # JSON is YAML. Without the file this falls through to exit 64 below.
         print((root / "chart-values.json").read_text())

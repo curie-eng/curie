@@ -8130,7 +8130,7 @@ fn image_pins(fixture: &Fixture, requested: &str, installed: &str, running: &str
     .unwrap();
 }
 
-fn assert_prerelease_recovery(fixture: &Fixture, refusal: &str) {
+fn prerelease_recovery(fixture: &Fixture, refusal: &str) -> (Value, Vec<String>) {
     let helm = Command::new("sh")
         .args(["-c", "command -v helm"])
         .output()
@@ -8140,6 +8140,21 @@ fn assert_prerelease_recovery(fixture: &Fixture, refusal: &str) {
         "real Helm required for chart packaging"
     );
     let helm = String::from_utf8(helm.stdout).unwrap();
+    let registry = support::oci_registry_stub::OciRegistryStub::start(vec![(
+        support::oci_registry_stub::RUNNER_REPO.into(),
+        "0.9.0".into(),
+        support::oci_registry_stub::INDEX_MEDIA_TYPE.into(),
+        STOCK_BASE_INDEX.as_bytes().to_vec(),
+    )]);
+    let runner_image = registry.image(support::oci_registry_stub::RUNNER_REPO);
+    let runner_values = serde_json::json!({"agentSandbox": {
+        "runner": {"image": runner_image, "tag": "", "digest": ""},
+        "runnerImages": {"acme-bot": LAYER_BOT}
+    }});
+    fixture.set_retained(&serde_json::json!({
+        "connectorCaller": {"existingSecret": "acme-caller-pair"},
+        "agentSandbox": runner_values["agentSandbox"]
+    }));
     let chart = fixture.0.path().join("chart");
     fs::create_dir(&chart).unwrap();
     fs::write(
@@ -8147,6 +8162,28 @@ fn assert_prerelease_recovery(fixture: &Fixture, refusal: &str) {
         "apiVersion: v2\nname: curie\nversion: 0.9.0\nappVersion: 0.9.0\n",
     )
     .unwrap();
+    let chart_values = serde_json::json!({"agentSandbox": {"runner":
+        runner_values["agentSandbox"]["runner"]
+    }});
+    fs::write(chart.join("values.yaml"), chart_values.to_string()).unwrap();
+    fs::create_dir(chart.join("templates")).unwrap();
+    fs::write(
+        chart.join("templates/_helpers.tpl"),
+        include_str!("../../charts/curie/templates/_helpers.tpl"),
+    )
+    .unwrap();
+    fs::write(
+        chart.join("templates/runner.yaml"),
+        r#"apiVersion: v1
+kind: Pod
+metadata:
+  name: runner
+spec:
+  containers:
+    - name: runner
+      image: {{ include "curie.image" (dict "repository" .Values.agentSandbox.runner.image "tag" .Values.agentSandbox.runner.tag "digest" .Values.agentSandbox.runner.digest "defaultTag" .Chart.AppVersion) | quote }}
+"#,
+    ).unwrap();
     let package = refusal
         .split('`')
         .find(|command| command.starts_with("helm package "))
@@ -8193,8 +8230,11 @@ fn assert_prerelease_recovery(fixture: &Fixture, refusal: &str) {
             "requested_image": PIN_NEW,
             "installed_image": PIN_OLD,
             "running_image": PIN_NEW,
+            "before": "0.9.0",
+            "served_before": "0.9.0",
             "after": version,
             "target": version,
+            "app_version": "0.9.0",
         })
         .to_string(),
     )
@@ -8218,6 +8258,26 @@ fn assert_prerelease_recovery(fixture: &Fixture, refusal: &str) {
     assert!(output.status.success(), "{body}");
     assert_eq!(body["convergence"]["exact"], true, "{body}");
     assert_eq!(fixture.helm_upgrades().len(), 1);
+    let applied: Value = serde_json::from_str(&fixture.values(1)).unwrap();
+    let values = fixture.0.path().join("rendered-values.json");
+    fs::write(&values, serde_json::to_vec(&applied).unwrap()).unwrap();
+    let rendered = Command::new(helm.trim())
+        .args(["template", "rel"])
+        .arg(&packaged)
+        .arg("-f")
+        .arg(&values)
+        .output()
+        .unwrap();
+    assert!(rendered.status.success(), "{}", visible(&rendered));
+    let pod: Value = serde_norway::from_slice(&rendered.stdout).unwrap();
+    assert_eq!(
+        pod["spec"]["containers"][0]["image"],
+        format!("{runner_image}:0.9.0")
+    );
+    (
+        applied,
+        registry.recorded().into_iter().map(|r| r.path).collect(),
+    )
 }
 
 #[test]
@@ -8241,7 +8301,18 @@ fn same_version_chart_digest_difference_refuses() {
         assert!(text.contains("distinct chart version"), "{body}");
         assert!(fixture.helm_upgrades().is_empty());
         if extra.is_empty() {
-            assert_prerelease_recovery(&fixture, body["error"].as_str().unwrap());
+            let (applied, registry_paths) =
+                prerelease_recovery(&fixture, body["error"].as_str().unwrap());
+            assert_eq!(
+                applied["agentSandbox"]["runnerImages"]["acme-bot"], LAYER_BOT,
+                "recovery must preserve the retained runner binding: {applied}"
+            );
+            assert!(
+                !registry_paths
+                    .iter()
+                    .any(|path| path.contains("0.9.0-pins.1")),
+                "{registry_paths:?}"
+            );
         }
         if !extra.is_empty() {
             assert!(
