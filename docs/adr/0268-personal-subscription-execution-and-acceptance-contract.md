@@ -1,7 +1,9 @@
 # 268. Personal subscription execution and its acceptance contract
 
 Date: 2026-11-04
-Status: Draft
+Status: Accepted
+
+Accepted 2026-11-04 with explicit maintainer approval from Brian Conn (TheConnMan), recorded in #5371.
 
 ## Context
 
@@ -10,9 +12,10 @@ records the SDK adapter and the need for a production authentication decision.
 [ADR 0088](0088-per-user-delegated-oauth-for-mcp.md) concerns delegated MCP
 authorization, not model authentication. [ADR 0166](0166-tenant-boundary-and-principal-identity-land-together.md)
 provides tenant principals and identity links, but does not bind model billing
-authority to an execution. This Draft proposes that binding for #5370; #5371
-tracks the decision record. It authorizes no implementation or subscription use.
-Acceptance requires explicit maintainer approval under [ADR 0085](0085-acceptance-not-implementation-authorizes-an-adr.md)
+authority to an execution. This decision records that binding for #5370; #5371
+tracks the decision record. Acceptance authorizes the implementation tracked in
+#5372 to #5380 under the recorded provider-risk decision.
+Explicit maintainer approval is recorded above under [ADR 0085](0085-acceptance-not-implementation-authorizes-an-adr.md)
 and [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
 
 The experiments recorded in #5371 are inputs, not product acceptance. Fresh
@@ -57,8 +60,8 @@ collector and mounts no saved native login or refresh profile in a coding
 sandbox. The candidate custody shape stores the user-supplied token in a
 Kubernetes Secret outside the coding environment and delivers
 `CLAUDE_CODE_OAUTH_TOKEN` only to the native CLI through a controlled launch
-boundary. This custody shape is conditional on the provider conclusion in
-section 5 and the containment result in #5372; it is not an approved design.
+boundary. This custody shape proceeds under the maintainer-accepted provider
+risk in section 5 and remains conditional on the containment result in #5372.
 #5374 implements only a boundary that passes that experiment. Failure stops
 delivery work and requires redesign and a new estimate.
 
@@ -141,7 +144,7 @@ grant, not human attribution. #5376 through #5378 introduce owner-aware admissio
 and lifecycle checks before #5379 qualifies two independent owners. No claim of
 tenant isolation exceeds the checks actually implemented and observed.
 
-### 5. Provider eligibility remains unresolved
+### 5. Provider eligibility decided as maintainer-accepted risk
 
 Retrieved on **2026-11-04** from Anthropic's
 [Legal and compliance](https://code.claude.com/docs/en/legal-and-compliance)
@@ -165,9 +168,9 @@ Its authentication restrictions include:
 
 > Advertised usage limits for Pro, Max, and Ultra plans assume ordinary, individual usage of Claude Code and the Agent SDK.
 
-These scope and usage-limit statements bear on open question 4: an unattended
-factory with reviewers and repair rounds still needs a conclusion about
-ordinary, individual subscription use.
+These scope and usage-limit statements bear on question 4 below. The maintainer
+has accepted the risk concerning ordinary, individual subscription use by an
+unattended factory with reviewers and repair rounds.
 
 > Developers building products or services that interact with Claude’s capabilities, including those using the Agent SDK, should use API key authentication through Claude Console or a supported cloud provider.
 
@@ -181,10 +184,10 @@ states:
 > This does not restrict how customers provision and manage their own API keys or third-party inference provider credentials — for example, configuring an API key in a development environment, secrets manager, or machine image for use by the customer’s own authorized users — provided the resulting usage is billed to the key owner under their agreement with Anthropic (or the applicable provider) and is not resold or intermediated as described above. Nor does it prevent an end user from signing in to the unmodified Claude Code binary with their own Claude subscription, including where a platform hosts Claude Code as described under Can customers offer Claude Code in their products? above.
 
 The secrets manager and machine image carve-out covers API keys and third-party
-inference provider credentials, not subscription tokens. Open question 2 must
-resolve the proposed subscription-token Secret custody separately; this
-paragraph does not grant that permission. Its no-resale and no-intermediation
-conditions also bear on open question 4.
+inference provider credentials, not subscription tokens. Question 2 below
+records the accepted risk for the proposed subscription-token Secret custody;
+this paragraph does not grant that permission. Its no-resale and
+no-intermediation conditions also bear on question 4.
 
 The authentication page documents the candidate token mechanism:
 
@@ -224,7 +227,13 @@ storing or intermediating credentials. Keeping the binary unmodified does not
 resolve those restrictions, nor the possible conflict between excluding
 alternative auth sources and the condition against restricting auth methods.
 
-Before acceptance, a maintainer must resolve and record:
+Resolution, 2026-11-04: the maintainer selected “Accept, take provider risk” in
+#5371 and resolved questions 1 to 4 as accepted risk for the shape this ADR
+describes. No provider clarification or approval was obtained or is claimed.
+A successful inference is still not provider approval. If Anthropic's terms
+change or Anthropic objects, revise this decision through a superseding ADR.
+Test grants come from the maintainer's own account and are delivered privately
+when needed. The four questions remain listed as the risks accepted:
 
 1. Whether the concrete SDK-driven factory is eligible hosted native-binary use
    or prohibited third-party subscription routing, including autonomous repairs
@@ -239,11 +248,6 @@ Before acceptance, a maintainer must resolve and record:
    limits and no-intermediation conditions cover the operator and end user,
    without paying for, reselling or intermediating their usage.
 
-Record the permitted concrete shape and its basis before accepting this ADR
-or dispatching dependent implementation. If the candidate is ineligible, revise
-this Draft and the tickets rather than implementing a workaround. A successful
-test inference proves authentication liveness only; it is never provider approval.
-
 ### 6. Acceptance contract
 
 These observable outcomes are future acceptance gates, not results delivered
@@ -252,8 +256,8 @@ Use dedicated test grants delivered privately; captures and public reports
 contain no credentials or real deployment identifiers. A row passes only with
 recorded candidate commit, exact driver command, expected and observed outcome,
 and owned-resource cleanup evidence. Static inspection does not replace a named
-runtime check. The #5372 experiment informs this Draft; implementation gates
-also require ADR acceptance and a permitting provider conclusion.
+runtime check. The #5372 experiment informs this decision; implementation gates
+rely on this acceptance and the recorded provider-risk decision.
 
 1. **Explicit mode and no fallback.** #5373; runner boundary tests and a real
    authenticated CLI turn on a throwaway Kubernetes cluster. Supply conflicting
@@ -340,7 +344,7 @@ Codex execution is outside this ADR and remains governed by the harness work
 in #4440. Slack issue-link kickoff is the feature #5380 and needs no separate
 architectural decision here; row 13 records its integration proof, not a new
 conversation system. Durable clarification conversations are outside that
-feature. No frozen package, chart, or runtime change ships with this Draft.
+feature. No frozen package, chart, or runtime change ships with this decision record.
 
 ## Consequences
 
@@ -357,9 +361,9 @@ feature. No frozen package, chart, or runtime change ships with this Draft.
 4. Replacement and disconnect require process termination and durable workspace
    recovery, with explicit authentication-required handling instead of silent
    continuation on a different billing identity.
-5. Eligibility and containment may invalidate the proposed custody shape.
-   This remains Draft until a maintainer resolves those questions and approves
-   the decision; successful probes cannot supply that authority.
+5. This ADR is Accepted under the recorded maintainer provider-risk decision.
+   The containment result in #5372 can still invalidate the proposed custody
+   shape; successful probes do not supply provider approval.
 
 ## Alternatives
 
