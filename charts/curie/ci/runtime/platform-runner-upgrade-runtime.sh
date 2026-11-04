@@ -156,11 +156,20 @@ def turn(executable, namespace, release, chart, expected, since):
 
 
 def snapshot(namespace, fullname):
-    credentials = read(namespace, "secret/" + fullname + "-secrets")["data"]
-    for value in credentials.values():
-        diagnostic_redactions.add(value)
-        diagnostic_redactions.add(base64.b64decode(value).decode(errors="replace"))
-    return {"credentials": {key: hashlib.sha256(value.encode()).hexdigest() for key, value in credentials.items()},
+    primary = read(namespace, "secret/" + fullname + "-secrets")
+    owner = primary["metadata"]["annotations"]["meta.helm.sh/release-name"]
+    credentials = {}
+    for secret in read(namespace, "secrets")["items"]:
+        if secret["metadata"].get("annotations", {}).get("meta.helm.sh/release-name") != owner:
+            continue
+        for key, value in secret.get("data", {}).items():
+            if key == "installationId":
+                continue
+            credentials[secret["metadata"]["name"] + "/" + key] = hashlib.sha256(value.encode()).hexdigest()
+            diagnostic_redactions.add(value)
+            diagnostic_redactions.add(base64.b64decode(value).decode(errors="replace"))
+    require(bool(credentials), "release has no recorded credential hashes")
+    return {"credentials": credentials,
             "pvcs": {item["metadata"]["name"]: item["metadata"]["uid"] for item in read(namespace, "pvc")["items"]}}
 
 
@@ -262,8 +271,8 @@ with urllib.request.urlopen(request,timeout=30) as response:
                 "--values-file", values_path, timeout=900)
         retained = snapshot(namespace, fullname)
         for kind in ("credentials", "pvcs"):
-            require(all(retained[kind].get(key) == value for key, value in before[kind].items()),
-                    "pre-existing release credentials or PVC identity changed")
+            changed = [key for key, value in before[kind].items() if retained[kind].get(key) != value]
+            require(not changed, "pre-existing " + kind + " changed: " + ", ".join(changed))
         layer_after = read(namespace, "sandboxtemplate/" + layer_name)
         expected_layer = images["runner"] if entry == "upgrade" else layer_before["spec"]["podTemplate"]["spec"]["containers"][0]["image"]
         require(layer_after["spec"]["podTemplate"]["spec"]["containers"][0]["image"] == expected_layer,
