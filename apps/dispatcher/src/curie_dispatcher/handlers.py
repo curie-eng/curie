@@ -96,6 +96,7 @@ from .approval_actions import (
     this_release_owns_action,
 )
 from .config import DispatcherConfig, release_identity
+from .dm_continuity import SlackDmContinuity
 from .http_receiver import (
     HttpReceiverRuntime,
     ReceiverSubmission,
@@ -466,8 +467,16 @@ def submit_selected_mention(
     the listener turns a refused one into the notice.
     @spec HTTP-INVOCATION-EXECUTION-27.
     """
+    # HTTP prepare has the bot user and not the bot id. History rows for this
+    # path set user to that bot user, so the user match is enough.
+    reader = SlackDmContinuity(web_client, config, logger=log)
+
+    def with_dm_history(turn_text: str) -> str:
+        return reader.resolve(event, bot_user_id, None, turn_text, body=body)
+
     prepared = runtime.prepare(
         body=body, event=event, slack_identity=slack_identity, bot_user_id=bot_user_id,
+        dm_continuity=with_dm_history,
     )
     if prepared is None:
         return SelectedMention(ReceiverSubmission(status="refused", stream_id=None), None)
@@ -821,6 +830,11 @@ def process_event(
             bot_user_id=bot_user_id,
             bot_id=bot_id,
             text=text,
+        )
+        # Same seam as the thread root: after the claim, before the placeholder,
+        # and it never raises, so a history failure still mints the turn.
+        text = SlackDmContinuity(web_client, config, logger=log).resolve(
+            event, bot_user_id, bot_id, text, body=body,
         )
 
         return _mint_turn(
