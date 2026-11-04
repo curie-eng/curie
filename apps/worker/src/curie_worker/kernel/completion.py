@@ -22,7 +22,7 @@ from ..behaviorpacks import (
     sample_load,
     sample_tip,
 )
-from ..capacity_wait import current_wait
+from ..capacity_wait import current_order, current_wait
 from ..delivery_lease import DeliveryLease
 from ..hook_runs import HookRunOutcome, HookRunReason
 from ..markers import (
@@ -292,10 +292,12 @@ async def _complete(
     marker_value: DoneMarkerValue = "history_capacity" if history_capacity_review else "1"
     thread_order = None
     if outcome == "escalated" and self._can_park(qevent) and lease is not None:
+        ordering = current_order()
         waiting = current_wait()
+        store = ordering[0] if ordering is not None else waiting[0] if waiting is not None else None
         member = (
-            await waiting[0].order_member(event_id, lease.entry_id)
-            if waiting is not None
+            await store.order_member(event_id, lease.entry_id)
+            if store is not None
             else f"{delivery_order_token(lease.entry_id)}|{event_id}"
         )
         thread_order = (routing._thread_key_for(qevent), member)

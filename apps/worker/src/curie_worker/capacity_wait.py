@@ -34,6 +34,10 @@ class CapacityWaitRequested(Exception):
     """The kernel could not start an interactive turn because capacity is absent."""
 
 
+class ThreadOrderWaitRequested(CapacityWaitRequested):
+    """An earlier delivery must start or report its failure first."""
+
+
 class WorkspaceDependencyWaitRequested(CapacityWaitRequested):
     """A pre-start workspace dependency needs the fixed durable retry window."""
 
@@ -86,6 +90,67 @@ def current_wait() -> tuple[CapacityWaitStore, str, int, DeliveryLease] | None:
     return _CURRENT_WAIT.get()
 
 
+_CURRENT_ORDER: ContextVar[tuple[CapacityWaitStore, str, str, DeliveryLease] | None] = ContextVar(
+    "curie_current_thread_order", default=None
+)
+
+
+@contextmanager
+def order_delivery_scope(
+    store: CapacityWaitStore,
+    event_id: str,
+    thread_key: str,
+    lease: DeliveryLease,
+) -> Iterator[None]:
+    token = _CURRENT_ORDER.set((store, event_id, thread_key, lease))
+    try:
+        yield
+    finally:
+        _CURRENT_ORDER.reset(token)
+
+
+def current_order() -> tuple[CapacityWaitStore, str, str, DeliveryLease] | None:
+    return _CURRENT_ORDER.get()
+
+
+_REGISTER_ORDER_LUA = """
+if redis.call('GET', KEYS[3]) ~= ARGV[1] then return {0} end
+if redis.call('HGET', KEYS[4], 'gen') ~= ARGV[2] then return {0} end
+local pending = redis.call('XPENDING', ARGV[3], ARGV[4], 'IDLE', 0, ARGV[5], ARGV[5], 1)
+if #pending == 0 or pending[1][2] ~= ARGV[6] then return {0} end
+local rank = redis.call('HGET', KEYS[2], 'order_token') or ARGV[8]
+local member = rank .. '|' .. ARGV[7]
+if redis.call('HGET', KEYS[2], 'order_started') ~= '1' then
+  redis.call('ZADD', KEYS[1], 0, member)
+  redis.call('HSET', KEYS[2], 'order_token', rank,
+    'order_stream', ARGV[3], 'order_group', ARGV[4], 'order_entry', ARGV[5])
+end
+for _, key in ipairs({KEYS[1], KEYS[2]}) do
+  redis.call('PEXPIRE', key, math.max(redis.call('PTTL', key), tonumber(ARGV[9])))
+end
+local first = redis.call('ZRANGE', KEYS[1], 0, 0)
+return {1, member, first[1] or ''}
+"""
+
+
+_FINISH_ORDER_LUA = """
+if redis.call('GET', KEYS[3]) ~= ARGV[1] then return 0 end
+if redis.call('HGET', KEYS[4], 'gen') ~= ARGV[2] then return 0 end
+if ARGV[5] == '0' and not redis.call('HGET', KEYS[2], 'state') then
+  redis.call('DEL', KEYS[2])
+  return 1
+end
+if redis.call('HGET', KEYS[2], 'order_entry') ~= ARGV[3] then return 1 end
+local rank = redis.call('HGET', KEYS[2], 'order_token')
+if ARGV[5] == '1' then
+  redis.call('HSET', KEYS[2], 'order_started', '1')
+  if rank then redis.call('ZREM', KEYS[1], rank .. '|' .. ARGV[4]) end
+end
+redis.call('HDEL', KEYS[2], 'order_stream', 'order_group', 'order_entry')
+return 1
+"""
+
+
 # Every guard precedes the first write. In particular, the exact PEL owner and
 # the delivery token are checked inside the script that acknowledges the entry.
 _PARK_LUA = """
@@ -136,10 +201,10 @@ local deferrals = tonumber(redis.call('HGET', record, 'deferrals')) or 0
 deferrals = deferrals + 1
 local retry_ms = tonumber(ARGV[12])
 local dependency_deadline = tonumber(redis.call('HGET', record, 'dependency_deadline_ms'))
-if tonumber(ARGV[15]) == 0 then
+if tonumber(ARGV[15]) == 0 and ARGV[16] ~= '1' then
   redis.call('HDEL', record, 'dependency_first_ms', 'dependency_deadline_ms')
   dependency_deadline = nil
-elseif not dependency_deadline then
+elseif not dependency_deadline and tonumber(ARGV[15]) > 0 then
   dependency_deadline = math.min(deadline, now + tonumber(ARGV[15]))
   redis.call('HSET', record, 'dependency_first_ms', now,
     'dependency_deadline_ms', dependency_deadline)
@@ -563,6 +628,9 @@ class CapacityWaitStore:
         def val(name: str, default: str = "") -> str:
             value = raw.get(name, default)
             return value.decode() if isinstance(value, bytes) else str(value)
+
+        if not val("state"):
+            return None
         return CapacityWaitRecord(
             event_id=event_id,
             fields=json.loads(val("fields", "{}")),
@@ -592,22 +660,67 @@ class CapacityWaitStore:
         rank = stored_rank.decode() if isinstance(stored_rank, bytes) else stored_rank
         return f"{rank or delivery_order_token(entry_id)}|{event_id}"
 
-    async def predecessor(self, thread_key: str, event_id: str, entry_id: str) -> str | None:
+    async def has_predecessor(
+        self,
+        thread_key: str,
+        event_id: str,
+        entry_id: str,
+        lease: DeliveryLease,
+    ) -> bool:
+        lease.raise_if_lost()
         key = self._thread_order(thread_key)
-        rank = (await self.order_member(event_id, entry_id)).split("|", 1)[0]
+        raw = await self._redis.eval(
+            _REGISTER_ORDER_LUA,
+            4,
+            key,
+            self._record(event_id),
+            self._config.delivery_lease_key(lease.stream, lease.group, entry_id),
+            self._config.delivery_state_key(lease.stream, lease.group, entry_id),
+            lease.owner,
+            str(lease.generation),
+            lease.stream,
+            lease.group,
+            entry_id,
+            self._config.consumer_name,
+            event_id,
+            delivery_order_token(entry_id),
+            str(int(self._config.capacity_wait_budget_s * 1000) + self._retention_ms),
+        )
+        if int(raw[0]) != 1:
+            raise CapacityWaitRefused("thread order registration lost its delivery")
+        member = raw[1].decode() if isinstance(raw[1], bytes) else str(raw[1])
+        rank = member.split("|", 1)[0]
         markers = Markers(self._redis, self._config)
+        head = raw[2]
         for _ in range(_BATCH):
-            members = await self._redis.zrange(key, 0, 0)
-            if not members:
-                return None
-            member = members[0].decode() if isinstance(members[0], bytes) else str(members[0])
+            if not head:
+                return False
+            member = head.decode() if isinstance(head, bytes) else str(head)
             earlier_rank, earlier = member.split("|", 1)
             if earlier == event_id or earlier_rank >= rank:
-                return None
+                return False
             record = await self.get(earlier)
             completion = await markers.read_completion(earlier)
+            pending = False
+            if record is None and completion is None:
+                stream, group, entry = await self._redis.hmget(
+                    self._record(earlier),
+                    "order_stream",
+                    "order_group",
+                    "order_entry",
+                )
+                if stream and group and entry:
+                    pending = bool(
+                        await self._redis.xpending_range(
+                            stream,
+                            group,
+                            min=entry,
+                            max=entry,
+                            count=1,
+                        )
+                    )
             resolved = (
-                (record is None and completion is None)
+                (record is None and completion is None and not pending)
                 or (record is not None and record.grant_confirmed)
                 or (
                     completion is None
@@ -616,9 +729,36 @@ class CapacityWaitStore:
                 )
             )
             if not resolved:
-                return earlier
+                return True
             await self._redis.zrem(key, member)
-        return earlier
+            members = await self._redis.zrange(key, 0, 0)
+            head = members[0] if members else ""
+        return True
+
+    async def finish_order(
+        self,
+        thread_key: str,
+        event_id: str,
+        lease: DeliveryLease,
+        *,
+        started: bool,
+    ) -> None:
+        lease.raise_if_lost()
+        finished = await self._redis.eval(
+            _FINISH_ORDER_LUA,
+            4,
+            self._thread_order(thread_key),
+            self._record(event_id),
+            self._config.delivery_lease_key(lease.stream, lease.group, lease.entry_id),
+            self._config.delivery_state_key(lease.stream, lease.group, lease.entry_id),
+            lease.owner,
+            str(lease.generation),
+            lease.entry_id,
+            event_id,
+            "1" if started else "0",
+        )
+        if int(finished) != 1:
+            raise CapacityWaitRefused("thread order release lost its delivery")
 
     async def park(
         self,
@@ -629,6 +769,7 @@ class CapacityWaitStore:
         *,
         thread_key: str | None = None,
         dependency_budget_s: float | None = None,
+        preserve_dependency: bool = False,
     ) -> CapacityWaitRecord:
         if not lease.owner or not lease.stream or not lease.group:
             raise CapacityWaitRefused("a real delivery lease is required")
@@ -662,6 +803,7 @@ class CapacityWaitStore:
             thread_key or "",
             delivery_order_token(entry_id),
             str(int(dependency_budget_s * 1000) if dependency_budget_s is not None else 0),
+            "1" if preserve_dependency else "0",
         )
         if int(raw[0]) != 1:
             raise CapacityWaitRefused(str(raw[1]))

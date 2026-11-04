@@ -46,6 +46,7 @@ from ..behaviorpacks import (
 )
 from ..capacity_wait import (
     CapacityWaitRequested,
+    current_order,
 )
 from ..delivery_lease import DeliveryLease
 from ..publication_validation import validate_snapshot_against_base
@@ -760,6 +761,9 @@ async def _attempt_turn(
     assert routed is not None
     record_reclaimed_retry()
     try:
+        ordering = current_order()
+        if ordering is not None:
+            await ordering[0].finish_order(ordering[2], ordering[1], ordering[3], started=True)
         release_order()
     except BaseException:  # noqa: BLE001 - broad catch kept at a failure boundary
         await close_routed_turn()

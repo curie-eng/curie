@@ -64,9 +64,12 @@ from .capacity_wait import (
     WAIT_TERMINAL_ONLY_FIELD,
     CapacityWaitExpired,
     CapacityWaitRecord,
+    CapacityWaitRefused,
     CapacityWaitRequested,
     CapacityWaitStore,
+    ThreadOrderWaitRequested,
     WorkspaceDependencyWaitRequested,
+    order_delivery_scope,
     wait_delivery_scope,
 )
 from .completion_health import observe_completion_outbox
@@ -584,7 +587,23 @@ class Consumer(StreamConsumer):
                     if qevent.event_id:
                         span.set_attribute("event_id", qevent.event_id)
 
+                    order_blocked = False
+                    order_error: Exception | None = None
+                    if self._kernel._can_park(qevent):
+                        try:
+                            order_blocked = await self._waits.has_predecessor(
+                                _thread_key_for(qevent),
+                                qevent.event_id,
+                                entry_id,
+                                lease,
+                            )
+                        except RedisError:
+                            order_blocked = True
+                        except (LeaseLostError, CapacityWaitRefused) as exc:
+                            order_error = exc
+
                     wait_generation: int | None = None
+                    wait_expired = False
                     if WAIT_GENERATION_FIELD in fields:
                         wait_generation = int(fields[WAIT_GENERATION_FIELD])
                         if WAIT_REPLY_REF_FIELD in fields and qevent.reply_handle is not None:
@@ -622,6 +641,7 @@ class Consumer(StreamConsumer):
                             await self._settle_delivery_best_effort(entry_id)
                             return
                         if wait_state == "expired":
+                            wait_expired = True
                             expired = await self._waits.get(qevent.event_id)
                             if expired is None or expired.dependency_deadline_ms is None:
                                 await self._expire_wait_delivery(
@@ -719,26 +739,41 @@ class Consumer(StreamConsumer):
                     with channel_event_id_scope(qevent.event_id):
                         try:
                             with (
-                                wait_delivery_scope(
-                                    self._waits, qevent.event_id, wait_generation, lease
-                                )
-                                if wait_generation is not None
-                                else nullcontext()
+                                (
+                                    order_delivery_scope(
+                                        self._waits,
+                                        qevent.event_id,
+                                        _thread_key_for(qevent),
+                                        lease,
+                                    )
+                                    if self._kernel._can_park(qevent)
+                                    else nullcontext()
+                                ),
+                                (
+                                    wait_delivery_scope(
+                                        self._waits, qevent.event_id, wait_generation, lease
+                                    )
+                                    if wait_generation is not None
+                                    else nullcontext()
+                                ),
                             ):
-                                if self._kernel._can_park(qevent):
-                                    try:
-                                        predecessor = await self._waits.predecessor(
-                                            _thread_key_for(qevent),
-                                            qevent.event_id,
-                                            entry_id,
-                                        )
-                                    except RedisError as exc:
-                                        raise CapacityWaitRequested() from exc
-                                    if predecessor is not None:
-                                        raise CapacityWaitRequested()
+                                if order_error is not None:
+                                    raise order_error
+                                if order_blocked and not wait_expired:
+                                    raise ThreadOrderWaitRequested()
                                 await self._kernel.process_event(
                                     qevent, lease=lease, **identity_arguments,
                                 )
+                                if (
+                                    self._kernel._can_park(qevent)
+                                    and await self._kernel._markers.is_terminal(qevent.event_id)
+                                ):
+                                    await self._waits.finish_order(
+                                        _thread_key_for(qevent),
+                                        qevent.event_id,
+                                        lease,
+                                        started=False,
+                                    )
                         except TurnAuthorityUnavailable:
                             logger.warning(
                                 "Current invocation authority unavailable; keeping pending"
@@ -766,6 +801,9 @@ class Consumer(StreamConsumer):
                                         _thread_key_for(qevent)
                                         if self._kernel._can_park(qevent)
                                         else None
+                                    ),
+                                    preserve_dependency=isinstance(
+                                        wait_requested, ThreadOrderWaitRequested
                                     ),
                                     dependency_budget_s=(
                                         self._config.workspace_total_timeout_seconds

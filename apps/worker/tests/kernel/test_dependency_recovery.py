@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
 from types import SimpleNamespace
 from typing import Any
 
@@ -22,7 +22,7 @@ from curie_worker.workspace import (
     WorkspacePreparationError,
 )
 
-from .test_consumer import _capacity_consumer, _pending_local_entry, _qevent
+from .test_consumer import _capacity_consumer, _pending_local_entry, _qevent, _wait_until
 from .test_kernel import _workspace_binding
 
 
@@ -507,5 +507,120 @@ def test_recovered_dependency_deadline_does_not_expire_a_healthy_wait(
                 assert h.runner.opened == ["original"]
                 assert h.sink.last_text == "healthy recovery"
                 assert h.sink.completions[-1].outcome == "delivered"
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("separate_kernel", [False, True])
+def test_followup_cannot_overtake_an_initial_dependency_failure(
+    make_harness,
+    separate_kernel: bool,
+) -> None:
+    async def go() -> None:
+        deployment = uuid.uuid4()
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = 0
+
+        async def selection(_request: web.Request) -> web.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_entered.set()
+                await release_first.wait()
+                return web.Response(status=503)
+            return web.json_response({"repo_full_name": None})
+
+        app = web.Application()
+        app.router.add_post(f"/v1/internal/workspaces/{deployment}/selection", selection)
+        async with TestServer(app) as server, AsyncExitStack() as stack:
+            knobs = dict(
+                binding=_workspace_binding(deployment),
+                slack_no_edit_streaming=True,
+                claim_timeout_seconds=0.02,
+            )
+            h = await stack.enter_async_context(make_harness(**knobs))
+            peer = await stack.enter_async_context(make_harness(**knobs)) if separate_kernel else h
+            credentials = WorkspaceCredentialClient(
+                api_url=str(server.make_url("")),
+                worker_token="example-worker-token",
+            )
+            for target in (h, peer):
+                target.kernel._workspace = WorkspaceClaimCoordinator(
+                    preparer=SimpleNamespace(credentials=credentials),
+                    substrate=target.substrate,
+                )
+            first_consumer = _capacity_consumer(h)
+            second_consumer = _capacity_consumer(peer)
+            await first_consumer.ensure_group()
+            first = _qevent("first", event_id="initial-first")
+            second = _qevent("second", event_id="initial-second", placeholder="p-2")
+            first_task = asyncio.create_task(_deliver(h, first_consumer, first))
+            second_task = None
+            try:
+                await asyncio.wait_for(first_entered.wait(), timeout=2)
+                second_task = asyncio.create_task(_deliver(peer, second_consumer, second))
+                await asyncio.wait_for(asyncio.shield(second_task), timeout=1)
+                assert h.runner.opened == peer.runner.opened == []
+                waiting = await second_consumer._waits.get(second.event_id)
+                assert waiting is not None and waiting.state == "waiting"
+                release_first.set()
+                await first_task
+                h.runner.default_script = [Final(text="first answer", status=SessionStatus.DONE)]
+                entry, fields = await _wake(h, first_consumer, first.event_id)
+                await first_consumer._sem.acquire()
+                await first_consumer._handle(entry, fields)
+                assert h.runner.opened == ["first"]
+                assert h.sink.last_text == "first answer"
+                for target in (h, peer):
+                    target.runner.default_script = [
+                        Final(text="second answer", status=SessionStatus.DONE)
+                    ]
+                entry, fields = await _wake(peer, second_consumer, second.event_id)
+                await second_consumer._sem.acquire()
+                await second_consumer._handle(entry, fields)
+                executed = h.runner.opened + (peer.runner.opened if separate_kernel else [])
+                assert executed == ["first", "second"]
+                assert peer.sink.last_text == "second answer"
+            finally:
+                release_first.set()
+                if second_task is not None and not second_task.done():
+                    second_task.cancel()
+                await asyncio.gather(
+                    first_task, *([second_task] if second_task else []), return_exceptions=True
+                )
+
+    asyncio.run(go())
+
+
+def test_registered_running_turn_still_accepts_a_followup_steer(make_harness, sync_redis) -> None:
+    async def go() -> None:
+        async with make_harness(slack_no_edit_streaming=False, max_concurrency=2) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            hold = asyncio.Event()
+            h.runner.default_script = []
+            h.runner.hold = hold
+            h.runner.tail = [Final(text="first answer", status=SessionStatus.DONE)]
+            first = _qevent("first", event_id="steer-first")
+            task = asyncio.create_task(_deliver(h, consumer, first))
+            try:
+                from curie_worker.kernel.routing import _thread_key_for
+
+                def started() -> bool:
+                    return bool(h.runner.queried) and not sync_redis.zcard(
+                        h.config.capacity_thread_order_key(_thread_key_for(first)),
+                    )
+
+                await _wait_until(started)
+                await _deliver(
+                    h, consumer, _qevent("second", event_id="steer-second", placeholder="p-2")
+                )
+                assert h.runner.opened == ["first"]
+                assert h.runner.steers == ["second"]
+                assert h.sink.completions[-1].outcome == "delivered"
+            finally:
+                hold.set()
+                await task
 
     asyncio.run(go())
