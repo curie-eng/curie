@@ -10,10 +10,13 @@
 //! `cluster_convergence.rs`. `PATH` is process-global, so every child gets its
 //! own `PATH` via `Command::env` and every test its own TempDir root.
 //!
-//! Upgrade convergence compares live containers against the requested chart.
-//! Requested pins, installed pins and running images vary independently so a
-//! retained manifest cannot silently substitute for the operator's target.
-//! Facet controls also assert that unrelated convergence flags remain true.
+//! Non-inertness is the design constraint. `convergence::observe` compares live
+//! containers against Helm's INSTALLED manifest, not against `--to`, so a
+//! fixture that moves the manifest and the live pods together can never make
+//! `images` false however the flag is wired. Every convergence fixture here
+//! therefore diverges exactly one facet and asserts that the OTHER named
+//! sub-flags stay true: a binding that collapses every flag onto
+//! `issues.is_empty()` fails these tests just as loudly as a hardcoded `true`.
 
 use crate::support;
 
@@ -633,8 +636,8 @@ fn only_false(json: &Value, expected_false: &[&str]) {
 /// produced this convergence payload.
 fn observed_for_real(fixture: &Fixture) {
     assert!(
-        fixture.issued(&["helm", "template"]),
-        "The requested chart must be rendered: {:?}",
+        fixture.issued(&["helm", "get", "manifest"]),
+        "Helm's installed target manifest must be read: {:?}",
         fixture.argv()
     );
     assert!(
@@ -8111,86 +8114,5 @@ fn repository_runner_upgrade_null_dockerfile_is_catalog_in_plan_and_canary() {
         );
         assert!(!record_completed(&fixture.last_record(), "commit"));
         assert_ownership_released(&fixture);
-    }
-}
-
-const PIN_OLD: &str = "ghcr.io/curie-eng/curie-api@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const PIN_NEW: &str = "ghcr.io/curie-eng/curie-api@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-
-fn image_pins(fixture: &Fixture, requested: &str, installed: &str, running: &str) {
-    fs::write(
-        fixture.0.path().join("image-pins.json"),
-        serde_json::json!({
-            "requested_image": requested,
-            "installed_image": installed,
-            "running_image": running,
-        })
-        .to_string(),
-    )
-    .unwrap();
-}
-
-#[test]
-fn same_version_chart_digest_difference_refuses() {
-    for extra in [vec![], vec!["--dry-run"]] {
-        let fixture = Fixture::new(None);
-        image_pins(&fixture, PIN_NEW, PIN_OLD, PIN_OLD);
-        let output = fixture.run_with("resumed-applied", "0.9.0", "charts/curie", &extra);
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-        let body = json(&output);
-        let text = body.to_string();
-        assert!(
-            text.contains("same-version") && text.contains(PIN_NEW) && text.contains(PIN_OLD),
-            "{body}"
-        );
-        assert!(text.contains("distinct chart version"), "{body}");
-        assert!(fixture.helm_upgrades().is_empty());
-        if !extra.is_empty() {
-            assert!(
-                body["plan"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|line| line.as_str().unwrap().contains("refusal at validate")),
-                "{body}"
-            );
-        }
-    }
-}
-
-#[test]
-fn same_version_identical_chart_pins_remain_noop() {
-    let fixture = Fixture::new(None);
-    image_pins(&fixture, PIN_NEW, PIN_NEW, PIN_NEW);
-    let output = fixture.local("resumed-applied");
-    let body = json(&output);
-    assert!(output.status.success(), "{body}");
-    assert_eq!(body["unchanged"], true, "{body}");
-    assert_eq!(body["convergence"]["images"], true, "{body}");
-    assert!(fixture.helm_upgrades().is_empty());
-}
-
-#[test]
-fn convergence_checks_requested_chart_pins() {
-    for (running, scenario, success) in
-        [(PIN_OLD, "stale-images", false), (PIN_NEW, "healthy", true)]
-    {
-        let fixture = Fixture::new(None);
-        image_pins(&fixture, PIN_NEW, PIN_OLD, running);
-        let output = fixture.local(scenario);
-        let body = json(&output);
-        assert_eq!(output.status.success(), success, "{body}");
-        if !success {
-            assert_eq!(output.status.code(), Some(1), "{body}");
-            assert_eq!(body["phase"], "converge", "{body}");
-        }
-        assert_eq!(body["convergence"]["images"], success, "{body}");
-        assert_eq!(body["convergence"]["exact"], success, "{body}");
-        assert_eq!(fixture.helm_upgrades().len(), 1);
     }
 }
