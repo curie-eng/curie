@@ -321,7 +321,6 @@ def test_cancellation_while_route_lock_exits_releases_open_runner_response(
     asyncio.run(go())
 
 
-
 def test_cancellation_during_registered_kill_recheck_releases_runner_response(
     make_harness,
 ) -> None:

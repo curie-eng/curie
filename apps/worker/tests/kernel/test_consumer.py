@@ -2789,7 +2789,6 @@ def test_dead_lettered_wake_gets_one_terminal_reply_and_owed_completion(
     asyncio.run(go())
 
 
-
 def test_dead_lettered_terminal_recovery_is_requeued_once(make_harness) -> None:
     async def go() -> None:
         async with make_harness(
@@ -2895,7 +2894,6 @@ def test_dead_lettered_terminal_recovery_is_requeued_once(make_harness) -> None:
             )
 
     asyncio.run(go())
-
 
 
 def test_active_dead_letter_stops_runner_before_terminal_reply(make_harness) -> None:
@@ -3134,7 +3132,6 @@ def test_capacity_wait_expires_at_its_original_deadline_after_restart(
                 assert not await h.async_redis.exists(h.config.completion_key(event.event_id))
 
     asyncio.run(go())
-
 
 
 def test_reclaim_skips_this_consumers_own_inflight_entry(make_harness) -> None:
@@ -4044,7 +4041,6 @@ def test_consumer_publishes_before_reads_and_renews_alive_and_capability(
     asyncio.run(go())
 
 
-
 def test_graceful_stop_keeps_lease_through_two_ttls_of_inflight_drain(
     make_harness,
 ) -> None:
@@ -4172,7 +4168,6 @@ def test_slow_renewal_inside_guard_keeps_lease_alive(make_harness) -> None:
     asyncio.run(go())
 
 
-
 def test_real_saturated_consumer_renews_lease_and_peer_cannot_prompt_claim(
     make_harness,
 ) -> None:
@@ -4240,7 +4235,6 @@ def test_real_saturated_consumer_renews_lease_and_peer_cannot_prompt_claim(
             await peer_task
 
     asyncio.run(go())
-
 
 
 def test_alive_restoration_resets_two_absence_proof(make_harness) -> None:
@@ -4622,7 +4616,6 @@ def test_terminal_liveness_failure_cancels_generation_and_clean_restart_recovers
     asyncio.run(go())
 
 
-
 def test_prompt_selection_stays_timely_while_heavy_reclaim_waits_for_capacity(
     make_harness,
 ) -> None:
@@ -4734,7 +4727,6 @@ def test_prompt_selection_stays_timely_while_heavy_reclaim_waits_for_capacity(
                 )
 
     asyncio.run(go())
-
 
 
 def test_next_turn_drains_queued_eval_reset_before_claiming(
