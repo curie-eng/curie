@@ -459,6 +459,7 @@ async def _attempt_turn(
     except (CapacityExhaustedError, AdmissionUnavailableError) as exc:
         rejection = exc.rejection if isinstance(exc, CapacityExhaustedError) else None
         if rejection is None:
+            record_reclaimed_retry()
             logger.warning("sandbox admission inventory unavailable for event %s", qevent.event_id)
         else:
             logger.warning(
