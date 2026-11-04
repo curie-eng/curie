@@ -3,8 +3,10 @@ name: CI
 on:
   merge_group:
     types: [checks_requested]
+  # backport/** holds maintenance backports: a release tag plus cherry-picked
+  # fixes. A push there gets the same proof as a push to a release branch.
   push:
-    branches: [main, next]
+    branches: [main, next, "backport/**"]
   pull_request:
     branches: [main, next, "task/**"]
     # Commit events only. A title or body edit must not cancel an in-flight
