@@ -284,6 +284,13 @@ def _is_factory_work_item_turn(self: Kernel, event_id: str) -> bool:
     return event_id in self._factory_work_item_events or self._run_for_event(event_id) is not None
 
 
+def _execution_deadline_for(self: Kernel, event_id: str) -> datetime | None:
+    """The execution deadline of the factory run bound to this turn, if any."""
+
+    run = self._run_for_event(event_id)
+    return None if run is None else run.execution_deadline
+
+
 def _work_item_repository(self: Kernel, event_id: str) -> str | None:
     """The persisted repository of this delivery's authenticated factory run."""
 

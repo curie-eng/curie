@@ -818,6 +818,7 @@ async def _pause_for_approval(
                 published.id,
                 outcome.ui_evidence,
                 remaining_s=None if lease is None else lease.remaining_s(),
+                execution_deadline=self._execution_deadline_for(qevent.event_id),
             )
         else:
             assert self._approvals is not None

@@ -1122,6 +1122,40 @@ def test_a_crash_after_the_comment_then_a_newer_revision_without_evidence_gets_t
     assert stack.fake.writes == writes
 
 
+def test_a_crash_after_the_ref_then_a_newer_revision_without_evidence_removes_it(
+    stack: Stack, auth_headers: dict[str, str]
+) -> None:
+    first = published_with_evidence(stack, auth_headers)
+    # GitHub applies the ref write, then the process dies: no comment exists.
+    _crash_once(_dies_after(stack, r"^(POST|PATCH) /repos/[^ ]+/git/refs"))
+    assert stack.fake.evidence_ref(str(first.lineage_id)) is not None
+    assert marked_comments(stack, first) == []
+
+    # Revision 2 lands with no evidence before the reconciler ever recovers.
+    second = create_revision(stack, auth_headers, previous=first)
+    approve_and_push(stack, auth_headers, second, head_tree=OTHER_OID, previous=first)
+    pull_request = code_pr(stack, second)
+    _execute(
+        "UPDATE curie.publications SET created_at = created_at - interval '5 minutes' "
+        "WHERE id = :id",
+        {"id": uuid.UUID(second.id)},
+    )
+    expire_leases()
+    reconcile(stack.http, passes=2)
+
+    body = only_comment(stack, second)
+    assert f"No UI evidence exists for the current pull request head `{second.head_sha}`" in body
+    assert image_urls(body) == {}
+    assert stack.fake.evidence_ref(str(first.lineage_id)) is None
+    settled = lineage_evidence(first)
+    assert settled["ref_commit_sha"] is None and settled["ref_pending"] is False
+    assert settled["comment_revision"] == 2
+    assert code_pr(stack, second) == pull_request
+    writes = stack.fake.writes
+    reconcile(stack.http)
+    assert stack.fake.writes == writes
+
+
 def test_an_index_with_no_image_stored_by_the_deadline_gets_a_failed_outcome(
     stack: Stack, auth_headers: dict[str, str]
 ) -> None:

@@ -248,6 +248,7 @@ async def _capture(checkout: Checkout) -> tuple[RunnerWorkspaceSnapshot, Any]:
             RUNNER_TOKEN,
             base_sha=snapshot.base_sha,
             remaining_s=600.0,
+            execution_deadline=None,
         )
         return snapshot, capture
     finally:
@@ -354,7 +355,9 @@ async def _create_and_relay(
             )
         )
         # A leaseless delivery, as the kernel relays without a delivery lease.
-        await relay_ui_evidence(creator, created.id, capture, remaining_s=None)
+        await relay_ui_evidence(
+            creator, created.id, capture, remaining_s=None, execution_deadline=None
+        )
         return created.id, created.approval_id
 
 
@@ -687,9 +690,7 @@ def test_live_github_round_trip(
         repository = client.portal.call(host.resolve_repository, f"{PATH_ID_PREFIX}{repo}")
         checkout = Checkout(tmp_path, repo, clone_header=header)
         base_sha = checkout.base_sha
-        tip = client.portal.call(
-            live.call, "GET", f"/git/ref/heads/{repository.default_branch}"
-        )
+        tip = client.portal.call(live.call, "GET", f"/git/ref/heads/{repository.default_branch}")
         assert tip.json()["object"]["sha"] == base_sha
 
         snapshot, capture = client.portal.call(_capture, checkout)

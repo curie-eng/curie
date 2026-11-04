@@ -225,14 +225,22 @@ class UiEvidenceReconciler:
                 ThreadPublicationLineage.status == "open",
                 ThreadPublicationLineage.pr_number.is_not(None),
                 ThreadPublicationLineage.head_sha.is_not(None),
-                # A comment is recorded for an earlier revision, or one was
-                # posted and never recorded.
+                # The pull request may carry something the latest revision did
+                # not record: a comment posted and never recorded, or a ref or
+                # comment recorded for an earlier revision or never at all.
                 or_(
                     PublicationLineageUiEvidence.comment_pending,
                     and_(
-                        PublicationLineageUiEvidence.comment_revision.is_not(None),
-                        PublicationLineageUiEvidence.comment_revision
-                        < ThreadPublicationLineage.latest_revision,
+                        or_(
+                            PublicationLineageUiEvidence.comment_revision.is_(None),
+                            PublicationLineageUiEvidence.comment_revision
+                            < ThreadPublicationLineage.latest_revision,
+                        ),
+                        or_(
+                            PublicationLineageUiEvidence.ref_pending,
+                            PublicationLineageUiEvidence.ref_commit_sha.is_not(None),
+                            PublicationLineageUiEvidence.comment_revision.is_not(None),
+                        ),
                     ),
                 ),
                 or_(no_evidence, failed),

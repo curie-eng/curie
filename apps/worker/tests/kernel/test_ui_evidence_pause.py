@@ -497,7 +497,8 @@ def test_the_upload_is_bounded_by_the_delivery_lease(
     make_harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # With the fixed upload cap lifted, the lease alone bounds the upload, and
-    # it leaves the settle floor before the delivery deadline.
+    # it leaves one API write budget (the approval hold) plus the settle floor
+    # before the delivery deadline.
     monkeypatch.setattr("curie_worker.ui_evidence.UPLOAD_BUDGET_S", 10_000.0)
 
     async def exercise() -> None:
@@ -517,6 +518,34 @@ def test_the_upload_is_bounded_by_the_delivery_lease(
             _assert_paused(view)
             (upload,) = publications.uploads
             assert upload["files"] == IMAGES
-            assert 250.0 < upload["budget_s"] <= 295.0
+            assert 160.0 < upload["budget_s"] <= 175.0
+
+    asyncio.run(exercise())
+
+
+def test_a_near_execution_deadline_skips_capture_and_upload(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No delivery lease bound, but the factory run's execution deadline is
+    # 100 s away: neither evidence step may spend what the create and the
+    # approval hold need before that deadline.
+    async def exercise() -> None:
+        events: list[str] = []
+        publications = _EvidencePublicationApi(events)
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_RetainedBaseWorkspace,
+            publication_creator=publications,
+        ) as h:
+            items = _WorkItems(deadline_s=100.0)
+            h.kernel._work_items = items
+            routes = _install(h, monkeypatch, events)
+            routes.mode = "hang"
+
+            view = await _pause_once(h, items, publications)
+
+            _assert_paused(view)
+            assert "evidence_index" not in events
+            assert publications.uploads == []
 
     asyncio.run(exercise())

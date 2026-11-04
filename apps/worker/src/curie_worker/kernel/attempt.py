@@ -984,6 +984,7 @@ async def _attempt_turn(
                             if snapshot_budget_s is None
                             else snapshot_budget_s - (clock.time.monotonic() - snapshot_started)
                         ),
+                        execution_deadline=self._execution_deadline_for(qevent.event_id),
                     )
                 except WorkspacePreparationError as exc:
                     outcome.publication_snapshot_error = f"publication snapshot failed: {exc}"

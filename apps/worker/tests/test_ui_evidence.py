@@ -23,6 +23,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -213,6 +214,7 @@ def _drive(
     wrap: Wrap | None = None,
     stall: bool = False,
     remaining_s: float | None = None,
+    execution_deadline: datetime | None = None,
     api: ApiStandIn | None = None,
 ) -> Run:
     api = api if api is not None else ApiStandIn(fault=fault)
@@ -236,13 +238,24 @@ def _drive(
                 wrap(client, checkout)
             started = time.monotonic()
             capture = await capture_ui_evidence(
-                client, base_url, TOKEN, base_sha=checkout.base, remaining_s=remaining_s
+                client,
+                base_url,
+                TOKEN,
+                base_sha=checkout.base,
+                remaining_s=remaining_s,
+                execution_deadline=execution_deadline,
             )
             elapsed = time.monotonic() - started
             release.set()
             second = await client.snapshot(base_url, token=TOKEN, base_sha=checkout.base)
             async with httpx.AsyncClient(transport=httpx.MockTransport(api.handle)) as http:
-                await relay_ui_evidence(_creator(http), PUBLICATION_ID, capture, remaining_s=None)
+                await relay_ui_evidence(
+                    _creator(http),
+                    PUBLICATION_ID,
+                    capture,
+                    remaining_s=None,
+                    execution_deadline=None,
+                )
         finally:
             release.set()
             await client.close()
@@ -486,6 +499,34 @@ def test_capture_skips_when_the_attempt_budget_is_spent(tmp_path: Path) -> None:
     assert sorted(live.image_calls) == [0, 1]
 
 
+def test_capture_skips_when_the_execution_deadline_is_near(tmp_path: Path) -> None:
+    # Plenty of delivery time, but the factory execution deadline is close: the
+    # publication create after the capture is refused past that deadline.
+    checkout = build_case_checkout(tmp_path / "case", CASES["complete"])
+    calls: list[str] = []
+
+    def count_index(client: RunnerClient, _checkout: CaseCheckout) -> None:
+        _wrap_index(client, lambda _index: calls.append("index"))
+
+    near = _drive(
+        checkout,
+        wrap=count_index,
+        remaining_s=3600.0,
+        execution_deadline=datetime.now(UTC) + timedelta(seconds=30),
+    )
+    assert near.capture is None
+    assert calls == []
+
+    far = _drive(
+        checkout,
+        wrap=count_index,
+        remaining_s=3600.0,
+        execution_deadline=datetime.now(UTC) + timedelta(seconds=600),
+    )
+    assert calls == ["index"]
+    assert far.capture is not None
+
+
 # --- Relay is best effort ------------------------------------------------------
 
 
@@ -528,6 +569,7 @@ def _fresh_capture(tmp_path: Path) -> tuple[Any, CaseCheckout]:
                 TOKEN,
                 base_sha=checkout.base,
                 remaining_s=None,
+                execution_deadline=None,
             )
         finally:
             await client.close()
@@ -568,7 +610,10 @@ def test_relay_never_raises_and_closes_its_files(
                 creator = _creator(http)
             started = time.monotonic()
             assert (
-                await relay_ui_evidence(creator, PUBLICATION_ID, capture, remaining_s=None) is None
+                await relay_ui_evidence(
+                    creator, PUBLICATION_ID, capture, remaining_s=None, execution_deadline=None
+                )
+                is None
             )
             if isinstance(creator, (_RaisingCreator, _HangingCreator)):
                 assert creator.calls == 1
@@ -608,7 +653,9 @@ def test_relay_of_no_capture_sends_nothing() -> None:
     async def go() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(api.handle)) as http:
             assert (
-                await relay_ui_evidence(_creator(http), PUBLICATION_ID, None, remaining_s=None)
+                await relay_ui_evidence(
+                    _creator(http), PUBLICATION_ID, None, remaining_s=None, execution_deadline=None
+                )
                 is None
             )
 
@@ -627,20 +674,39 @@ def test_relay_is_bounded_by_the_delivery_lease_and_skips_when_it_is_spent(
 
         async def go() -> float:
             started = time.monotonic()
-            await relay_ui_evidence(creator, PUBLICATION_ID, capture, remaining_s=remaining_s)
+            await relay_ui_evidence(
+                creator, PUBLICATION_ID, capture, remaining_s=remaining_s, execution_deadline=None
+            )
             return time.monotonic() - started
 
         elapsed = asyncio.run(go())
         return creator.calls, elapsed, all(handle.closed for handle in capture.files.values())
 
-    # The upload stops 5 s before the delivery deadline, whatever its own cap.
-    calls, elapsed, closed = relay(8.0)
+    # The upload stops one API write budget plus 5 s before the delivery
+    # deadline, whatever its own cap.
+    calls, elapsed, closed = relay(128.0)
     assert calls == 1
     assert 2.5 <= elapsed < 5.0
     assert closed
 
-    # Nothing is sent once what remains is the settle floor.
-    calls, elapsed, closed = relay(4.9)
+    # Nothing is sent once nothing beyond that reserve remains.
+    calls, elapsed, closed = relay(124.9)
     assert calls == 0
     assert elapsed < 1.0
     assert closed
+
+
+def test_relay_skips_when_the_execution_deadline_is_near(tmp_path: Path) -> None:
+    capture, _checkout = _fresh_capture(tmp_path)
+    creator = _HangingCreator()
+    asyncio.run(
+        relay_ui_evidence(
+            creator,
+            PUBLICATION_ID,
+            capture,
+            remaining_s=3600.0,
+            execution_deadline=datetime.now(UTC) + timedelta(seconds=60),
+        )
+    )
+    assert creator.calls == 0
+    assert all(handle.closed for handle in capture.files.values())

@@ -30,6 +30,7 @@ import re
 import tempfile
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import IO, TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -46,13 +47,30 @@ logger = logging.getLogger(__name__)
 # Budgets in seconds. Read at call time so tests may shorten them.
 CAPTURE_BUDGET_S = 120.0
 UPLOAD_BUDGET_S = 60.0
-# Evidence work never spends what the publication still needs. The capture
-# runs before the publication is created, so it leaves the create's whole API
-# write budget plus the settle floor untouched, and is skipped when what it may
-# spend is _MIN_CAPTURE_S or less; the upload runs after, so it stops the
-# settle floor before the delivery deadline, and is skipped when nothing is left.
+# Evidence work never spends what the publication flow still needs. What is
+# left is the earlier of the delivery deadline and the factory execution
+# deadline (the publication create and the approval hold are both refused
+# after it). Each evidence step leaves one whole API write budget plus the
+# settle floor of that untouched, for the create after the capture and for the
+# hold and settle after the upload. The capture is skipped when what it may
+# spend is _MIN_CAPTURE_S or less, the upload when nothing is left.
 _ATTEMPT_RESERVE_S = 5.0
 _MIN_CAPTURE_S = 5.0
+
+
+def _evidence_budget(
+    cap_s: float, remaining_s: float | None, execution_deadline: datetime | None
+) -> float:
+    """``cap_s``, cut so the flow after this step keeps its own budget."""
+
+    left = [] if remaining_s is None else [remaining_s]
+    if execution_deadline is not None:
+        left.append((execution_deadline - datetime.now(UTC)).total_seconds())
+    if not left:
+        return cap_s
+    return min(cap_s, min(left) - _ATTEMPT_RESERVE_S - _API_WRITE_BUDGET_S)
+
+
 # A runner request's own HTTP bound sits just past the capture deadline so the
 # capture deadline, not the transport, decides a timeout.
 _HTTP_GRACE_S = 1.0
@@ -268,19 +286,20 @@ async def capture_ui_evidence(
     *,
     base_sha: str,
     remaining_s: float | None,
+    execution_deadline: datetime | None,
 ) -> UiEvidenceCapture | None:
     """Copy this run's bound evidence images out of the sandbox, best effort.
 
-    Bounded to ``min(CAPTURE_BUDGET_S, remaining_s - 5 s - the publication
-    create's API write budget)`` and skipped when that is 5 s or less. Returns
+    Bounded to ``CAPTURE_BUDGET_S`` cut by ``_evidence_budget`` (the earlier of
+    ``remaining_s``, the delivery time left, and ``execution_deadline``, less
+    one API write budget and the settle floor) and skipped when that is 5 s or
+    less. Returns
     None when there is nothing to relay (no manifest, an unreachable or older
     runner, or a malformed index). Never
     raises except ``asyncio.CancelledError``, after closing its files.
     """
 
-    budget = float(CAPTURE_BUDGET_S)
-    if remaining_s is not None:
-        budget = min(budget, remaining_s - _ATTEMPT_RESERVE_S - _API_WRITE_BUDGET_S)
+    budget = _evidence_budget(float(CAPTURE_BUDGET_S), remaining_s, execution_deadline)
     if budget <= _MIN_CAPTURE_S:
         logger.info("ui evidence capture skipped: the attempt budget is spent")
         return None
@@ -353,13 +372,13 @@ async def relay_ui_evidence(
     capture: UiEvidenceCapture | None,
     *,
     remaining_s: float | None,
+    execution_deadline: datetime | None,
 ) -> None:
     """Upload ``capture`` for ``publication_id``, best effort, then close it.
 
-    Bounded to ``min(UPLOAD_BUDGET_S, remaining_s - 5 s)``, where
-    ``remaining_s`` is the delivery lease's remaining time, and skipped when
-    nothing is left. A None capture or a creator without
-    ``upload_ui_evidence`` sends nothing. Never raises except
+    Bounded to ``UPLOAD_BUDGET_S`` cut by ``_evidence_budget`` (``remaining_s``
+    is the delivery lease's remaining time) and skipped when nothing is left.
+    A None capture or a creator without ``upload_ui_evidence`` sends nothing. Never raises except
     ``asyncio.CancelledError``; the capture's files are closed on every path.
     """
 
@@ -369,9 +388,7 @@ async def relay_ui_evidence(
         upload = getattr(creator, "upload_ui_evidence", None)
         if upload is None:
             return
-        budget = float(UPLOAD_BUDGET_S)
-        if remaining_s is not None:
-            budget = min(budget, remaining_s - _ATTEMPT_RESERVE_S)
+        budget = _evidence_budget(float(UPLOAD_BUDGET_S), remaining_s, execution_deadline)
         if budget <= 0:
             logger.info("ui evidence upload skipped: the delivery budget is spent")
             return
