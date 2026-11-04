@@ -192,3 +192,40 @@ def test_missing_required_log_is_an_error(tmp_path: Path) -> None:
     assert result.returncode == 2
     assert result.stdout == ""
     assert "cannot read required API log" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "log",
+    [
+        'INFO: 127.0.0.1:1234 - "GET /agents HTTP/1.1" 500 Internal Server Error',
+        json.dumps(
+            {
+                "severity": "INFO",
+                "logger": "uvicorn.access",
+                "message": '127.0.0.1:1234 - "GET /agents?private=value HTTP/1.1" 503',
+            }
+        ),
+    ],
+)
+def test_unhandled_agent_listing_5xx(log: str) -> None:
+    summary = parse(log)
+    assert summary["api_5xx_routes"] == ["/agents"]
+    assert "private" not in json.dumps(summary)
+    assert "127.0.0.1" not in json.dumps(summary)
+
+
+def test_access_logs_never_promote_identifier_paths_to_templates() -> None:
+    log = "\n".join(
+        [
+            'INFO: 127.0.0.1:1234 - "GET /agents/private-id HTTP/1.1" 500 Internal Server Error',
+            'INFO: 127.0.0.1:1234 - "GET /agents HTTP/1.1" 200 OK',
+            json.dumps(
+                {
+                    "severity": "INFO",
+                    "logger": "curie_api.main",
+                    "message": 'private message contains "GET /agents HTTP/1.1" 500',
+                }
+            ),
+        ]
+    )
+    assert parse(log)["api_5xx_routes"] == []

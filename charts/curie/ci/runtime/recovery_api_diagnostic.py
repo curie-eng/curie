@@ -21,6 +21,9 @@ _TYPE_PATTERNS = (
 _COMPLETED = re.compile(
     r"^http request completed method=[A-Z]+ route=(/[^\s?#]*) status_class=5xx$"
 )
+# Unhandled 500s bypass the API completion logger. This exact collection route
+# has no path identifiers; arbitrary access-log paths cannot be reported safely.
+_AGENT_LIST_ACCESS = re.compile(r' - "GET /agents(?:\?[^"\s]*)? HTTP/[0-9.]+" 5[0-9]{2}(?:\s|$)')
 _SEVERITIES = frozenset({"WARNING", "ERROR", "CRITICAL"})
 _UVICORN = re.compile(r"^(WARNING|ERROR|CRITICAL):\s+")
 _LOGGER = re.compile(rf"{_IDENTIFIER}(?:\.{_IDENTIFIER})*")
@@ -54,10 +57,15 @@ def summarize(current: str, *, restart_count: int, previous: str = "") -> dict[s
             route = _COMPLETED.fullmatch(message) if isinstance(message, str) else None
             if route:
                 routes.add(route.group(1))
+            if logger == "uvicorn.access" and isinstance(message, str):
+                if _AGENT_LIST_ACCESS.search(message):
+                    routes.add("/agents")
         else:
             severity_match = _UVICORN.match(raw)
             if severity_match:
                 warnings.append(("uvicorn.error", severity_match.group(1)))
+            if raw.startswith("INFO:") and _AGENT_LIST_ACCESS.search(raw):
+                routes.add("/agents")
             texts = [raw]
         for text in texts:
             if isinstance(text, str):
