@@ -135,7 +135,7 @@ def clean(namespace, release):
     print("OK: owned release, namespace, PVCs and cluster objects removed", flush=True)
 
 
-def turn(executable, namespace, release, chart, expected, since):
+def turn(executable, namespace, release, chart, expected, since, runner_slots):
     thread = f"{time.time_ns() / 1e9:.6f}"
     started = time.monotonic()
     result = cli(executable, namespace, release, chart, "message", "--agent", "acme-bot", "--channel", "C0EXAMPLE1",
@@ -148,8 +148,9 @@ def turn(executable, namespace, release, chart, expected, since):
                and any(c.get("name") == "runner" for c in pod["spec"]["containers"])]
     require(bool(runners), "no new runner pod observed")
     for pod in runners:
-        runner = next(c for c in pod["spec"]["containers"] if c["name"] == "runner")
-        require(runner["image"] == expected, "new runner pod used a forbidden image")
+        for kind, name in runner_slots:
+            container = next(c for c in pod["spec"].get(kind, []) if c["name"] == name)
+            require(container["image"] == expected, f"new pod {kind} {name} used a forbidden runner image")
         require(any(c["name"] == "runner" and c.get("imageID") for c in pod["status"].get("containerStatuses", [])),
                 "new runner never started its image")
     print("OK: a new cold turn finalized on the expected runner within 180 seconds", flush=True)
@@ -230,6 +231,10 @@ with urllib.request.urlopen(request,timeout=30) as response:
                 "baseline deploy did not create a CLI-owned template")
         spec = source["spec"]["podTemplate"]["spec"]
         old_image = next(c["image"] for c in spec["containers"] if c["name"] == "runner")
+        runner_slots = [(kind, container["name"]) for kind in ("containers", "initContainers")
+                        for container in spec.get(kind, []) if container["image"] == old_image]
+        require(("initContainers", "workspace-init") in runner_slots,
+                "published baseline is missing its runner-backed workspace init container")
         extra_secret = {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "acme-runner-env"},
                         "stringData": {"ACME_UPGRADE_SENTINEL": "preserved"}}
         kc(namespace, "create", "-f", "-", stdin=json.dumps(extra_secret))
@@ -240,7 +245,7 @@ with urllib.request.urlopen(request,timeout=30) as response:
                 container["resources"]["limits"]["memory"] = "768Mi"
         patch(namespace, "sandboxtemplate", source_name, {"spec": source["spec"]})
         source = read(namespace, "sandboxtemplate/" + source_name)
-        turn(baseline, namespace, release, old_chart, old_image, "1970-01-01T00:00:00Z")
+        turn(baseline, namespace, release, old_chart, old_image, "1970-01-01T00:00:00Z", runner_slots)
         layer_name = fullname + "-agent-acme-layer-runner"
         layer_before = read(namespace, "sandboxtemplate/" + layer_name)
         before = snapshot(namespace, fullname)
@@ -279,15 +284,15 @@ with urllib.request.urlopen(request,timeout=30) as response:
                 "existing layered-runner upgrade behavior changed")
         after = read(namespace, "sandboxtemplate/" + source_name)
         expected_spec = copy.deepcopy(source["spec"])
-        for container in expected_spec["podTemplate"]["spec"]["containers"]:
-            if container["name"] == "runner":
-                container["image"] = images["runner"]
+        for kind, name in runner_slots:
+            container = next(c for c in expected_spec["podTemplate"]["spec"][kind] if c["name"] == name)
+            container["image"] = images["runner"]
         require(after["spec"] == expected_spec and after["metadata"]["labels"] == source["metadata"]["labels"],
                 "source template lost connector references, resources, labels, or target image")
         require(read(namespace, "sandboxwarmpool/" + source_name + "-pool")["spec"] == pool_before, "pool selection changed")
         require(read(namespace, "sandboxtemplate/" + foreign_name) == foreign_before, "unrelated template changed")
         kc(namespace, "delete", "sandboxclaims", "-l", "curietech.ai/agent=acme-bot", "--wait=true", "--timeout=90s")
-        turn(binary, namespace, release, chart, images["runner"], since)
+        turn(binary, namespace, release, chart, images["runner"], since, runner_slots)
         print(f"PASS: {entry} reconciled the deployed platform runner and preserved release and agent state", flush=True)
     finally:
         env.pop("K8S_KUBECONFIG", None)
