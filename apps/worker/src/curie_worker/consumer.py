@@ -809,6 +809,8 @@ class Consumer(StreamConsumer):
                                     entry_id,
                                     exc_info=True,
                                 )
+                            finally:
+                                self._kernel.forget_delivery(qevent.event_id)
                             return
                         try:
                             # A stale owner may not ACK. Checked immediately before

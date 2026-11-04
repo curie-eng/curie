@@ -1471,6 +1471,8 @@ def test_admission_unavailable_notice_without_durable_wait_stays_pending_then_co
             assert max(api.delivery_counts) == 2
             assert h.runner.queried == ["hello"]
             assert len(h.sink.completions) == 1
+            if placeholder:
+                assert h.sink.updates[-1] == ("C1", placeholder, "inventory restored")
             assert all("at capacity" not in text for _, _, text in h.sink.updates)
             assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
                 "pending"
@@ -1480,6 +1482,7 @@ def test_admission_unavailable_notice_without_durable_wait_stays_pending_then_co
     asyncio.run(go())
 
 
+@pytest.mark.parametrize("suppression", ["none", "lease-lost", "waiting", "wait-read-error"])
 @pytest.mark.parametrize("failure", ["sdk-timeout", "quota-timeout"])
 def test_admission_unavailable_notice_cleans_factory_continuation_on_original_kernel(
     make_harness,
@@ -1487,6 +1490,7 @@ def test_admission_unavailable_notice_cleans_factory_continuation_on_original_ke
     names,
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
+    suppression: str,
 ) -> None:
     client, api, admission = _inventory_timeout_client(
         sync_redis,
@@ -1520,11 +1524,35 @@ def test_admission_unavailable_notice_cleans_factory_continuation_on_original_ke
             entry_id, fields = await _pending_local_entry(h, event)
             opened = list(h.runner.opened)
             created = list(api.created)
+            wait_key = consumer._waits._record(event.event_id)
+            read_pods = api.list_namespaced_pod
+
+            def read_during_outage(*args: Any, **kwargs: Any) -> Any:
+                h.kernel._terminal_reply_attempted.add(event.event_id)
+                if suppression == "lease-lost":
+                    lease = kernel_constants._DELIVERY_LEASE.get()
+                    assert lease is not None
+                    lease.lost.set()
+                elif suppression == "waiting":
+                    sync_redis.hset(
+                        wait_key,
+                        mapping={
+                            "state": "waiting", "generation": "1", "fields": json.dumps(fields),
+                        },
+                    )
+                elif suppression == "wait-read-error":
+                    sync_redis.set(wait_key, "unreadable-wait-type")
+                return read_pods(*args, **kwargs)
+
+            monkeypatch.setattr(api, "list_namespaced_pod", read_during_outage)
             await consumer._sem.acquire()
             await consumer._handle(entry_id, fields)
             assert event.event_id not in h.kernel._factory_work_item_events
             assert event.event_id not in h.kernel._terminal_reply_attempted
+            if suppression in {"waiting", "wait-read-error"}:
+                assert sync_redis.delete(wait_key) == 1
             assert await consumer._waits.get(event.event_id) is None
+            monkeypatch.setattr(api, "list_namespaced_pod", read_pods)
             assert h.sink.updates == []
             assert h.runner.opened == opened
             assert api.created == created
