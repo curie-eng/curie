@@ -454,7 +454,8 @@ def test_full_profile_perms_wipe_leaves_no_anonymous_volume(cycle: Cycle) -> Non
     remaining = _volume_ids(cycle.env)
     survived = sorted(name for name in mounted if name in remaining)
     # The surviving id is first. A volume that is still present fails here,
-    # before the project label is checked.
+    # before the project label is checked. The release generator copies this
+    # named mount, and its test locks that copy.
     assert not survived, f"volumes still present after wipe: {survived}"
     assert cycle.foreign in remaining
     assert data_labels.get("com.docker.compose.project") == cycle.project, (
