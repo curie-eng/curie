@@ -186,6 +186,7 @@ BASE = {
     "deployment_absent": None,
     "target": "0.9.0",
     "requested_image": None,
+    "extra_containers": 0,
     "installed_image": None,
     "running_image": None,
     "show_chart": "0.9.0",
@@ -787,6 +788,11 @@ expected = {
     },
 }
 
+expected["spec"]["template"]["spec"]["containers"].extend(
+    {"name": f"sidecar{index}", "image": target_image}
+    for index in range(scenario["extra_containers"])
+)
+
 live = copy.deepcopy(expected)
 live["metadata"]["generation"] = 3
 live["spec"]["template"]["spec"]["containers"][0]["image"] = image
@@ -1286,6 +1292,10 @@ if program == "helm":
             requested["spec"]["template"]["spec"]["containers"][0]["image"] = (
                 scenario["requested_image"] or target_image
             )
+            digest = values.get("api", {}).get("image", {}).get("digest")
+            if digest:
+                for container in requested["spec"]["template"]["spec"]["containers"]:
+                    container["image"] = f"{REPO}@{digest}"
             print(json.dumps(requested))
             print("---")
             worker = values.get("worker", {})

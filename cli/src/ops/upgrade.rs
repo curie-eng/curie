@@ -1690,13 +1690,15 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
                 && !line.starts_with("phase migrate:")
                 && !line.starts_with(REPOSITORY_RUNNER_REBUILD_PREFIX)
         });
-        plan.insert(
-            2,
-            format!(
-                "phases drain_preflight, checkpoint, migrate, apply skipped: {} is already installed and known-good, so no helm upgrade runs; converge, canary and commit re-verify it",
-                opts.to
-            ),
-        );
+        if host.validate_refusal().is_none() {
+            plan.insert(
+                2,
+                format!(
+                    "phases drain_preflight, checkpoint, migrate, apply skipped: {} is already installed and known-good, so no helm upgrade runs; converge, canary and commit re-verify it",
+                    opts.to
+                ),
+            );
+        }
     }
     // Recovery still runs when the serving version is already known good.
     // Insert it after filtering the lifecycle's same-version skipped commands.
@@ -3468,8 +3470,41 @@ impl LiveHost {
             })
             .collect();
         if !differences.is_empty() {
-            bail!("same-version upgrade to {} has different chart image pins: {}; publish the requested chart with a distinct chart version and run `curie cluster upgrade --to <new-version> --chart <chart>`",
-                self.opts.to, differences.join("; "));
+            let shown = differences.len().min(3);
+            let preview = differences[..shown].join("\n");
+            let example_version = format!(
+                "{}-pins.1",
+                self.opts.to.split('+').next().unwrap_or_default()
+            );
+            let package = OpsCommand::new(
+                "helm",
+                vec![
+                    plain("package"),
+                    plain("<chart-directory>"),
+                    plain("--version"),
+                    plain(&example_version),
+                    plain("--app-version"),
+                    plain(&example_version),
+                ],
+            )
+            .display();
+            let mut example = self.opts.clone();
+            example.to = example_version.clone();
+            example.chart = UpgradeChart::AvailableLocal(format!("./curie-{example_version}.tgz"));
+            let mut upgrade = fail_forward_for(&example, false, "").command;
+            if self.opts.file_values.is_some() {
+                upgrade.push_str(" --values-file '<values-file>'");
+            }
+            bail!(
+                "same-version upgrade to {} refused: the requested render (chart plus values) \
+                 differs from the installed release; differing containers: {} (showing {shown})\n\
+                 {preview}\n\
+                 Repackage the chart with a distinct chart version, for example a prerelease: \
+                 `{package}` then `{upgrade}` (keep the same --values-file inputs), or, if the \
+                 change comes from a values file, drop the image change from --values-file.",
+                self.opts.to,
+                differences.len()
+            );
         }
         Ok(())
     }
@@ -3496,7 +3531,7 @@ impl LiveHost {
         let (ok, out, err) = self.run(&OpsCommand::new("helm", args))?;
         if !ok {
             bail!(
-                "could not render target Helm timeout metadata: {}",
+                "could not render requested chart and values: {}",
                 crate::schema_window::redact_probe_text(err.trim())
             );
         }

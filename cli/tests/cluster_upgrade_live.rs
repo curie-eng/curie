@@ -4026,7 +4026,7 @@ fn malformed_drain_timeout_metadata_refuses_before_apply() {
         );
         assert!(
             visible(&output).contains("target upgrade drain Job")
-                || visible(&output).contains("could not render target Helm timeout metadata"),
+                || visible(&output).contains("could not render requested chart and values"),
             "{scenario}: {}",
             visible(&output)
         );
@@ -8159,6 +8159,14 @@ fn same_version_chart_digest_difference_refuses() {
                     .any(|line| line.as_str().unwrap().contains("refusal at validate")),
                 "{body}"
             );
+            assert!(
+                !body["plan"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|line| { line.as_str().unwrap().contains("re-verify it") }),
+                "a refusing plan must not promise convergence, canary or commit: {body}"
+            );
         }
     }
 }
@@ -8193,4 +8201,116 @@ fn convergence_checks_requested_chart_pins() {
         assert_eq!(body["convergence"]["exact"], success, "{body}");
         assert_eq!(fixture.helm_upgrades().len(), 1);
     }
+}
+
+#[test]
+fn same_version_values_image_change_reports_bounded_recovery() {
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(
+        helm.status.success(),
+        "real Helm required to parse operator values"
+    );
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    for dry in [false, true] {
+        let fixture = Fixture::new(None);
+        fs::write(
+            fixture.0.path().join("image-pins.json"),
+            serde_json::json!({
+                "requested_image": PIN_OLD,
+                "installed_image": PIN_OLD,
+                "running_image": PIN_OLD,
+                "extra_containers": 5,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let values = fixture.0.path().join("operator-values.json");
+        fs::write(
+            &values,
+            serde_json::json!({"api": {"image": {
+                "digest": PIN_NEW.split_once('@').unwrap().1
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let mut flags = vec!["--values-file", values.to_str().unwrap()];
+        if dry {
+            flags.push("--dry-run");
+        }
+        let output = fixture.run_with_env(
+            "resumed-applied",
+            "0.9.0",
+            "charts/curie",
+            &flags,
+            &[("VALUES_FILES_REAL_HELM", helm.trim())],
+        );
+        assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
+        let body = json(&output);
+        let refusal = if dry {
+            plan_line(&body, "refusal at validate:")
+        } else {
+            body["error"].as_str().unwrap().to_owned()
+        };
+        assert!(
+            refusal.contains("requested render (chart plus values)"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("installed release"), "{refusal}");
+        assert!(
+            refusal.contains("differing containers: 6 (showing 3)"),
+            "{refusal}"
+        );
+        assert_eq!(refusal.matches(": installed ").count(), 3, "{refusal}");
+        assert!(!refusal.contains("containers/sidecar2"), "{refusal}");
+        assert!(
+            refusal.contains(PIN_OLD) && refusal.contains(PIN_NEW),
+            "{refusal}"
+        );
+        assert!(refusal.contains("helm package '<chart-directory>' --version 0.9.0-pins.1 --app-version 0.9.0-pins.1"), "{refusal}");
+        assert!(refusal.contains("curie cluster upgrade --to 0.9.0-pins.1 --release rel --namespace ns --chart ./curie-0.9.0-pins.1.tgz"), "{refusal}");
+        assert!(
+            refusal.contains("drop the image change from --values-file"),
+            "{refusal}"
+        );
+        assert!(fixture.helm_upgrades().is_empty());
+    }
+}
+
+#[test]
+fn same_version_values_non_image_change_remains_noop() {
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(
+        helm.status.success(),
+        "real Helm required to parse operator values"
+    );
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    let fixture = Fixture::new(None);
+    image_pins(&fixture, PIN_NEW, PIN_NEW, PIN_NEW);
+    let values = fixture.0.path().join("operator-values.json");
+    fs::write(&values, "{\"worker\":{\"deliveryBudgetSeconds\":777}}").unwrap();
+    let output = fixture.run_with_env(
+        "resumed-applied",
+        "0.9.0",
+        "charts/curie",
+        &["--values-file", values.to_str().unwrap()],
+        &[("VALUES_FILES_REAL_HELM", helm.trim())],
+    );
+    let body = json(&output);
+    assert!(output.status.success(), "{body}");
+    assert_eq!(body["unchanged"], true, "{body}");
+    assert!(
+        body["plan"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line.as_str().unwrap().contains("re-verify it")),
+        "{body}"
+    );
+    assert!(fixture.helm_upgrades().is_empty());
 }
