@@ -33,6 +33,7 @@ Env mapping:
     CURIE_ADMISSION_CACHE_PREFIX      -> admission_cache_prefix
     CURIE_THREAD_CONTEXT_CACHE_PREFIX -> thread_context_cache_prefix
     CURIE_THREAD_CONTEXT_TTL_SECONDS  -> thread_context_ttl_seconds
+    CURIE_DM_CONTINUITY_MAX_MESSAGES  -> dm_continuity_max_messages
     CURIE_HEARTBEAT_FILE             -> heartbeat_file
     CURIE_HEARTBEAT_INTERVAL_SECONDS -> heartbeat_interval_s
     CURIE_TEST_INSTALLATION_ENABLED  -> test_installation_enabled (ADR 0202)
@@ -238,6 +239,14 @@ class DispatcherConfig(BaseSettings):
         gt=0,
         validation_alias="CURIE_THREAD_CONTEXT_TTL_SECONDS",
     )
+    # How many earlier direct messages a top-level im may quote. Zero turns
+    # the read off. The alias is the only env name; a boolean is not a count.
+    dm_continuity_max_messages: int = Field(
+        default=20,
+        ge=0,
+        le=40,
+        validation_alias="CURIE_DM_CONTINUITY_MAX_MESSAGES",
+    )
 
     placeholder_text: str = Field(
         default="On it. Working on your request.",
@@ -302,6 +311,13 @@ class DispatcherConfig(BaseSettings):
             raise ValueError(
                 "test installation thread turn limit must be an integer, not a boolean"
             )
+        return value
+
+    @field_validator("dm_continuity_max_messages", mode="before")
+    @classmethod
+    def _dm_continuity_bound_is_not_a_boolean(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("dm continuity max messages must be an integer, not a boolean")
         return value
 
     @field_validator("test_installation_drivers", mode="before")

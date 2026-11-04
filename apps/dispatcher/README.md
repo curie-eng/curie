@@ -191,6 +191,19 @@ ID, channel, and root timestamp, for
 `CURIE_THREAD_CONTEXT_TTL_SECONDS`, so a restart keeps it and a long thread
 reads Slack once; a root that is not this bot's is cached without its text.
 
+## Earlier messages in a direct message
+
+A new top-level message in a one to one direct message quotes recent earlier
+messages from that person and this agent into the turn text, as untrusted
+context. The quote is the newest of those messages inside the last seven days,
+up to `CURIE_DM_CONTINUITY_MAX_MESSAGES` (default 20, allowed 0 through 40),
+oldest first. Zero does not call Slack. A thread reply, a channel mention, a
+group direct message, and any envelope whose `is_ext_shared_channel` is not
+exactly false are unchanged. The conversation id stays the Slack thread
+timestamp. The block is escaped the same way as a quoted thread root. A Slack
+error leaves the person's text unchanged and still admits the turn. Operators
+set the bound through `dispatcher.extraEnv`.
+
 ## The queue seam (what the worker consumes)
 
 The dispatcher `XADD`s onto a Valkey Stream (`CURIE_STREAM`, default
@@ -364,6 +377,7 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `CURIE_ADMISSION_CACHE_PREFIX` | `curie:admission:` | Valkey key prefix for the persisted caller-list answers, so a restarted dispatcher keeps them; change it only when two installs share one Valkey |
 | `CURIE_THREAD_CONTEXT_CACHE_PREFIX` | `curie:slack-root-context:` | Valkey key prefix for the cached thread-root answers (see *Replies in a thread this bot rooted*); change it only when two installs share one Valkey |
 | `CURIE_THREAD_CONTEXT_TTL_SECONDS` | `2592000` | how long a cached thread-root answer is kept, 30 days by default to match the idle transcript window; must be positive |
+| `CURIE_DM_CONTINUITY_MAX_MESSAGES` | `20` | how many earlier direct messages a top-level one to one direct message may quote; 0 turns the read off; allowed 0 through 40 |
 
 ### Boot preflights
 
