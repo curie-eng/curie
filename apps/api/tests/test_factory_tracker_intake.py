@@ -2031,3 +2031,57 @@ def test_base_poll_skips_completed_items_without_current_open_authority(
     assert _targeted_base_poll_reads(intake, jira_since, github_since) == (
         [f"/rest/api/3/issue/{issue.id}"], [f"/repositories/{REPO_ID}"]
     )
+
+
+def test_deleted_jira_issue_cancels_running_work_item(intake: Intake) -> None:
+    from curie_api import workitem_dispatch
+
+    intake.agent()
+    issue = _issue(intake)
+    intake.jira.add_label(issue.id, LABEL, intake.starter)
+    intake.poll()
+    [item] = _work_items(issue)
+    [request] = _requests(item["id"])
+    acquired = intake.acquire(request["id"])
+    assert acquired.status_code == 200, acquired.text
+    grant = acquired.json()
+    started = intake.client.post(
+        f"/v1/internal/work-items/requests/{request['id']}/start",
+        headers={"X-Curie-Worker-Token": get_settings().internal_worker_token},
+        json={
+            "owner": "factory-intake-owner",
+            "generation": grant["generation"],
+            "claim_name": "claim-deleted-issue",
+            "sandbox_name": "sandbox-deleted-issue",
+            "context": grant["context"],
+        },
+    )
+    assert started.status_code == 200, started.text
+    intake.poll()
+    assert _requests(item["id"])[0]["status"] == "running"
+
+    intake.jira.delete_issue(issue.id)
+    intake.poll()
+
+    [cancelled] = _rows(
+        "SELECT status, terminal_cause FROM curie.execution_requests WHERE id = :id",
+        {"id": request["id"]},
+    )
+    assert cancelled == {"status": "cancellation_requested", "terminal_cause": "issue_deleted"}
+    assert _work_items(issue)[0]["cancelled_at"] is not None
+    assert (
+        _rows(
+            "SELECT id FROM curie.publications WHERE execution_request_id = :id",
+            {"id": request["id"]},
+        )
+        == []
+    )
+
+    async def teardown_wake() -> None:
+        async with intake.client.app.state.sessionmaker() as session:
+            wakes = await workitem_dispatch.claim_terminate_publishes(
+                session, retry_seconds=60, limit=50
+            )
+            assert [wake.request_id for wake in wakes] == [request["id"]]
+
+    intake.client.portal.call(teardown_wake)

@@ -343,7 +343,7 @@ async def test_a_running_issue_missing_its_label_cancels_with_the_latest_removal
 
 
 @pytest.mark.anyio
-async def test_a_running_issue_that_is_gone_yields_nothing(fake: GitLabAPI) -> None:
+async def test_a_running_issue_that_is_gone_yields_deleted_cancellation(fake: GitLabAPI) -> None:
     tracker = gitlab_tracker(fake)
     iid = fake.add_issue("Ticket", author=WRITER)
     fake.label(iid, LABEL, WRITER)
@@ -352,7 +352,13 @@ async def test_a_running_issue_that_is_gone_yields_nothing(fake: GitLabAPI) -> N
 
     page = await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),))
 
-    assert page.notices == ()
+    (cancel,) = page.notices
+    assert (cancel.issue, cancel.disposition, cancel.event_id) == (
+        fake.issue_ref(iid),
+        Disposition.CANCEL,
+        "deleted",
+    )
+    assert await tracker.verify_current(cancel) is True
 
 
 @pytest.mark.anyio
