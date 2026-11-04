@@ -1090,8 +1090,12 @@ bounded wait that the route exposure section names. Every other signed
 delivery, including never configured and tombstoned hooks, keeps today's
 unbounded gate wait, so ordinary ingress behavior is unchanged. The
 gate-held reload still decides the path, so a row that changed while the
-request waited is resolved under the lock as before. Gate pool checkout itself stays bounded only by the pool
-timeout until [#4091](https://github.com/curie-eng/curie/issues/4091). The
+request waited is resolved under the lock as before. Gate pool checkout shares
+the supplied acquisition budget: it starts before checkout, so checkout,
+connection and transaction setup and the advisory lock wait all draw on it
+instead of adding up, while the unsupplied unbounded gate wait is unchanged and
+the rest of [#4091](https://github.com/curie-eng/curie/issues/4091) stays
+open. The
 SOURCE-2 rule that the gate is held through admission is unchanged: the
 admission script runs while the gate is held, and the gate is released only
 after the response is decided.
