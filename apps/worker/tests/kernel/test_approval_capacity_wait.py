@@ -1118,7 +1118,7 @@ def test_raw_approval_copy_preserves_unconfirmed_orphan_until_original_deadline(
                 await asyncio.gather(*list(replacement._inflight))
                 final = await replacement._waits.get(event.event_id)
                 expected_cause = {
-                    "epoch-only": "capacity_wait_expired",
+                    "epoch-only": "grant_unknown",
                     "unknown": "grant_unknown",
                     "ever-granted": "delivery_exhausted",
                 }[grant]
@@ -1314,5 +1314,77 @@ def test_approval_copy_checks_wait_after_winning_the_resume_claim(
                     if not task.done():
                         task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(go())
+
+
+class _FencedResumeClaim:
+    def __init__(self, delegate: DeliveryLeaseStore, h: Any, entry_id: str, fault: str) -> None:
+        self.delegate = delegate
+        self.h = h
+        self.entry_id = entry_id
+        self.fault = fault
+        self.claimed = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    async def claim_resume(self, lease: Any, event_id: str, *, consumer: str) -> bool:
+        granted = await self.delegate.claim_resume(lease, event_id, consumer=consumer)
+        if granted and lease.entry_id == self.entry_id:
+            self.claimed = True
+            if self.fault == "lease-token":
+                await self.h.async_redis.set(
+                    self.h.config.delivery_lease_key(lease.stream, lease.group, lease.entry_id),
+                    "acme-other-owner",
+                    px=int(self.h.config.delivery_lease_ttl_s * 1000),
+                )
+            else:
+                await self.h.async_redis.xclaim(
+                    lease.stream, lease.group, "acme-other-worker", 0, [lease.entry_id]
+                )
+        return granted
+
+
+@pytest.mark.parametrize("fault", ["lease-token", "pel-owner"])
+def test_raw_approval_orphan_adoption_refuses_a_lost_delivery_fence(
+    make_harness,
+    fault,
+) -> None:
+    async def go() -> None:
+        async with make_harness(slack_no_edit_streaming=True) as h:
+            original = _capacity_consumer(h)
+            await original.ensure_group()
+            event = _qevent("Continue", event_id="approval-acme-orphan-fenced-resolved")
+            parked = await _park(h, original, event)
+            await original._send_wait_notice(parked)
+            wake = await _wake(h, original, event.event_id)
+            assert await h.async_redis.xack(h.config.stream, h.config.consumer_group, wake[0]) == 1
+            before = await original._waits.get(event.event_id)
+            assert before is not None and before.state == "woken"
+            record_key = original._waits._record(event.event_id)
+            persisted = await h.async_redis.hgetall(record_key)
+            raw = await _pending_local_entry(h, event)
+            leases = _FencedResumeClaim(
+                DeliveryLeaseStore(h.async_redis, h.config), h, raw[0], fault
+            )
+            recovery = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=leases,
+            )
+            await _handle(recovery, raw)
+            assert leases.claimed
+            assert await recovery._waits.get(event.event_id) == before
+            assert await h.async_redis.hgetall(record_key) == persisted
+            pending = await _pending(h)
+            assert len(pending) == 1 and pending[0]["message_id"] == raw[0]
+            assert pending[0]["consumer"] == (
+                "acme-other-worker" if fault == "pel-owner" else h.config.consumer_name
+            )
+            assert h.runner.opened == h.sink.completions == []
+            assert not await h.kernel._markers.is_terminal(event.event_id)
+            assert not await h.async_redis.exists(h.config.dead_letter_stream_name())
 
     asyncio.run(go())

@@ -52,6 +52,7 @@ class CapacityWaitRecord:
     fields: dict[str, str]
     state: str
     generation: int
+    wake_entry: str | None
     first_wait_ms: int
     deadline_ms: int
     due_ms: int
@@ -329,6 +330,56 @@ redis.call('ZREM', waiting, event_id)
 redis.call('ZREM', notices, event_id)
 redis.call('ZADD', flight, tonumber(deadline), event_id)
 return {1, generation, wake_entry}
+"""
+
+
+_PREPARE_RESUME_LUA = """
+local record = KEYS[1]
+local stream = ARGV[1]
+local group = ARGV[2]
+local entry = ARGV[3]
+local pending = redis.call('XPENDING', stream, group, 'IDLE', 0, entry, entry, 1)
+if #pending == 0 then return {-1, 'not_pending'} end
+if pending[1][2] ~= ARGV[4] then return {-1, 'not_owner'} end
+if redis.call('GET', KEYS[4]) ~= ARGV[5] then return {-1, 'lease_lost'} end
+if redis.call('HGET', KEYS[5], 'gen') ~= ARGV[6] then
+  return {-1, 'lease_generation'}
+end
+if redis.call('EXISTS', KEYS[2]) == 1 or
+   redis.call('HGET', KEYS[3], 'done') == '1' then return {0} end
+local state = redis.call('HGET', record, 'state')
+if state == 'waiting' then return {1} end
+if state ~= 'woken' and state ~= 'active' then return {0} end
+local wake = redis.call('HGET', record, 'wake_entry')
+if wake == entry then return {1} end
+if wake then
+  local wake_pending = redis.call('XPENDING', stream, group, 'IDLE', 0, wake, wake, 1)
+  if #wake_pending > 0 then return {1} end
+  local entries = redis.call('XRANGE', stream, wake, wake, 'COUNT', 1)
+  if #entries > 0 then
+    local last_delivered = nil
+    for _, info in ipairs(redis.call('XINFO', 'GROUPS', stream)) do
+      local name = nil
+      local candidate = nil
+      for i = 1, #info, 2 do
+        if info[i] == 'name' then name = info[i + 1] end
+        if info[i] == 'last-delivered-id' then candidate = info[i + 1] end
+      end
+      if name == group then last_delivered = candidate; break end
+    end
+    if not last_delivered then return {-1, 'group_missing'} end
+    local wake_ms, wake_seq = string.match(wake, '^(%d+)%-(%d+)$')
+    local delivered_ms, delivered_seq = string.match(last_delivered, '^(%d+)%-(%d+)$')
+    if not wake_ms or not delivered_ms then return {-1, 'invalid_stream_id'} end
+    if tonumber(delivered_ms) < tonumber(wake_ms) or
+       (delivered_ms == wake_ms and tonumber(delivered_seq) < tonumber(wake_seq)) then
+      return {1}
+    end
+  end
+end
+local generation = tonumber(redis.call('HGET', record, 'generation')) + 1
+redis.call('HSET', record, 'generation', generation, 'wake_entry', entry)
+return {1}
 """
 
 
@@ -665,6 +716,7 @@ class CapacityWaitStore:
             fields=json.loads(val("fields", "{}")),
             state=val("state"),
             generation=int(val("generation", "0")),
+            wake_entry=val("wake_entry") or None,
             first_wait_ms=int(val("first_wait_ms", "0")),
             deadline_ms=int(val("deadline_ms", "0")),
             due_ms=int(val("due_ms", "0")),
@@ -819,6 +871,29 @@ class CapacityWaitStore:
         )
         if int(finished) != 1:
             raise CapacityWaitRefused("thread order release lost its delivery")
+
+    async def prepare_resume(
+        self, event_id: str, lease: DeliveryLease
+    ) -> CapacityWaitRecord | None:
+        """Keep an owned wake or adopt an orphan under the replacement's fence."""
+        lease.raise_if_lost()
+        raw = await self._redis.eval(
+            _PREPARE_RESUME_LUA, 5,
+            self._record(event_id), self._config.done_key(event_id),
+            self._config.completion_key(event_id),
+            self._config.delivery_lease_key(lease.stream, lease.group, lease.entry_id),
+            self._config.delivery_state_key(lease.stream, lease.group, lease.entry_id),
+            lease.stream, lease.group, lease.entry_id, self._config.consumer_name,
+            lease.owner, str(lease.generation),
+        )
+        if int(raw[0]) < 0:
+            raise CapacityWaitRefused(str(raw[1]))
+        if int(raw[0]) == 0:
+            return None
+        record = await self.get(event_id)
+        if record is None:
+            raise CapacityWaitRefused("resume wait disappeared")
+        return record
 
     async def park(
         self,

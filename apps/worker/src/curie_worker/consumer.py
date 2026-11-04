@@ -637,6 +637,47 @@ class Consumer(StreamConsumer):
                         except (LeaseLostError, CapacityWaitRefused) as exc:
                             order_error = exc
 
+                    raw_resume_claimed = False
+                    redundant_resume = False
+                    recovered_wait: CapacityWaitRecord | None = None
+                    approval_resume = self._kernel._is_approval_resume(qevent.event_id)
+                    if (
+                        approval_resume
+                        and WAIT_GENERATION_FIELD not in fields
+                        and self._leases is not None
+                    ):
+                        raw_resume_claimed = await self._leases.claim_resume(
+                            lease, qevent.event_id, consumer=self._spec.consumer
+                        )
+                        redundant_resume = not raw_resume_claimed
+                        if raw_resume_claimed:
+                            try:
+                                resume_wait = await self._waits.prepare_resume(
+                                    qevent.event_id, lease
+                                )
+                            except (CapacityWaitRefused, LeaseLostError) as exc:
+                                logger.warning(
+                                    "approval resume wait refused for event %s; "
+                                    "keeping pending: %s",
+                                    qevent.event_id,
+                                    exc,
+                                )
+                                record_metric(
+                                    "curie.queue.settle",
+                                    attributes={**metric_attributes, "outcome": "pending"},
+                                )
+                                return
+                            if resume_wait is not None:
+                                redundant_resume = resume_wait.wake_entry != entry_id
+                                if not redundant_resume:
+                                    recovered_wait = resume_wait
+                                    fields = {
+                                        **fields,
+                                        WAIT_GENERATION_FIELD: str(resume_wait.generation),
+                                    }
+                                    if resume_wait.reply_ref is not None:
+                                        fields[WAIT_REPLY_REF_FIELD] = resume_wait.reply_ref
+
                     wait_generation: int | None = None
                     if WAIT_GENERATION_FIELD in fields:
                         wait_generation = int(fields[WAIT_GENERATION_FIELD])
@@ -680,20 +721,13 @@ class Consumer(StreamConsumer):
                             )
                             return
 
-                    if self._kernel._is_approval_resume(qevent.event_id):
+                    if approval_resume:
                         # One live delivery or durable wait owns a resume. ACK
                         # copies while that winner retains the work; reclaiming
                         # a redundant entry would spend its delivery budget.
-                        resume_wait = (
-                            await self._waits.get(qevent.event_id)
-                            if wait_generation is None
-                            else None
-                        )
-                        already_waiting = resume_wait is not None and resume_wait.state in {
-                            "waiting", "woken", "active"
-                        }
-                        if already_waiting or (
-                            self._leases is not None
+                        if redundant_resume or (
+                            not raw_resume_claimed
+                            and self._leases is not None
                             and not await self._leases.claim_resume(
                                 lease, qevent.event_id, consumer=self._spec.consumer
                             )
@@ -797,6 +831,14 @@ class Consumer(StreamConsumer):
                                     raise order_error
                                 if order_blocked:
                                     raise ThreadOrderWaitRequested()
+
+                                if (
+                                    recovered_wait is not None
+                                    and recovered_wait.grant_epoch is not None
+                                ):
+                                    await self._kernel.resolve_capacity_grant(
+                                        qevent, recovered_wait.grant_epoch
+                                    )
                                 await self._kernel.process_event(
                                     qevent, lease=lease, **identity_arguments,
                                 )
