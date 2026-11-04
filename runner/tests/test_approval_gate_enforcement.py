@@ -1571,6 +1571,76 @@ def test_malformed_publish_proposal_fails_the_turn_closed() -> None:
     assert runner.status == SessionStatus.CLASSIFIED_FAILURE
 
 
+def test_malformed_publish_title_denies_without_stopping_the_turn() -> None:
+    # revert: re-emit continue_/stopReason (or interrupt=True) from the
+    # ValueError handlers -> this fails on the continue_ key, which is the
+    # verbatim #4460 repro. The refusal's own text says "Correct it and
+    # retry", so halting the turn on it turns a correctable slip into a
+    # classified-failure publication-unrecorded run; the deny must let the
+    # model retry in this same turn.
+    gate = _managed_publish_gate()
+
+    output = _run_hook(gate, PLATFORM_PUBLISH_TOOL_NAME, {"body": "b"})
+
+    decision = _decision(output)
+    assert decision["hookEventName"] == "PreToolUse"
+    assert decision["permissionDecision"] == "deny"
+    assert decision["permissionDecisionReason"] == (
+        "Publication request was not recorded: publication title must be"
+        " 1-240 characters. Correct it and retry."
+    )
+    # No continue_ key and no stopReason: the SDK defaults a hook output to
+    # continuing, so omitting both is what "deny but keep the turn open" is.
+    assert "continue_" not in output
+    assert "stopReason" not in output
+    # A malformed proposal records nothing: there is no approval card until
+    # the corrected call arrives. (``pending_halt`` is NOT asserted here --
+    # ``block`` sets it before ``_record_pending`` raises, which is unchanged
+    # and inert while no record stands.)
+    assert gate.pending_summary is None
+
+
+def test_malformed_publish_body_denies_without_stopping_the_turn() -> None:
+    # The second ValueError _record_pending raises; same rule as the title one.
+    gate = _managed_publish_gate()
+
+    output = _run_hook(gate, PLATFORM_PUBLISH_TOOL_NAME, {"title": "t", "body": "b" * 65_537})
+
+    decision = _decision(output)
+    assert decision["permissionDecision"] == "deny"
+    assert decision["permissionDecisionReason"] == (
+        "Publication request was not recorded: publication body must be at"
+        " most 65536 characters. Correct it and retry."
+    )
+    assert "continue_" not in output
+    assert "stopReason" not in output
+    assert gate.pending_summary is None
+
+
+def test_malformed_publish_title_denies_without_interrupting_the_callback() -> None:
+    # revert: interrupt=True in can_use_tool's ValueError handler -> this
+    # fails. The permission callback is the backstop when no hook decided, and
+    # an interrupting deny stops the turn exactly as the hook's stopReason does.
+    gate = _managed_publish_gate()
+    callback = build_can_use_tool(gate)
+
+    async def go() -> Any:
+        return await callback(
+            PLATFORM_PUBLISH_TOOL_NAME,
+            {"body": "b"},
+            ToolPermissionContext(tool_use_id="tuid-1"),
+        )
+
+    decision = anyio.run(go)
+    assert isinstance(decision, PermissionResultDeny)
+    assert decision.interrupt is False
+    assert decision.message == (
+        "Publication request was not recorded: publication title must be"
+        " 1-240 characters. Correct it and retry."
+    )
+    assert gate.pending_summary is None
+
+
 def test_two_publish_calls_in_one_turn_record_exactly_one_approval() -> None:
     # revert: record every observed call -> one action produces two approval
     # cards, and a human resolving the second leaves the first pending forever.
