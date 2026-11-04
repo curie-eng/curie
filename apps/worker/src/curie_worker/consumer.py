@@ -590,12 +590,26 @@ class Consumer(StreamConsumer):
                     order_blocked = False
                     order_error: Exception | None = None
                     if self._kernel._can_park(qevent):
+                        thread_key = _thread_key_for(qevent)
+
+                        def identify_predecessor(candidate_fields: dict[str, str]) -> str | None:
+                            try:
+                                candidate = from_stream_fields(candidate_fields)
+                                matches = (
+                                    self._kernel._can_park(candidate)
+                                    and _thread_key_for(candidate) == thread_key
+                                )
+                            except (KeyError, ValueError):
+                                return None
+                            return candidate.event_id if matches else None
+
                         try:
                             order_blocked = await self._waits.has_predecessor(
                                 _thread_key_for(qevent),
                                 qevent.event_id,
                                 entry_id,
                                 lease,
+                                identify=identify_predecessor,
                             )
                         except RedisError:
                             order_blocked = True

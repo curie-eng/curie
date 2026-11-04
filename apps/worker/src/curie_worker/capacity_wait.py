@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -113,11 +113,42 @@ def current_order() -> tuple[CapacityWaitStore, str, str, DeliveryLease] | None:
     return _CURRENT_ORDER.get()
 
 
+_PENDING_ORDER_PAGE_LUA = """
+local cursor = redis.call('HGET', KEYS[1], 'order_scan_after') or ''
+if redis.call('HGET', KEYS[1], 'order_scan_done') == '1' then
+  return {cursor, cursor, 1, {}}
+end
+local rank = redis.call('HGET', KEYS[1], 'order_token') or ARGV[2]
+local milliseconds, sequence = string.match(rank, '^(%d+)%-(%d+)$')
+local function unpad(value)
+  local result = string.gsub(value, '^0+', '')
+  if result == '' then return '0' end
+  return result
+end
+local before = '(' .. unpad(milliseconds) .. '-' .. unpad(sequence)
+local after = '-'
+if cursor ~= '' then after = '(' .. cursor end
+local bound = tonumber(ARGV[3])
+local pending = redis.call('XPENDING', KEYS[2], ARGV[1], after, before, bound + 1)
+local rows = {}
+local next_cursor = cursor
+for i = 1, math.min(bound, #pending) do
+  next_cursor = pending[i][1]
+  local entry = redis.call('XRANGE', KEYS[2], next_cursor, next_cursor)
+  if #entry > 0 then table.insert(rows, entry[1]) end
+end
+local complete = 0
+if #pending <= bound then complete = 1 end
+return {cursor, next_cursor, complete, rows}
+"""
+
+
 _REGISTER_ORDER_LUA = """
 if redis.call('GET', KEYS[3]) ~= ARGV[1] then return {0} end
 if redis.call('HGET', KEYS[4], 'gen') ~= ARGV[2] then return {0} end
 local pending = redis.call('XPENDING', ARGV[3], ARGV[4], 'IDLE', 0, ARGV[5], ARGV[5], 1)
 if #pending == 0 or pending[1][2] ~= ARGV[6] then return {0} end
+if (redis.call('HGET', KEYS[2], 'order_scan_after') or '') ~= ARGV[11] then return {0} end
 local rank = redis.call('HGET', KEYS[2], 'order_token') or ARGV[8]
 local member = rank .. '|' .. ARGV[7]
 if redis.call('HGET', KEYS[2], 'order_started') ~= '1' then
@@ -125,11 +156,25 @@ if redis.call('HGET', KEYS[2], 'order_started') ~= '1' then
   redis.call('HSET', KEYS[2], 'order_token', rank,
     'order_stream', ARGV[3], 'order_group', ARGV[4], 'order_entry', ARGV[5])
 end
+local candidates = cjson.decode(ARGV[10])
+for i, candidate in ipairs(candidates) do
+  local record = KEYS[4 + i]
+  local earlier = redis.call('XPENDING', ARGV[3], ARGV[4],
+    'IDLE', 0, candidate[1], candidate[1], 1)
+  if #earlier > 0 and redis.call('HGET', record, 'order_started') ~= '1' then
+    local earlier_rank = redis.call('HGET', record, 'order_token') or candidate[3]
+    redis.call('ZADD', KEYS[1], 0, earlier_rank .. '|' .. candidate[2])
+    redis.call('HSET', record, 'order_token', earlier_rank,
+      'order_stream', ARGV[3], 'order_group', ARGV[4], 'order_entry', candidate[1])
+    redis.call('PEXPIRE', record, math.max(redis.call('PTTL', record), tonumber(ARGV[9])))
+  end
+end
+redis.call('HSET', KEYS[2], 'order_scan_after', ARGV[12], 'order_scan_done', ARGV[13])
 for _, key in ipairs({KEYS[1], KEYS[2]}) do
   redis.call('PEXPIRE', key, math.max(redis.call('PTTL', key), tonumber(ARGV[9])))
 end
 local first = redis.call('ZRANGE', KEYS[1], 0, 0)
-return {1, member, first[1] or ''}
+return {1, member, first[1] or '', ARGV[13]}
 """
 
 
@@ -666,16 +711,44 @@ class CapacityWaitStore:
         event_id: str,
         entry_id: str,
         lease: DeliveryLease,
+        *,
+        identify: Callable[[dict[str, str]], str | None],
     ) -> bool:
         lease.raise_if_lost()
         key = self._thread_order(thread_key)
+        page = await self._redis.eval(
+            _PENDING_ORDER_PAGE_LUA,
+            2,
+            self._record(event_id),
+            lease.stream,
+            lease.group,
+            delivery_order_token(entry_id),
+            str(_BATCH),
+        )
+        candidates = []
+        for pending_entry, values in page[3]:
+            fields = {
+                (name.decode() if isinstance(name, bytes) else str(name)): (
+                    value.decode() if isinstance(value, bytes) else str(value)
+                )
+                for name, value in zip(values[::2], values[1::2], strict=True)
+            }
+            earlier_id = identify(fields)
+            if earlier_id is not None and earlier_id != event_id:
+                earlier_entry = (
+                    pending_entry.decode()
+                    if isinstance(pending_entry, bytes)
+                    else str(pending_entry)
+                )
+                candidates.append((earlier_entry, earlier_id, delivery_order_token(earlier_entry)))
         raw = await self._redis.eval(
             _REGISTER_ORDER_LUA,
-            4,
+            4 + len(candidates),
             key,
             self._record(event_id),
             self._config.delivery_lease_key(lease.stream, lease.group, entry_id),
             self._config.delivery_state_key(lease.stream, lease.group, entry_id),
+            *(self._record(candidate[1]) for candidate in candidates),
             lease.owner,
             str(lease.generation),
             lease.stream,
@@ -685,9 +758,15 @@ class CapacityWaitStore:
             event_id,
             delivery_order_token(entry_id),
             str(int(self._config.capacity_wait_budget_s * 1000) + self._retention_ms),
+            json.dumps(candidates),
+            page[0],
+            page[1],
+            str(int(page[2])),
         )
         if int(raw[0]) != 1:
-            raise CapacityWaitRefused("thread order registration lost its delivery")
+            raise CapacityWaitRefused("thread order registration lost its delivery or scan")
+        if int(raw[3]) != 1:
+            return True
         member = raw[1].decode() if isinstance(raw[1], bytes) else str(raw[1])
         rank = member.split("|", 1)[0]
         markers = Markers(self._redis, self._config)

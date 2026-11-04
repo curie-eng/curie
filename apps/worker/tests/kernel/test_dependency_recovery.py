@@ -624,3 +624,106 @@ def test_registered_running_turn_still_accepts_a_followup_steer(make_harness, sy
                 await task
 
     asyncio.run(go())
+
+
+@pytest.mark.parametrize("separate_kernel", [False, True])
+def test_pending_stream_order_wins_when_the_later_delivery_registers_first(
+    make_harness,
+    separate_kernel: bool,
+) -> None:
+    async def go() -> None:
+        async with AsyncExitStack() as stack:
+            h = await stack.enter_async_context(make_harness(slack_no_edit_streaming=True))
+            peer = (
+                await stack.enter_async_context(make_harness(slack_no_edit_streaming=True))
+                if separate_kernel
+                else h
+            )
+            original = _capacity_consumer(h)
+            later = _capacity_consumer(peer)
+            await original.ensure_group()
+            first = _qevent("first", event_id="unregistered-original")
+            second = _qevent("second", event_id="registered-later", placeholder="p-2")
+            first_entry, first_fields = await _pending_local_entry(h, first)
+            second_entry, second_fields = await _pending_local_entry(peer, second)
+            await later._sem.acquire()
+            await later._handle(second_entry, second_fields)
+            assert h.runner.opened == peer.runner.opened == []
+            waiting = await later._waits.get(second.event_id)
+            assert waiting is not None and waiting.state == "waiting"
+            h.runner.default_script = [Final(text="first answer", status=SessionStatus.DONE)]
+            await original._sem.acquire()
+            await original._handle(first_entry, first_fields)
+            assert h.runner.opened == ["first"]
+            assert h.sink.last_text == "first answer"
+            for target in (h, peer):
+                target.runner.default_script = [
+                    Final(text="second answer", status=SessionStatus.DONE)
+                ]
+            entry, fields = await _wake(peer, later, second.event_id)
+            await later._sem.acquire()
+            await later._handle(entry, fields)
+            assert h.runner.opened + (peer.runner.opened if separate_kernel else []) == [
+                "first",
+                "second",
+            ]
+            assert peer.sink.last_text == "second answer"
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("lane", ["other-thread", "other-identity", "approval", "webhook"])
+def test_unregistered_unrelated_or_exempt_pending_messages_do_not_block(
+    make_harness, lane: str
+) -> None:
+    async def go() -> None:
+        async with make_harness(slack_no_edit_streaming=True) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            earlier = _qevent(
+                "earlier",
+                event_id="approval-pending-resolved"
+                if lane == "approval"
+                else "unregistered-other",
+                thread="other-thread" if lane == "other-thread" else "th-1",
+                adapter="other-app" if lane == "other-identity" else None,
+                source=TurnSource.WEBHOOK if lane == "webhook" else TurnSource.SLACK,
+            )
+            await _pending_local_entry(h, earlier)
+            h.runner.default_script = [Final(text="independent answer", status=SessionStatus.DONE)]
+            await _deliver(h, consumer, _qevent("later", event_id="independent-later"))
+            assert h.runner.opened == ["later"]
+            assert h.sink.last_text == "independent answer"
+
+    asyncio.run(go())
+
+
+def test_pending_predecessor_scan_makes_bounded_progress_across_wakes(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(slack_no_edit_streaming=True) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            for number in range(70):
+                await _pending_local_entry(
+                    h,
+                    _qevent(
+                        "unrelated",
+                        thread=f"other-{number}",
+                        event_id=f"unrelated-{number}",
+                    ),
+                )
+            event = _qevent("later", event_id="scan-later")
+            h.runner.default_script = [Final(text="scan completed", status=SessionStatus.DONE)]
+            await _deliver(h, consumer, event)
+            for _ in range(3):
+                if h.runner.opened:
+                    break
+                entry, fields = await _wake(h, consumer, event.event_id)
+                await consumer._sem.acquire()
+                await consumer._handle(entry, fields)
+            assert h.runner.opened == ["later"]
+            assert h.sink.last_text == "scan completed"
+            pending = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+            assert pending["pending"] == 70
+
+    asyncio.run(go())
