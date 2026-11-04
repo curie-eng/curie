@@ -201,15 +201,35 @@ def test_full_profile_perms_wipe_leaves_no_anonymous_volume(cycle: Cycle) -> Non
     wipe. Cleanup of that volume happens after the assertion.
     """
 
+    # Observed on the engine: rustfs/rustfs:1.0.0-beta.12 declares VOLUME /data.
+    # An uncovered image volume is anonymous and labeled only
+    # com.docker.volume.anonymous. compose down -v deletes that volume only
+    # while its container still exists, so the wipe below runs after the
+    # one-shot container has been removed without its volumes.
     data = [mount for mount in cycle.mounts if mount.get("Destination") == "/data"]
     assert len(data) == 1
     data_labels = cycle.volume_labels(str(data[0]["Name"]))
     assert data_labels.get("com.docker.compose.project") == cycle.project
+    assert data_labels.get("com.docker.compose.volume") == "otel_collector_perms_data"
     assert "com.docker.volume.anonymous" not in data_labels
     for mount in cycle.mounts:
         labels = cycle.volume_labels(str(mount["Name"]))
         assert labels.get("com.docker.compose.project") == cycle.project
     assert cycle.project_volumes_before == set()
+    containers = _require(
+        _run(
+            [
+                "docker",
+                "ps",
+                "-aq",
+                "--filter",
+                f"label=com.docker.compose.project={cycle.project}",
+            ]
+        ),
+        "listing the one-shot container",
+    ).split()
+    assert containers
+    _require(_run(["docker", "rm", "-f", *containers]), "removing the one-shot container")
     cycle.down()
     assert _project_volume_ids(cycle.project) == set()
     assert cycle.foreign in _volume_ids()
