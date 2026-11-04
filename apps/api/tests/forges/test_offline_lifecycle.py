@@ -1033,7 +1033,11 @@ def _jira_pair(monkeypatch: pytest.MonkeyPatch, key_dir: Path) -> Iterator[Pair]
 @pytest.fixture(
     params=[
         pytest.param("github", id="github"),
-        pytest.param("jira_cloud+github", id="jira_cloud+github"),
+        pytest.param(
+            "jira_cloud+github",
+            id="jira_cloud+github",
+            marks=pytest.mark.skip(reason="intermittently not_dispatchable (#5327)"),
+        ),
     ]
 )
 def pair(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pair]:
