@@ -390,3 +390,144 @@ def test_a_retried_record_with_native_replay_requests_a_full_checkpoint(
             await api.stop()
 
     anyio.run(go)
+
+
+class _LateCommitCompactionApi:
+    """A transcript key whose appends are refused at the reserve, for compaction.
+
+    ``POST <key>/append`` always answers 413 with the reserve refusal detail of
+    ``enforce_thread_cap`` in apps/api/src/curie_api/transcripts.py, the
+    store's compaction trigger. ``late_commit``, when set, is stored right
+    after that refusal: a cancelled earlier attempt's compaction PUT that
+    commits between the retry's 413 and its compaction read. GET answers the
+    stored value with the cap header, and PUT is the API's compare-and-set
+    write (409 on a stale ``expected_version``); every PUT body is recorded.
+    """
+
+    def __init__(self, seed: list[dict[str, Any]]) -> None:
+        self.value: list[dict[str, Any]] = list(seed)
+        self.version = 1
+        self.late_commit: dict[str, Any] | None = None
+        self.puts: list[dict[str, Any]] = []
+        self._runner: web.AppRunner | None = None
+        self.url = ""
+
+    def _entry(self) -> dict[str, Any]:
+        return {
+            "namespace": "transcript",
+            "key": _KEY_PATH.rsplit("/", 1)[-1],
+            "value": list(self.value),
+            "version": self.version,
+            "updated_at": "2026-01-01T00:00:00Z",
+        }
+
+    def _app(self) -> web.Application:
+        app = web.Application()
+
+        async def get_key(_request: web.Request) -> web.Response:
+            return web.json_response(self._entry(), headers=_CAP_HEADERS)
+
+        async def append_key(request: web.Request) -> web.Response:
+            body = await request.json()
+            assert body["reserve_bytes"] > 0
+            if self.late_commit is not None:
+                self.value.append(self.late_commit)
+                self.version += 1
+                self.late_commit = None
+            return web.json_response(
+                {"detail": "value leaves under the reserve of the per-thread transcript cap"},
+                status=413,
+            )
+
+        async def put_key(request: web.Request) -> web.Response:
+            body = await request.json()
+            self.puts.append(body)
+            if body.get("expected_version") != self.version:
+                return web.json_response({"detail": "version mismatch"}, status=409)
+            self.value = list(body["value"])
+            self.version += 1
+            return web.json_response(self._entry())
+
+        app.router.add_get(_KEY_PATH, get_key)
+        app.router.add_post(f"{_KEY_PATH}/append", append_key)
+        app.router.add_put(_KEY_PATH, put_key)
+        return app
+
+    async def start(self) -> None:
+        runner = web.AppRunner(self._app())
+        await runner.setup()
+        port = _free_port()
+        await web.TCPSite(runner, "127.0.0.1", port, reuse_address=True).start()
+        self._runner = runner
+        self.url = f"http://127.0.0.1:{port}{_KEY_PATH}"
+
+    async def stop(self) -> None:
+        if self._runner is not None:
+            runner, self._runner = self._runner, None
+            await runner.cleanup()
+
+
+_RECORD_ID = "rid-5366-PLACEHOLDER"
+
+
+def _prior_turn() -> dict[str, Any]:
+    return TurnRecord(
+        user="earlier question", assistant="earlier answer", ts="2026-01-01T00:00:00Z"
+    ).to_dict()
+
+
+def _retried_turn() -> TurnRecord:
+    return TurnRecord(
+        user="late question",
+        assistant="late answer",
+        ts="2026-01-01T00:01:00Z",
+        record_id=_RECORD_ID,
+    )
+
+
+def _with_record_id(value: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [item for item in value if item.get("record_id") == _RECORD_ID]
+
+
+def test_a_retry_whose_compaction_finds_its_record_already_stored_writes_nothing() -> None:
+    """Review F1: a late compaction commit must not store the retried turn twice."""
+    record = _retried_turn()
+    api = _LateCommitCompactionApi([_prior_turn()])
+    # The cancelled earlier attempt's compaction lands after the retry's 413.
+    api.late_commit = record.to_dict()
+
+    async def go() -> bool:
+        await api.start()
+        try:
+            store = StateApiTranscriptStore(api.url, token=None)
+            return await store.append(record)
+        finally:
+            await api.stop()
+
+    retained = anyio.run(go)
+
+    assert api.puts == []
+    assert len(_with_record_id(api.value)) == 1
+    # Whether native replay survived the earlier write is unknown.
+    assert retained is False
+
+
+def test_a_retry_whose_compaction_lacks_its_record_still_compacts_once() -> None:
+    """The liveness twin: without the record stored, compaction writes it once."""
+    record = _retried_turn()
+    api = _LateCommitCompactionApi([_prior_turn()])
+
+    async def go() -> bool:
+        await api.start()
+        try:
+            store = StateApiTranscriptStore(api.url, token=None)
+            return await store.append(record)
+        finally:
+            await api.stop()
+
+    retained = anyio.run(go)
+
+    assert len(api.puts) == 1
+    assert len(_with_record_id(api.puts[0]["value"])) == 1
+    assert len(_with_record_id(api.value)) == 1
+    assert retained is False
