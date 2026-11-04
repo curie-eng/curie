@@ -19,6 +19,7 @@ import signal
 import subprocess
 import tempfile
 import time
+import urllib.request
 
 import yaml
 
@@ -46,7 +47,7 @@ require(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,24}", run_id), "invalid caller run ID
 require(not context.startswith("-") and not re.search(r"[\s\x00-\x1f\x7f]", context), "invalid caller context")
 binary = str(Path(os.environ["CURIE_BIN"]).resolve())
 require(os.access(binary, os.X_OK), "candidate CLI is unavailable")
-for name in ("helm", "kubectl", "gh", "python3"):
+for name in ("helm", "kubectl", "python3"):
     require(shutil.which(name), f"{name} is required")
 images = {part: os.environ[f"CURIE_SCENARIO_{part.upper()}_IMAGE"] for part in ("api", "worker", "runner")}
 for image in images.values():
@@ -115,6 +116,11 @@ def patch(namespace, kind, name, value):
 
 
 def clean(namespace, release):
+    worker = kc(namespace, "get", "deployment/" + release + "-curie-worker", "--ignore-not-found", "-o", "name").stdout.strip()
+    if worker:
+        kc(namespace, "scale", worker, "--replicas=0")
+    for kind in ("sandboxwarmpools", "sandboxclaims", "sandboxes"):
+        kc(namespace, "delete", kind, "--all", "--ignore-not-found", "--wait=true", "--timeout=120s", timeout=140)
     run(["helm", "--kube-context", context, "-n", namespace, "uninstall", release,
          "--ignore-not-found", "--wait", "--timeout", "120s"], "owned release uninstall", timeout=150)
     kc(namespace, "delete", "namespace", namespace, "--ignore-not-found", "--wait=true", "--timeout=180s", timeout=200)
@@ -305,9 +311,10 @@ crds = ("sandboxes.agents.x-k8s.io", "sandboxclaims.extensions.agents.x-k8s.io",
 absent_crds = [name for name in crds if not kc("default", "get", "crd/" + name, "--ignore-not-found", "-o", "name").stdout.strip()]
 try:
     # Published baseline bytes are checked independently of the candidate checkout.
-    run(["gh", "release", "download", "v0.13.0", "--repo", "curie-eng/curie", "--dir", work,
-         "--pattern", "curie-x86_64-unknown-linux-gnu", "--pattern", "curie-0.13.0.tgz", "--pattern", "checksums.txt"],
-        "download published baseline", timeout=180)
+    for name in ("curie-x86_64-unknown-linux-gnu", "curie-0.13.0.tgz", "checksums.txt"):
+        url = "https://github.com/curie-eng/curie/releases/download/v0.13.0/" + name
+        with urllib.request.urlopen(url, timeout=120) as response, (work / name).open("wb") as output:
+            shutil.copyfileobj(response, output)
     checks = {line.split()[-1].lstrip("*"): line.split()[0] for line in (work / "checksums.txt").read_text().splitlines()}
     for name in ("curie-x86_64-unknown-linux-gnu", "curie-0.13.0.tgz"):
         require(hashlib.sha256((work / name).read_bytes()).hexdigest() == checks[name], "published baseline checksum mismatch")
