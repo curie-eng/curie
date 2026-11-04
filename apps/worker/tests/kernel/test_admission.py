@@ -13,7 +13,6 @@ from aci_protocol import Final, SessionStatus
 from curie_telemetry import build_resource, configure_meter_provider
 from curie_telemetry import metrics as telemetry_metrics
 from curie_worker.capacity_wait import CapacityWaitRequested
-from curie_worker.sandbox.types import AdmissionUnavailableError
 from kubernetes.utils.quantity import parse_quantity
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
@@ -183,12 +182,7 @@ def test_admission_reclaim_telemetry_after_unavailable_observations(
                 assert h.runner.opened == [event.text]
                 assert h.sink.last_text == "reclaimed safely"
             else:
-                expected = (
-                    AdmissionUnavailableError
-                    if lane == "approval-resume" and scenario != "retry-refused"
-                    else CapacityWaitRequested
-                )
-                with pytest.raises(expected):
+                with pytest.raises(CapacityWaitRequested):
                     await h.kernel.process_event(event, lease=lease)
                 assert h.runner.opened == h.sink.completions == []
                 assert not await h.kernel._markers.is_terminal(event.event_id)

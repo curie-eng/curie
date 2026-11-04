@@ -5857,16 +5857,7 @@ def test_approval_resume_capacity_retries_then_escalates(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#3693, #3700: a resume that reclamation cannot help is not a runner failure.
-
-    The reclamation pass runs for the resume as for any turn, finds no idle
-    route to free, and the resume keeps its retries. Each of the three
-    attempts records the pass, and the failure is a ``sandbox-capacity``
-    escalation, not the fresh-turn capacity reply. The person is told the
-    agent was at capacity, with no quota detail (#2434). The same event id
-    resumes an approved, a rejected and an expired approval, so the sentence
-    names the decision, not an approval.
-    """
+    """#5399: a refused approval parks after one safe-reclamation pass."""
 
     real_record_metric = kernel_log.record_metric
     recorded: list[tuple[str, dict[str, str]]] = []
@@ -5900,45 +5891,22 @@ def test_approval_resume_capacity_retries_then_escalates(
             )
             lease = await _pressure_lease(h, ev.event_id)
 
-            await h.kernel.process_event(ev, lease=lease)
+            with pytest.raises(CapacityWaitRequested):
+                await h.kernel.process_event(ev, lease=lease)
 
-            assert len(h.fake_k8s.claim_envs) == 3
-            assert h.runner.opened == []
-            assert h.sink.updates == [
-                (
-                    "C1",
-                    "p-1",
-                    "curie-turn-failure: sandbox-capacity\n\n"
-                    "The run failed (sandbox-capacity) after 3 attempt(s). "
-                    "The agent was at capacity, so it could not continue after the "
-                    "approval decision. Send the request again in a few minutes if it "
-                    "is still needed. "
-                    "event_id=approval-example-resolved. Flagging for a human.",
-                )
-            ]
-            reply = h.sink.updates[0][2]
-            for leaked in (
-                "curie-sandbox-quota",
-                "limits.cpu",
-                "quota",
-                "runner-error",
-                "approved request",
-            ):
-                assert leaked not in reply
+            assert len(h.fake_k8s.claim_envs) == 1
+            assert h.runner.opened == h.sink.updates == h.sink.completions == []
             retries = [attrs for name, attrs in recorded if name == "curie.queue.retry"]
-            assert [attrs["retry_class"] for attrs in retries] == [
-                "sandbox-capacity",
-                "sandbox-capacity",
-            ]
+            assert retries == []
             reclaims = [
                 attrs["outcome"]
                 for name, attrs in recorded
                 if name == "curie.sandbox.lifecycle" and attrs.get("operation") == "reclaim"
             ]
-            assert reclaims == ["refused-no-safe-route"] * 3
-            assert h.sink.update_endpoints == [endpoint]
+            assert reclaims == ["refused-no-safe-route"]
+            assert h.sink.update_endpoints == []
             assert h.kernel._order_locks == {}
-            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+            assert not await h.async_redis.exists(h.config.done_key(ev.event_id))
 
     asyncio.run(go())
 
@@ -5993,13 +5961,7 @@ def test_approval_resume_refused_again_after_reclaim_keeps_its_capacity_failure(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#3700: the retry after a reclamation is refused again.
-
-    The resume records ``reclaimed-retry-refused`` and fails as
-    ``sandbox-capacity``. It neither sends the fresh turn's capacity reply nor
-    asks to wait for capacity (#2711), which would drop the approved
-    continuation.
-    """
+    """#5399: reclaim refusal parks without losing the approved continuation."""
 
     async def go() -> None:
         outcomes = _capture_pressure_outcomes(monkeypatch)
@@ -6022,17 +5984,16 @@ def test_approval_resume_refused_again_after_reclaim_keeps_its_capacity_failure(
             )
             lease = await _pressure_lease(h, ev.event_id)
 
-            await h.kernel.process_event(ev, lease=lease)
+            with pytest.raises(CapacityWaitRequested):
+                await h.kernel.process_event(ev, lease=lease)
 
             assert victim.claim_name in h.fake_k8s.deleted_claims
             # "reclaimed" is recorded only when the retry succeeds.
             assert outcomes == ["reclaimed-retry-refused"]
             assert h.runner.opened == []
-            reply = h.sink.updates[-1][2]
-            assert reply.startswith("curie-turn-failure: sandbox-capacity\n\n")
-            assert "queued" not in reply.lower()
-            assert "limits.cpu" not in reply
-            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+            assert h.sink.updates == h.sink.completions == []
+            assert h.kernel._order_locks == {}
+            assert not await h.async_redis.exists(h.config.done_key(ev.event_id))
 
     asyncio.run(go())
 
@@ -6040,9 +6001,9 @@ def test_approval_resume_refused_again_after_reclaim_keeps_its_capacity_failure(
 def test_approval_resume_capacity_keeps_an_earlier_pod_termination(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """#3693: a resume whose pod was evicted, then refused for capacity on the
-    retries, still tells the operator about the eviction, as runner-error did."""
+    """#5399: parking preserves the earlier eviction in the operator log."""
 
     async def go() -> None:
         async with make_harness(
@@ -6078,13 +6039,15 @@ def test_approval_resume_capacity_keeps_an_earlier_pod_termination(
                 event_id="approval-evicted-resolved",
             )
 
-            await h.kernel.process_event(ev)
+            with caplog.at_level(logging.WARNING), pytest.raises(CapacityWaitRequested):
+                await h.kernel.process_event(ev)
 
             assert len(h.runner.opened) == 1
-            reply = h.sink.updates[-1][2]
-            assert reply.startswith("curie-turn-failure: sandbox-capacity\n\n")
-            assert "Earlier attempt: Kubernetes pod terminated: Evicted" in reply
-            assert "limits.cpu" not in reply
+            assert "Evicted" in caplog.text
+            assert "The node was low on memory." in caplog.text
+            assert h.sink.completions == []
+            assert not await h.async_redis.exists(h.config.done_key(ev.event_id))
+            assert h.kernel._order_locks == {}
 
     asyncio.run(go())
 

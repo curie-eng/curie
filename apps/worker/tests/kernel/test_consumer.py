@@ -1409,10 +1409,15 @@ def test_factory_admission_unavailable_defers_without_capacity_accounting(
 
 
 @pytest.mark.parametrize(
-    ("lane", "placeholder"),
-    [("webhook", None), ("approval-resume", None), ("approval-resume", "p-1")],
+    ("lane", "placeholder", "failure"),
+    [
+        ("webhook", None, "sdk-timeout"),
+        ("webhook", None, "quota-timeout"),
+        ("webhook", None, "transient"),
+        ("approval-resume", None, "transient"),
+        ("approval-resume", "p-1", "transient"),
+    ],
 )
-@pytest.mark.parametrize("failure", ["sdk-timeout", "quota-timeout", "transient"])
 def test_admission_unavailable_notice_without_durable_wait_stays_pending_then_completes(
     make_harness,
     sync_redis,
