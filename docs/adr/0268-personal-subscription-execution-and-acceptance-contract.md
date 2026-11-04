@@ -1,4 +1,4 @@
-# 148. Personal subscription execution and its acceptance contract
+# 268. Personal subscription execution and its acceptance contract
 
 Date: 2026-11-04
 Status: Draft
@@ -161,15 +161,30 @@ The legal page's hosted-product conditions include:
 
 Its authentication restrictions include:
 
+> OAuth authentication is intended exclusively for purchasers of Claude Free, Pro, Max, Ultra, Team, and Enterprise subscription plans and is designed to support ordinary use of Claude Code and other native Anthropic applications.
+
+> Advertised usage limits for Pro, Max, and Ultra plans assume ordinary, individual usage of Claude Code and the Agent SDK.
+
+These scope and usage-limit statements bear on open question 4: an unattended
+factory with reviewers and repair rounds still needs a conclusion about
+ordinary, individual subscription use.
+
 > Developers building products or services that interact with Claude’s capabilities, including those using the Agent SDK, should use API key authentication through Claude Console or a supported cloud provider.
 
 > Anthropic does not permit third-party developers to offer Claude.ai login into their own applications, or to route requests through Free, Pro, Max, or Ultra plan credentials on behalf of their users.
 
 The same paragraph expressly prohibits the following custody behavior:
 “developers may not collect, store, or intermediate Claude.ai credentials or session tokens”.
-Sign-in must complete through Anthropic's own flow. The page also states:
+Sign-in must complete through Anthropic's own flow. The provisioning paragraph
+states:
 
-> Nor does it prevent an end user from signing in to the unmodified Claude Code binary with their own Claude subscription, including where a platform hosts Claude Code as described under Can customers offer Claude Code in their products? above.
+> This does not restrict how customers provision and manage their own API keys or third-party inference provider credentials — for example, configuring an API key in a development environment, secrets manager, or machine image for use by the customer’s own authorized users — provided the resulting usage is billed to the key owner under their agreement with Anthropic (or the applicable provider) and is not resold or intermediated as described above. Nor does it prevent an end user from signing in to the unmodified Claude Code binary with their own Claude subscription, including where a platform hosts Claude Code as described under Can customers offer Claude Code in their products? above.
+
+The secrets manager and machine image carve-out covers API keys and third-party
+inference provider credentials, not subscription tokens. Open question 2 must
+resolve the proposed subscription-token Secret custody separately; this
+paragraph does not grant that permission. Its no-resale and no-intermediation
+conditions also bear on open question 4.
 
 The authentication page documents the candidate token mechanism:
 
@@ -188,8 +203,8 @@ The authentication page documents the candidate token mechanism:
 Under “Authentication precedence”, the documented order is cloud provider
 credentials selected by `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` or
 `CLAUDE_CODE_USE_FOUNDRY`; `ANTHROPIC_AUTH_TOKEN`; `ANTHROPIC_API_KEY`;
-`apiKeyHelper`; `CLAUDE_CODE_OAUTH_TOKEN`; explicitly selected Anthropic profile
-or federation credentials; then `/login`. An unnamed profile saved by `ant auth
+`apiKeyHelper`; `CLAUDE_CODE_OAUTH_TOKEN`; named profile, federation variables,
+or an active federation profile; then `/login`. An unnamed profile saved by `ant auth
 login` ranks below `/login`. The page separately documents a signed-in Claude
 apps gateway session as a provider selection outside this list that outranks
 the cloud selectors; forced gateway managed settings can skip the other
