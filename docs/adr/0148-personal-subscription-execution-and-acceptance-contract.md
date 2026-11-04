@@ -70,9 +70,8 @@ cloud provider selectors, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` and
 credential overrides, so a grant cannot reach a substituted endpoint. A signed-in
 Claude apps gateway session and managed settings that force gateway login also
 outrank the ordinary credential list; #5373 must exclude them or refuse launch.
-No saved
-profile or `/login` credential may become a fallback. A missing owner grant
-refuses before launch, even with a working service credential present.
+No saved profile or `/login` credential may become a fallback. A missing owner
+grant refuses before launch, even with a working service credential present.
 
 The implementer and both factory reviewer roles use the same recorded owner
 grant and an explicitly configured Claude reviewer model. Credential shape
@@ -113,8 +112,7 @@ Do not infer expiry from token text or prefix. A missing token at launch,
 a lost grant during an active run, or a rejected or expired token yields an authentication-required result,
 stops model progress without service fallback and preserves the owner and
 workspace. #5377 implements classification and replacement; #5378 carries them
-through repair and recovery. Recovery never silently replays an uncertain
-external write.
+through repair and recovery.
 
 Disconnect marks the enrollment inactive, invalidates its generation, stops
 that owner's runtimes, and blocks later launch, reuse and resume even after a
@@ -257,8 +255,8 @@ also require ADR acceptance and a permitting provider conclusion.
    the real token is delivered, through direct, symlink, hardlink, environment,
    `/proc` environment or root aliases. Each channel reads an ordinary public
    control file successfully, and real inference succeeds in the same
-   configuration. Check claims, manifests, logs, traces, events and published
-   output for token absence. A denied operation without its positive control is
+   configuration. Check claims, manifests, logs, traces, events, API responses
+   and published output for token absence. A denied operation without its positive control is
    not PASS; a failed #5372 result stops #5374.
 3. **Implementer and both reviewers.** #5373 and #5375; real factory admission
    on a throwaway Kubernetes cluster with one dedicated test grant. Drive a
