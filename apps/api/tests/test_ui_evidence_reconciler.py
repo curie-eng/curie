@@ -1156,6 +1156,54 @@ def test_a_crash_after_the_ref_then_a_newer_revision_without_evidence_removes_it
     assert stack.fake.writes == writes
 
 
+def _no_evidence_revision(
+    stack: Stack, auth_headers: dict[str, str], previous: Revision
+) -> Revision:
+    """A later revision with no evidence, past its upload window."""
+
+    revision = create_revision(stack, auth_headers, previous=previous)
+    approve_and_push(stack, auth_headers, revision, head_tree=OTHER_OID, previous=previous)
+    _execute(
+        "UPDATE curie.publications SET created_at = created_at - interval '5 minutes' "
+        "WHERE id = :id",
+        {"id": uuid.UUID(revision.id)},
+    )
+    return revision
+
+
+def test_a_crash_after_the_stale_notice_still_converges_on_the_current_head(
+    stack: Stack, auth_headers: dict[str, str]
+) -> None:
+    first = published_with_evidence(stack, auth_headers)
+    # Revision 1 dies right after its ref write; nothing is recorded.
+    _crash_once(_dies_after(stack, r"^(POST|PATCH) /repos/[^ ]+/git/refs"))
+    second = _no_evidence_revision(stack, auth_headers, first)
+    expire_leases()
+    # Recovery deletes the ref, posts revision 2's notice, then dies before
+    # recording it.
+    _crash_once(_dies_after(stack, _COMMENT_WRITES))
+    assert stack.fake.evidence_ref(str(first.lineage_id)) is None
+    assert f"`{second.head_sha}` (revision 2)" in only_comment(stack, second)
+    held = lineage_evidence(first)
+    assert held["comment_pending"] is True and held["comment_revision"] is None
+
+    # A third revision without evidence lands before recovery: its notice wins.
+    third = _no_evidence_revision(stack, auth_headers, second)
+    pull_request = code_pr(stack, third)
+    expire_leases()
+    reconcile(stack.http, passes=2)
+
+    body = only_comment(stack, third)
+    assert f"No UI evidence exists for the current pull request head `{third.head_sha}`" in body
+    assert "(revision 3)" in body
+    settled = lineage_evidence(first)
+    assert settled["comment_revision"] == 3 and settled["comment_pending"] is False
+    assert code_pr(stack, third) == pull_request
+    writes = stack.fake.writes
+    reconcile(stack.http)
+    assert stack.fake.writes == writes
+
+
 def test_an_index_with_no_image_stored_by_the_deadline_gets_a_failed_outcome(
     stack: Stack, auth_headers: dict[str, str]
 ) -> None:

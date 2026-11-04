@@ -464,6 +464,9 @@ class UiEvidenceReconciler:
             )
         except Unsupported:
             return
+        # Durable before any external write: a crash after the ref delete or
+        # the post still leaves this lineage selected for the notice.
+        await self._write_lineage(lease, comment_pending=True)
         if lineage.ref_held:
             await self._delete_ref(code_host, lease, lineage.repository)
         body = render_stale(

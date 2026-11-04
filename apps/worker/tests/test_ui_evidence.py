@@ -487,13 +487,13 @@ def test_capture_skips_when_the_attempt_budget_is_spent(tmp_path: Path) -> None:
     assert spent.image_calls == []
     assert spent.api.requests == []
 
-    # The publication create's whole API write budget is also left untouched.
-    reserved = _drive(checkout, wrap=count_index, remaining_s=129.0)
+    # The create's and the approval hold's API write budgets are also left untouched.
+    reserved = _drive(checkout, wrap=count_index, remaining_s=249.0)
     assert reserved.capture is None
     assert calls == []
 
     # Liveness: a realistic remaining budget captures.
-    live = _drive(checkout, wrap=count_index, remaining_s=200.0)
+    live = _drive(checkout, wrap=count_index, remaining_s=400.0)
     assert calls == ["index"]
     assert live.capture is not None
     assert sorted(live.image_calls) == [0, 1]
