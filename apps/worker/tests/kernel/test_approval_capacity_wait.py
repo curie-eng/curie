@@ -16,7 +16,7 @@ from typing import Any
 import aiohttp
 import asyncpg
 import pytest
-from aci_protocol import Event, Final, SessionStatus
+from aci_protocol import Event, Final, SessionStatus, TextDelta
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from alembic import command
@@ -1386,5 +1386,205 @@ def test_raw_approval_orphan_adoption_refuses_a_lost_delivery_fence(
             assert h.runner.opened == h.sink.completions == []
             assert not await h.kernel._markers.is_terminal(event.event_id)
             assert not await h.async_redis.exists(h.config.dead_letter_stream_name())
+
+    asyncio.run(go())
+
+
+class _PausedCoveredResume:
+    def __init__(self, delegate: Any, entry_id: str) -> None:
+        self.delegate = delegate
+        self.entry_id = entry_id
+        self.prepared = asyncio.Event()
+        self.proceed = asyncio.Event()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    async def prepare_resume(self, event_id: str, lease: Any) -> Any:
+        record = await self.delegate.prepare_resume(event_id, lease)
+        if lease.entry_id == self.entry_id:
+            assert record is not None and record.wake_entry != lease.entry_id
+            self.prepared.set()
+            await self.proceed.wait()
+        return record
+
+
+def test_capacity_wake_stays_pending_while_redundant_raw_copy_holds_resume_claim(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch,
+    approval_wait_database,
+    approval_plugin,
+) -> None:
+    client, api, admission = _inventory_timeout_client(
+        sync_redis,
+        names,
+        monkeypatch,
+        failure="sdk-timeout",
+        restore=True,
+        failures=1,
+    )
+    executing = _ExecutingRunner(api, approval_plugin, monkeypatch)
+
+    async def go() -> None:
+        async with _binding(approval_wait_database) as (engine, channel, approval_id):
+            async with make_harness(
+                sandbox_client=client,
+                substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+                binding_factory=lambda config: BindingResolver(engine, config),
+                runner_app=executing.app,
+                slack_no_edit_streaming=True,
+                reclaim_min_idle_ms=0,
+            ) as h:
+                original = _capacity_consumer(h)
+                await original.ensure_group()
+                event = _qevent(
+                    "Continue the approved tool",
+                    event_id=f"approval-{approval_id}-resolved",
+                    channel=channel,
+                )
+                await _handle(original, await _pending_local_entry(h, event))
+                parked = await original._waits.get(event.event_id)
+                assert parked is not None and parked.state == "waiting"
+                wake = await _wake(h, original, event.event_id)
+                before = await original._waits.get(event.event_id)
+                raw = await _pending_local_entry(h, event)
+                duplicate = _capacity_consumer(h)
+                paused = _PausedCoveredResume(duplicate._waits, raw[0])
+                duplicate._waits = paused
+                task = asyncio.create_task(_handle(duplicate, raw))
+                try:
+                    await asyncio.wait_for(paused.prepared.wait(), timeout=5)
+                    await _handle(original, wake)
+                    pending = await _pending(h)
+                    assert {row["message_id"] for row in pending} == {wake[0], raw[0]}
+                    assert all(row["times_delivered"] == 1 for row in pending)
+                    assert await original._waits.get(event.event_id) == before
+                    assert executing.calls == [] and executing.server is None
+                    paused.proceed.set()
+                    await asyncio.wait_for(task, timeout=5)
+                    pending = await _pending(h)
+                    assert len(pending) == 1 and pending[0]["message_id"] == wake[0]
+                    assert pending[0]["times_delivered"] == 1
+                    assert await original._reclaim_once() == 1
+                    await asyncio.gather(*list(original._inflight))
+                    final = await original._waits.get(event.event_id)
+                    assert final.state == "done" and final.deadline_ms == parked.deadline_ms
+                    assert final.reply_ref == parked.reply_ref
+                    assert executing.calls == ["hi"]
+                    assert len(executing.sessions[0].queries) == 1
+                    assert max(api.delivery_counts) == 2
+                    assert len(h.sink.completions) == 1
+                    assert await _pending(h) == []
+                    assert not await h.async_redis.exists(h.config.dead_letter_stream_name())
+                finally:
+                    paused.proceed.set()
+                    if not task.done():
+                        task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(go())
+
+
+def test_adopted_raw_approval_lease_loss_does_not_interrupt_a_later_thread_turn(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(slack_no_edit_streaming=True) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event = _qevent(
+                "Continue",
+                thread="acme-shared-thread",
+                event_id="approval-acme-adopted-resolved",
+            )
+            parked = await _park(h, consumer, event)
+            await consumer._send_wait_notice(parked)
+            wake = await _wake(h, consumer, event.event_id)
+            woken = await consumer._waits.get(event.event_id)
+            leases = DeliveryLeaseStore(h.async_redis, h.config)
+            lease = await leases.acquire(
+                h.config.stream,
+                h.config.consumer_group,
+                wake[0],
+                consumer=h.config.consumer_name,
+            )
+            old_epoch = uuid.uuid4().hex
+            try:
+                assert (
+                    await consumer._waits.mark_active(
+                        event.event_id, woken.generation, lease, old_epoch
+                    )
+                    == "active"
+                )
+                assert (
+                    await h.async_redis.xack(h.config.stream, h.config.consumer_group, wake[0]) == 1
+                )
+            finally:
+                await leases.release(
+                    h.config.stream,
+                    h.config.consumer_group,
+                    wake[0],
+                    owner=lease.owner,
+                    resume_event_id=None,
+                )
+            raw = await _pending_local_entry(h, event)
+            assert WAIT_GENERATION_FIELD not in raw[1]
+            await _handle(consumer, raw)
+            adopted = await consumer._waits.get(event.event_id)
+            assert adopted.generation > woken.generation
+            assert adopted.wake_entry == raw[0] and adopted.grant_epoch == old_epoch
+            assert adopted.deadline_ms == parked.deadline_ms
+            assert h.runner.queried == []
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.tail = [Final(text="later answer", status=SessionStatus.DONE)]
+            later = _qevent("later", thread="acme-shared-thread", event_id="acme-later-turn")
+            later_task = asyncio.create_task(h.kernel.process_event(later))
+            raw_lease = None
+            try:
+                await _wait_until(lambda: h.runner.queried == ["later"])
+                later_epoch = h.runner.turn_epoch
+                assert later_epoch is not None and later_epoch != old_epoch
+                raw_lease = await leases.acquire(
+                    h.config.stream,
+                    h.config.consumer_group,
+                    raw[0],
+                    consumer=h.config.consumer_name,
+                )
+                await h.async_redis.delete(
+                    h.config.delivery_lease_key(h.config.stream, h.config.consumer_group, raw[0])
+                )
+                before_headers = len(h.runner.status_headers)
+                await consumer._interrupt_on_lease_lost(raw[0], raw[1])
+                assert h.runner.turn_active and h.runner.turn_epoch == later_epoch
+                assert not later_task.done()
+                assert h.runner.interrupts == 0 and h.runner.timeout_calls == 0
+                assert h.runner.queried == ["later"]
+                assert any(
+                    headers.get("X-Curie-Turn-Epoch") == old_epoch
+                    for headers in h.runner.status_headers[before_headers:]
+                )
+                pending = await _pending(h)
+                assert len(pending) == 1 and pending[0]["message_id"] == raw[0]
+                assert not await h.kernel._markers.is_terminal(event.event_id)
+                hold.set()
+                await asyncio.wait_for(later_task, timeout=5)
+                assert h.sink.last_text == "later answer"
+                assert (await consumer._waits.get(event.event_id)).deadline_ms == parked.deadline_ms
+            finally:
+                hold.set()
+                if not later_task.done():
+                    await asyncio.wait_for(later_task, timeout=5)
+                if raw_lease is not None:
+                    await leases.release(
+                        h.config.stream,
+                        h.config.consumer_group,
+                        raw[0],
+                        owner=raw_lease.owner,
+                        resume_event_id=None,
+                    )
 
     asyncio.run(go())

@@ -671,10 +671,7 @@ class Consumer(StreamConsumer):
                                 redundant_resume = resume_wait.wake_entry != entry_id
                                 if not redundant_resume:
                                     recovered_wait = resume_wait
-                                    fields = {
-                                        **fields,
-                                        WAIT_GENERATION_FIELD: str(resume_wait.generation),
-                                    }
+                                    fields[WAIT_GENERATION_FIELD] = str(resume_wait.generation)
                                     if resume_wait.reply_ref is not None:
                                         fields[WAIT_REPLY_REF_FIELD] = resume_wait.reply_ref
 
@@ -732,6 +729,12 @@ class Consumer(StreamConsumer):
                                 lease, qevent.event_id, consumer=self._spec.consumer
                             )
                         ):
+                            if wait_generation is not None:
+                                record_metric(
+                                    "curie.queue.settle",
+                                    attributes={**metric_attributes, "outcome": "pending"},
+                                )
+                                return
                             logger.debug(
                                 "approval resume %s already owned or waiting; ack duplicate %s",
                                 qevent.event_id,

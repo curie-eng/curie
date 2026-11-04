@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from aci_protocol import ErrorEvent, Final, SessionStatus, TurnSource
+from aci_protocol import ErrorEvent, Final, SessionStatus, TextDelta, TurnSource
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from curie_worker.consumer import Consumer
@@ -247,7 +247,7 @@ def test_capacity_wake_recovers_from_workspace_outage_without_escalating(
 
 
 @pytest.mark.parametrize("bound", ["workspace", "delivery"])
-def test_dependency_wait_has_one_fixed_workspace_deadline(make_harness, bound: str) -> None:
+def test_dependency_retry_has_one_fixed_in_invocation_deadline(make_harness, bound: str) -> None:
     async def go() -> None:
         async with _selection_server() as (deployment, credentials, state):
             async with make_harness(
@@ -634,6 +634,76 @@ def test_followup_cannot_overtake_an_initial_dependency_failure(
                 await asyncio.gather(
                     first_task, *([second_task] if second_task else []), return_exceptions=True
                 )
+
+    asyncio.run(go())
+
+
+def test_approval_dependency_retry_holds_local_order_until_resume_starts(make_harness) -> None:
+    from curie_worker.kernel.routing import _thread_key_for
+
+    async def go() -> None:
+        deployment = uuid.uuid4()
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        runner_release = asyncio.Event()
+        calls = 0
+
+        async def selection(_request: web.Request) -> web.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_entered.set()
+                await release_first.wait()
+                return web.Response(status=503)
+            return web.json_response({"repo_full_name": None})
+
+        app = web.Application()
+        app.router.add_post(f"/v1/internal/workspaces/{deployment}/selection", selection)
+        async with TestServer(app) as server, make_harness(
+            binding=_workspace_binding(deployment),
+            max_attempts=1,
+            workspace_total_timeout_seconds=2,
+            retry_backoff_base_s=0.2,
+            retry_backoff_max_s=0.2,
+        ) as h:
+            credentials = WorkspaceCredentialClient(
+                api_url=str(server.make_url("")), worker_token="example-worker-token"
+            )
+            h.kernel._workspace = WorkspaceClaimCoordinator(
+                preparer=SimpleNamespace(credentials=credentials), substrate=h.substrate
+            )
+            h.runner.default_script = [TextDelta(text="running")]
+            h.runner.hold = runner_release
+            h.runner.tail = [Final(text="resumed", status=SessionStatus.DONE)]
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            resume = _qevent("approved resume", event_id=f"approval-{uuid.uuid4()}-resolved")
+            followup = _qevent("followup", event_id="approval-retry-followup", placeholder="p-2")
+            first_task = asyncio.create_task(_deliver(h, consumer, resume))
+            second_task = None
+            try:
+                await asyncio.wait_for(first_entered.wait(), timeout=2)
+                second_task = asyncio.create_task(_deliver(h, consumer, followup))
+                key = _thread_key_for(resume)
+                await _wait_until(lambda: h.kernel._order_locks[key].refs > 1)
+                release_first.set()
+                await _wait_until(lambda: bool(h.runner.queried))
+                assert h.runner.opened == ["approved resume"]
+                assert h.runner.queried == ["approved resume"]
+                await asyncio.wait_for(asyncio.shield(second_task), timeout=2)
+                assert h.runner.steers == ["followup"]
+                assert await consumer._waits.get(resume.event_id) is None
+                assert await consumer._waits.get(followup.event_id) is None
+                runner_release.set()
+                await asyncio.wait_for(asyncio.shield(first_task), timeout=2)
+            finally:
+                release_first.set()
+                runner_release.set()
+                tasks = [first_task, *([second_task] if second_task is not None else [])]
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     asyncio.run(go())
 
