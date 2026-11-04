@@ -1702,7 +1702,7 @@ def _map_finish_conflict(result: WorkItemConflict, request: ExecutionRequest | N
     if result.code == "publication_pending":
         return "publication_pending"
     if request is not None and request.status == "cancellation_requested":
-        if request.terminal_cause == "issue_cancelled":
+        if request.terminal_cause in ("issue_cancelled", "issue_deleted"):
             return "work_item_cancelled"
         return "not_running"
     return "not_running"
@@ -1893,11 +1893,13 @@ async def cancel(
     *,
     work_item_id: uuid.UUID,
     expected_version: int,
+    cause: lifecycle.CancellationCause = "issue_cancelled",
 ) -> WorkItemOutcome | WorkItemConflict:
     return await lifecycle.request_cancellation(
         session,
         work_item_id=work_item_id,
         expected_work_item_version=expected_version,
+        cause=cause,
     )
 
 
@@ -2022,7 +2024,7 @@ async def claim_terminate_publishes(
                     ExecutionRequest.status == "cancellation_requested",
                     or_(
                         # An issue cancellation stops a live runtime too.
-                        ExecutionRequest.terminal_cause == "issue_cancelled",
+                        ExecutionRequest.terminal_cause.in_(("issue_cancelled", "issue_deleted")),
                         ExecutionRequest.runtime_owner.is_(None),
                         ExecutionRequest.runtime_heartbeat_expires_at.is_(None),
                         ExecutionRequest.runtime_heartbeat_expires_at <= func.clock_timestamp(),

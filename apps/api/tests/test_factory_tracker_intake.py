@@ -2085,3 +2085,106 @@ def test_deleted_jira_issue_cancels_running_work_item(intake: Intake) -> None:
             assert [wake.request_id for wake in wakes] == [request["id"]]
 
     intake.client.portal.call(teardown_wake)
+    recorded = intake.client.post(
+        f"/v1/internal/work-items/requests/{request['id']}/termination",
+        headers={"X-Curie-Worker-Token": get_settings().internal_worker_token},
+        json={"runtime_epoch": started.json()["runtime_epoch"], "observation": "sandbox deleted"},
+    )
+    assert recorded.status_code == 200, recorded.text
+    assert _rows(
+        "SELECT status, terminal_cause FROM curie.execution_requests WHERE id = :id",
+        {"id": request["id"]},
+    ) == [{"status": "cancelled", "terminal_cause": "issue_deleted"}]
+    from curie_api import factory_notices
+
+    async def sync_status() -> None:
+        await factory_notices.sync_status_comments(
+            intake.client.app.state.sessionmaker,
+            get_settings(),
+            owner="deleted-issue-status",
+            limit=50,
+        )
+
+    intake.client.portal.call(sync_status)
+    assert (
+        _rows(
+            "SELECT finalized_at, refused_at, refusal, applied_label "
+            "FROM curie.factory_terminal_notices "
+            "WHERE execution_request_id = :id",
+            {"id": request["id"]},
+        )[0]["refusal"]
+        == "issue_deleted"
+    )
+    assert intake.jira.requests_of("comment_create") == []
+
+
+@pytest.mark.parametrize("change", ["deleted", "unlabelled", "closed"])
+def test_missing_or_closed_jira_issue_cancels_waiting_work(intake: Intake, change: str) -> None:
+    intake.agent()
+    issue = _issue(intake)
+    intake.jira.add_label(issue.id, LABEL, intake.starter)
+    intake.poll()
+    [item] = _work_items(issue)
+    if change == "deleted":
+        intake.jira.delete_issue(issue.id)
+    elif change == "unlabelled":
+        intake.jira.remove_label(issue.id, LABEL, intake.starter)
+    else:
+        intake.jira.set_status(issue.id, "Done", intake.starter)
+    intake.poll()
+    assert _rows(
+        "SELECT status, terminal_cause FROM curie.execution_requests WHERE work_item_id = :id",
+        {"id": item["id"]},
+    ) == [
+        {
+            "status": "cancelled",
+            "terminal_cause": "issue_deleted" if change == "deleted" else "issue_cancelled",
+        }
+    ]
+
+
+def test_missing_status_comment_does_not_undo_cancellation(
+    intake: Intake, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_api import factory_notices
+
+    intake.agent()
+    issue = _issue(intake)
+    intake.jira.add_label(issue.id, LABEL, intake.starter)
+    intake.poll()
+    [item] = _work_items(issue)
+    intake.jira.remove_label(issue.id, LABEL, intake.starter)
+    intake.poll()
+    intake.jira.fail_next("comments", status=404)
+    original = httpx.AsyncClient
+
+    def external_client(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs.setdefault(
+            "transport", _ByHost(intake.jira, intake.github, intake.dc, dc_down=False)
+        )
+        return original(**kwargs)
+
+    monkeypatch.setattr(factory_notices.httpx, "AsyncClient", external_client)
+
+    async def sync_status() -> None:
+        await factory_notices.sync_status_comments(
+            intake.client.app.state.sessionmaker, get_settings(), owner="missing-comment", limit=50
+        )
+
+    intake.client.portal.call(sync_status)
+    assert _rows(
+        "SELECT status, terminal_cause FROM curie.execution_requests WHERE work_item_id = :id",
+        {"id": item["id"]},
+    ) == [{"status": "cancelled", "terminal_cause": "issue_cancelled"}]
+    [notice] = _rows(
+        "SELECT finalized_at, refused_at, refusal, applied_label "
+        "FROM curie.factory_terminal_notices "
+        "WHERE work_item_id = :id",
+        {"id": item["id"]},
+    )
+    assert notice["refused_at"] is not None
+    assert notice["refusal"] == "issue_deleted"
+    assert notice["applied_label"] == ""
+    reads = len(intake.jira.requests)
+    intake.client.portal.call(sync_status)
+    assert len(intake.jira.requests) == reads

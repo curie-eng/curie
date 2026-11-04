@@ -65,7 +65,7 @@ CONTRACT = "0041"
 # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
 # Factory base transition ORM reads require the 0144 transition table.
 # The 0145 join requires both the stable deadline backport (0140) and 0144.
-APP_SCHEMA_MIN = "0145"
+APP_SCHEMA_MIN = "0147"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -169,6 +169,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0143",
             "0144",
             "0145",
+            "0147",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -202,8 +203,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0143",
             "0144",
             "0145",
+            "0147",
         }
-    assert current_revision() == "0145"
+    assert current_revision() == "0147"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -295,13 +297,13 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # can serve an older database.
     # Factory base transition reads require the 0144 table, and the 0145 join
     # also requires the stable deadline backport (0140).
-    for revision in sorted(known - {"0145"}):
+    for revision in sorted(known - {"0147"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
     assert can_serve("0143", window, known) is False
     assert can_serve("0144", window, known) is False
-    assert can_serve("0145", window, known) is True
+    assert can_serve("0147", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:
@@ -1176,3 +1178,35 @@ def test_moved_postgres_wait_extracts_ssl_without_forwarding_it_as_a_server_sett
         assert kwargs == {"timeout": 2, "ssl": "disable"}
     finally:
         get_settings.cache_clear()
+
+
+@pytest.mark.parametrize("deleted_rows", [False, True])
+def test_deleted_issue_migration_refuses_to_discard_cancellation_records(
+    isolated_migration_db: IsolatedMigrationDb, deleted_rows: bool
+) -> None:
+    from curie_api.workitems import lifecycle
+    from test_workitems import _agent, _item, _request, with_session
+
+    isolated_migration_db.at("0145")
+    command.upgrade(alembic_config(), "0147")
+    if deleted_rows:
+
+        async def cancel_deleted(session):
+            agent = await _agent(session)
+            waiting = await _request(session, (await _item(session, agent)).work_item)
+            cancelled = await lifecycle.request_cancellation(
+                session,
+                work_item_id=waiting.work_item.id,
+                expected_work_item_version=waiting.work_item.version,
+                cause="issue_deleted",
+            )
+            assert isinstance(cancelled, lifecycle.WorkItemOutcome)
+            assert cancelled.request.terminal_cause == "issue_deleted"
+
+        with_session(cancel_deleted)
+        with pytest.raises(RuntimeError, match="cannot downgrade"):
+            command.downgrade(alembic_config(), "0145")
+        assert current_revision() == "0147"
+    else:
+        command.downgrade(alembic_config(), "0145")
+        assert current_revision() == "0145"

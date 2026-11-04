@@ -6,6 +6,8 @@ import asyncio
 
 import httpx
 import pytest
+
+# ruff: noqa: F811 (the shared harness fixture is imported and then requested)
 from curie_worker import api_retry
 from curie_worker.approvals import ApprovalBackendError, ApprovalClient, ApprovalRequest
 

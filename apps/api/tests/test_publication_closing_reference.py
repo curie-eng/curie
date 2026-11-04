@@ -387,4 +387,6 @@ def test_deleted_jira_issue_names_the_issue_on_publication_create(
     )
     assert finish.status_code == 409, finish.text
     assert finish.json()["detail"]["code"] == "work_item_cancelled"
-    assert _rows("SELECT terminal_cause FROM curie.execution_requests WHERE id = :id", {"id": request_id}) == [{"terminal_cause": "issue_deleted"}]
+    assert _rows(
+        "SELECT terminal_cause FROM curie.execution_requests WHERE id = :id", {"id": request_id}
+    ) == [{"terminal_cause": "issue_deleted"}]

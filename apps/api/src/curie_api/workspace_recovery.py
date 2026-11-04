@@ -63,6 +63,7 @@ def _failed_source(source: ExecutionRequest) -> None:
             "start_failed",
             "execution_deadline",
             "issue_cancelled",
+            "issue_deleted",
             "lineage_closed",
         }
     ):
