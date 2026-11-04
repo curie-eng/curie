@@ -108,6 +108,7 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.grafanaConnector.updater.podSecurityContext | nindent 8 }}
+      enableServiceLinks: false
       containers:
         - name: grafana-token-updater
           image: {{ .Values.grafanaConnector.updater.image }}
@@ -480,6 +481,7 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.grafanaConnector.updater.podSecurityContext | nindent 8 }}
+      enableServiceLinks: false
       containers:
         - name: grafana-token-cleanup
           image: {{ .Values.grafanaConnector.updater.image }}

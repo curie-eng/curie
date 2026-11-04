@@ -63,6 +63,7 @@ spec:
         - name: data
           emptyDir: {}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: postgres
           image: {{ .Values.postgres.image }}

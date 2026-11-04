@@ -137,6 +137,7 @@ spec:
       {{- with .Values.priorityClasses.platform.name }}
       priorityClassName: {{ . }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: controller-ready
           image: {{ .Values.preflights.controllerReady.image }}

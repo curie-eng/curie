@@ -58,6 +58,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: schema-migrate
           image: {{ $image | quote }}

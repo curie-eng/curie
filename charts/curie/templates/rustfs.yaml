@@ -108,6 +108,7 @@ spec:
               mountPath: /storage-guard
               readOnly: true
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: rustfs
           image: {{ .Values.rustfs.image }}
@@ -202,6 +203,7 @@ spec:
       {{- with .Values.priorityClasses.platform.name }}
       priorityClassName: {{ . }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: aws-cli
           image: {{ .Values.rustfs.awsCliImage }}
