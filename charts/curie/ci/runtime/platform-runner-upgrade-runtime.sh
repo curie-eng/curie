@@ -294,7 +294,7 @@ with urllib.request.urlopen(request,timeout=30) as response:
             container = next(c for c in expected_spec["podTemplate"]["spec"][kind] if c["name"] == name)
             container["image"] = images["runner"]
         require(after["spec"] == expected_spec and after["metadata"]["labels"] == source["metadata"]["labels"],
-                "source template lost connector references, resources, labels, or target image")
+                "deployment-created template retained a stale runner app/init image or lost agent settings")
         require(read(namespace, "sandboxwarmpool/" + source_name + "-pool")["spec"] == pool_before, "pool selection changed")
         require(read(namespace, "sandboxtemplate/" + foreign_name) == foreign_before, "unrelated template changed")
         kc(namespace, "delete", "sandboxclaims", "-l", "curietech.ai/agent=acme-bot", "--wait=true", "--timeout=90s")
