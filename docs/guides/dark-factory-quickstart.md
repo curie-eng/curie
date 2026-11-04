@@ -1065,6 +1065,13 @@ Reference: the same binding is made by hand with
 `--label` applies only when a surface is added, and the overlap rule above
 applies to it as well.
 
+A Jira plus GitHub quickstart on a site that already has a binding is refused
+before any write. One Jira site has one binding. Extend that binding by hand,
+as [Writing the values by hand](#writing-the-values-by-hand) describes: add a
+repo alias and keep `defaultRepo`, put a `repo:<alias>` label on the ticket,
+then bind the agent with
+`curie cluster surfaces <agent> --add jira=<binding> --label <label>`.
+
 ## Troubleshooting
 
 | What you see | Cause | Fix |

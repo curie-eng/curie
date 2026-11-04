@@ -192,6 +192,10 @@ fn matches(planned: &Value, recorded: &Value) -> bool {
     }
 }
 
+/// One Jira site has one binding. A second repository is added by hand,
+/// not by rerunning quickstart with flags that would rewrite `defaultRepo`.
+const HAND_WRITTEN_ALIAS_FIX: &str = "one Jira site has one binding; extend the existing binding by hand as docs/guides/dark-factory-quickstart.md#writing-the-values-by-hand describes, adding a repo alias and keeping `defaultRepo`; put a `repo:<alias>` label on the ticket; then bind the agent with `curie cluster surfaces <agent> --add jira=<binding> --label <label>`";
+
 /// The flags that set each compared field, for the refusal's fix.
 fn field_flags(field: &str) -> &'static str {
     match field {
@@ -253,15 +257,20 @@ pub(in crate::factory_quickstart) fn check_recorded(
             };
             let key = camel(field);
             let entry = list.trim_end_matches('s');
+            let fix = if list == "bindings" && (field == "default_repo" || field == "repos") {
+                HAND_WRITTEN_ALIAS_FIX.to_string()
+            } else {
+                format!(
+                    "rerun with {} matching factory.{list}[{name}].{key}, or change that entry on the release with helm for every Jira agent as docs/guides/dark-factory-quickstart.md shows, then rerun",
+                    field_flags(field)
+                )
+            };
             return Err(CliError::usage(format!(
                 "release {release} already has a Jira {entry} `{name}` that other agents serve, and its {key} is {} where this run would write {}; the conflicting {entry} was refused before any write",
                 shown(recorded.get(field)),
                 shown(planned.get(field)),
             ))
-            .with_fix(format!(
-                "rerun with {} matching factory.{list}[{name}].{key}, or change that entry on the release with helm for every Jira agent as docs/guides/dark-factory-quickstart.md shows, then rerun",
-                field_flags(field)
-            ))
+            .with_fix(fix)
             .into());
         }
     }
