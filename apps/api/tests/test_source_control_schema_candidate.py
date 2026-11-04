@@ -44,7 +44,7 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
     # Workspace recovery reads require the 0141 outcome ledger.
     # The 0145 join requires both the stable deadline backport (0140) and 0144.
-    assert window == {"schema_min": "0145", "schema_head": "0145"}
+    assert window == {"schema_min": "0147", "schema_head": "0147"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -75,7 +75,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.3") == {"schema_min": "0140", "schema_head": "0140"}
     assert data["windows"].get("0.14.4") == {"schema_min": "0140", "schema_head": "0140"}
-    assert data["revisions"][-29:] == [
+    assert data["revisions"][-30:] == [
         "0095",
         "0096",
         "0097",
@@ -105,6 +105,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0143",
         "0144",
         "0145",
+        "0147",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -213,7 +214,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0145"
+    assert current_revision() == "0147"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]
