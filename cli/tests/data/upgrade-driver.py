@@ -186,6 +186,9 @@ BASE = {
     "deployment_unreadable_after": None,
     "deployment_absent": None,
     "target": "0.9.0",
+    "requested_image": None,
+    "installed_image": None,
+    "running_image": None,
     "show_chart": "0.9.0",
     "ready": 1,
     "updated": 1,
@@ -491,6 +494,8 @@ SCENARIOS = {
 root = Path(os.environ["UPGRADE_DRIVER_ROOT"])
 scenario = dict(BASE)
 scenario.update(SCENARIOS[os.environ["UPGRADE_DRIVER_SCENARIO"]])
+if (root / "image-pins.json").exists():
+    scenario.update(json.loads((root / "image-pins.json").read_text()))
 if scenario["after_converge"] is None:
     scenario["after_converge"] = scenario["after"]
 program = Path(sys.argv[0]).name
@@ -514,7 +519,8 @@ else:
     chart_version = scenario["before"]
 served = scenario["served_after"] if upgraded else scenario["served_before"]
 image = f"{REPO}:{served}"
-target_image = f"{REPO}:{scenario['target']}"
+target_image = scenario["installed_image"] or f"{REPO}:{scenario['target']}"
+image = scenario["running_image"] or image
 
 
 def emit(value):
@@ -815,7 +821,7 @@ pod = {
             {
                 "name": "api",
                 "image": image,
-                "imageID": "containerd://sha256:" + "a" * 64,
+                "imageID": scenario["running_image"] or "containerd://sha256:" + "a" * 64,
                 "ready": True,
                 "state": {"running": {}},
             }
@@ -1277,6 +1283,12 @@ if program == "helm":
             values = json.loads(Path(values_file).read_text()) if values_file else {}
             if values_file:
                 capture("render-values", ".json", values_file)
+            requested = copy.deepcopy(expected)
+            requested["spec"]["template"]["spec"]["containers"][0]["image"] = (
+                scenario["requested_image"] or target_image
+            )
+            print(json.dumps(requested))
+            print("---")
             worker = values.get("worker", {})
             if (
                 worker.get("deploy", True) is False
