@@ -1283,15 +1283,16 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
 
     let (ok, out, _) = pods_read?;
     let mut warnings: Vec<String> = Vec::new();
-    let (mut pods, ready, total, mut unhealthy) = if ok {
+    let (mut pods, ready, total, mut unhealthy, sandbox_warnings) = if ok {
         let items: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&out)
             .ok()
             .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
             .unwrap_or_default();
         collect_pod_summary(&items)
     } else {
-        (Vec::new(), 0, 0, Vec::new())
+        (Vec::new(), 0, 0, Vec::new(), Vec::new())
     };
+    warnings.extend(sandbox_warnings);
 
     if !mail_probe_is_gated_off(computed.as_ref().ok().and_then(Option::as_ref)) {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&out) {
@@ -1418,6 +1419,7 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
         ok,
         &crate::kube_context::available_contexts(),
     );
+    let convergence_fix = status_convergence_fix(&unhealthy);
     let output = ClusterStatusOutput::Status(Box::new(ClusterStatus {
         namespace: opts.namespace.clone(),
         revision,
@@ -1444,10 +1446,17 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
             &output,
             crate::exit::CliError::failure(format!(
                 "target release has not converged: {}",
-                json["pods"]["unhealthy"].as_array().map(|reasons| reasons.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>().join("; ")).unwrap_or_default()
+                json["pods"]["unhealthy"]
+                    .as_array()
+                    .map(|reasons| reasons
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("; "))
+                    .unwrap_or_default()
             ))
-                .with_fix("inspect the unhealthy rollout reasons, correct the target configuration and rerun `curie cluster up`")
-                .into(),
+            .with_fix(convergence_fix)
+            .into(),
         ));
     }
     Ok(output)
@@ -2839,15 +2848,24 @@ fn render_pod_table(ui: &crate::ui::Ui, pods: &[PodRow]) {
     ui.payload_plain(&crate::ui::table(&["pod", "ready", "status"], &rows, &[]));
 }
 
+/// The operator remedy for a status convergence failure.
+fn status_convergence_fix(_unhealthy: &[String]) -> String {
+    "inspect the unhealthy rollout reasons, correct the target configuration and rerun `curie cluster up`".to_string()
+}
+
 /// Summarise `kubectl get pods` output into (rows, ready count, steady-state
-/// total, names of pods not Running) WITHOUT printing, so the caller can render
-/// or serialize it (#485). Terminal (`Succeeded`, `Failed`, `Completed`) and
-/// terminating pods stay in the rows but are excluded from the tally; a kubelet
-/// eviction leaves a `Failed` pod its ReplicaSet never deletes (#4496).
-fn collect_pod_summary(pods: &[serde_json::Value]) -> (Vec<PodRow>, usize, usize, Vec<String>) {
+/// total, names of pods not Running, runtime-sandbox warnings) WITHOUT
+/// printing, so the caller can render or serialize it (#485). Terminal
+/// (`Succeeded`, `Failed`, `Completed`) and terminating pods stay in the rows
+/// but are excluded from the tally; a kubelet eviction leaves a `Failed` pod
+/// its ReplicaSet never deletes (#4496).
+fn collect_pod_summary(
+    pods: &[serde_json::Value],
+) -> (Vec<PodRow>, usize, usize, Vec<String>, Vec<String>) {
     let mut ready = 0usize;
     let mut total = 0usize;
     let mut unhealthy: Vec<String> = Vec::new();
+    let sandbox_warnings: Vec<String> = Vec::new();
     let mut table_rows: Vec<PodRow> = Vec::new();
     for pod in pods {
         let name = pod
@@ -2911,7 +2929,7 @@ fn collect_pod_summary(pods: &[serde_json::Value]) -> (Vec<PodRow>, usize, usize
             unhealthy.push(name);
         }
     }
-    (table_rows, ready, total, unhealthy)
+    (table_rows, ready, total, unhealthy, sandbox_warnings)
 }
 
 /// Resolve a routable node host: kubeconfig cluster server hostname, falling
@@ -6862,10 +6880,11 @@ mod tests {
     fn pod_summary_does_not_panic_on_empty() {
         // No items: empty items array.
         let items: Vec<serde_json::Value> = Vec::new();
-        let (rows, ready, total, unhealthy) = collect_pod_summary(&items);
+        let (rows, ready, total, unhealthy, warnings) = collect_pod_summary(&items);
         assert!(rows.is_empty());
         assert_eq!((ready, total), (0, 0));
         assert!(unhealthy.is_empty());
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -6888,7 +6907,7 @@ mod tests {
         ]"#;
 
         let items: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
-        let (_, ready, total, unhealthy) = collect_pod_summary(&items);
+        let (_, ready, total, unhealthy, _) = collect_pod_summary(&items);
         assert_eq!((ready, total, unhealthy), (10, 10, vec![]));
     }
 
@@ -6903,7 +6922,7 @@ mod tests {
         ]"#;
 
         let items: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
-        let (rows, ready, total, unhealthy) = collect_pod_summary(&items);
+        let (rows, ready, total, unhealthy, _) = collect_pod_summary(&items);
         assert_eq!((ready, total, unhealthy), (1, 1, vec![]));
         let listed: Vec<(&str, &str)> = rows
             .iter()
@@ -6928,11 +6947,108 @@ mod tests {
         ]"#;
 
         let items: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
-        let (_, ready, total, unhealthy) = collect_pod_summary(&items);
+        let (_, ready, total, unhealthy, _) = collect_pod_summary(&items);
         assert_eq!(
             (ready, total, unhealthy),
             (2, 3, vec!["dispatcher0".to_string()])
         );
+    }
+
+    /// #4750: a starting factory sandbox stays visible and does not fail the release.
+    #[test]
+    fn starting_sandbox_is_not_release_failure() {
+        let release = r#"[{"metadata":{"name":"api0"},"status":{"phase":"Running","containerStatuses":[{"ready":true}]}}]"#;
+        let with_sandbox = r#"[
+            {"metadata":{"name":"api0"},"status":{"phase":"Running","containerStatuses":[{"ready":true}]}},
+            {"metadata":{"name":"curie-thread-example"},"status":{"phase":"Pending"}}
+        ]"#;
+        let release_items: Vec<serde_json::Value> = serde_json::from_str(release).unwrap();
+        let sandbox_items: Vec<serde_json::Value> = serde_json::from_str(with_sandbox).unwrap();
+        let (_, base_ready, base_total, base_unhealthy, _) = collect_pod_summary(&release_items);
+        let (rows, ready, total, unhealthy, warnings) = collect_pod_summary(&sandbox_items);
+        assert!(
+            rows.iter().any(|row| row.name == "curie-thread-example"),
+            "the sandbox stays in the status table"
+        );
+        assert_eq!(
+            (ready, total, &unhealthy),
+            (base_ready, base_total, &base_unhealthy),
+            "a starting sandbox does not change ready, total, or the convergence list"
+        );
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.contains("curie-thread-example")
+                    && warning.contains("runtime sandbox")
+                    && warning.contains("not ready")
+            }),
+            "names the sandbox in warnings: {warnings:?}"
+        );
+
+        let running_sandbox = r#"[
+            {"metadata":{"name":"api0"},"status":{"phase":"Running","containerStatuses":[{"ready":true}]}},
+            {"metadata":{"name":"curie-thread-ready"},"status":{"phase":"Running","containerStatuses":[{"ready":true}]}}
+        ]"#;
+        let running_items: Vec<serde_json::Value> = serde_json::from_str(running_sandbox).unwrap();
+        let (_, ready, total, unhealthy, warnings) = collect_pod_summary(&running_items);
+        assert_eq!(
+            (ready, total, &unhealthy),
+            (base_ready, base_total, &base_unhealthy)
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("curie-thread-ready")),
+            "a ready sandbox is not warned as not ready: {warnings:?}"
+        );
+
+        let pending_release = r#"[
+            {"metadata":{"name":"api0"},"status":{"phase":"Running","containerStatuses":[{"ready":true}]}},
+            {"metadata":{"name":"dispatcher0"},"status":{"phase":"Pending"}}
+        ]"#;
+        let items: Vec<serde_json::Value> = serde_json::from_str(pending_release).unwrap();
+        let (_, ready, total, unhealthy, _) = collect_pod_summary(&items);
+        assert_eq!((ready, total), (1, 2));
+        assert_eq!(unhealthy, vec!["dispatcher0".to_string()]);
+        let fix = status_convergence_fix(&unhealthy);
+        assert!(
+            fix.contains("inspect the unhealthy rollout reasons"),
+            "{fix}"
+        );
+        assert!(fix.contains("curie cluster up"), "{fix}");
+        let failure =
+            crate::exit::CliError::failure("target release has not converged: dispatcher0")
+                .with_fix(fix);
+        assert_eq!(failure.class.code(), 1);
+    }
+
+    /// #4750: a rejected static token is repaired by the Secret merge patch.
+    #[test]
+    fn authentication_rejected_fix_is_the_token_patch() {
+        let reasons =
+            vec!["credential tracker example (static_token): authentication rejected".to_string()];
+        let fix = status_convergence_fix(&reasons);
+        assert!(
+            fix.contains("docs/guides/dark-factory-quickstart.md#replace-a-static-token"),
+            "{fix}"
+        );
+        assert!(fix.contains("curie cluster status"), "{fix}");
+        assert!(!fix.contains("curie cluster up"), "{fix}");
+
+        let rollout = status_convergence_fix(&["dispatcher0".to_string()]);
+        assert!(
+            rollout.contains("inspect the unhealthy rollout reasons"),
+            "{rollout}"
+        );
+        assert!(rollout.contains("curie cluster up"), "{rollout}");
+        assert!(!rollout.contains("replace-a-static-token"), "{rollout}");
+
+        let both = status_convergence_fix(&[
+            "credential tracker example (static_token): authentication rejected".to_string(),
+            "dispatcher0".to_string(),
+        ]);
+        let token_at = both.find("replace-a-static-token").expect(&both);
+        let rollout_at = both.find("curie cluster up").expect(&both);
+        assert!(token_at < rollout_at, "{both}");
     }
 
     #[test]
