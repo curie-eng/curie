@@ -1055,7 +1055,11 @@ def test_required_workflows_reach_one_task_branch_without_widening_pushes() -> N
             assert push is None, f"{path.name} must remain pull request only"
         else:
             assert isinstance(push, dict), f"{path.name} must retain its push trigger"
-            assert push.get("branches") == ["main", "next"], path.name
+            expected = ["main", "next"]
+            if path.name in {"ci.yaml", "helm-ci.yaml"}:
+                # Maintenance backport branches cut from a release tag.
+                expected = ["main", "next", "backport/**"]
+            assert push.get("branches") == expected, path.name
 
 
 def _python_job(
