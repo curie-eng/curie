@@ -19,7 +19,6 @@ from curie_worker.sandbox import QuotaRejection
 from curie_worker.workspace import (
     WorkspaceClaimCoordinator,
     WorkspaceCredentialClient,
-    WorkspaceDependencyUnavailable,
     WorkspacePreparationError,
 )
 
@@ -412,6 +411,8 @@ def test_workspace_dependency_classification_covers_selection_and_redemption(
     stage: str,
     status: int,
 ) -> None:
+    from curie_worker.workspace import WorkspaceDependencyUnavailable
+
     async def go() -> None:
         deployment = uuid.uuid4()
         app = web.Application()
