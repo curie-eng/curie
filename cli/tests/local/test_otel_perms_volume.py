@@ -1,9 +1,10 @@
 """Full-profile local wipe must drop every volume the project mounted (#5362).
 
-``curie local up`` starts the full profile. ``curie local down --wipe --yes``
-is the wipe. The RustFS image declares VOLUME /data, and otel-collector-perms
-does not use that path. A named project volume covers it so the wipe can see
-the mount after the one-shot exits.
+``curie local up`` starts the full profile. A plain ``curie local down`` then
+removes the exited otel-collector-perms one-shot without its volumes, and
+``curie local down --wipe --yes`` is the wipe. The RustFS image declares
+VOLUME /data. A named project volume covers that path, so the wipe still
+removes it after the container is gone.
 """
 
 from __future__ import annotations
@@ -307,7 +308,9 @@ def _cleanup(cycle: Cycle) -> None:
         )
         if removed.returncode != 0:
             errors.append((removed.stderr or "container cleanup failed").strip())
-    for name in sorted(_project_volume_ids(cycle.project, cycle.env) | {cycle.foreign}):
+    mounted_ids = {mount.name for mount in cycle.mounts}
+    owned = mounted_ids | _project_volume_ids(cycle.project, cycle.env) | {cycle.foreign}
+    for name in sorted(owned):
         if name not in _volume_ids(cycle.env):
             continue
         removed = _run(["docker", "volume", "rm", name], env=cycle.env)
@@ -330,6 +333,9 @@ def _cleanup(cycle: Cycle) -> None:
             errors.append((removed.stderr or "network cleanup failed").strip())
     if _project_volume_ids(cycle.project, cycle.env):
         errors.append("project volumes remained after cleanup")
+    left = mounted_ids & _volume_ids(cycle.env)
+    if left:
+        errors.append(f"mounted volumes remained after cleanup: {sorted(left)}")
     still = _run(
         [
             "docker",
@@ -431,23 +437,24 @@ def _perms_data(cycle: Cycle) -> Mount:
 
 
 def test_full_profile_perms_wipe_leaves_no_anonymous_volume(cycle: Cycle) -> None:
-    """A full-profile up and wipe leaves no volume this project mounted.
+    """A full-profile up, plain down, and wipe leaves no mounted volume behind.
 
-    An unrelated volume created beside the project must still exist after the
-    wipe. Cleanup of that volume happens after the assertion.
+    The plain down removes the exited one-shot without its volumes. Compose
+    5.6.1 still deletes an anonymous image volume when the wipe runs while
+    that container exists, so this records the volume that remains once the
+    container is already gone. An unrelated volume must survive the wipe.
     """
 
     assert cycle.mounts
     data = _perms_data(cycle)
     data_labels = cycle.volume_labels(data.name)
     mounted = {mount.name for mount in cycle.mounts}
+    _require(cycle.local("down", timeout=180), "stopping the project")
     _require(cycle.local("down", "--wipe", "--yes", timeout=180), "wiping the project")
     remaining = _volume_ids(cycle.env)
     survived = sorted(name for name in mounted if name in remaining)
-    # The wipe result is first so a volume that is still present fails here.
-    # On compose 5.6.1, down -v also removes an anonymous image volume while
-    # its container still exists, and then the project label below is the
-    # check that fails when /data is that image volume.
+    # The surviving id is first. A volume that is still present fails here,
+    # before the project label is checked.
     assert not survived, f"volumes still present after wipe: {survived}"
     assert cycle.foreign in remaining
     assert data_labels.get("com.docker.compose.project") == cycle.project, (
