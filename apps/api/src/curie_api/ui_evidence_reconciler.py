@@ -152,6 +152,57 @@ def _refusal(image: PublicationUiEvidenceImage) -> str | None:
     return None if _stored(image) else "not_stored"
 
 
+def _stale_due() -> list[ColumnElement[bool]]:
+    """When an open lineage's pull request needs the current-head notice: the
+    latest revision has no evidence (past its upload window) or its evidence
+    failed, and the pull request may carry something that revision did not
+    record (a comment posted and never recorded, or a ref or comment recorded
+    for an earlier revision or never at all). Selection and the re-check under
+    the lineage lease use this one predicate."""
+
+    latest = (
+        select(Publication.id)
+        .where(
+            Publication.lineage_id == ThreadPublicationLineage.id,
+            Publication.revision_number == ThreadPublicationLineage.latest_revision,
+            Publication.status == "succeeded",
+            Publication.result_url == ThreadPublicationLineage.pr_url,
+        )
+        .correlate(ThreadPublicationLineage)
+    )
+    evidence = select(PublicationUiEvidence.publication_id).where(
+        PublicationUiEvidence.publication_id == Publication.id
+    )
+    no_evidence = latest.where(
+        Publication.created_at < func.now() - timedelta(seconds=NO_EVIDENCE_AFTER_S),
+        ~evidence.exists(),
+    ).exists()
+    failed = latest.where(
+        evidence.where(PublicationUiEvidence.status == "failed").exists()
+    ).exists()
+    return [
+        ThreadPublicationLineage.status == "open",
+        ThreadPublicationLineage.pr_number.is_not(None),
+        ThreadPublicationLineage.head_sha.is_not(None),
+        or_(
+            PublicationLineageUiEvidence.comment_pending,
+            and_(
+                or_(
+                    PublicationLineageUiEvidence.comment_revision.is_(None),
+                    PublicationLineageUiEvidence.comment_revision
+                    < ThreadPublicationLineage.latest_revision,
+                ),
+                or_(
+                    PublicationLineageUiEvidence.ref_pending,
+                    PublicationLineageUiEvidence.ref_commit_sha.is_not(None),
+                    PublicationLineageUiEvidence.comment_revision.is_not(None),
+                ),
+            ),
+        ),
+        or_(no_evidence, failed),
+    ]
+
+
 class UiEvidenceReconciler:
     """Publish uploaded UI evidence and keep each pull request's comment current."""
 
@@ -186,26 +237,6 @@ class UiEvidenceReconciler:
                     .limit(_BATCH_LIMIT)
                 )
             )
-            latest = (
-                select(Publication.id)
-                .where(
-                    Publication.lineage_id == ThreadPublicationLineage.id,
-                    Publication.revision_number == ThreadPublicationLineage.latest_revision,
-                    Publication.status == "succeeded",
-                    Publication.result_url == ThreadPublicationLineage.pr_url,
-                )
-                .correlate(ThreadPublicationLineage)
-            )
-            evidence = select(PublicationUiEvidence.publication_id).where(
-                PublicationUiEvidence.publication_id == Publication.id
-            )
-            no_evidence = latest.where(
-                Publication.created_at < func.now() - timedelta(seconds=NO_EVIDENCE_AFTER_S),
-                ~evidence.exists(),
-            ).exists()
-            failed = latest.where(
-                evidence.where(PublicationUiEvidence.status == "failed").exists()
-            ).exists()
 
             async def lineages(*where: ColumnElement[bool]) -> list[uuid.UUID]:
                 return list(
@@ -221,30 +252,7 @@ class UiEvidenceReconciler:
                     )
                 )
 
-            stale = await lineages(
-                ThreadPublicationLineage.status == "open",
-                ThreadPublicationLineage.pr_number.is_not(None),
-                ThreadPublicationLineage.head_sha.is_not(None),
-                # The pull request may carry something the latest revision did
-                # not record: a comment posted and never recorded, or a ref or
-                # comment recorded for an earlier revision or never at all.
-                or_(
-                    PublicationLineageUiEvidence.comment_pending,
-                    and_(
-                        or_(
-                            PublicationLineageUiEvidence.comment_revision.is_(None),
-                            PublicationLineageUiEvidence.comment_revision
-                            < ThreadPublicationLineage.latest_revision,
-                        ),
-                        or_(
-                            PublicationLineageUiEvidence.ref_pending,
-                            PublicationLineageUiEvidence.ref_commit_sha.is_not(None),
-                            PublicationLineageUiEvidence.comment_revision.is_not(None),
-                        ),
-                    ),
-                ),
-                or_(no_evidence, failed),
-            )
+            stale = await lineages(*_stale_due())
             ended = await lineages(
                 ThreadPublicationLineage.status.in_(("merged", "closed")),
                 or_(
@@ -445,6 +453,22 @@ class UiEvidenceReconciler:
         ):
             result.deleted += 1
 
+    async def _stale_still_due(self, lineage_id: uuid.UUID, revision: int) -> bool:
+        async with self._sessionmaker() as session:
+            due = await session.scalar(
+                select(ThreadPublicationLineage.id)
+                .join(
+                    PublicationLineageUiEvidence,
+                    PublicationLineageUiEvidence.lineage_id == ThreadPublicationLineage.id,
+                )
+                .where(
+                    ThreadPublicationLineage.id == lineage_id,
+                    ThreadPublicationLineage.latest_revision == revision,
+                    *_stale_due(),
+                )
+            )
+        return due is not None
+
     async def _stale(self, lease: _Lease, result: PassResult) -> None:
         """A later revision has no evidence: the comment says so, and the ref
         holding an earlier revision's images is deleted."""
@@ -455,6 +479,10 @@ class UiEvidenceReconciler:
             or lineage.status != "open"
             or lineage.head_sha is None
             or lineage.pr_number is None
+            # Selected before this lease was held: another owner may have
+            # published since, or a newer revision landed. Re-check now that no
+            # other owner can write, for the revision this notice names.
+            or not await self._stale_still_due(lease.lineage_id, lineage.revision)
         ):
             return
         code_host = self._code_host_for(lineage.repository)

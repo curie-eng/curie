@@ -1204,6 +1204,54 @@ def test_a_crash_after_the_stale_notice_still_converges_on_the_current_head(
     assert stack.fake.writes == writes
 
 
+def test_stale_work_overtaken_by_another_owner_publishing_writes_nothing(
+    stack: Stack, auth_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = published_with_evidence(stack, auth_headers)
+    _crash_once(_dies_after(stack, r"^(POST|PATCH) /repos/[^ ]+/git/refs"))
+    second = _no_evidence_revision(stack, auth_headers, first)
+    expire_leases()
+    third_tree = "7e57" * 10
+    landed: dict[str, Revision] = {}
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            maker = async_sessionmaker(engine, expire_on_commit=False)
+            slow, fast = reconciler(maker, stack.http), reconciler(maker, stack.http)
+            selected = slow._work
+
+            async def overtaken() -> dict[uuid.UUID, uuid.UUID | str]:
+                # The slow owner has chosen stale work but holds no lease yet.
+                work = await selected()
+                assert work.get(first.lineage_id) == "stale"
+                # Revision 3 lands with evidence and another owner publishes it.
+                landed["third"] = await asyncio.to_thread(
+                    published_with_evidence,
+                    stack,
+                    auth_headers,
+                    previous=second,
+                    head_tree=third_tree,
+                    candidate_tree=third_tree,
+                )
+                await fast.run_once()
+                return work
+
+            monkeypatch.setattr(slow, "_work", overtaken)
+            await slow.run_once()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+    third = landed["third"]
+    body = only_comment(stack, third)
+    assert "(revision 3)" in body
+    assert "No UI evidence exists" not in body
+    assert_shows(stack, third, body, {0, 1})
+    assert lineage_evidence(third)["comment_revision"] == 3
+
+
 def test_an_index_with_no_image_stored_by_the_deadline_gets_a_failed_outcome(
     stack: Stack, auth_headers: dict[str, str]
 ) -> None:
