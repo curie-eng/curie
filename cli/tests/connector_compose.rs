@@ -1056,7 +1056,7 @@ async fn bring_up_local_refuses_a_declared_secret_with_no_value() {
         dir.path(),
         &curie::connector_build::load(dir.path()).unwrap(),
         &lock,
-        &scope("sre-bot"),
+        "sre-bot",
         "curie",
     )
     .await

@@ -3278,14 +3278,8 @@ async fn docker_subpath_preflight_local_bring_up_refuses_old_compose_before_any_
         connectors: std::collections::BTreeMap::new(),
         runner: None,
     };
-    let result = super::bring_up_local(
-        plugin.path(),
-        &decl,
-        &lock,
-        &subpath_scope(),
-        "test-project",
-    )
-    .await;
+    let result =
+        super::bring_up_local(plugin.path(), &decl, &lock, "acme-bot", "test-project").await;
     let err = result.expect_err("Compose v2.25.0 must refuse the local bring-up");
     let text = format!("{err:#}");
     for needle in ["Docker Compose 2.26.0", "2.25.0", "acme-connector"] {
@@ -3323,14 +3317,7 @@ async fn docker_subpath_preflight_bring_ups_skip_version_checks_without_secret_f
         "test-project",
     )
     .await;
-    let _ = super::bring_up_local(
-        plugin.path(),
-        &decl,
-        &lock,
-        &subpath_scope(),
-        "test-project",
-    )
-    .await;
+    let _ = super::bring_up_local(plugin.path(), &decl, &lock, "acme-bot", "test-project").await;
     let log_text = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(
         !log_text.contains("version --format") && !log_text.contains("compose version"),

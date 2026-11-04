@@ -965,13 +965,12 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
                 runner: None,
             }
         });
-        let identity = local_connector_scope(&outcome.agent.name);
         let project = crate::local::current_resources()?.project;
         let decl = crate::connector_build::restrict_to(
             &crate::connector_build::load(&plugin_dir)?,
             connector_allowlist.as_deref(),
         );
-        bring_up_local(&plugin_dir, &decl, &lock, &identity, &project).await?;
+        bring_up_local(&plugin_dir, &decl, &lock, &outcome.agent.name, &project).await?;
     }
 
     Ok(DeployOutput {
@@ -996,27 +995,6 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
 
 pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
     deploy_with_commit_sha(opts, None).await
-}
-
-/// Release and namespace for a local-tier connector container.
-///
-/// The compose worker receives `CURIE_RELEASE=${CURIE_RELEASE:-curie}` and
-/// `CURIE_NAMESPACE=${CURIE_NAMESPACE:-default}`. The runner dials that pair.
-/// An empty value matches the compose `:-` form, which treats empty as unset.
-/// The cluster tier does not call this. Its release is the Helm release.
-pub fn local_connector_scope(agent: &str) -> crate::connector_build::ConnectorScope {
-    crate::connector_build::ConnectorScope {
-        release: compose_default_env("CURIE_RELEASE", "curie"),
-        agent: agent.to_string(),
-        namespace: compose_default_env("CURIE_NAMESPACE", "default"),
-    }
-}
-
-fn compose_default_env(key: &str, default: &str) -> String {
-    match std::env::var(key) {
-        Ok(value) if !value.is_empty() => value,
-        _ => default.to_string(),
-    }
 }
 
 /// Installer-only deploy entry point. A stamped binary commit takes precedence

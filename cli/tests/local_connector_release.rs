@@ -6,14 +6,15 @@
 //! `WorkerConfig` reads those two variables. `binding.py` copies them onto
 //! the sandbox boot env. The runner's `derive_mcp_servers` calls
 //! `plugin_format.connector_render.mcp_entry`, and the hosted URL host is
-//! `service_dns`. The CLI starts the container under `object_name` and
-//! publishes that same DNS name as the container's network alias
-//! (`connector_build::compose_overlay`).
+//! `service_dns`. The local deploy branch calls `bring_up_local` with the
+//! resolved agent name. That function reads the two variables with the same
+//! compose defaults and writes `object_name` plus `service_dns` into the
+//! compose overlay before it starts the container. These tests drive that
+//! function and read the overlay. The docker stub exits before any daemon
+//! work, after the overlay is on disk.
 
 use std::path::Path;
 use std::process::Command;
-
-use curie::connector_build::{object_name, service_dns};
 
 const AGENT: &str = "acme-bot";
 const CONNECTOR: &str = "grafana";
@@ -25,6 +26,12 @@ struct EnvVar {
 
 impl EnvVar {
     fn set(name: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Self { name, previous }
+    }
+
+    fn set_os(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let previous = std::env::var_os(name);
         std::env::set_var(name, value);
         Self { name, previous }
@@ -101,12 +108,91 @@ print(json.dumps({
     )
 }
 
-fn started(agent: &str) -> (String, String) {
-    let scope = curie::commands::local_connector_scope(agent);
-    (
-        object_name(&scope.release, &scope.agent, CONNECTOR),
-        service_dns(&scope.release, &scope.agent, CONNECTOR, &scope.namespace),
+/// A hosted, secret-free bundle plus a docker stub that never reaches a daemon.
+///
+/// `bring_up_local` writes the overlay, then asks docker to start it. The stub
+/// answers every docker invocation with success and no containers, so readiness
+/// fails after the write. `COMPOSE_FILE` without `COMPOSE_PROJECT_NAME` would
+/// fail resource lookup before that write.
+struct Startup {
+    dir: tempfile::TempDir,
+    _bin: tempfile::TempDir,
+    _path: EnvVar,
+    _compose_file: EnvVar,
+    _compose_project: EnvVar,
+}
+
+fn startup() -> Startup {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::TempDir::new().expect("plugin dir");
+    let bin = tempfile::TempDir::new().expect("docker stub dir");
+    let docker = bin.path().join("docker");
+    std::fs::write(&docker, "#!/bin/sh\nexit 0\n").expect("write the docker stub");
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755))
+        .expect("make the docker stub executable");
+    let mut paths = vec![bin.path().to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(paths).expect("join PATH");
+    Startup {
+        dir,
+        _bin: bin,
+        _path: EnvVar::set_os("PATH", path),
+        _compose_file: EnvVar::unset("COMPOSE_FILE"),
+        _compose_project: EnvVar::unset("COMPOSE_PROJECT_NAME"),
+    }
+}
+
+fn hosted() -> (
+    curie::connector_build::ConnectorsFileDecl,
+    curie::connector_build::ConnectorLockFileDecl,
+) {
+    let decl = curie::connector_build::parse_connectors(
+        "connectors:\n  grafana:\n    image: ghcr.io/acme-corp/grafana:1\n",
     )
+    .expect("a hosted connector declaration");
+    let lock = curie::connector_build::ConnectorLockFileDecl {
+        version: curie::connector_build::LOCK_VERSION,
+        connectors: std::collections::BTreeMap::new(),
+        ..Default::default()
+    };
+    (decl, lock)
+}
+
+/// Service key and network alias from the overlay `bring_up_local` wrote.
+fn overlay_identity(plugin_dir: &Path, bring_up: &impl std::fmt::Debug) -> (String, String) {
+    let path = curie::connector_build::compose_overlay_path(plugin_dir);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!(
+            "bring-up wrote no overlay at {}: {err}; result: {bring_up:?}",
+            path.display()
+        )
+    });
+    let overlay: serde_json::Value =
+        serde_norway::from_str(&text).unwrap_or_else(|err| panic!("overlay yaml ({err}): {text}"));
+    let services = overlay["services"].as_object().expect("services");
+    assert_eq!(services.len(), 1, "{overlay}");
+    let (name, service) = services.iter().next().expect("the started service");
+    let networks = service["networks"].as_object().expect("networks");
+    assert_eq!(networks.len(), 1, "{service}");
+    let (_network, attachment) = networks.iter().next().expect("one network");
+    let aliases = attachment["aliases"].as_array().expect("aliases");
+    assert_eq!(aliases.len(), 1, "{service}");
+    let dns = aliases[0].as_str().expect("dns alias").to_string();
+    (name.clone(), dns)
+}
+
+fn assert_stopped_after_overlay(bring_up: Result<(), anyhow::Error>) {
+    let message = format!(
+        "{:#}",
+        bring_up.expect_err("the docker stub must not report a started container")
+    );
+    assert!(
+        message.contains("was not created"),
+        "readiness is the stop after the overlay write: {message}"
+    );
 }
 
 #[tokio::test]
@@ -114,17 +200,20 @@ async fn local_connector_name_matches_the_worker_dial_name() {
     let _lock = crate::support::ENV_LOCK.lock().await;
     let _release = EnvVar::set("CURIE_RELEASE", "acme-rel");
     let _namespace = EnvVar::set("CURIE_NAMESPACE", "acme-ns");
-    let scope = curie::commands::local_connector_scope(AGENT);
-    let name = object_name(&scope.release, &scope.agent, CONNECTOR);
-    let dns = service_dns(&scope.release, &scope.agent, CONNECTOR, &scope.namespace);
     let (dialed_name, dialed_dns) = worker_dial("acme-rel", "acme-ns");
+    let startup = startup();
+    let (decl, lock) = hosted();
+    let bring_up =
+        curie::commands::bring_up_local(startup.dir.path(), &decl, &lock, AGENT, "curie").await;
+    let (name, dns) = overlay_identity(startup.dir.path(), &bring_up);
     assert_eq!(name, dialed_name);
     assert_eq!(dns, dialed_dns);
-    assert_eq!(name, "acme-rel-acme-bot-mcp-grafana");
+    assert_eq!(name, format!("acme-rel-{AGENT}-mcp-{CONNECTOR}"));
     assert_eq!(
         dns,
-        "acme-rel-acme-bot-mcp-grafana.acme-ns.svc.cluster.local"
+        format!("acme-rel-{AGENT}-mcp-{CONNECTOR}.acme-ns.svc.cluster.local")
     );
+    assert_stopped_after_overlay(bring_up);
 }
 
 #[tokio::test]
@@ -132,19 +221,34 @@ async fn local_connector_name_defaults_when_release_and_namespace_are_unset() {
     let _lock = crate::support::ENV_LOCK.lock().await;
     let _release = EnvVar::unset("CURIE_RELEASE");
     let _namespace = EnvVar::unset("CURIE_NAMESPACE");
-    let (name, dns) = started(AGENT);
-    assert_eq!(name, "curie-acme-bot-mcp-grafana");
-    assert_eq!(dns, "curie-acme-bot-mcp-grafana.default.svc.cluster.local");
+    {
+        let startup = startup();
+        let (decl, lock) = hosted();
+        let bring_up =
+            curie::commands::bring_up_local(startup.dir.path(), &decl, &lock, AGENT, "curie").await;
+        let (name, dns) = overlay_identity(startup.dir.path(), &bring_up);
+        assert_eq!(name, format!("curie-{AGENT}-mcp-{CONNECTOR}"));
+        assert_eq!(
+            dns,
+            format!("curie-{AGENT}-mcp-{CONNECTOR}.default.svc.cluster.local")
+        );
+        assert_stopped_after_overlay(bring_up);
+    }
 
     // Compose `${VAR:-default}` treats an empty value the same as unset.
     drop(_release);
     drop(_namespace);
     let _release = EnvVar::set("CURIE_RELEASE", "");
     let _namespace = EnvVar::set("CURIE_NAMESPACE", "");
-    let (empty_name, empty_dns) = started(AGENT);
-    assert_eq!(empty_name, "curie-acme-bot-mcp-grafana");
+    let startup = startup();
+    let (decl, lock) = hosted();
+    let bring_up =
+        curie::commands::bring_up_local(startup.dir.path(), &decl, &lock, AGENT, "curie").await;
+    let (empty_name, empty_dns) = overlay_identity(startup.dir.path(), &bring_up);
+    assert_eq!(empty_name, format!("curie-{AGENT}-mcp-{CONNECTOR}"));
     assert_eq!(
         empty_dns,
-        "curie-acme-bot-mcp-grafana.default.svc.cluster.local"
+        format!("curie-{AGENT}-mcp-{CONNECTOR}.default.svc.cluster.local")
     );
+    assert_stopped_after_overlay(bring_up);
 }
