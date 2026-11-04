@@ -38,9 +38,6 @@ CHART_PATHS: tuple[str, ...] = (
     "compose/**",
 )
 
-_SHARDS = frozenset({"lint", "render", "retained"})
-
-
 def _compile(pattern: str) -> re.Pattern[str]:
     """Translate a GitHub filter pattern. `*` does not match `/`; `**` does."""
     parts: list[str] = []
@@ -85,24 +82,49 @@ def select_chart(event: str, changed: Sequence[str]) -> bool:
     raise SystemExit(1)
 
 
-def aggregate_ok(changes_result: str, chart: str, shards: Mapping[str, str]) -> bool:
-    """True only for a successful selector plus a consistent shard triple."""
-    if changes_result != "success" or chart not in {"true", "false"}:
-        return False
-    if set(shards) != _SHARDS:
-        return False
-    expected = "success" if chart == "true" else "skipped"
-    return all(value == expected for value in shards.values())
+_SHARDS = frozenset({"lint", "render", "retained"})
+# The kind jobs are deep tiers. An unlabeled pull request defers them to the
+# merge queue; every other event must run them when the chart is selected.
+_KIND_JOBS = {
+    "reserved_env": "Reject legacy extraEnv before upgrade mutation",
+    "thread_isolation": "Automatic thread isolation (kind)",
+}
+_RESULT_KEYS = _SHARDS | frozenset(_KIND_JOBS)
+_BOOLEANS = frozenset({"true", "false"})
 
 
-def _write_chart(value: str) -> None:
-    line = f"chart={value}\n"
+def aggregate_ok(
+    changes_result: str, event: str, chart: str, deep: str, results: Mapping[str, str],
+) -> bool:
+    """True only for a successful selector plus the selected result for every job."""
+    if changes_result != "success" or chart not in _BOOLEANS or deep not in _BOOLEANS:
+        return False
+    if event != "pull_request" and deep != "true":
+        return False
+    if set(results) != _RESULT_KEYS:
+        return False
+    for name, value in results.items():
+        selected = chart == "true" and (name in _SHARDS or deep == "true")
+        if value != ("success" if selected else "skipped"):
+            return False
+    return True
+
+
+def deferred(chart: str, deep: str) -> list[str]:
+    """Display names of the kind jobs a selected chart defers to the merge queue."""
+    if chart == "true" and deep == "false":
+        return list(_KIND_JOBS.values())
+    return []
+
+
+def _write_outputs(chart: bool, deep: bool) -> None:
+    text = f"chart={str(chart).lower()}\ndeep={str(deep).lower()}\n"
     output = os.environ.get("GITHUB_OUTPUT")
     if output:
         with open(output, "a", encoding="utf-8") as handle:
-            handle.write(line)
+            handle.write(text)
         return
-    sys.stdout.write(line)
+    sys.stdout.write(text)
 
 
 def _changed_merge_group_paths() -> list[str]:
@@ -148,39 +170,52 @@ def _changed_pull_request_paths() -> list[str]:
 def cmd_select() -> None:
     event = os.environ.get("EVENT_NAME", "")
     if event == "push":
-        _write_chart("true")
+        _write_outputs(True, True)
         return
     if event == "merge_group":
         changed = _changed_merge_group_paths()
+        deep = True
     elif event == "pull_request":
         changed = _changed_pull_request_paths()
+        deep = os.environ.get("DEEP_LABEL", "") == "true"
     else:
         raise SystemExit(1)
-    _write_chart("true" if select_chart(event, changed) else "false")
+    _write_outputs(select_chart(event, changed), deep)
 
 
-def _flipped(shards: Mapping[str, str], name: str) -> dict[str, str]:
-    mutated = dict(shards)
-    mutated[name] = "failure" if shards[name] == "success" else "success"
+def _flipped(results: Mapping[str, str], name: str) -> dict[str, str]:
+    mutated = dict(results)
+    mutated[name] = "failure" if results[name] == "success" else "success"
     return mutated
 
 
 def cmd_aggregate() -> None:
     changes_result = os.environ.get("CHANGES_RESULT", "")
+    event = os.environ.get("EVENT_NAME", "")
     chart = os.environ.get("CHART", "")
-    shards = {
+    deep = os.environ.get("DEEP", "")
+    results = {
         "lint": os.environ.get("SHARD_LINT", ""),
         "render": os.environ.get("SHARD_RENDER", ""),
         "retained": os.environ.get("SHARD_RETAINED", ""),
+        "reserved_env": os.environ.get("KIND_RESERVED_ENV", ""),
+        "thread_isolation": os.environ.get("KIND_THREAD_ISOLATION", ""),
     }
-    if not aggregate_ok(changes_result, chart, shards):
-        print("chart shard outcomes are not an allowed pair", file=sys.stderr)
+    if not aggregate_ok(changes_result, event, chart, deep, results):
+        print("chart job outcomes are not the selected outcomes", file=sys.stderr)
         raise SystemExit(1)
-    for name in shards:
-        if aggregate_ok(changes_result, chart, _flipped(shards, name)):
+    for name in results:
+        if aggregate_ok(changes_result, event, chart, deep, _flipped(results, name)):
             print(f"negative control still passed after flipping {name}", file=sys.stderr)
             raise SystemExit(1)
     print("negative control passed")
+    lines = [f"Deferred to the merge queue: {name}" for name in deferred(chart, deep)]
+    for line in lines:
+        print(line)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary and lines:
+        with open(summary, "a", encoding="utf-8") as handle:
+            handle.write("".join(f"{line}\n" for line in lines))
 
 
 def main(argv: Sequence[str]) -> None:

@@ -269,7 +269,7 @@ jobs:
               --registry .github/e2e-selection.yaml \
               --base "${{ github.event.merge_group.base_sha }}" \
               --head "${{ github.event.merge_group.head_sha }}" \
-              --pytest-targets-out pytest-targets.txt
+              --full-pytest
           elif [ "${{ github.event_name }}" != "pull_request" ]; then
             uv run python tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
@@ -398,8 +398,7 @@ jobs:
           esac
           pytest_args=(-q -n 4 --dist loadgroup --ci-shard "$SHARD/$PYTEST_SHARDS" --reruns 1 -rsR --durations=25 --ignore=tools/factory-e2e/tests/test_c4_initial_binding.py --ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py --ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py --ignore=tools/factory-e2e/tests/test_c4_forge_instances.py)
           pytest_args+=(--junitxml shard-result-durations/junit.xml -o junit_family=xunit1)
-          # The merge queue selects exactly what the pull request did (#5262).
-          if [[ "$EVENT_NAME" == "pull_request" || "$EVENT_NAME" == "merge_group" ]]; then
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
             pytest_args+=(--ci-shard-tiers "$PYTEST_STORAGE_SHARDS,$PYTEST_FULL_SHARDS")
           fi
           pytest_args+=(--deselect=tools/factory-e2e/tests/test_c4_admitted_agent.py --deselect=tools/factory-e2e/tests/test_c4_dynamic_base.py)
@@ -1089,6 +1088,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       tests: ${{ steps.select.outputs.tests }}
+      deep: ${{ needs.changes.outputs.deep }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1282,7 +1282,7 @@ jobs:
     name: Rust convergence regressions (kind)
     runs-on: ubuntu-24.04
     needs: [rust-select, rust-test-build]
-    if: ${{ needs.rust-select.outputs.tests == 'true' }}
+    if: ${{ needs.rust-select.outputs.tests == 'true' && needs.rust-select.outputs.deep == 'true' }}
     timeout-minutes: 45
     env:
       CI_REQUIRE_DOCKER_TESTS: "1"
@@ -1371,9 +1371,11 @@ jobs:
           BUILD: ${{ needs.rust-test-build.result }}
           TESTS: ${{ needs.rust-test.result }}
           CONVERGENCE: ${{ needs.rust-convergence.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          DEEP: ${{ needs.rust-select.outputs.deep }}
         run: |
           set -euo pipefail
-          echo "lint=$LINT select=$SELECT selected=${SELECTED:-<empty>} build=$BUILD tests=$TESTS convergence=$CONVERGENCE"
+          echo "lint=$LINT select=$SELECT selected=${SELECTED:-<empty>} deep=${DEEP:-<empty>} build=$BUILD tests=$TESTS convergence=$CONVERGENCE"
           if [ "$LINT" != success ]; then
             echo "Rust fmt + clippy did not pass" >&2
             exit 1
@@ -1387,6 +1389,20 @@ jobs:
             false) expected=skipped ;;
             *) echo "Rust test selection must be true or false" >&2; exit 1 ;;
           esac
+          # Convergence is a deep tier: an unlabeled pull request defers it to
+          # the merge queue, and every other event must run it.
+          case "$DEEP" in
+            true|false) ;;
+            *) echo "Rust deep selection must be true or false" >&2; exit 1 ;;
+          esac
+          if [ "$EVENT_NAME" != pull_request ] && [ "$DEEP" != true ]; then
+            echo "Rust deep tiers must run on $EVENT_NAME" >&2
+            exit 1
+          fi
+          convergence_expected=skipped
+          if [ "$SELECTED" = true ] && [ "$DEEP" = true ]; then
+            convergence_expected=success
+          fi
           if [ "$BUILD" != "$expected" ]; then
             echo "Rust test build: expected $expected, got $BUILD" >&2
             exit 1
@@ -1395,11 +1411,18 @@ jobs:
             echo "Rust test partitions: expected $expected, got $TESTS" >&2
             exit 1
           fi
-          if [ "$CONVERGENCE" != "$expected" ]; then
-            echo "Rust convergence regressions: expected $expected, got $CONVERGENCE" >&2
+          if [ "$CONVERGENCE" != "$convergence_expected" ]; then
+            echo "Rust convergence regressions: expected $convergence_expected, got $CONVERGENCE" >&2
             exit 1
           fi
           echo "Rust gate passed (tests $expected)"
+          if [ "$SELECTED" = true ] && [ "$DEEP" = false ]; then
+            line="Deferred to the merge queue: Rust convergence regressions (kind)"
+            echo "$line"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              echo "$line" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
 
   # The release binary the e2e ladder + falsifiability gate consume, split out of
   # the quality job above so those downstream jobs start as soon as the binary
@@ -1413,7 +1436,7 @@ jobs:
     name: Build the curie release binary
     runs-on: ubuntu-24.04
     needs: [changes]
-    if: ${{ needs.changes.outputs.skill == 'true' || needs.changes.outputs.local == 'true' || needs.changes.outputs.local_release == 'true' || needs.changes.outputs.cluster == 'true' || needs.changes.outputs.released_upgrade == 'true' }}
+    if: ${{ needs.changes.outputs.skill == 'true' || needs.changes.outputs.local == 'true' || needs.changes.outputs.local_release == 'true' || (needs.changes.outputs.deep == 'true' && (needs.changes.outputs.cluster == 'true' || needs.changes.outputs.released_upgrade == 'true')) }}
     defaults:
       run:
         working-directory: cli
@@ -1796,7 +1819,7 @@ jobs:
     name: Build CI images (no push)
     runs-on: ubuntu-24.04
     needs: [changes]
-    if: ${{ needs.changes.outputs.images == 'true' || needs.changes.outputs.skill == 'true' || needs.changes.outputs.local == 'true' || needs.changes.outputs.local_release == 'true' || needs.changes.outputs.cluster == 'true' || needs.changes.outputs.released_upgrade == 'true' }}
+    if: ${{ needs.changes.outputs.images == 'true' || needs.changes.outputs.skill == 'true' || needs.changes.outputs.local == 'true' || needs.changes.outputs.local_release == 'true' || (needs.changes.outputs.deep == 'true' && (needs.changes.outputs.cluster == 'true' || needs.changes.outputs.released_upgrade == 'true')) }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -2955,6 +2978,7 @@ jobs:
       factory: ${{ steps.filter.outputs.factory }}
       approval_resume: ${{ steps.filter.outputs.approval_resume }}
       runtime_assertions: ${{ steps.runtime.outputs.runtime_assertions }}
+      deep: ${{ steps.deep.outputs.deep }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -2972,6 +2996,21 @@ jobs:
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      # Deep tiers (kind clusters, upgrades, convergence) run before merge in
+      # the merge queue. A pull request runs them only with the ci:deep label;
+      # the label is read from the event, so it takes effect on the next push.
+      - id: deep
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DEEP_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:deep') }}
+        run: |
+          set -euo pipefail
+          deep=true
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$DEEP_LABEL" != "true" ]; then
+            deep=false
+          fi
+          echo "deep tiers: $deep"
+          echo "deep=$deep" >> "$GITHUB_OUTPUT"
       # Pushes to both release train branches omit kind. Pull requests into
       # either train select kind tiers by changed paths, because a regression
       # merged into next with kind omitted was first seen by the nightly run
@@ -2994,7 +3033,8 @@ jobs:
               tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --base "${{ github.event.merge_group.base_sha }}" \
-              --head "${{ github.event.merge_group.head_sha }}"
+              --head "${{ github.event.merge_group.head_sha }}" \
+              --full-pytest
           elif [ "$event" = "push" ]; then
             uv run --no-project --with pyyaml==6.0.3 python \
               tools/e2e-ci-selection/select_tiers.py \
@@ -3035,7 +3075,7 @@ jobs:
     name: E2E parity ladder (cluster rung on kind, fake model)
     runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
-    if: ${{ needs.changes.outputs.cluster == 'true' }}
+    if: ${{ needs.changes.outputs.cluster == 'true' && needs.changes.outputs.deep == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -3366,7 +3406,7 @@ jobs:
     name: E2E scripted factory (kind, scripted model, ${{ matrix.suite }})
     runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
-    if: ${{ needs.changes.outputs.factory == 'true' }}
+    if: ${{ needs.changes.outputs.factory == 'true' && needs.changes.outputs.deep == 'true' }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -3497,7 +3537,7 @@ jobs:
     name: Admitted agent runtime regressions (kind, shard ${{ matrix.shard }}/5)
     runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
-    if: ${{ needs.changes.outputs.factory == 'true' }}
+    if: ${{ needs.changes.outputs.factory == 'true' && needs.changes.outputs.deep == 'true' }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -3726,7 +3766,7 @@ jobs:
     name: E2E chart runtime regressions (kind, Calico, ${{ matrix.leg }})
     runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
-    if: ${{ needs.changes.outputs.chart_scenarios != '[]' }}
+    if: ${{ needs.changes.outputs.chart_scenarios != '[]' && needs.changes.outputs.deep == 'true' }}
     env:
       CURIE_SCENARIO_NAMESPACE: test-workload-${{ github.run_id }}-${{ github.run_attempt }}
       CURIE_SCENARIO_RELEASE: workload-${{ github.run_id }}-${{ github.run_attempt }}
@@ -4350,7 +4390,7 @@ jobs:
     name: E2E approval resume after worker and store restarts (kind)
     runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
-    if: ${{ needs.changes.outputs.approval_resume == 'true' }}
+    if: ${{ needs.changes.outputs.approval_resume == 'true' && needs.changes.outputs.deep == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -5088,7 +5128,7 @@ jobs:
     name: E2E released chart upgrade negative control (nil unsafe helpers)
     runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
-    if: ${{ needs.changes.outputs.released_upgrade == 'true' }}
+    if: ${{ needs.changes.outputs.released_upgrade == 'true' && needs.changes.outputs.deep == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -5382,7 +5422,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [rust-build, changes, e2e-cluster-upgrade-matrix-shards, ci-images]
-    if: ${{ needs.changes.outputs.released_upgrade == 'true' }}
+    if: ${{ needs.changes.outputs.released_upgrade == 'true' && needs.changes.outputs.deep == 'true' }}
     strategy:
       fail-fast: false
       # One wave for 14 shards. Seven ran two waves, and shards waited 9.3
@@ -5609,6 +5649,8 @@ jobs:
           RELEASED_UPGRADE_FULL: ${{ needs.changes.outputs.released_upgrade_full }}
           APPROVAL_RESUME_SELECTED: ${{ needs.changes.outputs.approval_resume }}
           FACTORY_SELECTED: ${{ needs.changes.outputs.factory }}
+          DEEP: ${{ needs.changes.outputs.deep }}
+          RUNTIME_ASSERTIONS: ${{ needs.changes.outputs.runtime_assertions }}
           SKILL_LOCAL_RESULT: ${{ needs.e2e-ladder.result }}
           OIDC_RESULT: ${{ needs.e2e-oidc.result }}
           LOCAL_RELEASE_RESULT: ${{ needs.e2e-ladder-release.result }}
@@ -5658,7 +5700,9 @@ jobs:
                 ( "$RELEASED_UPGRADE_FULL" != "true" && "$RELEASED_UPGRADE_FULL" != "false" ) ||
                 ( "$APPROVAL_RESUME_SELECTED" != "true" && "$APPROVAL_RESUME_SELECTED" != "false" ) ||
                 ( "$FACTORY_SELECTED" != "true" && "$FACTORY_SELECTED" != "false" ) ||
-                ( "$RELEASED_UPGRADE_FULL" == "true" && "$RELEASED_UPGRADE_SELECTED" != "true" ) ]]; then
+                ( "$RELEASED_UPGRADE_FULL" == "true" && "$RELEASED_UPGRADE_SELECTED" != "true" ) ||
+                ( "$DEEP" != "true" && "$DEEP" != "false" ) ||
+                ( "$EVENT_NAME" != "pull_request" && "$DEEP" != "true" ) ]]; then
             echo "E2E required failed" >&2
             exit 1
           fi
@@ -5723,6 +5767,14 @@ jobs:
             released_upgrade_negative_expected="success"
             upgrade_matrix_expected="success"
           fi
+          # Deep tiers run only when deep is true. An unlabeled pull request
+          # defers them to the merge queue, so each is expected skipped.
+          if [[ "$DEEP" != "true" ]]; then
+            for name in cluster_expected cluster_chart_expected approval_resume_expected \
+              factory_expected released_upgrade_negative_expected upgrade_matrix_expected; do
+              printf -v "$name" '%s' skipped
+            done
+          fi
 
           if ! validate_selected_outcomes; then
             echo "E2E required failed" >&2
@@ -5748,6 +5800,37 @@ jobs:
           echo "Selected and skipped negative control passed"
 
           echo "E2E required passed"
+
+          # Name each selected deep tier this run deferred to the merge queue.
+          deferred=()
+          if [[ "$DEEP" == "false" ]]; then
+            if [[ "$CLUSTER_SELECTED" == "true" ]]; then
+              deferred+=("E2E parity ladder (cluster rung on kind, fake model)")
+            fi
+            if [[ "$CHART_SCENARIOS" != "[]" ]]; then
+              deferred+=("E2E chart runtime regressions (kind, Calico)")
+            fi
+            if [[ "$APPROVAL_RESUME_SELECTED" == "true" ]]; then
+              deferred+=("E2E approval resume after worker and store restarts (kind)")
+            fi
+            if [[ "$FACTORY_SELECTED" == "true" ]]; then
+              deferred+=("E2E scripted factory (kind, scripted model)")
+              deferred+=("Admitted agent runtime regressions (kind)")
+            fi
+            if [[ "$RELEASED_UPGRADE_SELECTED" == "true" ]]; then
+              deferred+=("E2E released chart upgrade negative control (nil unsafe helpers)")
+              deferred+=("E2E cluster upgrade matrix")
+            fi
+            if [[ "$RUNTIME_ASSERTIONS" != "[]" ]]; then
+              deferred+=("changed runtime assertion receipts")
+            fi
+          fi
+          for name in "${deferred[@]}"; do
+            echo "Deferred to the merge queue: $name"
+            if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+              echo "Deferred to the merge queue: $name" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         if: ${{ !cancelled() }}
         with:
@@ -5770,21 +5853,21 @@ jobs:
         if: ${{ !cancelled() && steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure' }}
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Download runtime assertion receipts
-        if: ${{ !cancelled() && needs.changes.outputs.runtime_assertions != '[]' }}
+        if: ${{ !cancelled() && needs.changes.outputs.runtime_assertions != '[]' && needs.changes.outputs.deep == 'true' }}
         uses: actions/download-artifact@v8
         with:
           pattern: runtime-assertion-receipts-*
           merge-multiple: true
           path: ${{ runner.temp }}/runtime-assertion-receipts
       - name: Changed runtime assertions executed and passed
-        if: ${{ !cancelled() && needs.changes.outputs.runtime_assertions != '[]' }}
+        if: ${{ !cancelled() && needs.changes.outputs.runtime_assertions != '[]' && needs.changes.outputs.deep == 'true' }}
         env:
           RUNTIME_ASSERTIONS: ${{ needs.changes.outputs.runtime_assertions }}
         run: |
           uv run --no-project --with pyyaml==6.0.3 python tools/runtime-assertion-gate/gate.py \
             receipts --dir "$RUNNER_TEMP/runtime-assertion-receipts" --scripts "$RUNTIME_ASSERTIONS"
       - name: Assert upgrade matrix wall clock
-        if: ${{ !cancelled() && needs.changes.outputs.released_upgrade == 'true' }}
+        if: ${{ !cancelled() && needs.changes.outputs.released_upgrade == 'true' && needs.changes.outputs.deep == 'true' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 tools/e2e-ci-selection/assert_upgrade_matrix_budget.py

@@ -1407,6 +1407,83 @@ def _shard_outputs(output: dict[str, str]) -> tuple[int, int, int]:
     )
 
 
+@pytest.mark.parametrize(
+    "paths",
+    (
+        (
+            "apps/api/tests/test_contract_migration_timing_gate.py",
+            "scripts/check-contract-migration-timing.py",
+        ),
+        ("runner/src/curie_runner/__init__.py",),
+        ("runner/tests/fixtures/repo_toolchain/tests/test_rates.py",),
+    ),
+)
+def test_foreign_fixture_is_not_an_impact_target(tmp_path: Path, paths: tuple[str, ...]) -> None:
+    targets_out = tmp_path / "targets.txt"
+    options = [option for path in paths for option in ("--path", path)]
+
+    completed, output = _run_selector(tmp_path, *options, targets_out=targets_out)
+
+    assert completed.returncode == 0, completed.stderr
+    assert output["pytest_scope"] == "impact"
+    targets = targets_out.read_text(encoding="utf-8").splitlines()
+    assert not any(path.startswith("runner/tests/fixtures/") for path in targets)
+    assert "runner/tests/test_repo_toolchain_proof.py" in targets
+    assert "runner/tests/test_session.py" in targets
+
+
+def test_foreign_fixture_collection_uses_root_exclusion(tmp_path: Path) -> None:
+    fixture = Path("runner/tests/fixtures/repo_toolchain/tests/test_rates.py")
+    foreign_test = tmp_path / fixture
+    foreign_test.parent.mkdir(parents=True)
+    foreign_test.write_bytes((REPO_ROOT / fixture).read_bytes())
+    for relative in (
+        "runner/tests/test_neighbor.py",
+        "runner/tests/fixtures-neighbor/test_keep.py",
+        "other/tests/fixtures/test_keep.py",
+    ):
+        neighbor = tmp_path / relative
+        neighbor.parent.mkdir(parents=True, exist_ok=True)
+        neighbor.write_text("def test_kept():\n    assert True\n", encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--noconftest",
+            "-q",
+            "-c",
+            str(REPO_ROOT / "pyproject.toml"),
+            str(tmp_path),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "3 passed" in completed.stdout
+
+
+def test_foreign_fixture_keeps_its_own_check_command() -> None:
+    fixture = REPO_ROOT / "runner/tests/fixtures/repo_toolchain"
+    completed = subprocess.run(
+        [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v"],
+        cwd=fixture,
+        env={**os.environ, "PYTHONPATH": str(fixture / "src")},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+    assert "Ran 4 tests" in completed.stderr
+    assert "FAIL: test_refuses_the_request_that_would_exceed_the_limit" in completed.stderr
+    assert "FAILED (failures=1)" in completed.stderr
+
+
 def test_push_non_pull_request_event_runs_full_scope_on_six_shards(tmp_path: Path) -> None:
     targets_out = tmp_path / "targets.txt"
 
@@ -1521,6 +1598,34 @@ def _commit(repo: Path, relative: str, content: str) -> str:
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "candidate")
     return _git(repo, "rev-parse", "HEAD")
+
+
+def test_merge_queue_revision_mode_keeps_the_full_pytest_plan(
+    revision_repo: tuple[Path, str], tmp_path: Path
+) -> None:
+    # The same hunk narrows a pull request to impact targets (see below).
+    repo, base = revision_repo
+    head = _commit(repo, WORKFLOW_PATH, _workflow(rust_lint="echo changed"))
+    targets_out = tmp_path / "targets.txt"
+
+    completed, output = _run_selector(
+        tmp_path,
+        "--base",
+        base,
+        "--head",
+        head,
+        "--full-pytest",
+        cwd=repo,
+        registry=repo / REGISTRY_PATH,
+        targets_out=targets_out,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert output["pytest"] == "true"
+    assert output["pytest_scope"] == "full"
+    assert output["pytest_targets"] == ""
+    assert _shard_outputs(output) == (6, 6, 6)
+    assert targets_out.read_text(encoding="utf-8") == ""
 
 
 @pytest.mark.parametrize(

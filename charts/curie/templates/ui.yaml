@@ -60,6 +60,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: ui
           image: {{ include "curie.image" (dict "repository" .Values.ui.image.repository "tag" .Values.ui.image.tag "digest" .Values.ui.image.digest "defaultTag" .Chart.AppVersion) | quote }}

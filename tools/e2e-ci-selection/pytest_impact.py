@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import bisect
+import fnmatch
 import hashlib
 import json
 import math
@@ -1002,14 +1003,21 @@ class ImpactGraph:
         if cached:
             scanner.load_cache()
         document = _read_toml(root / "pyproject.toml")
-        testpaths = [
-            path.strip("/")
-            for path in _string_list(
-                _table(document, "tool", "pytest", "ini_options").get("testpaths")
-            )
-        ]
+        pytest_options = _table(document, "tool", "pytest", "ini_options")
+        testpaths = [path.strip("/") for path in _string_list(pytest_options.get("testpaths"))]
+        norecursedirs = _string_list(pytest_options.get("norecursedirs"))
         test_files = tuple(
-            sorted(path for path in tracked if _is_test_name(path) and _under_any(path, testpaths))
+            sorted(
+                path
+                for path in tracked
+                if _is_test_name(path)
+                and _under_any(path, testpaths)
+                and not any(
+                    fnmatch.fnmatch(str(parent) if "/" in pattern else parent.name, pattern)
+                    for parent in PurePosixPath(path).parents
+                    for pattern in norecursedirs
+                )
+            )
         )
         project_members: dict[str, str] = {}
         declared: dict[str, list[str]] = {}

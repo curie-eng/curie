@@ -318,6 +318,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: mail-adapter
           image: {{ include "curie.image" (dict "repository" .Values.mailAdapter.image.repository "tag" .Values.mailAdapter.image.tag "digest" .Values.mailAdapter.image.digest "defaultTag" .Chart.AppVersion) | quote }}

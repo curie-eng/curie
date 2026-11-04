@@ -73,7 +73,9 @@ One at a time
 `concurrencyPolicy: Forbid` only governs Jobs the CronJob controller creates; it
 says nothing about one created here. Two overlapping runs would race on creating
 the agent version, and the loser leaves a version row behind. So this refuses
-while a Job for the same CronJob is still active.
+while a Job for the same CronJob is still active -- and a Jobs list that cannot
+be read or parsed is not an empty list, so the failed read itself refuses
+rather than starting a Job on top of not-knowing.
 """
 
 # NOTE: no `from __future__ import annotations`. FastMCP introspects tool
@@ -242,9 +244,11 @@ def _active_job(client, namespace: str, cronjob: str) -> str | None:
     bundle redeploy are independent, and treating either as "an upgrade is
     running" would refuse a call that is safe.
 
-    Returns None when nothing is active. A listing failure also returns None:
-    refusing to upgrade because a *status* read failed would be a worse outcome
-    than the race it guards, and the race is narrow.
+    Returns None only from a well-formed Jobs list that holds no active Job. A
+    list that cannot be read -- an HTTP refusal, a transport failure, malformed
+    JSON, a non-object payload, or no `items` list -- is NOT an empty list:
+    starting a Job on top of it is exactly the overlapping run this check
+    exists to prevent, so the failed read itself refuses the call.
     """
 
     try:
@@ -252,15 +256,36 @@ def _active_job(client, namespace: str, cronjob: str) -> str | None:
             f"/apis/batch/v1/namespaces/{namespace}/jobs",
             params={"labelSelector": f"curie.dev/self-upgrade-of={cronjob}"},
         )
-    except httpx.HTTPError:
-        return None
+    except httpx.HTTPError as exc:
+        # The exception CATEGORY, never `str(exc)`: transport errors can quote
+        # peer-supplied bytes verbatim (an illegal chunk header names its own
+        # line), and a refusal is reported back into the channel, so nothing a
+        # peer sent may ride along.
+        raise ToolError(
+            f"could not read the Jobs list for {namespace}/{cronjob} to check "
+            f"whether an upgrade is still running: {type(exc).__name__}"
+        ) from exc
     if listed.status_code >= 400:
-        return None
+        raise ToolError(
+            f"could not read the Jobs list for {namespace}/{cronjob}: "
+            f"HTTP {listed.status_code}"
+        )
     try:
-        items = listed.json().get("items") or []
-    except (ValueError, AttributeError):
-        return None
+        payload = listed.json()
+    except ValueError as exc:
+        raise ToolError(
+            f"the Jobs list for {namespace}/{cronjob} was not valid JSON"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ToolError("the Jobs list response was not a JSON object")
+    items = payload.get("items")
+    if not isinstance(items, list):
+        raise ToolError("the Jobs list response has no items list")
     for job in items:
+        if not isinstance(job, dict):
+            # Otherwise this crashes mid-loop instead of refusing, which
+            # would report an internal error rather than a refused read.
+            raise ToolError("the Jobs list response held a job that is not an object")
         status = job.get("status") or {}
         if status.get("active"):
             return (job.get("metadata") or {}).get("name")

@@ -41,9 +41,14 @@ RUNTIME_DIR = "charts/curie/ci/runtime"
 WORKLOAD_INSTALL = "charts/curie/ci/scenarios/workload-install.sh"
 RUNNER = "tools/runtime-assertion-gate/run.sh"
 REQUIRED_JOB = "e2e-required"
-CLUSTER_SELECTOR = "${{ needs.changes.outputs.cluster == 'true' }}"
+# Cluster jobs are deep tiers: an unlabeled pull request defers them.
+CLUSTER_SELECTOR = (
+    "${{ needs.changes.outputs.cluster == 'true' && needs.changes.outputs.deep == 'true' }}"
+)
 CHART_JOB = "e2e-cluster-chart-regressions"
-CHART_SELECTOR = "${{ needs.changes.outputs.chart_scenarios != '[]' }}"
+CHART_SELECTOR = (
+    "${{ needs.changes.outputs.chart_scenarios != '[]' && needs.changes.outputs.deep == 'true' }}"
+)
 CALICO_MARKERS = ("projectcalico/calico", "rollout status daemonset/calico-node")
 # #5255 owns diagnostics, the causal fix and exact-head proof before re-enabling.
 DISABLED_ASSERTIONS = {"charts/curie/ci/runtime/failed-first-install-retry-runtime.sh"}

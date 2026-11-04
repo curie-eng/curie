@@ -28,6 +28,7 @@ from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import replace
 
+import aiohttp
 import anyio
 from aci_protocol import (
     ErrorEvent,
@@ -125,6 +126,11 @@ SessionFactory = Callable[[], ModelSession]
 _CONNECTOR_RECOVERY_BUDGET_SECONDS = 20.0
 _HISTORY_PERSISTENCE_BUDGET_SECONDS = 15.0
 _HISTORY_REPLAY_EXPORT_BUDGET_SECONDS = 5.0
+# Backoff for retrying transcript appends that never reached the state API
+# (#5354): the first retry waits the initial delay, each later one doubles it,
+# up to the cap.
+_HISTORY_RETRY_INITIAL_S = 0.5
+_HISTORY_RETRY_MAX_S = 5.0
 _CAPACITY_ADMISSION_TIMEOUT_S = 30.0
 # How long a turn waits, before sending its own query, for the terminal result
 # an abandoned predecessor left on the shared SDK stream (#3425). The abandoned
@@ -539,12 +545,22 @@ class SessionRunner:
         # transcript append re-authorizes replacement, unless an earlier turn
         # was already lost by this process. Later appends cannot repair that
         # missing prefix, so the loss remains sticky for this runner's lifetime.
+        # An append that never reached the state API (a connect failure) is not
+        # a loss (#5354): nothing was written, so the record is deferred and
+        # retried in order until it lands, and the fence stays shut until then.
         # A turn whose terminal the transcript never records (failed, budget,
         # interrupted, result-less) re-authorizes it too (#4188): replay
         # already holds everything it ever will, and leaving the fence shut
         # would lock the thread, since only another turn could reopen it.
         self._history_durable = True
         self._history_loss_observed = False
+        # Records whose append never reached the state API, oldest first. The
+        # lock serializes every transcript append, from a turn or the retry
+        # task, so records land in turn order. asyncio.Lock has no owner, so a
+        # turn generator finalized on another task still releases it.
+        self._deferred_history: list[TurnRecord] = []
+        self._history_append_lock = asyncio.Lock()
+        self._history_retry_task: asyncio.Task[None] | None = None
         self._terminal_persistence_ran = False
         # The cap and turn size of the last unboundable turn (#3301).
         self._capacity_detail: str | None = None
@@ -690,7 +706,9 @@ class SessionRunner:
         ``state.final_text`` before this runs. Failed, budget, authentication,
         and idle turns leave it None and are not persisted. A capacity refusal
         propagates to the prepublication terminal decision. Other failures keep
-        the candidate terminal under the best effort history policy.
+        the candidate terminal under the best effort history policy. A record
+        whose append never reached the state API, or that would land ahead of
+        an earlier such record, is deferred for the retry task (#5354).
         """
 
         if state.final_text is None:
@@ -704,6 +722,10 @@ class SessionRunner:
             and state.approval_gate_kind == "permission"
         ):
             messages = close_suspended_tool_calls(messages)
+        record: TurnRecord | None = None
+        # Set just before this turn's own request starts. A cancellation before
+        # then (waiting for the lock, or flushing older records) sent nothing.
+        own_append_started = False
         try:
             harness_replay: HarnessReplayState | None = None
             # Once a channel read body reached this SDK session, its native
@@ -752,12 +774,32 @@ class SessionRunner:
                 ),
                 harness_replay=harness_replay,
             )
-            native_retained = await self._history.append(record)
-            if harness_replay is not None and not native_retained:
-                requester = getattr(self._session, "request_full_checkpoint", None)
-                if not callable(requester):
-                    raise RuntimeError("native replay exporter cannot reset its checkpoint")
-                requester()
+            async with self._history_append_lock:
+                await self._flush_deferred_history()
+                if self._deferred_history:
+                    # An earlier record still cannot reach the API; this one
+                    # must not land ahead of it.
+                    self._deferred_history.append(record)
+                    logger.warning(
+                        "history append deferred session=%s behind=%d",
+                        self._session_id,
+                        len(self._deferred_history) - 1,
+                    )
+                else:
+                    own_append_started = True
+                    try:
+                        await self._append_history(record)
+                    except aiohttp.ClientConnectorError as exc:
+                        # The request never reached the API, so nothing was
+                        # written and a retry cannot duplicate the record.
+                        self._deferred_history.append(record)
+                        logger.warning(
+                            "history append deferred session=%s error_class=%s",
+                            self._session_id,
+                            type(exc).__name__,
+                        )
+                if self._deferred_history:
+                    self._ensure_history_retry()
         except HistoryCapacityError as exc:
             self._history_loss_observed = True
             self._history_durable = False
@@ -769,8 +811,24 @@ class SessionRunner:
             )
             raise
         except BaseException as exc:
-            self._history_loss_observed = True
             self._history_durable = False
+            if record is not None and not own_append_started:
+                # This turn's request never started, so nothing was written:
+                # keep the record for the retry instead of losing it.
+                if all(item is not record for item in self._deferred_history):
+                    self._deferred_history.append(record)
+                self._ensure_history_retry()
+                logger.warning(
+                    "history append deferred session=%s error_class=%s",
+                    self._session_id,
+                    type(exc).__name__,
+                )
+                if isinstance(exc, anyio.get_cancelled_exc_class()) or not isinstance(
+                    exc, Exception
+                ):
+                    raise
+                return
+            self._history_loss_observed = True
             if isinstance(exc, anyio.get_cancelled_exc_class()) or not isinstance(exc, Exception):
                 raise
             status = getattr(exc, "status", None)
@@ -788,7 +846,89 @@ class SessionRunner:
                     type(exc).__name__,
                 )
         else:
-            self._history_durable = not self._history_loss_observed
+            self._history_durable = self._settled_history_durable()
+
+    def _settled_history_durable(self) -> bool:
+        """Durable replay holds every completed turn: none lost, none deferred."""
+
+        return not self._history_loss_observed and not self._deferred_history
+
+    async def _append_history(self, record: TurnRecord) -> None:
+        """Append one record, resetting the native checkpoint if it was dropped."""
+
+        native_retained = await self._history.append(record)
+        if record.harness_replay is not None and not native_retained:
+            requester = getattr(self._session, "request_full_checkpoint", None)
+            if not callable(requester):
+                raise RuntimeError("native replay exporter cannot reset its checkpoint")
+            requester()
+
+    async def _flush_deferred_history(self) -> None:
+        """Append deferred records in order, stopping at one that cannot connect.
+
+        The caller holds the append lock. A record the API answered with a
+        refusal, or one cut off mid-request, may or may not have been written,
+        so it is never retried: it becomes a sticky loss, as on the turn path.
+        """
+
+        persisted = 0
+        while self._deferred_history:
+            # The record stays at the head while its request is in flight, so
+            # the fence reads it as not yet durable until it lands.
+            record = self._deferred_history[0]
+            try:
+                await self._append_history(record)
+            except aiohttp.ClientConnectorError:
+                logger.debug(
+                    "deferred history append still unreachable session=%s pending=%d",
+                    self._session_id,
+                    len(self._deferred_history),
+                )
+                break
+            except BaseException as exc:
+                self._history_loss_observed = True
+                del self._deferred_history[0]
+                if isinstance(exc, anyio.get_cancelled_exc_class()) or not isinstance(
+                    exc, Exception
+                ):
+                    raise
+                logger.warning(
+                    "deferred history append failed session=%s error_class=%s",
+                    self._session_id,
+                    type(exc).__name__,
+                )
+            else:
+                del self._deferred_history[0]
+                persisted += 1
+        if persisted:
+            logger.info(
+                "deferred history persisted session=%s records=%d",
+                self._session_id,
+                persisted,
+            )
+
+    def _ensure_history_retry(self) -> None:
+        task = self._history_retry_task
+        if task is None or task.done():
+            self._history_retry_task = asyncio.create_task(self._retry_deferred_history())
+
+    async def _retry_deferred_history(self) -> None:
+        """Retry deferred records with backoff until none remain (#5354)."""
+
+        delay = _HISTORY_RETRY_INITIAL_S
+        while self._deferred_history:
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _HISTORY_RETRY_MAX_S)
+            async with self._history_append_lock:
+                await self._flush_deferred_history()
+                # A turn in progress, through its terminal append, settles the
+                # fence itself; reopening it here could expose that turn.
+                if (
+                    not self._deferred_history
+                    and not self._turn_open
+                    and not self._persistence_owned
+                ):
+                    self._history_durable = self._settled_history_durable()
 
     async def _persist_terminal(
         self,
@@ -898,6 +1038,10 @@ class SessionRunner:
     async def close(self) -> None:
         if self._attachment_access is not None:
             self._attachment_access.end()
+        retry = self._history_retry_task
+        if retry is not None and not retry.done():
+            retry.cancel()
+            await asyncio.wait({retry})
         task = self._start_task
         if task is not None and not task.done():
             # Shutdown during a held preflight: cancelling kills the check's
@@ -1571,8 +1715,9 @@ class SessionRunner:
             finally:
                 if terminal_for_log and not self._terminal_persistence_ran:
                     # A terminal the transcript does not record adds nothing
-                    # replay must hold; only an earlier loss keeps the fence shut.
-                    self._history_durable = not self._history_loss_observed
+                    # replay must hold; only an earlier loss or a record still
+                    # deferred keeps the fence shut.
+                    self._history_durable = self._settled_history_durable()
                 if self._usage_reporter is not None:
                     # Every ending passes here, including GeneratorExit and
                     # cancellation. A turn that reached its result already

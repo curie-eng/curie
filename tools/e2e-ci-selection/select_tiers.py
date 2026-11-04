@@ -1062,6 +1062,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--head")
     parser.add_argument("--push", action="store_true")
     parser.add_argument(
+        "--full-pytest",
+        action="store_true",
+        help=(
+            "Select tiers from the revision diff but run pytest on its full scope and "
+            "shard plan whenever a pull request would run it, with no CLI scope, "
+            "conditional deselection or impact narrowing (the merge queue)."
+        ),
+    )
+    parser.add_argument(
         "--pytest-targets-out",
         type=Path,
         help="Write the impact targets one per line (empty unless the scope is impact).",
@@ -1112,6 +1121,8 @@ def _run() -> None:
         else:
             raise RegistryError("provide paths, push, or both base and head revisions")
         selected = set().union(*(_select_path(registry, path) for path in paths))
+        # The merge queue runs pytest whenever the pull request would, so it
+        # keeps the impact readers' widening; it never narrows what runs.
         pytest_needed = _pytest_needed(
             registry,
             paths,
@@ -1158,6 +1169,7 @@ def _run() -> None:
     pytest_deselect = []
     if (
         not args.push
+        and not args.full_pytest
         and paths
         and pytest_needed
         and all(
@@ -1179,6 +1191,7 @@ def _run() -> None:
     pytest_scope = "full"
     if (
         not args.push
+        and not args.full_pytest
         and paths
         and pytest_needed
         and all(_matches_pytest_scope(registry.pytest_scopes["cli"], path) for path in paths)
@@ -1208,7 +1221,7 @@ def _run() -> None:
         registry,
         paths,
         pytest_scope,
-        pull_request=not args.push,
+        pull_request=not (args.push or args.full_pytest),
         pytest_needed=pytest_needed,
         workflow_jobs_changed=workflow_jobs_changed,
         registry_pytest_changed=registry_pytest_changed,

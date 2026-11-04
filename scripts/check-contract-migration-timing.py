@@ -13,8 +13,13 @@ names (called or passed as a value, directly or through anything a
 module-level statement binds from it, such as an alias), and the nested
 functions, lambdas, classes and comprehensions inside that code. Reachability
 ignores local shadowing, so a name that could mean a module function reaches
-every definition ever bound to it. Downgrade-only code is never visited. A
-table or column argument resolves through a module-level string constant only
+every definition ever bound to it. An Alembic ``op`` operation is recognized
+through the name ``op`` and through any alias an ``op`` namespace import binds
+(``from alembic import op as ddl``, ``import alembic.op as ddl``), wherever the
+import statement sits (module level, inside ``upgrade()``, or inside a helper
+it reaches), in plain calls and in ``batch_alter_table`` contexts.
+Downgrade-only code is never visited. A table or column argument resolves
+through a module-level string constant only
 where no local binding shadows the name (a ``global`` declaration is not a
 local binding) and no function rebinds it through ``global``; anything else,
 including unpacked ``*``/``**`` arguments, is non-literal.
@@ -336,6 +341,29 @@ def _module_constants(module: ast.Module) -> dict[str, str]:
     }
 
 
+def _op_namespace_names(module: ast.Module) -> set[str]:
+    """Names an Alembic ``op`` namespace import binds, import placement ignored.
+
+    ``from alembic import op`` (aliased or not) and ``import alembic.op as ddl``
+    bind the namespace wherever the import statement sits: at module level,
+    inside ``upgrade()``, or inside a helper it reaches. Reachability ignores
+    local shadowing, so a name any such import ever binds is treated as the
+    namespace. ``import alembic.op`` without an alias binds the ``alembic``
+    package, not ``op``, so it binds no operation receiver here.
+    """
+    names: set[str] = set()
+    for node in ast.walk(module):
+        if isinstance(node, ast.Import):
+            names.update(
+                alias.asname
+                for alias in node.names
+                if alias.name == "alembic.op" and alias.asname is not None
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module == "alembic":
+            names.update(alias.asname or alias.name for alias in node.names if alias.name == "op")
+    return names
+
+
 def _module_functions(
     module: ast.Module,
 ) -> dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]]:
@@ -401,6 +429,7 @@ class _UpgradeScanner:
         self.constants = _module_constants(module)
         self.functions = _module_functions(module)
         self.references = _module_references(module)
+        self.op_names = {"op"} | _op_namespace_names(module)
         self.dropped: list[DroppedObject] = []
         self.nonliteral: list[Nonliteral] = []
 
@@ -477,7 +506,7 @@ class _UpgradeScanner:
                     isinstance(expr, ast.Call)
                     and isinstance(expr.func, ast.Attribute)
                     and isinstance(expr.func.value, ast.Name)
-                    and expr.func.value.id == "op"
+                    and expr.func.value.id in self.op_names
                     and expr.func.attr == "batch_alter_table"
                     and isinstance(item.optional_vars, ast.Name)
                 ):
@@ -489,7 +518,7 @@ class _UpgradeScanner:
             func = node.func
             if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
                 receiver = func.value.id
-                if receiver == "op":
+                if receiver in self.op_names:
                     self._op_call(node, func.attr, local, "op", None)
                 elif receiver in batch_tables or receiver == "batch_op":
                     self._op_call(node, func.attr, local, "batch_op", batch_tables.get(receiver))
