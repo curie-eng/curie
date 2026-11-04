@@ -4125,7 +4125,9 @@ impl LiveHost {
                 .block_on(super::runner_templates::verify(&self.opts.common))
         }) {
             issues.push(format!(
-                "could not confirm platform agent SandboxTemplates: {error:#}"
+                "could not confirm platform agent SandboxTemplates: {error:#}; \
+                 repair them with `curie cluster up --namespace {} --release {}`, then rerun the upgrade",
+                self.opts.common.namespace, self.opts.common.release
             ));
         }
         Ok(CanaryVerdict {

@@ -8159,7 +8159,13 @@ fn platform_agent_template_canary_rejects_stale_image_without_layers() {
     assert_eq!(body["status"], "failed", "{body}");
     assert_eq!(body["phase"], "canary", "{body}");
     assert_ne!(body["known_good_version"], "0.9.0", "{body}");
-    assert!(body["fail_forward"]["reason"].as_str().unwrap().contains("curie cluster up"), "{body}");
+    assert!(
+        body["fail_forward"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("curie cluster up"),
+        "{body}"
+    );
 }
 
 #[test]

@@ -580,6 +580,7 @@ impl RollbackFixture {
                  echo \"$*\" >> '{helm_log}'\n\
                  case \"$1:$2\" in\n\
                  history:*) cat '{history}' ;;\n\
+                 get:values) echo '{{\"agentSandbox\":{{\"deploy\":false}}}}' ;;\n\
                  get:manifest) if [ -f '{dir}/manifest-'\"$7\"'.yaml' ]; then cat '{dir}/manifest-'\"$7\"'.yaml'; else {manifest_action}; fi ;;\n\
                  rollback:*) echo 'Rollback was a success.' ;;\n\
                  *) echo \"unexpected helm invocation: $*\" >&2; exit 1 ;;\n\
@@ -767,7 +768,7 @@ async fn v085_revision_0039_to_v084_is_refused_before_helm_mutates() {
          echo \"$*\" >> \"$FAKE_HELM_ROLLBACK_LOG\"\n\
          case \"$1\" in\n\
          history) cat \"$FAKE_HELM_HISTORY\" ;;\n\
-         get) echo 'schema gate read must be disabled' >&2; exit 1 ;;\n\
+         get) if [ \"$2\" = values ]; then echo '{\"agentSandbox\":{\"deploy\":false}}'; else echo 'schema gate read must be disabled' >&2; exit 1; fi ;;\n\
          rollback) echo 'Rollback was a success.' ;;\n\
          *) echo \"unexpected helm verb: $1\" >&2; exit 1 ;;\n\
          esac\n",

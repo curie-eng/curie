@@ -303,6 +303,28 @@ with urllib.request.urlopen(request,timeout=30) as response:
         kc(namespace, "delete", "sandboxclaims", "-l", "curietech.ai/agent=acme-bot", "--wait=true", "--timeout=90s")
         turn(binary, namespace, release, chart, images["runner"], since, runner_slots)
         print(f"PASS: {entry} reconciled the deployed platform runner and preserved release and agent state", flush=True)
+        if entry == "up":
+            history = json.loads(run(["helm", "--kube-context", context, "-n", namespace, "history", release, "-o", "json"], "read rollback target history").stdout)
+            revision = str(history[-1]["revision"])
+            run(["helm", "--kube-context", context, "-n", namespace, "upgrade", release, chart,
+                 "--reuse-values", "--wait", "--timeout", "300s"], "prepare compatible rollback revision", timeout=330)
+            stale = copy.deepcopy(after["spec"])
+            for kind, name in runner_slots:
+                next(c for c in stale["podTemplate"]["spec"][kind] if c["name"] == name)["image"] = old_image
+            patch(namespace, "sandboxtemplate", source_name, {"spec": stale})
+            rollback_since = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+            result = cli(binary, namespace, release, chart, "rollback", "--revision", revision, "--yes", timeout=900)
+            require(json.loads(result.stdout)["rolled_back"] is True, "rollback did not succeed")
+            restored = read(namespace, "sandboxtemplate/" + source_name)
+            require(restored["spec"] == expected_spec, "rollback left a stale runner image or changed agent settings")
+            require(read(namespace, "sandboxwarmpool/" + source_name + "-pool")["spec"] == pool_before, "rollback changed pool selection")
+            retained = snapshot(namespace, fullname)
+            for kind in ("credentials", "pvcs"):
+                require(all(retained[kind].get(key) == value for key, value in before[kind].items()),
+                        "rollback changed existing " + kind)
+            kc(namespace, "delete", "sandboxclaims", "-l", "curietech.ai/agent=acme-bot", "--wait=true", "--timeout=90s")
+            turn(binary, namespace, release, chart, images["runner"], rollback_since, runner_slots)
+            print("PASS: rollback repaired the stale deployed runner template and completed a fresh turn", flush=True)
     finally:
         env.pop("K8S_KUBECONFIG", None)
         if owned:
