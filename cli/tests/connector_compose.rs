@@ -1017,66 +1017,6 @@ fn the_up_command_carries_the_secret_in_the_child_env_never_in_argv() {
     );
 }
 
-/// The local tier refuses the whole bring-up when a declared secret has no value
-/// here, instead of writing a `${NAME}` nothing will populate.
-///
-/// It used to skip an unresolved secret silently -- the check `skill up` has
-/// always performed. With the overlay carrying references, skipping is worse
-/// than before: compose would warn, expand the reference to empty, and start the
-/// connector authenticating with nothing. The overlay file is asserted absent
-/// because it is written before `docker compose` is invoked, so its absence is
-/// the proof that the refusal came first and no container was ever started.
-#[tokio::test]
-async fn bring_up_local_refuses_a_declared_secret_with_no_value() {
-    let dir = TempDir::new().expect("a scratch bundle");
-    // Point the credential vault at an empty directory: the refusal must come
-    // from the declaration having no value HERE, not from whatever this box's
-    // operator happens to have stored (and the redirect keeps the test off the
-    // OS credential store entirely).
-    let _env = crate::support::ENV_LOCK.lock().await;
-    let previous_config_dir = std::env::var_os("CURIE_CONFIG_DIR");
-    std::env::set_var("CURIE_CONFIG_DIR", dir.path().join("config"));
-    std::env::remove_var("CURIE_TEST_UNSET_CONNECTOR_TOKEN");
-    std::fs::write(
-        dir.path().join("connectors.yaml"),
-        "connectors:\n  \
-           gated:\n    \
-             image: ghcr.io/acme-corp/gated:v1\n    \
-             secrets:\n      \
-               - CURIE_TEST_UNSET_CONNECTOR_TOKEN\n",
-    )
-    .expect("write connectors.yaml");
-
-    let lock = ConnectorLockFileDecl {
-        version: LOCK_VERSION,
-        connectors: BTreeMap::new(),
-        ..Default::default()
-    };
-    let error = curie::commands::bring_up_local(
-        dir.path(),
-        &curie::connector_build::load(dir.path()).unwrap(),
-        &lock,
-        "sre-bot",
-        "curie",
-    )
-    .await
-    .expect_err("a declared secret with no value must refuse the bring-up");
-    match previous_config_dir {
-        Some(value) => std::env::set_var("CURIE_CONFIG_DIR", value),
-        None => std::env::remove_var("CURIE_CONFIG_DIR"),
-    }
-
-    let message = format!("{error:#}");
-    assert!(
-        message.contains("CURIE_TEST_UNSET_CONNECTOR_TOKEN"),
-        "the refusal names the missing credential: {message}"
-    );
-    assert!(
-        !compose_overlay_path(dir.path()).exists(),
-        "the refusal must land before anything is written or started"
-    );
-}
-
 // ─── Identity: one struct drives the alias and the runner scope (B1-11) ──────
 
 /// `--agent <override>` moves the alias AND the runner scope together.

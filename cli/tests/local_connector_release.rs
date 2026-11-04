@@ -1,56 +1,35 @@
-//! Local deploy names hosted connectors with the same release and namespace
-//! the compose worker hands the runner.
+//! Local `curie local deploy` names hosted connectors with the same release
+//! and namespace the compose worker hands the runner.
 //!
 //! `compose.dev.yaml` passes `CURIE_RELEASE=${CURIE_RELEASE:-curie}` and
 //! `CURIE_NAMESPACE=${CURIE_NAMESPACE:-default}` into the worker.
 //! `WorkerConfig` reads those two variables. `binding.py` copies them onto
 //! the sandbox boot env. The runner's `derive_mcp_servers` calls
 //! `plugin_format.connector_render.mcp_entry`, and the hosted URL host is
-//! `service_dns`. The local deploy branch calls `bring_up_local` with the
-//! resolved agent name. That function reads the two variables with the same
-//! compose defaults and writes `object_name` plus `service_dns` into the
-//! compose overlay before it starts the container. These tests drive that
-//! function and read the overlay. The docker stub exits before any daemon
-//! work, after the overlay is on disk.
+//! `service_dns`. These tests run the built `curie local deploy` command for
+//! a connector bundle on the local tier. The platform API is a wire stub.
+//! A docker shim on `PATH` records every invocation and exits before any
+//! daemon work, after deploy has written the compose overlay. The service
+//! key, the DNS alias, and the compose service the shim recorded are the
+//! name that deploy started.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
+
+use crate::support::{serve, Response};
 
 const AGENT: &str = "acme-bot";
 const CONNECTOR: &str = "grafana";
+const AGENT_ID: &str = "11111111-1111-1111-1111-111111111111";
+const VERSION_ID: &str = "22222222-2222-2222-2222-222222222222";
+const DEPLOYMENT_ID: &str = "33333333-3333-3333-3333-333333333333";
 
-struct EnvVar {
-    name: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl EnvVar {
-    fn set(name: &'static str, value: &str) -> Self {
-        let previous = std::env::var_os(name);
-        std::env::set_var(name, value);
-        Self { name, previous }
-    }
-
-    fn set_os(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let previous = std::env::var_os(name);
-        std::env::set_var(name, value);
-        Self { name, previous }
-    }
-
-    fn unset(name: &'static str) -> Self {
-        let previous = std::env::var_os(name);
-        std::env::remove_var(name);
-        Self { name, previous }
-    }
-}
-
-impl Drop for EnvVar {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(value) => std::env::set_var(self.name, value),
-            None => std::env::remove_var(self.name),
-        }
-    }
+/// Release and namespace handed to one `curie local deploy` child.
+enum ComposeEnv<'a> {
+    /// Set both variables, including the empty string.
+    Values(&'a str, &'a str),
+    /// Leave both unset, so compose `${VAR:-default}` applies.
+    Unset,
 }
 
 /// The name and DNS host the worker's runner dials for this env pair.
@@ -108,65 +87,134 @@ print(json.dumps({
     )
 }
 
-/// A hosted, secret-free bundle plus a docker stub that never reaches a daemon.
-///
-/// `bring_up_local` writes the overlay, then asks docker to start it. The stub
-/// answers every docker invocation with success and no containers, so readiness
-/// fails after the write. `COMPOSE_FILE` without `COMPOSE_PROJECT_NAME` would
-/// fail resource lookup before that write.
-struct Startup {
-    dir: tempfile::TempDir,
-    _bin: tempfile::TempDir,
-    _path: EnvVar,
-    _compose_file: EnvVar,
-    _compose_project: EnvVar,
+/// Platform answers for the writes `local deploy` sends before it starts
+/// connectors. The agent name is the one the runner dials.
+fn serve_platform() -> crate::support::MockServer {
+    let agent = serde_json::json!({
+        "id": AGENT_ID,
+        "name": AGENT,
+        "channels": [{"kind": "slack", "address": "C0LOCALDEV"}],
+        "approval_required_tools": null,
+        "approval_routes": null,
+        "memory": false,
+    })
+    .to_string();
+    let listed = format!("[{agent}]");
+    serve(move |req| {
+        let path = req.path.split('?').next().unwrap_or_default();
+        let agent_path = format!("/agents/{AGENT_ID}");
+        let versions = format!("{agent_path}/versions");
+        let bundle = format!("{versions}/{VERSION_ID}/bundle");
+        match (req.method.as_str(), path) {
+            ("GET", "/agents") => Response::json(200, &listed),
+            ("PATCH", p) if p == agent_path => Response::json(200, &agent),
+            ("POST", p) if p == versions => Response::json(
+                201,
+                &format!(r#"{{"id":"{VERSION_ID}","version_label":"0.1.0-1"}}"#),
+            ),
+            ("PUT", p) if p == bundle => Response::json(
+                201,
+                r#"{"bundle_ref":"bundles/x.tar.gz","bundle_sha256":"deadbeef","size_bytes":512}"#,
+            ),
+            ("POST", "/deployments") => Response::json(
+                201,
+                &format!(r#"{{"id":"{DEPLOYMENT_ID}","environment":"dev","status":"active"}}"#),
+            ),
+            _ => Response::json(
+                500,
+                &format!(r#"{{"detail":"unmodeled {} {}"}}"#, req.method, path),
+            ),
+        }
+    })
 }
 
-fn startup() -> Startup {
+fn write_docker_shim(dir: &Path, record: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = tempfile::TempDir::new().expect("plugin dir");
-    let bin = tempfile::TempDir::new().expect("docker stub dir");
-    let docker = bin.path().join("docker");
-    std::fs::write(&docker, "#!/bin/sh\nexit 0\n").expect("write the docker stub");
+    let record = record.display().to_string();
+    assert!(!record.contains('\''), "the shim quotes the record path");
+    let script = format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{record}'\nexit 0\n");
+    let docker = dir.join("docker");
+    std::fs::write(&docker, script).expect("write the docker shim");
     std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755))
-        .expect("make the docker stub executable");
-    let mut paths = vec![bin.path().to_path_buf()];
+        .expect("make the docker shim executable");
+}
+
+struct Deployed {
+    plugin: tempfile::TempDir,
+    output: Output,
+    record: String,
+}
+
+/// Run `curie local deploy` for a hosted, secret-free grafana bundle.
+///
+/// The child inherits nothing that would select an isolated compose project,
+/// and its `PATH` starts with a docker shim that records argv and exits 0.
+/// Readiness then fails because the shim created no container. The overlay
+/// is already on disk.
+fn local_deploy(env: ComposeEnv<'_>) -> Deployed {
+    let plugin = tempfile::tempdir().expect("plugin dir");
+    curie::scaffold::scaffold(plugin.path(), AGENT).expect("scaffold the bundle");
+    std::fs::write(
+        plugin.path().join("connectors.yaml"),
+        "connectors:\n  grafana:\n    image: ghcr.io/acme-corp/grafana:1\n",
+    )
+    .expect("write the hosted connector");
+
+    let server = serve_platform();
+    let shim = tempfile::tempdir().expect("docker shim dir");
+    let record_path = plugin.path().join("docker.log");
+    write_docker_shim(shim.path(), &record_path);
+    let mut paths = vec![shim.path().to_path_buf()];
     paths.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
     ));
     let path = std::env::join_paths(paths).expect("join PATH");
-    Startup {
-        dir,
-        _bin: bin,
-        _path: EnvVar::set_os("PATH", path),
-        _compose_file: EnvVar::unset("COMPOSE_FILE"),
-        _compose_project: EnvVar::unset("COMPOSE_PROJECT_NAME"),
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_curie"));
+    cmd.arg("--debug")
+        .args(["local", "deploy"])
+        .arg("--plugin-dir")
+        .arg(plugin.path())
+        .arg("--api-url")
+        .arg(&server.base_url)
+        .arg("--api-key")
+        .arg("test-key")
+        .arg("--agent")
+        .arg(AGENT)
+        .arg("--label")
+        .arg("0.1.0-1")
+        .env("PATH", path)
+        .env("CURIE_API_URL", &server.base_url)
+        .env("CURIE_API_KEY", "test-key")
+        .env_remove("COMPOSE_FILE")
+        .env_remove("COMPOSE_PROJECT_NAME")
+        .env_remove("CURIE_CONNECTOR_START_TIMEOUT_SECONDS");
+    match env {
+        ComposeEnv::Values(release, namespace) => {
+            cmd.env("CURIE_RELEASE", release);
+            cmd.env("CURIE_NAMESPACE", namespace);
+        }
+        ComposeEnv::Unset => {
+            cmd.env_remove("CURIE_RELEASE");
+            cmd.env_remove("CURIE_NAMESPACE");
+        }
+    }
+    let output = cmd.output().expect("run curie local deploy");
+    let record = std::fs::read_to_string(&record_path).unwrap_or_default();
+    Deployed {
+        plugin,
+        output,
+        record,
     }
 }
 
-fn hosted() -> (
-    curie::connector_build::ConnectorsFileDecl,
-    curie::connector_build::ConnectorLockFileDecl,
-) {
-    let decl = curie::connector_build::parse_connectors(
-        "connectors:\n  grafana:\n    image: ghcr.io/acme-corp/grafana:1\n",
-    )
-    .expect("a hosted connector declaration");
-    let lock = curie::connector_build::ConnectorLockFileDecl {
-        version: curie::connector_build::LOCK_VERSION,
-        connectors: std::collections::BTreeMap::new(),
-        ..Default::default()
-    };
-    (decl, lock)
-}
-
-/// Service key and network alias from the overlay `bring_up_local` wrote.
-fn overlay_identity(plugin_dir: &Path, bring_up: &impl std::fmt::Debug) -> (String, String) {
+/// Service key and network alias from the overlay local deploy wrote.
+fn overlay_identity(plugin_dir: &Path, context: &str) -> (String, String) {
     let path = curie::connector_build::compose_overlay_path(plugin_dir);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|err| {
         panic!(
-            "bring-up wrote no overlay at {}: {err}; result: {bring_up:?}",
+            "local deploy wrote no overlay at {}: {err}; output: {context}",
             path.display()
         )
     });
@@ -184,71 +232,65 @@ fn overlay_identity(plugin_dir: &Path, bring_up: &impl std::fmt::Debug) -> (Stri
     (name.clone(), dns)
 }
 
-fn assert_stopped_after_overlay(bring_up: Result<(), anyhow::Error>) {
-    let message = format!(
-        "{:#}",
-        bring_up.expect_err("the docker stub must not report a started container")
+fn command_text(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn assert_deployed_name(deployed: &Deployed, name: &str, dns: &str) {
+    let text = command_text(&deployed.output);
+    assert!(
+        !deployed.output.status.success(),
+        "the docker shim must not report a started container: {text}"
     );
     assert!(
-        message.contains("was not created"),
-        "readiness is the stop after the overlay write: {message}"
+        text.contains("was not created"),
+        "readiness is the stop after the overlay write: {text}"
+    );
+    let (got_name, got_dns) = overlay_identity(deployed.plugin.path(), &text);
+    assert_eq!(got_name, name);
+    assert_eq!(got_dns, dns);
+    let overlay = curie::connector_build::compose_overlay_path(deployed.plugin.path());
+    assert!(
+        deployed
+            .record
+            .contains(&format!("-f {}", overlay.display())),
+        "local deploy must pass the overlay to docker compose: {}",
+        deployed.record
+    );
+    assert!(
+        deployed
+            .record
+            .lines()
+            .any(|line| line.contains(" ps ") && line.ends_with(name)),
+        "local deploy must ask docker for the connector service {name}: {}",
+        deployed.record
     );
 }
 
 #[tokio::test]
 async fn local_connector_name_matches_the_worker_dial_name() {
     let _lock = crate::support::ENV_LOCK.lock().await;
-    let _release = EnvVar::set("CURIE_RELEASE", "acme-rel");
-    let _namespace = EnvVar::set("CURIE_NAMESPACE", "acme-ns");
     let (dialed_name, dialed_dns) = worker_dial("acme-rel", "acme-ns");
-    let startup = startup();
-    let (decl, lock) = hosted();
-    let bring_up =
-        curie::commands::bring_up_local(startup.dir.path(), &decl, &lock, AGENT, "curie").await;
-    let (name, dns) = overlay_identity(startup.dir.path(), &bring_up);
-    assert_eq!(name, dialed_name);
-    assert_eq!(dns, dialed_dns);
-    assert_eq!(name, format!("acme-rel-{AGENT}-mcp-{CONNECTOR}"));
+    let deployed = local_deploy(ComposeEnv::Values("acme-rel", "acme-ns"));
+    assert_deployed_name(&deployed, &dialed_name, &dialed_dns);
+    assert_eq!(dialed_name, format!("acme-rel-{AGENT}-mcp-{CONNECTOR}"));
     assert_eq!(
-        dns,
+        dialed_dns,
         format!("acme-rel-{AGENT}-mcp-{CONNECTOR}.acme-ns.svc.cluster.local")
     );
-    assert_stopped_after_overlay(bring_up);
 }
 
 #[tokio::test]
 async fn local_connector_name_defaults_when_release_and_namespace_are_unset() {
     let _lock = crate::support::ENV_LOCK.lock().await;
-    let _release = EnvVar::unset("CURIE_RELEASE");
-    let _namespace = EnvVar::unset("CURIE_NAMESPACE");
-    {
-        let startup = startup();
-        let (decl, lock) = hosted();
-        let bring_up =
-            curie::commands::bring_up_local(startup.dir.path(), &decl, &lock, AGENT, "curie").await;
-        let (name, dns) = overlay_identity(startup.dir.path(), &bring_up);
-        assert_eq!(name, format!("curie-{AGENT}-mcp-{CONNECTOR}"));
-        assert_eq!(
-            dns,
-            format!("curie-{AGENT}-mcp-{CONNECTOR}.default.svc.cluster.local")
-        );
-        assert_stopped_after_overlay(bring_up);
-    }
+    let name = format!("curie-{AGENT}-mcp-{CONNECTOR}");
+    let dns = format!("curie-{AGENT}-mcp-{CONNECTOR}.default.svc.cluster.local");
+    assert_deployed_name(&local_deploy(ComposeEnv::Unset), &name, &dns);
 
     // Compose `${VAR:-default}` treats an empty value the same as unset.
-    drop(_release);
-    drop(_namespace);
-    let _release = EnvVar::set("CURIE_RELEASE", "");
-    let _namespace = EnvVar::set("CURIE_NAMESPACE", "");
-    let startup = startup();
-    let (decl, lock) = hosted();
-    let bring_up =
-        curie::commands::bring_up_local(startup.dir.path(), &decl, &lock, AGENT, "curie").await;
-    let (empty_name, empty_dns) = overlay_identity(startup.dir.path(), &bring_up);
-    assert_eq!(empty_name, format!("curie-{AGENT}-mcp-{CONNECTOR}"));
-    assert_eq!(
-        empty_dns,
-        format!("curie-{AGENT}-mcp-{CONNECTOR}.default.svc.cluster.local")
-    );
-    assert_stopped_after_overlay(bring_up);
+    assert_deployed_name(&local_deploy(ComposeEnv::Values("", "")), &name, &dns);
 }

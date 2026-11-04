@@ -3324,3 +3324,63 @@ async fn docker_subpath_preflight_bring_ups_skip_version_checks_without_secret_f
         "no version check may run without secret_files: {log_text}"
     );
 }
+
+/// The local tier refuses the whole bring-up when a declared secret has no value,
+/// instead of writing a `${NAME}` nothing will populate.
+///
+/// It used to skip an unresolved secret silently, the check `skill up` has
+/// always performed. With the overlay carrying references, skipping is worse:
+/// compose would warn, expand the reference to empty, and start the connector
+/// authenticating with nothing. The overlay file is asserted absent because it
+/// is written before `docker compose` is invoked, so its absence is the proof
+/// that the refusal came first and no container was ever started.
+#[tokio::test]
+async fn bring_up_local_refuses_a_declared_secret_with_no_value() {
+    let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("a scratch bundle");
+    // Point the credential vault at an empty directory: the refusal must come
+    // from the declaration having no value here, not from whatever this box's
+    // operator happens to have stored. The redirect keeps the test off the OS
+    // credential store entirely.
+    let previous_config_dir = std::env::var_os("CURIE_CONFIG_DIR");
+    std::env::set_var("CURIE_CONFIG_DIR", dir.path().join("config"));
+    std::env::remove_var("CURIE_TEST_UNSET_CONNECTOR_TOKEN");
+    std::fs::write(
+        dir.path().join("connectors.yaml"),
+        "connectors:\n  \
+           gated:\n    \
+             image: ghcr.io/acme-corp/gated:v1\n    \
+             secrets:\n      \
+               - CURIE_TEST_UNSET_CONNECTOR_TOKEN\n",
+    )
+    .expect("write connectors.yaml");
+
+    let lock = crate::connector_build::ConnectorLockFileDecl {
+        version: crate::connector_build::LOCK_VERSION,
+        connectors: std::collections::BTreeMap::new(),
+        ..Default::default()
+    };
+    let error = super::bring_up_local(
+        dir.path(),
+        &crate::connector_build::load(dir.path()).unwrap(),
+        &lock,
+        "sre-bot",
+        "curie",
+    )
+    .await
+    .expect_err("a declared secret with no value must refuse the bring-up");
+    match previous_config_dir {
+        Some(value) => std::env::set_var("CURIE_CONFIG_DIR", value),
+        None => std::env::remove_var("CURIE_CONFIG_DIR"),
+    }
+
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("CURIE_TEST_UNSET_CONNECTOR_TOKEN"),
+        "the refusal names the missing credential: {message}"
+    );
+    assert!(
+        !crate::connector_build::compose_overlay_path(dir.path()).exists(),
+        "the refusal must land before anything is written or started"
+    );
+}
