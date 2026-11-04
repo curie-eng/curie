@@ -482,8 +482,11 @@ async def settle_terminal(
         await transcripts.expire_for_work_item(session, work_item)
 
 
+CancellationCause = Literal["issue_cancelled", "issue_deleted"]
+
+
 async def _cancel_queued_requests(
-    session: AsyncSession, work_item_id: uuid.UUID, now: datetime
+    session: AsyncSession, work_item_id: uuid.UUID, now: datetime, cause: CancellationCause
 ) -> None:
     await session.execute(
         update(ExecutionRequest)
@@ -494,7 +497,7 @@ async def _cancel_queued_requests(
         .values(
             status="cancelled",
             terminal_at=now,
-            terminal_cause="issue_cancelled",
+            terminal_cause=cause,
             version=ExecutionRequest.version + 1,
             updated_at=func.clock_timestamp(),
         )
@@ -1924,6 +1927,7 @@ async def request_cancellation(
     *,
     work_item_id: uuid.UUID,
     expected_work_item_version: int,
+    cause: CancellationCause = "issue_cancelled",
 ) -> WorkItemResult:
     work_item = await lock_work_item(session, work_item_id)
     if work_item is None:
@@ -1932,7 +1936,7 @@ async def request_cancellation(
         return await _conflict(session, "stale_version", work_item=work_item)
     if work_item.cancelled_at is not None:
         active = await lock_active_request(session, work_item_id)
-        await _cancel_queued_requests(session, work_item_id, await database_now(session))
+        await _cancel_queued_requests(session, work_item_id, await database_now(session), cause)
         if work_item.readmit_request_id is None:
             return await outcome(session, work_item, active, replayed=True)
         # The last label action wins: an unlabel drops a pending relabel.
@@ -1968,7 +1972,7 @@ async def request_cancellation(
         work_item = await reload_work_item(session, work_item_id)
         return await _conflict(session, "stale_version", work_item=work_item)
 
-    await _cancel_queued_requests(session, work_item_id, now)
+    await _cancel_queued_requests(session, work_item_id, now, cause)
 
     active = await lock_active_request(session, work_item_id)
     if active is not None and active.status == "waiting":
@@ -1983,7 +1987,7 @@ async def request_cancellation(
             .values(
                 status="cancelled",
                 terminal_at=now,
-                terminal_cause="issue_cancelled",
+                terminal_cause=cause,
                 version=ExecutionRequest.version + 1,
                 updated_at=func.clock_timestamp(),
             )
@@ -2001,7 +2005,7 @@ async def request_cancellation(
             )
             .values(
                 status="cancellation_requested",
-                terminal_cause="issue_cancelled",
+                terminal_cause=cause,
                 cancellation_requested_at=now,
                 runtime_heartbeat_expires_at=_release_parked_hold(),
                 version=ExecutionRequest.version + 1,
@@ -2023,7 +2027,7 @@ async def request_cancellation(
                 ExecutionRequest.status == "cancellation_requested",
             )
             .values(
-                terminal_cause="issue_cancelled",
+                terminal_cause=cause,
                 version=ExecutionRequest.version + 1,
                 updated_at=func.clock_timestamp(),
             )
@@ -2341,7 +2345,7 @@ async def settle_overdue_cancellation(
     now = await database_now(session)
     if (
         request.status != "cancellation_requested"
-        or request.terminal_cause != "issue_cancelled"
+        or request.terminal_cause not in ("issue_cancelled", "issue_deleted")
         or request.cancellation_requested_at is None
         or request.cancellation_requested_at + window > now
         or request.terminate_published_at is None
@@ -2361,7 +2365,7 @@ async def settle_overdue_cancellation(
             ExecutionRequest.work_item_id == work_item_id,
             ExecutionRequest.version == expected_request_version,
             ExecutionRequest.status == "cancellation_requested",
-            ExecutionRequest.terminal_cause == "issue_cancelled",
+            ExecutionRequest.terminal_cause.in_(("issue_cancelled", "issue_deleted")),
             ExecutionRequest.terminate_published_at.is_not(None),
             ExecutionRequest.cancellation_requested_at <= now - window,
             ExecutionRequest.runtime_owner.is_(None)
@@ -2585,7 +2589,7 @@ async def record_runtime_termination_where(
             work_item=work_item,
             request=request,
         )
-    if request.terminal_cause == "issue_cancelled":
+    if request.terminal_cause in ("issue_cancelled", "issue_deleted"):
         terminal_status = "cancelled"
     elif request.terminal_cause == "execution_deadline":
         terminal_status = "expired"

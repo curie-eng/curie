@@ -76,9 +76,10 @@ def graph_payload() -> dict[str, Any]:
         ("0140", False),
         ("0141", False),
         ("0143", False),
-        # The candidate minimum is the 0145 join of 0140 and 0144.
+        # The candidate minimum includes deleted-issue cancellation.
         ("0144", False),
-        ("0145", True),
+        ("0145", False),
+        ("0147", True),
         ("0000", True),
         ("future-expand", True),
     ],
