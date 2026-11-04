@@ -362,6 +362,32 @@ async def test_a_running_issue_that_is_gone_yields_deleted_cancellation(fake: Gi
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("status", [503, 429])
+async def test_a_transient_running_issue_read_defers_the_poll(fake: GitLabAPI, status: int) -> None:
+    tracker = gitlab_tracker(fake)
+    iid = fake.add_issue("Ticket", author=WRITER)
+    fake.label(iid, LABEL, WRITER)
+    admitted = await tracker.poll_marked(None, running=())
+    path = f"{PROJECT}/issues/{iid}"
+    reads = len(fake.calls("GET", path))
+    fake.script(status, path=path, method="GET", headers={"Retry-After": "30"})
+
+    with pytest.raises(Unavailable):
+        await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),))
+
+    assert len(fake.calls("GET", path)) == reads + 1
+    if status == 429:
+        requests = len(fake.requests)
+        with pytest.raises(Unavailable):
+            await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),))
+        assert len(fake.requests) == requests
+        return
+    resumed = await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),))
+    assert resumed.notices == ()
+    assert len(fake.calls("GET", path)) == reads + 2
+
+
+@pytest.mark.anyio
 async def test_a_running_issue_still_labelled_and_open_yields_nothing(fake: GitLabAPI) -> None:
     tracker = gitlab_tracker(fake)
     iid = fake.add_issue("Ticket", author=WRITER)

@@ -913,12 +913,14 @@ async def _release_sync_claim(
         await session.commit()
 
 
-def _skip_deleted_issue_comment(row: FactoryStatusComment, now: datetime) -> None:
+def _skip_missing_comment(row: FactoryStatusComment, now: datetime) -> None:
     row.applied_label = ""
     if row.posted_at is not None:
         row.finalized_at = now
     else:
-        row.refusal = "issue_deleted"
+        row.refusal = (
+            "issue_deleted" if row.terminal_cause == "issue_deleted" else "recipient_missing"
+        )
         row.refused_at = now
 
 
@@ -929,7 +931,7 @@ async def _sync_one(
 ) -> int:
     row = claim.row
     if row.terminal_cause == "issue_deleted":
-        _skip_deleted_issue_comment(row, claim.now)
+        _skip_missing_comment(row, claim.now)
         return 0
     if claim.tracker_issue.kind != GITHUB:
         return await _sync_through_ports(client, settings, claim)
@@ -1025,7 +1027,7 @@ async def _sync_port_comment(tracker: Tracker, code_host: CodeHost, claim: _Stat
             target, status_marker(row.execution_request_id), body
         )
     except NotFound:
-        _skip_deleted_issue_comment(row, now)
+        _skip_missing_comment(row, now)
         return 0
     except Unauthorized:
         row.comment_id = None

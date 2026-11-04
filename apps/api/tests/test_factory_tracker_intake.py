@@ -2116,6 +2116,10 @@ def test_deleted_jira_issue_cancels_running_work_item(intake: Intake) -> None:
         == "issue_deleted"
     )
     assert intake.jira.requests_of("comment_create") == []
+    assert _rows(
+        "SELECT status, terminal_cause FROM curie.execution_requests WHERE id = :id",
+        {"id": request["id"]},
+    ) == [{"status": "cancelled", "terminal_cause": "issue_deleted"}]
 
 
 @pytest.mark.parametrize("change", ["deleted", "unlabelled", "closed"])
@@ -2143,8 +2147,9 @@ def test_missing_or_closed_jira_issue_cancels_waiting_work(intake: Intake, chang
     ]
 
 
+@pytest.mark.parametrize("missing_endpoint", ["comments", "comment_create"])
 def test_missing_status_comment_does_not_undo_cancellation(
-    intake: Intake, monkeypatch: pytest.MonkeyPatch
+    intake: Intake, monkeypatch: pytest.MonkeyPatch, missing_endpoint: str
 ) -> None:
     from curie_api import factory_notices
 
@@ -2155,7 +2160,7 @@ def test_missing_status_comment_does_not_undo_cancellation(
     [item] = _work_items(issue)
     intake.jira.remove_label(issue.id, LABEL, intake.starter)
     intake.poll()
-    intake.jira.fail_next("comments", status=404)
+    intake.jira.fail_next(missing_endpoint, status=404)
     original = httpx.AsyncClient
 
     def external_client(**kwargs: Any) -> httpx.AsyncClient:
@@ -2183,7 +2188,8 @@ def test_missing_status_comment_does_not_undo_cancellation(
         {"id": item["id"]},
     )
     assert notice["refused_at"] is not None
-    assert notice["refusal"] == "issue_deleted"
+    assert notice["refusal"] == "recipient_missing"
+    assert notice["finalized_at"] is None
     assert notice["applied_label"] == ""
     reads = len(intake.jira.requests)
     intake.client.portal.call(sync_status)
