@@ -3,9 +3,10 @@
 A connect failure (``aiohttp.ClientConnectorError``) proves the request never
 reached the API, so nothing was written and a later attempt cannot duplicate
 the record. The runner keeps such a record, retries it in order once the API is
-back, and only then reports ``history_durable``. Any append the API actually
-answered (a 500, a capacity refusal) stays a sticky loss for the process, as
-before: the append route has no idempotency key, so a retry could write twice.
+back, and only then reports ``history_durable``. An append the API refused with
+a 4xx (here a 400) stays a sticky loss for the process: the request was
+understood and refused, so a retry cannot succeed. A 5xx or a cut connection is
+retried too since #5366 (``test_history_refused_append_5366``).
 
 The state API here is the shared fake key (``runner_state_fake.CappedCasState``,
 which replays ``get_state`` and ``append_state`` in
@@ -270,7 +271,7 @@ def test_records_deferred_by_an_outage_land_in_turn_order(
     anyio.run(go)
 
 
-def test_an_append_the_api_answered_with_500_stays_a_sticky_loss(
+def test_an_append_the_api_answered_with_400_stays_a_sticky_loss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _fast_retry(monkeypatch)
@@ -282,13 +283,13 @@ def test_an_append_the_api_answered_with_500_stays_a_sticky_loss(
         runner = _runner(store)
         await runner.start()
         try:
-            api.state.force_append_status = 500
+            api.state.force_append_status = 400
             assert await _turn(runner, "first question") is SessionStatus.DONE
             assert api.posted_users() == ["first question"]
             assert runner.history_durable is False
             api.state.force_append_status = None
 
-            # The request reached the API, so it is never sent again.
+            # The API refused the request with a 4xx, so it is never sent again.
             await _retry_settled(runner)
             assert api.posted_users() == ["first question"]
 
@@ -305,7 +306,7 @@ def test_an_append_the_api_answered_with_500_stays_a_sticky_loss(
     anyio.run(go)
 
 
-def test_a_deferred_record_refused_on_retry_becomes_a_real_loss(
+def test_a_deferred_record_refused_with_400_on_retry_becomes_a_real_loss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _fast_retry(monkeypatch)
@@ -321,8 +322,8 @@ def test_a_deferred_record_refused_on_retry_becomes_a_real_loss(
             assert await _turn(runner, "first question") is SessionStatus.DONE
             assert runner.history_durable is False
 
-            # The API comes back but refuses the retried append.
-            api.state.force_append_status = 500
+            # The API comes back but refuses the retried append with a 4xx.
+            api.state.force_append_status = 400
             await api.start()
             await _retry_settled(runner)
             # One refusal ends the retry: exactly one attempt reached the API.
