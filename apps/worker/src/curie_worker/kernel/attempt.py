@@ -30,6 +30,7 @@ from channel_protocol.reply import (
     ReplyUpdate,
 )
 from curie_telemetry.redact import redact_text
+from redis.exceptions import RedisError
 
 from ..actions import ActionBackendError
 from ..approvals import (
@@ -763,7 +764,12 @@ async def _attempt_turn(
     try:
         ordering = current_order()
         if ordering is not None:
-            await ordering[0].finish_order(ordering[2], ordering[1], ordering[3], started=True)
+            try:
+                await ordering[0].finish_order(ordering[2], ordering[1], ordering[3], started=True)
+            except RedisError:
+                logger.warning(
+                    "thread order release unavailable after runner start for %s", qevent.event_id
+                )
         release_order()
     except BaseException:  # noqa: BLE001 - broad catch kept at a failure boundary
         await close_routed_turn()

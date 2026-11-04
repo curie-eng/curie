@@ -320,7 +320,9 @@ async def _complete(
         ),
         answer_best_effort=(
             self._is_approval_resume(qevent.event_id)
-            and (escalation_update is not None or (turn is not None and turn.answer is not None))
+            and outcome == "delivered"
+            and turn is not None
+            and turn.answer is not None
         ),
         thread_order=thread_order,
         created_at=clock.time.time(),

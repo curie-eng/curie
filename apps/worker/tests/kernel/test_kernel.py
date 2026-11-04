@@ -13,7 +13,8 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -277,6 +278,48 @@ def test_post_final_stall_does_not_reclassify_or_retry_success(make_harness) -> 
                 hold.set()
 
     asyncio.run(go())
+
+
+def test_cancellation_while_route_lock_exits_releases_open_runner_response(
+    make_harness,
+) -> None:
+    class BlockingExitLock:
+        def __init__(self, inner: object) -> None:
+            self._inner = inner
+            self.exit_started = asyncio.Event()
+            self.unblock = asyncio.Event()
+
+        @asynccontextmanager
+        async def hold(self, key: str) -> AsyncIterator[object]:
+            async with self._inner.hold(key) as lease:  # type: ignore[attr-defined]
+                yield lease
+                self.exit_started.set()
+                await self.unblock.wait()
+
+    async def go() -> None:
+        async with make_harness() as h:
+            runner_hold = asyncio.Event()
+            h.runner.hold = runner_hold
+            h.runner.default_script = [Final(text="answer", status=DONE)]
+            lock = BlockingExitLock(h.kernel._lock)
+            h.kernel._lock = lock  # type: ignore[assignment]
+            release_calls = _spy_next_turn_release(h.kernel)
+            task = asyncio.create_task(h.kernel.process_event(qevent("hi", thread="tCancel")))
+            try:
+                await asyncio.wait_for(lock.exit_started.wait(), timeout=1.0)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert release_calls["n"] >= 1
+            finally:
+                lock.unblock.set()
+                runner_hold.set()
+                if not task.done():
+                    task.cancel()
+                await wait_until(lambda: not h.runner.turn_active)
+
+    asyncio.run(go())
+
 
 
 def test_cancellation_during_registered_kill_recheck_releases_runner_response(

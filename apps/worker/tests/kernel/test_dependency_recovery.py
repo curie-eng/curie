@@ -264,7 +264,11 @@ def test_dependency_wait_has_one_fixed_workspace_deadline(make_harness) -> None:
                 first = await consumer._waits.get(event.event_id)
                 assert first is not None and first.state == "waiting"
                 assert first.dependency_deadline_ms is not None
-                assert 0 < first.dependency_deadline_ms - first.first_wait_ms <= 150000
+                assert (
+                    h.config.workspace_total_timeout_seconds * 1000
+                    <= first.dependency_deadline_ms - first.first_wait_ms
+                    <= 150000
+                )
                 entry, fields = await _wake(h, consumer, event.event_id)
                 await consumer._sem.acquire()
                 await consumer._handle(entry, fields)
@@ -560,12 +564,23 @@ def test_followup_cannot_overtake_an_initial_dependency_failure(
             try:
                 await asyncio.wait_for(first_entered.wait(), timeout=2)
                 second_task = asyncio.create_task(_deliver(peer, second_consumer, second))
-                await asyncio.wait_for(asyncio.shield(second_task), timeout=1)
+                if separate_kernel:
+                    await asyncio.wait_for(asyncio.shield(second_task), timeout=1)
+                    waiting = await second_consumer._waits.get(second.event_id)
+                    assert waiting is not None and waiting.state == "waiting"
+                else:
+                    from curie_worker.kernel.routing import _thread_key_for
+
+                    key = _thread_key_for(first)
+                    await _wait_until(lambda: h.kernel._order_locks[key].refs > 1)
+                    assert not second_task.done()
+                    assert await second_consumer._waits.get(second.event_id) is None
                 assert h.runner.opened == peer.runner.opened == []
-                waiting = await second_consumer._waits.get(second.event_id)
-                assert waiting is not None and waiting.state == "waiting"
                 release_first.set()
                 await first_task
+                await second_task
+                waiting = await second_consumer._waits.get(second.event_id)
+                assert waiting is not None and waiting.state == "waiting"
                 h.runner.default_script = [Final(text="first answer", status=SessionStatus.DONE)]
                 entry, fields = await _wake(h, first_consumer, first.event_id)
                 await first_consumer._sem.acquire()
@@ -725,5 +740,175 @@ def test_pending_predecessor_scan_makes_bounded_progress_across_wakes(make_harne
             assert h.sink.last_text == "scan completed"
             pending = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
             assert pending["pending"] == 70
+
+    asyncio.run(go())
+
+
+def test_quick_local_followup_waits_for_boot_then_steers_without_notice(make_harness) -> None:
+    async def go() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        deployment = uuid.uuid4()
+
+        async def selection(_request: web.Request) -> web.Response:
+            entered.set()
+            await release.wait()
+            return web.json_response({"repo_full_name": None})
+
+        app = web.Application()
+        app.router.add_post(f"/v1/internal/workspaces/{deployment}/selection", selection)
+        async with (
+            TestServer(app) as server,
+            make_harness(
+                binding=_workspace_binding(deployment),
+                slack_no_edit_streaming=False,
+            ) as h,
+        ):
+            h.kernel._workspace = WorkspaceClaimCoordinator(
+                preparer=SimpleNamespace(
+                    credentials=WorkspaceCredentialClient(
+                        api_url=str(server.make_url("")),
+                        worker_token="example-worker-token",
+                    )
+                ),
+                substrate=h.substrate,
+            )
+            hold = asyncio.Event()
+            h.runner.default_script = []
+            h.runner.hold = hold
+            h.runner.tail = [Final(text="first answer", status=SessionStatus.DONE)]
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            first = asyncio.create_task(
+                _deliver(h, consumer, _qevent("first", event_id="boot-first"))
+            )
+            second = None
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=2)
+                before_followup = list(h.sink.updates)
+                second = asyncio.create_task(
+                    _deliver(h, consumer, _qevent("second", event_id="boot-second"))
+                )
+                from curie_worker.kernel.routing import _thread_key_for
+
+                key = _thread_key_for(_qevent("first"))
+                await _wait_until(lambda: second.done() or h.kernel._order_locks[key].refs > 1)
+                assert not second.done()
+                assert await consumer._waits.get("boot-second") is None
+                assert h.sink.updates == before_followup
+                release.set()
+                await asyncio.wait_for(second, timeout=2)
+                assert h.runner.opened == ["first"]
+                assert h.runner.steers == ["second"]
+                assert await consumer._waits.get("boot-second") is None
+                assert all("queued" not in text for _, _, text in h.sink.updates)
+            finally:
+                release.set()
+                hold.set()
+                await asyncio.gather(first, *([second] if second else []), return_exceptions=True)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("fault_on", ["start", "steer"])
+def test_order_release_redis_error_does_not_abort_an_accepted_turn(make_harness, fault_on) -> None:
+    from redis.asyncio import Redis
+
+    from .conftest import FakeRunner
+
+    async def go() -> None:
+        runner = FakeRunner()
+        state: dict[str, Any] = {}
+        user = f"order-fault-{uuid.uuid4().hex}"
+
+        @web.middleware
+        async def reject_order_release(request, handler):
+            if request.path == ("/v1/event" if fault_on == "start" else "/v1/steer") and (
+                fault_on == "start" or runner.turn_active
+            ):
+                await state["admin"].execute_command("ACL", "SETUSER", user, "-eval")
+            return await handler(request)
+
+        runner.app.middlewares.append(reject_order_release)
+        async with make_harness(runner_app=runner.app, slack_no_edit_streaming=True) as h:
+            state["admin"] = h.async_redis
+            await h.async_redis.execute_command(
+                "ACL", "SETUSER", user, "reset", "on", ">example-password", "~*", "+@all"
+            )
+            connection = h.async_redis.connection_pool.connection_kwargs
+            client = Redis(
+                host=connection["host"],
+                port=connection["port"],
+                username=user,
+                password="example-password",
+                decode_responses=True,
+            )
+            consumer = _capacity_consumer(h)
+            consumer._waits._redis = client
+            await consumer.ensure_group()
+            hold = asyncio.Event()
+            first_task = None
+            try:
+                if fault_on == "steer":
+                    runner.hold = hold
+                    runner.default_script = []
+                    runner.tail = [Final(text="accepted answer", status=SessionStatus.DONE)]
+                    first_task = asyncio.create_task(
+                        _deliver(h, consumer, _qevent("first", event_id="accepted-first"))
+                    )
+                    await _wait_until(lambda: runner.turn_active)
+                    await _deliver(h, consumer, _qevent("second", event_id="accepted-second"))
+                    assert runner.steers == ["second"]
+                else:
+                    runner.default_script = [
+                        Final(text="accepted answer", status=SessionStatus.DONE)
+                    ]
+                    await _deliver(h, consumer, _qevent("first", event_id="accepted-first"))
+                    assert h.sink.last_text == "accepted answer"
+                assert runner.opened == ["first"]
+                assert h.sink.completions[-1].outcome == "delivered"
+                if first_task is not None:
+                    hold.set()
+                    await first_task
+                assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                    "pending"
+                ] == 0
+            finally:
+                hold.set()
+                if first_task is not None:
+                    await asyncio.gather(first_task, return_exceptions=True)
+                await client.aclose()
+                await h.async_redis.execute_command("ACL", "DELUSER", user)
+
+    asyncio.run(go())
+
+
+def test_approval_resume_escalation_stays_owed_when_adapter_is_unreachable(make_harness) -> None:
+    async def go() -> None:
+        async with _selection_server() as (deployment, credentials, state):
+            async with make_harness(
+                binding=_workspace_binding(deployment),
+                slack_no_edit_streaming=True,
+                completion_sweep_grace_s=0,
+            ) as h:
+                h.kernel._workspace = WorkspaceClaimCoordinator(
+                    preparer=SimpleNamespace(credentials=credentials),
+                    substrate=h.substrate,
+                )
+                state["status"] = 422
+                endpoint = "https://reply.example.com/hook"
+                event = _qevent("resume", event_id="approval-resolved", endpoint=endpoint)
+                h.sink.dead_endpoints.add(endpoint)
+                consumer = _capacity_consumer(h)
+                await consumer.ensure_group()
+                await _deliver(h, consumer, event)
+                assert h.runner.opened == []
+                assert h.sink.swallowed == []
+                stored = await h.kernel._markers.read_completion(event.event_id)
+                assert stored is not None and stored.record.answer is not None
+                h.sink.dead_endpoints.clear()
+                await h.kernel.sweep_pending_completions()
+                assert failure_class_from_reply(h.sink.last_text) == "workspace-error"
+                assert await h.kernel._markers.read_completion(event.event_id) is None
 
     asyncio.run(go())

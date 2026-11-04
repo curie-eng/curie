@@ -611,6 +611,24 @@ class Consumer(StreamConsumer):
                                 lease,
                                 identify=identify_predecessor,
                             )
+                            local_order = self._kernel._order_locks.get(thread_key)
+                            if (
+                                order_blocked
+                                and local_order is not None
+                                and local_order.lock.locked()
+                            ):
+                                local_order = self._kernel._acquire_order_entry(thread_key)
+                                try:
+                                    async with local_order.lock:
+                                        order_blocked = await self._waits.has_predecessor(
+                                            thread_key,
+                                            qevent.event_id,
+                                            entry_id,
+                                            lease,
+                                            identify=identify_predecessor,
+                                        )
+                                finally:
+                                    self._kernel._release_order_entry(thread_key, local_order)
                         except RedisError:
                             order_blocked = True
                         except (LeaseLostError, CapacityWaitRefused) as exc:
@@ -782,12 +800,18 @@ class Consumer(StreamConsumer):
                                     self._kernel._can_park(qevent)
                                     and await self._kernel._markers.is_terminal(qevent.event_id)
                                 ):
-                                    await self._waits.finish_order(
-                                        _thread_key_for(qevent),
-                                        qevent.event_id,
-                                        lease,
-                                        started=False,
-                                    )
+                                    try:
+                                        await self._waits.finish_order(
+                                            _thread_key_for(qevent),
+                                            qevent.event_id,
+                                            lease,
+                                            started=False,
+                                        )
+                                    except RedisError:
+                                        logger.warning(
+                                            "settled thread order cleanup unavailable for %s",
+                                            qevent.event_id,
+                                        )
                         except TurnAuthorityUnavailable:
                             logger.warning(
                                 "Current invocation authority unavailable; keeping pending"
