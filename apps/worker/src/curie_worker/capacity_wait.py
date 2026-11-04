@@ -173,7 +173,7 @@ redis.call('HSET', KEYS[2], 'order_scan_after', ARGV[12], 'order_scan_done', ARG
 for _, key in ipairs({KEYS[1], KEYS[2]}) do
   redis.call('PEXPIRE', key, math.max(redis.call('PTTL', key), tonumber(ARGV[9])))
 end
-local first = redis.call('ZRANGE', KEYS[1], 0, 0)
+local first = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', '+inf', 'LIMIT', 0, 1)
 return {1, member, first[1] or '', ARGV[13]}
 """
 
@@ -810,7 +810,7 @@ class CapacityWaitStore:
             if not resolved:
                 return True
             await self._redis.zrem(key, member)
-            members = await self._redis.zrange(key, 0, 0)
+            members = await self._redis.zrangebyscore(key, "-inf", "+inf", start=0, num=1)
             head = members[0] if members else ""
         return True
 
