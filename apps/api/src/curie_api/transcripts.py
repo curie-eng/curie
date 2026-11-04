@@ -255,6 +255,16 @@ async def put(
     return row
 
 
+def _stores_record(value: list[Any], item: Any) -> bool:
+    """Whether ``value`` already holds an entry with ``item``'s ``record_id``."""
+    record_id = item.get("record_id") if isinstance(item, dict) else None
+    if not isinstance(record_id, str) or not record_id:
+        return False
+    return any(
+        isinstance(stored, dict) and stored.get("record_id") == record_id for stored in value
+    )
+
+
 async def append(
     session: AsyncSession,
     agent_id: uuid.UUID,
@@ -263,7 +273,13 @@ async def append(
     item: Any,
     reserve_bytes: int | None,
 ) -> ThreadTranscript:
-    """Append one record to a thread's transcript, creating it if absent. Commits."""
+    """Append one record to a thread's transcript, creating it if absent. Commits.
+
+    An item whose nonempty ``record_id`` is already stored is a replay of an
+    append whose response was lost (#5366): the stored row is returned
+    unchanged, with no version or expiry change, and the cap is not checked,
+    since the record adds no bytes. The row lock makes the check race free.
+    """
     row = await _get_locked(session, agent_id, scope, key)
     if row is None:
         value = [item]
@@ -281,6 +297,10 @@ async def append(
             raise HTTPException(
                 status.HTTP_409_CONFLICT, "cannot append: stored value is not a JSON array"
             )
+        if _stores_record(row.value, item):
+            await session.commit()
+            await session.refresh(row)
+            return row
         value = [*row.value, item]
         enforce_thread_cap(key, value, reserve_bytes=reserve_bytes)
         row.value = value

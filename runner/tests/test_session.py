@@ -745,7 +745,7 @@ def test_optional_replay_export_failure_still_appends_portable_history(
     assert all("private replay token-PLACEHOLDER" not in message for message in messages)
 
 
-def test_persistence_stage_timeout_is_bounded_and_loss_stays_sticky(
+def test_persistence_stage_timeout_is_bounded_and_the_record_is_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     assert session_module._HISTORY_PERSISTENCE_BUDGET_SECONDS == 15.0
@@ -778,12 +778,14 @@ def test_persistence_stage_timeout_is_bounded_and_loss_stays_sticky(
     first, second = anyio.run(go)
     assert first[-1].status is SessionStatus.DONE
     assert second[-1].status is SessionStatus.DONE
-    assert [record.user for record in store.turns] == ["second"]
+    # #5366: the timed-out append may have landed, but its record_id makes a
+    # retry safe, so it is deferred and lands ahead of the next turn's record.
+    assert [record.user for record in store.turns] == ["first", "second"]
     assert runner.turn_active is False
-    assert runner.history_durable is False
+    assert runner.history_durable is True
 
 
-def test_cancellation_during_persistence_marks_loss_without_a_terminal(caplog) -> None:
+def test_cancellation_during_persistence_keeps_the_record_without_a_terminal(caplog) -> None:
     store = _FirstBlockedTranscriptStore()
     runner, fake = _runner_with_history(store)
     first_lines: list[str] = []
@@ -822,10 +824,12 @@ def test_cancellation_during_persistence_marks_loss_without_a_terminal(caplog) -
     assert not any(isinstance(event, Final) for event in first)
     assert second[-1].status is SessionStatus.DONE
     assert sum("turn end" in record.getMessage() for record in caplog.records) == 1
-    assert [record.user for record in store.turns] == ["second"]
+    # #5366: an append cancelled after its request was sent is deferred, not
+    # lost (its record_id makes the retry safe), and lands in turn order.
+    assert [record.user for record in store.turns] == ["first", "second"]
     assert fake.interrupts == 0
     assert runner.turn_active is False
-    assert runner.history_durable is False
+    assert runner.history_durable is True
 
 
 def test_first_resumed_turn_records_cache_read_metric_once(monkeypatch) -> None:
