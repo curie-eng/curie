@@ -49,10 +49,9 @@ implementation detail of the observer):
   applied   -- a ``helm upgrade`` has been issued
   converged -- the convergence observation has read the live workloads
 
-`convergence.observe` compares live containers against Helm's INSTALLED
-manifest, never against ``--to``. So ``target`` (what ``helm get manifest``
-renders) and ``served_*`` (what the live pods run) are separate knobs: a
-fixture that moves them together can never make ``images`` false.
+Upgrade convergence compares live containers against the requested chart render.
+The requested, installed and running image pins vary independently; the status
+observer still uses Helm's installed manifest.
 """
 
 import copy
@@ -186,7 +185,12 @@ BASE = {
     "deployment_unreadable_after": None,
     "deployment_absent": None,
     "target": "0.9.0",
+    "requested_image": None,
+    "extra_containers": 0,
+    "installed_image": None,
+    "running_image": None,
     "show_chart": "0.9.0",
+    "app_version": None,
     "ready": 1,
     "updated": 1,
     "unavailable": 0,
@@ -491,6 +495,8 @@ SCENARIOS = {
 root = Path(os.environ["UPGRADE_DRIVER_ROOT"])
 scenario = dict(BASE)
 scenario.update(SCENARIOS[os.environ["UPGRADE_DRIVER_SCENARIO"]])
+if (root / "image-pins.json").exists():
+    scenario.update(json.loads((root / "image-pins.json").read_text()))
 if scenario["after_converge"] is None:
     scenario["after_converge"] = scenario["after"]
 program = Path(sys.argv[0]).name
@@ -514,7 +520,8 @@ else:
     chart_version = scenario["before"]
 served = scenario["served_after"] if upgraded else scenario["served_before"]
 image = f"{REPO}:{served}"
-target_image = f"{REPO}:{scenario['target']}"
+target_image = scenario["installed_image"] or f"{REPO}:{scenario['target']}"
+image = scenario["running_image"] or image
 
 
 def emit(value):
@@ -782,6 +789,11 @@ expected = {
     },
 }
 
+expected["spec"]["template"]["spec"]["containers"].extend(
+    {"name": f"sidecar{index}", "image": target_image}
+    for index in range(scenario["extra_containers"])
+)
+
 live = copy.deepcopy(expected)
 live["metadata"]["generation"] = 3
 live["spec"]["template"]["spec"]["containers"][0]["image"] = image
@@ -815,7 +827,7 @@ pod = {
             {
                 "name": "api",
                 "image": image,
-                "imageID": "containerd://sha256:" + "a" * 64,
+                "imageID": scenario["running_image"] or "containerd://sha256:" + "a" * 64,
                 "ready": True,
                 "state": {"running": {}},
             }
@@ -964,7 +976,8 @@ def sandbox_templates():
     if runner.get("digest"):
         platform = f"{image}@{runner['digest']}"
     else:
-        platform = f"{image}:{runner.get('tag') or scenario['show_chart']}"
+        tag = runner.get("tag") or scenario["app_version"] or scenario["show_chart"]
+        platform = f"{image}:{tag}"
     agents = set()
     for key in POOL_AGENT_MAPS:
         if isinstance(sandbox.get(key), dict):
@@ -1177,7 +1190,7 @@ if program == "helm":
             "name": RELEASE,
             "chart": "curie",
             "version": chart_version,
-            "appVersion": chart_version,
+            "appVersion": scenario["app_version"] or chart_version,
             "namespace": NAMESPACE,
             "revision": row["revision"],
             "status": row["status"],
@@ -1253,10 +1266,16 @@ if program == "helm":
         print(json.dumps(expected))
         sys.exit(0)
     if args[:2] == ["show", "chart"]:
+        if os.environ.get("UPGRADE_DRIVER_REAL_HELM"):
+            import subprocess
+            sys.exit(subprocess.call([os.environ["UPGRADE_DRIVER_REAL_HELM"], *args]))
         print(
             "name: curie\nversion: {v}\nappVersion: {v}".format(v=scenario["show_chart"])
         )
         sys.exit(0)
+    if args[:2] == ["show", "values"] and os.environ.get("UPGRADE_DRIVER_REAL_HELM"):
+        import subprocess
+        sys.exit(subprocess.call([os.environ["UPGRADE_DRIVER_REAL_HELM"], *args]))
     if args[:2] == ["show", "values"] and (root / "chart-values.json").exists():
         # JSON is YAML. Without the file this falls through to exit 64 below.
         print((root / "chart-values.json").read_text())
@@ -1306,6 +1325,16 @@ if program == "helm":
             values = json.loads(Path(values_file).read_text()) if values_file else {}
             if values_file:
                 capture("render-values", ".json", values_file)
+            requested = copy.deepcopy(expected)
+            requested["spec"]["template"]["spec"]["containers"][0]["image"] = (
+                scenario["requested_image"] or target_image
+            )
+            digest = values.get("api", {}).get("image", {}).get("digest")
+            if digest:
+                for container in requested["spec"]["template"]["spec"]["containers"]:
+                    container["image"] = f"{REPO}@{digest}"
+            print(json.dumps(requested))
+            print("---")
             worker = values.get("worker", {})
             if (
                 worker.get("deploy", True) is False
