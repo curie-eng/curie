@@ -45,7 +45,7 @@ from slack_sdk.web import WebClient
 from slack_sdk.web.slack_response import SlackResponse
 
 from .test_config import _clear_all_config_env, _set_valid_chat_attester_secret
-from .test_http_receiver import BOT, SENDER, HttpRig, api
+from .test_http_receiver import BOT, SENDER, HttpRig, api, receiving
 from .test_http_receiver_direct_messages import dm_bindings, dm_native
 from .test_http_receiver_dispatch import DM_CHANNEL, _deliver_selected
 from .test_identity_dispatch import _mention, _ops
@@ -174,6 +174,7 @@ def _run_legacy(
                 "type": "event_callback",
                 "event_id": event_id,
                 "team_id": "T1",
+                "authorizations": receiving(),
                 "is_ext_shared_channel": False,
                 "event": event,
             },
