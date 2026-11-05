@@ -310,10 +310,12 @@ def test_one_unavailable_lookup_is_retried_within_the_composition_budget(
     provider = synthetic_provider
     real = HttpIdentityClient.lookup
     pending = True
+    calls: list[int] = []
 
     async def lookup(client: HttpIdentityClient, **kwargs: Any) -> Any:
         """@spec HTTP-INVOCATION-EXECUTION-4: the first refusal does not call the provider."""
         nonlocal pending
+        calls.append(1)
         if pending:
             pending = False
             return FactsRefusal(code="unavailable")
@@ -323,6 +325,7 @@ def test_one_unavailable_lookup_is_retried_within_the_composition_budget(
     # The helper's own POST is the composition under test.
     with turn_authority.queued_invocation(provider, valkey, runs_stream):
         pass
+    assert len(calls) == 2
 
 
 def test_unavailable_lookups_exhaust_the_composition_attempts(
