@@ -3874,6 +3874,50 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/work-items/{work_item_id}/personal-context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Personal Context
+         * @description The token-free facts a worker revalidates a personal WorkItem from (#5376).
+         */
+        get: operations["read_personal_context_v1_internal_work_items__work_item_id__personal_context_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/work-items/{work_item_id}/personal-context/revalidate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revalidate Personal Context
+         * @description Bind a personal WorkItem to its owner's current enrollment generation.
+         *
+         *     Compare-and-set on the WorkItem, request and enrollment versions; a stale
+         *     version, another owner, an inactive enrollment, a live runtime or an
+         *     unchanged generation is 409 with its code (#5376).
+         */
+        post: operations["revalidate_personal_context_v1_internal_work_items__work_item_id__personal_context_revalidate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/workspace-recovery/acquire-reader": {
         parameters: {
             query?: never;
@@ -4577,8 +4621,15 @@ export interface components {
             code_host_installation_id?: number | null;
             /** Kind */
             kind: string;
+            /**
+             * Model Auth Mode
+             * @default service
+             * @enum {string}
+             */
+            model_auth_mode?: "service" | "personal";
             /** Objective */
             objective: string;
+            owner?: components["schemas"]["OwnerContextIn"] | null;
             /** Reply Conversation Id */
             reply_conversation_id: string;
             repository: components["schemas"]["RepositoryIn"];
@@ -8001,6 +8052,27 @@ export interface components {
             /** Thread Key */
             thread_key: string;
         };
+        /**
+         * OwnerContextIn
+         * @description The verified owner a personal execution runs as (#5376, ADR 0268).
+         *
+         *     Accepted only here, from the trusted worker: a principal of the agent's
+         *     tenant and the enrollment generation it is bound to.
+         */
+        OwnerContextIn: {
+            /** Enrollment Generation */
+            enrollment_generation: number;
+            /**
+             * Principal Id
+             * Format: uuid
+             */
+            principal_id: string;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+        };
         /** OwnerLostBody */
         OwnerLostBody: {
             /** Owner */
@@ -8014,6 +8086,77 @@ export interface components {
             files: components["schemas"]["FileDescriptor"][];
             /** Next Cursor */
             next_cursor: string | null;
+        };
+        /**
+         * PersonalContextEnrollmentOut
+         * @description The owner's enrollment header: its generation, state and CAS version.
+         */
+        PersonalContextEnrollmentOut: {
+            /** Active */
+            active: boolean;
+            /** Generation */
+            generation: number;
+            /** Version */
+            version: number;
+        };
+        /**
+         * PersonalContextOut
+         * @description A personal WorkItem's owner, bound generation and versions (#5376).
+         *
+         *     Token free: identifiers, generations and versions only. ``enrollment`` is
+         *     null when the owner has no enrollment row.
+         */
+        PersonalContextOut: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            enrollment: components["schemas"]["PersonalContextEnrollmentOut"] | null;
+            /** Enrollment Generation */
+            enrollment_generation: number;
+            /**
+             * Model Auth Mode
+             * @enum {string}
+             */
+            model_auth_mode: "service" | "personal";
+            /**
+             * Owner Principal Id
+             * Format: uuid
+             */
+            owner_principal_id: string;
+            request: components["schemas"]["PersonalContextRequestOut"] | null;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+            /** Work Item Version */
+            work_item_version: number;
+        };
+        /**
+         * PersonalContextRequestOut
+         * @description The WorkItem's latest request and the generation it snapshotted.
+         */
+        PersonalContextRequestOut: {
+            /** Enrollment Generation */
+            enrollment_generation: number | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Sequence */
+            sequence: number;
+            /** Status */
+            status: string;
+            /** Version */
+            version: number;
         };
         /** PhaseDeclaration */
         PhaseDeclaration: {
@@ -9702,6 +9845,64 @@ export interface components {
             /** Slack Channel */
             slack_channel?: string | null;
         };
+        /**
+         * RevalidationBody
+         * @description The versions the caller read, compared and set in one transaction.
+         */
+        RevalidationBody: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Expected Enrollment Version */
+            expected_enrollment_version: number;
+            /** Expected Request Version */
+            expected_request_version: number;
+            /** Expected Work Item Version */
+            expected_work_item_version: number;
+            /**
+             * Owner Principal Id
+             * Format: uuid
+             */
+            owner_principal_id: string;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+        };
+        /**
+         * RevalidationOut
+         * @description The generation the WorkItem is now bound to and the versions it moved to.
+         */
+        RevalidationOut: {
+            /** Enrollment Generation */
+            enrollment_generation: number;
+            /** Enrollment Version */
+            enrollment_version: number;
+            /** Previous Generation */
+            previous_generation: number;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Request Version */
+            request_version: number;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+            /** Work Item Version */
+            work_item_version: number;
+        };
         /** ReviewReservationOut */
         ReviewReservationOut: {
             /** Origin Key */
@@ -9920,7 +10121,7 @@ export interface components {
             /** Lease Held To Deadline */
             lease_held_to_deadline: boolean;
             /** Refusal */
-            refusal: ("not_found" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed") | null;
+            refusal: ("not_found" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch") | null;
             /** Repository Path */
             repository_path: string;
             /**
@@ -10837,15 +11038,25 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
+            /** Enrollment Generation */
+            enrollment_generation?: number | null;
             /**
              * Id
              * Format: uuid
              */
             id: string;
+            /**
+             * Model Auth Mode
+             * @default service
+             * @enum {string}
+             */
+            model_auth_mode?: "service" | "personal";
             /** Objective */
             objective: string | null;
             /** Objective Truncated */
             objective_truncated: boolean;
+            /** Owner Principal Id */
+            owner_principal_id?: string | null;
             pr: components["schemas"]["WorkItemPrOut"] | null;
             progress?: components["schemas"]["WorkItemProgressOut"] | null;
             publication: components["schemas"]["WorkItemPublicationOut"] | null;
@@ -10859,6 +11070,8 @@ export interface components {
              * @enum {string}
              */
             state: "queued" | "waiting" | "running" | "cancellation_requested" | "cancelled" | "expired" | "failed" | "awaiting_approval" | "publishing" | "published" | "completed_unpublished";
+            /** Tenant Id */
+            tenant_id?: string | null;
             /** Title */
             title?: string | null;
             tracker: components["schemas"]["WorkItemTrackerOut"];
@@ -10925,18 +11138,30 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
+            /** Enrollment Generation */
+            enrollment_generation?: number | null;
             /** Execution Deadline */
             execution_deadline: string | null;
             /** Last Deferral Reason */
             last_deferral_reason: string | null;
             /** Last Start Failure Detail */
             last_start_failure_detail: string | null;
+            /**
+             * Model Auth Mode
+             * @default service
+             * @enum {string}
+             */
+            model_auth_mode?: "service" | "personal";
+            /** Owner Principal Id */
+            owner_principal_id?: string | null;
             /** Sequence */
             sequence: number;
             /** Started At */
             started_at: string | null;
             /** Status */
             status: string;
+            /** Tenant Id */
+            tenant_id?: string | null;
             /** Terminal At */
             terminal_at: string | null;
             /** Terminal Cause */
@@ -19276,6 +19501,80 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_personal_context_v1_internal_work_items__work_item_id__personal_context_get: {
+        parameters: {
+            query: {
+                tenant_id: string;
+                agent_id: string;
+                owner_principal_id: string;
+            };
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                work_item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalContextOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    revalidate_personal_context_v1_internal_work_items__work_item_id__personal_context_revalidate_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                work_item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RevalidationBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RevalidationOut"];
                 };
             };
             /** @description Validation Error */

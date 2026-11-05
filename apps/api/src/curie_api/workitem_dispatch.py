@@ -51,6 +51,14 @@ from .models import (
     FactoryBaseTransition,
     WorkItem,
 )
+from .personal_execution import (
+    ModelAuthMode,
+    OwnerContext,
+    OwnerRefusal,
+    OwnerRefusalCode,
+    existing_work_item_refusal,
+    new_work_item_owner,
+)
 from .threadkeys import (
     legacy_route_adapter_of,
     pre_identity_key_of,
@@ -107,6 +115,8 @@ RefusalCode = Literal[
     "factory_binding_changed",
     "factory_surface_mismatch",
     "factory_start_failed",
+    # Execution owner admission refusals (#5376).
+    OwnerRefusalCode,
 ]
 
 DispatchResult = WorkItemOutcome | WorkItemConflict
@@ -145,6 +155,12 @@ class Admission:
     # the WorkItem at admission and readmission. None for an admission no label
     # started (a revision, review feedback, the work-items API).
     trigger_label: str | None = None
+    # Who the execution runs as (#5376, ADR 0268). Only the internal worker
+    # admission route names an owner; tracker ingress passes the installation
+    # mode and never an owner. On an existing WorkItem these never change its
+    # owner tuple (``personal_execution``).
+    model_auth_mode: ModelAuthMode = "service"
+    owner: OwnerContext | None = None
 
 
 @dataclass(frozen=True)
@@ -351,6 +367,9 @@ async def _replay_existing(
             work_item_id=work_item.id,
             request_id=locked.id,
         )
+    refused = await existing_work_item_refusal(session, work_item, facts)
+    if refused is not None:
+        return await _refuse(session, refused.code, work_item_id=work_item.id, request_id=locked.id)
     if locked.objective is None:
         written = await _write_snapshot(session, locked.id, facts)
         if isinstance(written, DispatchConflict):
@@ -447,6 +466,9 @@ async def admit_revision(
         return await _refuse(session, "not_found")
     if not _work_item_matches(work_item, facts, resolved.adapter):
         return await _refuse(session, "identity_mismatch", work_item_id=work_item.id)
+    refused = await existing_work_item_refusal(session, work_item, facts)
+    if refused is not None:
+        return await _refuse(session, refused.code, work_item_id=work_item.id)
     now = await database_now(session)
     requested = await lifecycle.create_revision_request(
         session,
@@ -492,6 +514,9 @@ async def readmit(
         return await _admit_new(session, facts, resolved.adapter)
     if not _work_item_matches(work_item, facts, resolved.adapter):
         return await _refuse(session, "identity_mismatch", work_item_id=work_item.id)
+    refused = await existing_work_item_refusal(session, work_item, facts)
+    if refused is not None:
+        return await _refuse(session, refused.code, work_item_id=work_item.id)
     now = await database_now(session)
     readmitted = await lifecycle.readmit(
         session,
@@ -523,6 +548,24 @@ async def readmit(
 async def _admit_new(
     session: AsyncSession, facts: Any, adapter: str | None
 ) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
+    # The owner is settled before any row is written, in the transaction that
+    # inserts the WorkItem (#5376): a refusal leaves no WorkItem or request. An
+    # existing WorkItem stays locked so it keeps the tuple it is compared to.
+    existing = await session.scalar(
+        select(WorkItem)
+        .where(*lifecycle.for_tracker_issue(facts.issue))
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    owner = (
+        await existing_work_item_refusal(session, existing, facts)
+        if existing is not None
+        else await new_work_item_owner(session, facts)
+    )
+    if isinstance(owner, OwnerRefusal):
+        return await _refuse(
+            session, owner.code, work_item_id=existing.id if existing is not None else None
+        )
     created = await lifecycle.create_or_get_work_item(
         session,
         issue=facts.issue,
@@ -532,6 +575,7 @@ async def _admit_new(
         conversation_id=_facts_conversation(facts, adapter),
         base=getattr(facts, "base", None),
         trigger_label=facts.trigger_label,
+        owner=owner,
     )
     if isinstance(created, WorkItemConflict):
         return created
@@ -2200,6 +2244,18 @@ def work_item_view(row: WorkItemSnapshot) -> dict[str, Any]:
         "cancelled_at": row.cancelled_at,
         "version": row.version,
         "next_sequence": row.next_sequence,
+        **_owner_view(row),
+    }
+
+
+def _owner_view(row: WorkItemSnapshot | ExecutionRequestSnapshot) -> dict[str, Any]:
+    """The owner tuple (#5376): identifiers and a generation, never a credential."""
+
+    return {
+        "tenant_id": row.tenant_id,
+        "model_auth_mode": row.model_auth_mode,
+        "owner_principal_id": row.owner_principal_id,
+        "enrollment_generation": row.enrollment_generation,
     }
 
 
@@ -2216,4 +2272,5 @@ def request_snapshot_view(row: ExecutionRequestSnapshot) -> dict[str, Any]:
         "terminal_cause": row.terminal_cause,
         "termination_observation": row.termination_observation,
         "version": row.version,
+        **_owner_view(row),
     }

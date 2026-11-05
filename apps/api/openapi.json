@@ -870,11 +870,30 @@
             "title": "Kind",
             "type": "string"
           },
+          "model_auth_mode": {
+            "default": "service",
+            "enum": [
+              "service",
+              "personal"
+            ],
+            "title": "Model Auth Mode",
+            "type": "string"
+          },
           "objective": {
             "maxLength": 65536,
             "minLength": 1,
             "title": "Objective",
             "type": "string"
+          },
+          "owner": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OwnerContextIn"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "reply_conversation_id": {
             "minLength": 1,
@@ -8830,6 +8849,33 @@
         "title": "Owner",
         "type": "object"
       },
+      "OwnerContextIn": {
+        "description": "The verified owner a personal execution runs as (#5376, ADR 0268).\n\nAccepted only here, from the trusted worker: a principal of the agent's\ntenant and the enrollment generation it is bound to.",
+        "properties": {
+          "enrollment_generation": {
+            "minimum": 1.0,
+            "title": "Enrollment Generation",
+            "type": "integer"
+          },
+          "principal_id": {
+            "format": "uuid",
+            "title": "Principal Id",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "principal_id",
+          "enrollment_generation"
+        ],
+        "title": "OwnerContextIn",
+        "type": "object"
+      },
       "OwnerLostBody": {
         "properties": {
           "owner": {
@@ -8877,6 +8923,146 @@
           "next_cursor"
         ],
         "title": "Page",
+        "type": "object"
+      },
+      "PersonalContextEnrollmentOut": {
+        "description": "The owner's enrollment header: its generation, state and CAS version.",
+        "properties": {
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "generation",
+          "active",
+          "version"
+        ],
+        "title": "PersonalContextEnrollmentOut",
+        "type": "object"
+      },
+      "PersonalContextOut": {
+        "description": "A personal WorkItem's owner, bound generation and versions (#5376).\n\nToken free: identifiers, generations and versions only. ``enrollment`` is\nnull when the owner has no enrollment row.",
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "enrollment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PersonalContextEnrollmentOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "enrollment_generation": {
+            "title": "Enrollment Generation",
+            "type": "integer"
+          },
+          "model_auth_mode": {
+            "enum": [
+              "service",
+              "personal"
+            ],
+            "title": "Model Auth Mode",
+            "type": "string"
+          },
+          "owner_principal_id": {
+            "format": "uuid",
+            "title": "Owner Principal Id",
+            "type": "string"
+          },
+          "request": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PersonalContextRequestOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          },
+          "work_item_version": {
+            "title": "Work Item Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "agent_id",
+          "tenant_id",
+          "model_auth_mode",
+          "owner_principal_id",
+          "enrollment_generation",
+          "work_item_version",
+          "request",
+          "enrollment"
+        ],
+        "title": "PersonalContextOut",
+        "type": "object"
+      },
+      "PersonalContextRequestOut": {
+        "description": "The WorkItem's latest request and the generation it snapshotted.",
+        "properties": {
+          "enrollment_generation": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enrollment Generation"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "sequence": {
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "sequence",
+          "status",
+          "version",
+          "enrollment_generation"
+        ],
+        "title": "PersonalContextRequestOut",
         "type": "object"
       },
       "PhaseDeclaration": {
@@ -12807,6 +12993,103 @@
         "title": "ResolvedTarget",
         "type": "object"
       },
+      "RevalidationBody": {
+        "description": "The versions the caller read, compared and set in one transaction.",
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "expected_enrollment_version": {
+            "minimum": 1.0,
+            "title": "Expected Enrollment Version",
+            "type": "integer"
+          },
+          "expected_request_version": {
+            "minimum": 1.0,
+            "title": "Expected Request Version",
+            "type": "integer"
+          },
+          "expected_work_item_version": {
+            "minimum": 1.0,
+            "title": "Expected Work Item Version",
+            "type": "integer"
+          },
+          "owner_principal_id": {
+            "format": "uuid",
+            "title": "Owner Principal Id",
+            "type": "string"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "agent_id",
+          "owner_principal_id",
+          "request_id",
+          "expected_work_item_version",
+          "expected_request_version",
+          "expected_enrollment_version"
+        ],
+        "title": "RevalidationBody",
+        "type": "object"
+      },
+      "RevalidationOut": {
+        "description": "The generation the WorkItem is now bound to and the versions it moved to.",
+        "properties": {
+          "enrollment_generation": {
+            "title": "Enrollment Generation",
+            "type": "integer"
+          },
+          "enrollment_version": {
+            "title": "Enrollment Version",
+            "type": "integer"
+          },
+          "previous_generation": {
+            "title": "Previous Generation",
+            "type": "integer"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "request_version": {
+            "title": "Request Version",
+            "type": "integer"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          },
+          "work_item_version": {
+            "title": "Work Item Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "request_id",
+          "previous_generation",
+          "enrollment_generation",
+          "work_item_version",
+          "request_version",
+          "enrollment_version"
+        ],
+        "title": "RevalidationOut",
+        "type": "object"
+      },
       "ReviewReservationOut": {
         "properties": {
           "origin_key": {
@@ -13267,7 +13550,16 @@
                   "factory_binding_ambiguous",
                   "factory_binding_changed",
                   "factory_surface_mismatch",
-                  "factory_start_failed"
+                  "factory_start_failed",
+                  "personal_owner_required",
+                  "owner_context_unexpected",
+                  "owner_tenant_mismatch",
+                  "owner_tenant_inactive",
+                  "owner_principal_missing",
+                  "owner_principal_inactive",
+                  "enrollment_inactive",
+                  "enrollment_generation_mismatch",
+                  "owner_mismatch"
                 ],
                 "type": "string"
               },
@@ -15552,9 +15844,29 @@
             "title": "Created At",
             "type": "string"
           },
+          "enrollment_generation": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enrollment Generation"
+          },
           "id": {
             "format": "uuid",
             "title": "Id",
+            "type": "string"
+          },
+          "model_auth_mode": {
+            "default": "service",
+            "enum": [
+              "service",
+              "personal"
+            ],
+            "title": "Model Auth Mode",
             "type": "string"
           },
           "objective": {
@@ -15571,6 +15883,18 @@
           "objective_truncated": {
             "title": "Objective Truncated",
             "type": "boolean"
+          },
+          "owner_principal_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Principal Id"
           },
           "pr": {
             "anyOf": [
@@ -15639,6 +15963,18 @@
             ],
             "title": "State",
             "type": "string"
+          },
+          "tenant_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tenant Id"
           },
           "title": {
             "anyOf": [
@@ -15824,6 +16160,17 @@
             "title": "Created At",
             "type": "string"
           },
+          "enrollment_generation": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enrollment Generation"
+          },
           "execution_deadline": {
             "anyOf": [
               {
@@ -15858,6 +16205,27 @@
             ],
             "title": "Last Start Failure Detail"
           },
+          "model_auth_mode": {
+            "default": "service",
+            "enum": [
+              "service",
+              "personal"
+            ],
+            "title": "Model Auth Mode",
+            "type": "string"
+          },
+          "owner_principal_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Principal Id"
+          },
           "sequence": {
             "title": "Sequence",
             "type": "integer"
@@ -15877,6 +16245,18 @@
           "status": {
             "title": "Status",
             "type": "string"
+          },
+          "tenant_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tenant Id"
           },
           "terminal_at": {
             "anyOf": [
@@ -32124,6 +32504,166 @@
           }
         },
         "summary": "Cancel Work Item",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/{work_item_id}/personal-context": {
+      "get": {
+        "description": "The token-free facts a worker revalidates a personal WorkItem from (#5376).",
+        "operationId": "read_personal_context_v1_internal_work_items__work_item_id__personal_context_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "owner_principal_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Owner Principal Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalContextOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Personal Context",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/{work_item_id}/personal-context/revalidate": {
+      "post": {
+        "description": "Bind a personal WorkItem to its owner's current enrollment generation.\n\nCompare-and-set on the WorkItem, request and enrollment versions; a stale\nversion, another owner, an inactive enrollment, a live runtime or an\nunchanged generation is 409 with its code (#5376).",
+        "operationId": "revalidate_personal_context_v1_internal_work_items__work_item_id__personal_context_revalidate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevalidationBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevalidationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revalidate Personal Context",
         "tags": [
           "internal-work-items"
         ]

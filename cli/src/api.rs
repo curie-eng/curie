@@ -1374,6 +1374,14 @@ pub struct RemediationPolicyGeneration {
 pub struct WorkItemOutcome {
     pub id: String,
     pub agent_id: String,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub model_auth_mode: Option<String>,
+    #[serde(default)]
+    pub owner_principal_id: Option<String>,
+    #[serde(default)]
+    pub enrollment_generation: Option<i64>,
     pub tracker: WorkItemTracker,
     pub repository: WorkItemRepository,
     pub cancelled_at: Option<String>,
@@ -1458,6 +1466,14 @@ pub struct WorkItemCi {
 /// `WorkItemRequestOut`: one execution request of a work item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItemRequest {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub model_auth_mode: Option<String>,
+    #[serde(default)]
+    pub owner_principal_id: Option<String>,
+    #[serde(default)]
+    pub enrollment_generation: Option<i64>,
     pub sequence: u64,
     pub status: String,
     pub created_at: String,

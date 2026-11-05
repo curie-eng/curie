@@ -59,6 +59,7 @@ from .models import (
     ThreadPublicationLineage,
     WorkItem,
 )
+from .personal_execution import mode_of
 
 OBJECTIVE_LIMIT = 512
 _SHA = re.compile(r"[0-9a-fA-F]{7,64}")
@@ -351,6 +352,10 @@ def derive_outcome(
         correctness=WorkItemCorrectnessOut(),
         ci=None,
         requests=[_request_view(r) for r in ordered],
+        tenant_id=item.tenant_id,
+        model_auth_mode=mode_of(item.model_auth_mode),
+        owner_principal_id=item.owner_principal_id,
+        enrollment_generation=item.enrollment_generation,
     )
 
 
@@ -391,6 +396,10 @@ def _request_view(req: ExecutionRequest) -> WorkItemRequestOut:
         capacity_deferrals=req.capacity_deferrals,
         last_deferral_reason=req.last_deferral_reason,
         last_start_failure_detail=req.last_start_failure_detail,
+        tenant_id=req.tenant_id,
+        model_auth_mode=mode_of(req.model_auth_mode),
+        owner_principal_id=req.owner_principal_id,
+        enrollment_generation=req.enrollment_generation,
     )
 
 

@@ -809,6 +809,20 @@ class ThreadPublicationLineage(Base):
         )
 
 
+# The execution owner tuple shared by work_items and execution_requests (#5376,
+# ADR 0268). Migration 0148 carries a frozen copy. A service row names no owner
+# or generation; a personal row names its tenant, owner and a positive
+# generation. ``IS TRUE`` keeps an UNKNOWN from passing.
+MODEL_AUTH_MODE_CHECK = "model_auth_mode IN ('service', 'personal')"
+OWNER_TUPLE_CHECK = (
+    "((model_auth_mode = 'service' AND owner_principal_id IS NULL "
+    "AND enrollment_generation IS NULL) "
+    "OR (model_auth_mode = 'personal' AND tenant_id IS NOT NULL "
+    "AND owner_principal_id IS NOT NULL AND enrollment_generation IS NOT NULL "
+    "AND enrollment_generation >= 1)) IS TRUE"
+)
+
+
 class WorkItem(Base):
     """Durable execution identity for one tracker issue (ADR 0162, ADR 0197).
 
@@ -873,11 +887,39 @@ class WorkItem(Base):
             "base_source IS NULL OR base_source IN ('label', 'default')",
             name="work_items_base_source_ck",
         ),
+        # The execution owner tuple (#5376, migration 0148).
+        CheckConstraint(MODEL_AUTH_MODE_CHECK, name="work_items_model_auth_mode_ck"),
+        CheckConstraint(OWNER_TUPLE_CHECK, name="work_items_owner_tuple_ck"),
+        ForeignKeyConstraint(
+            ["tenant_id", "agent_id"],
+            [f"{SCHEMA}.agents.tenant_id", f"{SCHEMA}.agents.id"],
+            name="work_items_tenant_agent_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "owner_principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="work_items_tenant_owner_fkey",
+        ),
+        # Targets of the request snapshot's composite foreign keys.
+        UniqueConstraint("id", "model_auth_mode", name="work_items_id_model_auth_mode_key"),
+        UniqueConstraint("id", "tenant_id", name="work_items_id_tenant_id_key"),
+        UniqueConstraint(
+            "id", "tenant_id", "owner_principal_id", name="work_items_id_tenant_owner_key"
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
+    # The owner tuple, fixed when the WorkItem is created from validated
+    # admission facts (#5376, ADR 0268). Only the versioned revalidation moves
+    # ``enrollment_generation``; the owner never changes. ``tenant_id`` is the
+    # agent's tenant; it stays nullable until a contract revision.
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    model_auth_mode: Mapped[str] = mapped_column(Text, default="service", server_default="service")
+    owner_principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    enrollment_generation: Mapped[int | None] = mapped_column(BigInteger, default=None)
     tracker_kind: Mapped[str] = mapped_column(Text)
     tracker_host: Mapped[str] = mapped_column(Text)
     tracker_scope_id: Mapped[str] = mapped_column(Text)
@@ -946,10 +988,12 @@ class WorkItem(Base):
     )
 
     publication_lineage: Mapped[ThreadPublicationLineage | None] = relationship()
+    # Named explicitly: the snapshot's composite keys also reference work_items.
     execution_requests: Mapped[list[ExecutionRequest]] = relationship(
         back_populates="work_item",
         cascade="all, delete-orphan",
         passive_deletes=True,
+        foreign_keys="ExecutionRequest.work_item_id",
     )
 
     @property
@@ -1132,6 +1176,33 @@ class ExecutionRequest(Base):
             LAST_START_FAILURE_DETAIL_CHECK,
             name="execution_requests_last_start_failure_detail_ck",
         ),
+        # The owner snapshot (#5376, migration 0148). MATCH SIMPLE skips a
+        # composite key with a NULL member, so three keys bind it to its
+        # WorkItem: the mode (never NULL), the tenant, and the owner.
+        CheckConstraint(MODEL_AUTH_MODE_CHECK, name="execution_requests_model_auth_mode_ck"),
+        CheckConstraint(OWNER_TUPLE_CHECK, name="execution_requests_owner_tuple_ck"),
+        ForeignKeyConstraint(
+            ["work_item_id", "model_auth_mode"],
+            [f"{SCHEMA}.work_items.id", f"{SCHEMA}.work_items.model_auth_mode"],
+            name="execution_requests_work_item_mode_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["work_item_id", "tenant_id"],
+            [f"{SCHEMA}.work_items.id", f"{SCHEMA}.work_items.tenant_id"],
+            name="execution_requests_work_item_tenant_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["work_item_id", "tenant_id", "owner_principal_id"],
+            [
+                f"{SCHEMA}.work_items.id",
+                f"{SCHEMA}.work_items.tenant_id",
+                f"{SCHEMA}.work_items.owner_principal_id",
+            ],
+            name="execution_requests_work_item_owner_fkey",
+            ondelete="CASCADE",
+        ),
         UniqueConstraint(
             "work_item_id",
             "sequence",
@@ -1169,6 +1240,14 @@ class ExecutionRequest(Base):
     work_item_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
     )
+    # The WorkItem's owner tuple, copied at insertion from the locked WorkItem
+    # (``personal_execution.snapshot_columns``), never from admission facts or
+    # the newest author. Only revalidation rebinds a queued or waiting
+    # request's generation.
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    model_auth_mode: Mapped[str] = mapped_column(Text, default="service", server_default="service")
+    owner_principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    enrollment_generation: Mapped[int | None] = mapped_column(BigInteger, default=None)
     sequence: Mapped[int]
     status: Mapped[str] = mapped_column(default="waiting", server_default="waiting")
     wait_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -1252,7 +1331,9 @@ class ExecutionRequest(Base):
     reply_target_comment_id: Mapped[str | None] = mapped_column(Text, default=None)
     reply_target_url: Mapped[str | None] = mapped_column(Text, default=None)
 
-    work_item: Mapped[WorkItem] = relationship(back_populates="execution_requests")
+    work_item: Mapped[WorkItem] = relationship(
+        back_populates="execution_requests", foreign_keys=[work_item_id]
+    )
 
 
 def new_card_token() -> str:
@@ -3193,6 +3274,41 @@ class Principal(Base):
     )
     authorization_version: Mapped[int] = mapped_column(
         Integer, default=1, server_default="1"
+    )
+
+
+class PersonalClaudeEnrollment(Base):
+    """The token-free header of one principal's personal enrollment (#5376, ADR 0268).
+
+    One row per tenant principal. ``generation`` names the enrolled subscription
+    a personal WorkItem binds; ``version`` is the CAS counter its writers
+    compare. No Secret reference or token lives here; #5377 owns the
+    enrollment mutations and their custody.
+    """
+
+    __tablename__ = "personal_claude_enrollments"
+    __table_args__ = (
+        CheckConstraint("generation >= 1", name="personal_claude_enrollments_generation_ck"),
+        CheckConstraint("version >= 1", name="personal_claude_enrollments_version_ck"),
+        UniqueConstraint(
+            "tenant_id", "principal_id", name="personal_claude_enrollments_tenant_principal_key"
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="personal_claude_enrollments_principal_fkey",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    generation: Mapped[int] = mapped_column(BigInteger)
+    active: Mapped[bool] = mapped_column(default=True, server_default=text("true"))
+    version: Mapped[int] = mapped_column(BigInteger, default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
 

@@ -1498,7 +1498,11 @@ configuration loaded. No separate Helm upgrade is needed.
 
 Factory intake polls GitHub by default. It is off until `factory.enabled` is
 true (environment `FACTORY_ENABLED=true`). `factory.intake` (`FACTORY_INTAKE`)
-is `poll` or `webhook`, and `poll` is the default. The `factory:` block replaces
+is `poll` or `webhook`, and `poll` is the default. The API setting
+`FACTORY_MODEL_AUTH_MODE` (default `service`) selects the mode GitHub and
+tracker intake admit under. Intake never names an owner, so `personal` makes
+every new intake admission refuse with `personal_owner_required`; it is an
+environment setting only, with no chart value. The `factory:` block replaces
 the removed `api.githubFactory*` keys. For a v0.12.5 installation configured
 with `curie cluster factory`, use the
 [automatic retained migration](#automatic-migration-of-a-legacy-github-factory)
@@ -1913,6 +1917,21 @@ Factory execution waits in PostgreSQL rather than on the runs-stream pending
 list. Admission, acquire, start, heartbeat, finish, and termination are internal
 worker-token routes under `/v1/internal/work-items`. The API lifespan reconciler
 publishes execute and terminate wakes onto `curie:runs`.
+
+A personal WorkItem has two more worker-token routes:
+`GET /v1/internal/work-items/{id}/personal-context` reads its owner tuple, and
+`POST /v1/internal/work-items/{id}/personal-context/revalidate` moves the item,
+and its queued or waiting requests, to the owner's current enrollment
+generation. Requests that already ran keep the generation they ran under.
+Revalidation proceeds only once every request of the WorkItem that started has
+a worker-recorded runtime termination. A run that finished normally records
+none, so its WorkItem answers `runtime_live` until an explicit termination
+confirmation exists. On the read, a wrong tenant, agent or owner gets the same
+404 as an unknown id. On revalidation, a wrong tenant or agent gets that 404,
+while another owner, a stale version, an inactive enrollment, a live runtime or
+an unchanged generation returns 409 with its code (`owner_mismatch`,
+`stale_version`, `enrollment_inactive`, `runtime_live` or
+`generation_current`).
 
 Reconciler steps fail independently: each failure logs the step and traceback,
 and execute wakes continue despite an unrelated step failure. OpenTelemetry
@@ -2393,6 +2412,19 @@ request, a `state` and an `actionable_cause`. The states:
 - `published`: a pull request is open for the work.
 - `completed_unpublished`: the run completed with no publication, or its
   publication was denied, expired or failed.
+
+Each item and each of its requests carry four owner facts: `tenant_id`,
+`model_auth_mode`, `owner_principal_id` and `enrollment_generation`. A service
+item has `model_auth_mode` of `service` and null `owner_principal_id` and
+`enrollment_generation`. A personal item has `model_auth_mode` of `personal`
+with an owner principal and a generation. A row written by an older API during
+the schema upgrade window can also show a null `tenant_id`. The tenant, mode
+and owner are fixed at creation. A worker-token revalidation can move the
+item's generation together with that of its queued or waiting requests; a
+request that already ran keeps the generation it ran under. The fields name
+identifiers and a generation only, never a credential.
+`curie <tier> work-items --json` carries the same four fields,
+and the human detail view prints one `auth` line.
 
 The platform never asserts correctness: every item reports
 `correctness: {"asserted": false, "owner": "bundle"}`. Verification belongs

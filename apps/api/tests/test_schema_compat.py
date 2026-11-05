@@ -66,7 +66,8 @@ CONTRACT = "0041"
 # Factory base transition ORM reads require the 0144 transition table.
 # The 0145 join requires both the stable deadline backport (0140) and 0144.
 # The UI evidence reconciler reads the 0146 evidence tables.
-APP_SCHEMA_MIN = "0146"
+# WorkItem and request reads select the 0148 execution owner columns (#5376).
+APP_SCHEMA_MIN = "0148"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -171,6 +172,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0144",
             "0145",
             "0146",
+            "0148",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -205,8 +207,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0144",
             "0145",
             "0146",
+            "0148",
         }
-    assert current_revision() == "0146"
+    assert current_revision() == "0148"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -236,6 +239,16 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
         ("publication_ui_evidence_images", "sha256"),
         ("publication_lineage_ui_evidence", "ref_commit_sha"),
         ("publication_lineage_ui_evidence", "comment_revision"),
+        ("work_items", "tenant_id"),
+        ("work_items", "model_auth_mode"),
+        ("work_items", "owner_principal_id"),
+        ("work_items", "enrollment_generation"),
+        ("execution_requests", "tenant_id"),
+        ("execution_requests", "model_auth_mode"),
+        ("execution_requests", "owner_principal_id"),
+        ("execution_requests", "enrollment_generation"),
+        ("personal_claude_enrollments", "generation"),
+        ("personal_claude_enrollments", "version"),
     } <= columns
 
 
@@ -304,15 +317,17 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # can serve an older database.
     # Factory base transition reads require the 0144 table, and the 0145 join
     # also requires the stable deadline backport (0140). The UI evidence
-    # reconciler reads the 0146 tables.
-    for revision in sorted(known - {"0146"}):
+    # reconciler reads the 0146 tables, and WorkItem reads select the 0148
+    # execution owner columns (#5376).
+    for revision in sorted(known - {"0148"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
     assert can_serve("0143", window, known) is False
     assert can_serve("0144", window, known) is False
     assert can_serve("0145", window, known) is False
-    assert can_serve("0146", window, known) is True
+    assert can_serve("0146", window, known) is False
+    assert can_serve("0148", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

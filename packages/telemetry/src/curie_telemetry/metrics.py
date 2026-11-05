@@ -495,6 +495,9 @@ _HTTP_OPERATIONS = [
     "/v1/internal/work-items/admissions",
     "/v1/internal/work-items/requests/{request_id}",
     "/v1/internal/work-items/{work_item_id}/cancel",
+    # Personal execution owner context and revalidation (#5376).
+    "/v1/internal/work-items/{work_item_id}/personal-context",
+    "/v1/internal/work-items/{work_item_id}/personal-context/revalidate",
     "/v1/internal/work-items/requests/{request_id}/acquire",
     "/v1/internal/work-items/requests/{request_id}/defer",
     "/v1/internal/work-items/requests/{request_id}/start",

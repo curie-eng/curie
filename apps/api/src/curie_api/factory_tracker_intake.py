@@ -750,6 +750,8 @@ async def _admission(
         requester=f"{tracker.kind}:{notice.actor.id}:{notice.actor.login}",
         request_id=notice_request_id(notice),
         trigger_label=label,
+        # The installation's mode and never an owner: the actor is not one (#5376).
+        model_auth_mode=scope.settings.factory_model_auth_mode,
     )
 
 
@@ -786,6 +788,7 @@ async def _mention(
         ),
         requester=f"{tracker.kind}:{notice.actor.id}:{notice.actor.login}",
         request_id=notice_request_id(notice),
+        model_auth_mode=scope.settings.factory_model_auth_mode,
     )
     async with AsyncSession(
         bind=await session.connection(),
