@@ -45,6 +45,32 @@ _READ_SECONDS = 8.0
 _OBSERVE_ATTEMPTS = 3
 
 
+def _selection_fingerprint(choice: factory_base.BaseChoice | factory_base.BaseRefusal) -> str:
+    intent = (
+        f"refusal\0{choice.code}\0{choice.reason}"
+        if isinstance(choice, factory_base.BaseRefusal)
+        else f"{choice.branch}\0{choice.source}"
+    )
+    return hashlib.sha256(intent.encode()).hexdigest()
+
+
+async def initialize_base_selection(
+    session: AsyncSession,
+    *,
+    item_id: uuid.UUID,
+    labels: set[str],
+    default_branch: str | None,
+    settings: Settings,
+) -> None:
+    """Initialize the observation fence before the admission transaction is visible."""
+    item = await session.get(WorkItem, item_id)
+    assert item is not None
+    policy = work_item_policy(forges_registry(settings), item.tracker_issue, item.repository)
+    choice = factory_base.choose_base(labels, factory_base.bases_for(policy), default_branch)
+    item.base_selection_fingerprint = _selection_fingerprint(choice)
+    await session.commit()
+
+
 def transition_blocks() -> Any:
     return or_(
         FactoryBaseTransition.phase.in_(_UNFINISHED),
@@ -587,12 +613,7 @@ async def _observe_base_labels_once(
         and item.cancelled_at is None
         and (item.trigger_label is None or item.trigger_label in labels)
     ):
-        intent = (
-            f"refusal\0{choice.code}\0{choice.reason}"
-            if isinstance(choice, factory_base.BaseRefusal)
-            else f"{choice.branch}\0{choice.source}"
-        )
-        fingerprint = hashlib.sha256(intent.encode()).hexdigest()
+        fingerprint = _selection_fingerprint(choice)
         if item.base_selection_fingerprint != fingerprint:
             item.base_selection_fingerprint = fingerprint
             item.version += 1

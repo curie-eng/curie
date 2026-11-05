@@ -681,6 +681,16 @@ async def _admit(
         expire_on_commit=False,
     ) as dispatch:
         result = await workitem_dispatch.readmit(dispatch, admission)
+        if existing is None and isinstance(result, lifecycle.WorkItemOutcome):
+            from .factory_base_reconcile import initialize_base_selection
+
+            await initialize_base_selection(
+                dispatch,
+                item_id=result.work_item.id,
+                labels=set(ticket.labels),
+                default_branch=repository.default_branch,
+                settings=scope.settings,
+            )
     _log_dispatch(scope, result)
 
 
