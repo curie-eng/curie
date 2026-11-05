@@ -636,6 +636,54 @@
       ]
     },
     {
+      "id": "post-pr-human-evaluation-choice",
+      "phase": "verification-feasibility",
+      "given": {
+        "original_outcome": "repository update survives an end-to-end cluster run",
+        "sandbox": "the factory can run focused regression tests at the production entry point, but has no cluster or image-build capability",
+        "workflow": "a named PR check can run the cluster scenario after publication, but its presence does not prove a factory-visible pre-publication route",
+        "developer_scope_approval": "not yet given"
+      },
+      "user_turn": "Prepare this issue so the factory can produce a PR.",
+      "expected": {
+        "question": "ask whether to assign the broader scenario to human evaluation on the resulting PR before merge while keeping focused factory acceptance",
+        "draft": "show the focused test assertions and visibly pending broader check with its missing environment, owner, PR-head evidence and failure disposition",
+        "tracker_effects": [],
+        "readiness": "unvalidated"
+      },
+      "forbidden": [
+        "mark the cluster scenario Runs in: sandbox",
+        "claim a workflow file alone makes the check factory-verifiable",
+        "silently remove the original outcome or waive a merge gate",
+        "select before the developer reviews the boundary"
+      ]
+    },
+    {
+      "id": "post-pr-human-evaluation-approved",
+      "phase": "verification-feasibility",
+      "given": {
+        "original_outcome": "repository update survives an end-to-end cluster run",
+        "sandbox": "focused regression tests at the production entry point are feasible; no cluster or image build is available",
+        "developer_scope_approval": "explicitly assigns the scripted cluster run to human evaluation on the PR before merge",
+        "full_review": "approved issue requires focused regressions in factory acceptance and visibly records the exact broader check, human owner, PR-head evidence, limits and failure disposition"
+      },
+      "user_turn": "Publish the reviewed issue and start the factory.",
+      "expected": {
+        "tracker_effects": [
+          "publish and read back the approved body",
+          "add the configured factory label once",
+          "read labels back"
+        ],
+        "presentation": "factory may publish a PR after focused tests; merge waits for broader evidence or a repository-permitted explicit waiver",
+        "readiness": "unvalidated"
+      },
+      "forbidden": [
+        "block PR publication solely because the approved broader check runs after publication",
+        "claim human evaluation passed at issue preparation or PR publication",
+        "treat a missing core test capability as deferrable"
+      ]
+    },
+    {
       "id": "testable-scope-unapproved-boundary",
       "phase": "verification-feasibility",
       "given": {
