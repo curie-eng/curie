@@ -3593,14 +3593,36 @@ def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
         step["name"]: step for step in negative_job["steps"] if isinstance(step.get("name"), str)
     }
     assert len(negative_steps) == sum("name" in step for step in negative_job["steps"])
+    disk_name = "Free disk for the disposable released upgrade cluster"
     for shared in (
         "Install Helm",
         "Install Calico so NetworkPolicy is enforced",
         "Download and verify the exact public v0.8.2 chart",
         "Write the legacy retained values fixture",
         "Write the managed attester verifier",
+        disk_name,
     ):
         assert negative_steps[shared] == named_steps[shared], shared
+    matrix_disk = next(
+        step["run"]
+        for step in jobs["e2e-cluster-upgrade-matrix"]["steps"]
+        if step.get("name") == "Free disk for the disposable upgrade matrix cluster"
+    )
+    assert named_steps[disk_name]["run"] == matrix_disk
+    assert "if" not in named_steps[disk_name]
+    for label, owner in (
+        ("e2e-released-upgrade", job),
+        ("e2e-released-upgrade-negative", negative_job),
+    ):
+        names = [step.get("name") for step in owner["steps"]]
+        disk_at = names.index(disk_name)
+        image_loads = [
+            index
+            for index, name in enumerate(names)
+            if isinstance(name, str) and name.startswith("Load ") and "image" in name
+        ]
+        assert image_loads, label
+        assert disk_at < min(image_loads), label
     negative_load = negative_steps["Load the worker image built by the ci-images job"]
     assert negative_load["uses"] == "./.github/actions/load-ci-images"
     assert negative_load["with"]["images"] == "worker"
