@@ -1879,3 +1879,171 @@ def test_bundle_accepts_a_route_caller_declared_in_the_manifest(tmp_path: Path) 
     )
     result = validate_bundle(str(root))
     assert result.valid, [e.code for e in result.errors]
+
+
+# --------------------------------------------------------------------------- #
+# `scratch`: a bounded writable volume for the hosted server container (#5415).
+# --------------------------------------------------------------------------- #
+_SCRATCH_SIZES = _vector_file("connector-scratch-size.json")["cases"]
+
+
+def _scratch(scratch: object, **extra: object) -> dict:
+    return {"connectors": {"files": {"image": "x:1", "scratch": scratch, **extra}}}
+
+
+def test_scratch_is_absent_by_default() -> None:
+    parsed, errors = validate_connectors({"connectors": {"files": {"image": "x:1"}}})
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["files"].scratch is None
+
+
+def test_a_hosted_connector_may_declare_scratch() -> None:
+    parsed, errors = validate_connectors(_scratch({"path": "/scratch", "size_limit": "2Gi"}))
+    assert errors == []
+    assert parsed is not None
+    scratch = parsed.connectors["files"].scratch
+    assert scratch is not None
+    assert (scratch.path, scratch.size_limit) == ("/scratch", "2Gi")
+
+
+@pytest.mark.parametrize("case", _SCRATCH_SIZES, ids=lambda case: repr(case["size_limit"]))
+def test_scratch_size_vectors(case: dict) -> None:
+    codes = _codes(_scratch({"path": "/scratch", "size_limit": case["size_limit"]}))
+    if case["bytes"] is None:
+        assert codes == ["connectors.bad_scratch_size"]
+    else:
+        assert codes == []
+
+
+def test_the_scratch_size_vector_covers_both_bounds() -> None:
+    accepted = {case["bytes"] for case in _SCRATCH_SIZES if case["bytes"] is not None}
+    assert min(accepted) == 2**20
+    assert max(accepted) == 64 * 2**30
+    refused = [case for case in _SCRATCH_SIZES if case["bytes"] is None]
+    assert {"1048575", "68719476737"} <= {case["size_limit"] for case in refused}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/scratch",
+        "/tmp",
+        "/var/spool/uploads",
+        "/data/scratch-1",
+        "/home/app/.cache",
+    ],
+)
+def test_a_scratch_path_may_be_any_dedicated_absolute_directory(path: str) -> None:
+    assert _codes(_scratch({"path": path, "size_limit": "1Gi"})) == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "",
+        "/",
+        "scratch",
+        "./scratch",
+        "/scratch/",
+        "//scratch",
+        "/scratch//spool",
+        "/scratch/./spool",
+        "/scratch/../etc",
+        "/scr atch",
+        "/scratch\n",
+        "/scr~atch",
+        "/scrätch",
+        "/etc",
+        "/etc/app",
+        "/usr/local/scratch",
+        "/proc",
+        "/sys/fs",
+        "/dev/shm",
+        "/run/app",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/boot",
+    ],
+)
+def test_a_malformed_or_system_scratch_path_is_refused(path: str) -> None:
+    assert _codes(_scratch({"path": path, "size_limit": "1Gi"})) == [
+        "connectors.bad_scratch_path"
+    ]
+
+
+@pytest.mark.parametrize("path", ["/etcetera", "/devices", "/runtime", "/library"])
+def test_a_scratch_path_that_only_shares_a_prefix_with_a_system_directory_is_fine(
+    path: str,
+) -> None:
+    assert _codes(_scratch({"path": path, "size_limit": "1Gi"})) == []
+
+
+@pytest.mark.parametrize(
+    ("scratch_path", "secret_path"),
+    [
+        ("/secrets", "/secrets"),
+        ("/data", "/data/token"),
+        ("/data/token/spool", "/data/token"),
+    ],
+)
+def test_scratch_may_not_overlap_a_secret_file(scratch_path: str, secret_path: str) -> None:
+    assert _codes(
+        _scratch(
+            {"path": scratch_path, "size_limit": "1Gi"},
+            secret_files={"FILES_TOKEN": secret_path},
+        )
+    ) == ["connectors.scratch_overlaps_secret_file"]
+
+
+def test_scratch_beside_a_secret_file_is_fine() -> None:
+    assert (
+        _codes(
+            _scratch(
+                {"path": "/scratch", "size_limit": "1Gi"},
+                secret_files={"FILES_TOKEN": "/secrets/token"},
+            )
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "scratch",
+    [
+        {"path": "/scratch"},
+        {"size_limit": "1Gi"},
+        {"path": "/scratch", "size_limit": "1Gi", "medium": "Memory"},
+        {"path": "/scratch", "size_limit": 1073741824},
+        ["/scratch", "1Gi"],
+        "/scratch",
+    ],
+)
+def test_a_scratch_with_a_missing_unknown_or_mistyped_key_is_refused(scratch: object) -> None:
+    assert _codes(_scratch(scratch)) == ["connectors.invalid"]
+
+
+def test_scratch_on_a_remote_connector_is_refused() -> None:
+    assert _codes(
+        {
+            "connectors": {
+                "r": {
+                    "url": "https://mcp.example.com/mcp",
+                    "scratch": {"path": "/scratch", "size_limit": "1Gi"},
+                }
+            }
+        }
+    ) == ["connectors.remote_has_scratch"]
+
+
+def test_bundle_surfaces_a_refused_scratch(tmp_path: Path) -> None:
+    root = _bundle(
+        tmp_path,
+        "connectors:\n  files:\n    image: x:1\n    scratch:\n      path: /etc\n"
+        "      size_limit: 1Gi\n",
+    )
+    result = validate_bundle(str(root))
+    assert not result.valid
+    assert [e.code for e in result.errors] == ["connectors.bad_scratch_path"]

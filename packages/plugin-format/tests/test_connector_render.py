@@ -2456,3 +2456,73 @@ def test_declared_routes_reach_the_proxy_env_without_their_callers() -> None:
 # @spec ADR-0240 d3
 def test_without_declared_routes_the_proxy_env_does_not_name_any() -> None:
     assert "CURIE_CALLER_PROXY_ROUTES" not in _proxy_env(_proxied())
+
+
+# --------------------------------------------------------------------------- #
+# `scratch`: a bounded writable volume for the server container (#5415).
+# --------------------------------------------------------------------------- #
+def _pod(spec: ConnectorSpec) -> dict:
+    return _proxied(spec)["Deployment"]["spec"]["template"]["spec"]
+
+
+def test_scratch_renders_a_bounded_disk_backed_empty_dir() -> None:
+    spec = _tuned(scratch={"path": "/scratch", "size_limit": "2Gi"})
+    pod = _pod(spec)
+    assert pod["volumes"] == [{"name": "scratch", "emptyDir": {"sizeLimit": "2Gi"}}]
+    # Disk, never memory: a memory-backed volume counts against the limit.
+    assert "medium" not in pod["volumes"][0]["emptyDir"]
+    server = _containers(_proxied(spec))["server"]
+    assert server["volumeMounts"] == [{"name": "scratch", "mountPath": "/scratch"}]
+    # The mount is writable and the root filesystem is not.
+    assert server["securityContext"]["readOnlyRootFilesystem"] is True
+
+
+def test_scratch_leaves_the_proxy_and_the_pod_security_context_alone() -> None:
+    spec = _tuned(scratch={"path": "/scratch", "size_limit": "2Gi"})
+    tuned = _proxied(spec)
+    baseline = _proxied()
+    assert _containers(tuned)[r.CALLER_PROXY_CONTAINER] == (
+        _containers(baseline)[r.CALLER_PROXY_CONTAINER]
+    )
+    pod = tuned["Deployment"]["spec"]["template"]["spec"]
+    base_pod = baseline["Deployment"]["spec"]["template"]["spec"]
+    # An emptyDir is world-writable, so no fsGroup is needed to write it.
+    assert pod["securityContext"] == base_pod["securityContext"]
+    assert "fsGroup" not in pod["securityContext"]
+
+
+def test_scratch_sits_beside_secret_files() -> None:
+    spec = _tuned(
+        secret_files={"FILES_TOKEN": "/secrets/token"},
+        scratch={"path": "/scratch", "size_limit": "1Gi"},
+    )
+    pod = _pod(spec)
+    assert [v["name"] for v in pod["volumes"]] == ["secret-file-0", "scratch"]
+    server = _containers(_proxied(spec))["server"]
+    mounts = {m["name"]: m for m in server["volumeMounts"]}
+    assert mounts["secret-file-0"]["readOnly"] is True
+    assert mounts["scratch"] == {"name": "scratch", "mountPath": "/scratch"}
+    assert pod["securityContext"]["fsGroup"] == 65532
+
+
+def test_scratch_moves_nothing_but_the_server_mount_and_the_pod_volume() -> None:
+    tuned = _proxied(_tuned(scratch={"path": "/scratch", "size_limit": "2Gi"}))
+    baseline = _proxied()
+    for key in ("Service", "Service/direct", "NetworkPolicy/Egress", "NetworkPolicy/Ingress"):
+        assert tuned[key] == baseline[key], key
+    server = dict(_containers(tuned)["server"])
+    assert server.pop("volumeMounts") == [{"name": "scratch", "mountPath": "/scratch"}]
+    assert server == _containers(baseline)["server"]
+    pod = dict(tuned["Deployment"]["spec"]["template"]["spec"])
+    base_pod = dict(baseline["Deployment"]["spec"]["template"]["spec"])
+    pod.pop("volumes")
+    pod.pop("containers")
+    base_pod.pop("containers")
+    assert pod == base_pod
+
+
+def test_an_unset_scratch_renders_the_same_bytes() -> None:
+    cases = json.loads(_BASELINE.read_text(encoding="utf-8"))["cases"]
+    for case in cases:
+        explicit = ConnectorSpec.model_validate({**case["spec"], "scratch": None})
+        assert _baseline_render_digest(explicit, case["connector"]) == case["sha256"], case["name"]
