@@ -55,6 +55,7 @@ from .personal_execution import (
     ModelAuthMode,
     OwnerContext,
     OwnerRefusal,
+    OwnerRefusalCode,
     existing_work_item_refusal,
     new_work_item_owner,
 )
@@ -114,16 +115,8 @@ RefusalCode = Literal[
     "factory_binding_changed",
     "factory_surface_mismatch",
     "factory_start_failed",
-    # Execution owner admission refusals (#5376, personal_execution).
-    "personal_owner_required",
-    "owner_context_unexpected",
-    "owner_tenant_mismatch",
-    "owner_tenant_inactive",
-    "owner_principal_missing",
-    "owner_principal_inactive",
-    "enrollment_inactive",
-    "enrollment_generation_mismatch",
-    "owner_mismatch",
+    # Execution owner admission refusals (#5376).
+    OwnerRefusalCode,
 ]
 
 DispatchResult = WorkItemOutcome | WorkItemConflict

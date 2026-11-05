@@ -42,6 +42,7 @@ from ..models import (
 )
 from ..personal_execution import (
     ModelAuthMode,
+    OwnerMismatchCode,
     OwnerTuple,
     assert_no_owner_columns,
     compare_owner,
@@ -79,8 +80,7 @@ ConflictCode = Literal[
     "publication_pending",
     "termination_observation_required",
     # An explicit personal owner that differs from the WorkItem it raced to (#5376).
-    "owner_mismatch",
-    "enrollment_generation_mismatch",
+    OwnerMismatchCode,
 ]
 
 _ACTIVE_STATUSES = ("waiting", "running", "cancellation_requested")
