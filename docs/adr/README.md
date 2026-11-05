@@ -288,4 +288,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0266 | [Email receivers share a trusted sender domain under one namespace](0266-email-receivers-share-a-trusted-sender-domain-under-one-namespace.md) | Accepted |
 | 0267 | [An email reply answers an approval under the HTTP approver role](0267-an-email-reply-answers-an-approval-under-the-http-approver-role.md) | Accepted |
 | 0268 | [Personal subscription execution and its acceptance contract](0268-personal-subscription-execution-and-acceptance-contract.md) | Accepted |
+| 0269 | [Factory failure retries share a bounded fresh request allowance](0269-factory-failure-retries-share-a-bounded-fresh-request-allowance.md) | Accepted |
 <!-- END GENERATED: adr-index -->
