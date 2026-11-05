@@ -2619,6 +2619,16 @@ share it with a local dispatcher or another cluster install.
 For the `local`-target equivalent (`curie local comms --slack`), see
 [`cli/README.md`](../cli/README.md).
 
+### Factory Slack progress
+
+An agent opts in with `PATCH /agents/{agent_id}` and `{"factory_slack_channel": "C0EXAMPLE1"}` (`null` clears), described in the [Software Factory guide](software-factory.md#follow-a-runs-progress-in-slack). The channel must have exactly one Slack binding on that agent, whose app identity posts; otherwise the API answers 409 `factory_slack_channel_unbound`. Only runs live at or after the moment the channel was set are posted. Changing the channel keeps each existing WorkItem in its original thread while that channel keeps its binding; clearing it stops all posting.
+
+The worker's progress lane derives what is owed from existing run records on each pass and keeps it in a durable outbox (`factory_slack_threads` binds each WorkItem to one Slack root for its whole life, `factory_slack_posts` holds the owed posts). Two settings govern it: `CURIE_FACTORY_SLACK_PROGRESS_ENABLED` (default true) and `CURIE_FACTORY_SLACK_INTERVAL_S` (default 2 seconds). With the switch off a worker posts nothing; a worker with it on later still finds and posts what is owed.
+
+Delivery is at least once and ordered per WorkItem: the root first, then each post only after every earlier one. A rejected send, including one for an identity whose token this worker lacks, stays owed and retries with backoff; only an invalid target fails permanently. A worker that stops mid-send posts that message again after a restart, and a worker restarted after a long outage posts everything owed since. A phase report that commits late is still posted when a later pass finds it, so it can land out of order.
+
+Steering a run from its Slack thread is not available yet: a mention of the app in a run thread is ordinary chat.
+
 ### Connecting email
 
 There is no `curie cluster comms --email` yet, so email is wired with a private

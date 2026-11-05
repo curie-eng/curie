@@ -617,6 +617,10 @@ class AgentUpdate(BaseModel):
     publication_policy: Literal["approve", "auto"] | None = None
     publication_draft: bool | None = None
     publication_branch_prefix: str | None = None
+    # The Slack channel factory runs post progress to (#5414). Same three-way
+    # semantics as `reviewer_model`: omitted is unchanged, explicit null stops
+    # posting. A channel needs exactly one Slack binding of this agent there.
+    factory_slack_channel: Annotated[str, Field(pattern=r"^[CG][A-Z0-9]{6,}$")] | None = None
 
     _check_reviewer_model = field_validator("reviewer_model")(
         nullable_override_validator("reviewer_model", "a reviewer model id like 'claude-opus-5-5'")
@@ -683,6 +687,8 @@ class AgentOut(BaseModel):
     publication_policy_version: int = 1
     publication_draft: bool = False
     publication_branch_prefix: str | None = None
+    # Null means factory runs post no Slack progress (#5414).
+    factory_slack_channel: str | None = None
     created_at: datetime
 
     @field_validator("secrets", mode="before")

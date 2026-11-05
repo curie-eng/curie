@@ -126,6 +126,10 @@
         {
           "field": "created_at",
           "why": "No CLI verb prints an agent's creation timestamp; the deploy summary and lifecycle verbs render id/name/channel only."
+        },
+        {
+          "field": "factory_slack_channel",
+          "why": "No CLI verb reads an agent's factory Slack progress channel; it is set through the agent API PATCH, so no agent response consumer reads it."
         }
       ]
     },
@@ -617,6 +621,10 @@
       "struct": "AgentUpdate",
       "schema": "AgentUpdate",
       "omissions": [
+        {
+          "field": "factory_slack_channel",
+          "why": "The factory Slack progress channel is set through the agent API PATCH directly; no CLI verb sends it."
+        },
         {
           "field": "deploy_notifications",
           "why": "No CLI verb toggles deploy notices; the opt-in is set through the agent API directly, so a CLI PATCH never carries it."

@@ -127,6 +127,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_CONSUMER_HEARTBEAT_TTL_MS",
         "CURIE_CONSUMER_NAME",
         "CURIE_DEAD_LETTER_MAXLEN",
+        # #5414: the factory Slack progress lane's switch and pass interval,
+        # read by WorkerConfig at worker startup and consumed only by
+        # run._build_factory_slack_progress. Never injected into a sandbox.
+        "CURIE_FACTORY_SLACK_PROGRESS_ENABLED",
+        "CURIE_FACTORY_SLACK_INTERVAL_S",
         # Reclaim scan policy for the WORKER's own maintenance tick (#2433):
         # how idle a pending row whose delivery lease has expired must be before
         # the lease-expiry pass may transfer it. Read from the worker's env by
