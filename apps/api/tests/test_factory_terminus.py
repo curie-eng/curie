@@ -404,9 +404,8 @@ def test_admission_unavailable_deferral_preserves_deadline_and_neutral_surfaces(
     )[0]["wait_deadline"]
 
     deferrals = ([("capacity", True)] if capacity_first else []) + [
-        ("admission_unavailable", False),
-        ("admission_unavailable", False),
-    ]
+        ("admission_unavailable", False)
+    ] * 6
     for generation, (reason, capacity) in enumerate(deferrals, start=1):
 
         async def acquire_waiting(current_generation: int) -> Any:
