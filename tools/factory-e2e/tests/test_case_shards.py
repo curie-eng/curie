@@ -29,7 +29,8 @@ def test_longest_first_unknown_median_and_node_id_ties() -> None:
     nodes = ["small", "unknown", "equal-b", "large", "equal-a"]
     weights = {"small": 1, "large": 9, "equal-a": 5, "equal-b": 5, "stale": 5}
     assert assign_case_shards(nodes, 2, weights) == [
-        ["unknown", "large"], ["small", "equal-b", "equal-a"]
+        ["unknown", "large"],
+        ["small", "equal-b", "equal-a"],
     ]
 
 
@@ -45,12 +46,11 @@ def test_colocated_cases_are_assigned_by_summed_weight() -> None:
         for phase in ("held", "restarted")
     ] + [f"{module}::test_two_worker_ci_preserves_successor_identity_and_rejects_stale_predecessor"]
     weights = {**dict.fromkeys(group, 2), "heavy": 9, "light": 8, "stale": 1000}
-    assert assign_case_shards(["heavy", *group, "light"], 2, weights) == [
-        group, ["heavy", "light"]
-    ]
+    assert assign_case_shards(["heavy", *group, "light"], 2, weights) == [group, ["heavy", "light"]]
     partial = group[1:]
     assert assign_case_shards(["heavy", *partial, "light"], 2, weights) == [
-        partial, ["heavy", "light"]
+        partial,
+        ["heavy", "light"],
     ]
 
 
@@ -96,8 +96,12 @@ def test_rebuild_command_sums_phases_and_replaces_older_measurements(tmp_path: P
     )
     second.write_text("40.00s call tools/tests/test_example.py::test_b\n")
     output = tmp_path / "durations.json"
-    command = [sys.executable, str(Path(__file__).parents[1] / "rebuild_case_durations.py"),
-               "--output", str(output)]
+    command = [
+        sys.executable,
+        str(Path(__file__).parents[1] / "rebuild_case_durations.py"),
+        "--output",
+        str(output),
+    ]
     subprocess.run([*command, str(first), str(second)], check=True)
     assert json.loads(output.read_text()) == {
         "tools/tests/test_example.py::test_a[x]": 31,
