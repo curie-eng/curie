@@ -302,7 +302,6 @@ PY
 
 is_workload_selector() {
   case "$selector" in
-    charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh | \
     charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh | \
     charts/curie/ci/runtime/connector-secret-rotation-runtime.sh | \
     charts/curie/ci/runtime/connector-apply-race-runtime.sh | \
