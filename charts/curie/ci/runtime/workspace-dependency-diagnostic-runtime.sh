@@ -153,14 +153,16 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+[[ "$(kc get deployment "$FULLNAME-worker" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="CURIE_CLAIM_TIMEOUT_SECONDS")].value}')" == 90 ]] \
+    || fail "worker claim timeout must retain its normal 90-second value"
+[[ "$(kc get deployment "$FULLNAME-worker" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="CURIE_WORKSPACE_TOTAL_TIMEOUT_SECONDS")].value}')" == 150 ]] \
+    || fail "worker workspace total timeout must retain its normal 150-second value"
 for component in api worker; do
     image_variable="CURIE_SCENARIO_${component^^}_IMAGE"
     kc rollout status "deployment/$FULLNAME-$component" --timeout=300s >/dev/null
     [[ "$(kc get "deployment/$FULLNAME-$component" -o jsonpath='{.spec.template.spec.containers[0].image}')" == "${!image_variable}" ]] \
         || fail "the $component Deployment is not using the candidate image"
 done
-[[ "$(kc get deployment "$FULLNAME-worker" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="CURIE_CLAIM_TIMEOUT_SECONDS")].value}')" == 90 ]] \
-    || fail "worker claim timeout must retain its normal 90-second value"
 [[ "$(kc get deployment "$FULLNAME-worker" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="CURIE_WORKSPACE_ENABLED")].value}')" == true ]] \
     || fail "real workspace selection must be enabled"
 helm --kube-context "$CONTEXT" upgrade "$RELEASE" "$REPO_ROOT/charts/curie" -n "$NAMESPACE" --reuse-values \

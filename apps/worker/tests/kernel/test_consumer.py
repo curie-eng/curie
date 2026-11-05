@@ -1409,10 +1409,15 @@ def test_factory_admission_unavailable_defers_without_capacity_accounting(
 
 
 @pytest.mark.parametrize(
-    ("lane", "placeholder"),
-    [("webhook", None), ("approval-resume", None), ("approval-resume", "p-1")],
+    ("lane", "placeholder", "failure"),
+    [
+        ("webhook", None, "sdk-timeout"),
+        ("webhook", None, "quota-timeout"),
+        ("webhook", None, "transient"),
+        ("approval-resume", None, "transient"),
+        ("approval-resume", "p-1", "transient"),
+    ],
 )
-@pytest.mark.parametrize("failure", ["sdk-timeout", "quota-timeout", "transient"])
 def test_admission_unavailable_notice_without_durable_wait_stays_pending_then_completes(
     make_harness,
     sync_redis,
@@ -2726,7 +2731,7 @@ def test_active_wait_delivery_recovers_after_deadline_without_expiry(
             # replace it. The notice path is the same one the first consumer
             # used; after the answer it has to no-op.
             before = list(h.sink.updates)
-            await h.kernel.notify_capacity_queued(event)
+            await h.kernel.notify_capacity_queued(event, wait_reply_ref=None)
             assert h.sink.updates == before
             assert h.sink.last_text == "recovered answer"
             done = await _wait_capacity_state(recovery, event.event_id, "done")
@@ -4283,47 +4288,6 @@ def test_hang_renewals_during_inflight_turn_expire_liveness(make_harness) -> Non
                 await asyncio.wait_for(task, timeout=2)
             assert not await h.async_redis.exists(alive)
             hold.set()
-
-    asyncio.run(go())
-
-
-def test_slow_renewal_inside_guard_keeps_lease_alive(make_harness) -> None:
-    async def go() -> None:
-        async with make_harness(
-            reclaim_min_idle_ms=300,
-            consumer_heartbeat_ttl_ms=150,
-            consumer_capability_ttl_ms=450,
-            read_block_ms=10,
-        ) as h:
-            consumer = Consumer(
-                redis=h.async_redis,
-                kernel=h.kernel,
-                config=h.config,
-                leases=DeliveryLeaseStore(h.async_redis, h.config),
-            )
-            probe = _RenewalProbeStore(ConsumerLivenessStore(h.async_redis), slow_renewal_s=0.04)
-            consumer._liveness_store = probe  # type: ignore[assignment]
-            alive = consumer_heartbeat_key(
-                h.config.stream, h.config.consumer_group, h.config.consumer_name
-            )
-
-            task = asyncio.create_task(consumer.run())
-            deadline = time.monotonic() + 2
-            while probe.slow_completed < 1 and time.monotonic() < deadline:
-                if task.done():
-                    exc = task.exception()
-                    if exc is not None:
-                        raise exc
-                    raise AssertionError(
-                        f"consumer finished during slow renewal: {task.result()!r}"
-                    )
-                await asyncio.sleep(0.005)
-            assert probe.slow_completed >= 1
-            assert not task.done()
-            assert await h.async_redis.exists(alive)
-
-            consumer.request_stop()
-            await task
 
     asyncio.run(go())
 

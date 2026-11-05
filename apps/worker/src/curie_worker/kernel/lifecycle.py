@@ -499,7 +499,11 @@ async def _process_event(
         # the continuation: expired (#419) or resolved (#1084). Best-effort,
         # and gated on the resume event id so an ordinary turn pays nothing.
         if self._is_approval_resume(qevent.event_id):
-            qevent = await self._place_the_resumed_reply(qevent)
+            waiting = current_wait()
+            wait_record = await waiting[0].get(waiting[1]) if waiting is not None else None
+            qevent = await self._place_the_resumed_reply(
+                qevent, wait_reply_ref=wait_record.reply_ref if wait_record is not None else None
+            )
             with log.operation_span(
                 "curie.approval.resume",
                 kind=SpanKind.INTERNAL,

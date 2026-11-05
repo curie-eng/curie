@@ -496,23 +496,25 @@ async def _attempt_turn(
 
         async def capacity_refusal() -> failures.TurnOutcome:
             # Started factory continuations wait in the driving loop:
-            # their running request cannot use SQL defer (#4275). An
-            # interactive approval keeps its bounded retry policy (#3693).
-            if (
-                parsed_execute is not None
-                and parsed_execute.is_ci_fix
-                and self._run_for_event(qevent.event_id) is not None
-            ) or self._is_approval_resume(qevent.event_id):
+            # their running request cannot use SQL defer (#4275).
+            if self._run_for_event(qevent.event_id) is not None and (
+                (parsed_execute is not None and parsed_execute.is_ci_fix)
+                or self._is_approval_resume(qevent.event_id)
+            ):
                 release_order()
                 return failures.TurnOutcome(terminal_ok=False, classification="sandbox-capacity")
             return await capacity_response()
 
         if rejection is None:
+            if (
+                self._is_approval_resume(qevent.event_id)
+                and self._run_for_event(qevent.event_id) is not None
+            ):
+                return await capacity_refusal()
             release_order()
             if (
                 qevent.source is TurnSource.SLACK
                 and handle is not None
-                and not self._is_approval_resume(qevent.event_id)
                 and (parsed_execute is None or not parsed_execute.is_ci_fix)
             ):
                 raise CapacityWaitRequested() from None
@@ -622,7 +624,8 @@ async def _attempt_turn(
         # retryable); the classification and log identify the fault, and the
         # terminal diagnostic carries a redacted, bounded reason naming the stage.
         record_reclaimed_retry()
-        release_order()
+        if not isinstance(exc, WorkspaceDependencyUnavailable) or self._can_park(qevent):
+            release_order()
         self._log_workspace_start_failure(
             qevent,
             event.text,
@@ -1163,6 +1166,9 @@ async def _consume(
                 if termination is not None:
                     classification = "sandbox-terminated"
                     acc.error_message = failures._sandbox_termination_detail(termination)
+                    logger.warning(
+                        "sandbox terminated for event %s: %s", qevent.event_id, acc.error_message
+                    )
                     termination_carry = constants._SANDBOX_TERMINATION_CARRY.get()
                     if termination_carry is not None:
                         termination_carry.termination = termination
