@@ -73,7 +73,8 @@ it never resumes a failed request or selects a recovery checkpoint.**
 ### Failure disposition and authority
 
 1. Factory policy selects retry with backoff, wait for a verified condition,
-   publication-only recovery or terminal disposition. The platform enforces
+   publication-only recovery, read-only exact-head CI observation or terminal
+   disposition. The platform enforces
    the allowance, current authority, isolation and versioned transitions.
    Unknown causes and unproved conditions cannot default to retry-now.
 2. Preserve cancellation, issue deletion, newer-revision precedence, closed
@@ -96,16 +97,30 @@ it never resumes a failed request or selects a recovery checkpoint.**
    a retry. An unchanged limit that caused exhaustion does not grant a fresh
    execution merely because a successor would have a fresh deadline.
 5. Durable scheduling precedes terminal transcript expiry when authorized
-   continuation exists. Status shows waiting or publication recovery until
+   continuation exists. Status shows waiting, publication recovery or CI
+   observation until
    final disposition, then reports the cause and exhausted bound once. A
    historical failed request is never rewritten as successful.
+
+Read-only CI observation of an existing PR and its exact recorded head creates
+no ExecutionRequest, spends no successor slot and makes no model or publication
+call. It has a finite observation window, with 86400 seconds proposed as an
+author planning assumption, and never renews any request deadline. A late
+verified green result can record item-level observed completion while the
+failed request remains immutable. Cancellation, closure, foreign heads and
+unverified or stale checks cannot become success. Expiry reports unverified
+observation rather than successful implementation.
 
 ### Retained publication candidates
 
 A publication candidate is private data, not an approval or a recovery
 checkpoint. Retain its exact base, patch, digest and publication intent before
 expensive validation, through authorized recovery and for 86400 seconds after
-the owning request's final disposition. The 24-hour retention is the planning
+the owning request's final disposition. A bounded publication-recovery
+successor can take ownership under the WorkItem lock; retention then covers
+that recovery and its final disposition without rewriting the original
+request's final timestamp. Reads cannot renew retention or create a successor.
+The 24-hour retention is the planning
 recommendation the maintainer delegated to the author. Storage is bounded and
 collected independently of claim-owned objects and authority-bearing rows.
 
@@ -131,8 +146,10 @@ and #5146 are unchanged. Automatic successors never read those checkpoints.
 
 ### Exact amendment and delivery boundary
 
-This partially amends ADR 0157 D5 only to permit a separately admitted,
-bounded failure successor after a terminal request, and ADR 0206's Decision
+This partially amends ADR 0157 D5 to permit a separately admitted,
+bounded failure successor after a terminal request and finite read-only CI
+observation after failed settlement. Observation can update item-level result
+facts but leaves the terminal request unchanged. It amends ADR 0206's Decision
 and point 4 only to replace consecutive-owner-loss accounting with the shared
 allowance. Its teardown, fresh-sandbox, identity and cancellation guarantees
 remain. The rest of both ADRs stands.

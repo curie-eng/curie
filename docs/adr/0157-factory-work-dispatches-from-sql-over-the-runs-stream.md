@@ -6,9 +6,10 @@ Status: Accepted
 
 **Partially amended by [ADR 0269](0269-factory-failure-retries-share-a-bounded-fresh-request-allowance.md)**
 (back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
-D5 additionally permits separately admitted bounded failure successors. Owner
-loss uses the same two-successor allowance as other eligible failures rather
-than a separate consecutive-loss allowance. All other guarantees stand.
+D5 additionally permits separately admitted bounded failure successors and
+finite read-only CI observation that preserves the terminal request. Owner loss
+uses the same two-successor allowance as other eligible failures rather than a
+separate consecutive-loss allowance. All other guarantees stand.
 
 **Amended by [ADR 0206](0206-a-factory-run-lost-with-its-worker-is-re-admitted-as-a-new-attempt.md)**
 (back link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
