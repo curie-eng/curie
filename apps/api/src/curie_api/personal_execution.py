@@ -399,6 +399,23 @@ async def _conflict(session: AsyncSession, code: ContextConflictCode) -> Context
     return ContextConflict(code)
 
 
+def _runtime_proven_gone(row: ExecutionRequest) -> bool:
+    """Whether a started request carries worker-recorded termination evidence.
+
+    A normal finish, a failed finish and an expired heartbeat are not evidence:
+    worker sandbox cleanup after a finish is best effort, so the sandbox may
+    outlive it. An explicit epoch-bound termination confirmation for normally
+    finished runs is tracked in issue #5378.
+    """
+
+    return (
+        row.terminal_at is not None
+        and row.termination_observation is not None
+        and bool(row.termination_observation.strip())
+        and row.teardown_unconfirmed_at is None
+    )
+
+
 async def revalidate(
     session: AsyncSession,
     *,
@@ -416,10 +433,13 @@ async def revalidate(
     In one transaction, with the WorkItem, every request of it and the
     enrollment locked: the caller's WorkItem, request and enrollment versions
     must be current, the owner the WorkItem's, no runtime live (running,
-    stopping, holding an acquire lease, or force-settled without a teardown
-    receipt), and the enrollment active at a generation other than the bound
-    one. Success rebinds the WorkItem and its queued and waiting requests and
-    bumps their versions; terminal snapshots keep their generation. Commits.
+    stopping, holding an acquire lease, force-settled without a teardown
+    receipt, or started without a worker-recorded runtime termination), and
+    the enrollment active at a generation other than the bound one. It fails
+    closed: a terminal status alone, such as a normal finish, does not prove
+    the runtime stopped. Success rebinds the WorkItem and its queued and
+    waiting requests and bumps their versions; terminal snapshots keep their
+    generation. Commits.
     """
 
     work_item = await session.scalar(
@@ -455,6 +475,7 @@ async def revalidate(
             and row.acquire_expires_at is not None
             and row.acquire_expires_at > now
         )
+        or (row.started_at is not None and not _runtime_proven_gone(row))
         for row in requests
     ):
         return await _conflict(session, "runtime_live")

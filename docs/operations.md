@@ -1922,12 +1922,16 @@ A personal WorkItem has two more worker-token routes:
 `GET /v1/internal/work-items/{id}/personal-context` reads its owner tuple, and
 `POST /v1/internal/work-items/{id}/personal-context/revalidate` moves the item,
 and its queued or waiting requests, to the owner's current enrollment
-generation. Requests that already ran keep the generation they ran under. On
-the read, a wrong tenant, agent or owner gets the same 404 as an unknown id.
-On revalidation, a wrong tenant or agent gets that 404, while another owner,
-a stale version, an inactive enrollment, a live runtime or an unchanged
-generation returns 409 with its code (`owner_mismatch`, `stale_version`,
-`enrollment_inactive`, `runtime_live` or `generation_current`).
+generation. Requests that already ran keep the generation they ran under.
+Revalidation proceeds only once every request of the WorkItem that started has
+a worker-recorded runtime termination. A run that finished normally records
+none, so its WorkItem answers `runtime_live` until an explicit termination
+confirmation exists. On the read, a wrong tenant, agent or owner gets the same
+404 as an unknown id. On revalidation, a wrong tenant or agent gets that 404,
+while another owner, a stale version, an inactive enrollment, a live runtime or
+an unchanged generation returns 409 with its code (`owner_mismatch`,
+`stale_version`, `enrollment_inactive`, `runtime_live` or
+`generation_current`).
 
 Reconciler steps fail independently: each failure logs the step and traceback,
 and execute wakes continue despite an unrelated step failure. OpenTelemetry
