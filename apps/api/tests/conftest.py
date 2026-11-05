@@ -215,7 +215,7 @@ async def _truncate() -> None:
                     "curie.approvals, curie.deployments, "
                     "curie.agent_versions, curie.agents, "
                     "curie.console_sessions, curie.github_review_deliveries, "
-                    "curie.factory_poll_cursors CASCADE"
+                    "curie.factory_poll_cursors, curie.personal_claude_enrollments CASCADE"
                 )
             )
     finally:
