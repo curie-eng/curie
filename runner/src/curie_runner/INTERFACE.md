@@ -37,6 +37,17 @@ names. The keys are walked in declared order and the first that is both set and
 non-empty wins; a present-but-empty key is skipped, never wins. Unset or empty
 defaults to `CURIE_CREDENTIALS`, the single hardcoded name read before this.
 
+### `CURIE_MODEL_AUTH_MODE` (input)
+
+Selects who authenticates model work: exactly `service` or `personal`. Unset
+means `service`, which is every rule on this page. Any other present value,
+including the empty string, raises `InvalidAuthModeError` before the CLI starts.
+`personal` is checked right after the wire-protocol gate: `resolve_sdk_env`
+returns no override and maps nothing, so this seam's base URL override and
+`CURIE_CREDENTIALS` mapping never apply, and the owner's `CLAUDE_CODE_OAUTH_TOKEN`
+is the only grant. The personal policy lives in `personal_auth.py` (#5373,
+ADR 0268); see the runner README, "Personal subscription mode".
+
 ### `ANTHROPIC_API_KEY` (output, set by the runner)
 
 A NON-EMPTY no-op placeholder (`not-needed`, the `NO_OP_API_KEY` constant).

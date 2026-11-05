@@ -452,6 +452,54 @@ resources and fake provider credentials, with no real model or approval action.
   Bearer stay in the environment, because stdio / remote MCP clients still
   expand `${VAR}` there.
 
+## Personal subscription mode
+
+`CURIE_MODEL_AUTH_MODE` selects who authenticates model work (#5373, ADR 0268
+section 1). Unset or `service` is the default and keeps every existing path:
+`CURIE_CREDENTIALS` mapping, provider base URLs, OpenRouter routing and the
+credential-prefix reviewer default. `personal` makes the owner's
+`CLAUDE_CODE_OAUTH_TOKEN` the only model grant. Any other value, including the
+empty string or a different case, is refused at boot and at connect. When the
+inherited env and the explicit SDK env disagree, personal wins.
+
+In personal mode the policy in `personal_auth.py` does the following before the
+CLI starts:
+
+1. `resolve_sdk_env` returns no override and maps nothing, so `CURIE_CREDENTIALS`
+   and a `CURIE_MODEL_ENV_KEY` target are never used as the grant.
+2. An absent, empty or blank grant raises `AuthenticationRequiredError`, whose
+   message starts `authentication required`, even when a working service
+   credential or a saved login is present.
+3. Every competing source is removed from the CLI parent env and from the SDK
+   options env: cloud selectors and their settings, `ANTHROPIC_API_KEY`,
+   `ANTHROPIC_AUTH_TOKEN`, custom headers, both base URL variables, profile and
+   federation variables, and any other provider credential or endpoint
+   variable (`is_competing_auth_key`). Installation transport (`HTTPS_PROXY`,
+   `HTTP_PROXY`, `NO_PROXY`, `NODE_EXTRA_CA_CERTS`) and model selection stay.
+4. `CLAUDE_CONFIG_DIR` and `ANTHROPIC_CONFIG_DIR` point at fresh 0700
+   directories the runner creates per connect and removes on close, so a saved
+   login, a signed-in gateway session, user settings with `apiKeyHelper` and
+   named profiles are excluded.
+5. Workspace `.claude/settings.json` or `.claude/settings.local.json` that sets a
+   credential helper, a forced login, `modelOverrides`, or an auth, endpoint or
+   transport `env` key refuses the launch (`PersonalLaunchRefusedError`).
+6. Managed policy under `/etc/claude-code` (`managed-settings.json`, then
+   `managed-settings.d/*.json`) that forces gateway login, names a credential
+   helper or `policyHelper`, puts a competing variable in `env`, or cannot be
+   read or parsed refuses the launch. The runner never edits or bypasses it.
+
+Personal mode also needs an explicit Claude reviewer model in
+`CURIE_REVIEWER_MODEL` (a `claude-*` ID). It is required, sets
+`ANTHROPIC_DEFAULT_OPUS_MODEL` for the factory reviewer roles, and no default
+is derived from the credential. The `--bare` flag is never passed and the
+setting sources stay `user`, `project`, `local` (ADR 0189).
+
+Out of scope here: worker emission of the personal boot env (#5378) and
+containment of the grant inside the sandbox (#5374). Known residual: the CLI
+reloads project and local settings during a session, and the guard inspects
+them only at launch, so a `.claude/settings.local.json` written mid-session is
+not re-inspected. That channel belongs to #5374.
+
 ## Build and smoke
 
 The image compiles against the frozen workspace packages, so build from the repo

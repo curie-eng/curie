@@ -67,6 +67,16 @@ from .history import (
     validate_group_provenance,
 )
 from .mcp_argv import install as install_mcp_argv_offload
+from .personal_auth import (
+    AuthMode,
+    PersonalConfigDirs,
+    effective_auth_mode,
+    inspect_managed_policy,
+    inspect_workspace_settings,
+    personal_cli_env,
+    require_claude_reviewer_model,
+    require_owner_grant,
+)
 from .startup_diagnostics import StderrTail, sdk_initialize_diagnostics
 
 install_mcp_argv_offload()
@@ -622,18 +632,24 @@ def build_options(
             *(tool_name for tool_name in disallowed_tools if tool_name != "WebSearch"),
         ]
     sdk_env = dict(env or {})
-    # Auth has already been resolved at boot. An explicit SDK env value,
-    # including an empty value that fences inherited auth, wins over the
-    # process env. Reviewers use the Opus alias so install overrides do not
-    # require rebuilding the bundle (#4120).
-    credential = sdk_env.get(
-        "CLAUDE_CODE_OAUTH_TOKEN", os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
-    ) or sdk_env.get("ANTHROPIC_API_KEY", os.environ.get("ANTHROPIC_API_KEY", ""))
-    sdk_env[_SDK_REVIEWER_MODEL_ENV] = (
-        reviewer_model
-        if reviewer_model is not None
-        else ("claude-opus-5-5" if credential.startswith("sk-ant-") else "openai/gpt-6.1-sol")
-    )
+    # Reviewers use the Opus alias so install overrides do not require
+    # rebuilding the bundle (#4120); the CLI resolves it through this env.
+    if effective_auth_mode(os.environ, sdk_env) is AuthMode.PERSONAL:
+        # The explicit Claude reviewer only; a credential prefix is not a mode
+        # or an owner, so it never picks the default (#5373, ADR 0268).
+        sdk_env[_SDK_REVIEWER_MODEL_ENV] = require_claude_reviewer_model(reviewer_model)
+    else:
+        # Auth has already been resolved at boot. An explicit SDK env value,
+        # including an empty value that fences inherited auth, wins over the
+        # process env.
+        credential = sdk_env.get(
+            "CLAUDE_CODE_OAUTH_TOKEN", os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+        ) or sdk_env.get("ANTHROPIC_API_KEY", os.environ.get("ANTHROPIC_API_KEY", ""))
+        sdk_env[_SDK_REVIEWER_MODEL_ENV] = (
+            reviewer_model
+            if reviewer_model is not None
+            else ("claude-opus-5-5" if credential.startswith("sk-ant-") else "openai/gpt-6.1-sol")
+        )
     title_model = sdk_env.get(_SDK_TITLE_MODEL_ENV, os.environ.get(_SDK_TITLE_MODEL_ENV, ""))
     if not title_model.strip():
         sdk_env[_SDK_DISABLE_TERMINAL_TITLE_ENV] = "1"
@@ -715,6 +731,8 @@ class ClaudeAgentSession:
         )
         self._options = replace(options, stderr=self._stderr_tail)
         self._client = ClaudeSDKClient(self._options)
+        # The fresh CLI config a personal connect created; close() removes it.
+        self._personal_config: PersonalConfigDirs | None = None
 
     async def connect(self) -> None:
         # The SDK copies os.environ into the CLI at spawn. Install the parent
@@ -730,6 +748,9 @@ class ClaudeAgentSession:
         )
 
         snapshot = dict(os.environ)
+        if effective_auth_mode(snapshot, self._options.env) is AuthMode.PERSONAL:
+            await self._connect_personal(snapshot)
+            return
         denied = platform_credential_names({**snapshot, **self._options.env})
         for key in list(self._options.env):
             if key in denied and key not in CLI_PARENT_MODEL_KEYS:
@@ -747,6 +768,52 @@ class ClaudeAgentSession:
             finally:
                 os.environ.clear()
                 os.environ.update(snapshot)
+
+    async def _connect_personal(self, snapshot: dict[str, str]) -> None:
+        """Launch with the owner grant as the only model credential (#5373, ADR 0268).
+
+        Every refusal raises here, before ``ClaudeSDKClient.connect`` starts any
+        subprocess. The CLI then gets fresh config dirs and an env with every
+        competing source removed; the shell pin and credential scrubbing stay.
+        """
+
+        from .subprocess_env import cli_parent_env, platform_credential_names, sdk_shell_env
+
+        options_env = self._options.env
+        # An explicit value, including an empty one, fences the inherited grant.
+        grant = require_owner_grant({**snapshot, **options_env})
+        inspect_workspace_settings(self._options.cwd or os.getcwd())
+        inspect_managed_policy()
+        removed = platform_credential_names(snapshot) | platform_credential_names(
+            {**snapshot, **options_env}
+        )
+        # Pin authority before the env is built, as the service path does.
+        options_env.update(sdk_shell_env())
+        config = PersonalConfigDirs.create()
+        self._personal_config = config
+        try:
+            with sdk_initialize_diagnostics(self._stderr_tail, _SDK_VERSION):
+                try:
+                    os.environ.clear()
+                    os.environ.update(
+                        personal_cli_env(
+                            cli_parent_env(snapshot),
+                            options_env,
+                            grant=grant,
+                            config=config,
+                            removed=removed,
+                        )
+                    )
+                    await self._client.connect()
+                finally:
+                    os.environ.clear()
+                    os.environ.update(snapshot)
+        except BaseException:
+            # The SDK has already stopped the CLI; the original error stands.
+            self._personal_config = None
+            with contextlib.suppress(OSError):
+                config.remove()
+            raise
 
     async def query(self, text: str) -> None:
         await self._client.query(text)
@@ -801,7 +868,12 @@ class ClaudeAgentSession:
         await self._client.interrupt()
 
     async def close(self) -> None:
-        await self._client.disconnect()
+        try:
+            await self._client.disconnect()
+        finally:
+            config, self._personal_config = self._personal_config, None
+            if config is not None:
+                config.remove()
 
     async def export_replay_state(self) -> HarnessReplayState | None:
         """Export the provider transcript checkpoint/delta mirrored this turn."""

@@ -373,7 +373,15 @@ def resolve_sdk_env(env: MutableMapping[str, str]) -> dict[str, str] | None:
     ``resolve_model_credential``.
     Returns the override dict to pass as ``ClaudeAgentOptions.env`` (base-URL
     override mode), or ``None`` when resolution mutated ``env`` in place.
+
+    ``CURIE_MODEL_AUTH_MODE=personal`` returns ``None`` right after the backend
+    gate and mutates nothing: the owner's ``CLAUDE_CODE_OAUTH_TOKEN`` is the only
+    grant, so no service credential is mapped and no endpoint override is built
+    (#5373). An invalid mode raises before any mapping.
     """
+    # personal_auth builds on this module's names, so it is imported here.
+    from .personal_auth import AuthMode, resolve_auth_mode
+
     backend = resolve_api_backend(env)
     if not backend.speaks_anthropic_wire:
         raise UnsupportedApiBackendError(
@@ -384,6 +392,8 @@ def resolve_sdk_env(env: MutableMapping[str, str]) -> dict[str, str] | None:
             f"Set {API_BACKEND_ENV}={ApiBackend.MESSAGES.value!r} (the default) and "
             "point the base URL at an Anthropic Messages endpoint."
         )
+    if resolve_auth_mode(env) is AuthMode.PERSONAL:
+        return None
     credential = resolve_credential(env)
     if not credential.startswith("sk-or-"):
         override = resolve_base_url_override(env)
