@@ -1922,10 +1922,12 @@ A personal WorkItem has two more worker-token routes:
 `GET /v1/internal/work-items/{id}/personal-context` reads its owner tuple, and
 `POST /v1/internal/work-items/{id}/personal-context/revalidate` moves the item,
 and its queued or waiting requests, to the owner's current enrollment
-generation. Requests that already ran keep the generation they ran under. A
-stale version, another owner, an inactive enrollment, a live runtime or an
-unchanged generation returns 409 with its code. A wrong tenant, agent or owner
-gets the same 404 as an unknown id.
+generation. Requests that already ran keep the generation they ran under. On
+the read, a wrong tenant, agent or owner gets the same 404 as an unknown id.
+On revalidation, a wrong tenant or agent gets that 404, while another owner,
+a stale version, an inactive enrollment, a live runtime or an unchanged
+generation returns 409 with its code (`owner_mismatch`, `stale_version`,
+`enrollment_inactive`, `runtime_live` or `generation_current`).
 
 Reconciler steps fail independently: each failure logs the step and traceback,
 and execute wakes continue despite an unrelated step failure. OpenTelemetry
@@ -2412,11 +2414,12 @@ Each item and each of its requests carry four owner facts: `tenant_id`,
 item has `model_auth_mode` of `service` and null `owner_principal_id` and
 `enrollment_generation`. A personal item has `model_auth_mode` of `personal`
 with an owner principal and a generation. A row written by an older API during
-the schema upgrade window can also show a null `tenant_id`. The tuple is fixed
-at creation. The item shows its current generation, which a worker-token
-revalidation can move, while each request keeps the generation it snapshotted
-when it was inserted. The fields name identifiers and a generation only, never
-a credential. `curie <tier> work-items --json` carries the same four fields,
+the schema upgrade window can also show a null `tenant_id`. The tenant, mode
+and owner are fixed at creation. A worker-token revalidation can move the
+item's generation together with that of its queued or waiting requests; a
+request that already ran keeps the generation it ran under. The fields name
+identifiers and a generation only, never a credential.
+`curie <tier> work-items --json` carries the same four fields,
 and the human detail view prints one `auth` line.
 
 The platform never asserts correctness: every item reports
