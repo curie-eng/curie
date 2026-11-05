@@ -2853,7 +2853,7 @@ fn render_pod_table(ui: &crate::ui::Ui, pods: &[PodRow]) {
 /// The operator remedy for a status convergence failure. A rejected static
 /// token is repaired by the Secret merge patch. Any other remaining reason
 /// keeps the rollout sentence. When both are present, the token sentence
-/// comes first.
+/// comes first and the two sentences are joined with "; ".
 fn status_convergence_fix(unhealthy: &[String]) -> String {
     const ROLLOUT_FIX: &str = "inspect the unhealthy rollout reasons, correct the target configuration and rerun `curie cluster up`";
     const TOKEN_FIX: &str = "replace the rejected static token with the Secret merge patch in docs/guides/dark-factory-quickstart.md#replace-a-static-token, then rerun `curie cluster status`";
@@ -2865,8 +2865,41 @@ fn status_convergence_fix(unhealthy: &[String]) -> String {
         .any(|reason| !reason.contains("authentication rejected"));
     match (token, rollout) {
         (true, false) => TOKEN_FIX.to_string(),
-        (true, true) => format!("{TOKEN_FIX} {ROLLOUT_FIX}"),
+        (true, true) => format!("{TOKEN_FIX}; {ROLLOUT_FIX}"),
         _ => ROLLOUT_FIX.to_string(),
+    }
+}
+
+/// The first container waiting reason on a pod. Init containers are checked
+/// first because they start first; a failing init is the reason a sandbox
+/// cannot start, ahead of a later app-container waiting reason.
+fn first_container_waiting_reason(pod: &serde_json::Value) -> Option<&str> {
+    let status = pod.get("status")?;
+    for field in ["initContainerStatuses", "containerStatuses"] {
+        let Some(containers) = status.get(field).and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for container in containers {
+            if let Some(reason) = container
+                .get("state")
+                .and_then(|state| state.get("waiting"))
+                .and_then(|waiting| waiting.get("reason"))
+                .and_then(|reason| reason.as_str())
+                .filter(|reason| !reason.is_empty())
+            {
+                return Some(reason);
+            }
+        }
+    }
+    None
+}
+
+fn sandbox_not_ready_warning(name: &str, phase: &str, waiting: Option<&str>) -> String {
+    match waiting {
+        Some(waiting) => format!(
+            "{name} is a runtime sandbox that is not ready (phase {phase}, waiting {waiting})"
+        ),
+        None => format!("{name} is a runtime sandbox that is not ready (phase {phase})"),
     }
 }
 
@@ -2876,8 +2909,10 @@ fn status_convergence_fix(unhealthy: &[String]) -> String {
 /// (`Succeeded`, `Failed`, `Completed`) and terminating pods stay in the rows
 /// but are excluded from the tally; a kubelet eviction leaves a `Failed` pod
 /// its ReplicaSet never deletes (#4496). A `curie-thread-` pod is a runtime
-/// sandbox: it stays in the rows, and a not-ready one is warned, but it is
-/// left out of the tally and the convergence list.
+/// sandbox: it stays in the rows, and a not-ready one is warned with its phase
+/// and the first container waiting reason when one is present, but it is
+/// left out of the tally and the convergence list. That exclusion has no age
+/// bound, so a sandbox stuck not ready stays out of the exit code.
 fn collect_pod_summary(
     pods: &[serde_json::Value],
 ) -> (Vec<PodRow>, usize, usize, Vec<String>, Vec<String>) {
@@ -2942,7 +2977,11 @@ fn collect_pod_summary(
         let all_ready = total_m > 0 && ready_n == total_m;
         if name.starts_with("curie-thread-") {
             if phase != "Running" || !all_ready {
-                sandbox_warnings.push(format!("{name} is a runtime sandbox that is not ready"));
+                sandbox_warnings.push(sandbox_not_ready_warning(
+                    &name,
+                    phase,
+                    first_container_waiting_reason(pod),
+                ));
             }
             continue;
         }
@@ -7000,13 +7039,48 @@ mod tests {
             (base_ready, base_total, &base_unhealthy),
             "a starting sandbox does not change ready, total, or the convergence list"
         );
-        assert!(
-            warnings.iter().any(|warning| {
-                warning.contains("curie-thread-example")
-                    && warning.contains("runtime sandbox")
-                    && warning.contains("not ready")
-            }),
-            "names the sandbox in warnings: {warnings:?}"
+        assert_eq!(
+            warnings,
+            vec![
+                "curie-thread-example is a runtime sandbox that is not ready (phase Pending)"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            release_healthy(rows, ready, total, unhealthy, warnings),
+            serde_json::json!(true),
+            "a release whose only not-ready pod is a Pending curie-thread- sandbox is healthy"
+        );
+
+        let stuck = r#"[
+            {"metadata":{"name":"api0"},"status":{"phase":"Running","containerStatuses":[{"ready":true}]}},
+            {"metadata":{"name":"curie-thread-stuck"},"status":{"phase":"Pending","initContainerStatuses":[{"name":"install","ready":false,"state":{"waiting":{"reason":"ImagePullBackOff"}}}],"containerStatuses":[{"name":"sandbox","ready":false,"state":{"waiting":{"reason":"PodInitializing"}}}]}}
+        ]"#;
+        let stuck_items: Vec<serde_json::Value> = serde_json::from_str(stuck).unwrap();
+        let (_, ready, total, unhealthy, warnings) = collect_pod_summary(&stuck_items);
+        assert_eq!(
+            (ready, total, &unhealthy),
+            (base_ready, base_total, &base_unhealthy),
+            "a sandbox that cannot start stays out of ready, total, and the convergence list"
+        );
+        assert_eq!(
+            warnings,
+            vec!["curie-thread-stuck is a runtime sandbox that is not ready (phase Pending, waiting ImagePullBackOff)".to_string()]
+        );
+
+        let crash = r#"[
+            {"metadata":{"name":"api0"},"status":{"phase":"Running","containerStatuses":[{"ready":true}]}},
+            {"metadata":{"name":"curie-thread-crash"},"status":{"phase":"Running","containerStatuses":[{"name":"sandbox","ready":false,"state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}}
+        ]"#;
+        let crash_items: Vec<serde_json::Value> = serde_json::from_str(crash).unwrap();
+        let (_, ready, total, unhealthy, warnings) = collect_pod_summary(&crash_items);
+        assert_eq!(
+            (ready, total, &unhealthy),
+            (base_ready, base_total, &base_unhealthy)
+        );
+        assert_eq!(
+            warnings,
+            vec!["curie-thread-crash is a runtime sandbox that is not ready (phase Running, waiting CrashLoopBackOff)".to_string()]
         );
 
         let running_sandbox = r#"[
@@ -7031,7 +7105,7 @@ mod tests {
             {"metadata":{"name":"dispatcher0"},"status":{"phase":"Pending"}}
         ]"#;
         let items: Vec<serde_json::Value> = serde_json::from_str(pending_release).unwrap();
-        let (_, ready, total, unhealthy, _) = collect_pod_summary(&items);
+        let (rows, ready, total, unhealthy, warnings) = collect_pod_summary(&items);
         assert_eq!((ready, total), (1, 2));
         assert_eq!(unhealthy, vec!["dispatcher0".to_string()]);
         let fix = status_convergence_fix(&unhealthy);
@@ -7040,10 +7114,49 @@ mod tests {
             "{fix}"
         );
         assert!(fix.contains("curie cluster up"), "{fix}");
-        let failure =
-            crate::exit::CliError::failure("target release has not converged: dispatcher0")
-                .with_fix(fix);
-        assert_eq!(failure.class.code(), 1);
+        assert_eq!(
+            release_healthy(rows, ready, total, unhealthy, warnings),
+            serde_json::json!(false),
+            "a Pending release pod leaves healthy false"
+        );
+    }
+
+    /// Healthy is the value `status` reads at `ClusterStatusOutput::to_json`.
+    /// Delivery is not degraded, so the result is the tally alone.
+    fn release_healthy(
+        pods: Vec<PodRow>,
+        ready: usize,
+        total: usize,
+        unhealthy: Vec<String>,
+        warnings: Vec<String>,
+    ) -> serde_json::Value {
+        let output = ClusterStatusOutput::Status(Box::new(ClusterStatus {
+            namespace: "acme".to_string(),
+            revision: "1".to_string(),
+            release_state: "deployed".to_string(),
+            release_found: true,
+            release_missing_note: None,
+            pods,
+            ready,
+            total,
+            unhealthy,
+            warnings,
+            pods_listed: true,
+            urls: Vec::new(),
+            delivery: crate::completion_outbox::Report {
+                count: 0,
+                oldest_age_s: 0.0,
+                inflight: 0,
+                retry: 0,
+                terminal: 0,
+                state: crate::completion_outbox::State::Empty,
+                degraded: false,
+                detail: String::new(),
+            },
+            upgrade: crate::ops::upgrade::UpgradeStatusView::idle(None),
+            credentials: Vec::new(),
+        }));
+        crate::ui::CliOutput::to_json(&output)["healthy"].clone()
     }
 
     /// #4750: a rejected static token is repaired by the Secret merge patch.
@@ -7074,6 +7187,10 @@ mod tests {
         let token_at = both.find("replace-a-static-token").expect(&both);
         let rollout_at = both.find("curie cluster up").expect(&both);
         assert!(token_at < rollout_at, "{both}");
+        assert!(
+            both.contains("`curie cluster status`; inspect the unhealthy rollout reasons"),
+            "{both}"
+        );
     }
 
     #[test]
