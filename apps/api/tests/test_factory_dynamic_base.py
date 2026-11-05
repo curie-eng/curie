@@ -129,7 +129,18 @@ def _acquire_through_forge(
     return client.portal.call(post)
 
 
-def _assert_unstarted_and_unpinned(number: int, admitted: dict[str, Any]) -> None:
+def _unresolved_base_state(admitted: dict[str, Any]) -> dict[str, Any]:
+    (item,) = _rows(
+        "SELECT base_branch, base_source, base_commit, base_resolved_request_id, "
+        "base_selection_fingerprint, publication_lineage_id FROM curie.work_items WHERE id = :id",
+        {"id": admitted["work_item_id"]},
+    )
+    return item
+
+
+def _assert_unstarted_and_unpinned(
+    number: int, admitted: dict[str, Any], base_before: dict[str, Any]
+) -> None:
     row = _execution(number)
     assert row["id"] == admitted["id"]
     assert row["objective"] == admitted["objective"]
@@ -147,12 +158,11 @@ def _assert_unstarted_and_unpinned(number: int, admitted: dict[str, Any]) -> Non
         "runtime_sandbox_name",
     ):
         assert row[field] is None, (field, row[field])
-    (item,) = _rows(
-        "SELECT base_branch, base_source, base_commit, base_resolved_request_id, "
-        "base_selection_fingerprint, publication_lineage_id FROM curie.work_items WHERE id = :id",
-        {"id": admitted["work_item_id"]},
-    )
-    assert all(value is None for value in item.values()), item
+    item = _unresolved_base_state(admitted)
+    assert item == base_before
+    assert all(
+        value is None for field, value in item.items() if field != "base_selection_fingerprint"
+    ), item
     assert _rows(
         "SELECT id FROM curie.publications WHERE execution_request_id = :id",
         {"id": admitted["id"]},
@@ -168,6 +178,7 @@ def test_unresolved_acquisition_refuses_invalid_tracker_authority_and_recovers(
     assert _label(client, api, number, "base:next").json()["status"] == "factory_admitted"
     _due(number)
     before, payload = _execution(number), _acquire_body(number)
+    base_before = _unresolved_base_state(before)
     original = _revoke_tracker(client, monkeypatch, change=change)
     reads: list[str] = []
 
@@ -187,7 +198,7 @@ def test_unresolved_acquisition_refuses_invalid_tracker_authority_and_recovers(
     assert row["dispatch_generation"] == before["dispatch_generation"] + 1
     assert row["terminal_cause"] is None
     assert reads == []
-    _assert_unstarted_and_unpinned(number, before)
+    _assert_unstarted_and_unpinned(number, before, base_before)
     _set_forges(client, monkeypatch, original)
     _due(number)
 
@@ -212,6 +223,7 @@ def test_removed_tracker_settles_after_five_refusals_and_keeps_its_status_outbox
     _due(number)
     before = _execution(number)
     notice_sql = "SELECT * FROM curie.factory_terminal_notices WHERE execution_request_id = :id"
+    base_before = _unresolved_base_state(before)
     (notice_before,) = _rows(notice_sql, {"id": before["id"]})
     _revoke_tracker(client, monkeypatch)
     for attempt in range(1, 6):
@@ -227,7 +239,7 @@ def test_removed_tracker_settles_after_five_refusals_and_keeps_its_status_outbox
         assert row["capacity_deferrals"] == before["capacity_deferrals"]
         assert row["dispatch_generation"] == before["dispatch_generation"] + attempt
         assert row["last_deferral_reason"] == "not_started:factory_surface_mismatch"
-        _assert_unstarted_and_unpinned(number, before)
+        _assert_unstarted_and_unpinned(number, before, base_before)
     assert row["terminal_cause"] == "start_failed"
     assert row["terminal_at"] is not None
     (terminal_notice,) = _rows(notice_sql, {"id": before["id"]})
@@ -308,6 +320,7 @@ def test_an_authorized_tracker_outage_does_not_count_as_a_start_refusal(base_app
     assert _label(client, api, number, "base:next").json()["status"] == "factory_admitted"
     _due(number)
     before = _execution(number)
+    base_before = _unresolved_base_state(before)
     reads: list[str] = []
 
     def forge(request: httpx.Request) -> httpx.Response:
@@ -327,7 +340,7 @@ def test_an_authorized_tracker_outage_does_not_count_as_a_start_refusal(base_app
     assert row["capacity_deferrals"] == before["capacity_deferrals"]
     assert f"/repos/{REPO}/issues/{number}" in reads
     assert api.branch_requests == []
-    _assert_unstarted_and_unpinned(number, before)
+    _assert_unstarted_and_unpinned(number, before, base_before)
     _due(number)
 
     restored = _acquire(client, number)
@@ -632,7 +645,7 @@ def test_a_base_only_label_observation_fences_a_blocked_first_acquisition(
     if label != "base:main":
         assert first.status_code == 409, first.text
     else:
-        assert first.status_code in {200, 409}, first.text
+        assert first.status_code == 200, first.text
     if first.status_code == 409:
         assert current["acquire_owner"] is None
         item = _work_item(number)

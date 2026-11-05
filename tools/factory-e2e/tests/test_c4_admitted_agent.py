@@ -1637,7 +1637,7 @@ def test_renewal_and_late_start_revalidate_granted_binding(
     body = acquire_body(before, wake)
     path = f"/v1/internal/work-items/requests/{before['id']}"
     status, grant = run.api_result("POST", path + "/acquire", body, internal=True)
-    assert status == 200, "the valid neighbor acquire did not grant the admitted request"
+    assert status == 200, f"the valid neighbor acquire did not grant the admitted request: {grant}"
     assert grant["context"]["agent_id"] == ticket.agent.id
     assert grant["generation"] == before["dispatch_generation"]
     assert grant["repository_path"] == REPOSITORY

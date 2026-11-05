@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import sys
 import uuid
@@ -390,6 +391,7 @@ def test_capacity_wait_expiry_posts_one_comment(admitted: Any) -> None:
 def test_admission_unavailable_deferral_preserves_deadline_and_neutral_surfaces(
     admitted: Any,
     capacity_first: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     client, github, sink = admitted
     number = 5296
@@ -402,9 +404,8 @@ def test_admission_unavailable_deferral_preserves_deadline_and_neutral_surfaces(
     )[0]["wait_deadline"]
 
     deferrals = ([("capacity", True)] if capacity_first else []) + [
-        ("admission_unavailable", False),
-        ("admission_unavailable", False),
-    ]
+        ("admission_unavailable", False)
+    ] * 6
     for generation, (reason, capacity) in enumerate(deferrals, start=1):
 
         async def acquire_waiting(current_generation: int) -> Any:
@@ -456,7 +457,18 @@ def test_admission_unavailable_deferral_preserves_deadline_and_neutral_surfaces(
             assert "admission observations" in view.json()["actionable_cause"]
             assert "capacity" not in view.json()["actionable_cause"]
 
-    _reconcile_later(31)
+    with caplog.at_level(logging.WARNING, logger="curie_api.workitem_reconciler"):
+        _reconcile_later(31)
+    expiry_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "curie_api.workitem_reconciler"
+        and "expired waiting" in record.getMessage()
+    ]
+    assert expiry_logs == [
+        f"work item request {request_id} expired waiting for sandbox admission "
+        f"after {int(capacity_first)} capacity deferrals"
+    ]
     expired = _request(number)
     assert expired["status"] == "expired"
     assert expired["terminal_cause"] == "capacity_wait_expired"

@@ -396,9 +396,13 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
         try:
             decision = await _decide_gate(gate, tool_name, tool_input, _context.tool_use_id)
         except ValueError as exc:
+            # #4460: a malformed publication proposal is denied WITHOUT the
+            # interrupt, so the model receives the reason and can correct the
+            # call in this same turn. The fail-closed session rule still ends
+            # the turn classified-failure if nothing valid is ever recorded.
             return PermissionResultDeny(
                 message=f"Publication request was not recorded: {exc}. Correct it and retry.",
-                interrupt=True,
+                interrupt=False,
             )
         if decision.refusal is not None:
             return PermissionResultDeny(
@@ -532,6 +536,12 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
         try:
             decision = await _decide_gate(gate, tool_name, tool_input, _tool_use_id)
         except ValueError as exc:
+            # #4460: deny without the turn-stopping control fields. Omitting
+            # ``continue_`` leaves the SDK's default (continue), so the model
+            # receives this reason as the tool result and can issue the
+            # corrected call in this same turn, which the reason itself asks
+            # for. The fail-closed session rule still ends the turn
+            # classified-failure if nothing valid is ever recorded.
             reason = f"Publication request was not recorded: {exc}. Correct it and retry."
             return {
                 "hookSpecificOutput": {
@@ -539,8 +549,6 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
                     "permissionDecision": "deny",
                     "permissionDecisionReason": reason,
                 },
-                "continue_": False,
-                "stopReason": reason,
             }
         if decision.refusal is not None:
             if decision.continue_turn:

@@ -153,14 +153,16 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+[[ "$(kc get deployment "$FULLNAME-worker" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="CURIE_CLAIM_TIMEOUT_SECONDS")].value}')" == 90 ]] \
+    || fail "worker claim timeout must retain its normal 90-second value"
+[[ "$(kc get deployment "$FULLNAME-worker" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="CURIE_WORKSPACE_TOTAL_TIMEOUT_SECONDS")].value}')" == 150 ]] \
+    || fail "worker workspace total timeout must retain its normal 150-second value"
 for component in api worker; do
     image_variable="CURIE_SCENARIO_${component^^}_IMAGE"
     kc rollout status "deployment/$FULLNAME-$component" --timeout=300s >/dev/null
     [[ "$(kc get "deployment/$FULLNAME-$component" -o jsonpath='{.spec.template.spec.containers[0].image}')" == "${!image_variable}" ]] \
         || fail "the $component Deployment is not using the candidate image"
 done
-[[ "$(kc get deployment "$FULLNAME-worker" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="CURIE_CLAIM_TIMEOUT_SECONDS")].value}')" == 90 ]] \
-    || fail "worker claim timeout must retain its normal 90-second value"
 [[ "$(kc get deployment "$FULLNAME-worker" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="CURIE_WORKSPACE_ENABLED")].value}')" == true ]] \
     || fail "real workspace selection must be enabled"
 helm --kube-context "$CONTEXT" upgrade "$RELEASE" "$REPO_ROOT/charts/curie" -n "$NAMESPACE" --reuse-values \
@@ -421,30 +423,27 @@ if isinstance(payload, dict):
         "is unreachable" in error or "could not send the requested operation" in error)
 print("Recovery diagnostic: " + json.dumps(summary, sort_keys=True))
 PY
-    # Name the API's server-side failure by exception type only. Messages and
-    # tracebacks stay private; type names are code identifiers, not data.
-    kc logs "deployment/$FULLNAME-api" --since-time="$RECOVERY_SINCE" >"$WORKDIR/recovery-api.log" 2>&1 || true
-    python3 - "$WORKDIR/recovery-api.log" <<'PY'
-import json, pathlib, re, sys
-name = r"(?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*(?:Error|Exception|Timeout|Exit)"
-patterns = (re.compile(rf"^({name})(?::|$)"), re.compile(rf"<class '({name})'>"))
-types, server_errors = set(), 0
-for raw in pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines():
-    try:
-        record = json.loads(raw)
-    except ValueError:
-        record = None
-    texts = [record.get(key) for key in ("message", "exception")] if isinstance(record, dict) else [raw]
-    for text in texts:
-        if not isinstance(text, str):
-            continue
-        server_errors += '" 500' in text
-        for line in text.splitlines():
-            for pattern in patterns:
-                types.update(pattern.findall(line.strip()))
-summary = {"phase": "recovery", "api_exception_types": sorted(types)[:12], "api_http_500_lines": server_errors}
-print("Recovery API diagnostic: " + json.dumps(summary, sort_keys=True))
-PY
+    # Project logs onto fixed metadata; raw messages and tracebacks stay private.
+    # items[0] assumes this scenario's single API replica.
+    api_pod="$(kc get pods -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=api" \
+        -o jsonpath='{.items[0].metadata.name}')" || api_pod=""
+    api_restarts=""
+    if [[ -n "$api_pod" ]]; then
+        api_restarts="$(kc get pod "$api_pod" \
+            -o jsonpath='{.status.containerStatuses[?(@.name=="api")].restartCount}')" || api_restarts=""
+        kc logs "$api_pod" -c api --since-time="$RECOVERY_SINCE" >"$WORKDIR/recovery-api.log" 2>&1 || true
+    else
+        : >"$WORKDIR/recovery-api.log" || true
+    fi
+    api_restarts=${api_restarts:-0}
+    [[ "$api_restarts" =~ ^(0|[1-9][0-9]*)$ ]] || api_restarts=0
+    previous_args=()
+    if (( api_restarts > 0 )); then
+        kc logs "$api_pod" -c api --previous >"$WORKDIR/recovery-api-previous.log" 2>&1 || true
+        previous_args=(--previous-log "$WORKDIR/recovery-api-previous.log")
+    fi
+    python3 "$REPO_ROOT/charts/curie/ci/runtime/recovery_api_diagnostic.py" \
+        "$WORKDIR/recovery-api.log" --restart-count "$api_restarts" "${previous_args[@]}" || true
 fi
 [[ "$TURN_STATUS" == 0 ]] || fail "recovery CLI turn failed"
 python3 - "$WORKDIR/recovery.json" <<'PY'

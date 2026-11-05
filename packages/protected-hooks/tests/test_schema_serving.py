@@ -76,11 +76,13 @@ def graph_payload() -> dict[str, Any]:
         ("0140", False),
         ("0141", False),
         ("0143", False),
-        # 0145 joins 0140 and 0144; the candidate minimum is 0146, the UI
-        # evidence tables the API reconciler reads.
+        # 0145 joins 0140 and 0144. The candidate minimum is the 0149 join of
+        # the 0146 UI evidence tables and the 0147 deleted issue cancellation.
         ("0144", False),
         ("0145", False),
-        ("0146", True),
+        ("0146", False),
+        ("0147", False),
+        ("0149", True),
         ("0000", True),
         ("future-expand", True),
     ],

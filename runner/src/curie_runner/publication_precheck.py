@@ -25,10 +25,6 @@ _UNAVAILABLE = (
 )
 
 
-class _MalformedPublication(ValueError):
-    """A malformed proposal retains the existing halting gate behavior."""
-
-
 def _origin(url: str | None) -> tuple[str, str, int] | None:
     if not url:
         return None
@@ -54,7 +50,6 @@ class _Call:
     tool_input: dict[str, Any]
     ready: anyio.Event = field(default_factory=anyio.Event)
     refusal: str | None = _UNAVAILABLE
-    malformed: ValueError | None = None
     conflicted: bool = False
 
 
@@ -124,8 +119,6 @@ class PublicationPrecheck:
             try:
                 with anyio.fail_after(PRECHECK_TIMEOUT_SECONDS):
                     call.refusal = await self._compare(context, tool_input)
-            except _MalformedPublication as exc:
-                call.malformed = exc
             except Exception:  # noqa: BLE001 - existing broad catch retained
                 # Never include a transport diagnostic containing the endpoint
                 # or its credential in model text, transcripts or logs.
@@ -134,13 +127,7 @@ class PublicationPrecheck:
                 call.ready.set()
         if self._context is not context or not self._active:
             return _UNAVAILABLE
-        refusal: str | None
-        if call.conflicted:
-            refusal = _UNAVAILABLE
-        else:
-            if call.malformed is not None:
-                raise call.malformed
-            refusal = call.refusal
+        refusal: str | None = _UNAVAILABLE if call.conflicted else call.refusal
         if refusal is not None:
             self.refused_ids.add(tool_use_id)
         return refusal
@@ -153,9 +140,15 @@ class PublicationPrecheck:
             return "body_required: Provide a useful nonblank publication body and retry."
         title = tool_input.get("title")
         if not isinstance(title, str) or not title.strip() or len(title) > 240:
-            raise _MalformedPublication("publication title must be 1 to 240 characters")
+            # #4460: a malformed proposal is a continuing refusal, exactly like
+            # a blank body. The refusal tells the model to retry, so halting the
+            # turn on it would fail the run before the retry can happen.
+            return "title_required: Provide a pull request title of 1 to 240 characters and retry."
         if not isinstance(body, str) or len(body) > 65_536:
-            raise _MalformedPublication("publication body must be at most 65536 characters")
+            return (
+                "body_too_large: Shorten the publication body to at most 65536"
+                " characters and retry."
+            )
         if (
             self._trusted_origin is None
             or _origin(context.precheck_url) != self._trusted_origin

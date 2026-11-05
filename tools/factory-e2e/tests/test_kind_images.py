@@ -29,6 +29,27 @@ def test_budget_counts_snapshots_largest_import_and_runtime_reserve() -> None:
     )
 
 
+def test_runner_layer_budget_is_twice_the_runner_plus_reserve() -> None:
+    runner = 745 * 1024**2
+
+    def command(*argv: str, **_kwargs: object) -> str:
+        assert argv[:4] == ("docker", "image", "inspect", "curie-runner:latest")
+        return json.dumps([{"Size": runner}])
+
+    assert kind_images.runner_layer_budget(command, "curie-runner:latest") == (
+        2 * runner + kind_images.RUNTIME_RESERVE_BYTES
+    )
+
+
+@pytest.mark.parametrize("sizes", [[], [0], [-1], [True], ["123"], [10, 20]])
+def test_runner_layer_budget_refuses_a_missing_or_invalid_size(sizes: list[object]) -> None:
+    def command(*_argv: str, **_kwargs: object) -> str:
+        return json.dumps([{"Size": size} for size in sizes])
+
+    with pytest.raises(ValueError, match="runner image size"):
+        kind_images.runner_layer_budget(command, "curie-runner:latest")
+
+
 @pytest.mark.parametrize("save_status,import_status", [(0, 0), (1, 0), (0, 1)])
 def test_stream_delivers_image_bytes_and_propagates_both_failures(
     save_status: int,

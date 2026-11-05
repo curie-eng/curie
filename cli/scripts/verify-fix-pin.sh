@@ -348,7 +348,8 @@ provision_selector_phase() {
     else
       dockerfile="apps/$component/Dockerfile"
     fi
-    docker build --file "$scratch/$dockerfile" --tag "$image" "$scratch" \
+    docker build --file "$scratch/$dockerfile" --tag "$image" \
+      --label "curie.fixpin.phase=$phase" "$scratch" \
       >"$temp_root/build-$component-$phase.log" 2>&1 || fail "Fix pin $phase candidate $component image build failed"
   done
   kind load docker-image --name "$provision_cluster" "${phase_images[@]}" \
