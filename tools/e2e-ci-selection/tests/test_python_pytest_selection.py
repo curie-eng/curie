@@ -31,9 +31,6 @@ ADMITTED_AGENT_RUNTIMES = (ADMITTED_AGENT_RUNTIME, DYNAMIC_BASE_RUNTIME)
 SCRIPTED_FACTORY_JOB = "e2e-scripted-factory"
 ADMITTED_AGENT_JOB = "factory-admitted-agent"
 ADMITTED_AGENT_SHARDS = [1, 2, 3, 4, 5, 6, 7]
-RELABEL_REGRESSION = (
-    "test_two_worker_ci_preserves_successor_identity_and_rejects_stale_predecessor"
-)
 
 
 def _invoke_selector(
@@ -1324,7 +1321,6 @@ def test_admitted_agent_shards_partition_the_module_in_collection_order(tmp_path
     assert len(flattened) == len(whole)
     assert set(flattened) == set(whole)
     assert all(shard == [case for case in whole if case in shard] for shard in shards)
-
 
 
 @pytest.mark.parametrize("shard", range(1, SHARD_COUNT + 1))

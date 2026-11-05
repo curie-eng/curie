@@ -41,6 +41,29 @@ def test_invalid_duration_file_is_refused(tmp_path: Path, data: object) -> None:
         load_durations(path)
 
 
+def test_missing_duration_file_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(OSError):
+        load_durations(tmp_path / "missing.json")
+
+
+def test_malformed_duration_file_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "durations.json"
+    path.write_text("not json")
+    with pytest.raises(ValueError):
+        load_durations(path)
+
+
+def test_unreadable_duration_file_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "durations.json"
+    path.write_text('{"case": 1}')
+    path.chmod(0)
+    try:
+        with pytest.raises(OSError):
+            load_durations(path)
+    finally:
+        path.chmod(0o600)
+
+
 def test_rebuild_command_sums_phases_and_replaces_older_measurements(tmp_path: Path) -> None:
     first = tmp_path / "first.log"
     second = tmp_path / "second.log"
