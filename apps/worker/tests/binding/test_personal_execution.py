@@ -347,6 +347,73 @@ def test_a_service_request_projects_service_mode_with_no_owner_or_generation() -
     _with_seed(body)
 
 
+def test_a_legacy_shaped_service_request_projects_with_no_tenant_snapshot() -> None:
+    # Migration 0148 is an expand: an older application inside the schema
+    # window still inserts WorkItems and requests that name none of the four
+    # owner columns, so tenant_id stays NULL and the mode defaults to service.
+    # Such a row must still project, as the API read already shows it.
+    legacy_item_id, legacy_request_id = uuid.uuid4(), uuid.uuid4()
+
+    async def body(engine: AsyncEngine, seeded: Seeded) -> None:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    f"INSERT INTO {_SCHEMA}.work_items (id, code_host_kind, code_host_host, "
+                    "tracker_kind, tracker_host, tracker_scope_id, repository_project_id, "
+                    "tracker_issue_id, code_host_installation_id, agent_id, repository_path, "
+                    "conversation_id, version, base_branch, base_source, base_commit) "
+                    "VALUES (:id, 'github', 'github.com', 'github', 'github.com', '9001', "
+                    "'9001', :issue, 41, :agent, 'acme-corp/acme-bot', :conversation, 1, "
+                    "'main', 'default', :base)"
+                ),
+                {
+                    "id": legacy_item_id,
+                    "issue": str(uuid.uuid4().int % 10**9),
+                    "agent": seeded.agent_id,
+                    "conversation": f"conv-{legacy_item_id.hex[:12]}",
+                    "base": "a" * 40,
+                },
+            )
+            await conn.execute(
+                text(
+                    f"INSERT INTO {_SCHEMA}.execution_requests (id, work_item_id, sequence, "
+                    "status, wait_deadline, started_at, execution_deadline, terminal_at, "
+                    "terminal_cause, execution_attempts) "
+                    f"VALUES (:id, :item, 1, {_RUNNING_SHAPE}, 1)"
+                ),
+                {"id": legacy_request_id, "item": legacy_item_id},
+            )
+        try:
+            owning = _resolver(engine, seeded.tenant_id)
+            owner = await owning.resolve_execution_owner(legacy_request_id)
+
+            assert owner is not None
+            assert owner.model_dump() == {
+                "work_item_id": legacy_item_id,
+                "request_id": legacy_request_id,
+                "agent_id": seeded.agent_id,
+                "tenant_id": None,
+                "model_auth_mode": "service",
+                "owner_principal_id": None,
+                "enrollment_generation": None,
+            }
+            # The tenant scope still comes from the agent, not the NULL snapshot.
+            foreign = _resolver(engine, seeded.other_tenant_id)
+            assert await foreign.resolve_execution_owner(legacy_request_id) is None
+        finally:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(f"DELETE FROM {_SCHEMA}.execution_requests WHERE work_item_id = :id"),
+                    {"id": legacy_item_id},
+                )
+                await conn.execute(
+                    text(f"DELETE FROM {_SCHEMA}.work_items WHERE id = :id"),
+                    {"id": legacy_item_id},
+                )
+
+    _with_seed(body)
+
+
 def test_another_tenants_resolver_answers_none_exactly_like_an_unknown_request() -> None:
     async def body(engine: AsyncEngine, seeded: Seeded) -> None:
         foreign = _resolver(engine, seeded.other_tenant_id)
