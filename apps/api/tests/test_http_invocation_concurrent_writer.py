@@ -22,7 +22,11 @@ import redis.asyncio as redis_async
 from curie_api import identity_fence, principal_authority
 from curie_api.config import get_settings
 from curie_api.identity import http_invocation
+from curie_api.identity.http_transport import HttpIdentityClient
+from curie_api.main import create_app
+from curie_api.schemas.http_identity import FactsRefusal
 from curie_internal.identity_authority import IDENTITY_CALLER_WAIT_SECONDS
+from fastapi.testclient import TestClient
 from role_policy_support import run
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -296,3 +300,104 @@ def test_uncontended_slow_lookup_within_the_budget_queues_once(
 def test_production_composition_budget_is_below_the_caller_wait() -> None:
     """@spec HTTP-INVOCATION-EXECUTION-4: derived from the shared caller wait, not retyped."""
     assert 0 < http_invocation._COMPOSITION_BUDGET_SECONDS < IDENTITY_CALLER_WAIT_SECONDS
+
+
+def test_one_unavailable_lookup_is_retried_within_the_composition_budget(
+    clean_db: None, valkey: redis.Redis, runs_stream: str,
+    synthetic_provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-4: one unavailable lookup retries inside the budget."""
+    provider = synthetic_provider
+    real = HttpIdentityClient.lookup
+    pending = True
+
+    async def lookup(client: HttpIdentityClient, **kwargs: Any) -> Any:
+        """@spec HTTP-INVOCATION-EXECUTION-4: the first refusal does not call the provider."""
+        nonlocal pending
+        if pending:
+            pending = False
+            return FactsRefusal(code="unavailable")
+        return await real(client, **kwargs)
+
+    monkeypatch.setattr(HttpIdentityClient, "lookup", lookup)
+    # The helper's own POST is the composition under test.
+    with turn_authority.queued_invocation(provider, valkey, runs_stream):
+        pass
+
+
+def test_unavailable_lookups_exhaust_the_composition_attempts(
+    clean_db: None, valkey: redis.Redis, runs_stream: str,
+    synthetic_provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-4: unavailable lookups exhaust the three attempts."""
+    provider = synthetic_provider
+    scope = membership._scope(provider.url)
+    scope["trusted"] = ()
+    module = membership._runtime_api()
+    identity_client = HttpIdentityClient(tls_context=provider.tls)
+    calls: list[int] = []
+
+    async def lookup(client: HttpIdentityClient, **kwargs: Any) -> Any:
+        """@spec HTTP-INVOCATION-EXECUTION-4: refuse without calling the provider."""
+        calls.append(1)
+        return FactsRefusal(code="unavailable")
+
+    monkeypatch.setattr(HttpIdentityClient, "lookup", lookup)
+    try:
+        with TestClient(create_app(
+            http_identity_runtime=membership._runtime(module, scope),
+            http_identity_client=identity_client,
+        )) as client:
+            credential = membership._credential(client, scope)
+            before = turn_authority.delivery_state(valkey, runs_stream, scope["binding"])
+            refused = membership._post(client, credential, *membership._submission(scope))
+            assert refused.status_code == 503, refused.text
+            assert refused.json() == {"detail": "identity_authority_unavailable"}
+            assert len(calls) == 3
+            assert turn_authority.delivery_state(
+                valkey, runs_stream, scope["binding"],
+            ) == before
+        assert identity_client.close_status().state == "closed"
+    finally:
+        keys = membership._keys(valkey, scope["binding"])
+        if keys:
+            valkey.delete(*keys)
+
+
+def test_non_unavailable_lookup_refusal_is_not_retried(
+    clean_db: None, valkey: redis.Redis, runs_stream: str,
+    synthetic_provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-4: a non-unavailable lookup refusal is not retried."""
+    provider = synthetic_provider
+    scope = membership._scope(provider.url)
+    scope["trusted"] = ()
+    module = membership._runtime_api()
+    identity_client = HttpIdentityClient(tls_context=provider.tls)
+    calls: list[int] = []
+
+    async def lookup(client: HttpIdentityClient, **kwargs: Any) -> Any:
+        """@spec HTTP-INVOCATION-EXECUTION-4: refuse without calling the provider."""
+        calls.append(1)
+        return FactsRefusal(code="identity_stale")
+
+    monkeypatch.setattr(HttpIdentityClient, "lookup", lookup)
+    try:
+        with TestClient(create_app(
+            http_identity_runtime=membership._runtime(module, scope),
+            http_identity_client=identity_client,
+        )) as client:
+            credential = membership._credential(client, scope)
+            before = turn_authority.delivery_state(valkey, runs_stream, scope["binding"])
+            refused = membership._post(client, credential, *membership._submission(scope))
+            assert refused.status_code == 503, refused.text
+            assert refused.json() == {"detail": "identity_authority_unavailable"}
+            assert len(calls) == 1
+            assert turn_authority.delivery_state(
+                valkey, runs_stream, scope["binding"],
+            ) == before
+        assert identity_client.close_status().state == "closed"
+    finally:
+        keys = membership._keys(valkey, scope["binding"])
+        if keys:
+            valkey.delete(*keys)
