@@ -399,6 +399,18 @@ impl crate::ui::CliOutput for WorkItemsOutput {
                     &format!("{} {}", work_item_issue_label(item), item.tracker.url),
                 );
                 line("state", &item.state);
+                line(
+                    "auth",
+                    &match (item.model_auth_mode.as_deref(), &item.owner_principal_id) {
+                        (Some("personal"), Some(owner)) => format!(
+                            "personal, owner {owner}, generation {}, tenant {}",
+                            item.enrollment_generation
+                                .map_or_else(|| "-".into(), |g| g.to_string()),
+                            item.tenant_id.as_deref().unwrap_or("-")
+                        ),
+                        _ => "service".into(),
+                    },
+                );
                 line("cause", &item.actionable_cause);
                 line(
                     "pr",

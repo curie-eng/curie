@@ -445,6 +445,22 @@ WHERE c.kind = :kind AND c.address = :address
   AND a.tenant_id = :tenant_id AND c.tenant_id = :tenant_id
 """
 
+# #5376: the immutable owner tuple a request snapshotted at insertion. A read
+# only; the agent's tenant scopes it so another tenant answers like an unknown id.
+_EXECUTION_OWNER_SQL = """
+SELECT w.id AS work_item_id,
+       r.id AS request_id,
+       w.agent_id AS agent_id,
+       r.tenant_id AS tenant_id,
+       r.model_auth_mode AS model_auth_mode,
+       r.owner_principal_id AS owner_principal_id,
+       r.enrollment_generation AS enrollment_generation
+FROM {schema}.execution_requests r
+JOIN {schema}.work_items w ON w.id = r.work_item_id
+JOIN {schema}.agents a ON a.id = w.agent_id
+WHERE r.id = :request_id AND a.tenant_id = :tenant_id
+"""
+
 # ADR-0168 decision 6: the identity bound at an address, if any. A channel-port
 # identity is one adapter deployment on one address and writes as that
 # address. Case-insensitive because the mail adapter lowercases a sender
@@ -557,6 +573,20 @@ class FactoryWake(BaseModel):
     address: str
     adapter: str | None
     conversation_id: str
+
+
+class ExecutionOwner(BaseModel):
+    """The owner facts one execution request snapshotted (#5376); facts only."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    work_item_id: uuid.UUID
+    request_id: uuid.UUID
+    agent_id: uuid.UUID
+    tenant_id: uuid.UUID
+    model_auth_mode: Literal["service", "personal"]
+    owner_principal_id: uuid.UUID | None
+    enrollment_generation: int | None
 
 
 class FactoryContext(BaseModel):
@@ -757,6 +787,7 @@ class BindingResolver:
         self._undeployed_binding_sql = text(_UNDEPLOYED_BINDING_SQL.format(schema=config.db_schema))
         self._resolve_agent_sql = text(_RESOLVE_AGENT_SQL.format(schema=config.db_schema))
         self._address_identity_sql = text(_ADDRESS_IDENTITY_SQL.format(schema=config.db_schema))
+        self._execution_owner_sql = text(_EXECUTION_OWNER_SQL.format(schema=config.db_schema))
 
     async def identity_binding(
         self, kind: str, adapter: str | None, address: str,
@@ -917,6 +948,19 @@ class BindingResolver:
         # through the bound agent's route, so naming either agent is a guess.
         refuse_several_agents(kind, address, mapped)
         return BoundAgent.model_validate(mapped[0])
+
+    async def resolve_execution_owner(self, request_id: uuid.UUID) -> ExecutionOwner | None:
+        """The owner tuple ``request_id`` snapshotted, or None when unknown or foreign."""
+        async with self._engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    self._execution_owner_sql,
+                    {"request_id": request_id, "tenant_id": self._tenant_id},
+                )
+            ).first()
+        if row is None:
+            return None
+        return ExecutionOwner.model_validate(dict(row._mapping))
 
     async def identity_for_address(self, kind: str, address: str) -> str | None:
         """The identity bound at ``address`` on ``kind``, or None (ADR-0168 decision 6)."""

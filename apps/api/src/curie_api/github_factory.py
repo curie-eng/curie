@@ -27,7 +27,7 @@ from curie_api.workitems.lifecycle import (
 )
 
 from . import factory_rediscovery, workitem_dispatch
-from .config import Settings
+from .config import Settings, get_settings
 from .factory_admission import (
     LABEL_REFUSAL_MARKER,
     cancel_work_item,
@@ -249,6 +249,9 @@ def _facts(notice: FactoryNotice, binding: AgentChannel, registry: ForgeRegistry
         trigger_label=(
             effective_trigger_label(binding, registry) if notice.disposition == "admit" else None
         ),
+        # The installation's mode and never an owner: a webhook carries no
+        # verified owner, and its sender is not one (#5376).
+        model_auth_mode=get_settings().factory_model_auth_mode,
     )
 
 

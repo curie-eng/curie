@@ -52,6 +52,8 @@ WorkItemOutcomeState = Literal[
     "completed_unpublished",
 ]
 WorkItemCiState = Literal["passing", "failing", "pending", "none", "unavailable", "not_applicable"]
+# Who an execution's model calls are billed to (#5376, ADR 0268).
+ModelAuthMode = Literal["service", "personal"]
 
 
 class WorkItemRequestOut(BaseModel):
@@ -70,6 +72,11 @@ class WorkItemRequestOut(BaseModel):
     capacity_deferrals: int
     last_deferral_reason: str | None
     last_start_failure_detail: str | None
+    # The owner tuple this request snapshotted at insertion (#5376).
+    tenant_id: uuid.UUID | None = None
+    model_auth_mode: ModelAuthMode = "service"
+    owner_principal_id: uuid.UUID | None = None
+    enrollment_generation: int | None = None
 
 
 class WorkItemPrOut(BaseModel):
@@ -218,6 +225,13 @@ class WorkItemOutcomeOut(BaseModel):
     # them from the factory status comment rows and phase reports.
     title: str | None = None
     progress: WorkItemProgressOut | None = None
+    # Who the WorkItem's executions run as (#5376, ADR 0268): the tenant, the
+    # mode, and for a personal WorkItem its owner principal and the bound
+    # enrollment generation. Identifiers only, never a credential.
+    tenant_id: uuid.UUID | None = None
+    model_auth_mode: ModelAuthMode = "service"
+    owner_principal_id: uuid.UUID | None = None
+    enrollment_generation: int | None = None
 
 
 class WorkItemOutcomeList(BaseModel):

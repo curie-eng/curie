@@ -40,6 +40,14 @@ from ..models import (
     WorkItem,
     new_card_token,
 )
+from ..personal_execution import (
+    ModelAuthMode,
+    OwnerTuple,
+    assert_no_owner_columns,
+    compare_owner,
+    mode_of,
+    snapshot_columns,
+)
 
 if TYPE_CHECKING:
     # factory_base reaches this module through factory_notices at import time.
@@ -70,6 +78,9 @@ ConflictCode = Literal[
     "publication_ineligible",
     "publication_pending",
     "termination_observation_required",
+    # An explicit personal owner that differs from the WorkItem it raced to (#5376).
+    "owner_mismatch",
+    "enrollment_generation_mismatch",
 ]
 
 _ACTIVE_STATUSES = ("waiting", "running", "cancellation_requested")
@@ -298,6 +309,11 @@ class WorkItemSnapshot:
     cancelled_at: datetime | None
     version: int
     next_sequence: int
+    # The owner tuple (#5376).
+    tenant_id: uuid.UUID | None
+    model_auth_mode: ModelAuthMode
+    owner_principal_id: uuid.UUID | None
+    enrollment_generation: int | None
 
 
 @dataclass(frozen=True)
@@ -313,6 +329,11 @@ class ExecutionRequestSnapshot:
     terminal_cause: str | None
     termination_observation: str | None
     version: int
+    # The owner tuple this request snapshotted at insertion (#5376).
+    tenant_id: uuid.UUID | None
+    model_auth_mode: ModelAuthMode
+    owner_principal_id: uuid.UUID | None
+    enrollment_generation: int | None
 
 
 @dataclass(frozen=True)
@@ -346,6 +367,10 @@ def _work_item_snapshot(row: WorkItem) -> WorkItemSnapshot:
         cancelled_at=row.cancelled_at,
         version=row.version,
         next_sequence=row.next_sequence,
+        tenant_id=row.tenant_id,
+        model_auth_mode=mode_of(row.model_auth_mode),
+        owner_principal_id=row.owner_principal_id,
+        enrollment_generation=row.enrollment_generation,
     )
 
 
@@ -362,6 +387,10 @@ def _request_snapshot(row: ExecutionRequest) -> ExecutionRequestSnapshot:
         terminal_cause=row.terminal_cause,
         termination_observation=row.termination_observation,
         version=row.version,
+        tenant_id=row.tenant_id,
+        model_auth_mode=mode_of(row.model_auth_mode),
+        owner_principal_id=row.owner_principal_id,
+        enrollment_generation=row.enrollment_generation,
     )
 
 
@@ -639,6 +668,7 @@ async def create_or_get_work_item(
     conversation_id: str,
     base: ResolvedBase | None = None,
     trigger_label: str | None,
+    owner: OwnerTuple | None = None,
 ) -> WorkItemResult:
     """Insert the WorkItem, or return the existing one for the same issue.
 
@@ -648,13 +678,29 @@ async def create_or_get_work_item(
     an existing WorkItem recorded is the one it keeps. ``trigger_label`` is the
     label that admitted it (#4361 decision 10), None for an admission no label
     started; it follows the base fields' rule.
+
+    ``owner`` is the validated owner tuple the WorkItem is bound to (#5376);
+    None is a service WorkItem in the agent's tenant. An existing WorkItem
+    keeps its tuple: an explicit personal owner must equal it, and anything
+    else reuses it.
     """
 
+    owner_values = (
+        owner.columns()
+        if owner is not None
+        else {
+            "tenant_id": select(Agent.tenant_id).where(Agent.id == agent_id).scalar_subquery(),
+            "model_auth_mode": "service",
+            "owner_principal_id": None,
+            "enrollment_generation": None,
+        }
+    )
     new_id = uuid.uuid4()
     statement = (
         insert(WorkItem)
         .values(
             id=new_id,
+            **owner_values,
             **work_item_identity_values(issue, repository),
             code_host_installation_id=code_host_installation_id,
             agent_id=agent_id,
@@ -698,6 +744,10 @@ async def create_or_get_work_item(
     )
     if not exact_replay:
         return await _conflict(session, "identity_mismatch", work_item=work_item)
+    if inserted_id is None and owner is not None and owner.is_personal:
+        mismatch = compare_owner(OwnerTuple.of(work_item), owner)
+        if mismatch is not None:
+            return await _conflict(session, mismatch, work_item=work_item)
     return await outcome(session, work_item, None, replayed=inserted_id is None)
 
 
@@ -714,9 +764,12 @@ async def _insert_waiting_request(
     """Allocate the next sequence and insert a waiting request; the caller commits.
 
     False when the WorkItem moved past ``expected_work_item_version`` or was
-    cancelled. An ``IntegrityError`` leaves the savepoint rolled back.
+    cancelled. An ``IntegrityError`` leaves the savepoint rolled back. The
+    request snapshots ``work_item``'s owner tuple, so ``work_item`` is the
+    locked row and ``columns`` never names an owner fact (#5376).
     """
 
+    assert_no_owner_columns(columns or {})
     sequence = work_item.next_sequence
     async with session.begin_nested():
         changed_id: uuid.UUID | None = await session.scalar(
@@ -744,6 +797,7 @@ async def _insert_waiting_request(
                 wait_deadline=wait_deadline,
                 base_settle_until=base_settle_until,
                 version=1,
+                **snapshot_columns(work_item),
                 **(columns or {}),
             )
         )
@@ -860,6 +914,7 @@ async def create_revision_request(
             wait_deadline=wait_deadline,
             expected_work_item_version=expected_work_item_version,
         )
+    assert_no_owner_columns(snapshot)
     sequence = work_item.next_sequence
     try:
         async with session.begin_nested():
@@ -886,6 +941,7 @@ async def create_revision_request(
                     status="queued",
                     wait_deadline=None,
                     version=1,
+                    **snapshot_columns(work_item),
                     **snapshot,
                 )
             )
