@@ -30,7 +30,7 @@ DYNAMIC_BASE_RUNTIME = "tools/factory-e2e/tests/test_c4_dynamic_base.py"
 ADMITTED_AGENT_RUNTIMES = (ADMITTED_AGENT_RUNTIME, DYNAMIC_BASE_RUNTIME)
 SCRIPTED_FACTORY_JOB = "e2e-scripted-factory"
 ADMITTED_AGENT_JOB = "factory-admitted-agent"
-ADMITTED_AGENT_SHARDS = [1, 2, 3, 4, 5]
+ADMITTED_AGENT_SHARDS = [1, 2, 3, 4, 5, 6, 7]
 RELABEL_REGRESSION = (
     "test_two_worker_ci_preserves_successor_identity_and_rejects_stale_predecessor"
 )
@@ -1290,17 +1290,17 @@ def test_admitted_agent_factory_step_runs_whole_module_and_propagates_failure(
 ) -> None:
     _, step = _admitted_agent_runtime_owner(ADMITTED_AGENT_RUNTIME)
     completed, arguments = _record_uv_step(
-        tmp_path, step, environment={"CASE_SHARD": "3/5"}, exit_code=exit_code
+        tmp_path, step, environment={"CASE_SHARD": "3/7"}, exit_code=exit_code
     )
     assert arguments[:2] == ["run", "pytest"]
     for runtime in ADMITTED_AGENT_RUNTIMES:
         assert arguments.count(runtime) == 1
-    assert arguments[arguments.index("--case-shard") + 1] == "3/5"
+    assert arguments[arguments.index("--case-shard") + 1] == "3/7"
     assert arguments[arguments.index("-n") + 1] == "0"
     assert all(
         argument in {
             "run", "pytest", "-q", "-v", "-vv", "-n", "0", "--durations=0",
-            "--case-shard", "3/5", *ADMITTED_AGENT_RUNTIMES,
+            "--case-shard", "3/7", *ADMITTED_AGENT_RUNTIMES,
         }
         for argument in arguments
     ), arguments
@@ -1309,7 +1309,7 @@ def test_admitted_agent_factory_step_runs_whole_module_and_propagates_failure(
 
 def test_admitted_agent_shards_partition_the_module_in_collection_order(tmp_path: Path) -> None:
     _, step = _admitted_agent_runtime_owner(ADMITTED_AGENT_RUNTIME)
-    completed, arguments = _record_uv_step(tmp_path, step, environment={"CASE_SHARD": "1/5"})
+    completed, arguments = _record_uv_step(tmp_path, step, environment={"CASE_SHARD": "1/7"})
     assert completed.returncode == 0, completed.stdout + completed.stderr
     modules = [argument for argument in arguments if argument in ADMITTED_AGENT_RUNTIMES]
     assert modules == list(ADMITTED_AGENT_RUNTIMES)
@@ -1327,17 +1327,21 @@ def test_admitted_agent_shards_partition_the_module_in_collection_order(tmp_path
     count = len(ADMITTED_AGENT_SHARDS)
     shards = [collect("--case-shard", f"{index}/{count}") for index in ADMITTED_AGENT_SHARDS]
     assert all(shards)
-    assert [case for shard in shards for case in shard] == whole
-    # The successor regression keeps the continuation cases that precede it
-    # today in the same process, so its shard reproduces their order.
+    flattened = [case for shard in shards for case in shard]
+    assert len(flattened) == len(whole)
+    assert set(flattened) == set(whole)
+    assert all(shard == [case for case in whole if case in shard] for shard in shards)
+    prefix = (
+        f"{ADMITTED_AGENT_RUNTIME}::test_continuation_revalidates_current_authority["
+    )
+    continuations = [case for case in whole if case.startswith(prefix)]
+    assert len(continuations) == 6
     relabel = f"{ADMITTED_AGENT_RUNTIME}::{RELABEL_REGRESSION}"
+    assert whole[whole.index(relabel) - 6 : whole.index(relabel)] == continuations
     [owner] = [shard for shard in shards if relabel in shard]
     position = owner.index(relabel)
     assert position >= 6
-    assert all(
-        "test_continuation_revalidates_current_authority" in case
-        for case in owner[position - 6:position]
-    )
+    assert owner[position - 6:position] == continuations
 
 
 @pytest.mark.parametrize("shard", range(1, SHARD_COUNT + 1))

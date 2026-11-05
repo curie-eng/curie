@@ -5056,7 +5056,15 @@ def test_unrelated_changes_do_not_select_the_factory_runtime(tmp_path: Path, pat
 FRESH_INSTALL_TEST = "test_fresh_cluster_up_converges_without_rerun"
 SCRIPTED_FACTORY_LEGS = (
     ("scenario", lambda run: run == "python3 tools/factory-e2e/factory_e2e.py scripted"),
-    ("initial-binding", lambda run: INITIAL_BINDING_MODULE in run),
+    *(
+        (f"initial-binding-{index}",
+         lambda run, index=index: (
+             INITIAL_BINDING_MODULE in run
+             and f"--case-shard {index}/3" in run
+             and "--durations=0" in run
+         ))
+        for index in range(1, 4)
+    ),
     (
         "static-token-rotation",
         lambda run: run == f"uv run pytest -q -n 0 {STATIC_TOKEN_ROTATION_MODULE}",
@@ -5170,16 +5178,15 @@ def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required(tmp_p
 
     steps = job["steps"]
     registrations = [step for step in steps if INITIAL_BINDING_MODULE in step.get("run", "")]
-    assert len(registrations) == 1
-    registration = registrations[0]
+    assert len(registrations) == 3
     rotations = [step for step in steps if STATIC_TOKEN_ROTATION_MODULE in step.get("run", "")]
     assert len(rotations) == 1
     rotation = rotations[0]
     assert rotation["run"] == f"uv run pytest -q -n 0 {STATIC_TOKEN_ROTATION_MODULE}"
     assert not rotation.get("continue-on-error")
-    assert not registration.get("continue-on-error")
+    assert all(not registration.get("continue-on-error") for registration in registrations)
     pytest_steps = [step for step in steps if step.get("run", "").startswith("uv run pytest")]
-    assert len(pytest_steps) == 3
+    assert len(pytest_steps) == 5
     first_pytest = min(steps.index(step) for step in pytest_steps)
     assert any(
         step.get("uses", "").startswith("astral-sh/setup-uv@") for step in steps[:first_pytest]
@@ -5193,24 +5200,25 @@ def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required(tmp_p
         "Path(os.environ['REGISTRATION_ARGV']).write_text(json.dumps(sys.argv[1:]))\n"
     )
     uv.chmod(0o755)
-    executed = subprocess.run(
-        ["bash", "-e", "-o", "pipefail", "-c", registration["run"]],
-        cwd=tmp_path,
-        env={
-            **os.environ,
-            "PATH": f"{binaries}:{os.environ['PATH']}",
-            "REGISTRATION_ARGV": str(log),
-        },
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert executed.returncode == 0, executed.stdout + executed.stderr
-    argv = json.loads(log.read_text())
-    assert argv[:2] == ["run", "pytest"]
-    assert INITIAL_BINDING_MODULE in argv
-    assert not any(arg in argv for arg in ("-k", "-m", "--deselect"))
-    assert not any(arg.startswith(INITIAL_BINDING_MODULE + "::") for arg in argv)
+    for registration in registrations:
+        executed = subprocess.run(
+            ["bash", "-e", "-o", "pipefail", "-c", registration["run"]],
+            cwd=tmp_path,
+            env={
+                **os.environ,
+                "PATH": f"{binaries}:{os.environ['PATH']}",
+                "REGISTRATION_ARGV": str(log),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert executed.returncode == 0, executed.stdout + executed.stderr
+        argv = json.loads(log.read_text())
+        assert argv[:2] == ["run", "pytest"]
+        assert INITIAL_BINDING_MODULE in argv
+        assert not any(arg in argv for arg in ("-k", "-m", "--deselect"))
+        assert not any(arg.startswith(INITIAL_BINDING_MODULE + "::") for arg in argv)
 
 
 @pytest.mark.parametrize("exit_code", (0, 17))

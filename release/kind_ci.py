@@ -100,12 +100,14 @@ def required_job_names(repo_root: Path, *, deadline: float) -> frozenset[str]:
                 f"E2E scripted factory (kind, scripted model, {suite})"
                 for suite in (
                     "scenario",
-                    "initial-binding",
+                    "initial-binding-1",
+                    "initial-binding-2",
+                    "initial-binding-3",
                     "static-token-rotation",
                     "fresh-install",
                 )
             ),
-            *(f"Admitted agent runtime regressions (kind, shard {n}/5)" for n in range(1, 6)),
+            *(f"Admitted agent runtime regressions (kind, shard {n}/7)" for n in range(1, 8)),
             *(f"E2E cluster upgrade matrix ({shard_id})" for shard_id in ids),
         ]
     )

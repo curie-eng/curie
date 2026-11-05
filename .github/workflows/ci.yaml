@@ -3415,7 +3415,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [scenario, initial-binding, static-token-rotation, fresh-install]
+        suite: [scenario, initial-binding-1, initial-binding-2, initial-binding-3, static-token-rotation, fresh-install]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -3512,9 +3512,15 @@ jobs:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
           BUILDX_BUILDER: default
         run: python3 tools/factory-e2e/factory_e2e.py scripted
-      - name: Run the initial tracker binding regressions
-        if: matrix.suite == 'initial-binding'
-        run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_initial_binding.py
+      - name: Run the initial tracker binding regressions (shard 1/3)
+        if: matrix.suite == 'initial-binding-1'
+        run: uv run pytest -q -n 0 --durations=0 tools/factory-e2e/tests/test_c4_initial_binding.py --case-shard 1/3
+      - name: Run the initial tracker binding regressions (shard 2/3)
+        if: matrix.suite == 'initial-binding-2'
+        run: uv run pytest -q -n 0 --durations=0 tools/factory-e2e/tests/test_c4_initial_binding.py --case-shard 2/3
+      - name: Run the initial tracker binding regressions (shard 3/3)
+        if: matrix.suite == 'initial-binding-3'
+        run: uv run pytest -q -n 0 --durations=0 tools/factory-e2e/tests/test_c4_initial_binding.py --case-shard 3/3
       - name: Run the static token rotation regression
         if: matrix.suite == 'static-token-rotation'
         run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_static_token_rotation.py
@@ -3534,11 +3540,10 @@ jobs:
   # so it rebuilds nothing from the checkout. It is selected exactly like the
   # scripted factory scenario (#4620). Each leg provisions one kind cluster and
   # one platform install, and gives every case fresh agents on that install
-  # with a verified clean start. Each leg runs one contiguous collection-order
-  # block, so a case still runs after the cases that precede it. The legs
-  # partition the module exactly, and `E2E required` needs every leg.
+  # with a verified clean start. Duration weights balance cases across legs,
+  # retaining collection order within each leg. `E2E required` needs every leg.
   factory-admitted-agent:
-    name: Admitted agent runtime regressions (kind, shard ${{ matrix.shard }}/5)
+    name: Admitted agent runtime regressions (kind, shard ${{ matrix.shard }}/7)
     runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
     if: ${{ needs.changes.outputs.factory == 'true' && needs.changes.outputs.deep == 'true' }}
@@ -3546,7 +3551,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5]
+        shard: [1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -3646,7 +3651,7 @@ jobs:
           df -h /
       - name: Run admitted agent runtime regressions
         env:
-          CASE_SHARD: ${{ matrix.shard }}/5
+          CASE_SHARD: ${{ matrix.shard }}/7
           CURIE_C4_CANDIDATE_CLI: ${{ github.workspace }}/cli/target/release/curie
           CURIE_C4_CANDIDATE_IMAGES: curie-ci/{component}:candidate
         run: uv run pytest -q -n 0 --durations=0 tools/factory-e2e/tests/test_c4_admitted_agent.py tools/factory-e2e/tests/test_c4_dynamic_base.py --case-shard "$CASE_SHARD"
