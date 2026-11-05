@@ -6,7 +6,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
 from case_shards import assign_case_shards, load_durations
 
 

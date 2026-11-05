@@ -5074,7 +5074,15 @@ def test_unrelated_changes_do_not_select_the_factory_runtime(tmp_path: Path, pat
 FRESH_INSTALL_TEST = "test_fresh_cluster_up_converges_without_rerun"
 SCRIPTED_FACTORY_LEGS = (
     ("scenario", lambda run: run == "python3 tools/factory-e2e/factory_e2e.py scripted"),
-    ("initial-binding", lambda run: INITIAL_BINDING_MODULE in run),
+    *(
+        (f"initial-binding-{index}",
+         lambda run, index=index: (
+             INITIAL_BINDING_MODULE in run
+             and f"--case-shard {index}/3" in run
+             and "--durations=0" in run
+         ))
+        for index in range(1, 4)
+    ),
     (
         "static-token-rotation",
         lambda run: run == f"uv run pytest -q -n 0 {STATIC_TOKEN_ROTATION_MODULE}",
