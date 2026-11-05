@@ -801,6 +801,31 @@ MANAGED_REFUSALS: dict[str, dict[str, object]] = {
         "managed-settings.json": {"env": {REVIEWER_ENV: FORCED_SUBAGENT_MODEL}}
     },
     "env-not-an-object": {"managed-settings.json": {"env": ["ANTHROPIC_API_KEY"]}},
+    # Managed ``availableModels`` must literally list the implementer and the
+    # configured reviewer: observed on CLI 2.1.301 (the workspace control in
+    # test_personal_claude_reviewers.py), a role whose model is outside the
+    # allowlist silently inherits the parent's model, and the runner does not
+    # bypass mandatory policy, so it refuses.
+    "available-models-missing-reviewer": {
+        "managed-settings.json": {"availableModels": [IMPLEMENTER_MODEL, FORCED_SUBAGENT_MODEL]}
+    },
+    "available-models-missing-implementer": {
+        "managed-settings.json": {"availableModels": [REVIEWER_MODEL, FORCED_SUBAGENT_MODEL]}
+    },
+    "available-models-reviewer-as-alias": {
+        "managed-settings.json": {"availableModels": [IMPLEMENTER_MODEL, "opus"]}
+    },
+    "available-models-empty": {"managed-settings.json": {"availableModels": []}},
+    "available-models-not-a-list": {
+        "managed-settings.json": {"availableModels": f"{IMPLEMENTER_MODEL},{REVIEWER_MODEL}"}
+    },
+    "available-models-null": {"managed-settings.json": {"availableModels": None}},
+    "available-models-non-string-entry": {
+        "managed-settings.json": {"availableModels": [IMPLEMENTER_MODEL, REVIEWER_MODEL, 5]}
+    },
+    "drop-in-available-models-missing-reviewer": {
+        "managed-settings.d/30-models.json": {"availableModels": [IMPLEMENTER_MODEL]}
+    },
     "invalid-json": {"managed-settings.json": "{not json"},
     "not-an-object": {"managed-settings.json": '["forceLoginMethod"]'},
     "drop-in-invalid-json": {"managed-settings.d/10-broken.json": "{not json"},
@@ -833,6 +858,29 @@ def test_managed_policy_with_a_competing_source_is_refused_before_the_cli_starts
         connect_session(wiring)
 
     assert no_placeholder_in(str(refused.value)) == []
+    assert_cli_never_started(install.proxy)
+
+
+def test_a_managed_model_allowlist_without_an_explicit_implementer_model_is_refused(
+    install: Installation, monkeypatch: pytest.MonkeyPatch, managed_dir: Path
+) -> None:
+    # With no session ``model`` the CLI picks its own default, which the guard
+    # cannot check against the allowlist. The same policy launches with an
+    # explicit implementer model (the liveness case below).
+    personal(monkeypatch)
+    plant_managed(
+        managed_dir,
+        {
+            "managed-settings.json": {
+                "availableModels": [IMPLEMENTER_MODEL, REVIEWER_MODEL, FORCED_SUBAGENT_MODEL]
+            }
+        },
+    )
+    wiring = wire_session(install, reviewer_model=REVIEWER_MODEL, implementer_model=None)
+
+    with pytest.raises(PersonalLaunchRefusedError):
+        connect_session(wiring)
+
     assert_cli_never_started(install.proxy)
 
 
@@ -876,15 +924,19 @@ def test_managed_claudeai_policy_with_installation_transport_still_launches(
     # installation transport; hidden drop-ins and non-.json files are not read by
     # the CLI (managed-settings docs), so their forcing keys do not refuse either.
     # Keep-list runner settings and non-provider names are allowed in managed
-    # env (D2), and a managed ``availableModels`` allowlist is mandatory policy
-    # the runner respects, not a competing source (D3).
+    # env (D2), and a managed ``availableModels`` allowlist that lists the
+    # implementer and the configured reviewer (plus any other model) is
+    # mandatory policy the runner respects (D3). The pinned CLI reads managed
+    # policy only at /etc/claude-code, so offline this proves the guard's
+    # decision; the CLI-side effect of an allowlist is the workspace control in
+    # test_personal_claude_reviewers.py.
     personal(monkeypatch)
     plant_managed(
         managed_dir,
         {
             "managed-settings.json": {
                 "forceLoginMethod": "claudeai",
-                "availableModels": [IMPLEMENTER_MODEL, REVIEWER_MODEL],
+                "availableModels": [IMPLEMENTER_MODEL, REVIEWER_MODEL, FORCED_SUBAGENT_MODEL],
                 "env": {
                     "HTTPS_PROXY": install.proxy.url,
                     "NODE_EXTRA_CA_CERTS": os.environ["NODE_EXTRA_CA_CERTS"],

@@ -803,18 +803,20 @@ def wire_session(
     explicit_env: Mapping[str, str] | None = None,
     plugin_dir: str | None = None,
     max_turns: int = 6,
+    implementer_model: str | None = IMPLEMENTER_MODEL,
 ) -> Wiring:
     """``resolve_sdk_env(os.environ)`` then ``build_options``, as ``__main__`` does.
 
     ``explicit_env`` is what a caller hands ``build_options`` as the SDK env on
-    top of the boot override (``ClaudeAgentOptions.env``).
+    top of the boot override (``ClaudeAgentOptions.env``). ``implementer_model``
+    is the session ``model``; None leaves it to the CLI's default.
     """
 
     override = resolve_sdk_env(os.environ)
     access = TurnToolAccess(CLAUDE_READONLY_TOOLS)
     options = build_options(
         plugins=load_plugins(plugin_dir),
-        model=IMPLEMENTER_MODEL,
+        model=implementer_model,
         reviewer_model=reviewer_model,
         system_prompt=IMPLEMENTER_MARKER,
         max_turns=max_turns,

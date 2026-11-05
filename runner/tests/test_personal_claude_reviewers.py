@@ -367,3 +367,26 @@ def test_workspace_settings_without_a_rerouting_key_still_run_both_reviewers(
         **{role: {REVIEWER_MODEL} for role in _ROLES},
     }
     assert_owner_grant_only(install.proxy)
+
+
+@requires_cli
+def test_a_managed_allowlist_naming_both_models_keeps_both_roles_on_the_reviewer(
+    install: Installation, monkeypatch: pytest.MonkeyPatch, managed_dir: Path
+) -> None:
+    # Liveness for the managed ``availableModels`` refusals in
+    # test_personal_claude_auth.py. The pinned CLI reads managed policy only at
+    # /etc/claude-code, so this proves the guard's decision offline; the
+    # CLI-side effect of an allowlist is the workspace control above.
+    _personal(monkeypatch)
+    write_json(
+        managed_dir / "managed-settings.json",
+        {"availableModels": [IMPLEMENTER_MODEL, REVIEWER_MODEL, FORCED_SUBAGENT_MODEL]},
+    )
+
+    _, by_role = _review_turn(install, reviewer_model=REVIEWER_MODEL)
+
+    assert _role_models(by_role) == {
+        "implementer": {IMPLEMENTER_MODEL},
+        **{role: {REVIEWER_MODEL} for role in _ROLES},
+    }
+    assert_owner_grant_only(install.proxy)
