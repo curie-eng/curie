@@ -14,6 +14,7 @@ from aci_protocol import ErrorEvent, Final, SessionStatus, TurnSource
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from curie_worker.consumer import Consumer
+from curie_worker.delivery_lease import DeliveryBudget
 from curie_worker.kernel.failures import failure_class_from_reply
 from curie_worker.sandbox import QuotaRejection
 from curie_worker.workspace import (
@@ -62,10 +63,13 @@ async def _park(h: Any, consumer: Consumer, event: Any) -> None:
 @asynccontextmanager
 async def _selection_server():
     deployment = uuid.uuid4()
-    state = {"status": 200}
+    state: dict[str, Any] = {"status": 200}
 
     async def select(_request: web.Request) -> web.Response:
         state["calls"] = state.get("calls", 0) + 1
+        observer = state.get("before_response")
+        if observer is not None:
+            await observer(state)
         if state.get("fail_after", 100000) <= state["calls"] <= state.get("recover_after", 0):
             return web.Response(status=503)
         if state["status"] != 200:
@@ -209,6 +213,8 @@ def test_capacity_wake_recovers_from_workspace_outage_without_escalating(
                 binding=_workspace_binding(deployment),
                 slack_no_edit_streaming=True,
                 claim_timeout_seconds=0.02,
+                max_attempts=1,
+                workspace_total_timeout_seconds=1,
             ) as h:
                 h.kernel._workspace = WorkspaceClaimCoordinator(
                     preparer=SimpleNamespace(credentials=credentials),
@@ -223,19 +229,14 @@ def test_capacity_wake_recovers_from_workspace_outage_without_escalating(
                 outage_active = True
                 unavailable_until = time.monotonic() + outage_s
                 h.runner.default_script = [Final(text="recovered", status=SessionStatus.DONE)]
-                for _ in range(10000):
-                    entry, fields = await _wake(h, consumer, event.event_id)
-                    await consumer._sem.acquire()
-                    await consumer._handle(entry, fields)
-                    record = await consumer._waits.get(event.event_id)
-                    assert record is not None and record.deadline_ms == original.deadline_ms
-                    if record.state == "done":
-                        break
-                    assert record.state == "waiting"
-                    assert h.runner.opened == []
-                    assert not await h.kernel._markers.is_terminal(event.event_id)
-                else:
-                    pytest.fail("the dependency recovery did not finish")
+                entry, fields = await _wake(h, consumer, event.event_id)
+                await consumer._sem.acquire()
+                await asyncio.wait_for(consumer._handle(entry, fields), timeout=5)
+                record = await consumer._waits.get(event.event_id)
+                assert record is not None and record.state == "done"
+                assert record.deadline_ms == original.deadline_ms
+                assert record.deferrals == 1
+                assert await h.async_redis.xlen(h.config.stream) == 2
                 assert failed_reads >= 4
                 assert h.runner.opened == ["original"]
                 assert h.sink.last_text == "recovered"
@@ -245,12 +246,15 @@ def test_capacity_wake_recovers_from_workspace_outage_without_escalating(
     asyncio.run(go())
 
 
-def test_dependency_wait_has_one_fixed_workspace_deadline(make_harness) -> None:
+@pytest.mark.parametrize("bound", ["workspace", "delivery"])
+def test_dependency_wait_has_one_fixed_workspace_deadline(make_harness, bound: str) -> None:
     async def go() -> None:
         async with _selection_server() as (deployment, credentials, state):
             async with make_harness(
                 binding=_workspace_binding(deployment),
                 slack_no_edit_streaming=True,
+                max_attempts=1,
+                workspace_total_timeout_seconds=1,
             ) as h:
                 h.kernel._workspace = WorkspaceClaimCoordinator(
                     preparer=SimpleNamespace(credentials=credentials),
@@ -258,39 +262,56 @@ def test_dependency_wait_has_one_fixed_workspace_deadline(make_harness) -> None:
                 )
                 consumer = _capacity_consumer(h)
                 await consumer.ensure_group()
-                state["status"] = 503
+                state["status"] = 500
                 event = _qevent("original", event_id="dependency-deadline")
-                await _deliver(h, consumer, event)
-                first = await consumer._waits.get(event.event_id)
-                assert first is not None and first.state == "waiting"
-                assert first.dependency_deadline_ms is not None
-                assert (
-                    h.config.workspace_total_timeout_seconds * 1000
-                    <= first.dependency_deadline_ms - first.first_wait_ms
-                    <= 150000
-                )
-                entry, fields = await _wake(h, consumer, event.event_id)
+                entry, fields = await _pending_local_entry(h, event)
+                shortened = False
+
+                async def constrain_delivery(_state: dict[str, Any]) -> None:
+                    nonlocal shortened
+                    if bound != "delivery" or shortened:
+                        return
+                    lease = consumer._held_leases[entry]
+                    server_time = await h.async_redis.time()
+                    now_ms = server_time[0] * 1000 + server_time[1] // 1000
+                    await h.async_redis.hset(
+                        h.config.delivery_state_key(
+                            h.config.stream, h.config.consumer_group, entry
+                        ),
+                        "deadline_ms",
+                        now_ms + 4000,
+                    )
+                    lease.budget = DeliveryBudget(
+                        deadline_ms=now_ms + 4000,
+                        anchor_server_ms=now_ms,
+                        anchor_monotonic=time.monotonic(),
+                    )
+                    shortened = True
+
+                state["before_response"] = constrain_delivery
+                started = time.monotonic()
                 await consumer._sem.acquire()
-                await consumer._handle(entry, fields)
-                again = await consumer._waits.get(event.event_id)
-                assert again is not None and again.state == "waiting"
-                assert again.dependency_deadline_ms == first.dependency_deadline_ms
-                assert again.deadline_ms == first.deadline_ms
-                await h.async_redis.hset(
-                    consumer._waits._record(event.event_id),
-                    "dependency_deadline_ms",
-                    "1",
-                )
-                requests = state["calls"]
-                entry, fields = await _wake(h, consumer, event.event_id)
-                await consumer._sem.acquire()
-                await consumer._handle(entry, fields)
-                assert state["calls"] == requests
-                assert h.runner.opened == []
+                await asyncio.wait_for(consumer._handle(entry, fields), timeout=5)
+                elapsed = time.monotonic() - started
                 assert await h.kernel._markers.is_terminal(event.event_id)
-                assert failure_class_from_reply(h.sink.last_text) == "workspace-error"
-                assert "retry deadline" in h.sink.last_text
+                assert h.runner.opened == []
+                assert await consumer._waits.get(event.event_id) is None
+                assert await h.async_redis.xlen(h.config.stream) == 1
+                assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                    "pending"
+                ] == 0
                 assert h.sink.completions[-1].outcome == "escalated"
+                assert f"after {state['calls']} attempt(s)" in h.sink.last_text
+                if bound == "workspace":
+                    assert h.config.workspace_total_timeout_seconds <= elapsed < 5
+                    assert state["calls"] > h.config.max_attempts
+                    assert failure_class_from_reply(h.sink.last_text) == "workspace-error"
+                    assert "repository-selection" in h.sink.last_text
+                    assert "HTTP 500" in h.sink.last_text
+                else:
+                    assert shortened and elapsed < 5
+                    assert state["calls"] == 1
+                    assert failure_class_from_reply(h.sink.last_text) == "delivery-deadline"
 
     asyncio.run(go())
 
@@ -447,19 +468,18 @@ def test_workspace_dependency_classification_covers_selection_and_redemption(
 
 
 @pytest.mark.parametrize("recovery", ["capacity", "grant"])
-def test_recovered_dependency_deadline_does_not_expire_a_healthy_wait(
+def test_recovered_dependency_preserves_the_original_capacity_deadline(
     make_harness,
-    monkeypatch: pytest.MonkeyPatch,
     recovery: str,
 ) -> None:
-    from curie_worker.kernel import clock
-
     async def go() -> None:
         async with _selection_server() as (deployment, credentials, state):
             async with make_harness(
                 binding=_workspace_binding(deployment),
                 slack_no_edit_streaming=True,
                 claim_timeout_seconds=0.02,
+                max_attempts=1,
+                workspace_total_timeout_seconds=1,
             ) as h:
                 h.kernel._workspace = WorkspaceClaimCoordinator(
                     preparer=SimpleNamespace(credentials=credentials),
@@ -467,50 +487,51 @@ def test_recovered_dependency_deadline_does_not_expire_a_healthy_wait(
                 )
                 consumer = _capacity_consumer(h)
                 await consumer.ensure_group()
-                state["status"] = 503
                 event = _qevent("original", event_id="recovered-dependency")
-                await _deliver(h, consumer, event)
+                await _park(h, consumer, event)
                 first = await consumer._waits.get(event.event_id)
-                assert first is not None and first.dependency_deadline_ms is not None
-                state["status"] = 200
+                assert first is not None and first.state == "waiting"
+                state.update(fail_after=state["calls"] + 1, recover_after=state["calls"] + 3)
+                quota_set = False
+
+                async def fill_quota_after_recovery(observed: dict[str, Any]) -> None:
+                    nonlocal quota_set
+                    if (
+                        recovery == "capacity"
+                        and observed["calls"] > observed["recover_after"]
+                        and not quota_set
+                    ):
+                        h.fake_k8s.quota_rejection = QuotaRejection(
+                            quota_name="acme-quota",
+                            requested={"pods": "1"},
+                            used={"pods": "1"},
+                            hard={"pods": "1"},
+                        )
+                        quota_set = True
+
+                state["before_response"] = fill_quota_after_recovery
                 h.runner.default_script = [
                     Final(text="healthy recovery", status=SessionStatus.DONE)
                 ]
-                if recovery == "capacity":
-                    h.fake_k8s.quota_rejection = QuotaRejection(
-                        quota_name="acme-quota",
-                        requested={"pods": "1"},
-                        used={"pods": "1"},
-                        hard={"pods": "1"},
-                    )
                 entry, fields = await _wake(h, consumer, event.event_id)
                 await consumer._sem.acquire()
-                await consumer._handle(entry, fields)
+                await asyncio.wait_for(consumer._handle(entry, fields), timeout=5)
+                assert state["calls"] > state["recover_after"]
                 recovered = await consumer._waits.get(event.event_id)
-                assert recovered is not None
-                assert recovered.dependency_deadline_ms is None
-                assert not await h.async_redis.hexists(
-                    consumer._waits._record(event.event_id),
-                    "dependency_first_ms",
-                )
+                assert recovered is not None and recovered.deadline_ms == first.deadline_ms
                 if recovery == "capacity":
-                    assert recovered.state == "waiting" and h.runner.opened == []
-                    assert recovered.deadline_ms == first.deadline_ms
+                    assert quota_set and recovered.state == "waiting"
+                    assert recovered.deferrals == 2 and h.runner.opened == []
                     h.fake_k8s.quota_rejection = None
-                    monkeypatch.setattr(
-                        clock,
-                        "time",
-                        SimpleNamespace(
-                            time=lambda: first.dependency_deadline_ms / 1000 + 1,
-                            monotonic=time.monotonic,
-                        ),
-                    )
                     entry, fields = await _wake(h, consumer, event.event_id)
                     await consumer._sem.acquire()
                     await consumer._handle(entry, fields)
+                else:
+                    assert recovered.state == "done" and recovered.deferrals == 1
                 assert h.runner.opened == ["original"]
                 assert h.sink.last_text == "healthy recovery"
                 assert h.sink.completions[-1].outcome == "delivered"
+                assert (await consumer._waits.get(event.event_id)).deadline_ms == first.deadline_ms
 
     asyncio.run(go())
 
@@ -524,6 +545,8 @@ def test_followup_cannot_overtake_an_initial_dependency_failure(
         deployment = uuid.uuid4()
         first_entered = asyncio.Event()
         release_first = asyncio.Event()
+        retry_entered = asyncio.Event()
+        release_retry = asyncio.Event()
         calls = 0
 
         async def selection(_request: web.Request) -> web.Response:
@@ -533,6 +556,9 @@ def test_followup_cannot_overtake_an_initial_dependency_failure(
                 first_entered.set()
                 await release_first.wait()
                 return web.Response(status=503)
+            if calls == 2:
+                retry_entered.set()
+                await release_retry.wait()
             return web.json_response({"repo_full_name": None})
 
         app = web.Application()
@@ -542,6 +568,8 @@ def test_followup_cannot_overtake_an_initial_dependency_failure(
                 binding=_workspace_binding(deployment),
                 slack_no_edit_streaming=True,
                 claim_timeout_seconds=0.02,
+                max_attempts=1,
+                workspace_total_timeout_seconds=1,
             )
             h = await stack.enter_async_context(make_harness(**knobs))
             peer = await stack.enter_async_context(make_harness(**knobs)) if separate_kernel else h
@@ -559,6 +587,7 @@ def test_followup_cannot_overtake_an_initial_dependency_failure(
             await first_consumer.ensure_group()
             first = _qevent("first", event_id="initial-first")
             second = _qevent("second", event_id="initial-second", placeholder="p-2")
+            h.runner.default_script = [Final(text="first answer", status=SessionStatus.DONE)]
             first_task = asyncio.create_task(_deliver(h, first_consumer, first))
             second_task = None
             try:
@@ -577,14 +606,14 @@ def test_followup_cannot_overtake_an_initial_dependency_failure(
                     assert await second_consumer._waits.get(second.event_id) is None
                 assert h.runner.opened == peer.runner.opened == []
                 release_first.set()
-                await first_task
-                await second_task
+                await asyncio.wait_for(retry_entered.wait(), timeout=2)
+                await asyncio.wait_for(asyncio.shield(second_task), timeout=1)
                 waiting = await second_consumer._waits.get(second.event_id)
                 assert waiting is not None and waiting.state == "waiting"
-                h.runner.default_script = [Final(text="first answer", status=SessionStatus.DONE)]
-                entry, fields = await _wake(h, first_consumer, first.event_id)
-                await first_consumer._sem.acquire()
-                await first_consumer._handle(entry, fields)
+                assert not first_task.done()
+                assert h.runner.opened == peer.runner.opened == []
+                release_retry.set()
+                await first_task
                 assert h.runner.opened == ["first"]
                 assert h.sink.last_text == "first answer"
                 for target in (h, peer):
@@ -599,6 +628,7 @@ def test_followup_cannot_overtake_an_initial_dependency_failure(
                 assert peer.sink.last_text == "second answer"
             finally:
                 release_first.set()
+                release_retry.set()
                 if second_task is not None and not second_task.done():
                     second_task.cancel()
                 await asyncio.gather(
@@ -910,5 +940,246 @@ def test_approval_resume_escalation_stays_owed_when_adapter_is_unreachable(make_
                 await h.kernel.sweep_pending_completions()
                 assert failure_class_from_reply(h.sink.last_text) == "workspace-error"
                 assert await h.kernel._markers.read_completion(event.event_id) is None
+
+    asyncio.run(go())
+
+
+class _IdentityBindingOutage:
+    def __init__(self, delegate: Any) -> None:
+        self.delegate = delegate
+        self.unavailable = False
+        self.successful_calls = 0
+        self.failed_calls = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    async def identity_binding(self, *args: Any, **kwargs: Any) -> Any:
+        if self.unavailable:
+            self.failed_calls += 1
+            raise ConnectionRefusedError("identity binding connection refused")
+        classification = await self.delegate.identity_binding(*args, **kwargs)
+        self.successful_calls += 1
+        return classification
+
+
+@pytest.mark.parametrize("recovery", ["delivered", "sweep", "redelivery"])
+def test_capacity_wake_retains_current_identity_through_sustained_workspace_outage(
+    make_harness,
+    recovery: str,
+) -> None:
+    async def go() -> None:
+        async with _selection_server() as (deployment, credentials, state):
+            binding = _IdentityBindingOutage(_workspace_binding(deployment))
+            knobs = dict(
+                binding=binding,
+                slack_no_edit_streaming=True,
+                max_attempts=1,
+                workspace_total_timeout_seconds=1,
+                completion_sweep_grace_s=0,
+            )
+            async with make_harness(**knobs) as h:
+                h.kernel._workspace = WorkspaceClaimCoordinator(
+                    preparer=SimpleNamespace(credentials=credentials),
+                    substrate=h.substrate,
+                )
+                consumer = _capacity_consumer(h)
+                await consumer.ensure_group()
+                event = _qevent("original", event_id="sustained-workspace-outage")
+                await _park(h, consumer, event)
+                claims_before_wake = [dict(env) for env in h.fake_k8s.claim_envs]
+                parked = await consumer._waits.get(event.event_id)
+                assert parked is not None and parked.state == "waiting"
+                classified_before_wake = binding.successful_calls
+                assert classified_before_wake > 0
+                state["status"] = 500
+
+                async def fail_identity_after_healthy_prepare(_state: dict[str, Any]) -> None:
+                    assert binding.successful_calls > classified_before_wake
+                    binding.unavailable = True
+
+                state["before_response"] = fail_identity_after_healthy_prepare
+                if recovery != "delivered":
+                    h.sink.fail_events.add("reply.update")
+                entry, fields = await _wake(h, consumer, event.event_id)
+                woken = await consumer._waits.get(event.event_id)
+                await consumer._sem.acquire()
+                await asyncio.wait_for(consumer._handle(entry, fields), timeout=5)
+                assert await h.kernel._markers.is_terminal(event.event_id)
+                assert binding.unavailable and binding.failed_calls == 0
+                assert state["calls"] >= 3
+                assert h.runner.opened == []
+                assert h.fake_k8s.claim_envs == claims_before_wake
+                assert await h.async_redis.xlen(h.config.stream) == 2
+                assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                    "pending"
+                ] == 0
+                final = await consumer._waits.get(event.event_id)
+                assert final is not None and final.state == "done"
+                assert final.generation == woken.generation and final.deferrals == parked.deferrals
+                assert final.deadline_ms == parked.deadline_ms
+                assert not await h.async_redis.exists(h.config.dead_letter_stream_name())
+                if recovery == "delivered":
+                    reply = h.sink.last_text
+                    assert reply is not None
+                    assert failure_class_from_reply(reply) == "workspace-error"
+                    assert "repository-selection" in reply and "HTTP 500" in reply
+                    assert len(h.sink.completions) == 1
+                    assert h.sink.completions[0].outcome == "escalated"
+                else:
+                    stored = await h.kernel._markers.read_completion(event.event_id)
+                    assert stored is not None and stored.done_flag
+                    assert stored.record.answer is not None
+                    reply = stored.record.answer.text
+                    assert failure_class_from_reply(reply) == "workspace-error"
+                    assert "repository-selection" in reply and "HTTP 500" in reply
+                    requests = state["calls"]
+                    async with make_harness(**knobs) as peer:
+                        replacement = _capacity_consumer(peer)
+                        if recovery == "sweep":
+                            await peer.kernel.sweep_pending_completions()
+                        else:
+                            replay_id = await peer.async_redis.xadd(peer.config.stream, fields)
+                            rows = await peer.async_redis.xreadgroup(
+                                peer.config.consumer_group,
+                                peer.config.consumer_name,
+                                {peer.config.stream: ">"},
+                                count=1,
+                            )
+                            assert rows[0][1][0][0] == replay_id
+                            await replacement._sem.acquire()
+                            await replacement._handle(*rows[0][1][0])
+                        assert peer.runner.opened == []
+                        assert peer.sink.last_text == reply
+                        assert len(peer.sink.completions) == 1
+                        assert peer.sink.completions[0].outcome == "escalated"
+                        assert await peer.kernel._markers.read_completion(event.event_id) is None
+                        assert state["calls"] == requests
+                        assert binding.unavailable and binding.failed_calls == 0
+
+    asyncio.run(go())
+
+
+def test_selected_http_authority_loss_during_dependency_retry_stays_pending(make_harness) -> None:
+    from .test_http_identity_authority import CAPSULE, Binding, Core, pending_entry, qevent
+
+    async def go() -> None:
+        async with _selection_server() as (deployment, credentials, state):
+            binding, authority = Binding(), Core()
+            binding.resolved.deployment_id = deployment
+            async with make_harness(
+                binding=binding,
+                identity_authority=authority,
+                workspace_total_timeout_seconds=1,
+                max_attempts=1,
+            ) as h:
+                h.kernel._workspace = WorkspaceClaimCoordinator(
+                    preparer=SimpleNamespace(credentials=credentials),
+                    substrate=h.substrate,
+                )
+                consumer = _capacity_consumer(h)
+                event = qevent("selected dependency outage", thread="selected-dependency-outage")
+                fields = {
+                    "payload": event.model_dump_json(),
+                    "curie_identity_context_v1": CAPSULE,
+                }
+
+                async def lose_authority(_state: dict[str, Any]) -> None:
+                    authority.unavailable = True
+                    if _state["calls"] == 3:
+                        _state["status"] = 200
+
+                state.update(status=503, before_response=lose_authority)
+                entry, observed = await pending_entry(h, consumer, fields)
+                await consumer._sem.acquire()
+                await asyncio.wait_for(consumer._handle(entry, observed), timeout=5)
+                checks = [r for r in authority.requests if r.stage == "claim_or_resume"]
+                assert len(checks) == 1
+                assert state["calls"] == 3
+                pending = await h.async_redis.xpending_range(
+                    h.config.stream, h.config.consumer_group, entry, entry, 1
+                )
+                assert len(pending) == 1 and pending[0]["times_delivered"] == 1
+                assert h.runner.opened == [] and h.fake_k8s.claim_envs == []
+                assert h.sink.events == []
+                assert not await h.kernel._markers.is_terminal(event.event_id)
+                assert await h.kernel._markers.read_completion(event.event_id) is None
+                assert not await h.async_redis.exists(h.config.dead_letter_stream_name())
+
+    asyncio.run(go())
+
+
+def test_fresh_capacity_wake_with_unavailable_identity_stays_pending(make_harness) -> None:
+    async def go() -> None:
+        async with _selection_server() as (deployment, credentials, state):
+            binding = _IdentityBindingOutage(_workspace_binding(deployment))
+            async with make_harness(binding=binding, slack_no_edit_streaming=True) as h:
+                h.kernel._workspace = WorkspaceClaimCoordinator(
+                    preparer=SimpleNamespace(credentials=credentials),
+                    substrate=h.substrate,
+                )
+                consumer = _capacity_consumer(h)
+                await consumer.ensure_group()
+                event = _qevent("original", event_id="fresh-workspace-identity-outage")
+                await _park(h, consumer, event)
+                claims_before_wake = [dict(env) for env in h.fake_k8s.claim_envs]
+                assert binding.successful_calls > 0
+                before = list(h.sink.events)
+                requests = state["calls"]
+                binding.unavailable = True
+                entry, fields = await _wake(h, consumer, event.event_id)
+                await consumer._sem.acquire()
+                await consumer._handle(entry, fields)
+                pending = await h.async_redis.xpending_range(
+                    h.config.stream,
+                    h.config.consumer_group,
+                    entry,
+                    entry,
+                    1,
+                )
+                assert len(pending) == 1 and pending[0]["times_delivered"] == 1
+                assert binding.failed_calls > 0
+                assert state["calls"] == requests
+                assert h.sink.events == before
+                assert h.runner.opened == []
+                assert h.fake_k8s.claim_envs == claims_before_wake
+                assert not await h.kernel._markers.is_terminal(event.event_id)
+                assert await h.kernel._markers.read_completion(event.event_id) is None
+                assert not await h.async_redis.exists(h.config.dead_letter_stream_name())
+
+    asyncio.run(go())
+
+
+def test_unverified_http_capacity_expiry_never_emits_workspace_failure(make_harness) -> None:
+    from .test_http_identity_authority import park_notice_record
+
+    async def go() -> None:
+        binding = _IdentityBindingOutage(_workspace_binding(uuid.uuid4()))
+        binding.unavailable = True
+        async with make_harness(binding=binding, slack_no_edit_streaming=True) as h:
+            consumer = _capacity_consumer(h)
+            event = _qevent("unverified", event_id="http-workspace-expiry")
+            fields, record = await park_notice_record(
+                h,
+                consumer,
+                consumer._leases,
+                event,
+                recognized=True,
+            )
+            await h.async_redis.hset(consumer._waits._record(event.event_id), "deadline_ms", "1")
+            entry, wake_fields = await _wake(h, consumer, event.event_id)
+            await consumer._sem.acquire()
+            await consumer._handle(entry, wake_fields)
+            assert await h.kernel._markers.is_terminal(event.event_id)
+            assert h.sink.events == []
+            assert await h.kernel._markers.read_completion(event.event_id) is None
+            assert h.runner.opened == h.fake_k8s.claim_envs == []
+            retained = await consumer._waits.get(event.event_id)
+            assert retained is not None and retained.state == "expired"
+            assert retained.fields == fields
+            assert retained.generation > record.generation
+            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                "pending"
+            ] == 0
 
     asyncio.run(go())

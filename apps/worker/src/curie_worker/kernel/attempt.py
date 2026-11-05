@@ -622,11 +622,7 @@ async def _attempt_turn(
         # retryable); the classification and log identify the fault, and the
         # terminal diagnostic carries a redacted, bounded reason naming the stage.
         record_reclaimed_retry()
-        if (
-            not isinstance(exc, WorkspaceDependencyUnavailable)
-            or not self._markers.supports_answer_outbox
-        ):
-            release_order()
+        release_order()
         self._log_workspace_start_failure(
             qevent,
             event.text,

@@ -38,10 +38,7 @@ from ..binding import (
     FactoryWake,
     binding_adapter_for_handle,
 )
-from ..capacity_wait import (
-    WorkspaceDependencyWaitRequested,
-    current_wait,
-)
+from ..capacity_wait import current_wait
 from ..delivery_lease import DeliveryLease
 from ..hook_runs import HookRunOutcome, HookRunReason, HookRunRecorderError, retry_expiry
 from ..reply_sink import (
@@ -1128,6 +1125,7 @@ async def _process_event(
         capacity_wait_run: WorkItemRun | None = None
         dependency_deadline: float | None = None
         dependency_refusals = 0
+        dependency_attempts = 0
         while True:
             attempt += 1
             hook_carry = constants._HOOK_RUN_CARRY.get()
@@ -1185,7 +1183,7 @@ async def _process_event(
                         qevent,
                         route,
                         "The run exceeded its delivery deadline after "
-                        f"{attempt - 1} attempt(s) and was not restarted. "
+                        f"{attempt - 1 + dependency_attempts} attempt(s) and was not restarted. "
                         "Flagging for a human.",
                         failure_class="delivery-deadline",
                     )
@@ -1203,42 +1201,23 @@ async def _process_event(
                     )
                     return
             try:
-                dependency_record = None
-                wait_scope = current_wait()
-                if wait_scope is not None:
-                    dependency_record = await wait_scope[0].get(wait_scope[1])
-                dependency_expired = (
-                    dependency_record is not None
-                    and dependency_record.dependency_deadline_ms is not None
-                    and clock.time.time() * 1000 >= dependency_record.dependency_deadline_ms
+                outcome = await self._attempt(
+                    qevent,
+                    route,
+                    release_order,
+                    boot_env,
+                    agent_id,
+                    nav,
+                    packs,
+                    workspace_deployment_id,
+                    agent_name,
+                    runner_resources=runner_resources,
+                    remaining_s=claim._remaining_budget(lease),
+                    pressure_retried=False,
+                    workspace_inference=workspace_inference,
+                    memory_grant=memory_grant,
+                    channel_read_grant=channel_read_grant,
                 )
-                if dependency_expired:
-                    outcome = failures.TurnOutcome(
-                        classification="workspace-error",
-                        terminal_ok=False,
-                        workspace_dependency_unavailable=True,
-                        error_message=(
-                            "Workspace dependency did not recover before its retry deadline."
-                        ),
-                    )
-                else:
-                    outcome = await self._attempt(
-                        qevent,
-                        route,
-                        release_order,
-                        boot_env,
-                        agent_id,
-                        nav,
-                        packs,
-                        workspace_deployment_id,
-                        agent_name,
-                        runner_resources=runner_resources,
-                        remaining_s=claim._remaining_budget(lease),
-                        pressure_retried=False,
-                        workspace_inference=workspace_inference,
-                        memory_grant=memory_grant,
-                        channel_read_grant=channel_read_grant,
-                    )
             except failures._WorkItemDeferred:
                 return
             except failures.SweepClaimGone as exc:
@@ -1394,29 +1373,14 @@ async def _process_event(
                 dependency_deadline = None
                 dependency_refusals = 0
             dependency_remaining = 0.0
-            if dependency_retry and not dependency_expired:
+            if dependency_retry:
                 if dependency_deadline is None:
                     dependency_deadline = (
                         clock.time.monotonic() + self._config.workspace_total_timeout_seconds
                     )
                 dependency_remaining = dependency_deadline - clock.time.monotonic()
-                if (
-                    dependency_record is not None
-                    and dependency_record.dependency_deadline_ms is not None
-                ):
-                    dependency_remaining = min(
-                        dependency_remaining,
-                        (dependency_record.dependency_deadline_ms - clock.time.time() * 1000)
-                        / 1000,
-                    )
-                granted = (
-                    dependency_record is not None
-                    and dependency_record.state == "active"
-                    and (dependency_record.grant_confirmed or dependency_record.grant_unknown)
-                )
-                if self._can_park(qevent) and not granted:
-                    raise WorkspaceDependencyWaitRequested()
                 dependency_refusals += 1
+                dependency_attempts += 1
                 attempt -= 1
 
             if outcome.status is SessionStatus.AWAITING_APPROVAL and targetless:
@@ -1612,7 +1576,7 @@ async def _process_event(
                     qevent,
                     route,
                     "The run exceeded its delivery deadline after "
-                    f"{attempt} attempt(s) and was not restarted. "
+                    f"{attempt + dependency_attempts} attempt(s) and was not restarted. "
                     "Flagging for a human.",
                     failure_class="delivery-deadline",
                 )
@@ -1652,7 +1616,8 @@ async def _process_event(
                     failures._escalation_text(
                         qevent,
                         lead=failures._with_guidance(
-                            f"The run failed ({token}) after {attempt} attempt(s).",
+                            f"The run failed ({token}) after "
+                            f"{attempt + dependency_attempts} attempt(s).",
                             token,
                             delivered_max_turns=(boot_env or {}).get(MAX_TURNS_ENV),
                         ),

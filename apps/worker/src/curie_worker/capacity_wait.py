@@ -38,10 +38,6 @@ class ThreadOrderWaitRequested(CapacityWaitRequested):
     """An earlier delivery must start or report its failure first."""
 
 
-class WorkspaceDependencyWaitRequested(CapacityWaitRequested):
-    """A pre-start workspace dependency needs the fixed durable retry window."""
-
-
 class CapacityWaitRefused(RuntimeError):
     """The delivery or wait generation no longer owns this transition."""
 
@@ -67,7 +63,6 @@ class CapacityWaitRecord:
     grant_epoch: str | None
     grant_confirmed: bool
     grant_unknown: bool
-    dependency_deadline_ms: int | None = None
 
 
 _CURRENT_WAIT: ContextVar[tuple[CapacityWaitStore, str, int, DeliveryLease] | None] = ContextVar(
@@ -245,17 +240,7 @@ local deadline = tonumber(redis.call('HGET', record, 'deadline_ms')) or (now + b
 local deferrals = tonumber(redis.call('HGET', record, 'deferrals')) or 0
 deferrals = deferrals + 1
 local retry_ms = tonumber(ARGV[12])
-local dependency_deadline = tonumber(redis.call('HGET', record, 'dependency_deadline_ms'))
-if tonumber(ARGV[15]) == 0 and ARGV[16] ~= '1' then
-  redis.call('HDEL', record, 'dependency_first_ms', 'dependency_deadline_ms')
-  dependency_deadline = nil
-elseif not dependency_deadline and tonumber(ARGV[15]) > 0 then
-  dependency_deadline = math.min(deadline, now + tonumber(ARGV[15]))
-  redis.call('HSET', record, 'dependency_first_ms', now,
-    'dependency_deadline_ms', dependency_deadline)
-end
 local next_due = math.min(deadline, now + retry_ms)
-if dependency_deadline then next_due = math.min(next_due, dependency_deadline) end
 if ARGV[13] ~= '' then
   local rank = redis.call('HGET', record, 'order_token') or ARGV[14]
   redis.call('HSET', record, 'order_token', rank)
@@ -564,7 +549,6 @@ if redis.call('GET', KEYS[4]) ~= ARGV[7] then return 0 end
 if redis.call('HGET', KEYS[5], 'gen') ~= ARGV[8] then return 0 end
 redis.call('HSET', KEYS[1], 'grant_confirmed', '1',
   'ever_granted', '1', 'grant_unknown', '0')
-redis.call('HDEL', KEYS[1], 'dependency_first_ms', 'dependency_deadline_ms')
 if state == 'woken' then redis.call('HSET', KEYS[1], 'cause', 'delivery_exhausted') end
 return 1
 """
@@ -692,9 +676,6 @@ class CapacityWaitStore:
             grant_epoch=val("grant_epoch") or None,
             grant_confirmed=val("grant_confirmed") == "1",
             grant_unknown=val("grant_unknown") == "1",
-            dependency_deadline_ms=int(val("dependency_deadline_ms"))
-            if val("dependency_deadline_ms")
-            else None,
         )
 
     def _thread_order(self, thread_key: str) -> str:
@@ -847,8 +828,6 @@ class CapacityWaitStore:
         lease: DeliveryLease,
         *,
         thread_key: str | None = None,
-        dependency_budget_s: float | None = None,
-        preserve_dependency: bool = False,
     ) -> CapacityWaitRecord:
         if not lease.owner or not lease.stream or not lease.group:
             raise CapacityWaitRefused("a real delivery lease is required")
@@ -881,8 +860,6 @@ class CapacityWaitStore:
             str(_PARK_RETRY_MS),
             thread_key or "",
             delivery_order_token(entry_id),
-            str(int(dependency_budget_s * 1000) if dependency_budget_s is not None else 0),
-            "1" if preserve_dependency else "0",
         )
         if int(raw[0]) != 1:
             raise CapacityWaitRefused(str(raw[1]))

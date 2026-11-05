@@ -68,7 +68,6 @@ from .capacity_wait import (
     CapacityWaitRequested,
     CapacityWaitStore,
     ThreadOrderWaitRequested,
-    WorkspaceDependencyWaitRequested,
     order_delivery_scope,
     wait_delivery_scope,
 )
@@ -634,7 +633,6 @@ class Consumer(StreamConsumer):
                             order_error = exc
 
                     wait_generation: int | None = None
-                    wait_expired = False
                     if WAIT_GENERATION_FIELD in fields:
                         wait_generation = int(fields[WAIT_GENERATION_FIELD])
                         if WAIT_REPLY_REF_FIELD in fields and qevent.reply_handle is not None:
@@ -672,13 +670,10 @@ class Consumer(StreamConsumer):
                             await self._settle_delivery_best_effort(entry_id)
                             return
                         if wait_state == "expired":
-                            wait_expired = True
-                            expired = await self._waits.get(qevent.event_id)
-                            if expired is None or expired.dependency_deadline_ms is None:
-                                await self._expire_wait_delivery(
-                                    entry_id, qevent, wait_generation, lease
-                                )
-                                return
+                            await self._expire_wait_delivery(
+                                entry_id, qevent, wait_generation, lease
+                            )
+                            return
 
                     if self._leases is not None and self._kernel._is_approval_resume(
                         qevent.event_id
@@ -790,7 +785,7 @@ class Consumer(StreamConsumer):
                             ):
                                 if order_error is not None:
                                     raise order_error
-                                if order_blocked and not wait_expired:
+                                if order_blocked:
                                     raise ThreadOrderWaitRequested()
                                 await self._kernel.process_event(
                                     qevent, lease=lease, **identity_arguments,
@@ -827,7 +822,7 @@ class Consumer(StreamConsumer):
                                 entry_id, qevent, wait_generation, lease
                             )
                             return
-                        except CapacityWaitRequested as wait_requested:
+                        except CapacityWaitRequested:
                             try:
                                 record = await self._waits.park(
                                     entry_id,
@@ -837,16 +832,6 @@ class Consumer(StreamConsumer):
                                     thread_key=(
                                         _thread_key_for(qevent)
                                         if self._kernel._can_park(qevent)
-                                        else None
-                                    ),
-                                    preserve_dependency=isinstance(
-                                        wait_requested, ThreadOrderWaitRequested
-                                    ),
-                                    dependency_budget_s=(
-                                        self._config.workspace_total_timeout_seconds
-                                        if isinstance(
-                                            wait_requested, WorkspaceDependencyWaitRequested
-                                        )
                                         else None
                                     ),
                                 )
