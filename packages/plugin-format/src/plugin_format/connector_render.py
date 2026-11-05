@@ -627,6 +627,14 @@ def render_deployment(
             }
         )
 
+    # A declared scratch volume (#5415): disk-backed, so it never counts
+    # against the memory limit, bounded by its sizeLimit, and writable on the
+    # server container alone. An emptyDir is world-writable, so the non-root
+    # user writes it without the fsGroup that secret files need.
+    if spec.scratch is not None:
+        volumes.append({"name": "scratch", "emptyDir": {"sizeLimit": spec.scratch.size_limit}})
+        volume_mounts.append({"name": "scratch", "mountPath": spec.scratch.path})
+
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",

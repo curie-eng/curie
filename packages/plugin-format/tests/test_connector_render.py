@@ -2481,9 +2481,8 @@ def test_scratch_leaves_the_proxy_and_the_pod_security_context_alone() -> None:
     spec = _tuned(scratch={"path": "/scratch", "size_limit": "2Gi"})
     tuned = _proxied(spec)
     baseline = _proxied()
-    assert _containers(tuned)[r.CALLER_PROXY_CONTAINER] == (
-        _containers(baseline)[r.CALLER_PROXY_CONTAINER]
-    )
+    proxy = r.CALLER_PROXY_CONTAINER
+    assert _containers(tuned)[proxy] == _containers(baseline)[proxy]
     pod = tuned["Deployment"]["spec"]["template"]["spec"]
     base_pod = baseline["Deployment"]["spec"]["template"]["spec"]
     # An emptyDir is world-writable, so no fsGroup is needed to write it.

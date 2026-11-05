@@ -110,6 +110,12 @@ pub struct ConnectorSpecDecl {
     /// written; the quantity and request-within-limit rules are Python's.
     #[serde(default)]
     pub resources: Option<ConnectorResourcesDecl>,
+    /// A bounded writable volume for the server container (#5415). Carried
+    /// as written; `plugin_format.validate_connectors` owns the path rules,
+    /// and the local docker tier reads `size_limit` with
+    /// [`scratch_size_bytes`].
+    #[serde(default)]
+    pub scratch: Option<ConnectorScratchDecl>,
     /// Non-MCP routes the caller proxy admits a connector-scoped route token
     /// on (ADR 0240). Carried as written; `plugin_format.validate_connectors`
     /// and `validate_bundle` own the path, method, size and caller rules.
@@ -168,6 +174,38 @@ pub struct ConnectorResourcesDecl {
     pub requests: Option<ConnectorResourceQuantitiesDecl>,
     #[serde(default)]
     pub limits: Option<ConnectorResourceQuantitiesDecl>,
+}
+
+/// `scratch:` on a hosted connector: both keys are required.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorScratchDecl {
+    pub path: String,
+    pub size_limit: String,
+}
+
+/// The bytes a `scratch.size_limit` means, or `None` when it is refused.
+///
+/// A whole number of bytes with an optional `Ki`, `Mi` or `Gi` suffix, from
+/// 1Mi to 64Gi inclusive: the grammar `plugin_format.scratch_size_bytes`
+/// reads, pinned for both by `tests/vectors/connector-scratch-size.json`.
+pub fn scratch_size_bytes(text: &str) -> Option<u64> {
+    const MIN: u64 = 1 << 20;
+    const MAX: u64 = 64 << 30;
+    let (digits, scale) = if let Some(rest) = text.strip_suffix("Ki") {
+        (rest, 1u64 << 10)
+    } else if let Some(rest) = text.strip_suffix("Mi") {
+        (rest, 1u64 << 20)
+    } else if let Some(rest) = text.strip_suffix("Gi") {
+        (rest, 1u64 << 30)
+    } else {
+        (text, 1u64)
+    };
+    if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let bytes = digits.parse::<u64>().ok()?.checked_mul(scale)?;
+    (MIN..=MAX).contains(&bytes).then_some(bytes)
 }
 
 /// One side of [`ConnectorResourcesDecl`]: Kubernetes quantity strings.
@@ -231,6 +269,7 @@ impl Default for ConnectorSpecDecl {
             proxy_upstream_host: None,
             readiness_path: None,
             resources: None,
+            scratch: None,
             routes: Vec::new(),
             url: None,
             headers: BTreeMap::new(),

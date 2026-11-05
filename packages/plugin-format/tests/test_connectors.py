@@ -1969,9 +1969,7 @@ def test_a_scratch_path_may_be_any_dedicated_absolute_directory(path: str) -> No
     ],
 )
 def test_a_malformed_or_system_scratch_path_is_refused(path: str) -> None:
-    assert _codes(_scratch({"path": path, "size_limit": "1Gi"})) == [
-        "connectors.bad_scratch_path"
-    ]
+    assert _codes(_scratch({"path": path, "size_limit": "1Gi"})) == ["connectors.bad_scratch_path"]
 
 
 @pytest.mark.parametrize("path", ["/etcetera", "/devices", "/runtime", "/library"])

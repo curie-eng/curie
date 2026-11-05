@@ -125,7 +125,9 @@ fn a_local_connector_with_scratch_gets_a_bounded_world_writable_tmpfs() {
         path: "/scratch".to_string(),
         size_limit: "2Gi".to_string(),
     }));
-    let args = start(&spec).expect("a hosted connector with scratch starts").run_args();
+    let args = start(&spec)
+        .expect("a hosted connector with scratch starts")
+        .run_args();
     assert_eq!(
         mounts(&args),
         vec!["type=tmpfs,destination=/scratch,tmpfs-size=2147483648,tmpfs-mode=1777".to_string()]
@@ -136,7 +138,9 @@ fn a_local_connector_with_scratch_gets_a_bounded_world_writable_tmpfs() {
 
 #[test]
 fn a_local_connector_without_scratch_mounts_nothing() {
-    let args = start(&hosted(None)).expect("a hosted connector starts").run_args();
+    let args = start(&hosted(None))
+        .expect("a hosted connector starts")
+        .run_args();
     assert!(mounts(&args).is_empty(), "{args:?}");
 }
 

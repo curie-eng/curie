@@ -286,6 +286,26 @@
       "title": "ConnectorRoute",
       "type": "object"
     },
+    "ConnectorScratch": {
+      "additionalProperties": false,
+      "description": "A hosted connector's bounded writable scratch volume (#5415).\n\nA disk-backed ``emptyDir`` with ``size_limit`` as its ``sizeLimit``,\nmounted read-write at ``path`` on the server container alone. Both keys are\nrequired: an unbounded scratch volume could fill the node's disk.",
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "size_limit": {
+          "title": "Size Limit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "size_limit"
+      ],
+      "title": "ConnectorScratch",
+      "type": "object"
+    },
     "ConnectorSpec": {
       "additionalProperties": false,
       "description": "One declared connector. Exactly one of ``image``, ``build`` or ``url``.\n\nStrict, unlike the rest of this package. The leniency mandate exists because\nreal Claude Code plugin bundles carry keys this MVP does not model, and\nrejecting them would reject valid bundles. ``connectors.yaml`` is not a\nClaude Code artifact -- it is Curie's own file with no external producer, so\nan unrecognised key is a typo, and silently ignoring it would mean a\nconnector that renders subtly wrong with no diagnostic.",
@@ -426,6 +446,17 @@
           },
           "title": "Routes",
           "type": "array"
+        },
+        "scratch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConnectorScratch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "sealed_secrets": {
           "additionalProperties": {
