@@ -583,7 +583,9 @@ class ExecutionOwner(BaseModel):
     work_item_id: uuid.UUID
     request_id: uuid.UUID
     agent_id: uuid.UUID
-    tenant_id: uuid.UUID
+    # NULL only on a service request an older application wrote inside the
+    # 0148 expand window; the resolver's scope is the agent's tenant either way.
+    tenant_id: uuid.UUID | None
     model_auth_mode: Literal["service", "personal"]
     owner_principal_id: uuid.UUID | None
     enrollment_generation: int | None
