@@ -328,15 +328,6 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
         ],
         "leg": "chart",
     },
-    "workspace-diagnostic": {
-        "step": "Workspace dependency failure reaches the terminal diagnostic",
-        "inputs": [
-            WORKLOAD_INSTALL,
-            "charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh",
-            *CHART_IMAGE_INPUTS,
-        ],
-        "leg": "workload",
-    },
     "quota-progress": {
         "step": "Quota progress regression",
         "inputs": [
@@ -367,7 +358,6 @@ CHART_IDS = tuple(sorted(CHART_SCENARIOS))
 CHART_LEGS = ("chart", "workload")
 WORKLOAD_SCENARIOS = frozenset(
     {
-        "workspace-diagnostic",
         "quota-progress",
         "connector-secret-rotation",
         "connector-apply-race",
@@ -2078,7 +2068,6 @@ def test_mixed_root_documentation_and_runtime_diff_selects_runtime_tiers(
             "factory-resource-profile",
             "platform-runner-upgrade",
             "quota-progress",
-            "workspace-diagnostic",
         ),
         ci_policy_files=_expected_ci_policy_files("ARCHITECTURE.md", "apps/api/main.py"),
         paths=("ARCHITECTURE.md", "apps/api/main.py"),
@@ -4511,8 +4500,7 @@ def test_single_regression_proofs_run_outside_the_cluster_rung() -> None:
 
 WORKLOAD_STAGING_IF = (
     "${{ matrix.leg == 'workload' && "
-    "(contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') "
-    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') "
+    "(contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') "
@@ -4521,17 +4509,17 @@ WORKLOAD_STAGING_IF = (
 )
 
 
-def test_workspace_diagnostic_reuses_the_chart_cluster_and_candidate_artifacts() -> None:
+def test_workload_leg_reuses_the_chart_cluster_and_candidate_artifacts() -> None:
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
     chart = jobs["e2e-cluster-chart-regressions"]
     assert chart["needs"] == ["rust-build", "changes", "ci-images"]
     steps = chart["steps"]
-    workspace = next(
+    quota = next(
         step
         for step in steps
-        if step.get("name") == "Workspace dependency failure reaches the terminal diagnostic"
+        if step.get("name") == CHART_SCENARIOS["quota-progress"]["step"]
     )
-    assert workspace["env"] == {
+    assert quota["env"] == {
         "CURIE_BIN": "${{ github.workspace }}/cli/target/release/curie",
         "CURIE_SCENARIO_CONTEXT": "kind-curie-e2e",
         "CURIE_SCENARIO_RUN_ID": "${{ github.run_id }}-${{ github.run_attempt }}",
@@ -4539,12 +4527,6 @@ def test_workspace_diagnostic_reuses_the_chart_cluster_and_candidate_artifacts()
         "CURIE_SCENARIO_WORKER_IMAGE": "curie-worker:wsdiag-${{ github.sha }}",
         "CURIE_SCENARIO_RUNNER_IMAGE": "curie-runner:wsdiag-${{ github.sha }}",
     }
-    commands = workspace["run"].replace("\\\n", " ")
-    assert [" ".join(line.split()) for line in commands.splitlines() if line.strip()] == [
-        "set -euo pipefail",
-        "bash tools/runtime-assertion-gate/run.sh "
-        "charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh",
-    ]
     staging_names = [
         "Download the workspace diagnostic CLI",
         "Load the workspace diagnostic candidate images",
@@ -4558,8 +4540,8 @@ def test_workspace_diagnostic_reuses_the_chart_cluster_and_candidate_artifacts()
         if step.get("name") == "Install Calico so NetworkPolicy is actually enforced"
     )
     assert calico_index < steps.index(staging[0]) < steps.index(staging[1])
-    assert steps.index(staging[1]) < steps.index(staging[2]) < steps.index(workspace)
-    assert workspace["if"] == _chart_step_if("workspace-diagnostic")
+    assert steps.index(staging[1]) < steps.index(staging[2]) < steps.index(quota)
+    assert quota["if"] == _chart_step_if("quota-progress")
     for step in staging:
         assert step["if"] == WORKLOAD_STAGING_IF, step
         assert "continue-on-error" not in step
@@ -4596,14 +4578,14 @@ def test_failed_first_install_retry_reuses_the_chart_cluster_and_candidate_artif
     ]
     assert len(matches) == 1
     retry = matches[0]
-    workspace = next(
-        step for step in steps if step.get("if") == _chart_step_if("workspace-diagnostic")
+    quota = next(
+        step for step in steps if step.get("if") == _chart_step_if("quota-progress")
     )
     # #5255 retains selection and candidate wiring while execution is disabled.
     assert retry["if"] == _chart_step_if("failed-first-install-retry")
     assert retry["if"].endswith(" && false }}")
     assert retry["timeout-minutes"] == 30
-    assert retry["env"] == workspace["env"]
+    assert retry["env"] == quota["env"]
     assert "continue-on-error" not in retry
     commands = retry["run"].replace("\\\n", " ")
     assert [" ".join(line.split()) for line in commands.splitlines() if line.strip()] == [
@@ -4626,13 +4608,13 @@ def test_factory_resource_profile_runs_on_the_workload_leg() -> None:
     matches = [step for step in steps if step.get("name") == name]
     assert len(matches) == 1
     profile = matches[0]
-    workspace = next(
-        step for step in steps if step.get("if") == _chart_step_if("workspace-diagnostic")
+    quota = next(
+        step for step in steps if step.get("if") == _chart_step_if("quota-progress")
     )
     assert profile["if"] == _chart_step_if("factory-resource-profile")
     assert profile["timeout-minutes"] == 30
     assert "continue-on-error" not in profile
-    assert profile["env"] == workspace["env"]
+    assert profile["env"] == quota["env"]
     commands = profile["run"].replace("\\\n", " ")
     assert [" ".join(line.split()) for line in commands.splitlines() if line.strip()] == [
         "set -euo pipefail",
@@ -5548,7 +5530,6 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
                 "factory-resource-profile",
                 "platform-runner-upgrade",
                 "quota-progress",
-                "workspace-diagnostic",
             ),
         ),
         (("charts/curie/templates/agent-sandbox.yaml",), False, False, CHART_IDS),
@@ -5575,7 +5556,6 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
                 "factory-resource-profile",
                 "platform-runner-upgrade",
                 "quota-progress",
-                "workspace-diagnostic",
             ),
         ),
         (
@@ -5589,7 +5569,6 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
                 "factory-resource-profile",
                 "platform-runner-upgrade",
                 "quota-progress",
-                "workspace-diagnostic",
             ),
         ),
         (("docs/adr/AGENTS.md",), False, False, ()),
@@ -5616,7 +5595,6 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
                 "factory-resource-profile",
                 "failed-first-install-retry",
                 "quota-progress",
-                "workspace-diagnostic",
             ),
         ),
         (("charts/curie/ci/scenarios/other-fixture.sh",), False, True, ()),
@@ -5684,7 +5662,6 @@ def test_chart_scenarios_follow_changed_inputs_and_final_tiers(
                 "factory-resource-profile",
                 "platform-runner-upgrade",
                 "quota-progress",
-                "workspace-diagnostic",
             ),
         ),
         (
@@ -5776,7 +5753,6 @@ def test_workload_install_change_selects_every_shared_consumer(tmp_path: Path) -
         "factory-resource-profile",
         "failed-first-install-retry",
         "quota-progress",
-        "workspace-diagnostic",
     ]
 
 
@@ -5798,7 +5774,6 @@ def test_chart_scenario_union_is_sorted_and_deduplicated(tmp_path: Path) -> None
         "failed-first-install-retry",
         "platform-runner-upgrade",
         "quota-progress",
-        "workspace-diagnostic",
     ]
 
 
@@ -6143,7 +6118,6 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
                 "factory-resource-profile",
                 "platform-runner-upgrade",
                 "quota-progress",
-                "workspace-diagnostic",
             )
     )
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == sorted((*expected, "unregistered"))
@@ -6321,7 +6295,7 @@ def test_chart_shared_workload_order_preserves_scenario_isolation() -> None:
         }
     }
     assert shared[0]["name"] == CHART_SCENARIOS["quota-progress"]["step"]
-    assert shared[-1]["name"] == CHART_SCENARIOS["workspace-diagnostic"]["step"]
+    assert shared[-1]["name"] == CHART_SCENARIOS["factory-resource-profile"]["step"]
     assert chart[-1]["name"] == CHART_SCENARIOS["controller-preflight"]["step"]
     install = positions["Install the shared workload platform"]
     remove = positions["Remove the shared workload platform"]

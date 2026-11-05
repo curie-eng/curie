@@ -1,4 +1,4 @@
-"""Exercise the workspace scenario's input and shared-cluster boundaries."""
+"""Exercise idle-capacity input rejection and the shared workload install boundary."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(__file__).resolve().parent / "runtime/workspace-dependency-diagnostic-runtime.sh"
+SCRIPT = Path(__file__).resolve().parent / "runtime/idle-capacity-reclamation-runtime.sh"
 INPUTS = (
     "CURIE_BIN",
     "CURIE_SCENARIO_CONTEXT",
@@ -192,11 +192,8 @@ def test_valid_shared_install_reaches_workload_without_platform_mutation(
         if "delete" not in call:
             continue
         targets = call[call.index("delete") + 1:]
-        assert targets[0] in {"configmap", "sandboxclaims", "sandboxes", "pods"}, call
-        if targets[0] == "configmap":
-            assert targets[1] == "workspace-cold-start", call
-            assert all(argument.startswith("-") for argument in targets[2:]), call
-        elif targets[0] == "pods":
+        assert targets[0] in {"sandboxclaims", "sandboxes", "pods"}, call
+        if targets[0] == "pods":
             assert "--all" not in targets, call
             assert "-l" in targets, call
             assert targets[targets.index("-l") + 1] == (
@@ -210,7 +207,6 @@ def test_valid_shared_install_reaches_workload_without_platform_mutation(
     "script_name",
     [
         "idle-capacity-reclamation-runtime.sh",
-        "workspace-dependency-diagnostic-runtime.sh",
         "connector-secret-rotation-runtime.sh",
         "connector-apply-race-runtime.sh",
         "factory-resource-profile-runtime.sh",
