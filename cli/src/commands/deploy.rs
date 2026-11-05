@@ -965,17 +965,12 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
                 runner: None,
             }
         });
-        let identity = crate::connector_build::ConnectorScope {
-            release: "curie".to_string(),
-            agent: outcome.agent.name.clone(),
-            namespace: "default".to_string(),
-        };
         let project = crate::local::current_resources()?.project;
         let decl = crate::connector_build::restrict_to(
             &crate::connector_build::load(&plugin_dir)?,
             connector_allowlist.as_deref(),
         );
-        bring_up_local(&plugin_dir, &decl, &lock, &identity, &project).await?;
+        bring_up_local(&plugin_dir, &decl, &lock, &outcome.agent.name, &project).await?;
     }
 
     Ok(DeployOutput {

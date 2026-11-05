@@ -184,13 +184,16 @@ if tool == 'helm':
             (root / 'app.pem').unlink(missing_ok=True)
         if not values_file.exists():
             print('Error: release: not found', file=sys.stderr); sys.exit(1)
-        print(values_file.read_text()); sys.exit(0)
+        computed = json.loads(values_file.read_text())
+        if '--all' in args:
+            computed.setdefault('agentSandbox', {})['deploy'] = False
+        emit(computed)
     if args[:2] == ['get','hooks']: sys.exit(0)
     if args[:2] == ['get','metadata']: emit({'appVersion':os.environ['QUICKSTART_VERSION'],'version':os.environ['QUICKSTART_VERSION'],'chart':'curie-'+os.environ['QUICKSTART_VERSION']})
     if args[:2] == ['get','manifest']: emit(deployment)
     if args[0] == 'history':
         if history_file.exists(): emit(json.loads(history_file.read_text()))
-        emit([{'revision':1,'status':os.environ.get('QUICKSTART_REVISION_STATUS','deployed')}])
+        emit([{'revision':1,'status':'deployed' if (root / 'installed').exists() and (root / 'installed').read_text() == str(os.getppid()) else os.environ.get('QUICKSTART_REVISION_STATUS','deployed')}])
     if args[0] == 'status': emit({'version':1,'info':{'status':'deployed'},'hooks':[]})
     if args[:2] == ['show','chart']: print('name: curie\nversion: '+os.environ['QUICKSTART_VERSION']+'\nappVersion: '+os.environ['QUICKSTART_VERSION']); sys.exit(0)
     if args[0] == 'template':
@@ -231,6 +234,7 @@ if tool == 'helm':
             time.sleep(10)
             print('Error: pods "fixture" is forbidden: RuntimeClass "gvisor" not found', file=sys.stderr); sys.exit(1)
         record_upgrade(args)
+        (root / 'installed').write_text(str(os.getppid()))
         print('Release accepted'); sys.exit(0)
     if args[0] == 'uninstall': sys.exit(0)
 if tool == 'kubectl':

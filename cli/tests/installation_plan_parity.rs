@@ -1085,6 +1085,7 @@ fn install_factory_revision_reads(fixture: &HelmFixture, legacy: bool) {
         user["api"]["githubFactoryIngressEnabled"] = json!(false);
     }
     let mut computed = user.clone();
+    computed["agentSandbox"]["deploy"] = json!(false);
     computed["api"]["githubFactoryIngressEnabled"] = json!(false);
     computed["api"]["githubFactoryIntake"] = json!("poll");
     computed["api"]["githubFactoryPollIntervalSeconds"] = json!(45);
@@ -1135,6 +1136,11 @@ fn factory_revision_calls(fixture: &HelmFixture) -> Vec<Vec<String>> {
     fixture
         .calls()
         .lines()
+        .take_while(|line| {
+            line.strip_prefix("FACTORY_VALUES: ").is_none_or(|payload| {
+                serde_json::from_str::<Value>(payload).unwrap()["argv"][0] != "upgrade"
+            })
+        })
         .filter_map(|line| line.strip_prefix("FACTORY_CALL: "))
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()

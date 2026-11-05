@@ -272,6 +272,11 @@ class _ThrottledReply:
                 self._on_ref(ack.ref)
 
 
+def forget_delivery(self: Kernel, event_id: str) -> None:
+    self._terminal_reply_attempted.discard(event_id)
+    self._factory_work_item_events.discard(event_id)
+
+
 async def notify_turn_not_started(
     self: Kernel, qevent: QueuedTurn, *, lease: DeliveryLease | None = None
 ) -> None:
@@ -307,9 +312,8 @@ async def notify_turn_not_started(
     # person-facing RESULT was already sent during this delivery, and the
     # notice must not overwrite it with an invitation to resend.
     attempted = event_id in self._terminal_reply_attempted
-    self._terminal_reply_attempted.discard(event_id)
     factory_work_item_turn = self._is_factory_work_item_turn(event_id)
-    self._factory_work_item_events.discard(event_id)
+    self.forget_delivery(event_id)
 
     if factory_work_item_turn:
         logger.debug(

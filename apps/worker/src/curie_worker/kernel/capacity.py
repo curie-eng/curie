@@ -64,7 +64,7 @@ async def notify_capacity_queued(self: Kernel, qevent: QueuedTurn) -> ReplyAck:
         return await self._reply_for(
             qevent,
             routing._route_from_handle(qevent),
-            "The agent is busy. Your request is queued and will start when space opens.",
+            "Your request is queued while sandbox admission is pending.",
             terminal=False,
         )
     finally:

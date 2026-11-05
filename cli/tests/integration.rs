@@ -134,6 +134,7 @@ mod json_emit_contract;
 mod kube_spawn_inventory;
 mod lease_expiry_cluster_proof;
 mod local_connectedness_probe;
+mod local_connector_release;
 mod local_resources;
 mod local_stack_keys;
 mod local_up_build_channel_guard;

@@ -226,6 +226,19 @@ chart_scenarios:
       leg: chart
       inputs:
         - charts/curie/ci/runtime/upgrade-drain-installation-runtime.sh
+    platform-runner-upgrade:
+      step: Deployed platform runners survive both upgrade entry points
+      leg: workload
+      inputs:
+        - charts/curie/ci/runtime/platform-runner-upgrade-runtime.sh
+        - cli/src/ops
+        - cli/src/connectors.rs
+        - apps/api
+        - apps/worker
+        - runner
+        - packages
+        - pyproject.toml
+        - uv.lock
     # Selected inputs remain tracked; execution is temporarily disabled in ci.yaml (#5255).
     failed-first-install-retry:
       pr_inputs:

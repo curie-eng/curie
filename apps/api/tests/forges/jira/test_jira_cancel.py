@@ -2,14 +2,15 @@
 
 For each running issue `poll_marked` reads the issue: the label gone gives one
 CANCEL carrying the id of the changelog item that removed it; the status
-category ``done`` gives one CANCEL carrying the status change's id; a 404 gives
-nothing, as on GitHub. `verify_current` re-reads the issue for every
+category ``done`` gives one CANCEL carrying the status change's id; a 404 emits
+a deleted cancellation. `verify_current` re-reads the issue for every
 disposition, and a relabel is a new admission with a new request id.
 """
 
 from __future__ import annotations
 
 import pytest
+from curie_api.forges.errors import Unavailable
 from curie_api.forges.identity import notice_request_id
 from curie_api.forges.types import Disposition, MarkedNotice, NoticePage
 from forge_fakes.jira import (
@@ -99,7 +100,7 @@ async def test_jira_cancel_a_running_issue_that_keeps_its_label_is_not_cancelled
 
 
 @pytest.mark.anyio
-async def test_jira_cancel_a_running_issue_that_answers_404_yields_no_notice() -> None:
+async def test_jira_cancel_a_running_issue_that_answers_404_yields_deleted_notice() -> None:
     fake = JiraFake()
     human = _human(fake)
     issue = fake.seed_issue("Ticket")
@@ -111,7 +112,33 @@ async def test_jira_cancel_a_running_issue_that_answers_404_yields_no_notice() -
     fake.delete_issue(issue.id)
     page = await tracker.poll_marked(admitted.cursor, running=(gone,))
 
-    assert page.notices == ()
+    (cancel,) = page.notices
+    assert (cancel.issue, cancel.disposition, cancel.event_id) == (
+        gone,
+        Disposition.CANCEL,
+        "deleted",
+    )
+    assert await tracker.verify_current(cancel) is True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", [503, 429])
+async def test_jira_cancel_a_transient_running_issue_read_defers_the_poll(status: int) -> None:
+    fake = JiraFake()
+    issue = fake.seed_issue("Ticket")
+    fake.add_label(issue.id, LABEL, _human(fake))
+    tracker = jira_tracker(fake)
+    admitted = await tracker.poll_marked(None, running=())
+    reads = len(fake.requests_of("issue"))
+    fake.fail_next("issue", status=status, headers={"Retry-After": "30"})
+
+    with pytest.raises(Unavailable):
+        await tracker.poll_marked(admitted.cursor, running=(fake.ref(issue),))
+
+    assert len(fake.requests_of("issue")) == reads + 1
+    resumed = await tracker.poll_marked(admitted.cursor, running=(fake.ref(issue),))
+    assert resumed.notices == ()
+    assert len(fake.requests_of("issue")) == reads + 2
 
 
 @pytest.mark.anyio

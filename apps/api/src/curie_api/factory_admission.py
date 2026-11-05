@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.schemas.deployments import WebhookResult
-from curie_api.workitems.lifecycle import WorkItemConflict
+from curie_api.workitems.lifecycle import CancellationCause, WorkItemConflict
 
 from . import workitem_dispatch
 from .models import WorkItem
@@ -65,14 +65,16 @@ def ignored(code: str) -> WebhookResult:
     return WebhookResult(status="factory_ignored", errors=[{"code": code}])
 
 
-async def cancel_work_item(session: AsyncSession, item: WorkItem) -> WebhookResult:
+async def cancel_work_item(
+    session: AsyncSession, item: WorkItem, *, cause: CancellationCause = "issue_cancelled"
+) -> WebhookResult:
     """Cancel ``item``, retrying once at the version a stale read reports.
 
     Callers commit the session.
     """
 
     result = await workitem_dispatch.cancel(
-        session, work_item_id=item.id, expected_version=item.version
+        session, work_item_id=item.id, expected_version=item.version, cause=cause
     )
     if isinstance(result, WorkItemConflict) and result.code == "stale_version":
         if result.work_item_version is None:
@@ -81,6 +83,7 @@ async def cancel_work_item(session: AsyncSession, item: WorkItem) -> WebhookResu
             session,
             work_item_id=item.id,
             expected_version=result.work_item_version,
+            cause=cause,
         )
     if isinstance(result, WorkItemConflict):
         return ignored(result.code)

@@ -326,6 +326,7 @@ async fn rollback_hands_helm_the_selected_revision() {
         "#!/bin/sh\n\
          case \"$1\" in\n\
          history) cat \"$FAKE_HELM_HISTORY\" ;;\n\
+         get) [ \"$2\" = values ] || exit 1; echo '{\"agentSandbox\":{\"deploy\":false}}' ;;\n\
          rollback) echo \"$*\" >> \"$FAKE_HELM_ROLLBACK_LOG\"; echo 'Rollback was a success.' ;;\n\
          *) echo \"unexpected helm verb: $1\" >&2; exit 1 ;;\n\
          esac\n",
@@ -984,6 +985,7 @@ fn fake_helm_dir(history_json: &str) -> tempfile::TempDir {
              echo \"$*\" >> '{log}'\n\
              case \"$1\" in\n\
              history) cat '{history}' ;;\n\
+             get) [ \"$2\" = values ] || exit 1; echo '{{\"agentSandbox\":{{\"deploy\":false}}}}' ;;\n\
              rollback) echo 'Rollback was a success.' ;;\n\
              *) echo \"unexpected helm verb: $1\" >&2; exit 1 ;;\n\
              esac\n",
@@ -1058,7 +1060,7 @@ fn rollback_hands_helm_the_serving_revision_over_a_pending_one() {
     );
     assert_eq!(
         helm_log(dir.path()),
-        "history prod-release -n agent-ns -o json --max 256\nrollback prod-release 4 -n agent-ns\n",
+        "history prod-release -n agent-ns -o json --max 256\nrollback prod-release 4 -n agent-ns\nhistory prod-release -n agent-ns -o json --max 256\nget values prod-release -n agent-ns --revision 4 --all -o json\nhistory prod-release -n agent-ns -o json --max 256\nget values prod-release -n agent-ns --revision 4 --all -o json\n",
         "the real path must pass the serving revision to Helm"
     );
     assert!(
@@ -1340,7 +1342,7 @@ fn an_interrupted_rollback_is_resumed_through_the_binary() {
     assert_eq!(result["resumed_interrupted_rollback"], true);
     assert_eq!(
         helm_log(dir.path()),
-        "history prod-release -n agent-ns -o json --max 256\nrollback prod-release 9 -n agent-ns\n",
+        "history prod-release -n agent-ns -o json --max 256\nrollback prod-release 9 -n agent-ns\nhistory prod-release -n agent-ns -o json --max 256\nget values prod-release -n agent-ns --revision 10 --all -o json\nhistory prod-release -n agent-ns -o json --max 256\nget values prod-release -n agent-ns --revision 10 --all -o json\n",
         "the real path must pass the interrupted target to Helm"
     );
     assert!(
