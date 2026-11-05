@@ -13,14 +13,17 @@ hardened pod and is driven only through the runner HTTP API. In order:
    ``CLAUDE_CODE_OAUTH_TOKEN`` and every AC 1 competing input present at once
    (cloud selectors and settings, API and auth tokens, custom headers, both base
    URL paths, a declared credential key, profile and federation state, saved
-   login and gateway session, a user ``apiKeyHelper``). One implementer turn
+   login, a restorable gateway session in the inherited config dir and in a
+   separate ``CLAUDE_SECURESTORAGE_CONFIG_DIR``, a user ``apiKeyHelper``, and
+   subagent model forcing onto another Claude model). One implementer turn
    runs one Bash command (a bundle ``PreToolUse`` command hook marks it), then
    the real factory ``plan-reviewer`` and ``diff-reviewer`` roles as subagents.
    Every outbound connection goes through a CONNECT-logging proxy sidecar and
    every alternate endpoint points at a counting recorder sidecar, so the test
    observes that model traffic reached only the first-party endpoint, that no
    alternate saw a request, and that per-role usage carried the configured
-   implementer and reviewer models. The run succeeding at all is the evidence
+   implementer and reviewer models, not the forced subagent model. The run
+   succeeding at all is the evidence
    that no placeholder service credential authenticated it.
 3. Negative control: the same conflicts without the grant refuse with
    ``authentication required`` before any connection. No inference.
@@ -99,6 +102,10 @@ SYSTEM_OBJECTS = frozenset({"configmap/kube-root-ca.crt"})
 
 IMPLEMENTER_MODEL = "claude-sonnet-5-5"
 REVIEWER_MODEL = "claude-opus-5-5"
+# The model the inherited subagent forcing names. Observed on CLI 2.1.301:
+# CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1 runs every subagent, the factory reviewer
+# roles included, on CLAUDE_CODE_SUBAGENT_MODEL instead of their ``model:``.
+FORCED_SUBAGENT_MODEL = "claude-haiku-4-5"
 # The only first-party Messages host Decision 3 allows.
 # https://code.claude.com/docs/en/network-config lists api.anthropic.com as the
 # endpoint the CLI must reach.
@@ -120,6 +127,10 @@ HELPER_MARKER = f"{MARKER_DIR}/api-key-helper.log"
 PROBE_LOGS = "/probe-logs"
 INHERITED_CLAUDE_CONFIG_DIR = "/home/runner/.inherited-claude-config"
 INHERITED_ANTHROPIC_CONFIG_DIR = "/home/runner/.inherited-anthropic-config"
+# Holds only the saved credentials. Observed in CLI 2.1.301: the credential
+# store is read from CLAUDE_SECURESTORAGE_CONFIG_DIR when set, whatever
+# CLAUDE_CONFIG_DIR says.
+INHERITED_SECURE_STORAGE_DIR = "/home/runner/.inherited-secure-storage"
 TOOL_MARKER = "live-tool-ok"
 RECORDER_URL = f"http://127.0.0.1:{RECORDER_PORT}"
 
@@ -504,6 +515,11 @@ if os.environ.get("STAGE_CONFLICTS") == "1":
     saved = claude / ".credentials.json"
     shutil.copyfile(seed / "conflict" / "credentials.json", saved)
     saved.chmod(0o600)
+    store = Path(os.environ["STAGE_SECURE_STORAGE_DIR"])
+    store.mkdir(mode=0o700, parents=True)
+    stored = store / ".credentials.json"
+    shutil.copyfile(seed / "conflict" / "credentials.json", stored)
+    stored.chmod(0o600)
     profiles = Path(os.environ["STAGE_ANTHROPIC_CONFIG_DIR"]) / "configs"
     profiles.mkdir(mode=0o700, parents=True)
     shutil.copyfile(seed / "conflict" / "alt-profile.json", profiles / "alt-profile.json")
@@ -649,6 +665,9 @@ CONFLICT_ENV: tuple[tuple[str, str], ...] = (
     ("CLAUDE_CODE_USE_GATEWAY", "1"),
     ("CLAUDE_CODE_GATEWAY_TOKEN", "placeholder-gateway-token"),
     ("CLAUDE_CONFIG_DIR", INHERITED_CLAUDE_CONFIG_DIR),
+    ("CLAUDE_SECURESTORAGE_CONFIG_DIR", INHERITED_SECURE_STORAGE_DIR),
+    ("CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "1"),
+    ("CLAUDE_CODE_SUBAGENT_MODEL", FORCED_SUBAGENT_MODEL),
 )
 
 # User settings in the inherited config dir. The helper leaves a marker if the
@@ -661,7 +680,17 @@ CONFLICT_SETTINGS: dict[str, Any] = {
     "env": {"ANTHROPIC_BASE_URL": ALT_BASE},
 }
 # Saved login and signed-in gateway session, where the authentication docs say
-# the CLI stores credentials on Linux.
+# the CLI stores credentials on Linux. The gateway record is the shape the CLI
+# 2.1.301 startup restore reads: ``enterpriseGateway`` with ``url``, ``jwt`` and
+# ``expiresAt`` (ms), and ``gatewayTrust`` keyed by the URL's hostname holding a
+# TLS certificate SHA-256 as 64 lowercase hex characters. Without the trust
+# entry, or once expired, the restore skips the session. The gateway host here
+# reaches only the recorder, which does not speak TLS, so the restore's pin probe
+# fails and the CLI proceeds without re-verifying (only a completed probe with a
+# different fingerprint skips). Observed offline on CLI 2.1.301 with an
+# unreachable gateway and this placeholder pin: the session is installed, then
+# the CLI exits with "Couldn't load settings from Cloud gateway". A leak shows as
+# a CONNECT to the gateway and a failed turn.
 CONFLICT_CREDENTIALS: dict[str, Any] = {
     "claudeAiOauth": {
         "accessToken": "placeholder-saved-access-token",
@@ -670,7 +699,12 @@ CONFLICT_CREDENTIALS: dict[str, Any] = {
         "scopes": ["user:inference", "user:profile"],
         "subscriptionType": "max",
     },
-    "enterpriseGateway": {"url": ALT_GATEWAY, "sessionToken": "placeholder-gateway-session"},
+    "enterpriseGateway": {
+        "url": ALT_GATEWAY,
+        "jwt": "placeholder-gateway-session-jwt",
+        "expiresAt": 4102444800000,
+    },
+    "gatewayTrust": {"alt-gateway.example.com": "0123456789abcdef" * 4},
 }
 # A named profile with federation, at <ANTHROPIC_CONFIG_DIR>/configs/<name>.json,
 # the layout the pinned CLI resolves.
@@ -1049,6 +1083,7 @@ PERSONAL_STEP = StepPlan(
         "final_status": "done",
         "implementer_model": IMPLEMENTER_MODEL,
         "reviewer_model": REVIEWER_MODEL,
+        "forced_subagent_model_unused": FORCED_SUBAGENT_MODEL,
         "reviewer_roles": list(REVIEWER_ROLES),
         "bash_result_marker": TOOL_MARKER,
         "hook_marker": True,
@@ -1511,6 +1546,23 @@ def _judge_personal(run: StepRun) -> list[str]:
     roots = run.transcripts.get("roots") or []
     if INHERITED_CLAUDE_CONFIG_DIR in roots:
         failures.append("the native CLI wrote its transcript under the inherited config dir")
+    gateway_host = ALT_GATEWAY.removeprefix("https://")
+    if any(_host_of(target) == gateway_host for target in run.connect_targets()):
+        failures.append(f"the CLI restored the saved gateway session (CONNECT to {gateway_host})")
+    forced = [
+        item["model"]
+        for item in run.usage()
+        if item["role"] == "reviewer" and _same_model(item["model"], FORCED_SUBAGENT_MODEL)
+    ] + [
+        model
+        for model in (run.transcripts.get("reviewer") or {}).get("models") or {}
+        if _same_model(model, FORCED_SUBAGENT_MODEL)
+    ]
+    if forced:
+        failures.append(
+            f"reviewer requests ran on the forced subagent model {FORCED_SUBAGENT_MODEL}, "
+            f"not {REVIEWER_MODEL}"
+        )
     if run.helper_ran is not False:
         failures.append("the inherited apiKeyHelper ran or its marker could not be read")
     failures += _usage_model_failures(run, reviewers=True)
@@ -2279,6 +2331,7 @@ def _pod_manifest(plan: StepPlan, image: str, labels: Mapping[str, str]) -> dict
             _value_env("STAGE_CONFLICTS", "1" if plan.conflicts else "0"),
             _value_env("STAGE_CLAUDE_CONFIG_DIR", INHERITED_CLAUDE_CONFIG_DIR),
             _value_env("STAGE_ANTHROPIC_CONFIG_DIR", INHERITED_ANTHROPIC_CONFIG_DIR),
+            _value_env("STAGE_SECURE_STORAGE_DIR", INHERITED_SECURE_STORAGE_DIR),
             _value_env("PYTHONDONTWRITEBYTECODE", "1"),
         ],
         "securityContext": CONTAINER_SECURITY,

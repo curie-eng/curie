@@ -10,13 +10,16 @@ is read off the wire, not off an options dict.
 AC 1, competing inputs: one case per input class (cloud selectors, API key,
 auth token and custom headers, ``apiKeyHelper``, both base URL paths with the
 service credential and a ``CURIE_MODEL_ENV_KEY`` target, profile and
-federation state, saved login and gateway state) and one case with all of them
+federation state, saved login, a restorable gateway session in the config dir
+and one in ``CLAUDE_SECURESTORAGE_CONFIG_DIR``) and one case with all of them
 at once. Each personal case must reach ``api.anthropic.com/v1/messages`` with
 ``Authorization: Bearer <owner grant>``, no ``x-api-key`` and no request to an
 alternate host. Each class also runs in service mode with the same inputs; that
 control shows the input is live in this CLI, so the personal case is a real
-exclusion and not an input the CLI ignores anyway. Mandatory managed policy
-that forces gateway authentication, and workspace settings that add a
+exclusion and not an input the CLI ignores anyway. The env the CLI receives
+keeps only model selection, three runner-owned settings and the installation's
+nonessential traffic switch from the provider namespaces. Mandatory managed
+policy that forces gateway authentication, and workspace settings that add a
 competing source, are refused before the CLI starts.
 
 AC 2, refusals: a missing, empty or blank grant with every competing source
@@ -63,10 +66,13 @@ from personal_auth_support import (
     BEDROCK_BEARER,
     CUSTOM_HEADER,
     ENV_KEY_TARGET,
+    FAR_FUTURE_MS,
     FIRST_PARTY_HOST,
+    FORCED_SUBAGENT_MODEL,
     FOUNDRY_KEY,
     GATEWAY_TOKEN,
     IMPLEMENTER_MARKER,
+    IMPLEMENTER_MODEL,
     OWNER_GRANT,
     PLACEHOLDER_NAMES,
     REVIEWER_MODEL,
@@ -75,6 +81,7 @@ from personal_auth_support import (
     SERVICE_API_KEY,
     SERVICE_AUTH_TOKEN,
     SERVICE_OAUTH,
+    UNSET,
     Installation,
     RecordedRequest,
     Reply,
@@ -84,9 +91,12 @@ from personal_auth_support import (
     assert_cli_never_started,
     assert_owner_grant_only,
     connect_session,
+    env_probe_command,
+    env_probe_values,
     installed,
     merge_json,
     requires_cli,
+    restorable_gateway_session,
     run_turn,
     wire_session,
     write_api_key_helper,
@@ -95,6 +105,9 @@ from personal_auth_support import (
 
 GRANT_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
 REVIEWER_ENV = "ANTHROPIC_DEFAULT_OPUS_MODEL"
+MANAGED_PATH_ENV = "CLAUDE_CODE_MANAGED_SETTINGS_PATH"
+TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+SECURE_STORAGE_ENV = "CLAUDE_SECURESTORAGE_CONFIG_DIR"
 # A provider-native credential name a config author may declare (#514).
 ENV_KEY_NAME = "ACME_MODEL_CREDENTIAL"
 
@@ -282,41 +295,42 @@ def plant_profile(installation: Installation, monkeypatch: pytest.MonkeyPatch) -
     )
 
 
-def plant_saved_state(installation: Installation, monkeypatch: pytest.MonkeyPatch) -> None:
+def plant_saved_login(installation: Installation, monkeypatch: pytest.MonkeyPatch) -> None:
     # Saved login storage on Linux is ``<config dir>/.credentials.json``:
     # https://code.claude.com/docs/en/authentication ("Credential management").
-    # The gateway session and ``forceLoginGatewayUrl``: same page,
-    # "Authentication precedence". Planted in the inherited CLAUDE_CONFIG_DIR and
-    # in the default ``~/.claude`` / ``~/.claude.json``.
-    expires = 4_102_444_800_000  # 2100-01-01, in ms
+    # Planted in the inherited CLAUDE_CONFIG_DIR and in the default ``~/.claude``
+    # / ``~/.claude.json``. Merged, so the gateway session classes can share it.
     credentials = {
         "claudeAiOauth": {
             "accessToken": SAVED_LOGIN,
             "refreshToken": "sk-ant-ort01-PLACEHOLDER-refresh",
-            "expiresAt": expires,
+            "expiresAt": FAR_FUTURE_MS,
             "scopes": ["user:inference", "user:profile"],
             "subscriptionType": "max",
         },
-        "enterpriseGateway": {
-            "url": f"https://{ALT_GATEWAY_HOST}",
-            "jwt": "eyJhbGciOiJub25lIn0.eyJzdWIiOiJleGFtcGxlIn0.c2ln",
-            "expiresAt": expires,
-        },
     }
     config = inherited_claude_config(installation)
-    for credentials_path, global_config in (
-        (config / ".credentials.json", config / ".claude.json"),
-        (
-            installation.home / ".claude" / ".credentials.json",
-            installation.home / ".claude.json",
-        ),
+    for store, global_config in (
+        (config, config / ".claude.json"),
+        (installation.home / ".claude", installation.home / ".claude.json"),
     ):
-        write_json(credentials_path, credentials).chmod(0o600)
+        merge_json(store / ".credentials.json", credentials).chmod(0o600)
         merge_json(global_config, {"primaryApiKey": SAVED_API_KEY})
-        merge_json(
-            credentials_path.parent / "settings.json",
-            {"forceLoginGatewayUrl": f"https://{ALT_GATEWAY_HOST}"},
-        )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+
+
+def plant_gateway_session(installation: Installation, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A signed-in gateway session the CLI restores at startup (shape and trust
+    # pin: personal_auth_support.restorable_gateway_session), in the inherited
+    # CLAUDE_CONFIG_DIR and in the default ``~/.claude``, with the user setting
+    # that names the gateway and the gateway selector env. Docs:
+    # https://code.claude.com/docs/en/authentication ("Authentication
+    # precedence": a signed-in gateway session outranks every other source).
+    session = restorable_gateway_session(installation)
+    config = inherited_claude_config(installation)
+    for store in (config, installation.home / ".claude"):
+        merge_json(store / ".credentials.json", session).chmod(0o600)
+        merge_json(store / "settings.json", {"forceLoginGatewayUrl": f"https://{ALT_GATEWAY_HOST}"})
     setenv_all(
         monkeypatch,
         {
@@ -325,6 +339,23 @@ def plant_saved_state(installation: Installation, monkeypatch: pytest.MonkeyPatc
             "CLAUDE_CODE_GATEWAY_TOKEN": GATEWAY_TOKEN,
         },
     )
+
+
+def inherited_secure_storage(installation: Installation) -> Path:
+    return installation.root / "inherited-secure-storage"
+
+
+def plant_secure_storage_session(
+    installation: Installation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Observed in CLI 2.1.301: the credential store directory is
+    # CLAUDE_SECURESTORAGE_CONFIG_DIR when that is set (empty means
+    # ``~/.claude``), and only otherwise CLAUDE_CONFIG_DIR or ``~/.claude``. So
+    # a fresh CLAUDE_CONFIG_DIR alone leaves a session stored here live. This
+    # directory is separate from every config dir and holds only the session.
+    store = inherited_secure_storage(installation)
+    write_json(store / ".credentials.json", restorable_gateway_session(installation)).chmod(0o600)
+    monkeypatch.setenv(SECURE_STORAGE_ENV, str(store))
 
 
 # --- what each service control observes ---------------------------------------------
@@ -396,18 +427,30 @@ def control_profile(installation: Installation) -> None:
     assert exchanges, "the profile's token exchange never reached its base_url"
 
 
-def control_saved_state(installation: Installation) -> None:
+def control_saved_login(installation: Installation) -> None:
     # Observed on CLI 2.1.301: the saved claude.ai login authenticates the model
-    # request, and the saved ``primaryApiKey`` rides a settings request. The
-    # saved gateway session and CLAUDE_CODE_USE_GATEWAY produced no traffic to
-    # the gateway host offline, so their exclusion rests on the docs
-    # (authentication, "Authentication precedence": a signed-in gateway session
-    # outranks every other source) and on the zero-alternate assertion.
+    # request, and the saved ``primaryApiKey`` rides a settings request.
     [request, *_] = model_requests_on(installation, FIRST_PARTY_HOST)
     assert request.bearer == "saved claude.ai login", request.bearer
     assert any(
         request.api_key == "saved api key" for request in installation.proxy.all_requests()
     ), "the saved primaryApiKey was never sent"
+
+
+def control_gateway_session(installation: Installation) -> None:
+    # Observed on CLI 2.1.301 with the owner grant also set: the startup restore
+    # CONNECTs to the gateway host (its TLS pin probe, no HTTP inside), then
+    # sends ``GET /managed/settings`` and ``POST /v1/messages?beta=true`` to the
+    # gateway, both with ``Authorization: Bearer <session jwt>``, and no model
+    # request reaches the first-party host. The session outranks the grant.
+    requests = model_requests_on(installation, ALT_GATEWAY_HOST)
+    assert requests, "no model request reached the gateway"
+    assert {request.bearer for request in requests} == {"gateway jwt"}, [
+        request.bearer for request in requests
+    ]
+    assert model_requests_on(installation, FIRST_PARTY_HOST) == [], (
+        "a model request went first party although the gateway session was restored"
+    )
 
 
 @dataclass(frozen=True)
@@ -425,6 +468,16 @@ def helper_never_ran(installation: Installation) -> None:
     assert not helper_marker(installation).exists(), "the apiKeyHelper ran in personal mode"
 
 
+def gateway_never_reached(installation: Installation) -> None:
+    assert ALT_GATEWAY_HOST not in installation.proxy.connect_hosts(), "the CLI probed the gateway"
+    reached = [
+        f"{request.method} {request.path}"
+        for request in installation.proxy.all_requests()
+        if request.host == ALT_GATEWAY_HOST
+    ]
+    assert reached == [], f"the gateway received {reached}"
+
+
 INPUT_CLASSES: dict[str, InputClass] = {
     "bedrock": InputClass(plant_bedrock, control_reaches(ALT_BEDROCK_HOST)),
     "vertex": InputClass(plant_vertex, control_reaches(ALT_VERTEX_HOST)),
@@ -439,8 +492,14 @@ INPUT_CLASSES: dict[str, InputClass] = {
         plant_model_base_url, control_model_base_url
     ),
     "profile-and-federation": InputClass(plant_profile, control_profile, control_drops_grant=True),
-    "saved-login-and-gateway-session": InputClass(
-        plant_saved_state, control_saved_state, control_drops_grant=True
+    "saved-login": InputClass(plant_saved_login, control_saved_login, control_drops_grant=True),
+    "gateway-session": InputClass(
+        plant_gateway_session, control_gateway_session, personal_extra=gateway_never_reached
+    ),
+    "secure-storage-gateway-session": InputClass(
+        plant_secure_storage_session,
+        control_gateway_session,
+        personal_extra=gateway_never_reached,
     ),
 }
 
@@ -543,6 +602,9 @@ def test_the_combined_conflict_case_uses_the_owner_grant_and_a_fresh_config(
         "CLAUDE_CODE_USE_BEDROCK": "1",
         "CURIE_CREDENTIALS": SERVICE_OAUTH,
         "CLAUDE_CONFIG_DIR": str(inherited_claude_config(install)),
+        SECURE_STORAGE_ENV: str(inherited_secure_storage(install)),
+        "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1",
+        "CLAUDE_CODE_SUBAGENT_MODEL": FORCED_SUBAGENT_MODEL,
     }
 
     outcome = run_turn(wire_session(install, reviewer_model=REVIEWER_MODEL, explicit_env=explicit))
@@ -550,6 +612,7 @@ def test_the_combined_conflict_case_uses_the_owner_grant_and_a_fresh_config(
     assert outcome.final.status is SessionStatus.DONE, outcome.errors
     assert_owner_grant_only(install.proxy)
     helper_never_ran(install)
+    gateway_never_reached(install)
     [follow_up] = [
         request
         for request in install.proxy.model_requests()
@@ -575,6 +638,100 @@ def test_the_combined_conflict_case_uses_the_owner_grant_and_a_fresh_config(
     assert not {"configs", "credentials", "active_config"} & set(anthropic_listing)
     # close() removes the directory it created.
     assert not Path(claude_dir).exists(), "the runner left its CLI config dir behind"
+
+
+def probe_env_then_finish(names: list[str]) -> Callable[[RecordedRequest], Reply]:
+    """The implementer prints ``names`` from its Bash tool once, then ends the turn."""
+
+    def respond(request: RecordedRequest) -> Reply:
+        if IMPLEMENTER_MARKER in request.system and not request.tool_results():
+            command = env_probe_command(names)
+            return ToolCall("Bash", {"command": command, "description": "Show env"}, "toolu_env")
+        return TextReply("done")
+
+    return respond
+
+
+def probed_env(installation: Installation, names: list[str]) -> dict[str, str]:
+    [follow_up] = [
+        request
+        for request in installation.proxy.model_requests()
+        if IMPLEMENTER_MARKER in request.system and request.tool_results()
+    ]
+    return env_probe_values(follow_up.tool_result_text(), names)
+
+
+# Provider-namespace names outside the keep-list. Each is read by the pinned CLI
+# 2.1.301 (found in the bundled binary) except the invented ``*_SOMETHING_NEW*``
+# ones: the keep-list must remove a name whether or not a filter has heard of
+# it. Set in the inherited env and in the explicit SDK env respectively.
+_INHERITED_UNLISTED = {
+    "CLAUDE_CODE_FEDERATION_CACHE_DIR": "federation-cache",
+    "CLAUDE_CODE_DISABLE_ADMIN_ENV_UNION": "1",
+    "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": FORCED_SUBAGENT_MODEL,
+    "CLAUDE_CODE_SOMETHING_NEW": "1",
+}
+_EXPLICIT_UNLISTED = {
+    "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1",
+    "CLAUDE_CODE_SUBAGENT_MODEL": FORCED_SUBAGENT_MODEL,
+    "CLAUDE_CODE_SOMETHING_NEWER": "1",
+}
+_INHERITED_KEPT = {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "4096", "CURIE_PROBE_KEPT": "kept"}
+_EXPLICIT_KEPT = {"ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "Sonnet (probe)"}
+
+
+@requires_cli
+def test_the_personal_cli_env_keeps_only_the_keep_list(
+    install: Installation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # D1 through the real path: what the CLI's own Bash tool sees is the env the
+    # CLI was started with, as the fresh-config readback above relies on. A set
+    # CLAUDE_CODE_MANAGED_SETTINGS_PATH is removed like any other unlisted name
+    # (the pinned CLI ignores it, see the managed policy tests below) and the
+    # launch proceeds. The installation's CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+    # (set by ``installed``) is a privacy setting and is kept.
+    personal(monkeypatch)
+    folder = install.root / "policy-folder"
+    folder.mkdir()
+    store = inherited_secure_storage(install)
+    store.mkdir()
+    setenv_all(
+        monkeypatch,
+        {
+            **{
+                name: str(install.root / value) if name.endswith("_DIR") else value
+                for name, value in _INHERITED_UNLISTED.items()
+            },
+            **_INHERITED_KEPT,
+            SECURE_STORAGE_ENV: str(store),
+            MANAGED_PATH_ENV: str(folder),
+        },
+    )
+    removed = [*_INHERITED_UNLISTED, *_EXPLICIT_UNLISTED, SECURE_STORAGE_ENV, MANAGED_PATH_ENV]
+    kept = [*_INHERITED_KEPT, *_EXPLICIT_KEPT, TRAFFIC_ENV, REVIEWER_ENV, "CLAUDE_CODE_SHELL"]
+    install.proxy.responder = probe_env_then_finish([*removed, *kept])
+
+    outcome = run_turn(
+        wire_session(
+            install,
+            reviewer_model=REVIEWER_MODEL,
+            explicit_env={**_EXPLICIT_UNLISTED, **_EXPLICIT_KEPT},
+        )
+    )
+
+    assert outcome.final.status is SessionStatus.DONE, outcome.errors
+    assert_owner_grant_only(install.proxy)
+    seen = probed_env(install, [*removed, *kept])
+    assert [name for name in removed if seen[name] != UNSET] == []
+    assert {name: seen[name] for name in [*_INHERITED_KEPT, *_EXPLICIT_KEPT]} == {
+        **_INHERITED_KEPT,
+        **_EXPLICIT_KEPT,
+    }
+    # The installation's traffic switch survives, the reviewer route is the
+    # configured reviewer, and the runner's shell pin survives.
+    assert seen[TRAFFIC_ENV] == "1"
+    assert seen[REVIEWER_ENV] == REVIEWER_MODEL
+    assert seen["CLAUDE_CODE_SHELL"] not in ("", UNSET)
 
 
 # --- AC 1: mandatory managed policy is refused, never bypassed -------------------------------
@@ -611,6 +768,38 @@ MANAGED_REFUSALS: dict[str, dict[str, object]] = {
     },
     "env-bedrock-selector": {"managed-settings.json": {"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}},
     "env-oauth-token": {"managed-settings.json": {"env": {GRANT_ENV: SERVICE_OAUTH}}},
+    # D2: managed env refuses every name D1 removes (the managed settings path
+    # included) and every ANTHROPIC_* name.
+    "env-subagent-model-force": {
+        "managed-settings.json": {
+            "env": {
+                "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1",
+                "CLAUDE_CODE_SUBAGENT_MODEL": FORCED_SUBAGENT_MODEL,
+            }
+        }
+    },
+    "drop-in-env-subagent-model": {
+        "managed-settings.d/20-models.json": {
+            "env": {"CLAUDE_CODE_SUBAGENT_MODEL": FORCED_SUBAGENT_MODEL}
+        }
+    },
+    "env-workflow-subagent-model": {
+        "managed-settings.json": {
+            "env": {"CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": FORCED_SUBAGENT_MODEL}
+        }
+    },
+    "env-secure-storage-dir": {
+        "managed-settings.json": {"env": {SECURE_STORAGE_ENV: "/var/lib/claude-store"}}
+    },
+    "env-unknown-claude-name": {
+        "managed-settings.json": {"env": {"CLAUDE_CODE_SOMETHING_NEW": "1"}}
+    },
+    "env-managed-settings-path": {
+        "managed-settings.json": {"env": {MANAGED_PATH_ENV: "/opt/other-policy"}}
+    },
+    "env-model-selection": {
+        "managed-settings.json": {"env": {REVIEWER_ENV: FORCED_SUBAGENT_MODEL}}
+    },
     "env-not-an-object": {"managed-settings.json": {"env": ["ANTHROPIC_API_KEY"]}},
     "invalid-json": {"managed-settings.json": "{not json"},
     "not-an-object": {"managed-settings.json": '["forceLoginMethod"]'},
@@ -686,15 +875,22 @@ def test_managed_claudeai_policy_with_installation_transport_still_launches(
     # Liveness for every managed refusal above. Managed proxy and CA keys are
     # installation transport; hidden drop-ins and non-.json files are not read by
     # the CLI (managed-settings docs), so their forcing keys do not refuse either.
+    # Keep-list runner settings and non-provider names are allowed in managed
+    # env (D2), and a managed ``availableModels`` allowlist is mandatory policy
+    # the runner respects, not a competing source (D3).
     personal(monkeypatch)
     plant_managed(
         managed_dir,
         {
             "managed-settings.json": {
                 "forceLoginMethod": "claudeai",
+                "availableModels": [IMPLEMENTER_MODEL, REVIEWER_MODEL],
                 "env": {
                     "HTTPS_PROXY": install.proxy.url,
                     "NODE_EXTRA_CA_CERTS": os.environ["NODE_EXTRA_CA_CERTS"],
+                    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "4096",
+                    TRAFFIC_ENV: "1",
+                    "DISABLE_TELEMETRY": "1",
                 },
             },
             "managed-settings.d/10-retention.json": {"cleanupPeriodDays": 30},
@@ -709,11 +905,77 @@ def test_managed_claudeai_policy_with_installation_transport_still_launches(
     assert_owner_grant_only(install.proxy)
 
 
-def test_the_guard_reads_the_linux_managed_settings_path() -> None:
-    # Text pin (#5373): the real ``/etc/claude-code`` cannot be written by an
-    # offline test; the live cluster test mounts a policy there and observes the
-    # refusal. Docs: https://code.claude.com/docs/en/managed-settings (Linux).
+# --- AC 1: the managed policy folder is the one the CLI reads -------------------------------
+#
+# The guard inspects only ``personal_auth.MANAGED_SETTINGS_DIR`` (default
+# ``/etc/claude-code``). ``CLAUDE_CODE_MANAGED_SETTINGS_PATH`` is not on the
+# keep-list: personal mode removes it from the CLI env and refuses it in
+# workspace and managed settings env like any other unlisted name.
+
+
+def override_policy(installation: Installation) -> Path:
+    return installation.root / "override-policy"
+
+
+def test_policy_at_the_linux_path_is_still_refused_when_another_folder_is_named(
+    install: Installation, monkeypatch: pytest.MonkeyPatch, managed_dir: Path
+) -> None:
+    # The pinned CLI reads the Linux folder even when the variable names another
+    # one (observed in the test below), so a benign named folder must not hide
+    # forcing policy at the default.
+    personal(monkeypatch)
+    plant_managed(managed_dir, {"managed-settings.json": _GATEWAY_POLICY})
+    folder = override_policy(install)
+    plant_managed(folder, {"managed-settings.json": {"forceLoginMethod": "claudeai"}})
+    monkeypatch.setenv(MANAGED_PATH_ENV, str(folder))
+    wiring = wire_session(install, reviewer_model=REVIEWER_MODEL)
+
+    with pytest.raises(PersonalLaunchRefusedError):
+        connect_session(wiring)
+
+    assert_cli_never_started(install.proxy)
+
+
+_OVERRIDE_MARKER = "CURIE_PROBE_NAMED_POLICY"
+_WORKSPACE_MARKER = "CURIE_PROBE_WORKSPACE_SETTINGS"
+
+
+@requires_cli
+def test_the_pinned_cli_reads_managed_policy_only_at_the_linux_path(
+    install: Installation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Observed in CLI 2.1.301: the Linux managed folder resolves to
+    # ``/etc/claude-code`` and its override hook is compiled out (the resolver
+    # calls a function that returns undefined), although the variable name
+    # still appears in the binary's diagnostics. Service mode here, so nothing
+    # the runner does decides it: a folder named by the variable, holding a
+    # managed ``env`` marker and a forced gateway, is not read, while the same
+    # kind of marker in workspace settings ``env`` does reach the Bash tool.
+    # The guard therefore inspects only MANAGED_SETTINGS_DIR (the live cluster
+    # test mounts policy there), and personal mode removes the variable. If a
+    # later CLI honors it, this fails and that choice needs revisiting.
     assert MANAGED_SETTINGS_DIR == Path("/etc/claude-code")
+    monkeypatch.setenv(GRANT_ENV, OWNER_GRANT)
+    folder = override_policy(install)
+    plant_managed(
+        folder, {"managed-settings.json": {**_GATEWAY_POLICY, "env": {_OVERRIDE_MARKER: "named"}}}
+    )
+    monkeypatch.setenv(MANAGED_PATH_ENV, str(folder))
+    write_json(
+        install.workspace / ".claude" / "settings.json", {"env": {_WORKSPACE_MARKER: "workspace"}}
+    )
+    names = [_OVERRIDE_MARKER, _WORKSPACE_MARKER, MANAGED_PATH_ENV]
+    install.proxy.responder = probe_env_then_finish(names)
+
+    outcome = run_turn(wire_session(install))
+
+    assert outcome.final.status is SessionStatus.DONE, outcome.errors
+    assert probed_env(install, names) == {
+        _OVERRIDE_MARKER: UNSET,
+        _WORKSPACE_MARKER: "workspace",
+        MANAGED_PATH_ENV: str(folder),
+    }
+    assert_owner_grant_only(install.proxy)
 
 
 # --- AC 1: workspace settings that add a competing source are refused ------------------------
@@ -738,6 +1000,28 @@ WORKSPACE_REFUSALS: dict[str, dict[str, object]] = {
         "settings.json": {"modelOverrides": {"claude-opus-5-5": "arn:example:model"}}
     },
     "force-login-method": {"settings.json": {"forceLoginMethod": "console"}},
+    # D2: workspace env has no keep-list, so every CLAUDE_* and ANTHROPIC_* name
+    # refuses, runner settings and model selection included. The reviewer
+    # rerouting names and ``availableModels`` (D3) have their service-mode
+    # controls in test_personal_claude_reviewers.py.
+    "env-workflow-subagent-model": {
+        "settings.json": {"env": {"CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": FORCED_SUBAGENT_MODEL}}
+    },
+    "local-env-secure-storage-dir": {
+        "settings.local.json": {"env": {SECURE_STORAGE_ENV: "/workspace/store"}}
+    },
+    "env-unknown-claude-name": {"settings.json": {"env": {"CLAUDE_CODE_SOMETHING_NEW": "1"}}},
+    "env-keep-list-runner-setting": {
+        "settings.json": {"env": {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "4096"}}
+    },
+    "local-env-keep-list-traffic-switch": {"settings.local.json": {"env": {TRAFFIC_ENV: "1"}}},
+    "env-managed-settings-path": {
+        "settings.json": {"env": {MANAGED_PATH_ENV: "/workspace/policy"}}
+    },
+    "local-env-model-selection": {
+        "settings.local.json": {"env": {REVIEWER_ENV: FORCED_SUBAGENT_MODEL}}
+    },
+    "local-available-models": {"settings.local.json": {"availableModels": [IMPLEMENTER_MODEL]}},
     "env-not-an-object": {"settings.json": {"env": "ANTHROPIC_API_KEY=x"}},
     "invalid-json": {"settings.json": "{not json"},
     "local-not-an-object": {"settings.local.json": "[]"},
@@ -1010,29 +1294,85 @@ COMPETING = [
     "AWS_BEARER_TOKEN_BEDROCK",
     "AZURE_CLIENT_ID",
     "VERTEX_REGION_CLAUDE_SONNET_5_5",
+    # D1: the keep-list fails closed on the whole CLAUDE_* and ANTHROPIC_*
+    # namespace. Names the pinned CLI 2.1.301 reads (found in the bundled
+    # binary) that carry no auth word: the credential store dir, host and
+    # federation credential files, remote and mock settings sources, the
+    # admin env union switch, the environment kind, bridge endpoints and the
+    # first-party base URL assumption.
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    "CLAUDE_CODE_HOST_CREDS_FILE",
+    "CLAUDE_CODE_FEDERATION_CACHE_DIR",
+    "CLAUDE_CODE_REMOTE_SETTINGS_PATH",
+    "CLAUDE_CODE_MOCK_REMOTE_SETTINGS",
+    "CLAUDE_CODE_DISABLE_ADMIN_ENV_UNION",
+    "CLAUDE_CODE_ENVIRONMENT_KIND",
+    "CLAUDE_BRIDGE_SESSION_INGRESS_URL",
+    "CLAUDE_REMOTE_TOOLS_BRIDGE_URL",
+    "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
+    # Subagent model routing (D5): observed in CLI 2.1.301,
+    # CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1 makes a subagent ignore its ``model:``
+    # and run on CLAUDE_CODE_SUBAGENT_MODEL. The workflow sibling names the
+    # model for workflow agents (2.1.296 changelog in the binary).
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL_FORCE",
+    "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL",
+    # Invented names, so a future CLI variable is removed before anyone lists it.
+    "CLAUDE_CODE_SOMETHING_NEW",
+    "_ANTHROPIC_SOMETHING_NEW",
+    "__CLAUDE_SOMETHING_NEW",
+    # Namespace names that are not on the keep-list. The pinned CLI ignores the
+    # managed settings path (observed, see the managed policy tests above).
+    "CLAUDE_CODE_MANAGED_SETTINGS_PATH",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES",
+    "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+    # Google and metadata server credential discovery, and the CLI's OAuth
+    # environment switches, found in the pinned CLI 2.1.301 binary.
+    "GOOGLE_CLOUD_QUOTA_PROJECT",
+    "GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES",
+    "CLOUDSDK_CONFIG",
+    "GCE_METADATA_HOST",
+    "GCE_METADATA_ROOT",
+    "GCE_METADATA_IP",
+    "METADATA_SERVER_DETECTION",
+    "USE_LOCAL_OAUTH",
+    "USE_STAGING_OAUTH",
 ]
 KEPT = [
+    # Model selection.
     "ANTHROPIC_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
     "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
     "ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION",
+    # Runner-owned CLI settings and the installation's privacy switch.
+    "CLAUDE_CODE_SHELL",
+    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    # Observed in CLI 2.1.301: without it the CLI adds bootstrap, feature flag
+    # and event logging requests to api.anthropic.com.
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    # Installation transport and other non-provider names.
     "HTTPS_PROXY",
     "HTTP_PROXY",
     "NO_PROXY",
     "NODE_EXTRA_CA_CERTS",
-    "CLAUDE_CODE_SHELL",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
     "PATH",
     "HOME",
+    "LANG",
+    "DISABLE_TELEMETRY",
+    "DISABLE_AUTOUPDATER",
+    "CURIE_SESSION_ID",
 ]
 
 
-def test_the_classifier_strips_provider_namespaces_and_keeps_model_selection() -> None:
+def test_the_classifier_fails_closed_on_provider_namespaces_and_keeps_the_keep_list() -> None:
     # Provider selectors, credentials and endpoints named in the CLI docs
     # (https://code.claude.com/docs/en/env-vars, .../authentication) and the
-    # WIF reference, plus selectors found in the pinned CLI 2.1.301 binary.
+    # WIF reference, names found in the pinned CLI 2.1.301 binary, and invented
+    # names (D1). The keep-list is exact: model selection, three runner-owned
+    # CLI settings and the installation's nonessential traffic switch.
     assert [name for name in COMPETING if not is_competing_auth_key(name)] == []
     assert [name for name in KEPT if is_competing_auth_key(name)] == []

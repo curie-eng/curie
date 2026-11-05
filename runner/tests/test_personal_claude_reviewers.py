@@ -19,22 +19,37 @@ different ``ANTHROPIC_DEFAULT_OPUS_MODEL``, a service ``CURIE_CREDENTIALS`` and 
 service ``ANTHROPIC_API_KEY``. For two different explicit reviewer models, each
 role's native request must carry that model, the implementer its own model,
 and every request the owner grant alone.
+
+Subagent model routing can replace a role's ``model:`` without touching the
+alias. Observed on CLI 2.1.301 with these role files:
+``CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`` with ``CLAUDE_CODE_SUBAGENT_MODEL=<id>``
+runs every role on ``<id>``; ``CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`` alone makes
+each role inherit the implementer's model; ``CLAUDE_CODE_SUBAGENT_MODEL`` alone
+changes nothing; and a workspace ``availableModels`` that leaves the role's
+model out makes it inherit the implementer's model. Each route has a service
+mode control here, then the personal exclusion: env routes are removed (D5),
+settings routes refuse before the CLI starts (D2, D3). The workflow sibling
+``CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL`` did not change an ``Agent`` role's model
+on CLI 2.1.301, so it is pinned by the classifier, the env readback and the
+settings refusals in ``test_personal_claude_auth.py`` instead.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
 from aci_protocol import SessionStatus
 from curie_runner import personal_auth
-from curie_runner.personal_auth import AUTH_MODE_ENV
+from curie_runner.personal_auth import AUTH_MODE_ENV, PersonalLaunchRefusedError
 from personal_auth_support import (
+    FORCED_SUBAGENT_MODEL,
     IMPLEMENTER_MARKER,
     IMPLEMENTER_MODEL,
     OWNER_GRANT,
+    REVIEWER_MODEL,
     SERVICE_API_KEY,
     SERVICE_OAUTH,
     Installation,
@@ -42,18 +57,26 @@ from personal_auth_support import (
     Reply,
     TextReply,
     ToolCall,
+    assert_cli_never_started,
     assert_owner_grant_only,
+    connect_session,
     installed,
     requires_cli,
     run_turn,
     wire_session,
     write_bundle,
+    write_json,
 )
 
 _FACTORY = Path(__file__).resolve().parents[2] / "examples" / "dark-factory"
 _ROLES = ("plan-reviewer", "diff-reviewer")
 # Ambient defaults no personal session may use.
 _AMBIENT_OPUS_DEFAULT = "claude-opus-4-1-20250805"
+# The env route that replaces a role's ``model:`` (observed, see the docstring).
+_FORCING = {
+    "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1",
+    "CLAUDE_CODE_SUBAGENT_MODEL": FORCED_SUBAGENT_MODEL,
+}
 
 
 @pytest.fixture(autouse=True)
@@ -131,11 +154,7 @@ class _ReviewScript:
         return TextReply("done")
 
 
-@requires_cli
-@pytest.mark.parametrize("reviewer_model", ["claude-opus-5-5", "claude-fable-5-1"])
-def test_both_reviewer_roles_use_the_configured_model_and_the_owner_grant(
-    install: Installation, monkeypatch: pytest.MonkeyPatch, reviewer_model: str
-) -> None:
+def _review_bundle(install: Installation) -> tuple[str, _ReviewScript]:
     plugin = _plugin_name()
     bundle = write_bundle(
         install.root / "bundle",
@@ -144,35 +163,207 @@ def test_both_reviewer_roles_use_the_configured_model_and_the_owner_grant(
     )
     script = _ReviewScript(plugin)
     install.proxy.responder = script
+    return bundle, script
+
+
+def _review_turn(
+    install: Installation,
+    *,
+    reviewer_model: str,
+    explicit_env: Mapping[str, str] | None = None,
+) -> tuple[_ReviewScript, dict[str, list[RecordedRequest]]]:
+    """One implementer turn that calls both roles; the model requests by role."""
+
+    bundle, script = _review_bundle(install)
+    outcome = run_turn(
+        wire_session(
+            install,
+            reviewer_model=reviewer_model,
+            plugin_dir=bundle,
+            max_turns=8,
+            explicit_env=explicit_env,
+        )
+    )
+    assert outcome.final.status is SessionStatus.DONE, outcome.errors
+    by_role: dict[str, list[RecordedRequest]] = {}
+    for request in install.proxy.model_requests():
+        by_role.setdefault(script.role_of(request), []).append(request)
+    assert sorted(by_role) == sorted(["implementer", *_ROLES]), sorted(by_role)
+    # Both verdicts came back to the implementer, so each role finished in turn.
+    returned = by_role["implementer"][-1].tool_result_text()
+    for role in _ROLES:
+        assert f"REVIEWER: {role}" in returned, f"the {role} verdict never returned"
+    return script, by_role
+
+
+def _role_models(by_role: Mapping[str, list[RecordedRequest]]) -> dict[str, set[str | None]]:
+    return {role: {request.model for request in by_role[role]} for role in ("implementer", *_ROLES)}
+
+
+def _personal(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(AUTH_MODE_ENV, "personal")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", OWNER_GRANT)
+
+
+@requires_cli
+@pytest.mark.parametrize("reviewer_model", ["claude-opus-5-5", "claude-fable-5-1"])
+def test_both_reviewer_roles_use_the_configured_model_and_the_owner_grant(
+    install: Installation, monkeypatch: pytest.MonkeyPatch, reviewer_model: str
+) -> None:
+    _personal(monkeypatch)
     monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", _AMBIENT_OPUS_DEFAULT)
     monkeypatch.setenv("CURIE_CREDENTIALS", SERVICE_OAUTH)
     monkeypatch.setenv("ANTHROPIC_API_KEY", SERVICE_API_KEY)
 
-    outcome = run_turn(
-        wire_session(install, reviewer_model=reviewer_model, plugin_dir=bundle, max_turns=8)
-    )
+    script, by_role = _review_turn(install, reviewer_model=reviewer_model)
 
-    assert outcome.final.status is SessionStatus.DONE, outcome.errors
-    requests = install.proxy.model_requests()
-    by_role: dict[str, list[RecordedRequest]] = {}
-    for request in requests:
-        by_role.setdefault(script.role_of(request), []).append(request)
-    assert sorted(by_role) == sorted(["implementer", *_ROLES]), sorted(by_role)
     # The CLI names a plugin agent ``<plugin>:<file stem>``, the name the
     # implement-issue skill passes as subagent_type (observed on CLI 2.1.301 in
     # the implementer's agent listing).
     listing = json.dumps(by_role["implementer"][0].body)
     for subagent_type in script.subagent_types:
         assert subagent_type in listing, f"the CLI does not list {subagent_type}"
-    assert {request.model for request in by_role["implementer"]} == {IMPLEMENTER_MODEL}
     for role in _ROLES:
         assert len(by_role[role]) == 1, f"{role} sent {len(by_role[role])} requests"
-        [request] = by_role[role]
-        assert request.model == reviewer_model, f"{role} ran on {request.model}"
-    # Both verdicts came back to the implementer, so each role finished in turn.
-    returned = by_role["implementer"][-1].tool_result_text()
-    for role in _ROLES:
-        assert f"REVIEWER: {role}" in returned, f"the {role} verdict never returned"
+    assert _role_models(by_role) == {
+        "implementer": {IMPLEMENTER_MODEL},
+        **{role: {reviewer_model} for role in _ROLES},
+    }
+    assert_owner_grant_only(install.proxy)
+
+
+# --- D5: subagent model forcing in the env -------------------------------------------------
+
+
+@requires_cli
+@pytest.mark.parametrize("source", ["inherited", "options-env"])
+def test_subagent_model_forcing_reroutes_both_reviewer_roles_in_service_mode(
+    install: Installation, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    # The positive control for the case below: mode absent, the same explicit
+    # reviewer, so only the forcing differs from the configured route.
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", OWNER_GRANT)
+    explicit: dict[str, str] | None = None
+    if source == "inherited":
+        for name, value in _FORCING.items():
+            monkeypatch.setenv(name, value)
+    else:
+        explicit = dict(_FORCING)
+
+    _, by_role = _review_turn(install, reviewer_model=REVIEWER_MODEL, explicit_env=explicit)
+
+    assert _role_models(by_role) == {
+        "implementer": {IMPLEMENTER_MODEL},
+        **{role: {FORCED_SUBAGENT_MODEL} for role in _ROLES},
+    }
+
+
+@requires_cli
+@pytest.mark.parametrize("source", ["inherited", "options-env"])
+def test_personal_mode_removes_subagent_model_forcing(
+    install: Installation, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    _personal(monkeypatch)
+    explicit: dict[str, str] | None = None
+    if source == "inherited":
+        for name, value in _FORCING.items():
+            monkeypatch.setenv(name, value)
+    else:
+        explicit = dict(_FORCING)
+
+    _, by_role = _review_turn(install, reviewer_model=REVIEWER_MODEL, explicit_env=explicit)
+
+    assert _role_models(by_role) == {
+        "implementer": {IMPLEMENTER_MODEL},
+        **{role: {REVIEWER_MODEL} for role in _ROLES},
+    }
+    assert_owner_grant_only(install.proxy)
+
+
+# --- D2, D3: workspace settings that reroute a reviewer role ---------------------------------
+#
+# Project and local settings (``<cwd>/.claude/settings.json`` and
+# ``settings.local.json``, ADR 0189) are agent writable. Each case maps the
+# settings files to the model the control observes on both roles.
+
+REROUTING_SETTINGS: dict[str, tuple[dict[str, object], str]] = {
+    "env-subagent-model-force": ({"settings.json": {"env": _FORCING}}, FORCED_SUBAGENT_MODEL),
+    "local-env-subagent-model-force": (
+        {"settings.local.json": {"env": _FORCING}},
+        FORCED_SUBAGENT_MODEL,
+    ),
+    "env-subagent-model-force-alone": (
+        {"settings.json": {"env": {"CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"}}},
+        IMPLEMENTER_MODEL,
+    ),
+    # Observed on CLI 2.1.301: a role whose model is not in the allowlist
+    # inherits the parent's model ("Subagent model ... is not in the
+    # availableModels allowlist; ... inheriting the parent model instead").
+    "available-models": (
+        {"settings.json": {"availableModels": [IMPLEMENTER_MODEL]}},
+        IMPLEMENTER_MODEL,
+    ),
+}
+
+
+def _plant_workspace(install: Installation, files: Mapping[str, object]) -> None:
+    for name, content in files.items():
+        write_json(install.workspace / ".claude" / name, content)
+
+
+@requires_cli
+@pytest.mark.parametrize("case", list(REROUTING_SETTINGS))
+def test_rerouting_workspace_settings_are_live_in_service_mode(
+    install: Installation, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    # The positive control for the refusal below.
+    files, observed = REROUTING_SETTINGS[case]
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", OWNER_GRANT)
+    _plant_workspace(install, files)
+
+    _, by_role = _review_turn(install, reviewer_model=REVIEWER_MODEL)
+
+    assert _role_models(by_role) == {
+        "implementer": {IMPLEMENTER_MODEL},
+        **{role: {observed} for role in _ROLES},
+    }
+
+
+@pytest.mark.parametrize("case", list(REROUTING_SETTINGS))
+def test_rerouting_workspace_settings_are_refused_before_the_cli_starts(
+    install: Installation, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    files, _ = REROUTING_SETTINGS[case]
+    _personal(monkeypatch)
+    _plant_workspace(install, files)
+    bundle, _ = _review_bundle(install)
+    wiring = wire_session(install, reviewer_model=REVIEWER_MODEL, plugin_dir=bundle, max_turns=8)
+
+    with pytest.raises(PersonalLaunchRefusedError):
+        connect_session(wiring)
+
+    assert_cli_never_started(install.proxy)
+
+
+@requires_cli
+def test_workspace_settings_without_a_rerouting_key_still_run_both_reviewers(
+    install: Installation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Liveness for the refusals above: ordinary project and local settings,
+    # including a non-provider env name, keep both roles on the reviewer.
+    _personal(monkeypatch)
+    _plant_workspace(
+        install,
+        {
+            "settings.json": {"permissions": {"allow": ["Read"]}, "env": {"FOO": "bar"}},
+            "settings.local.json": {"permissions": {"deny": []}},
+        },
+    )
+
+    _, by_role = _review_turn(install, reviewer_model=REVIEWER_MODEL)
+
+    assert _role_models(by_role) == {
+        "implementer": {IMPLEMENTER_MODEL},
+        **{role: {REVIEWER_MODEL} for role in _ROLES},
+    }
     assert_owner_grant_only(install.proxy)

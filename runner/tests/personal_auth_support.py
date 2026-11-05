@@ -27,14 +27,16 @@ placeholder that matched, never a header value.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import datetime
+import hashlib
 import json
 import os
 import shutil
 import ssl
 import threading
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -68,6 +70,9 @@ TURN_TIMEOUT_S = 90
 CONNECT_TIMEOUT_S = 30
 IMPLEMENTER_MODEL = "claude-sonnet-5-5"
 REVIEWER_MODEL = "claude-opus-5-5"
+# A real Claude model ID that is neither the implementer nor the reviewer, so a
+# request on it can only come from CLAUDE_CODE_SUBAGENT_MODEL.
+FORCED_SUBAGENT_MODEL = "claude-haiku-4-5"
 IMPLEMENTER_MARKER = "IMPLEMENTER-PLACEHOLDER: you implement one issue."
 
 # --- placeholder credentials ----------------------------------------------------
@@ -89,6 +94,24 @@ AWS_SECRET = "PLACEHOLDER-aws-secret"
 SAVED_LOGIN = "sk-ant-oat01-PLACEHOLDER-saved-login"
 SAVED_API_KEY = "sk-ant-api03-PLACEHOLDER-saved-key"
 CUSTOM_HEADER = "PLACEHOLDER-custom-header"
+# 2100-01-01, in seconds and in ms: every planted session is unexpired.
+FAR_FUTURE_S = 4_102_444_800
+FAR_FUTURE_MS = FAR_FUTURE_S * 1000
+
+
+def _placeholder_jwt(claims: Mapping[str, Any]) -> str:
+    """An unsigned JWT-shaped placeholder (``alg: none``) carrying ``claims``."""
+
+    def part(data: Mapping[str, Any]) -> str:
+        raw = json.dumps(data, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    return f"{part({'alg': 'none', 'typ': 'JWT'})}.{part(claims)}.c2ln"
+
+
+# The signed-in gateway session's token. The CLI reads the record's own
+# ``expiresAt``; the ``exp`` claim is future too so no decoder sees it expired.
+GATEWAY_JWT = _placeholder_jwt({"sub": "example", "exp": FAR_FUTURE_S})
 
 PLACEHOLDER_NAMES: dict[str, str] = {
     OWNER_GRANT: "owner grant",
@@ -105,6 +128,7 @@ PLACEHOLDER_NAMES: dict[str, str] = {
     SAVED_LOGIN: "saved claude.ai login",
     SAVED_API_KEY: "saved api key",
     CUSTOM_HEADER: "custom header",
+    GATEWAY_JWT: "gateway jwt",
 }
 
 # --- hosts ----------------------------------------------------------------------
@@ -166,10 +190,15 @@ _OWNED_ENV_NAMES = (
 
 @dataclass(frozen=True)
 class TestAuthority:
-    """A throwaway CA and one leaf for every intercepted host, under ``tmp_path``."""
+    """A throwaway CA and one leaf for every intercepted host, under ``tmp_path``.
+
+    ``leaf_sha256`` is the SHA-256 of the leaf's DER bytes as lowercase hex
+    without colons: the form the CLI pins a gateway's TLS certificate in.
+    """
 
     ca_path: Path
     server_context: ssl.SSLContext
+    leaf_sha256: str
 
 
 def make_test_authority(root: Path) -> TestAuthority:
@@ -235,7 +264,11 @@ def make_test_authority(root: Path) -> TestAuthority:
     key_path.chmod(0o600)
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     context.load_cert_chain(leaf_path, key_path)
-    return TestAuthority(ca_path=ca_path, server_context=context)
+    return TestAuthority(
+        ca_path=ca_path,
+        server_context=context,
+        leaf_sha256=hashlib.sha256(leaf.public_bytes(serialization.Encoding.DER)).hexdigest(),
+    )
 
 
 # --- what the proxy records -----------------------------------------------------
@@ -406,6 +439,10 @@ class InterceptingProxy:
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self._port}"
+
+    @property
+    def authority(self) -> TestAuthority:
+        return self._authority
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="intercepting-proxy", daemon=True)
@@ -674,6 +711,51 @@ def merge_json(path: Path, data: Mapping[str, Any]) -> Path:
 
     existing = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
     return write_json(path, {**existing, **data})
+
+
+def restorable_gateway_session(installation: Installation) -> dict[str, Any]:
+    """A signed-in gateway session the pinned CLI restores at startup.
+
+    The ``.credentials.json`` shape the CLI 2.1.301 startup restore reads:
+    ``enterpriseGateway`` with ``url``, ``jwt`` and ``expiresAt`` (ms), and
+    ``gatewayTrust`` keyed by the gateway URL's hostname holding the gateway's
+    TLS certificate SHA-256 (lowercase hex, no colons). Without the trust entry
+    the CLI prints "Cloud gateway <host> is not trusted on this machine" and
+    skips the session; an expired session without ``idpRefreshToken`` is skipped
+    too. The restore then probes the gateway's TLS through ``HTTPS_PROXY``,
+    which here is the intercepting proxy, so the pin is this run's leaf.
+    """
+
+    return {
+        "enterpriseGateway": {
+            "url": f"https://{ALT_GATEWAY_HOST}",
+            "jwt": GATEWAY_JWT,
+            "expiresAt": FAR_FUTURE_MS,
+        },
+        "gatewayTrust": {ALT_GATEWAY_HOST: installation.proxy.authority.leaf_sha256},
+    }
+
+
+UNSET = "<unset>"
+
+
+def env_probe_command(names: Sequence[str]) -> str:
+    """A Bash command printing ``NAME=<value>`` for each name, ``<unset>`` when absent."""
+
+    return "; ".join(f"printf '{name}=%s\\n' \"${{{name}-{UNSET}}}\"" for name in names)
+
+
+def env_probe_values(text: str, names: Sequence[str]) -> dict[str, str]:
+    """The ``NAME=<value>`` lines ``env_probe_command`` printed, by name."""
+
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        name, sep, value = line.strip().partition("=")
+        if sep and name in names:
+            values[name] = value
+    missing = [name for name in names if name not in values]
+    assert not missing, f"the probe printed no line for {missing}"
+    return values
 
 
 def write_api_key_helper(root: Path) -> tuple[Path, Path]:
