@@ -805,3 +805,231 @@ fn non_uuid_id_is_a_structured_usage_error_at_both_tiers() {
         }
     }
 }
+
+// --- personal execution owner (#5376) -------------------------------------------
+//
+// The API serializes the immutable owner tuple on every WorkItem and on every
+// request snapshot. The shared vector holds the real bodies of
+// `GET /work-items/{id}` (`personal_detail`, `service_detail`) and
+// `GET /work-items` (`list`); the CLI must carry the four facts through
+// unchanged, in both tiers, and name them in the human detail.
+
+const OWNER_FACTS: [&str; 4] = [
+    "tenant_id",
+    "model_auth_mode",
+    "owner_principal_id",
+    "enrollment_generation",
+];
+
+fn owner_vector() -> Value {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tests/vectors/work-item-owner-read.json"
+    );
+    let raw = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("shared vector {path} must exist: {error}"));
+    serde_json::from_str(&raw).expect("vector is JSON")
+}
+
+fn owner_detail_server(detail: &Value) -> MockServer {
+    let id = detail["id"].as_str().expect("detail id").to_owned();
+    let body = detail.to_string();
+    serve(move |req| {
+        if route(&req.path) == format!("/work-items/{id}") {
+            Response::json(200, &body)
+        } else {
+            Response::json(500, r#"{"detail":"unexpected"}"#)
+        }
+    })
+}
+
+fn tier_output(tier: &str, extra: &[&str], api_url: &str, json: bool) -> Output {
+    let mut args = vec![tier, "work-items"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["--api-url", api_url, "--api-key", TEST_API_KEY]);
+    if json {
+        args.push("--json");
+    }
+    run(&args)
+}
+
+/// Every owner fact on `got` equals the one on `want` (a null stays null).
+fn assert_owner_facts(got: &Value, want: &Value, context: &str) {
+    for fact in OWNER_FACTS {
+        assert!(
+            want.get(fact).is_some(),
+            "{context}: the vector must carry {fact}: {want}"
+        );
+        assert_eq!(got[fact], want[fact], "{context}: {fact}");
+    }
+}
+
+fn assert_owner_shape(want: &Value, personal: bool, context: &str) {
+    if personal {
+        assert_eq!(want["model_auth_mode"], "personal", "{context}");
+        assert!(want["tenant_id"].is_string(), "{context}");
+        assert!(want["owner_principal_id"].is_string(), "{context}");
+        assert!(
+            want["enrollment_generation"].as_i64().unwrap_or(0) >= 1,
+            "{context}"
+        );
+    } else {
+        assert_eq!(want["model_auth_mode"], "service", "{context}");
+        assert!(want["owner_principal_id"].is_null(), "{context}");
+        assert!(want["enrollment_generation"].is_null(), "{context}");
+    }
+}
+
+#[test]
+fn detail_json_carries_the_owner_facts_on_the_item_and_every_request() {
+    let vector = owner_vector();
+    for (key, personal) in [("personal_detail", true), ("service_detail", false)] {
+        let detail = &vector[key];
+        assert_owner_shape(detail, personal, key);
+        let requests = detail["requests"].as_array().expect("requests");
+        assert!(!requests.is_empty(), "{key}: the vector needs requests");
+        for tier in ["local", "cluster"] {
+            let server = owner_detail_server(detail);
+            let id = detail["id"].as_str().unwrap();
+
+            let output = tier_output(tier, &[id], &server.base_url, true);
+
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{tier} {key}: {}",
+                describe(&output)
+            );
+            let value = one_object(&output);
+            assert_owner_facts(&value["item"], detail, &format!("{tier} {key} item"));
+            let got = value["item"]["requests"].as_array().expect("requests");
+            assert_eq!(got.len(), requests.len(), "{tier} {key}");
+            for (index, (got, want)) in got.iter().zip(requests).enumerate() {
+                assert_owner_shape(want, personal, &format!("{key} request {index}"));
+                assert_owner_facts(got, want, &format!("{tier} {key} request {index}"));
+            }
+            assert_schema(&value);
+        }
+    }
+}
+
+#[test]
+fn list_json_carries_the_owner_facts_and_validates_against_the_schema() {
+    let vector = owner_vector();
+    let list = &vector["list"];
+    let items = list["items"].as_array().expect("list items").clone();
+    assert!(
+        items.iter().any(|i| i["model_auth_mode"] == "personal")
+            && items.iter().any(|i| i["model_auth_mode"] == "service"),
+        "the list vector must hold a personal and a service item: {list}"
+    );
+    for tier in ["local", "cluster"] {
+        let body = list.to_string();
+        let server = serve(move |req| match route(&req.path) {
+            "/work-items" => Response::json(200, &body),
+            other => Response::json(500, &format!(r#"{{"detail":"unexpected {other}"}}"#)),
+        });
+
+        let output = tier_output(tier, &[], &server.base_url, true);
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{tier}: {}",
+            describe(&output)
+        );
+        let value = one_object(&output);
+        let got = value["items"].as_array().expect("items");
+        assert_eq!(got.len(), items.len(), "{tier}");
+        for (index, (got, want)) in got.iter().zip(&items).enumerate() {
+            assert_owner_facts(got, want, &format!("{tier} list item {index}"));
+            for (n, (got, want)) in got["requests"]
+                .as_array()
+                .expect("requests")
+                .iter()
+                .zip(want["requests"].as_array().expect("requests"))
+                .enumerate()
+            {
+                assert_owner_facts(got, want, &format!("{tier} list item {index} request {n}"));
+            }
+        }
+        assert_schema(&value);
+    }
+}
+
+#[test]
+fn human_detail_prints_one_auth_line_naming_the_owner_and_generation() {
+    let vector = owner_vector();
+    for tier in ["local", "cluster"] {
+        let personal = &vector["personal_detail"];
+        let server = owner_detail_server(personal);
+        let output = tier_output(
+            tier,
+            &[personal["id"].as_str().unwrap()],
+            &server.base_url,
+            false,
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{tier}: {}",
+            describe(&output)
+        );
+        let text = stdout(&output);
+        let auth: Vec<&str> = text
+            .lines()
+            .filter(|line| line.trim_start().starts_with("auth"))
+            .collect();
+        assert_eq!(auth.len(), 1, "{tier}: exactly one auth line: {text}");
+        assert!(auth[0].contains("personal"), "{tier}: {}", auth[0]);
+        assert!(
+            auth[0].contains(personal["owner_principal_id"].as_str().unwrap()),
+            "{tier}: {}",
+            auth[0]
+        );
+        assert!(
+            auth[0].contains(&personal["enrollment_generation"].to_string()),
+            "{tier}: {}",
+            auth[0]
+        );
+
+        let service = &vector["service_detail"];
+        let server = owner_detail_server(service);
+        let output = tier_output(
+            tier,
+            &[service["id"].as_str().unwrap()],
+            &server.base_url,
+            false,
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{tier}: {}",
+            describe(&output)
+        );
+        let text = stdout(&output);
+        let auth: Vec<&str> = text
+            .lines()
+            .filter(|line| line.trim_start().starts_with("auth"))
+            .collect();
+        assert_eq!(auth.len(), 1, "{tier}: exactly one auth line: {text}");
+        assert!(auth[0].contains("service"), "{tier}: {}", auth[0]);
+        assert!(!auth[0].contains("personal"), "{tier}: {}", auth[0]);
+    }
+}
+
+#[test]
+fn a_body_without_the_owner_facts_still_renders_and_emits_null_facts() {
+    // An older API omits the four fields; the mirror defaults them, so the
+    // CLI neither fails nor invents an owner.
+    let body = detail_item().to_string();
+    let server = serve(move |_req| Response::json(200, &body));
+
+    let output = local(&[ITEM_ID], &server.base_url, true);
+
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let value = one_object(&output);
+    assert!(value["item"]["owner_principal_id"].is_null(), "{value}");
+    assert!(value["item"]["enrollment_generation"].is_null(), "{value}");
+    assert_schema(&value);
+}
