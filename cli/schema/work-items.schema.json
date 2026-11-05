@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/work-items/v2.json",
+  "$id": "https://schemas.curietech.ai/cli/work-items/v2.1.json",
   "title": "curie <tier> work-items --json",
   "description": "The agent-facing payload of `curie <tier> work-items [ID]`: the dry-run plan, the factory work item list (`items`, `limit`, `truncated`), or one work item under `item` with live CI. `state` and `actionable_cause` are the platform API's strings, never derived by the CLI.",
   "$defs": {
@@ -37,11 +37,7 @@
         "terminal_cause",
         "termination_observation",
         "capacity_deferrals",
-        "last_deferral_reason",
-        "tenant_id",
-        "model_auth_mode",
-        "owner_principal_id",
-        "enrollment_generation"
+        "last_deferral_reason"
       ],
       "properties": {
         "sequence": {
@@ -317,11 +313,7 @@
         "publication",
         "correctness",
         "ci",
-        "requests",
-        "tenant_id",
-        "model_auth_mode",
-        "owner_principal_id",
-        "enrollment_generation"
+        "requests"
       ],
       "properties": {
         "id": {
