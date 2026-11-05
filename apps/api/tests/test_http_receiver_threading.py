@@ -101,7 +101,9 @@ def test_http_receiver_preserves_native_parent_through_queue_and_actual_slack_re
             }
             body = {
                 "type": "event_callback", "event_id": "EvSyntheticThreading",
-                "team_id": membership.ACCOUNT, "is_ext_shared_channel": False, "event": event,
+                "team_id": membership.ACCOUNT,
+                "authorizations": [{"team_id": membership.ACCOUNT, "user_id": BOT, "is_bot": True}],
+                "is_ext_shared_channel": False, "event": event,
             }
             submitted = runtime.submit(
                 body=body, event=event, slack_identity=scope["adapter"], bot_user_id=BOT,

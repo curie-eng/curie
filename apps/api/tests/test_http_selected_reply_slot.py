@@ -72,7 +72,9 @@ def _native(scope: dict[str, Any], *, text: str = "Synthetic reply slot") -> dic
     }
     return {
         "type": "event_callback", "event_id": "EvSyntheticReplySlot",
-        "team_id": membership.ACCOUNT, "is_ext_shared_channel": False, "event": event,
+        "team_id": membership.ACCOUNT,
+        "authorizations": [{"team_id": membership.ACCOUNT, "user_id": BOT, "is_bot": True}],
+        "is_ext_shared_channel": False, "event": event,
     }
 
 
