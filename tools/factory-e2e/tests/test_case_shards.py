@@ -89,12 +89,16 @@ def test_rebuild_command_sums_phases_and_replaces_older_measurements(tmp_path: P
     first = tmp_path / "first.log"
     second = tmp_path / "second.log"
     first.write_text(
+        "job\tstep\t2026-11-05T00:00:00Z =============== slowest durations ===============\n"
         "job\tstep\t2026-11-05T00:00:00Z 10.00s setup tools/tests/test_example.py::test_a[x]\n"
         "job\tstep\t2026-11-05T00:00:00Z 20.00s call tools/tests/test_example.py::test_a[x]\n"
         "job\tstep\t2026-11-05T00:00:00Z 1.00s teardown tools/tests/test_example.py::test_a[x]\n"
         "2.00s call tools/tests/test_example.py::test_b\n"
     )
-    second.write_text("40.00s call tools/tests/test_example.py::test_b\n")
+    second.write_text(
+        "=============== slowest durations ===============\n"
+        "40.00s call tools/tests/test_example.py::test_b\n"
+    )
     output = tmp_path / "durations.json"
     command = [
         sys.executable,
@@ -110,3 +114,82 @@ def test_rebuild_command_sums_phases_and_replaces_older_measurements(tmp_path: P
     second.write_text("no duration report\n")
     result = subprocess.run([*command, str(second)], capture_output=True, text=True)
     assert result.returncode != 0
+
+
+def _refresh(log: Path, output: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).parents[1] / "rebuild_case_durations.py"),
+            "--output",
+            str(output),
+            str(log),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_one_shard_refresh_keeps_other_shards_and_reports_counts(tmp_path: Path) -> None:
+    output = tmp_path / "durations.json"
+    output.write_text(json.dumps({"tools/x.py::updated": 10, "tools/y.py::kept": 20.12345}))
+    log = tmp_path / "shard.log"
+    log.write_text(
+        "=============== slowest durations ===============\n"
+        "2.00s call tools/x.py::updated\n"
+        "3.00s call tools/x.py::added\n"
+    )
+    result = _refresh(log, output)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(output.read_text()) == {
+        "tools/x.py::updated": 2,
+        "tools/y.py::kept": 20.12345,
+        "tools/x.py::added": 3,
+    }
+    assert "Updated 1, kept 1, added 1" in result.stdout
+
+
+def test_refresh_uses_only_anchored_rows_in_the_duration_section(tmp_path: Path) -> None:
+    output = tmp_path / "durations.json"
+    log = tmp_path / "shard.log"
+    prefix = "job\tstep\t2026-11-05T00:00:00Z "
+    log.write_text(
+        prefix
+        + "5.00s call tools/x.py::before_header\n"
+        + prefix
+        + "=============== slowest durations ===============\n"
+        + prefix
+        + "E   AssertionError: 5.00s call tools/x.py::bogus\n"
+        + prefix
+        + "7.00s call tools/x.py::valid\n"
+        + prefix
+        + "=============== short test summary info ===============\n"
+        + prefix
+        + "8.00s call tools/x.py::after_section\n"
+    )
+    result = _refresh(log, output)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(output.read_text()) == {"tools/x.py::valid": 7}
+
+
+@pytest.mark.parametrize("status", ["FAILED", "ERROR"])
+def test_refresh_keeps_previous_weight_for_a_failed_case(tmp_path: Path, status: str) -> None:
+    output = tmp_path / "durations.json"
+    output.write_text('{"tools/x.py::bad[case]": 9}')
+    log = tmp_path / "shard.log"
+    log.write_text(
+        "=============== slowest durations ===============\n"
+        "10.00s setup tools/x.py::bad[case]\n"
+        "100.00s call tools/x.py::bad[case]\n"
+        "20.00s teardown tools/x.py::bad[case]\n"
+        "1.00s call tools/x.py::good[ERROR]\n"
+        "=============== short test summary info ===============\n"
+        f"{status} tools/x.py::bad[case] - example failure\n"
+    )
+    result = _refresh(log, output)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(output.read_text()) == {
+        "tools/x.py::bad[case]": 9,
+        "tools/x.py::good[ERROR]": 1,
+    }

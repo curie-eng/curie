@@ -1330,6 +1330,7 @@ def test_admitted_agent_shards_partition_the_module_in_collection_order(tmp_path
     continuations = [case for case in whole if case.startswith(prefix)]
     assert len(continuations) == 6
     relabel = f"{ADMITTED_AGENT_RUNTIME}::{RELABEL_REGRESSION}"
+    assert whole[whole.index(relabel) - 6 : whole.index(relabel)] == continuations
     [owner] = [shard for shard in shards if relabel in shard]
     position = owner.index(relabel)
     assert position >= 6
