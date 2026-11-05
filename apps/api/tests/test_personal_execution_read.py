@@ -3,9 +3,10 @@
 ``GET /work-items/{id}`` and ``GET /work-items`` carry ``tenant_id``,
 ``model_auth_mode``, ``owner_principal_id`` and ``enrollment_generation`` on the
 WorkItem and on every request entry. The read happens after the transitions that
-could disturb them: a tool approval resolved by a different principal, the end of
-the run, a revalidation onto a replaced subscription and a revision from another
-requester. The WorkItem shows the rebound generation, the terminal request keeps
+could disturb them: a tool approval resolved by a different principal, a relabel
+from another requester that stops the run, the worker's recorded termination of
+that run, a revalidation onto a replaced subscription and the relabel's own
+request. The WorkItem shows the rebound generation, the terminal request keeps
 the one it ran under, and a service WorkItem shows NULL subscription facts. A
 wrong-agent read stays indistinguishable from an unknown id, every response is
 ``no-store``, and nothing in any body names a grant, token, secret or credential.
@@ -31,10 +32,8 @@ from uuid import uuid4
 
 import personal_execution_support as support
 import pytest
-from curie_api import workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.main import create_app
-from curie_api.workitems.lifecycle import WorkItemOutcome
 from fastapi.testclient import TestClient
 
 WORKER_TOKEN = "personal-read-worker-token"
@@ -44,14 +43,15 @@ APPROVER = "U0APPROVER1"
 PERSONAL_ISSUE = 53781
 SERVICE_ISSUE = 53782
 SERVICE_CONVERSATION = "1700000000.000200"
-REVISION_OBJECTIVE = "Address the follow up comment on the issue"
+RELABEL_OBJECTIVE = "Run the task again after the label was added back"
 VECTOR = Path(__file__).resolve().parents[3] / "tests" / "vectors" / "work-item-owner-read.json"
 UPDATE_ENV = "CURIE_TEST_WORK_ITEM_OWNER_VECTOR_UPDATE"
 SECTIONS = ("personal_detail", "service_detail", "list")
 VECTOR_COMMENT = (
     "Normalized operator read bodies for #5376: GET /work-items/{id} for a personal "
     "and a service WorkItem and GET /work-items, after a tool approval by another "
-    "principal, the run's end, a revalidation onto generation 2 and a revision. "
+    "principal, a relabel by another requester that stops the run, the run's recorded "
+    "termination, a revalidation onto generation 2 and the relabel's admission. "
     "Each distinct UUID is 00000000-0000-4000-8000-%012d in order of first appearance "
     "(sections personal_detail, service_detail, list; keys sorted); every ISO timestamp "
     "is 2026-01-01T00:00:00Z. Written by apps/api/tests/test_personal_execution_read.py "
@@ -165,7 +165,7 @@ def test_operator_read_exposes_the_owner_tuple_after_approval_and_revalidation(
     personal = support.admit_personal(
         api, WORKER_HEADERS, world, agent_id, issue_number=PERSONAL_ISSUE
     )
-    epoch = support.start_request(personal.request_id)
+    support.start_request(personal.request_id)
 
     # A different principal approves a tool call on the personal run.
     approval = support.tool_approval(api, auth_headers, agent_id=agent_id, route=ROUTE)
@@ -175,7 +175,16 @@ def test_operator_read_exposes_the_owner_tuple_after_approval_and_revalidation(
         headers=support.operator_headers(api, auth_headers, APPROVER),
     )
     assert resolved.status_code == 200, resolved.text
-    support.finish_failed(personal.request_id, epoch)
+
+    # Another requester relabels the issue, which stops the run; the worker
+    # records its termination.
+    relabel = support.relabel_while_live(
+        agent_id,
+        issue_number=PERSONAL_ISSUE,
+        live_request_id=personal.request_id,
+        objective=RELABEL_OBJECTIVE,
+    )
+    assert support.record_termination(personal.request_id).status == "cancelled"
 
     # The owner's subscription is replaced and the WorkItem revalidated onto it.
     advanced, _ = support.advance_enrollment(world)
@@ -183,18 +192,10 @@ def test_operator_read_exposes_the_owner_tuple_after_approval_and_revalidation(
         advanced
     )
 
-    # A revision from another requester runs under the rebound generation.
-    revision = support.facts(
-        agent_id,
-        issue_number=PERSONAL_ISSUE,
-        requester=support.OTHER_REQUESTER,
-        objective=REVISION_OBJECTIVE,
-    )
-    revised = support.with_session(
-        lambda session: workitem_dispatch.admit_revision(session, revision)
-    )
-    assert isinstance(revised, WorkItemOutcome), revised
-    assert revised.request is not None and revised.request.status == "waiting"
+    # The relabel's request runs under the rebound generation.
+    admitted = support.admit_pending_readmit(personal.work_item_id)
+    assert admitted.request is not None
+    assert (admitted.request.id, admitted.request.status) == (relabel.request_id, "waiting")
 
     personal_detail = api.get(f"/work-items/{personal.work_item_id}", headers=auth_headers)
     service_detail = api.get(f"/work-items/{service.work_item_id}", headers=auth_headers)
@@ -214,9 +215,13 @@ def test_operator_read_exposes_the_owner_tuple_after_approval_and_revalidation(
     tenant, owner = str(world.tenant_id), str(world.owner_id)
     assert _owner_facts(personal_body) == (tenant, "personal", owner, advanced)
     assert _request_facts(personal_body) == [
-        (1, "failed", tenant, "personal", owner, world.generation),
+        (1, "cancelled", tenant, "personal", owner, world.generation),
         (2, "waiting", tenant, "personal", owner, advanced),
     ]
+    # The terminal request carries the recorded termination, in its safe form.
+    assert personal_body["requests"][0]["termination_observation"] == (
+        "runtime termination observed; absent at 2026-09-18T12:00:10+00:00"
+    )
     # The newest requester is not the owner.
     assert personal_body["requester"] == support.OTHER_REQUESTER
     assert _owner_facts(service_body) == (tenant, "service", None, None)
