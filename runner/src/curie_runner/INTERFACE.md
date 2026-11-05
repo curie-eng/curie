@@ -45,8 +45,18 @@ including the empty string, raises `InvalidAuthModeError` before the CLI starts.
 `personal` is checked right after the wire-protocol gate: `resolve_sdk_env`
 returns no override and maps nothing, so this seam's base URL override and
 `CURIE_CREDENTIALS` mapping never apply, and the owner's `CLAUDE_CODE_OAUTH_TOKEN`
-is the only grant. The personal policy lives in `personal_auth.py` (#5373,
-ADR 0268); see the runner README, "Personal subscription mode".
+is the only grant. From the `CLAUDE_*` and `ANTHROPIC_*` namespaces the CLI
+parent env then keeps only model selection, `CLAUDE_CODE_SHELL`,
+`CLAUDE_CODE_DISABLE_TERMINAL_TITLE`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS` and
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`. Every other name there is removed,
+including `CLAUDE_SECURESTORAGE_CONFIG_DIR` and subagent model forcing
+(`CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL_FORCE`,
+`CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL`), so reviewer roles keep the configured
+reviewer model. Workspace settings `env` may set no name from those namespaces
+and workspace `availableModels` is refused; managed settings `env` may set only
+the kept `CLAUDE_*` names from them. The personal policy lives in
+`personal_auth.py` (#5373, ADR 0268); see the runner README, "Personal
+subscription mode".
 
 ### `ANTHROPIC_API_KEY` (output, set by the runner)
 

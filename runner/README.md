@@ -471,22 +471,37 @@ CLI starts:
    message starts `authentication required`, even when a working service
    credential or a saved login is present.
 3. Every competing source is removed from the CLI parent env and from the SDK
-   options env: cloud selectors and their settings, `ANTHROPIC_API_KEY`,
-   `ANTHROPIC_AUTH_TOKEN`, custom headers, both base URL variables, profile and
-   federation variables, and any other provider credential or endpoint
-   variable (`is_competing_auth_key`). Installation transport (`HTTPS_PROXY`,
-   `HTTP_PROXY`, `NO_PROXY`, `NODE_EXTRA_CA_CERTS`) and model selection stay.
+   options env (`is_competing_auth_key`). The `CLAUDE_*` and `ANTHROPIC_*`
+   namespaces, leading underscores ignored, fail closed against a keep-list:
+   model selection, the runner-owned `CLAUDE_CODE_SHELL`,
+   `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` and `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, and
+   the installation's `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`. Every other
+   name there goes, including `CLAUDE_SECURESTORAGE_CONFIG_DIR` (it would keep
+   a stored session live) and subagent model forcing
+   (`CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL_FORCE`,
+   `CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL`), so reviewer roles keep the
+   configured reviewer model. Outside the namespaces, cloud selectors and
+   settings (`AWS_*`, `AZURE_*`, Vertex and Google credential discovery),
+   `CURIE_CREDENTIALS`, `CURIE_MODEL_BASE_URL` and the CLI's OAuth switches go.
+   Installation transport (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`,
+   `NODE_EXTRA_CA_CERTS`) and every other name stay.
 4. `CLAUDE_CONFIG_DIR` and `ANTHROPIC_CONFIG_DIR` point at fresh 0700
    directories the runner creates per connect and removes on close, so a saved
    login, a signed-in gateway session, user settings with `apiKeyHelper` and
    named profiles are excluded.
 5. Workspace `.claude/settings.json` or `.claude/settings.local.json` that sets a
-   credential helper, a forced login, `modelOverrides`, or an auth, endpoint or
-   transport `env` key refuses the launch (`PersonalLaunchRefusedError`).
+   credential helper, a forced login, `modelOverrides`, `availableModels`, any
+   `CLAUDE_*` or `ANTHROPIC_*` `env` name (no keep-list, since the workspace is
+   agent writable), or a competing or transport `env` key refuses the launch
+   (`PersonalLaunchRefusedError`). Env names are compared case-insensitively.
 6. Managed policy under `/etc/claude-code` (`managed-settings.json`, then
    `managed-settings.d/*.json`) that forces gateway login, names a credential
-   helper or `policyHelper`, puts a competing variable in `env`, or cannot be
-   read or parsed refuses the launch. The runner never edits or bypasses it.
+   helper or `policyHelper`, puts a competing variable, any `ANTHROPIC_*` name
+   or an unlisted `CLAUDE_*` name in `env`, or cannot be read or parsed refuses
+   the launch. Keep-list `CLAUDE_*` names, transport and `availableModels` are
+   allowed. The runner never edits or bypasses it. The pinned CLI 2.1.301 does
+   not read `CLAUDE_CODE_MANAGED_SETTINGS_PATH`, so step 3 removes it and the
+   guard reads only `/etc/claude-code`.
 
 Personal mode also needs an explicit Claude reviewer model in
 `CURIE_REVIEWER_MODEL` (a `claude-*` ID). It is required, sets

@@ -16,6 +16,26 @@ list. This module therefore removes every removable source from the CLI parent
 env, points the CLI at fresh config directories, and refuses to launch when a
 workspace or managed settings file would reintroduce a competing source.
 
+The CLI parent env keeps a fixed list from the provider namespaces (``CLAUDE_*``
+and ``ANTHROPIC_*``, leading underscores ignored): model selection, the
+runner-owned ``CLAUDE_CODE_SHELL``, ``CLAUDE_CODE_DISABLE_TERMINAL_TITLE`` and
+``CLAUDE_CODE_MAX_OUTPUT_TOKENS``, and the installation's
+``CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC``. Every other namespace name is
+removed, including names no list has met yet. That removes
+``CLAUDE_SECURESTORAGE_CONFIG_DIR``, which would keep a stored session live
+beside a fresh config dir, and subagent model forcing
+(``CLAUDE_CODE_SUBAGENT_MODEL``, ``CLAUDE_CODE_SUBAGENT_MODEL_FORCE``,
+``CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL``), so reviewer roles keep the configured
+reviewer model. Outside the namespaces the cloud, Google credential discovery
+and CLI OAuth switches are removed and everything else, transport included, is
+kept.
+
+Workspace settings are agent writable, so their ``env`` may set no namespace
+name at all and no transport key, and they may not set ``availableModels``.
+Managed policy ``env`` may set the kept ``CLAUDE_*`` names and names outside
+the namespaces that do not compete, and a managed ``availableModels`` is
+respected.
+
 Error messages name variables, settings keys and files. They never carry a
 credential value.
 """
@@ -34,22 +54,17 @@ from pathlib import Path
 
 from aci_protocol import BootEnv
 
-from .sdk_auth import (
-    API_KEY_ENV,
-    AUTH_TOKEN_ENV,
-    BASE_URL_ENV,
-    CREDENTIALS_ENV,
-    MODEL_BASE_URL_ENV,
-    OAUTH_TOKEN_ENV,
-)
+from .sdk_auth import CREDENTIALS_ENV, MODEL_BASE_URL_ENV, OAUTH_TOKEN_ENV
 
 AUTH_MODE_ENV = "CURIE_MODEL_AUTH_MODE"
 REVIEWER_MODEL_ENV = BootEnv.env_key("reviewer_model")
 CLAUDE_CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
 ANTHROPIC_CONFIG_DIR_ENV = "ANTHROPIC_CONFIG_DIR"
 
-# Linux managed settings location. The pinned CLI resolves it with no override
-# (https://code.claude.com/docs/en/managed-settings). Read at call time.
+# Linux managed settings location (https://code.claude.com/docs/en/managed-settings).
+# The provider docs mention CLAUDE_CODE_MANAGED_SETTINGS_PATH, but the pinned
+# CLI 2.1.301 does not read it, so personal mode removes that variable and the
+# guard inspects the Linux path the CLI reads. Read at call time.
 MANAGED_SETTINGS_DIR = Path("/etc/claude-code")
 _MANAGED_FILE = "managed-settings.json"
 _MANAGED_DROP_IN_DIR = "managed-settings.d"
@@ -109,74 +124,65 @@ def effective_auth_mode(inherited: Mapping[str, str], explicit: Mapping[str, str
 
 # --- competing credential sources ------------------------------------------------
 #
-# Selectors, credentials and endpoints from https://code.claude.com/docs/en/env-vars
-# and .../authentication, plus names found in the pinned CLI 2.1.301 binary.
+# The provider namespaces fail closed against a keep-list, so a variable a later
+# CLI adds is removed before anyone lists it. Outside them, the cloud, Google
+# credential discovery and CLI OAuth switches from
+# https://code.claude.com/docs/en/env-vars, .../authentication and the pinned
+# CLI 2.1.301 binary compete.
 
+_PROVIDER_NAMESPACES = ("CLAUDE_", "ANTHROPIC_")
+_MODEL_SELECTION = re.compile(
+    r"ANTHROPIC_(?:MODEL|SMALL_FAST_MODEL|DEFAULT_[A-Z0-9]+_MODEL(?:_NAME|_DESCRIPTION)?)"
+)
+# Runner-owned CLI settings and the installation's nonessential traffic switch.
+_KEPT_CLAUDE_NAMES = frozenset(
+    {
+        "CLAUDE_CODE_SHELL",
+        "CLAUDE_CODE_DISABLE_TERMINAL_TITLE",
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    }
+)
 _COMPETING_NAMES = frozenset(
     {
-        API_KEY_ENV,
-        AUTH_TOKEN_ENV,
-        OAUTH_TOKEN_ENV,  # re-set to the owner grant by personal_cli_env
-        "ANTHROPIC_FOUNDRY_API_KEY",
-        "ANTHROPIC_CUSTOM_HEADERS",
-        BASE_URL_ENV,
-        MODEL_BASE_URL_ENV,
         CREDENTIALS_ENV,
-        CLAUDE_CONFIG_DIR_ENV,
-        ANTHROPIC_CONFIG_DIR_ENV,
+        MODEL_BASE_URL_ENV,
         "CLOUD_ML_REGION",
         "GOOGLE_APPLICATION_CREDENTIALS",
         "GOOGLE_CLOUD_PROJECT",
         "GCLOUD_PROJECT",
+        "GOOGLE_CLOUD_QUOTA_PROJECT",
+        "GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES",
+        "CLOUDSDK_CONFIG",
+        "GCE_METADATA_HOST",
+        "GCE_METADATA_ROOT",
+        "GCE_METADATA_IP",
+        "METADATA_SERVER_DETECTION",
+        "USE_LOCAL_OAUTH",
+        "USE_STAGING_OAUTH",
     }
 )
-_COMPETING_PREFIXES = (
-    "CLAUDE_CODE_USE_",
-    "AWS_",
-    "AZURE_",
-    "VERTEX_REGION_",
-    "CLAUDE_BG_",
-    "CLAUDE_LOCAL_OAUTH_",
-)
-# Model selection is the one ANTHROPIC_* family personal mode keeps.
-_MODEL_SELECTION = re.compile(
-    r"ANTHROPIC_(?:MODEL|SMALL_FAST_MODEL|DEFAULT_[A-Z0-9]+_MODEL(?:_NAME|_DESCRIPTION)?)"
-)
-# A CLAUDE_* name carrying one of these words is treated as auth or routing,
-# which covers undocumented gateway, descriptor, mTLS and skip-auth variables.
-_CLAUDE_AUTH_WORDS = frozenset(
-    {
-        "TOKEN",
-        "OAUTH",
-        "AUTH",
-        "KEY",
-        "CREDENTIAL",
-        "CREDENTIALS",
-        "CERT",
-        "PASSPHRASE",
-        "GATEWAY",
-        "DESCRIPTOR",
-        "PROVIDER",
-    }
-)
+_COMPETING_PREFIXES = ("AWS_", "AZURE_", "VERTEX_REGION_")
+
+
+def _in_provider_namespace(name: str) -> bool:
+    return name.lstrip("_").startswith(_PROVIDER_NAMESPACES)
 
 
 def is_competing_auth_key(name: str) -> bool:
-    """Whether ``name`` selects, carries or routes a model credential other than the grant.
+    """Whether ``name`` may select, carry or route a model credential other than the grant.
 
-    Fails closed on the provider namespaces. Installation transport
-    (``HTTPS_PROXY``, ``HTTP_PROXY``, ``NO_PROXY``, ``NODE_EXTRA_CA_CERTS``) and
-    model selection are kept. ``CLAUDE_CODE_OAUTH_TOKEN`` counts as competing so
-    no inherited copy survives; the policy sets the owner grant itself.
+    A ``CLAUDE_*`` or ``ANTHROPIC_*`` name, leading underscores ignored, competes
+    unless it is exactly model selection or a ``_KEPT_CLAUDE_NAMES`` entry. So
+    ``CLAUDE_CODE_OAUTH_TOKEN`` and both config dir variables compete, and the
+    policy sets the owner grant and fresh config dirs itself. Outside the
+    namespaces only the listed cloud and OAuth names compete; transport such as
+    ``HTTPS_PROXY`` and ``NODE_EXTRA_CA_CERTS`` is kept.
     """
 
-    if name in _COMPETING_NAMES or name.startswith(_COMPETING_PREFIXES):
-        return True
-    if name.startswith("ANTHROPIC_"):
-        return _MODEL_SELECTION.fullmatch(name) is None
-    if name.startswith("CLAUDE_"):
-        return "BASE_URL" in name or not _CLAUDE_AUTH_WORDS.isdisjoint(name.split("_"))
-    return False
+    if _in_provider_namespace(name):
+        return name not in _KEPT_CLAUDE_NAMES and _MODEL_SELECTION.fullmatch(name) is None
+    return name in _COMPETING_NAMES or name.startswith(_COMPETING_PREFIXES)
 
 
 # --- reviewer model and owner grant ----------------------------------------------
@@ -220,7 +226,10 @@ def require_owner_grant(env: Mapping[str, str]) -> str:
 _CREDENTIAL_HELPER_KEYS = frozenset(
     {"apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "gcpAuthRefresh"}
 )
+# A workspace availableModels that leaves a role's model out makes the role
+# inherit the implementer's model. Managed availableModels is mandatory policy.
 _WORKSPACE_REFUSED_KEYS = _CREDENTIAL_HELPER_KEYS | {
+    "availableModels",
     "forceLoginMethod",
     "forceLoginGatewayUrl",
     "forceLoginOrgUUID",
@@ -271,11 +280,27 @@ def _read_settings(source: str, path: Path) -> dict[str, object] | None:
 
 
 def _refused_policy_env(name: str) -> bool:
-    return is_competing_auth_key(name) or name.startswith("ANTHROPIC_")
+    """Managed ``env`` may set only the kept ``CLAUDE_*`` names from the namespaces.
+
+    Settings env names are upper-cased for the tests here, so a case variant of
+    a provider name fails closed.
+    """
+
+    upper = name.upper()
+    if _in_provider_namespace(upper):
+        return name not in _KEPT_CLAUDE_NAMES
+    return is_competing_auth_key(upper)
 
 
 def _refused_workspace_env(name: str) -> bool:
-    return _refused_policy_env(name) or name.upper() in _WORKSPACE_TRANSPORT_KEYS
+    """Workspace ``env`` is agent writable, so no namespace name and no transport key."""
+
+    upper = name.upper()
+    return (
+        _in_provider_namespace(upper)
+        or is_competing_auth_key(upper)
+        or upper in _WORKSPACE_TRANSPORT_KEYS
+    )
 
 
 def _settings_refusals(
@@ -343,9 +368,10 @@ def inspect_managed_policy() -> None:
 
     The runner never edits, hides or bypasses managed policy. Policy that forces
     gateway login, names a credential helper or ``policyHelper``, or puts a
-    competing variable in ``env`` is refused, as is a present file that cannot
-    be read or parsed. Managed proxy and CA variables are installation
-    transport and are allowed.
+    competing variable, any ``ANTHROPIC_*`` name or an unlisted ``CLAUDE_*``
+    name in ``env`` is refused, as is a present file that cannot be read or
+    parsed. Managed proxy and CA variables are installation transport and are
+    allowed, as is a managed ``availableModels``.
     """
 
     for path in _managed_files(MANAGED_SETTINGS_DIR):
