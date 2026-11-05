@@ -2492,10 +2492,7 @@ def test_wake_before_deadline_expires_if_turn_cannot_start_until_after_it(
     asyncio.run(go())
 
 
-@pytest.mark.parametrize("accepted_before_deadline", [False])
-def test_runner_acceptance_boundary_respects_wait_deadline(
-    make_harness, accepted_before_deadline: bool
-) -> None:
+def test_runner_acceptance_boundary_respects_wait_deadline(make_harness) -> None:
     async def go() -> None:
         async with make_harness(
             slack_no_edit_streaming=True,
@@ -2524,22 +2521,7 @@ def test_runner_acceptance_boundary_respects_wait_deadline(
 
             accept = asyncio.Event()
             hold = asyncio.Event()
-            accepted = asyncio.Event()
-            if not accepted_before_deadline:
-                h.runner.accept = accept
-            else:
-                real_start = h.kernel._runner.start_turn
-
-                async def delayed_start(*args: Any, **kwargs: Any) -> Any:
-                    turn = await real_start(*args, **kwargs)
-                    accepted.set()
-                    try:
-                        await accept.wait()
-                    except asyncio.CancelledError:
-                        pass
-                    return turn
-
-                h.kernel._runner.start_turn = delayed_start  # type: ignore[method-assign]
+            h.runner.accept = accept
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="late work")]
             h.runner.tail = [Final(text="late answer", status=DONE)]
@@ -2559,14 +2541,11 @@ def test_runner_acceptance_boundary_respects_wait_deadline(
             await replacement._sem.acquire()
             wake_task = asyncio.create_task(replacement._handle(wake_id, wake_fields))
             try:
-                if accepted_before_deadline:
-                    await asyncio.wait_for(accepted.wait(), timeout=2)
-                else:
-                    await _wait_until(lambda: h.runner.opened == ["hello"])
+                await _wait_until(lambda: h.runner.opened == ["hello"])
                 waiting_for_acceptance = await replacement._waits.get(event.event_id)
                 assert waiting_for_acceptance is not None
                 assert waiting_for_acceptance.state == "woken"
-                assert h.runner.turn_active is accepted_before_deadline
+                assert h.runner.turn_active is False
                 server_time = await h.async_redis.time()
                 now_ms = int(server_time[0]) * 1000 + int(server_time[1]) // 1000
                 await asyncio.sleep(max(0, parked.deadline_ms - now_ms) / 1000 + 0.05)
