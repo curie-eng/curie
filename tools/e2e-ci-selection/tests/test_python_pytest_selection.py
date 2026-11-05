@@ -572,6 +572,12 @@ def test_python_static_gates_stay_unconditional() -> None:
     docs = named["Docs gate (catalog drift + agent contract + citations)"]
     assert "scripts/check-docs.sh" in _string(docs, "run")
 
+    cli_list = named["CLI pytest file list"]
+    assert "if" not in cli_list
+    assert _string(cli_list, "run").strip() == (
+        "uv run python tools/e2e-ci-selection/cli_pytest_files.py --check"
+    )
+
 
 def test_static_job_holds_exactly_the_moved_gates_in_order() -> None:
     """The static gates preserve order, with private imports immediately after sync."""
@@ -587,6 +593,7 @@ def test_static_job_holds_exactly_the_moved_gates_in_order() -> None:
         "Lockfile is up to date",
         "Sync workspace",
         PRIVATE_IMPORT_STEP,
+        "CLI pytest file list",
         *MOVED_STATIC_STEPS[1:4],
         # ADR 0232 (#4610) added this gate after the move.
         "Contract migration timing gate",
