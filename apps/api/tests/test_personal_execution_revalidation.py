@@ -5,7 +5,11 @@ revalidate`` moves ``enrollment_generation``, and only when the caller's expecte
 WorkItem, request and enrollment versions are current, the named owner is the
 WorkItem's, the owner's enrollment is active and has advanced, and no runtime of
 the WorkItem can still be live (running, stopping, holding an acquire lease, or
-force-settled without a teardown receipt). Every refusal is HTTP 409
+force-settled without a teardown receipt). It fails closed: a request that ever
+started counts as stopped only once the worker's termination chain has recorded
+it terminal with a termination observation. A terminal status alone is not that
+evidence; a normally finished run keeps its claim and its sandbox may outlive
+the finish, and an expired heartbeat proves no more. Every refusal is HTTP 409
 ``{"detail": {"code": ...}}`` and leaves the durable rows untouched; each is paired
 with the call that passes in the same state. Concurrent writers holding the same
 expected versions bind exactly once.
@@ -23,7 +27,6 @@ from __future__ import annotations
 import asyncio
 import importlib
 from collections.abc import Iterator
-from datetime import timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -349,8 +352,8 @@ def test_revalidation_refuses_stale_mismatched_inactive_and_live_then_binds_once
         _revalidate(api, first.work_item_id, _body(world, agent_id, context)), "generation_current"
     )
 
-    # The old runtime is live: running, then with a revision queued behind it.
-    epoch = support.start_request(first.request_id)
+    # The old runtime is live: running, then with a revision queued behind it, then stopping.
+    support.start_request(first.request_id)
     generation, _ = support.advance_enrollment(world)
     assert generation == old + 1
     running = _read(api, world, agent_id, first.work_item_id)
@@ -376,9 +379,26 @@ def test_revalidation_refuses_stale_mismatched_inactive_and_live_then_binds_once
     _assert_conflict(
         _revalidate(api, first.work_item_id, _body(world, agent_id, behind)), "runtime_live"
     )
+    support.relabel_while_live(
+        agent_id,
+        issue_number=53776,
+        live_request_id=first.request_id,
+        objective=RELABEL_OBJECTIVE,
+    )
+    stopping = _read(api, world, agent_id, first.work_item_id)
+    assert (stopping["request"]["id"], stopping["request"]["status"]) == (
+        str(revision.request_id),
+        "queued",
+    )
+    assert support.request_column(first.request_id, "status") == "cancellation_requested"
+    stopping_bindings = _bindings(first.work_item_id)
+    _assert_conflict(
+        _revalidate(api, first.work_item_id, _body(world, agent_id, stopping)), "runtime_live"
+    )
+    assert _bindings(first.work_item_id) == stopping_bindings
 
-    # The old runtime reaches a terminus; from here only the inputs decide.
-    support.finish_failed(first.request_id, epoch)
+    # The worker records the old runtime's termination; from here only the inputs decide.
+    assert support.record_termination(first.request_id).status == "cancelled"
     current = _read(api, world, agent_id, first.work_item_id)
     assert current["enrollment"] == {"generation": generation, "active": True, "version": 2}
     before = _bindings(first.work_item_id)
@@ -482,6 +502,196 @@ def test_revalidation_refuses_stale_mismatched_inactive_and_live_then_binds_once
     assert _bindings(first.work_item_id) == after
 
 
+def test_revalidation_refuses_a_normally_finished_run_without_a_recorded_termination(
+    api: TestClient, world: support.World
+) -> None:
+    agent_id = support.insert_agent(world.tenant_id)
+    first = support.admit_personal(api, WORKER_HEADERS, world, agent_id, issue_number=53779)
+    old = world.generation
+    epoch = support.start_request(first.request_id)
+    generation, _ = support.advance_enrollment(world)
+    assert generation == old + 1
+
+    # The worker reports the run finished; its sandbox cleanup afterwards is best effort.
+    finished = api.post(
+        f"{support.INTERNAL_PREFIX}/requests/{first.request_id}/finish",
+        json={"runtime_epoch": epoch, "outcome": "failed", "cause": "deadline_halted"},
+        headers=WORKER_HEADERS,
+    )
+    assert finished.status_code == 200, finished.text
+    assert (finished.json()["status"], finished.json()["termination_observation"]) == (
+        "failed",
+        None,
+    )
+    runtime_facts = (
+        "SELECT terminal_at IS NOT NULL AS terminal, runtime_claim_name, "
+        "runtime_heartbeat_expires_at > clock_timestamp() AS heartbeat_live, "
+        "termination_observation FROM curie.execution_requests WHERE id = :id"
+    )
+    # Terminal, yet the claim is still recorded, the heartbeat unexpired, and no
+    # termination observed: nothing shows the runtime stopped.
+    assert support.rows(runtime_facts, {"id": first.request_id}) == [
+        {
+            "terminal": True,
+            "runtime_claim_name": support.CLAIM_NAME,
+            "heartbeat_live": True,
+            "termination_observation": None,
+        }
+    ]
+    finished_context = _read(api, world, agent_id, first.work_item_id)
+    assert finished_context["request"]["status"] == "failed"
+    assert finished_context["enrollment"] == {
+        "generation": generation,
+        "active": True,
+        "version": 2,
+    }
+    before = _bindings(first.work_item_id)
+    assert before["work_item"]["enrollment_generation"] == old
+    _assert_conflict(
+        _revalidate(api, first.work_item_id, _body(world, agent_id, finished_context)),
+        "runtime_live",
+    )
+    assert _bindings(first.work_item_id) == before
+
+    # An expired heartbeat alone is not evidence that the runtime stopped either.
+    support.rows(
+        "UPDATE curie.execution_requests "
+        "SET runtime_heartbeat_expires_at = clock_timestamp() - interval '1 hour' "
+        "WHERE id = :id",
+        {"id": first.request_id},
+    )
+    assert support.rows(runtime_facts, {"id": first.request_id}) == [
+        {
+            "terminal": True,
+            "runtime_claim_name": support.CLAIM_NAME,
+            "heartbeat_live": False,
+            "termination_observation": None,
+        }
+    ]
+    expired_context = _read(api, world, agent_id, first.work_item_id)
+    _assert_conflict(
+        _revalidate(api, first.work_item_id, _body(world, agent_id, expired_context)),
+        "runtime_live",
+    )
+    assert _bindings(first.work_item_id) == before
+    support.assert_owner_tuples(
+        first.work_item_id,
+        work_item=world.personal(old),
+        requests={first.request_id: world.personal(old)},
+    )
+
+
+def test_revalidation_binds_once_the_worker_records_the_runtime_termination(
+    api: TestClient, world: support.World
+) -> None:
+    agent_id = support.insert_agent(world.tenant_id)
+    first = support.admit_personal(api, WORKER_HEADERS, world, agent_id, issue_number=53780)
+    old = world.generation
+    support.start_request(first.request_id)
+    generation, enrollment_version = support.advance_enrollment(world)
+
+    # A relabel stops the live run; until its termination is recorded it is live.
+    relabel = support.relabel_while_live(
+        agent_id,
+        issue_number=53780,
+        live_request_id=first.request_id,
+        objective=RELABEL_OBJECTIVE,
+    )
+    stopping = _read(api, world, agent_id, first.work_item_id)
+    assert (stopping["request"]["id"], stopping["request"]["status"]) == (
+        str(first.request_id),
+        "cancellation_requested",
+    )
+    stopping_bindings = _bindings(first.work_item_id)
+    _assert_conflict(
+        _revalidate(api, first.work_item_id, _body(world, agent_id, stopping)), "runtime_live"
+    )
+    assert _bindings(first.work_item_id) == stopping_bindings
+
+    # The worker's termination chain records the runtime gone.
+    assert support.record_termination(first.request_id).status == "cancelled"
+
+    # The stored relabel waits, and a revision queues behind it, both under the old generation.
+    admitted = support.admit_pending_readmit(first.work_item_id)
+    assert admitted.request is not None
+    assert (admitted.request.id, admitted.request.status) == (relabel.request_id, "waiting")
+    revision = support.facts(
+        agent_id,
+        issue_number=53780,
+        requester=support.OTHER_REQUESTER,
+        objective=REVISION_OBJECTIVE,
+    )
+    queued = support.with_session(
+        lambda session: workitem_dispatch.admit_revision(session, revision)
+    )
+    assert isinstance(queued, WorkItemOutcome), queued
+    assert queued.request is not None
+    assert (queued.request.id, queued.request.status) == (revision.request_id, "queued")
+
+    ready = _read(api, world, agent_id, first.work_item_id)
+    assert (ready["request"]["id"], ready["request"]["status"]) == (
+        str(revision.request_id),
+        "queued",
+    )
+    assert ready["enrollment"] == {
+        "generation": generation,
+        "active": True,
+        "version": enrollment_version,
+    }
+    before = _bindings(first.work_item_id)
+    terminal, waiting, behind = before["requests"]
+    assert (terminal["id"], terminal["status"], terminal["enrollment_generation"]) == (
+        first.request_id,
+        "cancelled",
+        old,
+    )
+    assert (waiting["id"], waiting["status"], waiting["enrollment_generation"]) == (
+        relabel.request_id,
+        "waiting",
+        old,
+    )
+    assert (behind["id"], behind["status"], behind["enrollment_generation"]) == (
+        revision.request_id,
+        "queued",
+        old,
+    )
+
+    bound = _revalidate(api, first.work_item_id, _body(world, agent_id, ready))
+    assert bound.status_code == 200, bound.text
+    work_item_version = ready["work_item_version"] + 1
+    assert bound.json() == {
+        "work_item_id": str(first.work_item_id),
+        "request_id": str(revision.request_id),
+        "previous_generation": old,
+        "enrollment_generation": generation,
+        "work_item_version": work_item_version,
+        "request_version": behind["version"] + 1,
+        "enrollment_version": enrollment_version,
+    }
+    assert _bindings(first.work_item_id) == {
+        "work_item": {"version": work_item_version, "enrollment_generation": generation},
+        "requests": [
+            # The terminated request keeps the generation it ran under.
+            terminal,
+            {**waiting, "version": waiting["version"] + 1, "enrollment_generation": generation},
+            {**behind, "version": behind["version"] + 1, "enrollment_generation": generation},
+        ],
+    }
+    assert (
+        support.request_column(first.request_id, "termination_observation")
+        == support.TERMINATION_OBSERVATION
+    )
+    support.assert_owner_tuples(
+        first.work_item_id,
+        work_item=world.personal(generation),
+        requests={
+            first.request_id: world.personal(old),
+            relabel.request_id: world.personal(generation),
+            revision.request_id: world.personal(generation),
+        },
+    )
+
+
 def test_revalidation_waits_for_a_force_settled_teardown_to_be_confirmed(
     api: TestClient, world: support.World
 ) -> None:
@@ -566,14 +776,7 @@ def test_revalidation_waits_for_a_force_settled_teardown_to_be_confirmed(
     )
 
     # The relabel admitted afterwards snapshots the newly bound generation.
-    async def admit_pending(session: AsyncSession) -> object:
-        now = await lifecycle.database_now(session)
-        return await lifecycle.admit_pending_readmit(
-            session, work_item_id=first.work_item_id, wait_deadline=now + timedelta(hours=1)
-        )
-
-    admitted = support.with_session(admit_pending)
-    assert isinstance(admitted, WorkItemOutcome), admitted
+    admitted = support.admit_pending_readmit(first.work_item_id)
     assert admitted.request is not None and admitted.request.id == relabel.request_id
     support.assert_owner_tuples(
         first.work_item_id,

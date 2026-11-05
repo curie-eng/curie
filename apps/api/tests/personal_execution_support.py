@@ -21,6 +21,7 @@ import asyncio
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 from uuid import UUID
 
@@ -30,8 +31,9 @@ from curie_api import workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.db import create_sessionmaker
 from curie_api.forges.types import GITHUB, RepositoryRef, TrackerIssueRef
-from curie_api.workitem_dispatch import AcquireGrant, Admission, StartResult
-from curie_api.workitems.lifecycle import WorkItemOutcome
+from curie_api.workitem_dispatch import AcquireGrant, Admission, StartResult, TerminationClaim
+from curie_api.workitems import lifecycle
+from curie_api.workitems.lifecycle import ExecutionRequestSnapshot, WorkItemOutcome
 from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
 from forge_fakes import factory_wake, no_external_calls
@@ -555,6 +557,71 @@ def finish_failed(request_id: UUID, runtime_epoch: int, *, cause: str = "deadlin
         assert finished.request is not None and finished.request.status == "failed"
 
     with_session(body)
+
+
+def relabel_while_live(
+    agent_id: UUID, *, issue_number: int, live_request_id: UUID, objective: str
+) -> Admission:
+    """Another requester relabels the issue while its run is live.
+
+    The live request is asked to stop and the relabel is stored on the WorkItem
+    until that request reaches a terminus.
+    """
+
+    relabel = facts(
+        agent_id, issue_number=issue_number, requester=OTHER_REQUESTER, objective=objective
+    )
+    stopping = with_session(lambda session: workitem_dispatch.readmit(session, relabel))
+    assert isinstance(stopping, WorkItemOutcome), stopping
+    assert stopping.request is not None
+    assert (stopping.request.id, stopping.request.status) == (
+        live_request_id,
+        "cancellation_requested",
+    )
+    return relabel
+
+
+def record_termination(request_id: UUID, *, owner: str = RUNTIME_OWNER) -> ExecutionRequestSnapshot:
+    """End a stopping request through the worker's termination chain.
+
+    ``claim_termination``, then ``record_termination`` with an observation that
+    the run's claim and sandbox are gone: the request becomes terminal carrying
+    that observation, the evidence that its runtime stopped.
+    """
+
+    claimed = with_session(
+        lambda session: workitem_dispatch.claim_termination(session, request_id, owner=owner)
+    )
+    assert isinstance(claimed, TerminationClaim), claimed
+    runtime_epoch = claimed.runtime_epoch
+    ended = with_session(
+        lambda session: workitem_dispatch.record_termination(
+            session,
+            request_id,
+            runtime_epoch=runtime_epoch,
+            observation=TERMINATION_OBSERVATION,
+        )
+    )
+    assert isinstance(ended, WorkItemOutcome), ended
+    assert ended.request is not None and ended.request.id == request_id, ended
+    assert ended.request.terminal_at is not None, ended
+    assert ended.request.termination_observation == TERMINATION_OBSERVATION, ended
+    return ended.request
+
+
+def admit_pending_readmit(work_item_id: UUID) -> WorkItemOutcome:
+    """Create the request a relabel stored while its predecessor was stopping."""
+
+    async def body(session: AsyncSession) -> object:
+        now = await lifecycle.database_now(session)
+        return await lifecycle.admit_pending_readmit(
+            session, work_item_id=work_item_id, wait_deadline=now + timedelta(hours=1)
+        )
+
+    admitted = with_session(body)
+    assert isinstance(admitted, WorkItemOutcome), admitted
+    assert admitted.request is not None, admitted
+    return admitted
 
 
 # --- the durable owner tuple ---------------------------------------------------------

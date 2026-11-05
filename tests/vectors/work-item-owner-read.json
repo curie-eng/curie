@@ -1,5 +1,5 @@
 {
-  "_comment": "Normalized operator read bodies for #5376: GET /work-items/{id} for a personal and a service WorkItem and GET /work-items, after a tool approval by another principal, the run's end, a revalidation onto generation 2 and a revision. Each distinct UUID is 00000000-0000-4000-8000-%012d in order of first appearance (sections personal_detail, service_detail, list; keys sorted); every ISO timestamp is 2026-01-01T00:00:00Z. Written by apps/api/tests/test_personal_execution_read.py under CURIE_TEST_WORK_ITEM_OWNER_VECTOR_UPDATE=1; read by cli/tests/work_items.rs.",
+  "_comment": "Normalized operator read bodies for #5376: GET /work-items/{id} for a personal and a service WorkItem and GET /work-items, after a tool approval by another principal, a relabel by another requester that stops the run, the run's recorded termination, a revalidation onto generation 2 and the relabel's admission. Each distinct UUID is 00000000-0000-4000-8000-%012d in order of first appearance (sections personal_detail, service_detail, list; keys sorted); every ISO timestamp is 2026-01-01T00:00:00Z. Written by apps/api/tests/test_personal_execution_read.py under CURIE_TEST_WORK_ITEM_OWNER_VECTOR_UPDATE=1; read by cli/tests/work_items.rs.",
   "personal_detail": {
     "actionable_cause": "waiting for sandbox capacity; waiting deadline 2026-01-01T00:00:00Z",
     "agent_id": "00000000-0000-4000-8000-000000000001",
@@ -18,7 +18,7 @@
     "enrollment_generation": 2,
     "id": "00000000-0000-4000-8000-000000000002",
     "model_auth_mode": "personal",
-    "objective": "Address the follow up comment on the issue",
+    "objective": "Run the task again after the label was added back",
     "objective_truncated": false,
     "owner_principal_id": "00000000-0000-4000-8000-000000000003",
     "pr": null,
@@ -47,11 +47,11 @@
         "owner_principal_id": "00000000-0000-4000-8000-000000000003",
         "sequence": 1,
         "started_at": "2026-01-01T00:00:00Z",
-        "status": "failed",
+        "status": "cancelled",
         "tenant_id": "00000000-0000-4000-8000-000000000004",
         "terminal_at": "2026-01-01T00:00:00Z",
-        "terminal_cause": "deadline_halted",
-        "termination_observation": null,
+        "terminal_cause": "issue_cancelled",
+        "termination_observation": "runtime termination observed; absent at 2026-01-01T00:00:00Z",
         "wait_deadline": "2026-01-01T00:00:00Z"
       },
       {
@@ -169,7 +169,7 @@
         "enrollment_generation": 2,
         "id": "00000000-0000-4000-8000-000000000002",
         "model_auth_mode": "personal",
-        "objective": "Address the follow up comment on the issue",
+        "objective": "Run the task again after the label was added back",
         "objective_truncated": false,
         "owner_principal_id": "00000000-0000-4000-8000-000000000003",
         "pr": null,
@@ -198,11 +198,11 @@
             "owner_principal_id": "00000000-0000-4000-8000-000000000003",
             "sequence": 1,
             "started_at": "2026-01-01T00:00:00Z",
-            "status": "failed",
+            "status": "cancelled",
             "tenant_id": "00000000-0000-4000-8000-000000000004",
             "terminal_at": "2026-01-01T00:00:00Z",
-            "terminal_cause": "deadline_halted",
-            "termination_observation": null,
+            "terminal_cause": "issue_cancelled",
+            "termination_observation": "runtime termination observed; absent at 2026-01-01T00:00:00Z",
             "wait_deadline": "2026-01-01T00:00:00Z"
           },
           {
