@@ -540,6 +540,11 @@ for arg in "$@"; do
 done
 
 if [ "$1" = "get" ] && [ "$2" = "values" ]; then
+    if [ -f "${0%/*}/converged-helm-applied" ]; then
+        case " $* " in
+            *" --all "*) printf '%s\n' '{"agentSandbox":{"deploy":false}}'; exit 0 ;;
+        esac
+    fi
     if [ "${CURIE_TEST_HELM_VALUES:-absent}" = "absent" ]; then
         printf '%s\n' 'Error: release: not found' >&2
         exit 1

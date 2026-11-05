@@ -38,9 +38,7 @@ from ..binding import (
     FactoryWake,
     binding_adapter_for_handle,
 )
-from ..capacity_wait import (
-    current_wait,
-)
+from ..capacity_wait import current_wait
 from ..delivery_lease import DeliveryLease
 from ..hook_runs import HookRunOutcome, HookRunReason, HookRunRecorderError, retry_expiry
 from ..reply_sink import (
@@ -544,7 +542,7 @@ async def _process_event(
             # with nobody watching a thread. The handle-derived route is what
             # the record stores, so a sweeper re-emits over the same
             # transport the escalation text went to.
-            await self._escalate(
+            escalation_update = await self._escalate(
                 qevent,
                 route,
                 "A prior attempt may already have executed an action; "
@@ -555,6 +553,7 @@ async def _process_event(
                 qevent,
                 route,
                 "escalated",
+                escalation_update=escalation_update,
                 telemetry_outcome="classified_failure",
                 lease=lease,
                 hook_outcome="failed",
@@ -1124,6 +1123,9 @@ async def _process_event(
         attempt = 0
         capacity_refusals = 0
         capacity_wait_run: WorkItemRun | None = None
+        dependency_deadline: float | None = None
+        dependency_refusals = 0
+        dependency_attempts = 0
         while True:
             attempt += 1
             hook_carry = constants._HOOK_RUN_CARRY.get()
@@ -1177,11 +1179,11 @@ async def _process_event(
                     # classification: this is the wall-clock delivery
                     # deadline, and conflating the two would make both
                     # unreadable in telemetry.
-                    await self._escalate(
+                    escalation_update = await self._escalate(
                         qevent,
                         route,
                         "The run exceeded its delivery deadline after "
-                        f"{attempt - 1} attempt(s) and was not restarted. "
+                        f"{attempt - 1 + dependency_attempts} attempt(s) and was not restarted. "
                         "Flagging for a human.",
                         failure_class="delivery-deadline",
                     )
@@ -1189,6 +1191,7 @@ async def _process_event(
                         qevent,
                         route,
                         "escalated",
+                        escalation_update=escalation_update,
                         telemetry_outcome="deadline_halted",
                         lease=lease,
                         hook_outcome=hooks._hook_failure_outcome(),
@@ -1363,6 +1366,23 @@ async def _process_event(
                     return
                 raise
 
+            dependency_retry = (
+                outcome.workspace_dependency_unavailable and self._markers.supports_answer_outbox
+            )
+            if not dependency_retry:
+                dependency_deadline = None
+                dependency_refusals = 0
+            dependency_remaining = 0.0
+            if dependency_retry:
+                if dependency_deadline is None:
+                    dependency_deadline = (
+                        clock.time.monotonic() + self._config.workspace_total_timeout_seconds
+                    )
+                dependency_remaining = dependency_deadline - clock.time.monotonic()
+                dependency_refusals += 1
+                dependency_attempts += 1
+                attempt -= 1
+
             if outcome.status is SessionStatus.AWAITING_APPROVAL and targetless:
                 # A resume needs a reply route this turn does not carry
                 # (#2963), so a gate on a targetless turn is a failed run,
@@ -1382,7 +1402,7 @@ async def _process_event(
                 # @spec WORKER-TOOL-ACCESS-4: a restricted turn may not raise
                 # a card, whatever its runner reported. No record, no card,
                 # no suspend: a failed turn.
-                await self._escalate(
+                escalation_update = await self._escalate(
                     qevent,
                     route,
                     constants._READ_ONLY_APPROVAL_REFUSAL,
@@ -1392,6 +1412,7 @@ async def _process_event(
                     qevent,
                     route,
                     "escalated",
+                    escalation_update=escalation_update,
                     telemetry_outcome="classified_failure",
                     lease=lease,
                     hook_outcome=hooks._hook_failure_outcome(),
@@ -1444,6 +1465,7 @@ async def _process_event(
                     qevent,
                     route,
                     "awaiting-approval" if approval_created else "escalated",
+                    escalation_update=pause.escalation_update,
                     telemetry_outcome=(
                         "awaiting_approval" if approval_created else "classified_failure"
                     ),
@@ -1493,7 +1515,7 @@ async def _process_event(
 
             if outcome.saw_side_effect:
                 token = failures._display_error_classification(outcome.classification)
-                await self._escalate(
+                escalation_update = await self._escalate(
                     qevent,
                     route,
                     failures._escalation_text(
@@ -1517,6 +1539,7 @@ async def _process_event(
                     qevent,
                     route,
                     "escalated",
+                    escalation_update=escalation_update,
                     telemetry_outcome="side_effect_halted",
                     lease=lease,
                     hook_outcome=hooks._hook_failure_outcome(),
@@ -1549,11 +1572,11 @@ async def _process_event(
                 and lease is not None
                 and lease.remaining_s() <= constants._MIN_ATTEMPT_BUDGET_S
             ):
-                await self._escalate(
+                escalation_update = await self._escalate(
                     qevent,
                     route,
                     "The run exceeded its delivery deadline after "
-                    f"{attempt} attempt(s) and was not restarted. "
+                    f"{attempt + dependency_attempts} attempt(s) and was not restarted. "
                     "Flagging for a human.",
                     failure_class="delivery-deadline",
                 )
@@ -1561,6 +1584,7 @@ async def _process_event(
                     qevent,
                     route,
                     "escalated",
+                    escalation_update=escalation_update,
                     telemetry_outcome="deadline_halted",
                     lease=lease,
                     hook_outcome=hooks._hook_failure_outcome(),
@@ -1569,8 +1593,12 @@ async def _process_event(
                     ),
                 )
                 return
-            retryable = retryable and qevent.source is not TurnSource.CRON
-            if not retryable or attempt >= self._config.max_attempts:
+            retryable = (
+                dependency_remaining > 0
+                if dependency_retry
+                else retryable and qevent.source is not TurnSource.CRON
+            )
+            if not retryable or (attempt >= self._config.max_attempts and not dependency_retry):
                 if (
                     outcome.classification in {"runner-error", "sandbox-capacity"}
                     and termination_detail is not None
@@ -1582,13 +1610,14 @@ async def _process_event(
                         : constants._ESCALATION_DETAIL_MAX
                     ]
                 token = failures._display_error_classification(outcome.classification)
-                await self._escalate(
+                escalation_update = await self._escalate(
                     qevent,
                     route,
                     failures._escalation_text(
                         qevent,
                         lead=failures._with_guidance(
-                            f"The run failed ({token}) after {attempt} attempt(s).",
+                            f"The run failed ({token}) after "
+                            f"{attempt + dependency_attempts} attempt(s).",
                             token,
                             delivered_max_turns=(boot_env or {}).get(MAX_TURNS_ENV),
                         ),
@@ -1600,6 +1629,7 @@ async def _process_event(
                     qevent,
                     route,
                     "escalated",
+                    escalation_update=escalation_update,
                     telemetry_outcome=(
                         "budget_halted"
                         if outcome.classification == "budget-exceeded"
@@ -1625,9 +1655,19 @@ async def _process_event(
                 },
             )
             backoff_s = self._backoff(
-                capacity_refusals if capacity_continuation is not None else attempt
+                dependency_refusals
+                if dependency_retry
+                else capacity_refusals
+                if capacity_continuation is not None
+                else attempt
             )
             remaining = claim._remaining_budget(lease)
+            if dependency_retry:
+                remaining = (
+                    dependency_remaining
+                    if remaining is None
+                    else min(remaining, dependency_remaining)
+                )
             if capacity_continuation is not None:
                 remaining = capacity_continuation.bound_remaining_s(remaining)
             if remaining is not None:

@@ -2506,8 +2506,8 @@ def test_workspace_preparation_failure_escalates_by_its_own_name(make_harness, c
         pytest.param(
             500,
             "workspace repository-selection failed: API returned HTTP 500",
-            3,
-            id="fault-exhausts-retry-budget",
+            None,
+            id="dependency-fault-retries-in-current-invocation",
         ),
         pytest.param(
             403,
@@ -2525,7 +2525,7 @@ def test_workspace_preparation_failure_escalates_by_its_own_name(make_harness, c
     ],
 )
 def test_workspace_selection_http_failure_preserves_diagnostic_and_retry_policy(
-    make_harness, status: int, expected_detail: str, expected_attempts: int
+    make_harness, status: int, expected_detail: str, expected_attempts: int | None
 ) -> None:
     """#4367: selection faults retain the reason while policy refusals stay terminal."""
 
@@ -2553,7 +2553,11 @@ def test_workspace_selection_http_failure_preserves_diagnostic_and_retry_policy(
                 api_url=str(server.make_url("")),
                 worker_token="workspace-test-token",
             )
-            async with make_harness(binding=_workspace_binding(deployment_id), max_attempts=3) as h:
+            async with make_harness(
+                binding=_workspace_binding(deployment_id),
+                max_attempts=1,
+                workspace_total_timeout_seconds=1,
+            ) as h:
                 h.kernel._workspace = WorkspaceClaimCoordinator(
                     preparer=SimpleNamespace(credentials=credentials),
                     substrate=h.substrate,
@@ -2564,7 +2568,10 @@ def test_workspace_selection_http_failure_preserves_diagnostic_and_retry_policy(
                 )
                 await h.kernel.process_event(event)
 
-                assert len(requests) == expected_attempts
+                if status == 500:
+                    assert len(requests) > h.config.max_attempts
+                else:
+                    assert len(requests) == expected_attempts
                 assert all(body["repo_full_name"] == "acme-corp/acme-bot" for body in requests)
                 assert h.fake_k8s.claim_envs == []
                 assert h.runner.opened == []
@@ -2574,9 +2581,9 @@ def test_workspace_selection_http_failure_preserves_diagnostic_and_retry_policy(
                 reply = h.sink.last_text
                 assert reply is not None
                 if status == 500:
+                    assert f"after {len(requests)} attempt(s)" in reply
                     assert kernel_failures.failure_class_from_reply(reply) == "workspace-error"
                     assert expected_detail in reply
-                    assert "after 3 attempt(s)" in reply
                     assert h.sink.completions[0].outcome == "escalated"
                 else:
                     assert reply == expected_detail

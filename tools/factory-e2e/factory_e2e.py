@@ -344,6 +344,7 @@ TERMINUS_CAUSES = (
     "capacity_wait_expired",
     "execution_deadline",
     "issue_cancelled",
+    "issue_deleted",
     "owner_lost",
     "runner_escalated",
     "unclassified",

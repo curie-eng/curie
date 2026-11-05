@@ -2772,6 +2772,8 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
         ))
         .into());
     }
+    super::runner_templates::reconcile(&opts.common).await?;
+    super::runner_templates::verify(&opts.common).await?;
     step.done("rolled back");
 
     Ok(ClusterRollbackOutput::RolledBack {
