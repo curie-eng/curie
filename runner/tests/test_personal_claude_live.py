@@ -460,7 +460,7 @@ main()
 
 # The bundle's PreToolUse command hook. It records the tool and whether the
 # command carried the marker, never the command text.
-MARK_TOOL_PY = r'''
+MARK_TOOL_PY = r"""
 import json
 import os
 import sys
@@ -486,11 +486,11 @@ line = {
 with open(os.path.join(directory, "hook-marker.jsonl"), "a", encoding="utf-8") as handle:
     handle.write(json.dumps(line, sort_keys=True) + "\n")
 sys.exit(0)
-'''
+"""
 
 # Stages the bundle into a writable emptyDir, as the chart's bundle init pair
 # does, and seeds the inherited config dirs the conflict pods name.
-STAGE_PY = r'''
+STAGE_PY = r"""
 import os
 import shutil
 from pathlib import Path
@@ -507,14 +507,14 @@ if os.environ.get("STAGE_CONFLICTS") == "1":
     profiles = Path(os.environ["STAGE_ANTHROPIC_CONFIG_DIR"]) / "configs"
     profiles.mkdir(mode=0o700, parents=True)
     shutil.copyfile(seed / "conflict" / "alt-profile.json", profiles / "alt-profile.json")
-'''
+"""
 
 # Read in the runner container after the turn. Prints counts, model ids and
 # booleans only; no transcript text leaves the pod. The native CLI writes one
 # JSONL line per content block under <config dir>/projects, repeating the API
 # message id, and subagent turns either under .../subagents/ or flagged
 # isSidechain, so unique ids per role count assistant turns.
-TRANSCRIPT_SUMMARY_PY = r'''
+TRANSCRIPT_SUMMARY_PY = r"""
 import json
 import os
 import sys
@@ -597,7 +597,7 @@ for role, seen in roles.items():
         "output_tokens": sum(out for _model, out in seen.values()),
     }
 print(json.dumps(summary, sort_keys=True))
-'''
+"""
 
 
 # --- Conflict inputs (placeholders only) -----------------------------------------
@@ -1220,8 +1220,7 @@ class StepRun:
             found[role] = {
                 "calls": len(calls),
                 "closed_without_failure": any(
-                    closing is not None and closing.get("failed") is False
-                    for closing in closings
+                    closing is not None and closing.get("failed") is False for closing in closings
                 ),
                 "subagent_types": sorted(
                     {str((event.get("arguments") or {}).get("subagent_type")) for event in calls}
@@ -1854,9 +1853,7 @@ class LiveCluster:
                 status.get("containerStatuses") or []
             ):
                 state = item.get("state") or {}
-                reasons = {
-                    key: (value or {}).get("reason") for key, value in state.items()
-                }
+                reasons = {key: (value or {}).get("reason") for key, value in state.items()}
                 detail.append(f"{item.get('name')}: ready={item.get('ready')} state={reasons}")
         logs = self.kubectl("logs", pod, "-c", "runner", "--tail=40", namespaced=True)
         if logs.returncode == 0:
