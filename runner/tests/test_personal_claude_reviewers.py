@@ -286,14 +286,22 @@ def test_personal_mode_removes_subagent_model_forcing(
 # ``settings.local.json``, ADR 0189) are agent writable. Each case maps the
 # settings files to the model the control observes on both roles.
 
-REROUTING_SETTINGS: dict[str, tuple[dict[str, object], str]] = {
-    "env-subagent-model-force": ({"settings.json": {"env": _FORCING}}, FORCED_SUBAGENT_MODEL),
+# Each case maps the settings files to the models the control observes: the
+# implementer's, then both roles'.
+REROUTING_SETTINGS: dict[str, tuple[dict[str, object], str, str]] = {
+    "env-subagent-model-force": (
+        {"settings.json": {"env": _FORCING}},
+        IMPLEMENTER_MODEL,
+        FORCED_SUBAGENT_MODEL,
+    ),
     "local-env-subagent-model-force": (
         {"settings.local.json": {"env": _FORCING}},
+        IMPLEMENTER_MODEL,
         FORCED_SUBAGENT_MODEL,
     ),
     "env-subagent-model-force-alone": (
         {"settings.json": {"env": {"CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"}}},
+        IMPLEMENTER_MODEL,
         IMPLEMENTER_MODEL,
     ),
     # Observed on CLI 2.1.301: a role whose model is not in the allowlist
@@ -302,6 +310,34 @@ REROUTING_SETTINGS: dict[str, tuple[dict[str, object], str]] = {
     "available-models": (
         {"settings.json": {"availableModels": [IMPLEMENTER_MODEL]}},
         IMPLEMENTER_MODEL,
+        IMPLEMENTER_MODEL,
+    ),
+    # Observed on CLI 2.1.301 on the first-party endpoint: ``modelOverrides``
+    # rewrites the outgoing request model of whichever role resolves to a mapped
+    # ID, and an ``availableModels`` that lists both configured models does not
+    # stop it. Workspace ``modelOverrides`` was already refused; these cases are
+    # also the CLI-side control for the managed ``modelOverrides`` refusals in
+    # test_personal_claude_auth.py, since the pinned CLI reads managed policy
+    # only at /etc/claude-code.
+    "model-overrides-reviewer": (
+        {"settings.json": {"modelOverrides": {REVIEWER_MODEL: FORCED_SUBAGENT_MODEL}}},
+        IMPLEMENTER_MODEL,
+        FORCED_SUBAGENT_MODEL,
+    ),
+    "model-overrides-reviewer-with-allowlist": (
+        {
+            "settings.json": {
+                "availableModels": [IMPLEMENTER_MODEL, REVIEWER_MODEL],
+                "modelOverrides": {REVIEWER_MODEL: FORCED_SUBAGENT_MODEL},
+            }
+        },
+        IMPLEMENTER_MODEL,
+        FORCED_SUBAGENT_MODEL,
+    ),
+    "local-model-overrides-implementer": (
+        {"settings.local.json": {"modelOverrides": {IMPLEMENTER_MODEL: FORCED_SUBAGENT_MODEL}}},
+        FORCED_SUBAGENT_MODEL,
+        REVIEWER_MODEL,
     ),
 }
 
@@ -317,15 +353,15 @@ def test_rerouting_workspace_settings_are_live_in_service_mode(
     install: Installation, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
     # The positive control for the refusal below.
-    files, observed = REROUTING_SETTINGS[case]
+    files, implementer, roles = REROUTING_SETTINGS[case]
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", OWNER_GRANT)
     _plant_workspace(install, files)
 
     _, by_role = _review_turn(install, reviewer_model=REVIEWER_MODEL)
 
     assert _role_models(by_role) == {
-        "implementer": {IMPLEMENTER_MODEL},
-        **{role: {observed} for role in _ROLES},
+        "implementer": {implementer},
+        **{role: {roles} for role in _ROLES},
     }
 
 
@@ -333,7 +369,7 @@ def test_rerouting_workspace_settings_are_live_in_service_mode(
 def test_rerouting_workspace_settings_are_refused_before_the_cli_starts(
     install: Installation, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
-    files, _ = REROUTING_SETTINGS[case]
+    files, _, _ = REROUTING_SETTINGS[case]
     _personal(monkeypatch)
     _plant_workspace(install, files)
     bundle, _ = _review_bundle(install)
@@ -373,14 +409,18 @@ def test_workspace_settings_without_a_rerouting_key_still_run_both_reviewers(
 def test_a_managed_allowlist_naming_both_models_keeps_both_roles_on_the_reviewer(
     install: Installation, monkeypatch: pytest.MonkeyPatch, managed_dir: Path
 ) -> None:
-    # Liveness for the managed ``availableModels`` refusals in
-    # test_personal_claude_auth.py. The pinned CLI reads managed policy only at
-    # /etc/claude-code, so this proves the guard's decision offline; the
-    # CLI-side effect of an allowlist is the workspace control above.
+    # Liveness for the managed ``availableModels`` and ``modelOverrides``
+    # refusals in test_personal_claude_auth.py (an empty mapping is allowed).
+    # The pinned CLI reads managed policy only at /etc/claude-code, so this
+    # proves the guard's decision offline; the CLI-side effect of an allowlist
+    # or a mapping is the workspace control above.
     _personal(monkeypatch)
     write_json(
         managed_dir / "managed-settings.json",
-        {"availableModels": [IMPLEMENTER_MODEL, REVIEWER_MODEL, FORCED_SUBAGENT_MODEL]},
+        {
+            "availableModels": [IMPLEMENTER_MODEL, REVIEWER_MODEL, FORCED_SUBAGENT_MODEL],
+            "modelOverrides": {},
+        },
     )
 
     _, by_role = _review_turn(install, reviewer_model=REVIEWER_MODEL)

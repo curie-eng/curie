@@ -826,6 +826,39 @@ MANAGED_REFUSALS: dict[str, dict[str, object]] = {
     "drop-in-available-models-missing-reviewer": {
         "managed-settings.d/30-models.json": {"availableModels": [IMPLEMENTER_MODEL]}
     },
+    # Managed ``modelOverrides`` must be absent or ``{}``. Observed on CLI
+    # 2.1.301 (the workspace controls in test_personal_claude_reviewers.py), a
+    # mapping rewrites a role's outgoing request model on the first-party
+    # endpoint, after the guard and even when ``availableModels`` lists both
+    # configured models; the CLI's request-model function reads policy
+    # ``availableModels`` and ``modelOverrides`` and returns the mapped ID. Any
+    # non-empty mapping refuses rather than matching the CLI's alias rules.
+    "model-overrides-reviewer-with-allowlist": {
+        "managed-settings.json": {
+            "availableModels": [IMPLEMENTER_MODEL, REVIEWER_MODEL],
+            "modelOverrides": {REVIEWER_MODEL: FORCED_SUBAGENT_MODEL},
+        }
+    },
+    "model-overrides-implementer": {
+        "managed-settings.json": {"modelOverrides": {IMPLEMENTER_MODEL: FORCED_SUBAGENT_MODEL}}
+    },
+    "model-overrides-unrelated-model": {
+        "managed-settings.json": {
+            "modelOverrides": {FORCED_SUBAGENT_MODEL: "arn:example:inference-profile/haiku"}
+        }
+    },
+    "model-overrides-not-an-object": {
+        "managed-settings.json": {"modelOverrides": [[REVIEWER_MODEL, FORCED_SUBAGENT_MODEL]]}
+    },
+    "model-overrides-null": {"managed-settings.json": {"modelOverrides": None}},
+    "drop-in-model-overrides-reviewer": {
+        "managed-settings.d/40-overrides.json": {
+            "modelOverrides": {REVIEWER_MODEL: FORCED_SUBAGENT_MODEL}
+        }
+    },
+    "drop-in-model-overrides-not-an-object": {
+        "managed-settings.d/40-overrides.json": {"modelOverrides": "opus=haiku"}
+    },
     "invalid-json": {"managed-settings.json": "{not json"},
     "not-an-object": {"managed-settings.json": '["forceLoginMethod"]'},
     "drop-in-invalid-json": {"managed-settings.d/10-broken.json": "{not json"},
@@ -925,8 +958,9 @@ def test_managed_claudeai_policy_with_installation_transport_still_launches(
     # the CLI (managed-settings docs), so their forcing keys do not refuse either.
     # Keep-list runner settings and non-provider names are allowed in managed
     # env (D2), and a managed ``availableModels`` allowlist that lists the
-    # implementer and the configured reviewer (plus any other model) is
-    # mandatory policy the runner respects (D3). The pinned CLI reads managed
+    # implementer and the configured reviewer (plus any other model), and an
+    # empty ``modelOverrides``, are mandatory policy the runner respects (D3).
+    # The pinned CLI reads managed
     # policy only at /etc/claude-code, so offline this proves the guard's
     # decision; the CLI-side effect of an allowlist is the workspace control in
     # test_personal_claude_reviewers.py.
@@ -937,6 +971,7 @@ def test_managed_claudeai_policy_with_installation_transport_still_launches(
             "managed-settings.json": {
                 "forceLoginMethod": "claudeai",
                 "availableModels": [IMPLEMENTER_MODEL, REVIEWER_MODEL, FORCED_SUBAGENT_MODEL],
+                "modelOverrides": {},
                 "env": {
                     "HTTPS_PROXY": install.proxy.url,
                     "NODE_EXTRA_CA_CERTS": os.environ["NODE_EXTRA_CA_CERTS"],
@@ -946,6 +981,7 @@ def test_managed_claudeai_policy_with_installation_transport_still_launches(
                 },
             },
             "managed-settings.d/10-retention.json": {"cleanupPeriodDays": 30},
+            "managed-settings.d/20-overrides.json": {"modelOverrides": {}},
             "managed-settings.d/.hidden.json": _GATEWAY_POLICY,
             "managed-settings.d/notes.txt": '{"forceLoginMethod": "gateway"}',
         },
