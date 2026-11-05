@@ -754,6 +754,12 @@ jobs:
         run: |
           uv run python3 scripts/check-private-imports.py --self-test
           uv run python3 scripts/check-private-imports.py
+      # The CLI pytest list is generated from every test file, so a path
+      # filter cannot tell when it is stale. This job has no if and feeds
+      # the required Python aggregate. A stale list fails here, and the
+      # generator prints the one-line regenerate command.
+      - name: CLI pytest file list
+        run: uv run python tools/e2e-ci-selection/cli_pytest_files.py --check
       - name: Alembic revision gate
         run: uv run python scripts/check-alembic-revisions.py
       - name: Alembic cross-train lineage
