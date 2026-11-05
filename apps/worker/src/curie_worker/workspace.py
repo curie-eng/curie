@@ -175,6 +175,10 @@ class WorkspacePreparationError(RuntimeError):
         super().__init__(f"workspace {stage} failed: {detail}")
 
 
+class WorkspaceDependencyUnavailable(WorkspacePreparationError):
+    """A workspace API dependency cannot currently give a decision."""
+
+
 class GitCommandError(WorkspacePreparationError):
     """A git subprocess exited non-zero. Holds a redacted diagnostic, never raw stderr."""
 
@@ -548,7 +552,7 @@ class WorkspaceCredentialClient:
                 allow_redirects=False,
             )
         except Exception as exc:
-            raise WorkspacePreparationError(
+            raise WorkspaceDependencyUnavailable(
                 "repository-selection", "worker could not reach the internal workspace API"
             ) from exc
         if response.status == 403:
@@ -578,9 +582,12 @@ class WorkspaceCredentialClient:
                 ) from exc
             raise WorkspaceSelectionRefused(public_detail)
         if response.status != 200:
-            raise WorkspacePreparationError(
-                "repository-selection", f"API returned HTTP {response.status}"
+            error = (
+                WorkspaceDependencyUnavailable
+                if response.status in {500, 502, 503, 504}
+                else WorkspacePreparationError
             )
+            raise error("repository-selection", f"API returned HTTP {response.status}")
         try:
             selected = json.loads(response.body)["repo_full_name"]
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -612,13 +619,16 @@ class WorkspaceCredentialClient:
                 allow_redirects=False,
             )
         except Exception as exc:
-            raise WorkspacePreparationError(
+            raise WorkspaceDependencyUnavailable(
                 "credential-redemption", "worker could not reach the internal credential API"
             ) from exc
         if response.status != 200:
-            raise WorkspacePreparationError(
-                "credential-redemption", f"API returned HTTP {response.status}"
+            error = (
+                WorkspaceDependencyUnavailable
+                if response.status in {500, 502, 503, 504}
+                else WorkspacePreparationError
             )
+            raise error("credential-redemption", f"API returned HTTP {response.status}")
         cache_control = next(
             (
                 str(value).lower()

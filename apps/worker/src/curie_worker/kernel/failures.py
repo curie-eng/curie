@@ -200,6 +200,7 @@ class TurnOutcome:
     classification: str | None = None
     error_message: str | None = None
     workspace_stage_timeout: bool = False
+    workspace_dependency_unavailable: bool = False
     text: str = ""
     status: SessionStatus | None = None
     steered: bool = False

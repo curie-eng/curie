@@ -80,11 +80,16 @@ class _ApprovalPause:
     created: bool
     failure_detail: str | None = None
     abandoned: bool = False
+    escalation_update: ReplyUpdate | None = None
 
     @classmethod
-    def refused(cls, detail: str | None) -> _ApprovalPause:
+    def refused(
+        cls, detail: str | None, *, escalation_update: ReplyUpdate | None = None
+    ) -> _ApprovalPause:
         clipped = redact_text(detail)[: constants._ESCALATION_DETAIL_MAX] if detail else None
-        return cls(created=False, failure_detail=clipped or None)
+        return cls(
+            created=False, failure_detail=clipped or None, escalation_update=escalation_update
+        )
 
 
 def _valid_notification_endpoint(endpoint: Any) -> bool:
@@ -638,7 +643,7 @@ async def _pause_for_approval(
                 route_name,
                 agent_id,
             )
-            await self._escalate(
+            escalation_update = await self._escalate(
                 qevent,
                 route,
                 f"The run requested approval via route {route_name!r}, but that "
@@ -647,17 +652,17 @@ async def _pause_for_approval(
                 "to this channel.",
                 failure_class="approval-route-unbound",
             )
-            return _ApprovalPause(created=False)
+            return _ApprovalPause(created=False, escalation_update=escalation_update)
         fixed_target, notification_target = targets
         if fixed_target is not None:
             card_kind, card_channel = fixed_target
         elif handle.kind in constants._APPROVER_EMAIL_KINDS:
             card_approver_emails = _approver_emails(binding)
             if not card_approver_emails:
-                await self._escalate_unanswerable_email_approval(
+                escalation_update = await self._escalate_unanswerable_email_approval(
                     qevent, route, agent_id, route_name
                 )
-                return _ApprovalPause(created=False)
+                return _ApprovalPause(created=False, escalation_update=escalation_update)
         elif (
             handle.kind != SLACK_KIND
             and isinstance(binding, dict)
@@ -673,7 +678,7 @@ async def _pause_for_approval(
                 handle.kind,
                 agent_id,
             )
-            await self._escalate(
+            escalation_update = await self._escalate(
                 qevent,
                 route,
                 f"The run requested approval via route {route_name!r}, which "
@@ -682,32 +687,34 @@ async def _pause_for_approval(
                 "instead of creating an approval nobody here can answer.",
                 failure_class="approval-approvers-unverifiable",
             )
-            return _ApprovalPause(created=False)
+            return _ApprovalPause(created=False, escalation_update=escalation_update)
     elif handle.kind in constants._APPROVER_EMAIL_KINDS:
         # ADR-0177 amendment A3: a routeless approval has no binding, so no
         # approver emails, and on email nobody else may answer it.
-        await self._escalate_unanswerable_email_approval(qevent, route, agent_id, None)
-        return _ApprovalPause(created=False)
+        escalation_update = await self._escalate_unanswerable_email_approval(
+            qevent, route, agent_id, None
+        )
+        return _ApprovalPause(created=False, escalation_update=escalation_update)
 
     if not is_publication and self._approvals is None:
-        await self._escalate(
+        escalation_update = await self._escalate(
             qevent,
             route,
             "The run requested an approval, but no approval backend is "
             "configured on this worker; flagging for a human instead of pausing.",
             failure_class="approval-backend-missing",
         )
-        return _ApprovalPause(created=False)
+        return _ApprovalPause(created=False, escalation_update=escalation_update)
 
     if is_publication and self._publication_creator is None:
-        await self._escalate(
+        escalation_update = await self._escalate(
             qevent,
             route,
             "Repository publication is unavailable on this installation; nothing was "
             "published and no approval was created.",
             failure_class="publication-unavailable",
         )
-        return _ApprovalPause(created=False)
+        return _ApprovalPause(created=False, escalation_update=escalation_update)
 
     base = outcome.text.strip()
     # #2659: the inferred repository is a reply block only. It is composed
@@ -919,14 +926,14 @@ async def _pause_for_approval(
             type(exc).__name__,
             exc,
         )
-        await self._escalate(
+        escalation_update = await self._escalate(
             qevent,
             route,
             "The run requested an approval, but the approval record could "
             "not be created; flagging for a human instead of pausing.",
             failure_class="approval-create-failed",
         )
-        return _ApprovalPause.refused(refusal)
+        return _ApprovalPause.refused(refusal, escalation_update=escalation_update)
     except ValueError:
         # @spec HTTP-APPROVAL-CONTINUITY-3: a local validation error of a selected
         # request is the terminal refusal; any other propagates as before.
@@ -1293,7 +1300,7 @@ async def _escalate_unanswerable_email_approval(
     route: TargetRoute,
     agent_id: uuid.UUID | None,
     route_name: str | None,
-) -> None:
+) -> ReplyUpdate | None:
     """Escalate an approval raised in an email thread that nobody may answer.
 
     ADR-0177 amendment A3: on email, only an address on the route's approver
@@ -1322,7 +1329,7 @@ async def _escalate_unanswerable_email_approval(
             f"The run requested approval via route {route_name!r}, which lists no "
             "approver email addresses"
         )
-    await self._escalate(
+    return await self._escalate(
         qevent,
         route,
         f"{why}, and on email only an address on a route's approver list may "

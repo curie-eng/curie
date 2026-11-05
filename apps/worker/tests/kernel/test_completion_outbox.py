@@ -485,7 +485,12 @@ def test_every_terminal_path_writes_a_completion_record(make_harness) -> None:
             await h.kernel.process_event(_qevent(thread="tEsc", event_id="esc1"))
 
             assert await h.async_redis.exists(h.config.done_key("esc1"))
-            assert await h.async_redis.smembers(h.config.completions_pending_key()) == {"esc1"}
+            owed = await h.kernel._markers.read_completion("esc1")
+            assert owed is not None and owed.done_flag
+            assert owed.record.event.outcome == "escalated"
+            assert owed.record.answer is not None
+            entries = await h.kernel._markers.pending_completion_entries(10)
+            assert [entry.event_id for entry in entries] == ["esc1"]
 
     asyncio.run(go())
 
