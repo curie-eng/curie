@@ -503,7 +503,9 @@ CLI starts:
    model (the session `model`) and the reviewer model; otherwise, or when the
    session has no explicit implementer model, the launch is refused, because
    the CLI would silently move a role outside the list onto the parent model.
-   The runner never edits or bypasses it. The pinned CLI 2.1.301 does
+   A managed `modelOverrides` must be absent or an empty object, since the CLI
+   applies any mapping to the outgoing request model after the guard. The
+   runner never edits or bypasses it. The pinned CLI 2.1.301 does
    not read `CLAUDE_CODE_MANAGED_SETTINGS_PATH`, so step 3 removes it and the
    guard reads only `/etc/claude-code`.
 

@@ -33,8 +33,9 @@ kept.
 Workspace settings are agent writable, so their ``env`` may set no namespace
 name at all and no transport key, and they may not set ``availableModels``.
 Managed policy ``env`` may set the kept ``CLAUDE_*`` names and names outside
-the namespaces that do not compete, and a managed ``availableModels`` must list
-both the implementer and the reviewer model.
+the namespaces that do not compete, a managed ``availableModels`` must list
+both the implementer and the reviewer model, and a managed ``modelOverrides``
+must be absent or empty.
 
 Error messages name variables, settings keys and files. They never carry a
 credential value.
@@ -395,7 +396,8 @@ def inspect_managed_policy(*, implementer_model: str | None, reviewer_model: str
     parsed. Managed proxy and CA variables are installation transport and are
     allowed. A managed ``availableModels`` is allowed only as a list of strings
     naming both ``implementer_model`` (the session ``model``) and
-    ``reviewer_model`` (the configured ``ANTHROPIC_DEFAULT_OPUS_MODEL``).
+    ``reviewer_model`` (the configured ``ANTHROPIC_DEFAULT_OPUS_MODEL``), and a
+    managed ``modelOverrides`` only when absent or an empty object.
     """
 
     for path in _managed_files(MANAGED_SETTINGS_DIR):
@@ -426,6 +428,17 @@ def inspect_managed_policy(*, implementer_model: str | None, reviewer_model: str
                     f"sets availableModels {gap}, so a role would run on another model; "
                     f"managed policy is not bypassed",
                 )
+        # The pinned CLI 2.1.301 model resolver reads policy availableModels and
+        # modelOverrides and applies the mapping to the outgoing request model,
+        # after this guard, so any mapping can move a role off its configured
+        # model. Fail closed rather than reproduce the CLI's alias matching.
+        if settings.get("modelOverrides", {}) != {}:
+            raise _refused(
+                "managed settings",
+                path,
+                "sets modelOverrides to something other than an empty object, so a role "
+                "would run on another model; managed policy is not bypassed",
+            )
 
 
 # --- the CLI parent env --------------------------------------------------------------

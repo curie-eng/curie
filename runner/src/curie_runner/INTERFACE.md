@@ -54,8 +54,9 @@ including `CLAUDE_SECURESTORAGE_CONFIG_DIR` and subagent model forcing
 `CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL`), so reviewer roles keep the configured
 reviewer model. Workspace settings `env` may set no name from those namespaces
 and workspace `availableModels` is refused; managed settings `env` may set only
-the kept `CLAUDE_*` names from them, and a managed `availableModels` must list
-both the implementer and the reviewer model. The personal policy lives in
+the kept `CLAUDE_*` names from them, a managed `availableModels` must list both
+the implementer and the reviewer model, and a managed `modelOverrides` must be
+absent or empty. The personal policy lives in
 `personal_auth.py` (#5373, ADR 0268); see the runner README, "Personal
 subscription mode".
 
