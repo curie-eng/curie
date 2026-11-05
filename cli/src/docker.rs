@@ -3542,11 +3542,33 @@ impl ConnectorStartSpec {
                 })
                 .collect(),
             secret_names,
-            mounts: secret_volumes
-                .mounts(connector, spec)?
-                .iter()
-                .map(crate::connector_build::ConnectorSecretMount::docker_mount)
-                .collect(),
+            mounts: {
+                let mut mounts: Vec<String> = secret_volumes
+                    .mounts(connector, spec)?
+                    .iter()
+                    .map(crate::connector_build::ConnectorSecretMount::docker_mount)
+                    .collect();
+                // Where the rendered pod has its scratch emptyDir (#5415): the
+                // only writable path beside a read-only root, bounded, and
+                // writable by the non-root connector user.
+                if let Some(scratch) = &spec.scratch {
+                    let Some(bytes) =
+                        crate::connector_build::scratch_size_bytes(&scratch.size_limit)
+                    else {
+                        bail!(
+                            "connectors.bad_scratch_size: connector {connector} declares \
+                             scratch.size_limit {:?}; it must be a whole number of bytes with \
+                             an optional Ki, Mi or Gi suffix, from 1Mi to 64Gi",
+                            scratch.size_limit
+                        );
+                    };
+                    mounts.push(format!(
+                        "type=tmpfs,destination={},tmpfs-size={bytes},tmpfs-mode=1777",
+                        scratch.path
+                    ));
+                }
+                mounts
+            },
             labels: {
                 let mut labels = vec![
                     CLI_MANAGED_LABEL.to_string(),
