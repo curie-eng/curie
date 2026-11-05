@@ -127,6 +127,7 @@ def _collection_repository(tmp_path: Path) -> Path:
     root.mkdir()
     for relative in (
         "pyproject.toml", "conftest.py", "tools/factory-e2e/tests/conftest.py",
+        "tools/factory-e2e/case_shards.py", "tools/factory-e2e/tests/case_durations.json",
         "tests/baselines/test-time.json",
     ):
         destination = root / relative
