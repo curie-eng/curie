@@ -9,6 +9,13 @@ ADR 0106 supersedes only this ADR's publication-only requester exception and
 universal self-block premise; publication remains approval-gated under the
 selected approver set's authenticated-principal membership rule.
 
+**Superseded in part by [ADR 0256](0256-publication-validates-and-pushes-a-git-object-overlay.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+the worker clause that validates the binary patch, base commit, repository,
+paths, and the private base archive, and the Job clause that clones, branches,
+safely applies, commits, and pushes. The privately held base, the approval
+gate, and the rest of this decision stand.
+
 Maintainer approval supplied for this decision on 2026-08-20 authorizes ADR
 0125 to land Accepted with its realizing code paths in this PR.
 
