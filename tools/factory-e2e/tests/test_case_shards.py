@@ -33,6 +33,27 @@ def test_longest_first_unknown_median_and_node_id_ties() -> None:
     ]
 
 
+def test_colocated_cases_are_assigned_by_summed_weight() -> None:
+    module = "tools/factory-e2e/tests/test_c4_admitted_agent.py"
+    group = [
+        f"{module}::test_continuation_revalidates_current_authority[{change}-{reason}-{phase}]"
+        for change, reason in (
+            ("removed_binding", "factory_binding_missing"),
+            ("binding_tenant", "factory_tenant_mismatch"),
+            ("tracker_surface", "factory_surface_mismatch"),
+        )
+        for phase in ("held", "restarted")
+    ] + [f"{module}::test_two_worker_ci_preserves_successor_identity_and_rejects_stale_predecessor"]
+    weights = {**dict.fromkeys(group, 2), "heavy": 9, "light": 8, "stale": 1000}
+    assert assign_case_shards(["heavy", *group, "light"], 2, weights) == [
+        group, ["heavy", "light"]
+    ]
+    partial = group[1:]
+    assert assign_case_shards(["heavy", *partial, "light"], 2, weights) == [
+        partial, ["heavy", "light"]
+    ]
+
+
 @pytest.mark.parametrize("data", [{}, {"case": -1}, {"case": "bad"}])
 def test_invalid_duration_file_is_refused(tmp_path: Path, data: object) -> None:
     path = tmp_path / "durations.json"
