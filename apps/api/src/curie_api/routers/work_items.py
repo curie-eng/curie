@@ -393,36 +393,7 @@ async def read_personal_context(
     )
     if context is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND)
-    request, enrollment = context.request, context.enrollment
-    return PersonalContextOut(
-        work_item_id=context.work_item_id,
-        agent_id=context.agent_id,
-        tenant_id=context.tenant_id,
-        model_auth_mode=context.model_auth_mode,
-        owner_principal_id=context.owner_principal_id,
-        enrollment_generation=context.enrollment_generation,
-        work_item_version=context.work_item_version,
-        request=(
-            PersonalContextRequestOut(
-                id=request.id,
-                sequence=request.sequence,
-                status=request.status,
-                version=request.version,
-                enrollment_generation=request.enrollment_generation,
-            )
-            if request is not None
-            else None
-        ),
-        enrollment=(
-            PersonalContextEnrollmentOut(
-                generation=enrollment.generation,
-                active=enrollment.active,
-                version=enrollment.version,
-            )
-            if enrollment is not None
-            else None
-        ),
-    )
+    return PersonalContextOut.model_validate(context, from_attributes=True)
 
 
 @router.post("/{work_item_id}/personal-context/revalidate", response_model=RevalidationOut)
@@ -451,15 +422,7 @@ async def revalidate_personal_context(
         if result.code == "not_found":
             raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND)
         raise HTTPException(status.HTTP_409_CONFLICT, {"code": result.code})
-    return RevalidationOut(
-        work_item_id=result.work_item_id,
-        request_id=result.request_id,
-        previous_generation=result.previous_generation,
-        enrollment_generation=result.enrollment_generation,
-        work_item_version=result.work_item_version,
-        request_version=result.request_version,
-        enrollment_version=result.enrollment_version,
-    )
+    return RevalidationOut.model_validate(result, from_attributes=True)
 
 
 @router.post("/requests/{request_id}/acquire")
