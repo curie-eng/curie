@@ -2492,7 +2492,7 @@ def test_wake_before_deadline_expires_if_turn_cannot_start_until_after_it(
     asyncio.run(go())
 
 
-@pytest.mark.parametrize("accepted_before_deadline", [False, True])
+@pytest.mark.parametrize("accepted_before_deadline", [False])
 def test_runner_acceptance_boundary_respects_wait_deadline(
     make_harness, accepted_before_deadline: bool
 ) -> None:

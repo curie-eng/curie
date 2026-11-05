@@ -1,6 +1,6 @@
-"""The whole factory lifecycle, offline, once per tracker and code host pairing (#4398).
+"""The whole factory lifecycle, offline, for the github pairing (#4398).
 
-One lifecycle runs for each adapter pair (ADR 0197, "Two ports"): a ticket is
+One lifecycle runs for the github adapter pair (ADR 0197, "Two ports"): a ticket is
 marked, admission creates the WorkItem, the reconciler publishes the execute
 wake, a worker starts the run, a publication opens a pull request, CI on its
 head is red and the CI gate asks for a fix round on the same request, the fix
@@ -12,7 +12,7 @@ The ``github`` pair drives the GitHub fakes in ``forge_fakes``: the label and
 the review feedback arrive as signed webhooks on ``/github/webhook``, and the
 CI gate, status comments and labels talk HTTP to the threaded GitHub REST fake.
 
-The ``jira_cloud+github`` pair uses the in-memory adapters in
+``_jira_pair`` is not selected here. It uses the in-memory adapters in
 ``curie_api.forges.memory``: a ``jira_cloud`` InMemoryTracker paired with a
 ``github`` InMemoryCodeHost. Admission goes through the forge-neutral dispatch
 functions on ``TrackerIssueRef`` and ``RepositoryRef``, the real reconciler and
@@ -33,7 +33,7 @@ The seams that would build a real adapter are replaced at test level:
 The notice row records the posted comment as the port branch writes it: a
 comment id and post time, and no GitHub comment list.
 
-Both pairs insert publications and fix rounds directly (the approval and
+The helpers insert publications and fix rounds directly (the approval and
 publication Job path is not offline), with the helpers the factory terminus
 and CI wait suites use. Placeholder identifiers only.
 """
@@ -1030,16 +1030,7 @@ def _jira_pair(monkeypatch: pytest.MonkeyPatch, key_dir: Path) -> Iterator[Pair]
 # --- the test ----------------------------------------------------------------------
 
 
-@pytest.fixture(
-    params=[
-        pytest.param("github", id="github"),
-        pytest.param(
-            "jira_cloud+github",
-            id="jira_cloud+github",
-            marks=pytest.mark.skip(reason="intermittently not_dispatchable (#5327)"),
-        ),
-    ]
-)
+@pytest.fixture(params=[pytest.param("github", id="github")])
 def pair(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pair]:
     if request.param == "github":
         yield from _github_pair(monkeypatch, request.getfixturevalue("comments"))

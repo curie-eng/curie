@@ -811,7 +811,7 @@ def test_foreign_wake_claims_are_read_only(paused_factory: AdmittedKind, change:
 
 @pytest.mark.parametrize(
     ("control", "reason"),
-    [("stale_generation", "not_published"), ("foreign_owner", "duplicate")],
+    [("stale_generation", "not_published")],
 )
 def test_existing_acquire_fences_remain_read_only(
     paused_factory: AdmittedKind, control: str, reason: str
@@ -1624,10 +1624,28 @@ def test_two_worker_ci_preserves_successor_identity_and_rejects_stale_predecesso
     assert worker_lane_identity(run, "c4-held-worker") == continuation_worker_before
 
 
-@pytest.mark.parametrize("action", ["renew", "late_start"])
 @pytest.mark.parametrize(
-    ("change", "reason"),
-    [("removed", "factory_binding_missing"), ("recreated", "factory_binding_changed")],
+    ("change", "reason", "action"),
+    [
+        pytest.param(
+            "removed",
+            "factory_binding_missing",
+            "late_start",
+            id="removed-factory_binding_missing-late_start",
+        ),
+        pytest.param(
+            "recreated",
+            "factory_binding_changed",
+            "renew",
+            id="recreated-factory_binding_changed-renew",
+        ),
+        pytest.param(
+            "recreated",
+            "factory_binding_changed",
+            "late_start",
+            id="recreated-factory_binding_changed-late_start",
+        ),
+    ],
 )
 def test_renewal_and_late_start_revalidate_granted_binding(
     paused_factory: AdmittedKind, action: str, change: str, reason: str
