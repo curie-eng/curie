@@ -37,7 +37,11 @@
         "terminal_cause",
         "termination_observation",
         "capacity_deferrals",
-        "last_deferral_reason"
+        "last_deferral_reason",
+        "tenant_id",
+        "model_auth_mode",
+        "owner_principal_id",
+        "enrollment_generation"
       ],
       "properties": {
         "sequence": {
@@ -91,6 +95,35 @@
         "last_deferral_reason": {
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "tenant_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_auth_mode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "service",
+            "personal",
+            null
+          ]
+        },
+        "owner_principal_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enrollment_generation": {
+          "type": [
+            "integer",
             "null"
           ]
         }
@@ -284,7 +317,11 @@
         "publication",
         "correctness",
         "ci",
-        "requests"
+        "requests",
+        "tenant_id",
+        "model_auth_mode",
+        "owner_principal_id",
+        "enrollment_generation"
       ],
       "properties": {
         "id": {
@@ -363,6 +400,35 @@
           "items": {
             "$ref": "#/$defs/request"
           }
+        },
+        "tenant_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_auth_mode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "service",
+            "personal",
+            null
+          ]
+        },
+        "owner_principal_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enrollment_generation": {
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       }
     },

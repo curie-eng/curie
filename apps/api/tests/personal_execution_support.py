@@ -28,6 +28,7 @@ import pytest
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn
 from curie_api import workitem_dispatch
 from curie_api.config import get_settings
+from curie_api.db import create_sessionmaker
 from curie_api.forges.types import GITHUB, RepositoryRef, TrackerIssueRef
 from curie_api.workitem_dispatch import AcquireGrant, Admission, StartResult
 from curie_api.workitems.lifecycle import WorkItemOutcome
@@ -83,12 +84,16 @@ OwnerTuple = tuple[UUID | None, str, UUID | None, int | None]
 
 
 def with_session[T](body: Callable[[AsyncSession], Awaitable[T]]) -> T:
-    """Run ``body`` in its own session on a freshly created engine."""
+    """Run ``body`` in its own session on a freshly created engine.
+
+    The session comes from the application's own sessionmaker, so it keeps
+    loaded rows across a commit exactly as a production session does.
+    """
 
     async def go() -> T:
         engine = create_async_engine(get_settings().database_url)
         try:
-            async with AsyncSession(engine) as session:
+            async with create_sessionmaker(engine)() as session:
                 return await body(session)
         finally:
             await engine.dispose()

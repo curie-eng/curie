@@ -33,6 +33,9 @@ router = APIRouter(
 )
 
 _NOT_FOUND = {"code": "not_found"}
+# A miss is as uncacheable as a hit, and identical for an unknown id and
+# another agent's WorkItem (#5376).
+_NO_STORE = {"Cache-Control": "no-store"}
 
 
 @router.get("", response_model=WorkItemOutcomeList)
@@ -44,7 +47,7 @@ async def list_work_items(
 ) -> WorkItemOutcomeList:
     response.headers["Cache-Control"] = "no-store"
     if agent_id is not None and await crud_agents.get_agent(session, agent_id) is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND, headers=_NO_STORE)
     items, truncated = await workitem_outcomes.load_outcomes(
         session, agent_id=agent_id, limit=limit, settings=get_settings()
     )
@@ -65,7 +68,7 @@ async def get_work_item(
         session, work_item_id, agent_id=agent_id, settings=settings
     )
     if loaded is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND, headers=_NO_STORE)
     view, item, lineage = loaded
     registry: ForgeRegistry = request.app.state.forges
     # The code host entry the lineage (or the WorkItem alone) recorded, never
@@ -113,7 +116,7 @@ async def get_work_item_usage(
         session, work_item_id, agent_id=agent_id, settings=get_settings()
     )
     if loaded is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND, headers=_NO_STORE)
     _view, _item, lineage = loaded
     usage = await factory_usage.work_item_usage(session, work_item_id)
     if lineage is not None:
