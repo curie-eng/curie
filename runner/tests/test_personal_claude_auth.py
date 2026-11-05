@@ -859,6 +859,55 @@ MANAGED_REFUSALS: dict[str, dict[str, object]] = {
     "drop-in-model-overrides-not-an-object": {
         "managed-settings.d/40-overrides.json": {"modelOverrides": "opus=haiku"}
     },
+    # ``policyHelpers`` refuses whatever it holds, as ``policyHelper`` does. The
+    # CLI's settings schema (CLI 2.1.301 binary): "Per-OS variant of
+    # policyHelper, keyed by platform: macos, linux, windows, wsl, plus an
+    # optional "default" entry that is a STATIC settings payload (a JSON object
+    # of managed settings, not a helper)"; each per-OS entry carries a helper
+    # (a "path", or an inline "script") and/or a static "defaultSettings"
+    # payload. The CLI installs that payload as managed settings after the
+    # guard, so it can carry any competing source.
+    "policy-helpers-default-env": {
+        "managed-settings.json": {
+            "policyHelpers": {"default": {"env": {"ANTHROPIC_AUTH_TOKEN": SERVICE_AUTH_TOKEN}}}
+        }
+    },
+    "policy-helpers-linux-default-settings": {
+        "managed-settings.json": {
+            "policyHelpers": {"linux": {"defaultSettings": {"forceLoginMethod": "claudeai"}}}
+        }
+    },
+    "policy-helpers-empty": {"managed-settings.json": {"policyHelpers": {}}},
+    "drop-in-policy-helpers-linux-path": {
+        "managed-settings.d/60-helpers.json": {
+            "policyHelpers": {"linux": {"path": "/usr/local/bin/policy"}}
+        }
+    },
+    # ``deniedModels`` must be absent or ``[]``. The CLI's settings schema (CLI
+    # 2.1.301 binary): "Models users cannot select, even when availableModels
+    # allows them. A family alias ("opus") blocks that family. A model ID blocks
+    # that version in every spelling ... Read from managed settings only." (a
+    # workspace ``deniedModels: ["opus"]`` left both roles on Opus, observed). A
+    # role whose model is denied inherits the implementer's model, so any entry
+    # refuses rather than reproducing the CLI's alias matching.
+    "denied-models-opus-with-allowlist": {
+        "managed-settings.json": {
+            "availableModels": [IMPLEMENTER_MODEL, REVIEWER_MODEL],
+            "deniedModels": ["opus"],
+        }
+    },
+    "denied-models-reviewer-id": {"managed-settings.json": {"deniedModels": [REVIEWER_MODEL]}},
+    "denied-models-unrelated-model": {
+        "managed-settings.json": {"deniedModels": [FORCED_SUBAGENT_MODEL]}
+    },
+    "denied-models-not-a-list": {"managed-settings.json": {"deniedModels": "opus"}},
+    "drop-in-denied-models-opus": {"managed-settings.d/30-denied.json": {"deniedModels": ["opus"]}},
+    # ``fallbackModel`` refuses whatever it holds. Subagents inherit it, and a
+    # failed reviewer request then moves to it (the service control in
+    # test_personal_claude_reviewers.py, observed through workspace settings).
+    "fallback-model": {"managed-settings.json": {"fallbackModel": [FORCED_SUBAGENT_MODEL]}},
+    "fallback-model-empty": {"managed-settings.json": {"fallbackModel": []}},
+    "drop-in-fallback-model": {"managed-settings.d/50-fallback.json": {"fallbackModel": "default"}},
     "invalid-json": {"managed-settings.json": "{not json"},
     "not-an-object": {"managed-settings.json": '["forceLoginMethod"]'},
     "drop-in-invalid-json": {"managed-settings.d/10-broken.json": "{not json"},
@@ -958,8 +1007,9 @@ def test_managed_claudeai_policy_with_installation_transport_still_launches(
     # the CLI (managed-settings docs), so their forcing keys do not refuse either.
     # Keep-list runner settings and non-provider names are allowed in managed
     # env (D2), and a managed ``availableModels`` allowlist that lists the
-    # implementer and the configured reviewer (plus any other model), and an
-    # empty ``modelOverrides``, are mandatory policy the runner respects (D3).
+    # implementer and the configured reviewer (plus any other model), an empty
+    # ``modelOverrides`` and an empty ``deniedModels`` are mandatory policy the
+    # runner respects (D3).
     # The pinned CLI reads managed
     # policy only at /etc/claude-code, so offline this proves the guard's
     # decision; the CLI-side effect of an allowlist is the workspace control in
@@ -972,6 +1022,7 @@ def test_managed_claudeai_policy_with_installation_transport_still_launches(
                 "forceLoginMethod": "claudeai",
                 "availableModels": [IMPLEMENTER_MODEL, REVIEWER_MODEL, FORCED_SUBAGENT_MODEL],
                 "modelOverrides": {},
+                "deniedModels": [],
                 "env": {
                     "HTTPS_PROXY": install.proxy.url,
                     "NODE_EXTRA_CA_CERTS": os.environ["NODE_EXTRA_CA_CERTS"],
@@ -981,7 +1032,7 @@ def test_managed_claudeai_policy_with_installation_transport_still_launches(
                 },
             },
             "managed-settings.d/10-retention.json": {"cleanupPeriodDays": 30},
-            "managed-settings.d/20-overrides.json": {"modelOverrides": {}},
+            "managed-settings.d/20-overrides.json": {"modelOverrides": {}, "deniedModels": []},
             "managed-settings.d/.hidden.json": _GATEWAY_POLICY,
             "managed-settings.d/notes.txt": '{"forceLoginMethod": "gateway"}',
         },

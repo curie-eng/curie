@@ -37,7 +37,7 @@ settings refusals in ``test_personal_claude_auth.py`` instead.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -52,9 +52,11 @@ from personal_auth_support import (
     REVIEWER_MODEL,
     SERVICE_API_KEY,
     SERVICE_OAUTH,
+    ErrorReply,
     Installation,
     RecordedRequest,
     Reply,
+    Responder,
     TextReply,
     ToolCall,
     assert_cli_never_started,
@@ -171,10 +173,16 @@ def _review_turn(
     *,
     reviewer_model: str,
     explicit_env: Mapping[str, str] | None = None,
+    respond: Callable[[_ReviewScript], Responder] | None = None,
 ) -> tuple[_ReviewScript, dict[str, list[RecordedRequest]]]:
-    """One implementer turn that calls both roles; the model requests by role."""
+    """One implementer turn that calls both roles; the model requests by role.
+
+    ``respond`` wraps the review script when a case changes some answers.
+    """
 
     bundle, script = _review_bundle(install)
+    if respond is not None:
+        install.proxy.responder = respond(script)
     outcome = run_turn(
         wire_session(
             install,
@@ -409,8 +417,9 @@ def test_workspace_settings_without_a_rerouting_key_still_run_both_reviewers(
 def test_a_managed_allowlist_naming_both_models_keeps_both_roles_on_the_reviewer(
     install: Installation, monkeypatch: pytest.MonkeyPatch, managed_dir: Path
 ) -> None:
-    # Liveness for the managed ``availableModels`` and ``modelOverrides``
-    # refusals in test_personal_claude_auth.py (an empty mapping is allowed).
+    # Liveness for the managed ``availableModels``, ``modelOverrides`` and
+    # ``deniedModels`` refusals in test_personal_claude_auth.py (an empty
+    # mapping and an empty deny list are allowed).
     # The pinned CLI reads managed policy only at /etc/claude-code, so this
     # proves the guard's decision offline; the CLI-side effect of an allowlist
     # or a mapping is the workspace control above.
@@ -420,6 +429,7 @@ def test_a_managed_allowlist_naming_both_models_keeps_both_roles_on_the_reviewer
         {
             "availableModels": [IMPLEMENTER_MODEL, REVIEWER_MODEL, FORCED_SUBAGENT_MODEL],
             "modelOverrides": {},
+            "deniedModels": [],
         },
     )
 
@@ -430,3 +440,73 @@ def test_a_managed_allowlist_naming_both_models_keeps_both_roles_on_the_reviewer
         **{role: {REVIEWER_MODEL} for role in _ROLES},
     }
     assert_owner_grant_only(install.proxy)
+
+
+# --- workspace fallbackModel ------------------------------------------------------------
+#
+# The CLI's settings schema (CLI 2.1.301 binary): ``fallbackModel`` is "Fallback
+# model(s) tried in order when the primary model is overloaded or unavailable",
+# and subagents inherit it. Observed on CLI 2.1.301 with these role files: a
+# reviewer request answered 404 ``not_found_error`` is retried once on the
+# fallback model; one answered 529 ``overloaded_error`` is retried on the
+# reviewer model until three have failed, then sent on the fallback model.
+
+_FALLBACK_ERRORS = {
+    "model-not-found": ErrorReply(404, "not_found_error", f"model: {REVIEWER_MODEL}"),
+    "overloaded": ErrorReply(529, "overloaded_error", "Overloaded"),
+}
+_FALLBACK_SETTINGS = {
+    "project": {"settings.json": {"fallbackModel": [FORCED_SUBAGENT_MODEL]}},
+    "local": {"settings.local.json": {"fallbackModel": [FORCED_SUBAGENT_MODEL]}},
+}
+
+
+def _fail_reviewer_model(error: ErrorReply) -> Callable[[_ReviewScript], Responder]:
+    """Every reviewer-role request on the configured reviewer model gets ``error``."""
+
+    def wrap(script: _ReviewScript) -> Responder:
+        def respond(request: RecordedRequest) -> Reply:
+            if script.role_of(request) in _ROLES and request.model == REVIEWER_MODEL:
+                return error
+            return script(request)
+
+        return respond
+
+    return wrap
+
+
+@requires_cli
+@pytest.mark.parametrize("error", list(_FALLBACK_ERRORS))
+def test_a_workspace_fallback_model_takes_over_a_failed_reviewer_request_in_service_mode(
+    install: Installation, monkeypatch: pytest.MonkeyPatch, error: str
+) -> None:
+    # The positive control for the refusal below.
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", OWNER_GRANT)
+    _plant_workspace(install, _FALLBACK_SETTINGS["project"])
+
+    _, by_role = _review_turn(
+        install,
+        reviewer_model=REVIEWER_MODEL,
+        respond=_fail_reviewer_model(_FALLBACK_ERRORS[error]),
+    )
+
+    assert _role_models(by_role)["implementer"] == {IMPLEMENTER_MODEL}
+    for role in _ROLES:
+        *failed, answered = [request.model for request in by_role[role]]
+        assert failed and set(failed) == {REVIEWER_MODEL}, f"{role} sent {failed}"
+        assert answered == FORCED_SUBAGENT_MODEL, f"{role} fell back to {answered}"
+
+
+@pytest.mark.parametrize("settings", list(_FALLBACK_SETTINGS))
+def test_a_workspace_fallback_model_is_refused_before_the_cli_starts(
+    install: Installation, monkeypatch: pytest.MonkeyPatch, settings: str
+) -> None:
+    _personal(monkeypatch)
+    _plant_workspace(install, _FALLBACK_SETTINGS[settings])
+    bundle, _ = _review_bundle(install)
+    wiring = wire_session(install, reviewer_model=REVIEWER_MODEL, plugin_dir=bundle, max_turns=8)
+
+    with pytest.raises(PersonalLaunchRefusedError):
+        connect_session(wiring)
+
+    assert_cli_never_started(install.proxy)

@@ -348,7 +348,20 @@ class ToolCall:
     call_id: str
 
 
-Reply = TextReply | ToolCall
+@dataclass(frozen=True)
+class ErrorReply:
+    """A Messages API error answer: an HTTP status with the documented error body.
+
+    Shape per https://platform.claude.com/docs/en/api/errors (``{"type":
+    "error", "error": {"type": ..., "message": ...}}``).
+    """
+
+    status: int
+    error_type: str
+    message: str = "stand-in"
+
+
+Reply = TextReply | ToolCall | ErrorReply
 Responder = Callable[[RecordedRequest], Reply]
 
 
@@ -360,7 +373,9 @@ def _sse(event: str, data: Mapping[str, Any]) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
 
 
-def messages_stream(request: RecordedRequest, reply: Reply, message_id: str) -> bytes:
+def messages_stream(
+    request: RecordedRequest, reply: TextReply | ToolCall, message_id: str
+) -> bytes:
     """A Messages streaming answer, the shape ``test_harness_skills_real_cli`` uses."""
 
     message: dict[str, Any] = {
@@ -574,11 +589,23 @@ class InterceptingProxy:
                 method, path, headers = await self._read_head(reader)
             raw_body = await self._read_body(reader, headers)
             request = self._record(host, method, path, headers, raw_body)
-            if request.is_messages:
+            reply = self.responder(request) if request.is_messages else None
+            if isinstance(reply, ErrorReply):
+                payload = json.dumps(
+                    {
+                        "type": "error",
+                        "error": {"type": reply.error_type, "message": reply.message},
+                    }
+                ).encode()
+                head = (
+                    b"HTTP/1.1 %d Stand-in Error\r\ncontent-type: application/json\r\n"
+                    b"content-length: %d\r\n\r\n" % (reply.status, len(payload))
+                )
+            elif reply is not None:
                 with self._lock:
                     self._messages_answered += 1
                     message_id = f"msg_stand_in_{self._messages_answered}"
-                payload = messages_stream(request, self.responder(request), message_id)
+                payload = messages_stream(request, reply, message_id)
                 head = (
                     b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
                     b"content-length: %d\r\n\r\n" % len(payload)
