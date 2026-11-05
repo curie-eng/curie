@@ -450,6 +450,16 @@ async def admit_notice(
             result = await workitem_dispatch.admit_revision(admission, facts)
         else:
             result = await workitem_dispatch.readmit(admission, facts)
+        if existing is None and isinstance(result, WorkItemOutcome):
+            from .factory_base_reconcile import initialize_base_selection
+
+            await initialize_base_selection(
+                admission,
+                item_id=result.work_item.id,
+                labels=verified.labels,
+                default_branch=verified.default_branch,
+                settings=settings,
+            )
         outcome = admission_result(result, facts.request_id)
     # A label refusal can stand only where several labels are served, so a
     # single-label repository pays no read for it.
