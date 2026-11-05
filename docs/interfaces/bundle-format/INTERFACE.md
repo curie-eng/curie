@@ -128,6 +128,23 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   connector cannot declare it (`connectors.remote_has_resources`). Neither field touches the caller
   proxy container's probe or resources, and with both omitted the rendered Deployment is unchanged.
   A consumer built before these fields refuses a bundle that sets either one as an unknown key.
+  A hosted connector may declare `scratch`, with a required `path` and a required `size_limit`,
+  for a server that must stage data on disk (for example a large upload it spools before streaming
+  it upstream). The pod gains one disk-backed `emptyDir` volume named `scratch` with that
+  `sizeLimit`, and the server container alone mounts it read-write at `path`; the root filesystem
+  stays read-only, the caller proxy container mounts nothing new, and `fsGroup` is unchanged. The
+  `path` is absolute, holds only letters, digits, `.`, `_`, `-` and `/`, has no empty, `.` or `..`
+  segment, is not `/`, and is not at or under `/bin`, `/boot`, `/dev`, `/etc`, `/lib`, `/lib64`,
+  `/proc`, `/run`, `/sbin`, `/sys` or `/usr` (`connectors.bad_scratch_path`). It is not equal to,
+  above or below any `secret_files` mount path (`connectors.scratch_overlaps_secret_file`). The
+  `size_limit` is a whole number of bytes with an optional `Ki`, `Mi` or `Gi` suffix, from 1Mi to
+  64Gi inclusive (`connectors.bad_scratch_size`), and
+  [`tests/vectors/connector-scratch-size.json`](../../../tests/vectors/connector-scratch-size.json)
+  is the shared reading of that grammar. A `url` connector cannot declare it
+  (`connectors.remote_has_scratch`). On the local docker tier the connector container instead gets
+  a tmpfs of `size_limit` bytes at `path` with mode `1777`. Omitted, the rendered Deployment and
+  the local container are unchanged, and a consumer built before the field refuses a bundle that
+  sets it as an unknown key.
   A hosted connector may declare `routes`, the non-MCP HTTP routes its bundle's own stdio
   servers call through the caller proxy (ADR 0240). Each entry has a `path`, matched exactly, that
   starts with `/`, holds only letters, digits, `.`, `_`, `~`, `-` and `/`, has no empty, `.` or `..`
