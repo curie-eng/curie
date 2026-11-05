@@ -490,22 +490,24 @@ CLI starts:
    login, a signed-in gateway session, user settings with `apiKeyHelper` and
    named profiles are excluded.
 5. Workspace `.claude/settings.json` or `.claude/settings.local.json` that sets a
-   credential helper, a forced login, `modelOverrides`, `availableModels`, any
-   `CLAUDE_*` or `ANTHROPIC_*` `env` name (no keep-list, since the workspace is
-   agent writable), or a competing or transport `env` key refuses the launch
-   (`PersonalLaunchRefusedError`). Env names are compared case-insensitively.
+   credential helper, a forced login, `modelOverrides`, `availableModels`,
+   `fallbackModel`, any `CLAUDE_*` or `ANTHROPIC_*` `env` name (no keep-list,
+   since the workspace is agent writable), or a competing or transport `env`
+   key refuses the launch (`PersonalLaunchRefusedError`). Env names are
+   compared case-insensitively.
 6. Managed policy under `/etc/claude-code` (`managed-settings.json`, then
    `managed-settings.d/*.json`) that forces gateway login, names a credential
-   helper or `policyHelper`, puts a competing variable, any `ANTHROPIC_*` name
-   or an unlisted `CLAUDE_*` name in `env`, or cannot be read or parsed refuses
-   the launch. Keep-list `CLAUDE_*` names and transport are allowed. A managed
+   helper, `policyHelper` or `policyHelpers`, puts a competing variable, any
+   `ANTHROPIC_*` name or an unlisted `CLAUDE_*` name in `env`, or cannot be
+   read or parsed refuses the launch. Keep-list `CLAUDE_*` names and transport are allowed. A managed
    `availableModels` must be a list of strings that names both the implementer
    model (the session `model`) and the reviewer model; otherwise, or when the
    session has no explicit implementer model, the launch is refused, because
    the CLI would silently move a role outside the list onto the parent model.
-   A managed `modelOverrides` must be absent or an empty object, since the CLI
-   applies any mapping to the outgoing request model after the guard. The
-   runner never edits or bypasses it. The pinned CLI 2.1.301 does
+   Managed `modelOverrides` and `deniedModels` must be absent or empty and
+   `fallbackModel` absent, since the CLI applies each after the guard and any
+   of them can move a role off its configured model. The runner never edits or
+   bypasses it. The pinned CLI 2.1.301 does
    not read `CLAUDE_CODE_MANAGED_SETTINGS_PATH`, so step 3 removes it and the
    guard reads only `/etc/claude-code`.
 

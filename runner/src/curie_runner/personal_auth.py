@@ -31,11 +31,12 @@ and CLI OAuth switches are removed and everything else, transport included, is
 kept.
 
 Workspace settings are agent writable, so their ``env`` may set no namespace
-name at all and no transport key, and they may not set ``availableModels``.
-Managed policy ``env`` may set the kept ``CLAUDE_*`` names and names outside
-the namespaces that do not compete, a managed ``availableModels`` must list
-both the implementer and the reviewer model, and a managed ``modelOverrides``
-must be absent or empty.
+name at all and no transport key, and they may not set ``availableModels`` or
+``fallbackModel``. Managed policy ``env`` may set the kept ``CLAUDE_*`` names
+and names outside the namespaces that do not compete, a managed
+``availableModels`` must list both the implementer and the reviewer model,
+managed ``modelOverrides`` and ``deniedModels`` must be absent or empty, and
+managed ``fallbackModel`` and ``policyHelpers`` must be absent.
 
 Error messages name variables, settings keys and files. They never carry a
 credential value.
@@ -228,18 +229,27 @@ _CREDENTIAL_HELPER_KEYS = frozenset(
     {"apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "gcpAuthRefresh"}
 )
 # A workspace availableModels that leaves a role's model out makes the role
-# inherit the implementer's model. Managed availableModels is mandatory policy,
-# checked against both role models in inspect_managed_policy.
+# inherit the implementer's model, and fallbackModel takes over a role's failed
+# request. Managed model keys are mandatory policy, checked against both role
+# models in inspect_managed_policy.
 _WORKSPACE_REFUSED_KEYS = _CREDENTIAL_HELPER_KEYS | {
     "availableModels",
+    "fallbackModel",
     "forceLoginMethod",
     "forceLoginGatewayUrl",
     "forceLoginOrgUUID",
     "gatewayInternalNetworks",
     "modelOverrides",
 }
-# policyHelper computes policy at launch, so it cannot be classified here.
-_MANAGED_REFUSED_KEYS = _CREDENTIAL_HELPER_KEYS | {"forceLoginGatewayUrl", "policyHelper"}
+# policyHelper computes policy at launch and policyHelpers installs a helper's
+# payload as managed settings after this guard, so neither can be classified.
+_MANAGED_REFUSED_KEYS = _CREDENTIAL_HELPER_KEYS | {
+    "forceLoginGatewayUrl",
+    "policyHelper",
+    "policyHelpers",
+}
+# Managed model routing keys allowed only absent or equal to this empty value.
+_MANAGED_EMPTY_ONLY_KEYS: dict[str, object] = {"modelOverrides": {}, "deniedModels": []}
 # Workspace settings are agent writable, so their transport keys are not
 # installation-controlled. Compared case-insensitively.
 _WORKSPACE_TRANSPORT_KEYS = frozenset(
@@ -339,7 +349,8 @@ def inspect_workspace_settings(cwd: str | os.PathLike[str]) -> None:
             raise _refused(
                 "workspace settings",
                 path,
-                f"sets {', '.join(found)}, which would compete with the owner grant",
+                f"sets {', '.join(found)}, which would compete with the owner grant or "
+                f"move a role off its configured model",
             )
 
 
@@ -390,14 +401,15 @@ def inspect_managed_policy(*, implementer_model: str | None, reviewer_model: str
     """Refuse when mandatory managed policy forces or adds a competing source.
 
     The runner never edits, hides or bypasses managed policy. Policy that forces
-    gateway login, names a credential helper or ``policyHelper``, or puts a
-    competing variable, any ``ANTHROPIC_*`` name or an unlisted ``CLAUDE_*``
-    name in ``env`` is refused, as is a present file that cannot be read or
-    parsed. Managed proxy and CA variables are installation transport and are
-    allowed. A managed ``availableModels`` is allowed only as a list of strings
-    naming both ``implementer_model`` (the session ``model``) and
-    ``reviewer_model`` (the configured ``ANTHROPIC_DEFAULT_OPUS_MODEL``), and a
-    managed ``modelOverrides`` only when absent or an empty object.
+    gateway login, names a credential helper, ``policyHelper`` or
+    ``policyHelpers``, or puts a competing variable, any ``ANTHROPIC_*`` name
+    or an unlisted ``CLAUDE_*`` name in ``env`` is refused, as is a present file
+    that cannot be read or parsed. Managed proxy and CA variables are
+    installation transport and are allowed. A managed ``availableModels`` is
+    allowed only as a list of strings naming both ``implementer_model`` (the
+    session ``model``) and ``reviewer_model`` (the configured
+    ``ANTHROPIC_DEFAULT_OPUS_MODEL``), ``modelOverrides`` and ``deniedModels``
+    only when absent or empty, and ``fallbackModel`` only when absent.
     """
 
     for path in _managed_files(MANAGED_SETTINGS_DIR):
@@ -428,16 +440,27 @@ def inspect_managed_policy(*, implementer_model: str | None, reviewer_model: str
                     f"sets availableModels {gap}, so a role would run on another model; "
                     f"managed policy is not bypassed",
                 )
-        # The pinned CLI 2.1.301 model resolver reads policy availableModels and
-        # modelOverrides and applies the mapping to the outgoing request model,
-        # after this guard, so any mapping can move a role off its configured
-        # model. Fail closed rather than reproduce the CLI's alias matching.
-        if settings.get("modelOverrides", {}) != {}:
+        # The pinned CLI 2.1.301 applies these after this guard, and each can move
+        # a role off its configured model: modelOverrides rewrites the outgoing
+        # request model (its resolver reads policy availableModels and
+        # modelOverrides), a role whose model deniedModels blocks inherits the
+        # implementer model, and a fallback-eligible error such as model not
+        # found or overloaded moves a role onto fallbackModel. Fail closed
+        # rather than reproduce the CLI's alias matching.
+        rerouting = [
+            key
+            for key, empty in _MANAGED_EMPTY_ONLY_KEYS.items()
+            if settings.get(key, empty) != empty
+        ]
+        if "fallbackModel" in settings:
+            rerouting.append("fallbackModel")
+        if rerouting:
             raise _refused(
                 "managed settings",
                 path,
-                "sets modelOverrides to something other than an empty object, so a role "
-                "would run on another model; managed policy is not bypassed",
+                f"sets {', '.join(rerouting)}, so a role would run on another model "
+                f"(modelOverrides and deniedModels must be absent or empty, fallbackModel "
+                f"absent); managed policy is not bypassed",
             )
 
 
