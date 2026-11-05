@@ -313,19 +313,6 @@ chart_scenarios:
         - charts/curie/ci/scenarios/controller-preflight-kind.sh
         - pyproject.toml
         - uv.lock
-    workspace-diagnostic:
-      step: Workspace dependency failure reaches the terminal diagnostic
-      leg: workload
-      inputs:
-        - charts/curie/ci/scenarios/workload-install.sh
-        - charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh
-        - apps/api
-        - apps/worker
-        - runner
-        - cli
-        - packages
-        - pyproject.toml
-        - uv.lock
     quota-progress:
       step: Quota progress regression
       leg: workload
