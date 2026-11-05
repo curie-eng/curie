@@ -783,7 +783,10 @@ class ClaudeAgentSession:
         # An explicit value, including an empty one, fences the inherited grant.
         grant = require_owner_grant({**snapshot, **options_env})
         inspect_workspace_settings(self._options.cwd or os.getcwd())
-        inspect_managed_policy()
+        inspect_managed_policy(
+            implementer_model=self._options.model,
+            reviewer_model=options_env.get(_SDK_REVIEWER_MODEL_ENV),
+        )
         removed = platform_credential_names(snapshot) | platform_credential_names(
             {**snapshot, **options_env}
         )

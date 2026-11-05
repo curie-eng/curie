@@ -33,8 +33,8 @@ kept.
 Workspace settings are agent writable, so their ``env`` may set no namespace
 name at all and no transport key, and they may not set ``availableModels``.
 Managed policy ``env`` may set the kept ``CLAUDE_*`` names and names outside
-the namespaces that do not compete, and a managed ``availableModels`` is
-respected.
+the namespaces that do not compete, and a managed ``availableModels`` must list
+both the implementer and the reviewer model.
 
 Error messages name variables, settings keys and files. They never carry a
 credential value.
@@ -227,7 +227,8 @@ _CREDENTIAL_HELPER_KEYS = frozenset(
     {"apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "gcpAuthRefresh"}
 )
 # A workspace availableModels that leaves a role's model out makes the role
-# inherit the implementer's model. Managed availableModels is mandatory policy.
+# inherit the implementer's model. Managed availableModels is mandatory policy,
+# checked against both role models in inspect_managed_policy.
 _WORKSPACE_REFUSED_KEYS = _CREDENTIAL_HELPER_KEYS | {
     "availableModels",
     "forceLoginMethod",
@@ -363,7 +364,28 @@ def _managed_files(root: Path) -> list[Path]:
     ]
 
 
-def inspect_managed_policy() -> None:
+def _model_allowlist_gap(
+    allowed: object, *, implementer_model: str | None, reviewer_model: str | None
+) -> str | None:
+    """Why a managed ``availableModels`` cannot keep both roles on their models, or None.
+
+    CLI 2.1.301 makes a role whose model is outside ``availableModels`` inherit
+    the parent model. Managed policy is never bypassed, so a list that does not
+    literally name both configured models is refused rather than silently
+    changing the reviewer. Model IDs are not secrets and may be named.
+    """
+
+    if not isinstance(allowed, list) or not all(isinstance(model, str) for model in allowed):
+        return "that is not a list of model ID strings"
+    roles = {"implementer": implementer_model, "reviewer": reviewer_model}
+    unset = [role for role, model in roles.items() if not model]
+    if unset:
+        return f"but the session has no explicit {' or '.join(unset)} model to check it against"
+    missing = [f"the {role} model {model}" for role, model in roles.items() if model not in allowed]
+    return f"without {' and '.join(missing)}" if missing else None
+
+
+def inspect_managed_policy(*, implementer_model: str | None, reviewer_model: str | None) -> None:
     """Refuse when mandatory managed policy forces or adds a competing source.
 
     The runner never edits, hides or bypasses managed policy. Policy that forces
@@ -371,7 +393,9 @@ def inspect_managed_policy() -> None:
     competing variable, any ``ANTHROPIC_*`` name or an unlisted ``CLAUDE_*``
     name in ``env`` is refused, as is a present file that cannot be read or
     parsed. Managed proxy and CA variables are installation transport and are
-    allowed, as is a managed ``availableModels``.
+    allowed. A managed ``availableModels`` is allowed only as a list of strings
+    naming both ``implementer_model`` (the session ``model``) and
+    ``reviewer_model`` (the configured ``ANTHROPIC_DEFAULT_OPUS_MODEL``).
     """
 
     for path in _managed_files(MANAGED_SETTINGS_DIR):
@@ -389,6 +413,19 @@ def inspect_managed_policy() -> None:
                 f"sets {', '.join(found)}, which force or add a credential source other "
                 f"than the owner grant; managed policy is not bypassed",
             )
+        if "availableModels" in settings:
+            gap = _model_allowlist_gap(
+                settings["availableModels"],
+                implementer_model=implementer_model,
+                reviewer_model=reviewer_model,
+            )
+            if gap is not None:
+                raise _refused(
+                    "managed settings",
+                    path,
+                    f"sets availableModels {gap}, so a role would run on another model; "
+                    f"managed policy is not bypassed",
+                )
 
 
 # --- the CLI parent env --------------------------------------------------------------

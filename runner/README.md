@@ -498,8 +498,12 @@ CLI starts:
    `managed-settings.d/*.json`) that forces gateway login, names a credential
    helper or `policyHelper`, puts a competing variable, any `ANTHROPIC_*` name
    or an unlisted `CLAUDE_*` name in `env`, or cannot be read or parsed refuses
-   the launch. Keep-list `CLAUDE_*` names, transport and `availableModels` are
-   allowed. The runner never edits or bypasses it. The pinned CLI 2.1.301 does
+   the launch. Keep-list `CLAUDE_*` names and transport are allowed. A managed
+   `availableModels` must be a list of strings that names both the implementer
+   model (the session `model`) and the reviewer model; otherwise, or when the
+   session has no explicit implementer model, the launch is refused, because
+   the CLI would silently move a role outside the list onto the parent model.
+   The runner never edits or bypasses it. The pinned CLI 2.1.301 does
    not read `CLAUDE_CODE_MANAGED_SETTINGS_PATH`, so step 3 removes it and the
    guard reads only `/etc/claude-code`.
 
