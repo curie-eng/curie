@@ -6397,7 +6397,10 @@ def test_platform_runner_upgrade_stages_candidate_artifacts_before_own_lifecycle
         "bash", "tools/runtime-assertion-gate/run.sh",
         "charts/curie/ci/runtime/platform-runner-upgrade-runtime.sh",
     ]
-    assert scenario["env"]["CURIE_SCENARIO_RUNNER_IMAGE"] == "curie-runner:chart-runtime-${{ github.sha }}"
+    assert (
+        scenario["env"]["CURIE_SCENARIO_RUNNER_IMAGE"]
+        == "curie-runner:chart-runtime-${{ github.sha }}"
+    )
     assert positions["Stage the candidate chart runtime images in kind"] < positions[name]
     assert positions[name] < positions["Install the shared workload platform"]
     for staging in (
