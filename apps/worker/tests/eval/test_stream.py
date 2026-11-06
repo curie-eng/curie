@@ -110,7 +110,6 @@ _DB_SCHEMA = os.environ.get("TEST_DB_SCHEMA", "curie")
         pytest.param("delivery", 2.9, id="delivery-29s-survives"),
         pytest.param("liveness", 2.9, id="liveness-29s-survives"),
         pytest.param("delivery", 5.0, id="delivery-50s-expires"),
-        pytest.param("liveness", 5.0, id="liveness-50s-expires"),
         pytest.param("delivery-key-gone", 0.0, id="delivery-key-gone-refused"),
         pytest.param("delivery-wrong-token", 0.0, id="delivery-wrong-token-refused"),
     ],

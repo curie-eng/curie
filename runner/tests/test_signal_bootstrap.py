@@ -43,6 +43,11 @@ def _wire_process_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
         # A real token, not the dev flag: this drives production boot (#3821).
         runner_token="runner-test-token",
         allow_tokenless=False,
+        # _serve reads the workspace snapshotter's trusted origin off every
+        # RunnerConfig (config.py); mirror the fields so the stub keeps the
+        # production boot contract's shape.
+        repo_origin=None,
+        repo_path=None,
     )
     monkeypatch.setenv("CURIE_FAKE_MODEL", "1")
     monkeypatch.setattr(RunnerConfig, "from_env", lambda _env: config)

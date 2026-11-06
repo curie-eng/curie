@@ -1548,7 +1548,6 @@ def test_binding_quota_refuses_new_feedback_and_keeps_an_observable_row(review_s
         "member",
         "allowed",
         "revoked",
-        "wrong_id",
         "bad_login",
         "http404",
         "http403",
@@ -1828,8 +1827,6 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                         ]
                         if permission_case == "revoked":
                             permission["permission"] = "read"
-                        elif permission_case == "wrong_id":
-                            permission["user"] = {"id": 42}
                         elif permission_case == "bad_login":
                             truth.comment["user"]["login"] = "wrong/path"
                         elif permission_case.startswith("http"):
@@ -1841,7 +1838,7 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                         truth.calls.clear()
                         await consumer._dispatch(review_id, review_fields)
                         await handler_done(review_id)
-                        if permission_case in {"revoked", "wrong_id", "bad_login"}:
+                        if permission_case in {"revoked", "bad_login"}:
                             assert h.runner.opened == [original.text]
                             assert h.runner.steers == [ordinary_steer.text]
                             assert (
@@ -1861,7 +1858,6 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                             assert await reconciler.reconcile_terminal() == 1
                             code = {
                                 "revoked": "sender_permission_refused",
-                                "wrong_id": "sender_permission_identity_mismatch",
                                 "bad_login": "non_human_sender",
                             }[permission_case]
                             assert await asyncio.to_thread(

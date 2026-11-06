@@ -157,6 +157,20 @@ async def _closing_reference(
         raise unavailable from None
     try:
         reference: str = await tracker.closing_reference(item.tracker_issue, item.repository)
+    except NotFound:
+        locked = await lifecycle.lock_work_item(session, item.id)
+        if locked is not None:
+            await lifecycle.request_cancellation(
+                session,
+                work_item_id=locked.id,
+                expected_work_item_version=locked.version,
+                cause="issue_deleted",
+            )
+            await session.commit()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"code": "publication.issue_deleted", "message": "the tracker issue no longer exists"},
+        ) from None
     except ForgeError:
         raise unavailable from None
     return reference, item.tracker_issue

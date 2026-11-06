@@ -115,6 +115,7 @@ def _cause(
     if state == "cancellation_requested":
         reasons = {
             "issue_cancelled": "the issue was cancelled (label removed or issue closed)",
+            "issue_deleted": "the tracker issue no longer exists",
             "execution_deadline": (
                 f"the {_deadline_seconds(req)} s execution deadline elapsed"
             ),
@@ -151,6 +152,8 @@ def _cause(
     if state == "cancelled":
         if cause == "lineage_closed":
             text = "cancelled: the pull request closed before this revision could start"
+        elif cause == "issue_deleted":
+            text = "cancelled: the tracker issue no longer exists"
         else:
             text = "cancelled: the issue label was removed or the issue was closed"
         if lineage is not None and lineage.pr_number is not None:

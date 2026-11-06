@@ -908,6 +908,14 @@ def test_release_generator_keeps_collector_config_and_storage_in_lockstep():
     assert volume_name in (release.get("volumes") or {}), (
         f"generated compose.release.yaml: storage volume {volume_name!r} is not declared"
     )
+    perms = release["services"]["otel-collector-perms"]
+    assert "otel_collector_perms_data:/data" in (perms.get("volumes") or []), (
+        "generated compose.release.yaml: otel-collector-perms /data must be "
+        "the named volume otel_collector_perms_data"
+    )
+    assert "otel_collector_perms_data" in (release.get("volumes") or {}), (
+        "generated compose.release.yaml: volume otel_collector_perms_data is not declared"
+    )
 
 
 def test_collector_0_119_self_metric_names_remain_pinned():

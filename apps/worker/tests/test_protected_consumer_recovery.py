@@ -166,7 +166,9 @@ def test_actual_consumer_capacity_terminal_schedule_and_reply_ref(
                             original.turn.event_id, record.generation
                         )
                         assert notice_token is not None
-                        ack = await runtime.kernel._kernel.notify_capacity_queued(original.turn)
+                        ack = await runtime.kernel._kernel.notify_capacity_queued(
+                            original.turn, wait_reply_ref=None
+                        )
                         assert ack.ref == "message/queued-example"
                         await wait.finish_notice(
                             original.turn.event_id,

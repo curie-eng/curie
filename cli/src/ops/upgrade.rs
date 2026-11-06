@@ -766,12 +766,12 @@ fn plan_lines(
 
 /// The runner reference the upgraded release will render (#3218): the
 /// retained overlay's `agentSandbox.runner` fields over the target chart's
-/// defaults, with an empty tag meaning the target chart's appVersion, which
-/// the release train holds equal to `--to`. `None` when no image is known.
+/// defaults, with an empty tag meaning the target chart's appVersion.
+/// `None` when no image is known.
 pub(crate) fn target_runner_ref(
     chart_default: Option<&serde_json::Value>,
     overlay: &serde_json::Value,
-    to: &str,
+    app_version: Option<&str>,
 ) -> Option<String> {
     let mut runner = serde_json::Map::new();
     for source in [chart_default, Some(overlay)].into_iter().flatten() {
@@ -789,7 +789,7 @@ pub(crate) fn target_runner_ref(
         }
     }
     let values = serde_json::json!({"agentSandbox": {"runner": runner}});
-    crate::cluster_secrets::effective_runner_ref(&values, Some(to))
+    crate::cluster_secrets::effective_runner_ref(&values, app_version)
 }
 
 /// Retained repository declarations, with the indices used to replace only
@@ -1690,13 +1690,15 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
                 && !line.starts_with("phase migrate:")
                 && !line.starts_with(REPOSITORY_RUNNER_REBUILD_PREFIX)
         });
-        plan.insert(
-            2,
-            format!(
-                "phases drain_preflight, checkpoint, migrate, apply skipped: {} is already installed and known-good, so no helm upgrade runs; converge, canary and commit re-verify it",
-                opts.to
-            ),
-        );
+        if host.validate_refusal().is_none() {
+            plan.insert(
+                2,
+                format!(
+                    "phases drain_preflight, checkpoint, migrate, apply skipped: {} is already installed and known-good, so no helm upgrade runs; converge, canary and commit re-verify it",
+                    opts.to
+                ),
+            );
+        }
     }
     // Recovery still runs when the serving version is already known good.
     // Insert it after filtering the lifecycle's same-version skipped commands.
@@ -2138,6 +2140,69 @@ fn create_lost_race(stderr: &str) -> bool {
         || reason.contains("object has been modified")
 }
 
+fn manifest_images(manifest: &str, default_namespace: &str) -> Result<BTreeMap<String, String>> {
+    fn collect_container_images(
+        value: &serde_json::Value,
+        path: &str,
+        images: &mut BTreeMap<String, String>,
+    ) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                for (key, value) in fields {
+                    if matches!(key.as_str(), "containers" | "initContainers") {
+                        for container in value.as_array().into_iter().flatten() {
+                            if let (Some(name), Some(image)) =
+                                (container["name"].as_str(), container["image"].as_str())
+                            {
+                                images.insert(format!("{path}/{key}/{name}"), image.to_owned());
+                            }
+                        }
+                    } else {
+                        collect_container_images(value, &format!("{path}/{key}"), images);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    collect_container_images(item, &format!("{path}/{index}"), images);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut images = BTreeMap::new();
+    for document in serde_norway::Deserializer::from_str(manifest) {
+        let object =
+            serde_json::Value::deserialize(document).context("chart manifest is malformed")?;
+        if object
+            .pointer("/metadata/annotations/helm.sh~1hook")
+            .is_some()
+        {
+            continue;
+        }
+        let kind = object["kind"].as_str().unwrap_or("");
+        let name = object
+            .pointer("/metadata/name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let namespace = object
+            .pointer("/metadata/namespace")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(default_namespace);
+        if let Some(spec) = object.get("spec") {
+            collect_container_images(
+                spec,
+                &format!("{kind}/{namespace}/{name}/spec"),
+                &mut images,
+            );
+        }
+    }
+    if images.is_empty() {
+        bail!("cannot verify same-version chart image pins: manifest contains no container images");
+    }
+    Ok(images)
+}
+
 struct RepositoryRunnerBuild {
     binding_index: usize,
     repo_index: usize,
@@ -2166,6 +2231,8 @@ struct LiveHost {
     runner_layer_refusal: Option<String>,
     /// Why the chart cannot install `--to`, if it cannot (Ruling 2, R1).
     chart_refusal: Option<String>,
+    same_version_chart_refusal: Option<String>,
+    target_manifest: Option<String>,
     /// The redacted configuration schema plan lines (#2299, #4322).
     schema_plan: Vec<String>,
     /// Redacted schema compatibility decision (#2588).
@@ -2396,6 +2463,8 @@ impl LiveHost {
             config_refusal: None,
             runner_layer_refusal: None,
             chart_refusal: None,
+            same_version_chart_refusal: None,
+            target_manifest: None,
             schema_plan: Vec::new(),
             schema_decision: None,
             schema_refusal: None,
@@ -2845,23 +2914,18 @@ impl LiveHost {
         Ok(())
     }
 
-    /// The version an available local chart declares for itself.
-    fn declared_chart_version(&self, chart: &str) -> Result<Option<String>> {
-        let cmd = OpsCommand::new(
-            "helm",
-            vec![plain("show"), plain("chart"), plain(chart.to_string())],
-        );
-        let (ok, out, err) = self.run(&cmd)?;
+    fn target_chart_metadata(&self) -> Result<serde_json::Value> {
+        let chart = self.chart_ref();
+        let mut args = vec![plain("show"), plain("chart"), plain(chart)];
+        if self.opts.chart.uses_helm_version() {
+            args.push(plain("--version"));
+            args.push(plain(&self.opts.to));
+        }
+        let (ok, out, err) = self.run(&OpsCommand::new("helm", args))?;
         if !ok {
             bail!("could not read chart metadata for {chart}: {}", err.trim());
         }
-        let doc: serde_json::Value =
-            serde_norway::from_str(&out).context("chart metadata is malformed")?;
-        Ok(match doc.get("version") {
-            Some(serde_json::Value::String(version)) => Some(version.clone()),
-            Some(serde_json::Value::Number(version)) => Some(version.to_string()),
-            _ => None,
-        })
+        serde_norway::from_str(&out).context("chart metadata is malformed")
     }
 
     /// R1: the pre-mutation half of the target pin, for a local chart only.
@@ -2871,7 +2935,14 @@ impl LiveHost {
             return None;
         }
         let to = &self.opts.to;
-        match self.declared_chart_version(chart) {
+        let version = self
+            .target_chart_metadata()
+            .map(|doc| match doc.get("version") {
+                Some(serde_json::Value::String(version)) => Some(version.clone()),
+                Some(serde_json::Value::Number(version)) => Some(version.to_string()),
+                _ => None,
+            });
+        match version {
             Ok(Some(version)) if version == *to => None,
             Ok(Some(version)) => Some(format!(
                 "chart {chart} declares version {version}, so it cannot install the requested {to}; \
@@ -2972,15 +3043,29 @@ impl LiveHost {
         self.compute_repository_runners();
         if self.opts.chart.pending_release().is_none() {
             self.compute_schema_compat();
-            if self.current.is_some()
-                && self.chart_refusal.is_none()
+            if self.chart_refusal.is_none()
                 && self.config_refusal.is_none()
                 && self.schema_refusal.is_none()
             {
                 match self.render_target_helm_timeout(self.overlay.as_deref()) {
-                    Ok(seconds) => self.helm_timeout_seconds = seconds,
+                    Ok((seconds, manifest)) => {
+                        self.helm_timeout_seconds = seconds;
+                        self.target_manifest = Some(manifest);
+                    }
                     Err(error) => self.timeout_refusal = Some(format!("{error:#}")),
                 }
+            }
+            if self.current.as_deref() == Some(self.opts.to.as_str())
+                && self.known_good.as_deref() == Some(self.opts.to.as_str())
+                && self.chart_refusal.is_none()
+                && self.config_refusal.is_none()
+                && self.schema_refusal.is_none()
+                && self.timeout_refusal.is_none()
+            {
+                self.same_version_chart_refusal = self
+                    .check_same_version_images()
+                    .err()
+                    .map(|error| format!("{error:#}"));
             }
         }
     }
@@ -3030,7 +3115,21 @@ impl LiveHost {
         if has_repository_runners {
             self.chart_defaults = self.target_chart_values();
         }
-        let raw_target = target_runner_ref(self.chart_defaults.as_ref(), &overlay, &self.opts.to);
+        let app_version = if self.opts.chart.pending_release().is_none() {
+            self.target_chart_metadata().ok().and_then(|metadata| {
+                metadata
+                    .get("appVersion")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            })
+        } else {
+            None
+        };
+        let raw_target = target_runner_ref(
+            self.chart_defaults.as_ref(),
+            &overlay,
+            app_version.as_deref(),
+        );
         if self.opts.chart.pending_release().is_some() && raw_target.is_none() {
             let stock_agents: Vec<_> = bindings
                 .iter()
@@ -3344,7 +3443,87 @@ impl LiveHost {
         serde_norway::from_str(&out).ok()
     }
 
-    fn render_target_helm_timeout(&self, overlay: Option<&str>) -> Result<u64> {
+    fn render_target_helm_timeout(&self, overlay: Option<&str>) -> Result<(u64, String)> {
+        let manifest = self.render_target_manifest(overlay)?;
+        Ok((parse_target_helm_timeout(&manifest)?, manifest))
+    }
+
+    fn check_same_version_images(&self) -> Result<()> {
+        let requested = self
+            .target_manifest
+            .as_deref()
+            .context("requested chart was not rendered")?;
+        let args = vec![
+            plain("get"),
+            plain("manifest"),
+            plain(&self.opts.common.release),
+            plain("-n"),
+            plain(&self.opts.common.namespace),
+        ];
+        let (ok, installed, err) = self.run(&OpsCommand::new("helm", args))?;
+        if !ok {
+            bail!(
+                "cannot verify same-version chart image pins: {}",
+                crate::schema_window::redact_probe_text(err.trim())
+            );
+        }
+        let requested = manifest_images(requested, &self.opts.common.namespace)?;
+        let installed = manifest_images(&installed, &self.opts.common.namespace)?;
+        let keys: std::collections::BTreeSet<_> =
+            requested.keys().chain(installed.keys()).collect();
+        let differences: Vec<_> = keys
+            .into_iter()
+            .filter_map(|key| {
+                let wanted = requested.get(key);
+                let current = installed.get(key);
+                (wanted != current).then(|| {
+                    format!(
+                        "{key}: installed {}, requested {}",
+                        current.map(String::as_str).unwrap_or("<absent>"),
+                        wanted.map(String::as_str).unwrap_or("<absent>")
+                    )
+                })
+            })
+            .collect();
+        if !differences.is_empty() {
+            let shown = differences.len().min(3);
+            let preview = differences[..shown].join("\n");
+            let example_version = format!(
+                "{}-pins.1",
+                self.opts.to.split('+').next().unwrap_or_default()
+            );
+            let package = OpsCommand::new(
+                "helm",
+                vec![
+                    plain("package"),
+                    plain("<chart-directory>"),
+                    plain("--version"),
+                    plain(&example_version),
+                ],
+            )
+            .display();
+            let mut example = self.opts.clone();
+            example.to = example_version.clone();
+            example.chart = UpgradeChart::AvailableLocal(format!("./curie-{example_version}.tgz"));
+            let mut upgrade = fail_forward_for(&example, false, "").command;
+            if self.opts.file_values.is_some() {
+                upgrade.push_str(" --values-file '<values-file>'");
+            }
+            bail!(
+                "same-version upgrade to {} refused: the requested render (chart plus values) \
+                 differs from the installed release; differing containers: {} (showing {shown})\n\
+                 {preview}\n\
+                 Repackage the chart with a distinct chart version, for example a prerelease: \
+                 `{package}` then `{upgrade}` (keep the same --values-file inputs), or, if the \
+                 change comes from a values file, drop the image change from --values-file.",
+                self.opts.to,
+                differences.len()
+            );
+        }
+        Ok(())
+    }
+
+    fn render_target_manifest(&self, overlay: Option<&str>) -> Result<String> {
         let mut args = vec![
             plain("template"),
             plain(&self.opts.common.release),
@@ -3366,11 +3545,11 @@ impl LiveHost {
         let (ok, out, err) = self.run(&OpsCommand::new("helm", args))?;
         if !ok {
             bail!(
-                "could not render target Helm timeout metadata: {}",
+                "could not render requested chart and values: {}",
                 crate::schema_window::redact_probe_text(err.trim())
             );
         }
-        parse_target_helm_timeout(&out)
+        Ok(out)
     }
 
     fn compute_schema_compat(&mut self) {
@@ -4025,21 +4204,25 @@ impl LiveHost {
             );
         }
         let candidate = helm_values_document(&candidate)?;
-        let timeout = self.render_target_helm_timeout(Some(&candidate))?;
+        let (timeout, manifest) = self.render_target_helm_timeout(Some(&candidate))?;
         self.overlay = Some(candidate);
         self.helm_timeout_seconds = timeout;
+        self.target_manifest = Some(manifest);
         Ok(())
     }
 
-    /// R3: the integrated observer answers this, not a hand-rolled
-    /// `kubectl get deploy,sts,ds` read. `super::convergence` compares live
-    /// containers, generations, replicas, selectors and Helm hooks against
-    /// Helm's own retained target manifest; every sub-flag below is derived
-    /// from the facet that observation genuinely disproved.
+    /// Upgrade convergence uses the requested chart under the effective overlay.
+    /// Helm history still supplies revision identity and hook outcomes.
     fn live_convergence(&self) -> Result<ConvergenceVerdict> {
+        let requested = self
+            .target_manifest
+            .as_deref()
+            .context("requested chart was not rendered")?;
         let observation = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(super::convergence::wait_for_observation(&self.opts.common))
+            tokio::runtime::Handle::current().block_on(super::convergence::wait_for_observation(
+                &self.opts.common,
+                Some(requested),
+            ))
         });
         Ok(ConvergenceVerdict {
             convergence: convergence_from(&observation),
@@ -4090,7 +4273,7 @@ impl LiveHost {
             .iter()
             .any(|(_, _, repo)| repository_runner_dockerfile(&repo["runner"]).is_none());
         let needs_installed_names = !repository_runners.is_empty() && self.chart_defaults.is_none();
-        let issues = if expected.is_empty() && !has_catalog_runners {
+        let mut issues = if expected.is_empty() && !has_catalog_runners {
             Vec::new()
         } else {
             // #4321 and ADR 0216: agent layers and catalog repository
@@ -4120,6 +4303,16 @@ impl LiveHost {
                 )],
             }
         };
+        if let Err(error) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(super::runner_templates::verify(&self.opts.common))
+        }) {
+            issues.push(format!(
+                "could not confirm platform agent SandboxTemplates: {error:#}; \
+                 repair them with `curie cluster up --namespace {} --release {}`, then rerun the upgrade",
+                self.opts.common.namespace, self.opts.common.release
+            ));
+        }
         Ok(CanaryVerdict {
             canary: Canary {
                 passed: version_ok && issues.is_empty(),
@@ -4445,6 +4638,7 @@ impl UpgradeDriver for LiveHost {
         self.chart_refusal
             .clone()
             .or_else(|| self.config_refusal.clone())
+            .or_else(|| self.same_version_chart_refusal.clone())
             .or_else(|| self.runner_layer_refusal.clone())
             .or_else(|| self.repository_runner_refusal.clone())
             .or_else(|| self.timeout_refusal.clone())
@@ -4514,7 +4708,10 @@ impl UpgradeDriver for LiveHost {
     fn retire_runner_layer_claims(&mut self) -> Result<()> {
         let agents = self.runner_layers.retired_agents();
         if agents.is_empty() {
-            return Ok(());
+            return tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(super::runner_templates::reconcile(&self.opts.common))
+            });
         }
         let templates = self.read_sandbox_templates().ok();
         let fullname = self.release_fullname();
@@ -4570,7 +4767,10 @@ impl UpgradeDriver for LiveHost {
                 );
             }
         }
-        Ok(())
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(super::runner_templates::reconcile(&self.opts.common))
+        })
     }
     fn observe_convergence(&self) -> Result<ConvergenceVerdict> {
         self.live_convergence()
@@ -4952,7 +5152,7 @@ mod runner_layer_guard_tests {
         // The overlay only sets a digest; the image field must still come
         // from the chart default underneath it.
         let overlay = runner_values(serde_json::json!({"digest": "sha256:aaaa"}));
-        let reference = target_runner_ref(Some(&chart_default), &overlay, "0.9.0")
+        let reference = target_runner_ref(Some(&chart_default), &overlay, Some("0.9.0"))
             .expect("image known from chart default");
         assert_eq!(reference, "ghcr.io/curie-eng/curie-runner@sha256:aaaa");
     }
@@ -4965,20 +5165,21 @@ mod runner_layer_guard_tests {
             "digest": "sha256:aaaa",
         }));
         // An explicit null in the overlay clears the chart default's digest,
-        // so the tag (falling back to `to`) takes over.
+        // so the tag takes over.
         let overlay = runner_values(serde_json::json!({"digest": null}));
-        let reference = target_runner_ref(Some(&chart_default), &overlay, "0.9.9")
+        let reference = target_runner_ref(Some(&chart_default), &overlay, Some("0.9.9"))
             .expect("tag known from chart default");
         assert_eq!(reference, "ghcr.io/curie-eng/curie-runner:0.9.0");
     }
 
     #[test]
-    fn target_runner_ref_empty_tag_falls_back_to_to() {
+    fn target_runner_ref_empty_tag_uses_chart_app_version() {
         let overlay = runner_values(serde_json::json!({
             "image": "ghcr.io/curie-eng/curie-runner",
             "tag": "",
         }));
-        let reference = target_runner_ref(None, &overlay, "0.9.5").expect("to backs an empty tag");
+        let reference = target_runner_ref(None, &overlay, Some("0.9.5"))
+            .expect("chart appVersion backs an empty tag");
         assert_eq!(reference, "ghcr.io/curie-eng/curie-runner:0.9.5");
     }
 
@@ -4989,14 +5190,14 @@ mod runner_layer_guard_tests {
             "tag": "0.9.0",
             "digest": "sha256:bbbb",
         }));
-        let reference = target_runner_ref(None, &overlay, "0.9.0").expect("digest known");
+        let reference = target_runner_ref(None, &overlay, Some("0.9.0")).expect("digest known");
         assert_eq!(reference, "ghcr.io/curie-eng/curie-runner@sha256:bbbb");
     }
 
     #[test]
     fn target_runner_ref_none_when_no_image_known() {
         let overlay = serde_json::json!({});
-        assert_eq!(target_runner_ref(None, &overlay, "0.9.0"), None);
+        assert_eq!(target_runner_ref(None, &overlay, Some("0.9.0")), None);
     }
 
     const STOCK_OLD: &str = "ghcr.io/curie-eng/curie-dark-factory-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

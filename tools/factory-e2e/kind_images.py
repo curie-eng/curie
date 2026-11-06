@@ -25,6 +25,18 @@ def import_budget(command: Callable[..., str], images: Sequence[str]) -> int:
     return sum(sizes) + max(sizes) + RUNTIME_RESERVE_BYTES
 
 
+# A passing hosted run dropped about 3.3 GB of free disk while building the
+# runner layer. That drop fits inside the runtime reserve. Twice the runner
+# image covers the base image that stays on the daemon and a layer of the
+# same size, and the reserve stays on top of those bytes.
+def runner_layer_budget(command: Callable[..., str], image: str) -> int:
+    records = json.loads(command("docker", "image", "inspect", image, timeout=30))
+    sizes: list[int] = [record["Size"] for record in records]
+    if len(sizes) != 1 or type(sizes[0]) is not int or sizes[0] <= 0:
+        raise ValueError("runner image size is missing or invalid")
+    return 2 * sizes[0] + RUNTIME_RESERVE_BYTES
+
+
 def load_images(command: Callable[..., str], cluster: str, images: Sequence[str]) -> None:
     platform = command(
         "docker", "version", "--format", "{{.Server.Os}}/{{.Server.Arch}}", timeout=30

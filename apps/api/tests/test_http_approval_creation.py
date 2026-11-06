@@ -633,7 +633,8 @@ def test_resumed_turn_suspends_again_under_its_original_invoker(
 
 
 @pytest.mark.parametrize(
-    "variant", ["forged", "stale", "other_approval", "retagged", "altered_payload"],
+    "variant",
+    ["forged", "stale", "other_approval", "retagged", "altered_payload"],
 )
 def test_forged_stale_or_foreign_resume_cannot_suspend_again(
     creation_case: SimpleNamespace, variant: str,

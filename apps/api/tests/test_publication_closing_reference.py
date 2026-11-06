@@ -342,3 +342,51 @@ def test_the_python_ci_policy_is_the_jira_binding_s_not_another_binding_s(
         assert _factory_publication_body(answered.json()["id"]).endswith(
             f"Jira: {key} {jira_fake.SITE}/browse/{key}\n\n{_marker(request_id)}"
         )
+
+
+def test_deleted_jira_issue_names_the_issue_on_publication_create(
+    jira_case: tuple[TestClient, uuid.UUID, dict[str, Any], jira_fake.JiraFake, str],
+) -> None:
+    client, request_id, payload, fake, key = jira_case
+    [before] = _rows(
+        "SELECT w.cancelled_at FROM curie.work_items w JOIN curie.execution_requests r "
+        "ON r.work_item_id = w.id WHERE r.id = :id",
+        {"id": request_id},
+    )
+    assert before["cancelled_at"] is None
+    _passed(client, request_id)
+    fake.delete_issue(next(issue.id for issue in fake.issues.values() if issue.key == key))
+
+    refused = _post_factory_publication(client, payload)
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"] == {
+        "code": "publication.issue_deleted",
+        "message": "the tracker issue no longer exists",
+    }
+    assert (
+        _rows(
+            "SELECT id FROM curie.publications WHERE execution_request_id = :id", {"id": request_id}
+        )
+        == []
+    )
+    [cancelled] = _rows(
+        "SELECT status, terminal_cause FROM curie.execution_requests WHERE id = :id",
+        {"id": request_id},
+    )
+    assert cancelled == {"status": "cancellation_requested", "terminal_cause": "issue_deleted"}
+    finish = client.post(
+        f"/v1/internal/work-items/requests/{request_id}/finish",
+        headers={"X-Curie-Worker-Token": get_settings().internal_worker_token},
+        json={
+            "runtime_epoch": payload["work_item_runtime_epoch"],
+            "outcome": "failed",
+            "cause": "approval_create_failed",
+            "detail": None,
+        },
+    )
+    assert finish.status_code == 409, finish.text
+    assert finish.json()["detail"]["code"] == "work_item_cancelled"
+    assert _rows(
+        "SELECT terminal_cause FROM curie.execution_requests WHERE id = :id", {"id": request_id}
+    ) == [{"terminal_cause": "issue_deleted"}]

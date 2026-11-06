@@ -98,6 +98,20 @@ _CAPACITY_UNKNOWN_REPLY = (
     "Please check for a reply before sending it again."
 )
 
+_APPROVAL_CAPACITY_EXPIRED_REPLY = (
+    "The request could not continue after the approval decision before its wait expired."
+)
+
+_APPROVAL_CAPACITY_FAILED_REPLY = (
+    "The request could not finish after the approval decision. "
+    "Check the thread before retrying the original request."
+)
+
+_APPROVAL_CAPACITY_UNKNOWN_REPLY = (
+    "The request may have continued after the approval decision, but its result could not "
+    "be confirmed. Check the thread before retrying the original request."
+)
+
 _CAPACITY_ADMISSION_OBSERVE_S = 20.0
 
 _REVIEW_EVENT_ID_RE = re.compile(
