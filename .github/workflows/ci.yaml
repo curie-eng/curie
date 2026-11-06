@@ -3769,8 +3769,9 @@ jobs:
   # assertion and the connector readiness probe are registered runtime
   # assertions (#3391), and a failure here reddens the required verdict exactly
   # as the rung does. Proofs using this job's cluster each own their namespace.
-  # The job runs as two legs, `chart` and `workload`, each on its own runner
-  # and its own kind cluster; the selector's `chart_legs` output picks them.
+  # The job runs as three legs, `chart`, `upgrade`, and `workload`, each on
+  # its own runner and its own kind cluster; the selector's `chart_legs`
+  # output picks them.
   e2e-cluster-chart-regressions:
     name: E2E chart runtime regressions (kind, Calico, ${{ matrix.leg }})
     runs-on: ubuntu-24.04
@@ -3979,39 +3980,39 @@ jobs:
         run: |
           set -euo pipefail
           uv run bash charts/curie/ci/scenarios/controller-preflight-kind.sh
-      - name: Download the workspace diagnostic CLI
-        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade')) }}
+      - name: Download the candidate chart runtime CLI
+        if: ${{ (matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile'))) || (matrix.leg == 'upgrade' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade'))) }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: curie-x86_64-linux-${{ github.sha }}
           path: cli/target/release
-      - name: Load the workspace diagnostic candidate images
-        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade')) }}
+      - name: Load the candidate chart runtime images
+        if: ${{ (matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile'))) || (matrix.leg == 'upgrade' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade'))) }}
         uses: ./.github/actions/load-ci-images
         with:
           images: "{api,worker,runner}"
-      - name: Stage the workspace diagnostic images in kind
-        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade')) }}
+      - name: Stage the candidate chart runtime images in kind
+        if: ${{ (matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile'))) || (matrix.leg == 'upgrade' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade'))) }}
         run: |
           set -euo pipefail
           chmod +x cli/target/release/curie
-          docker tag curie-ci/api:candidate curie-api:wsdiag-${{ github.sha }}
-          docker tag curie-ci/worker:candidate curie-worker:wsdiag-${{ github.sha }}
-          docker tag curie-ci/runner:candidate curie-runner:wsdiag-${{ github.sha }}
+          docker tag curie-ci/api:candidate curie-api:chart-runtime-${{ github.sha }}
+          docker tag curie-ci/worker:candidate curie-worker:chart-runtime-${{ github.sha }}
+          docker tag curie-ci/runner:candidate curie-runner:chart-runtime-${{ github.sha }}
           kind load docker-image \
-            curie-api:wsdiag-${{ github.sha }} \
-            curie-worker:wsdiag-${{ github.sha }} \
-            curie-runner:wsdiag-${{ github.sha }} --name curie-e2e
+            curie-api:chart-runtime-${{ github.sha }} \
+            curie-worker:chart-runtime-${{ github.sha }} \
+            curie-runner:chart-runtime-${{ github.sha }} --name curie-e2e
       - name: Deployed platform runners survive both upgrade entry points
-        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade') }}
+        if: ${{ matrix.leg == 'upgrade' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade') }}
         timeout-minutes: 40
         env:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
           CURIE_SCENARIO_CONTEXT: kind-curie-e2e
           CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:chart-runtime-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:chart-runtime-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:chart-runtime-${{ github.sha }}
         run: bash tools/runtime-assertion-gate/run.sh charts/curie/ci/runtime/platform-runner-upgrade-runtime.sh
       - name: Install the shared workload platform
         id: workload_install
@@ -4020,9 +4021,9 @@ jobs:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
           CURIE_SCENARIO_CONTEXT: kind-curie-e2e
           CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:chart-runtime-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:chart-runtime-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:chart-runtime-${{ github.sha }}
         run: bash tools/runtime-assertion-gate/run.sh charts/curie/ci/scenarios/workload-install.sh up
       - name: Quota progress regression
         if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
@@ -4031,9 +4032,9 @@ jobs:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
           CURIE_SCENARIO_CONTEXT: kind-curie-e2e
           CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:chart-runtime-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:chart-runtime-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:chart-runtime-${{ github.sha }}
         shell: uv run python tools/sandbox-admission-observer/run.py -- bash {0}
         run: |
           set -euo pipefail
@@ -4046,9 +4047,9 @@ jobs:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
           CURIE_SCENARIO_CONTEXT: kind-curie-e2e
           CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:chart-runtime-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:chart-runtime-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:chart-runtime-${{ github.sha }}
         run: |
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
@@ -4060,9 +4061,9 @@ jobs:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
           CURIE_SCENARIO_CONTEXT: kind-curie-e2e
           CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:chart-runtime-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:chart-runtime-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:chart-runtime-${{ github.sha }}
         run: |
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
@@ -4076,9 +4077,9 @@ jobs:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
           CURIE_SCENARIO_CONTEXT: kind-curie-e2e
           CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:chart-runtime-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:chart-runtime-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:chart-runtime-${{ github.sha }}
         run: |
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
@@ -4094,21 +4095,21 @@ jobs:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
           CURIE_SCENARIO_CONTEXT: kind-curie-e2e
           CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:chart-runtime-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:chart-runtime-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:chart-runtime-${{ github.sha }}
         run: bash charts/curie/ci/scenarios/workload-install.sh down
       # Temporarily disabled at maintainer request; diagnostics and causal repair: #5255.
       - name: Failed first install retry recreates data volumes
-        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') && false }}
+        if: ${{ matrix.leg == 'upgrade' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') && false }}
         timeout-minutes: 30
         env:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
           CURIE_SCENARIO_CONTEXT: kind-curie-e2e
           CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
-          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:chart-runtime-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:chart-runtime-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:chart-runtime-${{ github.sha }}
         run: |
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \

@@ -228,7 +228,7 @@ chart_scenarios:
         - charts/curie/ci/runtime/upgrade-drain-installation-runtime.sh
     platform-runner-upgrade:
       step: Deployed platform runners survive both upgrade entry points
-      leg: workload
+      leg: upgrade
       inputs:
         - charts/curie/ci/runtime/platform-runner-upgrade-runtime.sh
         - cli/src/ops
@@ -249,7 +249,7 @@ chart_scenarios:
         - charts/curie/ci/runtime/failed-first-install-retry-runtime.sh
         - .github/workflows/ci.yaml
       step: Failed first install retry recreates data volumes
-      leg: workload
+      leg: upgrade
       inputs:
         - charts/curie/ci/runtime/failed-first-install-retry-runtime.sh
         - cli/src/ops/up.rs
