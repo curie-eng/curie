@@ -232,7 +232,7 @@ CHART_SETUP_FIXTURES = {
 CHART_SCENARIOS: dict[str, _ChartScenario] = {
     "platform-runner-upgrade": {
         "step": "Deployed platform runners survive both upgrade entry points",
-        "leg": "workload",
+        "leg": "upgrade",
         "inputs": [
             "charts/curie/ci/runtime/platform-runner-upgrade-runtime.sh",
             "cli/src/ops", "cli/src/connectors.rs", "apps/api", "apps/worker", "runner", "packages",
@@ -253,7 +253,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
             "charts/curie/ci/runtime/failed-first-install-retry-runtime.sh",
             ".github/workflows/ci.yaml",
         ],
-        "leg": "workload",
+        "leg": "upgrade",
     },
     "installation-identity": {
         "step": "Installation identity Secret lifecycle",
@@ -355,14 +355,18 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
 CHART_IDS = tuple(sorted(CHART_SCENARIOS))
 
 
-CHART_LEGS = ("chart", "workload")
+CHART_LEGS = ("chart", "upgrade", "workload")
 WORKLOAD_SCENARIOS = frozenset(
     {
         "quota-progress",
         "connector-secret-rotation",
         "connector-apply-race",
-        "failed-first-install-retry",
         "factory-resource-profile",
+    }
+)
+UPGRADE_SCENARIOS = frozenset(
+    {
+        "failed-first-install-retry",
         "platform-runner-upgrade",
     }
 )
@@ -3968,7 +3972,7 @@ def _run_aggregate(
         else:
             state["forge_instance_result"] = "skipped"
     if "chart_scenarios" not in overrides and state["cluster_selected"] == "true":
-        state["chart_scenarios"] = '["workspace-diagnostic"]'
+        state["chart_scenarios"] = '["quota-progress"]'
     environment = os.environ.copy()
     environment.update(
         {
@@ -4498,14 +4502,15 @@ def test_single_regression_proofs_run_outside_the_cluster_rung() -> None:
     assert "e2e-cluster-rollout-recovery" in jobs["e2e-required"]["needs"]
 
 
-WORKLOAD_STAGING_IF = (
-    "${{ matrix.leg == 'workload' && "
+CHART_CANDIDATE_STAGING_IF = (
+    "${{ (matrix.leg == 'workload' && "
     "(contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') "
-    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') "
-    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile') "
-    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade')) }}"
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile'))) "
+    "|| (matrix.leg == 'upgrade' && "
+    "(contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') "
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade'))) }}"
 )
 
 
@@ -4523,14 +4528,14 @@ def test_workload_leg_reuses_the_chart_cluster_and_candidate_artifacts() -> None
         "CURIE_BIN": "${{ github.workspace }}/cli/target/release/curie",
         "CURIE_SCENARIO_CONTEXT": "kind-curie-e2e",
         "CURIE_SCENARIO_RUN_ID": "${{ github.run_id }}-${{ github.run_attempt }}",
-        "CURIE_SCENARIO_API_IMAGE": "curie-api:wsdiag-${{ github.sha }}",
-        "CURIE_SCENARIO_WORKER_IMAGE": "curie-worker:wsdiag-${{ github.sha }}",
-        "CURIE_SCENARIO_RUNNER_IMAGE": "curie-runner:wsdiag-${{ github.sha }}",
+        "CURIE_SCENARIO_API_IMAGE": "curie-api:chart-runtime-${{ github.sha }}",
+        "CURIE_SCENARIO_WORKER_IMAGE": "curie-worker:chart-runtime-${{ github.sha }}",
+        "CURIE_SCENARIO_RUNNER_IMAGE": "curie-runner:chart-runtime-${{ github.sha }}",
     }
     staging_names = [
-        "Download the workspace diagnostic CLI",
-        "Load the workspace diagnostic candidate images",
-        "Stage the workspace diagnostic images in kind",
+        "Download the candidate chart runtime CLI",
+        "Load the candidate chart runtime images",
+        "Stage the candidate chart runtime images in kind",
     ]
     staging = [step for step in steps if step.get("name") in staging_names]
     assert [step["name"] for step in staging] == staging_names
@@ -4543,7 +4548,7 @@ def test_workload_leg_reuses_the_chart_cluster_and_candidate_artifacts() -> None
     assert steps.index(staging[1]) < steps.index(staging[2]) < steps.index(quota)
     assert quota["if"] == _chart_step_if("quota-progress")
     for step in staging:
-        assert step["if"] == WORKLOAD_STAGING_IF, step
+        assert step["if"] == CHART_CANDIDATE_STAGING_IF, step
         assert "continue-on-error" not in step
     download, load, stage = staging
     assert download["uses"].startswith("actions/download-artifact@")
@@ -4559,13 +4564,13 @@ def test_workload_leg_reuses_the_chart_cluster_and_candidate_artifacts() -> None
     for component in ("api", "worker", "runner"):
         assert (
             f"docker tag curie-ci/{component}:candidate "
-            f"curie-{component}:wsdiag-${{{{ github.sha }}}}"
+            f"curie-{component}:chart-runtime-${{{{ github.sha }}}}"
         ) in stage_run
     assert stage_run.count("kind load docker-image") == 1
     assert "--name curie-e2e" in stage_run
     image_load = stage_run[stage_run.index("kind load docker-image") :]
     for component in ("api", "worker", "runner"):
-        assert f"curie-{component}:wsdiag-${{{{ github.sha }}}}" in image_load
+        assert f"curie-{component}:chart-runtime-${{{{ github.sha }}}}" in image_load
 
 
 def test_failed_first_install_retry_reuses_the_chart_cluster_and_candidate_artifacts() -> None:
@@ -4596,7 +4601,7 @@ def test_failed_first_install_retry_reuses_the_chart_cluster_and_candidate_artif
     stage = next(
         step
         for step in steps
-        if step.get("name") == "Stage the workspace diagnostic images in kind"
+        if step.get("name") == "Stage the candidate chart runtime images in kind"
     )
     assert steps.index(stage) < steps.index(retry)
 
@@ -4624,7 +4629,7 @@ def test_factory_resource_profile_runs_on_the_workload_leg() -> None:
     stage = next(
         step
         for step in steps
-        if step.get("name") == "Stage the workspace diagnostic images in kind"
+        if step.get("name") == "Stage the candidate chart runtime images in kind"
     )
     assert steps.index(stage) < steps.index(profile)
 
@@ -4640,9 +4645,9 @@ def test_quota_progress_runs_on_the_workload_leg() -> None:
         "CURIE_BIN": "${{ github.workspace }}/cli/target/release/curie",
         "CURIE_SCENARIO_CONTEXT": "kind-curie-e2e",
         "CURIE_SCENARIO_RUN_ID": "${{ github.run_id }}-${{ github.run_attempt }}",
-        "CURIE_SCENARIO_API_IMAGE": "curie-api:wsdiag-${{ github.sha }}",
-        "CURIE_SCENARIO_WORKER_IMAGE": "curie-worker:wsdiag-${{ github.sha }}",
-        "CURIE_SCENARIO_RUNNER_IMAGE": "curie-runner:wsdiag-${{ github.sha }}",
+        "CURIE_SCENARIO_API_IMAGE": "curie-api:chart-runtime-${{ github.sha }}",
+        "CURIE_SCENARIO_WORKER_IMAGE": "curie-worker:chart-runtime-${{ github.sha }}",
+        "CURIE_SCENARIO_RUNNER_IMAGE": "curie-runner:chart-runtime-${{ github.sha }}",
     }
     assert quota["shell"] == (
         "uv run python tools/sandbox-admission-observer/run.py -- bash {0}"
@@ -5702,7 +5707,56 @@ def test_failed_first_install_retry_script_alone_selects_its_scenario(tmp_path: 
     selected = _outputs_of(output)
     assert selected["cluster"] == "true"
     assert json.loads(selected["chart_scenarios"]) == ["failed-first-install-retry"]
-    assert json.loads(selected["chart_legs"]) == ["workload"]
+    assert json.loads(selected["chart_legs"]) == ["upgrade"]
+
+
+# The scenario list is the one main returns for this path. The leg split must
+# not add or drop a scenario.
+MAIN_TEMPLATE_CHART_SCENARIOS = [
+    "connector-apply-race",
+    "connector-identity",
+    "connector-readiness",
+    "connector-secret-rotation",
+    "controller-preflight",
+    "factory-resource-profile",
+    "failed-first-install-retry",
+    "installation-identity",
+    "platform-runner-upgrade",
+    "quota-progress",
+    "runner-byo-egress",
+    "runner-resources-render",
+    "runner-template-admission",
+]
+
+
+def test_platform_runner_upgrade_script_selects_the_upgrade_leg(tmp_path: Path) -> None:
+    completed, output = _invoke_selector(
+        tmp_path, "charts/curie/ci/runtime/platform-runner-upgrade-runtime.sh"
+    )
+    assert completed.returncode == 0, completed.stderr
+    selected = _outputs_of(output)
+    assert json.loads(selected["chart_scenarios"]) == [
+        "failed-first-install-retry",
+        "platform-runner-upgrade",
+    ]
+    legs = json.loads(selected["chart_legs"])
+    assert "upgrade" in legs
+    assert "workload" not in legs
+
+
+def test_template_change_selects_upgrade_and_workload_with_the_main_scenario_list(
+    tmp_path: Path,
+) -> None:
+    assert MAIN_TEMPLATE_CHART_SCENARIOS == list(CHART_IDS)
+    completed, output = _invoke_selector(
+        tmp_path, "charts/curie/templates/agent-sandbox.yaml"
+    )
+    assert completed.returncode == 0, completed.stderr
+    selected = _outputs_of(output)
+    assert json.loads(selected["chart_scenarios"]) == MAIN_TEMPLATE_CHART_SCENARIOS
+    legs = json.loads(selected["chart_legs"])
+    assert "upgrade" in legs
+    assert "workload" in legs
 
 
 @pytest.mark.parametrize(
@@ -5867,7 +5921,9 @@ def test_every_chart_scenario_belongs_to_exactly_one_leg() -> None:
         assert isinstance(entry.get("leg"), str), scenario
         assert entry["leg"] in CHART_LEGS, scenario
     workload = {scenario for scenario, entry in scenarios.items() if entry["leg"] == "workload"}
+    upgrade = {scenario for scenario, entry in scenarios.items() if entry["leg"] == "upgrade"}
     assert workload == WORKLOAD_SCENARIOS
+    assert upgrade == UPGRADE_SCENARIOS
     loaded = _SELECTOR_MODULE._load_registry(REGISTRY).chart_scenarios.scenarios
     assert {scenario: loaded[scenario].leg for scenario in loaded} == {
         scenario: entry["leg"] for scenario, entry in scenarios.items()
@@ -5881,15 +5937,15 @@ def test_every_chart_scenario_belongs_to_exactly_one_leg() -> None:
             ("charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",),
             False,
             ["failed-first-install-retry", "quota-progress"],
-            ["workload"],
+            ["upgrade", "workload"],
         ),
         (
             ("charts/curie/ci/runtime/connector-readiness-runtime.sh",),
             False,
             ["connector-readiness", "failed-first-install-retry"],
-            ["chart", "workload"],
+            ["chart", "upgrade"],
         ),
-        ((), True, list(CHART_IDS), ["chart", "workload"]),
+        ((), True, list(CHART_IDS), ["chart", "upgrade", "workload"]),
         (("docs/adr/AGENTS.md",), False, [], []),
     ],
     ids=("quota-only", "chart-only", "push", "docs"),
@@ -5927,7 +5983,7 @@ def test_chart_scenario_registry_rejects_a_scenario_without_a_valid_leg(
     if mutation == "missing-leg":
         del entry["leg"]
     elif mutation == "unknown-leg":
-        entry["leg"] = "upgrade"
+        entry["leg"] = "sidecar"
     else:
         entry["leg"] = ["chart"]
     path = tmp_path / "registry.yaml"
@@ -5937,9 +5993,9 @@ def test_chart_scenario_registry_rejects_a_scenario_without_a_valid_leg(
 
 
 WORKLOAD_STAGING_STEPS = (
-    "Download the workspace diagnostic CLI",
-    "Load the workspace diagnostic candidate images",
-    "Stage the workspace diagnostic images in kind",
+    "Download the candidate chart runtime CLI",
+    "Load the candidate chart runtime images",
+    "Stage the candidate chart runtime images in kind",
 )
 
 
@@ -5954,7 +6010,7 @@ def test_chart_job_runs_one_leg_per_runner_from_the_selected_legs() -> None:
     assert chart["if"] == CHART_JOB_IF
     steps = {step.get("name"): step for step in chart["steps"]}
     for name in WORKLOAD_STAGING_STEPS:
-        assert steps[name].get("if") == WORKLOAD_STAGING_IF, name
+        assert steps[name].get("if") == CHART_CANDIDATE_STAGING_IF, name
     upload = steps["Upload runtime assertion receipts"]
     assert upload["with"]["name"] == (
         "runtime-assertion-receipts-${{ github.job }}-${{ matrix.leg }}"
@@ -5966,6 +6022,9 @@ def test_chart_job_runs_one_leg_per_runner_from_the_selected_legs() -> None:
         if not named:
             continue
         legs = {CHART_SCENARIOS[scenario]["leg"] for scenario in named}
+        if name in WORKLOAD_STAGING_STEPS:
+            assert legs == {"upgrade", "workload"}, name
+            continue
         assert len(legs) == 1, name
         assert condition.startswith("${{ " + _chart_leg_clause(legs.pop()) + " && "), name
 
@@ -6130,7 +6189,7 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
     )
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == sorted((*expected, "unregistered"))
     # An unregistered step has no leg condition, so it must run in every leg.
-    assert json.loads(_outputs_of(output)["chart_legs"]) == ["chart", "workload"]
+    assert json.loads(_outputs_of(output)["chart_legs"]) == ["chart", "upgrade", "workload"]
     docs, docs_output = _invoke_selector(tmp_path, "docs/example.md", cwd=repository)
     assert docs.returncode == 0, docs.stderr
     assert _outputs_of(docs_output)["chart_scenarios"] == "[]"
@@ -6141,8 +6200,8 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
     ("chart_scenarios", "chart_result", "expected_code"),
     [
         ("[]", "skipped", 0),
-        ('["workspace-diagnostic"]', "success", 0),
-        ('["workspace-diagnostic"]', "skipped", 1),
+        ('["quota-progress"]', "success", 0),
+        ('["quota-progress"]', "skipped", 1),
         ("[]", "success", 1),
     ],
 )
@@ -6163,13 +6222,13 @@ def test_e2e_required_uses_chart_scenarios_for_the_chart_result(
 
 def test_e2e_required_rejects_chart_scenarios_without_cluster() -> None:
     completed = _run_aggregate(
-        chart_scenarios='["workspace-diagnostic"]',
+        chart_scenarios='["quota-progress"]',
         cluster_chart_result="success",
     )
     assert completed.returncode != 0, completed.stdout + completed.stderr
 
 
-@pytest.mark.parametrize("chart_scenarios", ["", "true", "[", "]", '["workspace-diagnostic"'])
+@pytest.mark.parametrize("chart_scenarios", ["", "true", "[", "]", '["quota-progress"'])
 def test_e2e_required_rejects_chart_scenarios_without_list_delimiters(chart_scenarios: str) -> None:
     completed = _run_aggregate(
         chart_scenarios=chart_scenarios,
@@ -6186,7 +6245,7 @@ def test_negative_control_still_covers_the_chart_job_result() -> None:
         "event_name": "pull_request",
         "cluster_selected": "true",
         "cluster_result": "success",
-        "chart_scenarios": '["workspace-diagnostic"]',
+        "chart_scenarios": '["quota-progress"]',
         "cluster_chart_result": "success",
     }
     unmutated = _run_aggregate(**state)
@@ -6285,10 +6344,6 @@ def test_chart_shared_workload_order_preserves_scenario_isolation() -> None:
     shared = [
         step for step in steps
         if step.get("name") in scenario_names
-        and step["name"] not in {
-            CHART_SCENARIOS[item]["step"]
-            for item in ("failed-first-install-retry", "platform-runner-upgrade")
-        }
         and step.get("if", "").startswith("${{ matrix.leg == 'workload' && ")
     ]
     chart = [
@@ -6297,10 +6352,7 @@ def test_chart_shared_workload_order_preserves_scenario_isolation() -> None:
         and step.get("if", "").startswith("${{ matrix.leg == 'chart' && ")
     ]
     assert {step["name"] for step in shared} == {
-        CHART_SCENARIOS[scenario]["step"]
-        for scenario in WORKLOAD_SCENARIOS - {
-            "failed-first-install-retry", "platform-runner-upgrade"
-        }
+        CHART_SCENARIOS[scenario]["step"] for scenario in WORKLOAD_SCENARIOS
     }
     assert shared[0]["name"] == CHART_SCENARIOS["quota-progress"]["step"]
     assert shared[-1]["name"] == CHART_SCENARIOS["factory-resource-profile"]["step"]
@@ -6345,12 +6397,15 @@ def test_platform_runner_upgrade_stages_candidate_artifacts_before_own_lifecycle
         "bash", "tools/runtime-assertion-gate/run.sh",
         "charts/curie/ci/runtime/platform-runner-upgrade-runtime.sh",
     ]
-    assert scenario["env"]["CURIE_SCENARIO_RUNNER_IMAGE"] == "curie-runner:wsdiag-${{ github.sha }}"
-    assert positions["Stage the workspace diagnostic images in kind"] < positions[name]
+    assert (
+        scenario["env"]["CURIE_SCENARIO_RUNNER_IMAGE"]
+        == "curie-runner:chart-runtime-${{ github.sha }}"
+    )
+    assert positions["Stage the candidate chart runtime images in kind"] < positions[name]
     assert positions[name] < positions["Install the shared workload platform"]
     for staging in (
-        "Download the workspace diagnostic CLI",
-        "Load the workspace diagnostic candidate images",
-        "Stage the workspace diagnostic images in kind",
+        "Download the candidate chart runtime CLI",
+        "Load the candidate chart runtime images",
+        "Stage the candidate chart runtime images in kind",
     ):
-        assert steps[positions[staging]]["if"] == WORKLOAD_STAGING_IF
+        assert steps[positions[staging]]["if"] == CHART_CANDIDATE_STAGING_IF
