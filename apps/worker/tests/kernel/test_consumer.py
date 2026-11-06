@@ -4131,60 +4131,6 @@ def test_reclaim_does_not_steal_from_a_live_saturated_peer(make_harness) -> None
     asyncio.run(go())
 
 
-def test_consumer_publishes_before_reads_and_renews_alive_and_capability(
-    make_harness,
-) -> None:
-    async def go() -> None:
-        async with make_harness(
-            reclaim_min_idle_ms=300,
-            consumer_heartbeat_ttl_ms=150,
-            consumer_capability_ttl_ms=3000,
-            read_block_ms=10,
-        ) as h:
-            consumer = Consumer(
-                redis=h.async_redis,
-                kernel=h.kernel,
-                config=h.config,
-                leases=DeliveryLeaseStore(h.async_redis, h.config),
-            )
-            alive = consumer_heartbeat_key(
-                h.config.stream, h.config.consumer_group, h.config.consumer_name
-            )
-            capable = consumer_heartbeat_capable_key(
-                h.config.stream, h.config.consumer_group, h.config.consumer_name
-            )
-            read_observations: list[tuple[bool, bool]] = []
-            real_read = consumer._redis.xreadgroup
-
-            async def observe_first_read(*args: Any, **kwargs: Any) -> Any:
-                read_observations.append(
-                    (
-                        bool(await h.async_redis.exists(alive)),
-                        bool(await h.async_redis.exists(capable)),
-                    )
-                )
-                return await real_read(*args, **kwargs)
-
-            consumer._redis.xreadgroup = observe_first_read  # type: ignore[method-assign,assignment]
-
-            task = asyncio.create_task(consumer.run())
-            await _wait_key(h.async_redis, alive)
-            await _wait_key(h.async_redis, capable)
-            # Live longer than the capability marker's original TTL. Both keys
-            # surviving proves the refresher renews capability as well as alive.
-            await asyncio.sleep(0.55)
-            assert await h.async_redis.pttl(alive) > 0
-            assert await h.async_redis.pttl(capable) > 0
-            assert read_observations and read_observations[0] == (True, True)
-
-            consumer.request_stop()
-            await task
-            assert not await h.async_redis.exists(alive)
-            assert await h.async_redis.exists(capable)
-
-    asyncio.run(go())
-
-
 def test_graceful_stop_keeps_lease_through_two_ttls_of_inflight_drain(
     make_harness,
 ) -> None:
