@@ -811,20 +811,33 @@ def test_foreign_wake_claims_are_read_only(paused_factory: AdmittedKind, change:
 
 @pytest.mark.parametrize(
     ("control", "reason"),
-    [pytest.param("stale_generation", "not_published", id="stale_generation-not_published")],
+    [("stale_generation", "not_published"), ("foreign_owner", "duplicate")],
 )
 def test_existing_acquire_fences_remain_read_only(
     paused_factory: AdmittedKind, control: str, reason: str
 ) -> None:
-    """Existing generation control, not evidence of the new authority guard."""
+    """Existing generation/owner controls, not evidence of the new authority guard."""
     run = paused_factory
     ticket, row, wake = waiting_ticket(run)
     comments = run.comments(ticket)
-    run.write_sql(
-        "UPDATE curie.execution_requests SET dispatch_generation=dispatch_generation+1, "
-        "published_generation=dispatch_generation+1 "
-        f"WHERE id='{uuid.UUID(row['id'])}'"
-    )
+    if control == "stale_generation":
+        run.write_sql(
+            "UPDATE curie.execution_requests SET dispatch_generation=dispatch_generation+1, "
+            "published_generation=dispatch_generation+1 "
+            f"WHERE id='{uuid.UUID(row['id'])}'"
+        )
+    else:
+        notice_before = notice_state(run, row["id"])
+        run.api(
+            "POST", f"/v1/internal/work-items/requests/{row['id']}/acquire",
+            acquire_body(row, wake, owner="acme-other-worker"), internal=True,
+        )
+        run.write_sql(
+            "UPDATE curie.execution_requests SET acquire_expires_at=now()+interval '1 hour' "
+            f"WHERE id='{uuid.UUID(row['id'])}'"
+        )
+        await_base_pin_status(run, ticket, row, notice_before)
+        comments = run.comments(ticket)
     frozen = request_state(run, row["id"])
     run.enqueue(wake)
     run.worker_replicas(1)
@@ -1614,6 +1627,10 @@ def test_two_worker_ci_preserves_successor_identity_and_rejects_stale_predecesso
 @pytest.mark.parametrize(
     ("change", "reason", "action"),
     [
+        pytest.param(
+            "removed", "factory_binding_missing", "renew",
+            id="removed-factory_binding_missing-renew",
+        ),
         pytest.param(
             "removed", "factory_binding_missing", "late_start",
             id="removed-factory_binding_missing-late_start",
