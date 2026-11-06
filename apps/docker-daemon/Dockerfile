@@ -24,7 +24,7 @@ RUN set -eu; \
       cargo build --locked --release --target "$t"; \
     cp "target/$t/release/curie-docker-authz" /curie-docker-authz
 
-FROM docker:29.9.0-dind@sha256:0b6d18a4a222e71c88be6034926b4f6cde2fc33c2218643d03ccfddc65995470
+FROM docker:29.9.2-dind@sha256:9e79b879b177fbd72c34376a3dd3d91747da5db49e1f560f76aea59561471977
 COPY --from=build /curie-docker-authz /usr/local/bin/curie-docker-authz
 COPY daemon.json /etc/docker/daemon.json
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/curie-docker-daemon-entrypoint
