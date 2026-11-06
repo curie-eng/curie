@@ -427,6 +427,13 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # runner-local false-completion knob; read by the runner from its own env,
         # not a boot contract key.
         "CURIE_FALSE_COMPLETION_CHECK",
+        # Runner-local model authentication selector (#5373, ADR 0268): read by
+        # the runner's personal_auth policy from its own env. #5373 decides it is
+        # not a BootEnv field; worker emission of a personal boot env is #5378.
+        "CURIE_MODEL_AUTH_MODE",
+        # CLI-owned profile directory. personal_auth points it at a fresh
+        # runner-owned directory for a personal launch; it is never a boot key.
+        "ANTHROPIC_CONFIG_DIR",
         # ADR 0130 deliberately keeps ACI frozen. This direct worker-to-runner
         # sandbox boot fact is instead frozen across both declaration sites by
         # tests/vectors/turn-progress-capability.json.
