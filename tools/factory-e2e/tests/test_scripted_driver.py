@@ -6,8 +6,10 @@ kind scenario remains the proof that the product completes an issue.
 
 from __future__ import annotations
 
+import base64
 import fcntl
 import json
+import os
 import socket
 import sqlite3
 import subprocess
@@ -20,6 +22,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import factory_e2e as fe
+import kind_images
 import pytest
 import scripted_kind as sk
 
@@ -1588,3 +1591,126 @@ def test_image_builds_retain_the_existing_disk_reserve(
     monkeypatch.setattr(run, "command", _refuse_external_command)
     with pytest.raises(fe.ConfigError, match=str(30 * 1024**3)):
         run.prerequisites()
+
+
+# Hosted candidate sizes at the runner-layer check: the runner is about
+# 745 MiB and each other candidate is about 150 MiB. The free-byte figure
+# is the hosted runner that refused this stage.
+_LAYER_STAGE_IMAGE_BYTES = {
+    "curie-api:local": 150 * 1024**2,
+    "curie-worker:local": 150 * 1024**2,
+    "curie-ui:local": 150 * 1024**2,
+    "curie-runner:latest": 745 * 1024**2,
+}
+_OBSERVED_HOSTED_FREE_BYTES = 26525540352
+_RUNNER_LAYER_BUDGET_BYTES = (
+    2 * _LAYER_STAGE_IMAGE_BYTES["curie-runner:latest"] + kind_images.RUNTIME_RESERVE_BYTES
+)
+
+
+def _layer_image_size(image: str) -> int:
+    if image in _LAYER_STAGE_IMAGE_BYTES:
+        return _LAYER_STAGE_IMAGE_BYTES[image]
+    if image.endswith("/curie-runner:latest"):
+        return _LAYER_STAGE_IMAGE_BYTES["curie-runner:latest"]
+    raise AssertionError(image)
+
+
+class _TokenResponse:
+    def __enter__(self) -> _TokenResponse:
+        return self
+
+    def __exit__(self, *_args: object) -> bool:
+        return False
+
+    def read(self, _size: int = -1) -> bytes:
+        return b'{"token":"example-token"}'
+
+
+class _PortForward:
+    def __init__(self) -> None:
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"Forwarding from 127.0.0.1:18080 -> 8000\n")
+        os.close(write_fd)
+        self.stdout = os.fdopen(read_fd, "r")
+
+
+def _drive_runner_layer(
+    free_bytes: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[sk.ScriptedRun, list[tuple[str, ...]]]:
+    monkeypatch.setattr(
+        sk.shutil,
+        "disk_usage",
+        lambda _path: type("Usage", (), {"free": free_bytes})(),
+    )
+    monkeypatch.setattr(sk.ssl, "create_default_context", lambda **_kwargs: object())
+    monkeypatch.setattr(sk, "urlopen", lambda *_args, **_kwargs: _TokenResponse())
+    monkeypatch.setattr(sk.subprocess, "Popen", lambda *_args, **_kwargs: _PortForward())
+    monkeypatch.setattr(
+        sk.fe,
+        "http_json",
+        lambda *_args, **_kwargs: (201, {"id": "agent-example"}),
+    )
+    run = sk.ScriptedRun(_replay_args(tmp_path))
+    run.workdir = tmp_path / "work"
+    run.workdir.mkdir()
+    run.stub = type(
+        "Stub",
+        (),
+        {"ca_file": tmp_path / "ca.pem", "base_url": "https://stub.example.test"},
+    )()
+    (tmp_path / "ca.pem").write_text("placeholder\n")
+    encoded = base64.b64encode(b"example-key").decode()
+
+    def kubectl(*_args: str, **_kwargs: Any) -> str:
+        return json.dumps({"data": {"apiKey": encoded}})
+
+    builds: list[tuple[str, ...]] = []
+
+    def command(*argv: str, **_kwargs: Any) -> str:
+        if argv[:3] == ("docker", "image", "inspect"):
+            return json.dumps([{"Size": _layer_image_size(image)} for image in argv[3:]])
+        if len(argv) > 1 and argv[1] == "build" and "--plugin-dir" in argv:
+            builds.append(argv)
+            return ""
+        if len(argv) > 1 and argv[1] == "cluster":
+            raise sk.ScriptedScenarioError("layer-admitted")
+        raise AssertionError(argv[0:2])
+
+    monkeypatch.setattr(run, "kubectl", kubectl)
+    monkeypatch.setattr(run, "command", command)
+    return run, builds
+
+
+@pytest.mark.parametrize(
+    ("free_bytes", "admitted"),
+    [
+        (_OBSERVED_HOSTED_FREE_BYTES, True),
+        (_RUNNER_LAYER_BUDGET_BYTES - 1, False),
+    ],
+    ids=["observed-hosted-free", "below-measured"],
+)
+def test_runner_layer_disk_budget_follows_the_runner_image(
+    free_bytes: int,
+    admitted: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run, builds = _drive_runner_layer(free_bytes, tmp_path, monkeypatch)
+    if admitted:
+        with pytest.raises(sk.ScriptedScenarioError, match="layer-admitted"):
+            run.deploy("localhost:5000")
+        assert len(builds) == 1
+        err = capsys.readouterr().err
+        for stage in ("building the runner layer", "built runner layer"):
+            assert (
+                f"{stage} disk_free_bytes={free_bytes} "
+                f"disk_required_bytes={_RUNNER_LAYER_BUDGET_BYTES}"
+            ) in err
+    else:
+        with pytest.raises(fe.ConfigError, match=str(_RUNNER_LAYER_BUDGET_BYTES)):
+            run.deploy("localhost:5000")
+        assert builds == []

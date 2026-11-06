@@ -36,6 +36,7 @@ fn write_fake_helm(dir: &Path, history_json: &str) {
              echo \"$*\" >> '{log}'\n\
              case \"$1\" in\n\
              history) cat '{history}' ;;\n\
+             get) [ \"$2\" = values ] || exit 1; echo '{{\"agentSandbox\":{{\"deploy\":false}}}}' ;;\n\
              rollback) echo rollback-ran >> '{log}'; echo 'Rollback was a success.' ;;\n\
              *) echo \"unexpected helm verb: $1\" >&2; exit 1 ;;\n\
              esac\n",

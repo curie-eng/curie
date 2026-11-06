@@ -24,10 +24,13 @@ from aci_protocol import (
     TurnSource,
 )
 from channel_protocol.reply import (
+    REPLY_WIRE_VERSION,
     NavAffordance,
     ReplyAck,
+    ReplyUpdate,
 )
 from curie_telemetry.redact import redact_text
+from redis.exceptions import RedisError
 
 from ..actions import ActionBackendError
 from ..approvals import (
@@ -44,6 +47,7 @@ from ..behaviorpacks import (
 )
 from ..capacity_wait import (
     CapacityWaitRequested,
+    current_order,
 )
 from ..delivery_lease import DeliveryLease
 from ..publication_validation import validate_snapshot_against_base
@@ -78,6 +82,7 @@ from ..workitem_dispatch import (
     parse_work_item_event_id,
 )
 from ..workspace import (
+    WorkspaceDependencyUnavailable,
     WorkspacePreparationError,
     WorkspaceSelectionRefused,
     WorkspaceStageTimeout,
@@ -460,6 +465,7 @@ async def _attempt_turn(
     except (CapacityExhaustedError, AdmissionUnavailableError) as exc:
         rejection = exc.rejection if isinstance(exc, CapacityExhaustedError) else None
         if rejection is None:
+            record_reclaimed_retry()
             logger.warning("sandbox admission inventory unavailable for event %s", qevent.event_id)
         else:
             logger.warning(
@@ -491,23 +497,25 @@ async def _attempt_turn(
 
         async def capacity_refusal() -> failures.TurnOutcome:
             # Started factory continuations wait in the driving loop:
-            # their running request cannot use SQL defer (#4275). An
-            # interactive approval keeps its bounded retry policy (#3693).
-            if (
-                parsed_execute is not None
-                and parsed_execute.is_ci_fix
-                and self._run_for_event(qevent.event_id) is not None
-            ) or self._is_approval_resume(qevent.event_id):
+            # their running request cannot use SQL defer (#4275).
+            if self._run_for_event(qevent.event_id) is not None and (
+                (parsed_execute is not None and parsed_execute.is_ci_fix)
+                or self._is_approval_resume(qevent.event_id)
+            ):
                 release_order()
                 return failures.TurnOutcome(terminal_ok=False, classification="sandbox-capacity")
             return await capacity_response()
 
         if rejection is None:
+            if (
+                self._is_approval_resume(qevent.event_id)
+                and self._run_for_event(qevent.event_id) is not None
+            ):
+                return await capacity_refusal()
             release_order()
             if (
                 qevent.source is TurnSource.SLACK
                 and handle is not None
-                and not self._is_approval_resume(qevent.event_id)
                 and (parsed_execute is None or not parsed_execute.is_ci_fix)
             ):
                 raise CapacityWaitRequested() from None
@@ -617,7 +625,8 @@ async def _attempt_turn(
         # retryable); the classification and log identify the fault, and the
         # terminal diagnostic carries a redacted, bounded reason naming the stage.
         record_reclaimed_retry()
-        release_order()
+        if not isinstance(exc, WorkspaceDependencyUnavailable) or self._can_park(qevent):
+            release_order()
         self._log_workspace_start_failure(
             qevent,
             event.text,
@@ -630,6 +639,7 @@ async def _attempt_turn(
             terminal_ok=False,
             classification="workspace-error",
             workspace_stage_timeout=isinstance(exc, WorkspaceStageTimeout),
+            workspace_dependency_unavailable=isinstance(exc, WorkspaceDependencyUnavailable),
             error_message=" ".join(redact_text(str(exc)).split())[
                 : constants._ESCALATION_DETAIL_MAX
             ],
@@ -753,6 +763,14 @@ async def _attempt_turn(
     assert routed is not None
     record_reclaimed_retry()
     try:
+        ordering = current_order()
+        if ordering is not None:
+            try:
+                await ordering[0].finish_order(ordering[2], ordering[1], ordering[3], started=True)
+            except RedisError:
+                logger.warning(
+                    "thread order release unavailable after runner start for %s", qevent.event_id
+                )
         release_order()
     except BaseException:  # noqa: BLE001 - broad catch kept at a failure boundary
         await close_routed_turn()
@@ -1161,6 +1179,9 @@ async def _consume(
                 if termination is not None:
                     classification = "sandbox-terminated"
                     acc.error_message = failures._sandbox_termination_detail(termination)
+                    logger.warning(
+                        "sandbox terminated for event %s: %s", qevent.event_id, acc.error_message
+                    )
                     termination_carry = constants._SANDBOX_TERMINATION_CARRY.get()
                     if termination_carry is not None:
                         termination_carry.termination = termination
@@ -1406,7 +1427,7 @@ async def _escalate(
     message: str,
     *,
     failure_class: str,
-) -> None:
+) -> ReplyUpdate | None:
     """Deliver ``message`` as a failed turn, with the class on the first line.
 
     The class marker is what a consumer that sees only the reply text uses
@@ -1416,7 +1437,17 @@ async def _escalate(
 
     text = failures.turn_failure_reply(failure_class, message)
     logger.warning("escalating event %s: %s", qevent.event_id, text)
-    await self._reply_for(qevent, route, text)
+    if not self._markers.supports_answer_outbox:
+        await self._reply_for(qevent, route, text)
+        return None
+    if routing._is_targetless(qevent) or self._is_factory_work_item_turn(qevent.event_id):
+        return None
+    return ReplyUpdate(
+        version=REPLY_WIRE_VERSION,
+        event="reply.update",
+        target=self._target_for(qevent),
+        text=text,
+    )
 
 
 def _backoff(self: Kernel, attempt: int) -> float:

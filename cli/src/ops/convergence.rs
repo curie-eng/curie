@@ -1,5 +1,5 @@
-//! Read-only convergence against Helm's exact installed target manifest.
-//! Shared by up/apply and status; this does not perform transactional recovery.
+//! Read-only convergence against the requested upgrade manifest or installed release.
+//! Shared by up/apply, upgrade and status; this does not perform transactional recovery.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Stdio;
@@ -849,6 +849,7 @@ const UNOBSERVED: [Facet; 8] = [
 async fn observe_inner(
     opts: &CommonOpts,
     pinned: Option<u64>,
+    requested_manifest: Option<&str>,
     deadlines: Deadlines,
 ) -> Result<Observation> {
     let status = helm_status(opts, deadlines).await?;
@@ -883,12 +884,17 @@ async fn observe_inner(
             result.terminal = true;
         }
     }
-    let manifest = capture(
-        manifest_command(opts, &revision.to_string()),
-        "read target release manifest",
-        deadlines,
-    )
-    .await?;
+    let manifest = match requested_manifest {
+        Some(manifest) => manifest.to_owned(),
+        None => {
+            capture(
+                manifest_command(opts, &revision.to_string()),
+                "read target release manifest",
+                deadlines,
+            )
+            .await?
+        }
+    };
     let mut expected = Vec::new();
     for document in serde_norway::Deserializer::from_str(&manifest) {
         let value = Value::deserialize(document).context("target release manifest is malformed")?;
@@ -1066,13 +1072,14 @@ async fn observe_inner(
 async fn observe_pinned(
     opts: &CommonOpts,
     expected: Option<u64>,
+    requested_manifest: Option<&str>,
     convergence: Option<Instant>,
 ) -> Result<Observation> {
     let deadlines = Deadlines {
         observation: Instant::now() + Duration::from_secs(30),
         convergence,
     };
-    let result = observe_inner(opts, expected, deadlines).await;
+    let result = observe_inner(opts, expected, requested_manifest, deadlines).await;
     let (deadline, message) = deadlines.outer();
     if Instant::now() >= deadline {
         return tokio::time::timeout_at(deadline, std::future::pending())
@@ -1084,7 +1091,7 @@ async fn observe_pinned(
 
 /// One unpinned sample of whatever revision Helm currently reports.
 pub(super) async fn observe(opts: &CommonOpts) -> Result<Observation> {
-    observe_pinned(opts, None, None).await
+    observe_pinned(opts, None, None, None).await
 }
 
 pub(super) async fn installation_failure(
@@ -1125,7 +1132,7 @@ pub(super) async fn wait(opts: &CommonOpts, invocation: UpInvocation) -> Result<
     };
     let mut expected = None;
     loop {
-        let observation = observe_pinned(opts, expected, Some(deadline)).await;
+        let observation = observe_pinned(opts, expected, None, Some(deadline)).await;
         let result = match observation {
             Ok(result) => result,
             Err(error) if last_issues.is_empty() => return Err(error),
@@ -1170,12 +1177,15 @@ pub(super) async fn wait(opts: &CommonOpts, invocation: UpInvocation) -> Result<
 /// terminal observation rather than an `Err`: an unreadable cluster has not
 /// converged, and that is a verdict, not a crash. The target revision is
 /// pinned exactly as in [`wait`].
-pub(super) async fn wait_for_observation(opts: &CommonOpts) -> Observation {
+pub(super) async fn wait_for_observation(
+    opts: &CommonOpts,
+    requested_manifest: Option<&str>,
+) -> Observation {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     let mut carried = Observation::default();
     let mut expected = None;
     loop {
-        let observed = observe_pinned(opts, expected, Some(deadline)).await;
+        let observed = observe_pinned(opts, expected, requested_manifest, Some(deadline)).await;
         let result = match observed {
             Ok(result) => result,
             Err(error) => {
@@ -2516,7 +2526,7 @@ live\tPending\t\n";
                     Err(error) => (false, format!("{error:#}"), true),
                 },
                 "structured" => {
-                    let observed = wait_for_observation(&opts).await;
+                    let observed = wait_for_observation(&opts, None).await;
                     let success = observed.issues.is_empty();
                     if success { healthy(&observed); } else { assert!(!observed.holds(Facet::Rollout)); }
                     if expectation == "terminal-hook" { failed_facets(&observed, &[Facet::Hook, Facet::Rollout]); }

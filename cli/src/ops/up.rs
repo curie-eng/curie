@@ -6426,6 +6426,11 @@ async fn run_prepared_up(
         }
     }
 
+    if existing.is_some() {
+        super::runner_templates::reconcile(&opts.common).await?;
+        super::runner_templates::verify(&opts.common).await?;
+    }
+
     let step = cl.step("waiting for exact target workload convergence");
     if let Err(error) = convergence::wait(&opts.common, invocation).await {
         step.fail("not converged");

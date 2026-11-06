@@ -8,6 +8,7 @@ import aiohttp
 from aci_protocol import (
     QueuedTurn,
     SessionStatus,
+    TurnSource,
 )
 from channel_protocol.reply import (
     ReplyAck,
@@ -35,7 +36,37 @@ class _PressureResult:
     outcome: str
 
 
-async def notify_capacity_queued(self: Kernel, qevent: QueuedTurn) -> ReplyAck:
+def can_park(self: Kernel, qevent: QueuedTurn) -> bool:
+    return (
+        self._markers.supports_answer_outbox
+        and qevent.source is TurnSource.SLACK
+        and qevent.reply_handle is not None
+        and not self._is_approval_resume(qevent.event_id)
+        and not self._is_factory_work_item_turn(qevent.event_id)
+    )
+
+
+def _capacity_expiry_reply(approval_resume: bool, cause: str) -> str:
+    if approval_resume:
+        return (
+            constants._APPROVAL_CAPACITY_FAILED_REPLY
+            if cause == "delivery_exhausted"
+            else constants._APPROVAL_CAPACITY_UNKNOWN_REPLY
+            if cause == "grant_unknown"
+            else constants._APPROVAL_CAPACITY_EXPIRED_REPLY
+        )
+    return (
+        constants._CAPACITY_FAILED_REPLY
+        if cause == "delivery_exhausted"
+        else constants._CAPACITY_UNKNOWN_REPLY
+        if cause == "grant_unknown"
+        else constants._CAPACITY_EXPIRED_REPLY
+    )
+
+
+async def notify_capacity_queued(
+    self: Kernel, qevent: QueuedTurn, *, wait_reply_ref: str | None
+) -> ReplyAck:
     # A queued edit that starts after the answer must not replace it. An
     # edit already inside the sink is a different window: the notice lock
     # holds the wake until that send finishes. An unreadable terminality
@@ -49,11 +80,13 @@ async def notify_capacity_queued(self: Kernel, qevent: QueuedTurn) -> ReplyAck:
         raise
     if terminal:
         return ReplyAck()
+    if self._is_approval_resume(qevent.event_id):
+        qevent = await self._place_the_resumed_reply(qevent, wait_reply_ref=wait_reply_ref)
     try:
         return await self._reply_for(
             qevent,
             routing._route_from_handle(qevent),
-            "The agent is busy. Your request is queued and will start when space opens.",
+            "Your request is queued while sandbox admission is pending.",
             terminal=False,
         )
     finally:
@@ -67,6 +100,7 @@ async def expire_capacity_wait(
     lease: DeliveryLease,
     cause: str,
     grant_epoch: str | None,
+    wait_reply_ref: str | None,
     send_notice: bool = True,
 ) -> tuple[bool, str | None]:
     lease.raise_if_lost()
@@ -81,18 +115,14 @@ async def expire_capacity_wait(
         self._minted_refs.pop(qevent.event_id, None)
         self._terminal_reply_attempted.discard(qevent.event_id)
         return False, None
+    if self._is_approval_resume(qevent.event_id):
+        qevent = await self._place_the_resumed_reply(qevent, wait_reply_ref=wait_reply_ref)
     route = routing._route_from_handle(qevent)
     delivered = False
     reply_ref: str | None = None
     try:
         try:
-            text = (
-                constants._CAPACITY_FAILED_REPLY
-                if cause == "delivery_exhausted"
-                else constants._CAPACITY_UNKNOWN_REPLY
-                if cause == "grant_unknown"
-                else constants._CAPACITY_EXPIRED_REPLY
-            )
+            text = _capacity_expiry_reply(self._is_approval_resume(qevent.event_id), cause)
             ack = await self._reply_for(qevent, route, text)
             reply_ref = ack.ref
             delivered = True
@@ -123,15 +153,13 @@ async def resolve_capacity_grant(self: Kernel, qevent: QueuedTurn, epoch: str) -
     return await self._quiesce_capacity_epoch(routing._thread_key_for(qevent), epoch)
 
 
-async def notify_capacity_expired(self: Kernel, qevent: QueuedTurn, *, cause: str) -> ReplyAck:
+async def notify_capacity_expired(
+    self: Kernel, qevent: QueuedTurn, *, cause: str, wait_reply_ref: str | None
+) -> ReplyAck:
     try:
-        text = (
-            constants._CAPACITY_FAILED_REPLY
-            if cause == "delivery_exhausted"
-            else constants._CAPACITY_UNKNOWN_REPLY
-            if cause == "grant_unknown"
-            else constants._CAPACITY_EXPIRED_REPLY
-        )
+        if self._is_approval_resume(qevent.event_id):
+            qevent = await self._place_the_resumed_reply(qevent, wait_reply_ref=wait_reply_ref)
+        text = _capacity_expiry_reply(self._is_approval_resume(qevent.event_id), cause)
         return await self._reply_for(qevent, routing._route_from_handle(qevent), text)
     finally:
         self._minted_refs.pop(qevent.event_id, None)

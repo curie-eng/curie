@@ -237,6 +237,11 @@ if [ "$1" = template ]; then
     exit 0
 fi
 if [ "$1" = get ] && [ "$2" = values ]; then
+    if [ -f "${{0%/*}}/converged-helm-applied" ]; then
+        case " $* " in
+            *" --all "*) printf '%s\n' '{{"agentSandbox":{{"deploy":false}}}}'; exit 0 ;;
+        esac
+    fi
     if [ -n "$CURIE_CAPACITY_EXISTING_VALUES" ]; then
         printf '%s\n' "$CURIE_CAPACITY_EXISTING_VALUES"
         exit 0
@@ -256,6 +261,7 @@ if [ "$1" = upgrade ] && [ "$2" = --install ]; then
     # Snapshot the CLI's actual stderr at invocation, before Helm can return.
     cat "$CURIE_CAPACITY_STDERR" > "$CURIE_CAPACITY_STDERR_AT_INSTALL"
     printf '%s\n' "$*" >> "$CURIE_CAPACITY_UPGRADES"
+    : > "${{0%/*}}/converged-helm-applied"
     exit 0
 fi
 {}

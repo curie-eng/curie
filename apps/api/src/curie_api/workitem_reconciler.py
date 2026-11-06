@@ -249,7 +249,8 @@ class WorkItemReconciler:
                 )
             if isinstance(result, lifecycle.WorkItemOutcome):
                 logger.warning(
-                    "work item request %s expired waiting for capacity after %d deferrals",
+                    "work item request %s expired waiting for sandbox admission "
+                    "after %d capacity deferrals",
                     row.id,
                     row.capacity_deferrals,
                 )
@@ -336,7 +337,7 @@ class WorkItemReconciler:
                     )
                     .where(
                         ExecutionRequest.status == "cancellation_requested",
-                        ExecutionRequest.terminal_cause == "issue_cancelled",
+                        ExecutionRequest.terminal_cause.in_(("issue_cancelled", "issue_deleted")),
                         ExecutionRequest.cancellation_requested_at.is_not(None),
                         ExecutionRequest.cancellation_requested_at
                         <= now - timedelta(seconds=settle_seconds),

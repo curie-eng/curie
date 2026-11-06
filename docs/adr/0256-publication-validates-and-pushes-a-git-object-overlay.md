@@ -2,9 +2,11 @@
 
 Date: 2026-10-31
 
-Status: Draft
+Status: Accepted
 
-This Draft proposes to partially supersede two Decision clauses of
+Accepted 2026-11-05 with explicit maintainer approval from TheConnMan.
+
+This decision partially supersedes two Decision clauses of
 [ADR 0125](0125-managed-repository-workspaces-and-approval-gated-publication.md):
 the worker "validates the binary patch, base commit, repository, paths, and the
 private base archive", and the Job "clones, branches, safely applies, commits,
@@ -12,10 +14,9 @@ and pushes". Publication instead validates an object-bound private source
 receipt and constructs a revision without a full checkout. This retains
 ADR 0147's "validated against a privately-held base" guardrail: the receipt,
 prepared commit/tree and validated manifest remain private platform authority.
-It does not authorize implementation. ADR 0125 is not edited by this Draft.
-Acceptance must add the partial-supersession back-link required by
+The partial-supersession back-link required by
 [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)
-without rewriting ADR 0125's body or changing its Accepted status.
+is on ADR 0125. ADR 0125 stays Accepted and its decision text is unchanged.
 [ADR 0147](0147-publication-approval-is-a-per-agent-operator-policy.md),
 [ADR 0186](0186-a-factory-ticket-declares-its-base-and-keeps-it.md), and
 [ADR 0197](0197-the-factory-reaches-code-hosts-and-trackers-through-two-ports.md)

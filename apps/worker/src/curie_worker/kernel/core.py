@@ -286,6 +286,7 @@ class Kernel:
     _escalate = attempt._escalate
     _backoff = attempt._backoff
     _to_event = staticmethod(attempt._to_event)
+    _can_park = capacity.can_park
     notify_capacity_queued = capacity.notify_capacity_queued
     expire_capacity_wait = capacity.expire_capacity_wait
     resolve_capacity_grant = capacity.resolve_capacity_grant
@@ -310,6 +311,7 @@ class Kernel:
     sweep_pending_completions = completion.sweep_pending_completions
     _set_shimmer = completion._set_shimmer
     _emit_status = completion._emit_status
+    forget_delivery = delivery.forget_delivery
     notify_turn_not_started = delivery.notify_turn_not_started
     notify_broker_entry_vanished = delivery.notify_broker_entry_vanished
     interrupt_thread = delivery.interrupt_thread
