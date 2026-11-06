@@ -1062,6 +1062,13 @@ async def current_source_authority(
                     limits=credential.limits, deadline=deadline,
                 )
                 if not isinstance(observation, HttpIdentityObservation):
+                    # Continue before _unavailable(); that helper's HTTPException is re-raised.
+                    if (
+                        isinstance(observation, FactsRefusal)
+                        and observation.code == "unavailable"
+                        and loop.time() < deadline
+                    ):
+                        continue
                     _unavailable()
                 async with identity_fence.mutation(factory, valkey) as writer:
                     async with writer.begin():
