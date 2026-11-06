@@ -21,13 +21,13 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from .binding import binding_state_path
 from .runner_client import _DEFAULT_INTERRUPT_TIMEOUT_S
 
 if TYPE_CHECKING:
@@ -263,8 +263,8 @@ class SweepCoverage:
             if run.binding is not None:
                 kind, address = run.binding
                 urls.append(
-                    f"{self._base}/agents/{run.agent_id}/state/bindings/"
-                    f"{quote(kind, safe='')}/{quote(address, safe='')}/memory"
+                    f"{self._base}/agents/{run.agent_id}/state/"
+                    f"{binding_state_path(kind, address)}/memory"
                 )
             sources = await asyncio.gather(*(self._entries(run, url) for url in urls))
             return SweepRead(
