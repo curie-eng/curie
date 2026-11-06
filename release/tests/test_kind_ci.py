@@ -43,7 +43,10 @@ REQUIRED = frozenset(
         "E2E released chart upgrade negative control (nil unsafe helpers)",
         "E2E cluster upgrade matrix shards",
         "E2E required",
-        *(f"E2E chart runtime regressions (kind, Calico, {leg})" for leg in ("chart", "workload")),
+        *(
+            f"E2E chart runtime regressions (kind, Calico, {leg})"
+            for leg in ("chart", "upgrade", "workload")
+        ),
         *(
             f"E2E scripted factory (kind, scripted model, {suite})"
             for suite in (
@@ -67,7 +70,11 @@ CURRENT_JOBS = [
 ] + [
     {"name": name, "status": "completed", "conclusion": "success"}
     for name in sorted(REQUIRED)
-    if "initial-binding-" in name or name.startswith("Admitted agent runtime regressions")
+    if (
+        "initial-binding-" in name
+        or name.startswith("Admitted agent runtime regressions")
+        or name == "E2E chart runtime regressions (kind, Calico, upgrade)"
+    )
 ]
 
 GH = r'''#!/usr/bin/env python3
@@ -237,9 +244,9 @@ def test_canonical_required_jobs_ignore_environment_override(
 ) -> None:
     monkeypatch.setenv("CURIE_E2E_SHARDS_OVERRIDE", "s01 nosetup fresh-n")
     assert kind_ci.required_job_names(ROOT, deadline=time.monotonic() + 8) == REQUIRED
-    assert len(REQUIRED) == 40
+    assert len(REQUIRED) == 41
     assert len(HISTORY["jobs"]) == 80
-    assert len(CURRENT_JOBS) == 84
+    assert len(CURRENT_JOBS) == 85
     assert reasons(kind_ci) == []
 
 

@@ -509,10 +509,10 @@ def test_chart_legs_upload_distinct_receipts_the_required_verdict_merges() -> No
     assert download["merge-multiple"] is True
     names = {
         name.replace("${{ github.job }}", CHART_JOB).replace("${{ matrix.leg }}", leg)
-        for leg in ("chart", "workload")
+        for leg in ("chart", "upgrade", "workload")
     }
-    # Two legs uploading one name would collide; each leg needs its own artifact.
-    assert len(names) == 2
+    # Legs that share one artifact name would collide; each leg needs its own.
+    assert len(names) == 3
     for artifact in names:
         assert "${{" not in artifact
         assert fnmatch.fnmatchcase(artifact, download["pattern"]), artifact
