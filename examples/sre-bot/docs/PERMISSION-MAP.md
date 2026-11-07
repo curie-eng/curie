@@ -201,6 +201,35 @@ anything, and cannot act in another namespace. A leaked token can set those
 Deployments' replica counts, zero included, and nothing else; RBAC stays the
 ceiling even if the connector's own allowlist is wider than the Role.
 
+## `restart_deployment()` (opt-in restarter connector)
+
+Tool: `mcp__restarter__restart_deployment(name, restart_at)`, only after an
+operator opts in. The default bundle does not declare the `restarter`
+connector, names none of its tools, and does not apply its credential. The
+opt-in declaration is `connectors/restarter/opt-in.yaml`; it adds
+`restarter/restart_deployment` as `approval-required` with its own
+`sre-approvals` gate, and nothing as `allow`.
+
+The tool sets the `kubectl.kubernetes.io/restartedAt` annotation on the pod
+template of one Deployment in the one namespace the connector is configured for
+(`RESTARTER_NAMESPACE`), only for a name on its allowlist
+(`RESTARTER_DEPLOYMENTS`), so the controller replaces its Pods. The same
+`restart_at` twice, or a `restart_at` older than the last restart, changes
+nothing; a future one is refused. Every reply carries a sealed prior state, the
+version the write left and the target, so a platform executed remediation can
+record and qualify it as idempotent (see the README's restarter section). The
+connector serves no `restore`, so nothing it does is undoable.
+
+The connector identity is a separate ServiceAccount, `sre-bot-restarter`, from
+`manifests/restarter-access.yaml`. Its Role grants `get` and `patch` on
+`deployments` only, in the one namespace, with `resourceNames` limited to the
+allowlisted Deployments. It cannot list anything, delete or read Pods, read
+Secrets, or act in another namespace. RBAC cannot narrow `patch` to one field:
+a leaked token can change anything in those Deployments' spec, the image
+included, and `get` shows their pod templates. The connector itself sends only
+the one annotation and returns nothing of the template; RBAC stays the ceiling
+even if the connector's own allowlist is wider than the Role.
+
 ## Retention and evidence
 
 Kubernetes Events and pod logs are short-lived. Approval records show a call

@@ -3054,6 +3054,10 @@ ordinary approval path on a **disposable target inside the policy's bounds**:
      leaves the ledger record without a `post_version`, so it cannot produce
      this evidence: recording the qualification is refused
      `evidence_not_idempotent` and the action cannot be made automatic.
+     The SRE example's opt-in
+     [`restarter`](../examples/sre-bot/README.md#remediation-restarter-connector-opt-in)
+     is such a connector for a rolling restart: its `restart_at` token makes a
+     repeat write nothing and leave the same `post_version`.
 4. **Run the verifier twice** against a literal member of the action's allowed
    targets, with the target recovered (outcome `verified`) and not recovered
    (`not-recovered`), under the same verifier declaration:

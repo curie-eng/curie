@@ -1,0 +1,106 @@
+# The credential for the opt-in restarter connector (connectors/restarter).
+# Apply it only when you opt in to that connector; the default install neither
+# declares the connector nor applies this file.
+#
+#     kubectl apply -f examples/sre-bot/manifests/restarter-access.yaml
+#
+# SEPARATE FROM manifests/kubernetes-access.yaml AND manifests/scaler-access.yaml,
+# and it must stay that way. The scaler's identity can reach only the `scale`
+# subresource and never a pod template; a restart has to patch the pod template,
+# so this identity can. Sharing either credential would widen the other.
+#
+# Why each verb is here
+# ---------------------
+# `get` on deployments    -- the connector reads the uid, resourceVersion,
+#                            `spec.paused` and the restartedAt annotation it
+#                            seals before a write.
+# `patch` on deployments  -- the write itself: a JSON merge patch of the one
+#                            annotation, carrying the read's uid and
+#                            resourceVersion as preconditions, so a concurrent
+#                            change answers 409 instead of being overwritten.
+#
+# Deliberately absent:
+# `update`                -- the connector never replaces the object.
+# `list` / `watch`        -- `resourceNames` cannot narrow them, and the
+#                            connector reads only named objects.
+# `delete`, pods, secrets -- a restart needs none of them; the controller
+#                            replaces the Pods.
+#
+# The worst case, for a remediation qualification's statement: RBAC cannot
+# narrow `patch` to one field, so whoever holds this token can change anything
+# in the named Deployments' spec, including the image. `get` exposes their pod
+# templates, including literal env values. The connector sends only the one
+# annotation and returns nothing of the template; keep the token out of bundle
+# content and the allowlist as short as it can be.
+#
+# The `resourceNames` below and the connector's RESTARTER_DEPLOYMENTS are two
+# places on purpose: a ceiling stated once could move when someone edits the
+# other place. The Role is the ceiling even when the connector's list is wider.
+#
+# Verify the ceiling after applying:
+#
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-restarter \
+#     patch deployments/example-api -n sre-demo                       # yes
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-restarter \
+#     get deployments/example-api -n sre-demo                         # yes
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-restarter \
+#     patch deployments/example-other -n sre-demo                     # no
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-restarter \
+#     update deployments/example-api -n sre-demo                      # no
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-restarter \
+#     list deployments -n sre-demo                                    # no
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-restarter \
+#     delete pods -n sre-demo                                         # no
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-restarter \
+#     patch deployments/example-api -n curie                          # no
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sre-bot-restarter
+  # The namespace the Curie release runs in, like the other connector identities.
+  namespace: curie
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sre-bot-restarter
+  # CHANGE ME with RESTARTER_NAMESPACE: the one namespace the connector acts in.
+  namespace: sre-demo
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames:
+      # CHANGE ME with RESTARTER_DEPLOYMENTS: the Deployments this connector
+      # may restart. A placeholder name grants nothing until such a Deployment
+      # exists.
+      - example-api
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sre-bot-restarter
+  namespace: sre-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sre-bot-restarter
+subjects:
+  - kind: ServiceAccount
+    name: sre-bot-restarter
+    # Indented under `subjects`, not `metadata.namespace`. Getting it wrong does
+    # not fail `kubectl apply`; the binding simply grants nothing.
+    namespace: curie
+---
+# The connector reads a static file-mounted kubeconfig and cannot refresh a
+# projected token, so this mints the non-expiring token that kubeconfig holds.
+# Keep this credential out of bundle content.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sre-bot-restarter-token
+  namespace: curie
+  annotations:
+    kubernetes.io/service-account.name: sre-bot-restarter
+type: kubernetes.io/service-account-token
