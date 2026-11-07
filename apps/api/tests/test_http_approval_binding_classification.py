@@ -135,6 +135,7 @@ def _insert(
 
 def _route(binding: dict[str, Any], approvers: list[str]) -> None:
     """@spec HTTP-APPROVAL-CONTINUITY-14: a legacy approval route with an explicit user list."""
+    address = binding["address"] if binding["kind"] == "slack" else "C0EXAMPLE1"
 
     async def write(factory: async_sessionmaker[AsyncSession]) -> None:
         """@spec HTTP-APPROVAL-CONTINUITY-14."""
@@ -142,7 +143,7 @@ def _route(binding: dict[str, Any], approvers: list[str]) -> None:
             agent = await session.get(Agent, uuid.UUID(binding["agent"]))
             assert agent is not None
             agent.approval_routes = {ROUTE: {
-                "resolution": {"kind": binding["kind"], "address": binding["address"]},
+                "resolution": {"kind": "slack", "address": address},
                 "approvers": {"users": approvers},
             }}
 
@@ -181,7 +182,10 @@ def test_legacy_binding_in_an_adopted_tenant_keeps_the_legacy_approval_path(
     sibling = _sibling(scope, kind=kind)
     _route(sibling, ["U0EXAMPLEOTHER"])
     with TestClient(_app(scope, synthetic_provider, initialized=initialized)) as client:
-        body = _body(sibling, route=ROUTE)
+        body = _body(
+            sibling, route=ROUTE,
+            card_channel=sibling["address"] if kind == "slack" else "C0EXAMPLE1",
+        )
         response = _create(client, body)
         assert response.status_code == 201, response.text
         stored = _stored(body["dedupe_key"])
