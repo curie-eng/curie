@@ -303,7 +303,9 @@ token past the verifier's 4096 characters
 `apps/worker/src/curie_worker/caller_token.py::MAX_TOKEN_CHARS`). The proxy
 returns the principal only on an admitted decision
 (`apps/worker/src/curie_connector_proxy/caller.py::Principal`), never on an
-`expired` or `not_admitted` refusal, and never logs it. A requester adds no
+`expired` or `not_admitted` refusal, and never logs it. Its decision log line
+ends `principal=present` or `principal=absent` on an admitted `cct` and has no
+principal field on a refusal or a `ccr`. A requester adds no
 admission: `admits` still judges only the agent. A `ccr` never carries a
 principal, and one that does is `invalid`
 (`apps/worker/src/curie_connector_proxy/caller.py::decide_route`), so a route

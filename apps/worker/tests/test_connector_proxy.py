@@ -1106,5 +1106,5 @@ def test_a_replayed_grant_logs_not_spent(caplog: pytest.LogCaptureFixture) -> No
     with caplog.at_level(logging.INFO, logger="curie_connector_proxy"):
         _run(go)
     lines = [r.getMessage() for r in caplog.records if "outcome=" in r.getMessage()]
-    assert lines[0].endswith("outcome=admitted method=POST path='/mcp'")
+    assert lines[0].endswith("outcome=admitted method=POST path='/mcp' principal=absent")
     assert lines[1].endswith(f"grant={server.GRANT_NOT_SPENT}")

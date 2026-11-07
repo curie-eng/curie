@@ -1451,6 +1451,13 @@ def build_runner(
                 # progress demo runs the real handler (ADR 0130).
                 turn_progress=turn_progress,
                 tool_access=tool_access,
+                # ADR 0270 evidence: the hosted entries the caller proxy fronts,
+                # read here, after materialization, so ``[fake:connector-call]``
+                # dials each with its real caller header.
+                connector_servers={
+                    name: derived_mcp_servers[name]
+                    for name in proxied_connector_servers(derived_mcp_servers)
+                },
             )
         if preflight_block is not None:
             return PreflightBlockedSession(preflight_block, model=config.model)

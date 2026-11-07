@@ -2522,6 +2522,11 @@ The path, and what an operator can check on each hop:
 The fake model is network-free, including when progress headers are present.
 Use a live model or the API/worker integration fixture to exercise the ingress;
 `[fake:progress-demo]` is only a deterministic long turn for steering tests.
+Its one network directive, `[fake:connector-call]`, sends one MCP `initialize`
+and one `tools/list` to each hosted connector behind the caller proxy and
+answers one `connector-call <name>: ok tools=<n> caller=<fp>` or
+`... failed <reason> caller=<fp>` line each; `<fp>` is a sha256 prefix of the
+caller token, never the token.
 
 With an integration turn, inspect the durable result with:
 
