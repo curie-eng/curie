@@ -47,10 +47,12 @@ for your client. If `skills` is unrecognized, use the
 Then ask for a proposal:
 
 ```text
-Use the factory-environment-setup skill to review <repository binding>.
+Review the runner environment for <repository binding> and propose
+any changes needed for factory work.
 ```
 
-The skill compares repository checks and recent work with the runner image.
+This should select the installed `factory-environment-setup` skill. It
+compares repository checks and recent work with the runner image.
 Review its tool versions, checks, access needs, and rollback digest. Approve
 a concrete change, then verify the new digest and run checks in a sandbox
 claim. Restore the old binding if checks fail. See
@@ -63,10 +65,11 @@ curie cluster work-items --agent dark-factory
 ```
 
 ```text
-Use the factory-environment-maintenance skill to review <factory>
-over the last 30 days.
+Review factory failures for <factory> over the last 30 days and
+propose repairs.
 ```
 
+This should select the installed `factory-environment-maintenance` skill.
 Review grouped failures and a proposed repair. Image tools belong in the
 runner; network, credentials, CI, capacity, and instructions have other
 owners. Compare outcomes in a later window. The maintenance skill neither

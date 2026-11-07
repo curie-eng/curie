@@ -35,12 +35,13 @@ use their provider quickstart.
 2. **Prepare the issue** in your coding agent:
 
    ```text
-   Use the prepare-factory-ticket skill to add greeting.md with exactly
+   Prepare this change for the Software Factory: add greeting.md with exactly
    "# Hello, factory" and a final newline. Include this verification command:
    `printf '# Hello, factory\n' | cmp - greeting.md`
    ```
 
-   Review the full issue. For existing work, give the skill the issue URL.
+   This should select the installed `prepare-factory-ticket` skill. Review
+   the full issue. For existing work, provide the issue URL.
    See [ticket preparation](factory-preparation.md).
 
 3. **Start the factory.** Choose **publish and start the factory** after
@@ -57,10 +58,11 @@ use their provider quickstart.
 5. **Verify the PR.** Open its link and run:
 
    ```text
-   Use the review-pr skill to inspect <pr-url> and guide my local checks.
+   Walk me through this PR and help me test it locally: <pr-url>
    ```
 
-   Compare the diff with the issue, inspect CI, and run local checks. For
+   This should select the installed `review-pr` skill. Compare the diff
+   with the issue, inspect CI, and run local checks. For
    the example, run the `cmp` command in the PR checkout. See
    [guided PR review](factory-pr-review.md).
 
