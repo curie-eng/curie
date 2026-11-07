@@ -4064,7 +4064,9 @@ fn default_install_applies_one_identity_with_a_fixed_demo_namespace_ceiling() {
         "write authority must stay in the disposable namespace"
     );
     assert!(
-        !access.contains("sre-bot-writer") && !access.contains("sre-bot-scaler"),
+        !access.contains("sre-bot-writer")
+            && !access.contains("sre-bot-scaler")
+            && !access.contains("sre-bot-restarter"),
         "removed bespoke identities must not survive in rendered RBAC: {access}"
     );
 }

@@ -1967,12 +1967,17 @@ jobs:
             context: examples/sre-bot/connectors/self-upgrade
             dockerfile: examples/sre-bot/connectors/self-upgrade/Dockerfile
             platforms: linux/amd64,linux/arm64
-          # Opt-in and undeclared by default, so release.yaml does not publish
-          # it; an operator who opts in builds it with `curie build`. Built
-          # here so its Dockerfile cannot break unnoticed on either architecture.
+          # Opt-in and undeclared by default, as is the restarter below, so
+          # release.yaml does not publish either; an operator who opts in builds
+          # it with `curie build`. Built here so neither Dockerfile can break
+          # unnoticed on either architecture.
           - name: sre-bot-scaler
             context: examples/sre-bot/connectors/scaler
             dockerfile: examples/sre-bot/connectors/scaler/Dockerfile
+            platforms: linux/amd64,linux/arm64
+          - name: sre-bot-restarter
+            context: examples/sre-bot/connectors/restarter
+            dockerfile: examples/sre-bot/connectors/restarter/Dockerfile
             platforms: linux/amd64,linux/arm64
           # Opt-in and undeclared by default, like the scaler it verifies.
           - name: sre-bot-metrics
