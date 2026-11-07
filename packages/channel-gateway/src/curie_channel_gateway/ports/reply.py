@@ -67,11 +67,17 @@ class DeclaredReplyTransport[Route: Hashable]:
         self._transport = transport
         self._declarations = MappingProxyType(dict(declarations))
 
+    def _capabilities(self, kind: str, route: Route) -> ReplyCapabilities:
+        try:
+            return self._declarations[kind, route]
+        except KeyError:
+            raise KeyError("reply route has no capability declaration") from None
+
     def edits_in_place(self, kind: str, route: Route) -> bool:
-        return self._declarations[kind, route].edits_in_place
+        return self._capabilities(kind, route).edits_in_place
 
     def undeliverable_reason(self, kind: str, route: Route) -> str | None:
-        return self._declarations[kind, route].undeliverable_reason
+        return self._capabilities(kind, route).undeliverable_reason
 
     async def emit(
         self,
@@ -80,7 +86,7 @@ class DeclaredReplyTransport[Route: Hashable]:
         route: Route,
         best_effort_unreachable: bool = False,
     ) -> ReplyAck:
-        _ = self._declarations[event.target.kind, route]
+        self._capabilities(event.target.kind, route)
         return await self._transport.emit(
             event, route=route, best_effort_unreachable=best_effort_unreachable
         )

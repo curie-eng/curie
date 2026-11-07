@@ -88,8 +88,15 @@ def test_slack_capabilities_survive_http_delivery_and_kernel_routing() -> None:
                 transport.edits_in_place("email", good)
             with pytest.raises(KeyError):
                 router.undeliverable_reason("slack", TargetRoute(adapter="undeclared"))
-            with pytest.raises(KeyError):
-                await router.emit(event, route=TargetRoute(adapter="undeclared"))
+            with pytest.raises(KeyError) as refused:
+                await router.emit(
+                    event,
+                    route=TargetRoute(
+                        endpoint="https://example.com/reply?secret=test-private-value",
+                        adapter="undeclared",
+                    ),
+                )
+            assert "test-private-value" not in str(refused.value)
             assert receiver_calls == [event]
             assert len(posts) == 1
         finally:
