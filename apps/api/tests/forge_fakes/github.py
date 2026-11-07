@@ -594,6 +594,10 @@ class GitHubRepositoryFake:
         # Requested account id -> the `GET /user/{account_id}` payload (#5414).
         # https://docs.github.com/en/rest/users/users#get-a-user-using-their-id
         self.accounts: dict[str, dict[str, Any]] = {}
+        # The immutable id GitHub reports for this repository on both pull
+        # request sides (``head.repo.id``, ``base.repo.id``).
+        # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+        self.repository_id = REPO_ID
         self.branches: dict[str, str] = {}
         self.commits: dict[str, dict[str, Any]] = {}
         self.pulls: dict[int, dict[str, Any]] = {}
@@ -871,7 +875,7 @@ class GitHubRepositoryFake:
 
     def _pull_payload(self, number: int) -> dict[str, Any]:
         pull = self.pulls[number]
-        side = {"repo": {"id": REPO_ID, "full_name": REPO}}
+        side = {"repo": {"id": self.repository_id, "full_name": REPO}}
         return {
             "number": number,
             "node_id": f"PR_fixture_{number}",
