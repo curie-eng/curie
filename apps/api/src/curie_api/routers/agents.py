@@ -376,6 +376,17 @@ async def update_agent(
     # on. Both nullable overrides get it -- they are the same seam, and fixing
     # one beside the other would leave the sibling broken on an adjacent line.
     sent = data.model_fields_set
+    if "factory_slack_channel" in sent:
+        # First among the writes: each helper commits on its own, so a refusal
+        # here leaves no other field of this request persisted.
+        try:
+            agent = await crud_agents.update_agent_factory_slack_channel(
+                session, agent, data.factory_slack_channel
+            )
+        except crud_agents.FactorySlackChannelUnbound:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, {"code": "factory_slack_channel_unbound"}
+            ) from None
     if "model" in sent:
         agent = await crud_agents.update_agent_model(session, agent, data.model)
     if "reviewer_model" in sent:

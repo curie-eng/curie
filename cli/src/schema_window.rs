@@ -764,8 +764,9 @@ print(json.dumps(graph))
         // The 0145 join also requires the stable deadline backport (0140).
         // The UI evidence reconciler reads the tables 0146 introduces, and the
         // 0148 join also requires the deleted issue cancellation shape (0147).
-        assert_eq!(candidate.schema_min, "0148");
-        assert_eq!(candidate.schema_head, "0148");
+        // The factory Slack progress loop reads the tables 0149 introduces.
+        assert_eq!(candidate.schema_min, "0149");
+        assert_eq!(candidate.schema_head, "0149");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -804,7 +805,8 @@ print(json.dumps(graph))
         assert!(!live_in_window("0145", &current));
         assert!(!live_in_window("0146", &current));
         assert!(!live_in_window("0147", &current));
-        assert!(live_in_window("0148", &current));
+        assert!(!live_in_window("0148", &current));
+        assert!(live_in_window("0149", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

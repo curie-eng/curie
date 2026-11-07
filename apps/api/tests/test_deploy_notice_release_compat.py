@@ -48,14 +48,14 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # policies (0121), directory authority (0122), attachment catalogs (0130),
     # and the stable twelve-hour execution deadline (0140), joined by 0145,
     # publication UI evidence (0146), and deleted issue cancellation (0147),
-    # joined by 0148.
+    # joined by 0148, then the factory Slack progress tables (0149).
     released_0130 = {"schema_min": "0108", "schema_head": "0108"}
     # @spec AGENT-ROLE-PERSISTENCE-V1-9: policy ORM reads require 0133.
     # @spec HTTP-APPROVAL-CONTINUITY-5: approval ORM reads require the 0137 column.
     # @spec AUTOMATED-REMEDIATION-15: 0138 only widens a CHECK.
     # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
     # Workspace recovery reads require the 0141 outcome ledger.
-    candidate = {"schema_min": "0148", "schema_head": "0148"}
+    candidate = {"schema_min": "0149", "schema_head": "0149"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
@@ -63,7 +63,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["windows"]["0.12.3"] == {"schema_min": "0076", "schema_head": "0093"}
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == released_0130
-    assert catalog["revisions"][-32:] == [
+    assert catalog["revisions"][-33:] == [
         "0095",
         "0096",
         "0097",
@@ -96,6 +96,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
         "0146",
         "0147",
         "0148",
+        "0149",
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(

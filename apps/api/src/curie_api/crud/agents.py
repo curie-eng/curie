@@ -405,3 +405,41 @@ async def update_agent_reviewer_model(
     await session.commit()
     await session.refresh(agent)
     return agent
+
+
+class FactorySlackChannelUnbound(Exception):
+    """The agent does not hold exactly one Slack binding, with an identity, there."""
+
+
+async def update_agent_factory_slack_channel(
+    session: AsyncSession, agent: Agent, channel: str | None
+) -> Agent:
+    """Set or clear the factory Slack destination (#5414).
+
+    A channel names the agent's one Slack binding for that address whose
+    adapter is the posting identity. A changed channel restarts
+    ``factory_slack_since`` on the database clock; null clears both.
+    """
+
+    if channel is None:
+        agent.factory_slack_channel = None
+        agent.factory_slack_since = None
+    else:
+        bindings = await session.scalar(
+            select(func.count())
+            .select_from(AgentChannel)
+            .where(
+                AgentChannel.agent_id == agent.id,
+                AgentChannel.kind == "slack",
+                AgentChannel.address == channel,
+                AgentChannel.adapter.is_not(None),
+            )
+        )
+        if bindings != 1:
+            raise FactorySlackChannelUnbound(channel)
+        if agent.factory_slack_channel != channel or agent.factory_slack_since is None:
+            agent.factory_slack_channel = channel
+            agent.factory_slack_since = func.now()
+    await session.commit()
+    await session.refresh(agent)
+    return agent
