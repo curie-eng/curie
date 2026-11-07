@@ -669,7 +669,7 @@ The shared capacity vectors use the same compact execution arguments, agent
 | Principal shape | Largest fitting set and reserved grant length | First refusal |
 | --- | --- | --- |
 | Short synthetic issuer (22 characters), short subjects | 12 approvers, 3,943 characters | 13 approvers, 4,141 characters |
-| Okta-shaped issuer (39 characters), 20-character subjects | 10 approvers, 4,090 characters | 11 approvers, 4,335 characters |
+| Okta-shaped issuer (39 characters), 21-character subjects | 10 approvers, 4,090 characters | 11 approvers, 4,335 characters |
 | Entra-shaped issuer (76 characters), UUID subjects | 7 approvers, 4,094 characters | 8 approvers, 4,431 characters |
 | Short principals, each with one full recipient account | 3 approvers, 3,481 characters | 4 approvers, 4,110 characters |
 

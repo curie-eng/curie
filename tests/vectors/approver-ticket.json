@@ -5458,6 +5458,695 @@
       "now": 1700000001,
       "code": "invalid_ticket",
       "signature_valid": true
+    },
+    {
+      "name": "principal_trailing_whitespace_u0020",
+      "payload": {
+        "version": 1,
+        "purpose": "approval_request",
+        "tenant_id": "00000000-0000-4000-8000-000000000001",
+        "agent_id": "00000000-0000-4000-8000-000000000002",
+        "connector": "access",
+        "tool": "execute",
+        "route": "access",
+        "key_id": "selector-test-1",
+        "requester": {
+          "tenant_id": "00000000-0000-4000-8000-000000000001",
+          "issuer": "https://id.example.com",
+          "subject": "person "
+        },
+        "nonce": "aJGT-eKeZzwIH8VdJf8aqZ6cmg-XoCWFXpaJqxvBzh4",
+        "issued_at": 1700000000,
+        "expires_at": 1700000300,
+        "arguments_sha256": "0b6fd2d4e6e0f4732dfbcb5124c8301a3090fb103908d73051a0dda31ca2573f",
+        "approvers": [
+          {
+            "tenant_id": "00000000-0000-4000-8000-000000000001",
+            "issuer": "https://id.example.com",
+            "subject": "approver"
+          }
+        ]
+      },
+      "ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInN1YmplY3QiOiJhcHByb3ZlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9XSwiYXJndW1lbnRzX3NoYTI1NiI6IjBiNmZkMmQ0ZTZlMGY0NzMyZGZiY2I1MTI0YzgzMDFhMzA5MGZiMTAzOTA4ZDczMDUxYTBkZGEzMWNhMjU3M2YiLCJjb25uZWN0b3IiOiJhY2Nlc3MiLCJleHBpcmVzX2F0IjoxNzAwMDAwMzAwLCJpc3N1ZWRfYXQiOjE3MDAwMDAwMDAsImtleV9pZCI6InNlbGVjdG9yLXRlc3QtMSIsIm5vbmNlIjoiYUpHVC1lS2VaendJSDhWZEpmOGFxWjZjbWctWG9DV0ZYcGFKcXh2QnpoNCIsInB1cnBvc2UiOiJhcHByb3ZhbF9yZXF1ZXN0IiwicmVxdWVzdGVyIjp7Imlzc3VlciI6Imh0dHBzOi8vaWQuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoicGVyc29uICIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9LCJyb3V0ZSI6ImFjY2VzcyIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInRvb2wiOiJleGVjdXRlIiwidmVyc2lvbiI6MX0.KVMAqN7Ni7Iy1jBhr5AdgtbrPj7Q4prEWDH4gjPKOqFF1i9EfgX3EmM3lPli8pfU_5b9NE3908bbHeaPCyXrDg",
+      "arguments": {
+        "resource": "example",
+        "level": "read",
+        "nested": {
+          "approval_ticket": "execution data"
+        },
+        "amount": 1.0,
+        "note": "caf\u00e9",
+        "approval_ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInN1YmplY3QiOiJhcHByb3ZlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9XSwiYXJndW1lbnRzX3NoYTI1NiI6IjBiNmZkMmQ0ZTZlMGY0NzMyZGZiY2I1MTI0YzgzMDFhMzA5MGZiMTAzOTA4ZDczMDUxYTBkZGEzMWNhMjU3M2YiLCJjb25uZWN0b3IiOiJhY2Nlc3MiLCJleHBpcmVzX2F0IjoxNzAwMDAwMzAwLCJpc3N1ZWRfYXQiOjE3MDAwMDAwMDAsImtleV9pZCI6InNlbGVjdG9yLXRlc3QtMSIsIm5vbmNlIjoiYUpHVC1lS2VaendJSDhWZEpmOGFxWjZjbWctWG9DV0ZYcGFKcXh2QnpoNCIsInB1cnBvc2UiOiJhcHByb3ZhbF9yZXF1ZXN0IiwicmVxdWVzdGVyIjp7Imlzc3VlciI6Imh0dHBzOi8vaWQuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoicGVyc29uICIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9LCJyb3V0ZSI6ImFjY2VzcyIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInRvb2wiOiJleGVjdXRlIiwidmVyc2lvbiI6MX0.KVMAqN7Ni7Iy1jBhr5AdgtbrPj7Q4prEWDH4gjPKOqFF1i9EfgX3EmM3lPli8pfU_5b9NE3908bbHeaPCyXrDg"
+      },
+      "now": 1700000001,
+      "code": "invalid_ticket",
+      "signature_valid": true
+    },
+    {
+      "name": "principal_trailing_whitespace_u2028",
+      "payload": {
+        "version": 1,
+        "purpose": "approval_request",
+        "tenant_id": "00000000-0000-4000-8000-000000000001",
+        "agent_id": "00000000-0000-4000-8000-000000000002",
+        "connector": "access",
+        "tool": "execute",
+        "route": "access",
+        "key_id": "selector-test-1",
+        "requester": {
+          "tenant_id": "00000000-0000-4000-8000-000000000001",
+          "issuer": "https://id.example.com",
+          "subject": "person\u2028"
+        },
+        "nonce": "aJGT-eKeZzwIH8VdJf8aqZ6cmg-XoCWFXpaJqxvBzh4",
+        "issued_at": 1700000000,
+        "expires_at": 1700000300,
+        "arguments_sha256": "0b6fd2d4e6e0f4732dfbcb5124c8301a3090fb103908d73051a0dda31ca2573f",
+        "approvers": [
+          {
+            "tenant_id": "00000000-0000-4000-8000-000000000001",
+            "issuer": "https://id.example.com",
+            "subject": "approver"
+          }
+        ]
+      },
+      "ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInN1YmplY3QiOiJhcHByb3ZlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9XSwiYXJndW1lbnRzX3NoYTI1NiI6IjBiNmZkMmQ0ZTZlMGY0NzMyZGZiY2I1MTI0YzgzMDFhMzA5MGZiMTAzOTA4ZDczMDUxYTBkZGEzMWNhMjU3M2YiLCJjb25uZWN0b3IiOiJhY2Nlc3MiLCJleHBpcmVzX2F0IjoxNzAwMDAwMzAwLCJpc3N1ZWRfYXQiOjE3MDAwMDAwMDAsImtleV9pZCI6InNlbGVjdG9yLXRlc3QtMSIsIm5vbmNlIjoiYUpHVC1lS2VaendJSDhWZEpmOGFxWjZjbWctWG9DV0ZYcGFKcXh2QnpoNCIsInB1cnBvc2UiOiJhcHByb3ZhbF9yZXF1ZXN0IiwicmVxdWVzdGVyIjp7Imlzc3VlciI6Imh0dHBzOi8vaWQuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoicGVyc29uXHUyMDI4IiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn0sInJvdXRlIjoiYWNjZXNzIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwidG9vbCI6ImV4ZWN1dGUiLCJ2ZXJzaW9uIjoxfQ.MYHU30jSOLw98RBxH-FBeKVgsjhoNL8DpfJajPOrsrjlGvxO1VQJqe6qtvE8przSFASwsSZVB5vZ-9gmLxKWDg",
+      "arguments": {
+        "resource": "example",
+        "level": "read",
+        "nested": {
+          "approval_ticket": "execution data"
+        },
+        "amount": 1.0,
+        "note": "caf\u00e9",
+        "approval_ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInN1YmplY3QiOiJhcHByb3ZlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9XSwiYXJndW1lbnRzX3NoYTI1NiI6IjBiNmZkMmQ0ZTZlMGY0NzMyZGZiY2I1MTI0YzgzMDFhMzA5MGZiMTAzOTA4ZDczMDUxYTBkZGEzMWNhMjU3M2YiLCJjb25uZWN0b3IiOiJhY2Nlc3MiLCJleHBpcmVzX2F0IjoxNzAwMDAwMzAwLCJpc3N1ZWRfYXQiOjE3MDAwMDAwMDAsImtleV9pZCI6InNlbGVjdG9yLXRlc3QtMSIsIm5vbmNlIjoiYUpHVC1lS2VaendJSDhWZEpmOGFxWjZjbWctWG9DV0ZYcGFKcXh2QnpoNCIsInB1cnBvc2UiOiJhcHByb3ZhbF9yZXF1ZXN0IiwicmVxdWVzdGVyIjp7Imlzc3VlciI6Imh0dHBzOi8vaWQuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoicGVyc29uXHUyMDI4IiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn0sInJvdXRlIjoiYWNjZXNzIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwidG9vbCI6ImV4ZWN1dGUiLCJ2ZXJzaW9uIjoxfQ.MYHU30jSOLw98RBxH-FBeKVgsjhoNL8DpfJajPOrsrjlGvxO1VQJqe6qtvE8przSFASwsSZVB5vZ-9gmLxKWDg"
+      },
+      "now": 1700000001,
+      "code": "invalid_ticket",
+      "signature_valid": true
+    },
+    {
+      "name": "principal_trailing_whitespace_u2029",
+      "payload": {
+        "version": 1,
+        "purpose": "approval_request",
+        "tenant_id": "00000000-0000-4000-8000-000000000001",
+        "agent_id": "00000000-0000-4000-8000-000000000002",
+        "connector": "access",
+        "tool": "execute",
+        "route": "access",
+        "key_id": "selector-test-1",
+        "requester": {
+          "tenant_id": "00000000-0000-4000-8000-000000000001",
+          "issuer": "https://id.example.com",
+          "subject": "person\u2029"
+        },
+        "nonce": "aJGT-eKeZzwIH8VdJf8aqZ6cmg-XoCWFXpaJqxvBzh4",
+        "issued_at": 1700000000,
+        "expires_at": 1700000300,
+        "arguments_sha256": "0b6fd2d4e6e0f4732dfbcb5124c8301a3090fb103908d73051a0dda31ca2573f",
+        "approvers": [
+          {
+            "tenant_id": "00000000-0000-4000-8000-000000000001",
+            "issuer": "https://id.example.com",
+            "subject": "approver"
+          }
+        ]
+      },
+      "ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInN1YmplY3QiOiJhcHByb3ZlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9XSwiYXJndW1lbnRzX3NoYTI1NiI6IjBiNmZkMmQ0ZTZlMGY0NzMyZGZiY2I1MTI0YzgzMDFhMzA5MGZiMTAzOTA4ZDczMDUxYTBkZGEzMWNhMjU3M2YiLCJjb25uZWN0b3IiOiJhY2Nlc3MiLCJleHBpcmVzX2F0IjoxNzAwMDAwMzAwLCJpc3N1ZWRfYXQiOjE3MDAwMDAwMDAsImtleV9pZCI6InNlbGVjdG9yLXRlc3QtMSIsIm5vbmNlIjoiYUpHVC1lS2VaendJSDhWZEpmOGFxWjZjbWctWG9DV0ZYcGFKcXh2QnpoNCIsInB1cnBvc2UiOiJhcHByb3ZhbF9yZXF1ZXN0IiwicmVxdWVzdGVyIjp7Imlzc3VlciI6Imh0dHBzOi8vaWQuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoicGVyc29uXHUyMDI5IiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn0sInJvdXRlIjoiYWNjZXNzIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwidG9vbCI6ImV4ZWN1dGUiLCJ2ZXJzaW9uIjoxfQ.D0z2NhQ-Y0til_in5pVEB5lgQ0ycWgEzkhN7SIDU6fELn7436oy6eNiBKhmebiC0BNXL9y3NzkO3jGhJhMFODQ",
+      "arguments": {
+        "resource": "example",
+        "level": "read",
+        "nested": {
+          "approval_ticket": "execution data"
+        },
+        "amount": 1.0,
+        "note": "caf\u00e9",
+        "approval_ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInN1YmplY3QiOiJhcHByb3ZlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9XSwiYXJndW1lbnRzX3NoYTI1NiI6IjBiNmZkMmQ0ZTZlMGY0NzMyZGZiY2I1MTI0YzgzMDFhMzA5MGZiMTAzOTA4ZDczMDUxYTBkZGEzMWNhMjU3M2YiLCJjb25uZWN0b3IiOiJhY2Nlc3MiLCJleHBpcmVzX2F0IjoxNzAwMDAwMzAwLCJpc3N1ZWRfYXQiOjE3MDAwMDAwMDAsImtleV9pZCI6InNlbGVjdG9yLXRlc3QtMSIsIm5vbmNlIjoiYUpHVC1lS2VaendJSDhWZEpmOGFxWjZjbWctWG9DV0ZYcGFKcXh2QnpoNCIsInB1cnBvc2UiOiJhcHByb3ZhbF9yZXF1ZXN0IiwicmVxdWVzdGVyIjp7Imlzc3VlciI6Imh0dHBzOi8vaWQuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoicGVyc29uXHUyMDI5IiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn0sInJvdXRlIjoiYWNjZXNzIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwidG9vbCI6ImV4ZWN1dGUiLCJ2ZXJzaW9uIjoxfQ.D0z2NhQ-Y0til_in5pVEB5lgQ0ycWgEzkhN7SIDU6fELn7436oy6eNiBKhmebiC0BNXL9y3NzkO3jGhJhMFODQ"
+      },
+      "now": 1700000001,
+      "code": "invalid_ticket",
+      "signature_valid": true
+    },
+    {
+      "name": "recipient_provider_control",
+      "payload": {
+        "version": 1,
+        "purpose": "approval_request",
+        "tenant_id": "00000000-0000-4000-8000-000000000001",
+        "agent_id": "00000000-0000-4000-8000-000000000002",
+        "connector": "access",
+        "tool": "execute",
+        "route": "access",
+        "key_id": "selector-test-1",
+        "requester": {
+          "tenant_id": "00000000-0000-4000-8000-000000000001",
+          "issuer": "https://id.example.com",
+          "subject": "requester"
+        },
+        "nonce": "aJGT-eKeZzwIH8VdJf8aqZ6cmg-XoCWFXpaJqxvBzh4",
+        "issued_at": 1700000000,
+        "expires_at": 1700000300,
+        "arguments_sha256": "0b6fd2d4e6e0f4732dfbcb5124c8301a3090fb103908d73051a0dda31ca2573f",
+        "approvers": [
+          {
+            "tenant_id": "00000000-0000-4000-8000-000000000001",
+            "issuer": "https://id.example.com",
+            "subject": "approver",
+            "recipient_accounts": [
+              {
+                "provider": "a\u007fb",
+                "installation_id": "00000000-0000-4000-8000-000000000003",
+                "namespace": {
+                  "id": "00000000-0000-4000-8000-000000000004",
+                  "authority": "",
+                  "kind": "slack_workspace",
+                  "key": "T0EXAMPLE1"
+                },
+                "account_id": "U0EXAMPLE1"
+              }
+            ]
+          }
+        ]
+      },
+      "ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6IlUwRVhBTVBMRTEiLCJpbnN0YWxsYXRpb25faWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJuYW1lc3BhY2UiOnsiYXV0aG9yaXR5IjoiIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJrZXkiOiJUMEVYQU1QTEUxIiwia2luZCI6InNsYWNrX3dvcmtzcGFjZSJ9LCJwcm92aWRlciI6ImFcdTAwN2ZiIn1dLCJzdWJqZWN0IjoiYXBwcm92ZXIiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEifV0sImFyZ3VtZW50c19zaGEyNTYiOiIwYjZmZDJkNGU2ZTBmNDczMmRmYmNiNTEyNGM4MzAxYTMwOTBmYjEwMzkwOGQ3MzA1MWEwZGRhMzFjYTI1NzNmIiwiY29ubmVjdG9yIjoiYWNjZXNzIiwiZXhwaXJlc19hdCI6MTcwMDAwMDMwMCwiaXNzdWVkX2F0IjoxNzAwMDAwMDAwLCJrZXlfaWQiOiJzZWxlY3Rvci10ZXN0LTEiLCJub25jZSI6ImFKR1QtZUtlWnp3SUg4VmRKZjhhcVo2Y21nLVhvQ1dGWHBhSnF4dkJ6aDQiLCJwdXJwb3NlIjoiYXBwcm92YWxfcmVxdWVzdCIsInJlcXVlc3RlciI6eyJpc3N1ZXIiOiJodHRwczovL2lkLmV4YW1wbGUuY29tIiwic3ViamVjdCI6InJlcXVlc3RlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9LCJyb3V0ZSI6ImFjY2VzcyIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInRvb2wiOiJleGVjdXRlIiwidmVyc2lvbiI6MX0.K1UhmsWU8EEugx7vBAFGSj7EJtVxfsGaAubSvL8zLb5525aMUakd___aOlJY5Nuxp4vbeR3ch76RF5PMQvaPCA",
+      "arguments": {
+        "resource": "example",
+        "level": "read",
+        "nested": {
+          "approval_ticket": "execution data"
+        },
+        "amount": 1.0,
+        "note": "caf\u00e9",
+        "approval_ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6IlUwRVhBTVBMRTEiLCJpbnN0YWxsYXRpb25faWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJuYW1lc3BhY2UiOnsiYXV0aG9yaXR5IjoiIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJrZXkiOiJUMEVYQU1QTEUxIiwia2luZCI6InNsYWNrX3dvcmtzcGFjZSJ9LCJwcm92aWRlciI6ImFcdTAwN2ZiIn1dLCJzdWJqZWN0IjoiYXBwcm92ZXIiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEifV0sImFyZ3VtZW50c19zaGEyNTYiOiIwYjZmZDJkNGU2ZTBmNDczMmRmYmNiNTEyNGM4MzAxYTMwOTBmYjEwMzkwOGQ3MzA1MWEwZGRhMzFjYTI1NzNmIiwiY29ubmVjdG9yIjoiYWNjZXNzIiwiZXhwaXJlc19hdCI6MTcwMDAwMDMwMCwiaXNzdWVkX2F0IjoxNzAwMDAwMDAwLCJrZXlfaWQiOiJzZWxlY3Rvci10ZXN0LTEiLCJub25jZSI6ImFKR1QtZUtlWnp3SUg4VmRKZjhhcVo2Y21nLVhvQ1dGWHBhSnF4dkJ6aDQiLCJwdXJwb3NlIjoiYXBwcm92YWxfcmVxdWVzdCIsInJlcXVlc3RlciI6eyJpc3N1ZXIiOiJodHRwczovL2lkLmV4YW1wbGUuY29tIiwic3ViamVjdCI6InJlcXVlc3RlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9LCJyb3V0ZSI6ImFjY2VzcyIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInRvb2wiOiJleGVjdXRlIiwidmVyc2lvbiI6MX0.K1UhmsWU8EEugx7vBAFGSj7EJtVxfsGaAubSvL8zLb5525aMUakd___aOlJY5Nuxp4vbeR3ch76RF5PMQvaPCA"
+      },
+      "now": 1700000001,
+      "code": "invalid_ticket",
+      "signature_valid": true
+    },
+    {
+      "name": "recipient_provider_trailing_whitespace",
+      "payload": {
+        "version": 1,
+        "purpose": "approval_request",
+        "tenant_id": "00000000-0000-4000-8000-000000000001",
+        "agent_id": "00000000-0000-4000-8000-000000000002",
+        "connector": "access",
+        "tool": "execute",
+        "route": "access",
+        "key_id": "selector-test-1",
+        "requester": {
+          "tenant_id": "00000000-0000-4000-8000-000000000001",
+          "issuer": "https://id.example.com",
+          "subject": "requester"
+        },
+        "nonce": "aJGT-eKeZzwIH8VdJf8aqZ6cmg-XoCWFXpaJqxvBzh4",
+        "issued_at": 1700000000,
+        "expires_at": 1700000300,
+        "arguments_sha256": "0b6fd2d4e6e0f4732dfbcb5124c8301a3090fb103908d73051a0dda31ca2573f",
+        "approvers": [
+          {
+            "tenant_id": "00000000-0000-4000-8000-000000000001",
+            "issuer": "https://id.example.com",
+            "subject": "approver",
+            "recipient_accounts": [
+              {
+                "provider": "value\u2028",
+                "installation_id": "00000000-0000-4000-8000-000000000003",
+                "namespace": {
+                  "id": "00000000-0000-4000-8000-000000000004",
+                  "authority": "",
+                  "kind": "slack_workspace",
+                  "key": "T0EXAMPLE1"
+                },
+                "account_id": "U0EXAMPLE1"
+              }
+            ]
+          }
+        ]
+      },
+      "ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6IlUwRVhBTVBMRTEiLCJpbnN0YWxsYXRpb25faWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJuYW1lc3BhY2UiOnsiYXV0aG9yaXR5IjoiIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJrZXkiOiJUMEVYQU1QTEUxIiwia2luZCI6InNsYWNrX3dvcmtzcGFjZSJ9LCJwcm92aWRlciI6InZhbHVlXHUyMDI4In1dLCJzdWJqZWN0IjoiYXBwcm92ZXIiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEifV0sImFyZ3VtZW50c19zaGEyNTYiOiIwYjZmZDJkNGU2ZTBmNDczMmRmYmNiNTEyNGM4MzAxYTMwOTBmYjEwMzkwOGQ3MzA1MWEwZGRhMzFjYTI1NzNmIiwiY29ubmVjdG9yIjoiYWNjZXNzIiwiZXhwaXJlc19hdCI6MTcwMDAwMDMwMCwiaXNzdWVkX2F0IjoxNzAwMDAwMDAwLCJrZXlfaWQiOiJzZWxlY3Rvci10ZXN0LTEiLCJub25jZSI6ImFKR1QtZUtlWnp3SUg4VmRKZjhhcVo2Y21nLVhvQ1dGWHBhSnF4dkJ6aDQiLCJwdXJwb3NlIjoiYXBwcm92YWxfcmVxdWVzdCIsInJlcXVlc3RlciI6eyJpc3N1ZXIiOiJodHRwczovL2lkLmV4YW1wbGUuY29tIiwic3ViamVjdCI6InJlcXVlc3RlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9LCJyb3V0ZSI6ImFjY2VzcyIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInRvb2wiOiJleGVjdXRlIiwidmVyc2lvbiI6MX0.TzcI_LdqTfSI_htW3Es_ADz6K9zkVpiYDGRqH1Ri3M8XxsPoHofgoXxsXDQGOF0CT6vj2Z4CXhLLpp4s3Zz4CQ",
+      "arguments": {
+        "resource": "example",
+        "level": "read",
+        "nested": {
+          "approval_ticket": "execution data"
+        },
+        "amount": 1.0,
+        "note": "caf\u00e9",
+        "approval_ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6IlUwRVhBTVBMRTEiLCJpbnN0YWxsYXRpb25faWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJuYW1lc3BhY2UiOnsiYXV0aG9yaXR5IjoiIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJrZXkiOiJUMEVYQU1QTEUxIiwia2luZCI6InNsYWNrX3dvcmtzcGFjZSJ9LCJwcm92aWRlciI6InZhbHVlXHUyMDI4In1dLCJzdWJqZWN0IjoiYXBwcm92ZXIiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEifV0sImFyZ3VtZW50c19zaGEyNTYiOiIwYjZmZDJkNGU2ZTBmNDczMmRmYmNiNTEyNGM4MzAxYTMwOTBmYjEwMzkwOGQ3MzA1MWEwZGRhMzFjYTI1NzNmIiwiY29ubmVjdG9yIjoiYWNjZXNzIiwiZXhwaXJlc19hdCI6MTcwMDAwMDMwMCwiaXNzdWVkX2F0IjoxNzAwMDAwMDAwLCJrZXlfaWQiOiJzZWxlY3Rvci10ZXN0LTEiLCJub25jZSI6ImFKR1QtZUtlWnp3SUg4VmRKZjhhcVo2Y21nLVhvQ1dGWHBhSnF4dkJ6aDQiLCJwdXJwb3NlIjoiYXBwcm92YWxfcmVxdWVzdCIsInJlcXVlc3RlciI6eyJpc3N1ZXIiOiJodHRwczovL2lkLmV4YW1wbGUuY29tIiwic3ViamVjdCI6InJlcXVlc3RlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9LCJyb3V0ZSI6ImFjY2VzcyIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInRvb2wiOiJleGVjdXRlIiwidmVyc2lvbiI6MX0.TzcI_LdqTfSI_htW3Es_ADz6K9zkVpiYDGRqH1Ri3M8XxsPoHofgoXxsXDQGOF0CT6vj2Z4CXhLLpp4s3Zz4CQ"
+      },
+      "now": 1700000001,
+      "code": "invalid_ticket",
+      "signature_valid": true
+    },
+    {
+      "name": "recipient_account_id_control",
+      "payload": {
+        "version": 1,
+        "purpose": "approval_request",
+        "tenant_id": "00000000-0000-4000-8000-000000000001",
+        "agent_id": "00000000-0000-4000-8000-000000000002",
+        "connector": "access",
+        "tool": "execute",
+        "route": "access",
+        "key_id": "selector-test-1",
+        "requester": {
+          "tenant_id": "00000000-0000-4000-8000-000000000001",
+          "issuer": "https://id.example.com",
+          "subject": "requester"
+        },
+        "nonce": "aJGT-eKeZzwIH8VdJf8aqZ6cmg-XoCWFXpaJqxvBzh4",
+        "issued_at": 1700000000,
+        "expires_at": 1700000300,
+        "arguments_sha256": "0b6fd2d4e6e0f4732dfbcb5124c8301a3090fb103908d73051a0dda31ca2573f",
+        "approvers": [
+          {
+            "tenant_id": "00000000-0000-4000-8000-000000000001",
+            "issuer": "https://id.example.com",
+            "subject": "approver",
+            "recipient_accounts": [
+              {
+                "provider": "slack",
+                "installation_id": "00000000-0000-4000-8000-000000000003",
+                "namespace": {
+                  "id": "00000000-0000-4000-8000-000000000004",
+                  "authority": "",
+                  "kind": "slack_workspace",
+                  "key": "T0EXAMPLE1"
+                },
+                "account_id": "a\u007fb"
+              }
+            ]
+          }
+        ]
+      },
+      "ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6ImFcdTAwN2ZiIiwiaW5zdGFsbGF0aW9uX2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAzIiwibmFtZXNwYWNlIjp7ImF1dGhvcml0eSI6IiIsImlkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA0Iiwia2V5IjoiVDBFWEFNUExFMSIsImtpbmQiOiJzbGFja193b3Jrc3BhY2UifSwicHJvdmlkZXIiOiJzbGFjayJ9XSwic3ViamVjdCI6ImFwcHJvdmVyIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn1dLCJhcmd1bWVudHNfc2hhMjU2IjoiMGI2ZmQyZDRlNmUwZjQ3MzJkZmJjYjUxMjRjODMwMWEzMDkwZmIxMDM5MDhkNzMwNTFhMGRkYTMxY2EyNTczZiIsImNvbm5lY3RvciI6ImFjY2VzcyIsImV4cGlyZXNfYXQiOjE3MDAwMDAzMDAsImlzc3VlZF9hdCI6MTcwMDAwMDAwMCwia2V5X2lkIjoic2VsZWN0b3ItdGVzdC0xIiwibm9uY2UiOiJhSkdULWVLZVp6d0lIOFZkSmY4YXFaNmNtZy1Yb0NXRlhwYUpxeHZCemg0IiwicHVycG9zZSI6ImFwcHJvdmFsX3JlcXVlc3QiLCJyZXF1ZXN0ZXIiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInN1YmplY3QiOiJyZXF1ZXN0ZXIiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEifSwicm91dGUiOiJhY2Nlc3MiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJ0b29sIjoiZXhlY3V0ZSIsInZlcnNpb24iOjF9.hVWcBQbIzuGQC2PN4WVZ8kRQr2XtmuA8lJqf1UgD-pV44eNeoKe80m83LwtqDTffbB6j_lZAWFhIakpPB0wNDQ",
+      "arguments": {
+        "resource": "example",
+        "level": "read",
+        "nested": {
+          "approval_ticket": "execution data"
+        },
+        "amount": 1.0,
+        "note": "caf\u00e9",
+        "approval_ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6ImFcdTAwN2ZiIiwiaW5zdGFsbGF0aW9uX2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAzIiwibmFtZXNwYWNlIjp7ImF1dGhvcml0eSI6IiIsImlkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA0Iiwia2V5IjoiVDBFWEFNUExFMSIsImtpbmQiOiJzbGFja193b3Jrc3BhY2UifSwicHJvdmlkZXIiOiJzbGFjayJ9XSwic3ViamVjdCI6ImFwcHJvdmVyIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn1dLCJhcmd1bWVudHNfc2hhMjU2IjoiMGI2ZmQyZDRlNmUwZjQ3MzJkZmJjYjUxMjRjODMwMWEzMDkwZmIxMDM5MDhkNzMwNTFhMGRkYTMxY2EyNTczZiIsImNvbm5lY3RvciI6ImFjY2VzcyIsImV4cGlyZXNfYXQiOjE3MDAwMDAzMDAsImlzc3VlZF9hdCI6MTcwMDAwMDAwMCwia2V5X2lkIjoic2VsZWN0b3ItdGVzdC0xIiwibm9uY2UiOiJhSkdULWVLZVp6d0lIOFZkSmY4YXFaNmNtZy1Yb0NXRlhwYUpxeHZCemg0IiwicHVycG9zZSI6ImFwcHJvdmFsX3JlcXVlc3QiLCJyZXF1ZXN0ZXIiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInN1YmplY3QiOiJyZXF1ZXN0ZXIiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEifSwicm91dGUiOiJhY2Nlc3MiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJ0b29sIjoiZXhlY3V0ZSIsInZlcnNpb24iOjF9.hVWcBQbIzuGQC2PN4WVZ8kRQr2XtmuA8lJqf1UgD-pV44eNeoKe80m83LwtqDTffbB6j_lZAWFhIakpPB0wNDQ"
+      },
+      "now": 1700000001,
+      "code": "invalid_ticket",
+      "signature_valid": true
+    },
+    {
+      "name": "recipient_account_id_trailing_whitespace",
+      "payload": {
+        "version": 1,
+        "purpose": "approval_request",
+        "tenant_id": "00000000-0000-4000-8000-000000000001",
+        "agent_id": "00000000-0000-4000-8000-000000000002",
+        "connector": "access",
+        "tool": "execute",
+        "route": "access",
+        "key_id": "selector-test-1",
+        "requester": {
+          "tenant_id": "00000000-0000-4000-8000-000000000001",
+          "issuer": "https://id.example.com",
+          "subject": "requester"
+        },
+        "nonce": "aJGT-eKeZzwIH8VdJf8aqZ6cmg-XoCWFXpaJqxvBzh4",
+        "issued_at": 1700000000,
+        "expires_at": 1700000300,
+        "arguments_sha256": "0b6fd2d4e6e0f4732dfbcb5124c8301a3090fb103908d73051a0dda31ca2573f",
+        "approvers": [
+          {
+            "tenant_id": "00000000-0000-4000-8000-000000000001",
+            "issuer": "https://id.example.com",
+            "subject": "approver",
+            "recipient_accounts": [
+              {
+                "provider": "slack",
+                "installation_id": "00000000-0000-4000-8000-000000000003",
+                "namespace": {
+                  "id": "00000000-0000-4000-8000-000000000004",
+                  "authority": "",
+                  "kind": "slack_workspace",
+                  "key": "T0EXAMPLE1"
+                },
+                "account_id": "value\u2028"
+              }
+            ]
+          }
+        ]
+      },
+      "ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6InZhbHVlXHUyMDI4IiwiaW5zdGFsbGF0aW9uX2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAzIiwibmFtZXNwYWNlIjp7ImF1dGhvcml0eSI6IiIsImlkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA0Iiwia2V5IjoiVDBFWEFNUExFMSIsImtpbmQiOiJzbGFja193b3Jrc3BhY2UifSwicHJvdmlkZXIiOiJzbGFjayJ9XSwic3ViamVjdCI6ImFwcHJvdmVyIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn1dLCJhcmd1bWVudHNfc2hhMjU2IjoiMGI2ZmQyZDRlNmUwZjQ3MzJkZmJjYjUxMjRjODMwMWEzMDkwZmIxMDM5MDhkNzMwNTFhMGRkYTMxY2EyNTczZiIsImNvbm5lY3RvciI6ImFjY2VzcyIsImV4cGlyZXNfYXQiOjE3MDAwMDAzMDAsImlzc3VlZF9hdCI6MTcwMDAwMDAwMCwia2V5X2lkIjoic2VsZWN0b3ItdGVzdC0xIiwibm9uY2UiOiJhSkdULWVLZVp6d0lIOFZkSmY4YXFaNmNtZy1Yb0NXRlhwYUpxeHZCemg0IiwicHVycG9zZSI6ImFwcHJvdmFsX3JlcXVlc3QiLCJyZXF1ZXN0ZXIiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInN1YmplY3QiOiJyZXF1ZXN0ZXIiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEifSwicm91dGUiOiJhY2Nlc3MiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJ0b29sIjoiZXhlY3V0ZSIsInZlcnNpb24iOjF9.WN91UzC6ipWOaztE4ADbLxoIviw2X9AhZSaUolhNLbtN2s5FVqfqEc1SJr_b4asSl_FOTsSAV4a7e6dLRuEmAA",
+      "arguments": {
+        "resource": "example",
+        "level": "read",
+        "nested": {
+          "approval_ticket": "execution data"
+        },
+        "amount": 1.0,
+        "note": "caf\u00e9",
+        "approval_ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6InZhbHVlXHUyMDI4IiwiaW5zdGFsbGF0aW9uX2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAzIiwibmFtZXNwYWNlIjp7ImF1dGhvcml0eSI6IiIsImlkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA0Iiwia2V5IjoiVDBFWEFNUExFMSIsImtpbmQiOiJzbGFja193b3Jrc3BhY2UifSwicHJvdmlkZXIiOiJzbGFjayJ9XSwic3ViamVjdCI6ImFwcHJvdmVyIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn1dLCJhcmd1bWVudHNfc2hhMjU2IjoiMGI2ZmQyZDRlNmUwZjQ3MzJkZmJjYjUxMjRjODMwMWEzMDkwZmIxMDM5MDhkNzMwNTFhMGRkYTMxY2EyNTczZiIsImNvbm5lY3RvciI6ImFjY2VzcyIsImV4cGlyZXNfYXQiOjE3MDAwMDAzMDAsImlzc3VlZF9hdCI6MTcwMDAwMDAwMCwia2V5X2lkIjoic2VsZWN0b3ItdGVzdC0xIiwibm9uY2UiOiJhSkdULWVLZVp6d0lIOFZkSmY4YXFaNmNtZy1Yb0NXRlhwYUpxeHZCemg0IiwicHVycG9zZSI6ImFwcHJvdmFsX3JlcXVlc3QiLCJyZXF1ZXN0ZXIiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInN1YmplY3QiOiJyZXF1ZXN0ZXIiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEifSwicm91dGUiOiJhY2Nlc3MiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJ0b29sIjoiZXhlY3V0ZSIsInZlcnNpb24iOjF9.WN91UzC6ipWOaztE4ADbLxoIviw2X9AhZSaUolhNLbtN2s5FVqfqEc1SJr_b4asSl_FOTsSAV4a7e6dLRuEmAA"
+      },
+      "now": 1700000001,
+      "code": "invalid_ticket",
+      "signature_valid": true
+    },
+    {
+      "name": "recipient_authority_control",
+      "payload": {
+        "version": 1,
+        "purpose": "approval_request",
+        "tenant_id": "00000000-0000-4000-8000-000000000001",
+        "agent_id": "00000000-0000-4000-8000-000000000002",
+        "connector": "access",
+        "tool": "execute",
+        "route": "access",
+        "key_id": "selector-test-1",
+        "requester": {
+          "tenant_id": "00000000-0000-4000-8000-000000000001",
+          "issuer": "https://id.example.com",
+          "subject": "requester"
+        },
+        "nonce": "aJGT-eKeZzwIH8VdJf8aqZ6cmg-XoCWFXpaJqxvBzh4",
+        "issued_at": 1700000000,
+        "expires_at": 1700000300,
+        "arguments_sha256": "0b6fd2d4e6e0f4732dfbcb5124c8301a3090fb103908d73051a0dda31ca2573f",
+        "approvers": [
+          {
+            "tenant_id": "00000000-0000-4000-8000-000000000001",
+            "issuer": "https://id.example.com",
+            "subject": "approver",
+            "recipient_accounts": [
+              {
+                "provider": "slack",
+                "installation_id": "00000000-0000-4000-8000-000000000003",
+                "namespace": {
+                  "id": "00000000-0000-4000-8000-000000000004",
+                  "authority": "a\u007fb",
+                  "kind": "slack_workspace",
+                  "key": "T0EXAMPLE1"
+                },
+                "account_id": "U0EXAMPLE1"
+              }
+            ]
+          }
+        ]
+      },
+      "ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6IlUwRVhBTVBMRTEiLCJpbnN0YWxsYXRpb25faWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJuYW1lc3BhY2UiOnsiYXV0aG9yaXR5IjoiYVx1MDA3ZmIiLCJpZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwNCIsImtleSI6IlQwRVhBTVBMRTEiLCJraW5kIjoic2xhY2tfd29ya3NwYWNlIn0sInByb3ZpZGVyIjoic2xhY2sifV0sInN1YmplY3QiOiJhcHByb3ZlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9XSwiYXJndW1lbnRzX3NoYTI1NiI6IjBiNmZkMmQ0ZTZlMGY0NzMyZGZiY2I1MTI0YzgzMDFhMzA5MGZiMTAzOTA4ZDczMDUxYTBkZGEzMWNhMjU3M2YiLCJjb25uZWN0b3IiOiJhY2Nlc3MiLCJleHBpcmVzX2F0IjoxNzAwMDAwMzAwLCJpc3N1ZWRfYXQiOjE3MDAwMDAwMDAsImtleV9pZCI6InNlbGVjdG9yLXRlc3QtMSIsIm5vbmNlIjoiYUpHVC1lS2VaendJSDhWZEpmOGFxWjZjbWctWG9DV0ZYcGFKcXh2QnpoNCIsInB1cnBvc2UiOiJhcHByb3ZhbF9yZXF1ZXN0IiwicmVxdWVzdGVyIjp7Imlzc3VlciI6Imh0dHBzOi8vaWQuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoicmVxdWVzdGVyIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn0sInJvdXRlIjoiYWNjZXNzIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwidG9vbCI6ImV4ZWN1dGUiLCJ2ZXJzaW9uIjoxfQ.P-41ZVaaFn2qZBSFtIKhk629_2NCQyph4UyaDTn-oSPUWa7tBxulAM9CJINh3tN3bg1FRmOyRy1sLJGEopbcCA",
+      "arguments": {
+        "resource": "example",
+        "level": "read",
+        "nested": {
+          "approval_ticket": "execution data"
+        },
+        "amount": 1.0,
+        "note": "caf\u00e9",
+        "approval_ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6IlUwRVhBTVBMRTEiLCJpbnN0YWxsYXRpb25faWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJuYW1lc3BhY2UiOnsiYXV0aG9yaXR5IjoiYVx1MDA3ZmIiLCJpZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwNCIsImtleSI6IlQwRVhBTVBMRTEiLCJraW5kIjoic2xhY2tfd29ya3NwYWNlIn0sInByb3ZpZGVyIjoic2xhY2sifV0sInN1YmplY3QiOiJhcHByb3ZlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9XSwiYXJndW1lbnRzX3NoYTI1NiI6IjBiNmZkMmQ0ZTZlMGY0NzMyZGZiY2I1MTI0YzgzMDFhMzA5MGZiMTAzOTA4ZDczMDUxYTBkZGEzMWNhMjU3M2YiLCJjb25uZWN0b3IiOiJhY2Nlc3MiLCJleHBpcmVzX2F0IjoxNzAwMDAwMzAwLCJpc3N1ZWRfYXQiOjE3MDAwMDAwMDAsImtleV9pZCI6InNlbGVjdG9yLXRlc3QtMSIsIm5vbmNlIjoiYUpHVC1lS2VaendJSDhWZEpmOGFxWjZjbWctWG9DV0ZYcGFKcXh2QnpoNCIsInB1cnBvc2UiOiJhcHByb3ZhbF9yZXF1ZXN0IiwicmVxdWVzdGVyIjp7Imlzc3VlciI6Imh0dHBzOi8vaWQuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoicmVxdWVzdGVyIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn0sInJvdXRlIjoiYWNjZXNzIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwidG9vbCI6ImV4ZWN1dGUiLCJ2ZXJzaW9uIjoxfQ.P-41ZVaaFn2qZBSFtIKhk629_2NCQyph4UyaDTn-oSPUWa7tBxulAM9CJINh3tN3bg1FRmOyRy1sLJGEopbcCA"
+      },
+      "now": 1700000001,
+      "code": "invalid_ticket",
+      "signature_valid": true
+    },
+    {
+      "name": "recipient_authority_trailing_whitespace",
+      "payload": {
+        "version": 1,
+        "purpose": "approval_request",
+        "tenant_id": "00000000-0000-4000-8000-000000000001",
+        "agent_id": "00000000-0000-4000-8000-000000000002",
+        "connector": "access",
+        "tool": "execute",
+        "route": "access",
+        "key_id": "selector-test-1",
+        "requester": {
+          "tenant_id": "00000000-0000-4000-8000-000000000001",
+          "issuer": "https://id.example.com",
+          "subject": "requester"
+        },
+        "nonce": "aJGT-eKeZzwIH8VdJf8aqZ6cmg-XoCWFXpaJqxvBzh4",
+        "issued_at": 1700000000,
+        "expires_at": 1700000300,
+        "arguments_sha256": "0b6fd2d4e6e0f4732dfbcb5124c8301a3090fb103908d73051a0dda31ca2573f",
+        "approvers": [
+          {
+            "tenant_id": "00000000-0000-4000-8000-000000000001",
+            "issuer": "https://id.example.com",
+            "subject": "approver",
+            "recipient_accounts": [
+              {
+                "provider": "slack",
+                "installation_id": "00000000-0000-4000-8000-000000000003",
+                "namespace": {
+                  "id": "00000000-0000-4000-8000-000000000004",
+                  "authority": "value\u2028",
+                  "kind": "slack_workspace",
+                  "key": "T0EXAMPLE1"
+                },
+                "account_id": "U0EXAMPLE1"
+              }
+            ]
+          }
+        ]
+      },
+      "ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6IlUwRVhBTVBMRTEiLCJpbnN0YWxsYXRpb25faWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJuYW1lc3BhY2UiOnsiYXV0aG9yaXR5IjoidmFsdWVcdTIwMjgiLCJpZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwNCIsImtleSI6IlQwRVhBTVBMRTEiLCJraW5kIjoic2xhY2tfd29ya3NwYWNlIn0sInByb3ZpZGVyIjoic2xhY2sifV0sInN1YmplY3QiOiJhcHByb3ZlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9XSwiYXJndW1lbnRzX3NoYTI1NiI6IjBiNmZkMmQ0ZTZlMGY0NzMyZGZiY2I1MTI0YzgzMDFhMzA5MGZiMTAzOTA4ZDczMDUxYTBkZGEzMWNhMjU3M2YiLCJjb25uZWN0b3IiOiJhY2Nlc3MiLCJleHBpcmVzX2F0IjoxNzAwMDAwMzAwLCJpc3N1ZWRfYXQiOjE3MDAwMDAwMDAsImtleV9pZCI6InNlbGVjdG9yLXRlc3QtMSIsIm5vbmNlIjoiYUpHVC1lS2VaendJSDhWZEpmOGFxWjZjbWctWG9DV0ZYcGFKcXh2QnpoNCIsInB1cnBvc2UiOiJhcHByb3ZhbF9yZXF1ZXN0IiwicmVxdWVzdGVyIjp7Imlzc3VlciI6Imh0dHBzOi8vaWQuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoicmVxdWVzdGVyIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn0sInJvdXRlIjoiYWNjZXNzIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwidG9vbCI6ImV4ZWN1dGUiLCJ2ZXJzaW9uIjoxfQ.ZUHDuNn3H3QNQPXy8xX5LbOe8z8mueXIp6eY1ULyXAAVxoLiVjKVVOzyn1wYzR5L8nL9UwrTsQ-Q2Z3feFSECg",
+      "arguments": {
+        "resource": "example",
+        "level": "read",
+        "nested": {
+          "approval_ticket": "execution data"
+        },
+        "amount": 1.0,
+        "note": "caf\u00e9",
+        "approval_ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6IlUwRVhBTVBMRTEiLCJpbnN0YWxsYXRpb25faWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJuYW1lc3BhY2UiOnsiYXV0aG9yaXR5IjoidmFsdWVcdTIwMjgiLCJpZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwNCIsImtleSI6IlQwRVhBTVBMRTEiLCJraW5kIjoic2xhY2tfd29ya3NwYWNlIn0sInByb3ZpZGVyIjoic2xhY2sifV0sInN1YmplY3QiOiJhcHByb3ZlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9XSwiYXJndW1lbnRzX3NoYTI1NiI6IjBiNmZkMmQ0ZTZlMGY0NzMyZGZiY2I1MTI0YzgzMDFhMzA5MGZiMTAzOTA4ZDczMDUxYTBkZGEzMWNhMjU3M2YiLCJjb25uZWN0b3IiOiJhY2Nlc3MiLCJleHBpcmVzX2F0IjoxNzAwMDAwMzAwLCJpc3N1ZWRfYXQiOjE3MDAwMDAwMDAsImtleV9pZCI6InNlbGVjdG9yLXRlc3QtMSIsIm5vbmNlIjoiYUpHVC1lS2VaendJSDhWZEpmOGFxWjZjbWctWG9DV0ZYcGFKcXh2QnpoNCIsInB1cnBvc2UiOiJhcHByb3ZhbF9yZXF1ZXN0IiwicmVxdWVzdGVyIjp7Imlzc3VlciI6Imh0dHBzOi8vaWQuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoicmVxdWVzdGVyIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn0sInJvdXRlIjoiYWNjZXNzIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwidG9vbCI6ImV4ZWN1dGUiLCJ2ZXJzaW9uIjoxfQ.ZUHDuNn3H3QNQPXy8xX5LbOe8z8mueXIp6eY1ULyXAAVxoLiVjKVVOzyn1wYzR5L8nL9UwrTsQ-Q2Z3feFSECg"
+      },
+      "now": 1700000001,
+      "code": "invalid_ticket",
+      "signature_valid": true
+    },
+    {
+      "name": "recipient_kind_control",
+      "payload": {
+        "version": 1,
+        "purpose": "approval_request",
+        "tenant_id": "00000000-0000-4000-8000-000000000001",
+        "agent_id": "00000000-0000-4000-8000-000000000002",
+        "connector": "access",
+        "tool": "execute",
+        "route": "access",
+        "key_id": "selector-test-1",
+        "requester": {
+          "tenant_id": "00000000-0000-4000-8000-000000000001",
+          "issuer": "https://id.example.com",
+          "subject": "requester"
+        },
+        "nonce": "aJGT-eKeZzwIH8VdJf8aqZ6cmg-XoCWFXpaJqxvBzh4",
+        "issued_at": 1700000000,
+        "expires_at": 1700000300,
+        "arguments_sha256": "0b6fd2d4e6e0f4732dfbcb5124c8301a3090fb103908d73051a0dda31ca2573f",
+        "approvers": [
+          {
+            "tenant_id": "00000000-0000-4000-8000-000000000001",
+            "issuer": "https://id.example.com",
+            "subject": "approver",
+            "recipient_accounts": [
+              {
+                "provider": "slack",
+                "installation_id": "00000000-0000-4000-8000-000000000003",
+                "namespace": {
+                  "id": "00000000-0000-4000-8000-000000000004",
+                  "authority": "",
+                  "kind": "a\u007fb",
+                  "key": "T0EXAMPLE1"
+                },
+                "account_id": "U0EXAMPLE1"
+              }
+            ]
+          }
+        ]
+      },
+      "ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6IlUwRVhBTVBMRTEiLCJpbnN0YWxsYXRpb25faWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJuYW1lc3BhY2UiOnsiYXV0aG9yaXR5IjoiIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJrZXkiOiJUMEVYQU1QTEUxIiwia2luZCI6ImFcdTAwN2ZiIn0sInByb3ZpZGVyIjoic2xhY2sifV0sInN1YmplY3QiOiJhcHByb3ZlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9XSwiYXJndW1lbnRzX3NoYTI1NiI6IjBiNmZkMmQ0ZTZlMGY0NzMyZGZiY2I1MTI0YzgzMDFhMzA5MGZiMTAzOTA4ZDczMDUxYTBkZGEzMWNhMjU3M2YiLCJjb25uZWN0b3IiOiJhY2Nlc3MiLCJleHBpcmVzX2F0IjoxNzAwMDAwMzAwLCJpc3N1ZWRfYXQiOjE3MDAwMDAwMDAsImtleV9pZCI6InNlbGVjdG9yLXRlc3QtMSIsIm5vbmNlIjoiYUpHVC1lS2VaendJSDhWZEpmOGFxWjZjbWctWG9DV0ZYcGFKcXh2QnpoNCIsInB1cnBvc2UiOiJhcHByb3ZhbF9yZXF1ZXN0IiwicmVxdWVzdGVyIjp7Imlzc3VlciI6Imh0dHBzOi8vaWQuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoicmVxdWVzdGVyIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn0sInJvdXRlIjoiYWNjZXNzIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwidG9vbCI6ImV4ZWN1dGUiLCJ2ZXJzaW9uIjoxfQ.9f3sJUwvDicDDDnFfVqhXOkwp3erXxu5wzBbnmycPdiqIsfUszZG6ocUwVMtIQKpL3ul_W1NIcWIeXENoix4BQ",
+      "arguments": {
+        "resource": "example",
+        "level": "read",
+        "nested": {
+          "approval_ticket": "execution data"
+        },
+        "amount": 1.0,
+        "note": "caf\u00e9",
+        "approval_ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6IlUwRVhBTVBMRTEiLCJpbnN0YWxsYXRpb25faWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJuYW1lc3BhY2UiOnsiYXV0aG9yaXR5IjoiIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJrZXkiOiJUMEVYQU1QTEUxIiwia2luZCI6ImFcdTAwN2ZiIn0sInByb3ZpZGVyIjoic2xhY2sifV0sInN1YmplY3QiOiJhcHByb3ZlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9XSwiYXJndW1lbnRzX3NoYTI1NiI6IjBiNmZkMmQ0ZTZlMGY0NzMyZGZiY2I1MTI0YzgzMDFhMzA5MGZiMTAzOTA4ZDczMDUxYTBkZGEzMWNhMjU3M2YiLCJjb25uZWN0b3IiOiJhY2Nlc3MiLCJleHBpcmVzX2F0IjoxNzAwMDAwMzAwLCJpc3N1ZWRfYXQiOjE3MDAwMDAwMDAsImtleV9pZCI6InNlbGVjdG9yLXRlc3QtMSIsIm5vbmNlIjoiYUpHVC1lS2VaendJSDhWZEpmOGFxWjZjbWctWG9DV0ZYcGFKcXh2QnpoNCIsInB1cnBvc2UiOiJhcHByb3ZhbF9yZXF1ZXN0IiwicmVxdWVzdGVyIjp7Imlzc3VlciI6Imh0dHBzOi8vaWQuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoicmVxdWVzdGVyIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn0sInJvdXRlIjoiYWNjZXNzIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwidG9vbCI6ImV4ZWN1dGUiLCJ2ZXJzaW9uIjoxfQ.9f3sJUwvDicDDDnFfVqhXOkwp3erXxu5wzBbnmycPdiqIsfUszZG6ocUwVMtIQKpL3ul_W1NIcWIeXENoix4BQ"
+      },
+      "now": 1700000001,
+      "code": "invalid_ticket",
+      "signature_valid": true
+    },
+    {
+      "name": "recipient_kind_trailing_whitespace",
+      "payload": {
+        "version": 1,
+        "purpose": "approval_request",
+        "tenant_id": "00000000-0000-4000-8000-000000000001",
+        "agent_id": "00000000-0000-4000-8000-000000000002",
+        "connector": "access",
+        "tool": "execute",
+        "route": "access",
+        "key_id": "selector-test-1",
+        "requester": {
+          "tenant_id": "00000000-0000-4000-8000-000000000001",
+          "issuer": "https://id.example.com",
+          "subject": "requester"
+        },
+        "nonce": "aJGT-eKeZzwIH8VdJf8aqZ6cmg-XoCWFXpaJqxvBzh4",
+        "issued_at": 1700000000,
+        "expires_at": 1700000300,
+        "arguments_sha256": "0b6fd2d4e6e0f4732dfbcb5124c8301a3090fb103908d73051a0dda31ca2573f",
+        "approvers": [
+          {
+            "tenant_id": "00000000-0000-4000-8000-000000000001",
+            "issuer": "https://id.example.com",
+            "subject": "approver",
+            "recipient_accounts": [
+              {
+                "provider": "slack",
+                "installation_id": "00000000-0000-4000-8000-000000000003",
+                "namespace": {
+                  "id": "00000000-0000-4000-8000-000000000004",
+                  "authority": "",
+                  "kind": "value\u2028",
+                  "key": "T0EXAMPLE1"
+                },
+                "account_id": "U0EXAMPLE1"
+              }
+            ]
+          }
+        ]
+      },
+      "ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6IlUwRVhBTVBMRTEiLCJpbnN0YWxsYXRpb25faWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJuYW1lc3BhY2UiOnsiYXV0aG9yaXR5IjoiIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJrZXkiOiJUMEVYQU1QTEUxIiwia2luZCI6InZhbHVlXHUyMDI4In0sInByb3ZpZGVyIjoic2xhY2sifV0sInN1YmplY3QiOiJhcHByb3ZlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9XSwiYXJndW1lbnRzX3NoYTI1NiI6IjBiNmZkMmQ0ZTZlMGY0NzMyZGZiY2I1MTI0YzgzMDFhMzA5MGZiMTAzOTA4ZDczMDUxYTBkZGEzMWNhMjU3M2YiLCJjb25uZWN0b3IiOiJhY2Nlc3MiLCJleHBpcmVzX2F0IjoxNzAwMDAwMzAwLCJpc3N1ZWRfYXQiOjE3MDAwMDAwMDAsImtleV9pZCI6InNlbGVjdG9yLXRlc3QtMSIsIm5vbmNlIjoiYUpHVC1lS2VaendJSDhWZEpmOGFxWjZjbWctWG9DV0ZYcGFKcXh2QnpoNCIsInB1cnBvc2UiOiJhcHByb3ZhbF9yZXF1ZXN0IiwicmVxdWVzdGVyIjp7Imlzc3VlciI6Imh0dHBzOi8vaWQuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoicmVxdWVzdGVyIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn0sInJvdXRlIjoiYWNjZXNzIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwidG9vbCI6ImV4ZWN1dGUiLCJ2ZXJzaW9uIjoxfQ.nqNjKS_FAVHguqUmO_UbfzSy9Qy_oEkgzsmHpRDwi3z1h4yhEzF6Q34dylSh0_Amd7SH1893I3Fowfz821LQCA",
+      "arguments": {
+        "resource": "example",
+        "level": "read",
+        "nested": {
+          "approval_ticket": "execution data"
+        },
+        "amount": 1.0,
+        "note": "caf\u00e9",
+        "approval_ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6IlUwRVhBTVBMRTEiLCJpbnN0YWxsYXRpb25faWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJuYW1lc3BhY2UiOnsiYXV0aG9yaXR5IjoiIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJrZXkiOiJUMEVYQU1QTEUxIiwia2luZCI6InZhbHVlXHUyMDI4In0sInByb3ZpZGVyIjoic2xhY2sifV0sInN1YmplY3QiOiJhcHByb3ZlciIsInRlbmFudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSJ9XSwiYXJndW1lbnRzX3NoYTI1NiI6IjBiNmZkMmQ0ZTZlMGY0NzMyZGZiY2I1MTI0YzgzMDFhMzA5MGZiMTAzOTA4ZDczMDUxYTBkZGEzMWNhMjU3M2YiLCJjb25uZWN0b3IiOiJhY2Nlc3MiLCJleHBpcmVzX2F0IjoxNzAwMDAwMzAwLCJpc3N1ZWRfYXQiOjE3MDAwMDAwMDAsImtleV9pZCI6InNlbGVjdG9yLXRlc3QtMSIsIm5vbmNlIjoiYUpHVC1lS2VaendJSDhWZEpmOGFxWjZjbWctWG9DV0ZYcGFKcXh2QnpoNCIsInB1cnBvc2UiOiJhcHByb3ZhbF9yZXF1ZXN0IiwicmVxdWVzdGVyIjp7Imlzc3VlciI6Imh0dHBzOi8vaWQuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoicmVxdWVzdGVyIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn0sInJvdXRlIjoiYWNjZXNzIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwidG9vbCI6ImV4ZWN1dGUiLCJ2ZXJzaW9uIjoxfQ.nqNjKS_FAVHguqUmO_UbfzSy9Qy_oEkgzsmHpRDwi3z1h4yhEzF6Q34dylSh0_Amd7SH1893I3Fowfz821LQCA"
+      },
+      "now": 1700000001,
+      "code": "invalid_ticket",
+      "signature_valid": true
+    },
+    {
+      "name": "recipient_key_control",
+      "payload": {
+        "version": 1,
+        "purpose": "approval_request",
+        "tenant_id": "00000000-0000-4000-8000-000000000001",
+        "agent_id": "00000000-0000-4000-8000-000000000002",
+        "connector": "access",
+        "tool": "execute",
+        "route": "access",
+        "key_id": "selector-test-1",
+        "requester": {
+          "tenant_id": "00000000-0000-4000-8000-000000000001",
+          "issuer": "https://id.example.com",
+          "subject": "requester"
+        },
+        "nonce": "aJGT-eKeZzwIH8VdJf8aqZ6cmg-XoCWFXpaJqxvBzh4",
+        "issued_at": 1700000000,
+        "expires_at": 1700000300,
+        "arguments_sha256": "0b6fd2d4e6e0f4732dfbcb5124c8301a3090fb103908d73051a0dda31ca2573f",
+        "approvers": [
+          {
+            "tenant_id": "00000000-0000-4000-8000-000000000001",
+            "issuer": "https://id.example.com",
+            "subject": "approver",
+            "recipient_accounts": [
+              {
+                "provider": "slack",
+                "installation_id": "00000000-0000-4000-8000-000000000003",
+                "namespace": {
+                  "id": "00000000-0000-4000-8000-000000000004",
+                  "authority": "",
+                  "kind": "slack_workspace",
+                  "key": "a\u007fb"
+                },
+                "account_id": "U0EXAMPLE1"
+              }
+            ]
+          }
+        ]
+      },
+      "ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6IlUwRVhBTVBMRTEiLCJpbnN0YWxsYXRpb25faWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJuYW1lc3BhY2UiOnsiYXV0aG9yaXR5IjoiIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJrZXkiOiJhXHUwMDdmYiIsImtpbmQiOiJzbGFja193b3Jrc3BhY2UifSwicHJvdmlkZXIiOiJzbGFjayJ9XSwic3ViamVjdCI6ImFwcHJvdmVyIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn1dLCJhcmd1bWVudHNfc2hhMjU2IjoiMGI2ZmQyZDRlNmUwZjQ3MzJkZmJjYjUxMjRjODMwMWEzMDkwZmIxMDM5MDhkNzMwNTFhMGRkYTMxY2EyNTczZiIsImNvbm5lY3RvciI6ImFjY2VzcyIsImV4cGlyZXNfYXQiOjE3MDAwMDAzMDAsImlzc3VlZF9hdCI6MTcwMDAwMDAwMCwia2V5X2lkIjoic2VsZWN0b3ItdGVzdC0xIiwibm9uY2UiOiJhSkdULWVLZVp6d0lIOFZkSmY4YXFaNmNtZy1Yb0NXRlhwYUpxeHZCemg0IiwicHVycG9zZSI6ImFwcHJvdmFsX3JlcXVlc3QiLCJyZXF1ZXN0ZXIiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInN1YmplY3QiOiJyZXF1ZXN0ZXIiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEifSwicm91dGUiOiJhY2Nlc3MiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJ0b29sIjoiZXhlY3V0ZSIsInZlcnNpb24iOjF9.6Q2qVTvd8cBnFl913rEWv17ZM_mgOHZdnlV1rB9n396GmnVhr6vU9Tg76NtwZW1dMApg9tBw7RDZVBy4xRHAAw",
+      "arguments": {
+        "resource": "example",
+        "level": "read",
+        "nested": {
+          "approval_ticket": "execution data"
+        },
+        "amount": 1.0,
+        "note": "caf\u00e9",
+        "approval_ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6IlUwRVhBTVBMRTEiLCJpbnN0YWxsYXRpb25faWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJuYW1lc3BhY2UiOnsiYXV0aG9yaXR5IjoiIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJrZXkiOiJhXHUwMDdmYiIsImtpbmQiOiJzbGFja193b3Jrc3BhY2UifSwicHJvdmlkZXIiOiJzbGFjayJ9XSwic3ViamVjdCI6ImFwcHJvdmVyIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn1dLCJhcmd1bWVudHNfc2hhMjU2IjoiMGI2ZmQyZDRlNmUwZjQ3MzJkZmJjYjUxMjRjODMwMWEzMDkwZmIxMDM5MDhkNzMwNTFhMGRkYTMxY2EyNTczZiIsImNvbm5lY3RvciI6ImFjY2VzcyIsImV4cGlyZXNfYXQiOjE3MDAwMDAzMDAsImlzc3VlZF9hdCI6MTcwMDAwMDAwMCwia2V5X2lkIjoic2VsZWN0b3ItdGVzdC0xIiwibm9uY2UiOiJhSkdULWVLZVp6d0lIOFZkSmY4YXFaNmNtZy1Yb0NXRlhwYUpxeHZCemg0IiwicHVycG9zZSI6ImFwcHJvdmFsX3JlcXVlc3QiLCJyZXF1ZXN0ZXIiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInN1YmplY3QiOiJyZXF1ZXN0ZXIiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEifSwicm91dGUiOiJhY2Nlc3MiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJ0b29sIjoiZXhlY3V0ZSIsInZlcnNpb24iOjF9.6Q2qVTvd8cBnFl913rEWv17ZM_mgOHZdnlV1rB9n396GmnVhr6vU9Tg76NtwZW1dMApg9tBw7RDZVBy4xRHAAw"
+      },
+      "now": 1700000001,
+      "code": "invalid_ticket",
+      "signature_valid": true
+    },
+    {
+      "name": "recipient_key_trailing_whitespace",
+      "payload": {
+        "version": 1,
+        "purpose": "approval_request",
+        "tenant_id": "00000000-0000-4000-8000-000000000001",
+        "agent_id": "00000000-0000-4000-8000-000000000002",
+        "connector": "access",
+        "tool": "execute",
+        "route": "access",
+        "key_id": "selector-test-1",
+        "requester": {
+          "tenant_id": "00000000-0000-4000-8000-000000000001",
+          "issuer": "https://id.example.com",
+          "subject": "requester"
+        },
+        "nonce": "aJGT-eKeZzwIH8VdJf8aqZ6cmg-XoCWFXpaJqxvBzh4",
+        "issued_at": 1700000000,
+        "expires_at": 1700000300,
+        "arguments_sha256": "0b6fd2d4e6e0f4732dfbcb5124c8301a3090fb103908d73051a0dda31ca2573f",
+        "approvers": [
+          {
+            "tenant_id": "00000000-0000-4000-8000-000000000001",
+            "issuer": "https://id.example.com",
+            "subject": "approver",
+            "recipient_accounts": [
+              {
+                "provider": "slack",
+                "installation_id": "00000000-0000-4000-8000-000000000003",
+                "namespace": {
+                  "id": "00000000-0000-4000-8000-000000000004",
+                  "authority": "",
+                  "kind": "slack_workspace",
+                  "key": "value\u2028"
+                },
+                "account_id": "U0EXAMPLE1"
+              }
+            ]
+          }
+        ]
+      },
+      "ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6IlUwRVhBTVBMRTEiLCJpbnN0YWxsYXRpb25faWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJuYW1lc3BhY2UiOnsiYXV0aG9yaXR5IjoiIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJrZXkiOiJ2YWx1ZVx1MjAyOCIsImtpbmQiOiJzbGFja193b3Jrc3BhY2UifSwicHJvdmlkZXIiOiJzbGFjayJ9XSwic3ViamVjdCI6ImFwcHJvdmVyIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn1dLCJhcmd1bWVudHNfc2hhMjU2IjoiMGI2ZmQyZDRlNmUwZjQ3MzJkZmJjYjUxMjRjODMwMWEzMDkwZmIxMDM5MDhkNzMwNTFhMGRkYTMxY2EyNTczZiIsImNvbm5lY3RvciI6ImFjY2VzcyIsImV4cGlyZXNfYXQiOjE3MDAwMDAzMDAsImlzc3VlZF9hdCI6MTcwMDAwMDAwMCwia2V5X2lkIjoic2VsZWN0b3ItdGVzdC0xIiwibm9uY2UiOiJhSkdULWVLZVp6d0lIOFZkSmY4YXFaNmNtZy1Yb0NXRlhwYUpxeHZCemg0IiwicHVycG9zZSI6ImFwcHJvdmFsX3JlcXVlc3QiLCJyZXF1ZXN0ZXIiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInN1YmplY3QiOiJyZXF1ZXN0ZXIiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEifSwicm91dGUiOiJhY2Nlc3MiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJ0b29sIjoiZXhlY3V0ZSIsInZlcnNpb24iOjF9.--9R22MJnwTYrrMWwKWktNOdAy6KCUDiqeF4nlBhnjD1OlOWEdY-IzgasW9Vh0Po_pqCYKoPYkvK542oq4VwAw",
+      "arguments": {
+        "resource": "example",
+        "level": "read",
+        "nested": {
+          "approval_ticket": "execution data"
+        },
+        "amount": 1.0,
+        "note": "caf\u00e9",
+        "approval_ticket": "cat1.eyJhZ2VudF9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsImFwcHJvdmVycyI6W3siaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInJlY2lwaWVudF9hY2NvdW50cyI6W3siYWNjb3VudF9pZCI6IlUwRVhBTVBMRTEiLCJpbnN0YWxsYXRpb25faWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJuYW1lc3BhY2UiOnsiYXV0aG9yaXR5IjoiIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJrZXkiOiJ2YWx1ZVx1MjAyOCIsImtpbmQiOiJzbGFja193b3Jrc3BhY2UifSwicHJvdmlkZXIiOiJzbGFjayJ9XSwic3ViamVjdCI6ImFwcHJvdmVyIiwidGVuYW50X2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn1dLCJhcmd1bWVudHNfc2hhMjU2IjoiMGI2ZmQyZDRlNmUwZjQ3MzJkZmJjYjUxMjRjODMwMWEzMDkwZmIxMDM5MDhkNzMwNTFhMGRkYTMxY2EyNTczZiIsImNvbm5lY3RvciI6ImFjY2VzcyIsImV4cGlyZXNfYXQiOjE3MDAwMDAzMDAsImlzc3VlZF9hdCI6MTcwMDAwMDAwMCwia2V5X2lkIjoic2VsZWN0b3ItdGVzdC0xIiwibm9uY2UiOiJhSkdULWVLZVp6d0lIOFZkSmY4YXFaNmNtZy1Yb0NXRlhwYUpxeHZCemg0IiwicHVycG9zZSI6ImFwcHJvdmFsX3JlcXVlc3QiLCJyZXF1ZXN0ZXIiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZC5leGFtcGxlLmNvbSIsInN1YmplY3QiOiJyZXF1ZXN0ZXIiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEifSwicm91dGUiOiJhY2Nlc3MiLCJ0ZW5hbnRfaWQiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJ0b29sIjoiZXhlY3V0ZSIsInZlcnNpb24iOjF9.--9R22MJnwTYrrMWwKWktNOdAy6KCUDiqeF4nlBhnjD1OlOWEdY-IzgasW9Vh0Po_pqCYKoPYkvK542oq4VwAw"
+      },
+      "now": 1700000001,
+      "code": "invalid_ticket",
+      "signature_valid": true
     }
   ],
   "size_cases": [
