@@ -195,6 +195,10 @@ jobs:
       - name: Reject chart-owned extraEnv duplicates
         run: bash charts/curie/ci/reserved-env-assertions.sh
 
+      # API and worker render the same delivery budget and hook claim lease.
+      - name: Hook claim lease render
+        run: bash charts/curie/ci/hook-claim-lease-render.sh
+
       # A Service named <release>-<x> injects CURIE_<X>_PORT as a URL into any
       # pod with service links on, which broke the drain hook (#5350).
       - name: helm render assertions (service links off)
