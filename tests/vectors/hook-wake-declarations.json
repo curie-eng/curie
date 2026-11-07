@@ -580,8 +580,7 @@
         "triggers.wake_target_forbidden"
       ],
       "declarations_valid": false,
-      "wake_names": [],
-      "rust_code": "triggers.target_invalid"
+      "wake_names": []
     },
     {
       "id": "wake-target-blank",
@@ -603,8 +602,7 @@
         "triggers.wake_target_forbidden"
       ],
       "declarations_valid": false,
-      "wake_names": [],
-      "rust_code": "triggers.target_invalid"
+      "wake_names": []
     },
     {
       "id": "ordinary-target-null",
@@ -1098,6 +1096,50 @@
         "connectors.wake_key_delivery"
       ],
       "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "wake-schedule-forbidden",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results.",
+            "schedule": "0 9 * * *"
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.schedule_forbidden"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "wake-timezone-without-schedule",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results.",
+            "timezone": "UTC"
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.timezone_without_schedule"
+      ],
+      "declarations_valid": false,
       "wake_names": []
     }
   ]

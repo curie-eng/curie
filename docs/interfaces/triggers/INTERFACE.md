@@ -442,8 +442,11 @@ There is no shared-agent-key or protected-source-key fallback.
 ### Key derivation and administration
 
 The installation signing key is exactly `get_settings().api_key`, the same
-setting used by `get_hook_secret`. Let `G` be the stored generation integer
-for this agent and exact hook, initially 1 and bounded by `1 <= G <= 2^63-1`.
+setting used by `get_hook_secret`. Let `G` be the generation integer for this
+agent and exact hook, bounded by `1 <= G <= 2^63-1`. Absent generation metadata
+means generation 1; reading the key need not create a row. Rotation inserts
+generation 2 when metadata is absent, or increments the stored generation
+otherwise.
 Its encoding is canonical ASCII decimal, with no sign or leading zeroes.
 The derivation material is exactly:
 
@@ -462,7 +465,11 @@ The fixed vectors and independent test reference are in
 Both administrative operations use the same platform-key or live-console
 authority as `apps/api/src/curie_api/routers/agents.py::get_hook_secret`,
 with `Cache-Control: no-store` on their responses. A wake signature does not
-authorize either operation. No query parameters or request body are accepted.
+authorize either operation. After administrative authentication, a nonempty
+query string returns 400 `{"detail":"wake_query_forbidden"}`, including a
+parameter with an empty value. Then any nonempty request body returns 422
+`{"detail":"wake_body_invalid"}`. Both operations require zero body bytes;
+even `{}` is refused.
 
 | Operation | Success schema and exact fields |
 | --- | --- |
@@ -483,8 +490,11 @@ source authority. Refuse a source policy, unresolved source history,
 `remediation_policies` row, partition or source binding. Unavailable authority
 fails closed. Administrative errors use `HookWakeErrorOut` below: missing
 agent or wake declaration is 404 `wake_not_declared`; invalid stored bundle is
-503 `wake_declaration_unavailable`; nonordinary source is 409
-`wake_source_not_ordinary`; unavailable metadata/source authority is 503
+503 `wake_declaration_unavailable`. On both wake-key admin routes and the wake
+route, existing source policy or unresolved history outcomes from
+`apps/api/src/curie_api/routers/hook_fire.py::_require_ordinary_source` map to
+409 `wake_source_not_ordinary`, including when that helper reports 503.
+Only genuine metadata/source authority unavailability remains 503
 `authority_unavailable`. Check declaration before source classification.
 Administrative authentication failures retain the existing admin auth contract.
 
@@ -494,6 +504,9 @@ These are the complete wake success schemas, with all fields required and no
 additional fields. `run_id` is a UUID string naming the admitted hook run.
 Coalescing exposes no run identifier, including when a replay's original run
 has already settled.
+
+An admitted wake stores `hook_runs.source` as `webhook`; operator run queries
+report `trigger` as `webhook`.
 
 | HTTP | Schema | Exact body |
 | --- | --- | --- |
@@ -517,10 +530,12 @@ field and no other fields. Evaluate refusals in this order:
 3. Resolve the ranked active deployment and exact explicit wake declaration.
    Absence returns 404 `wake_not_declared`; unreadable or malformed required
    bundle returns 503 `wake_declaration_unavailable`.
-4. Recheck ordinary-source authority. Protected or configured source state
-   returns 409 `wake_source_not_ordinary`; unavailable authority returns 503
-   `authority_unavailable`. Neither ordinary ingress nor protected ingestion
-   is called as a fallback.
+4. Recheck ordinary-source authority. Protected or configured source state,
+   including existing source policy or unresolved history refused by
+   `apps/api/src/curie_api/routers/hook_fire.py::_require_ordinary_source`, returns 409
+   `wake_source_not_ordinary`. Only genuine authority unavailability returns
+   503 `authority_unavailable`. Neither ordinary ingress nor protected
+   ingestion is called as a fallback.
 5. Pause returns 409 `hook_paused`, then kill returns 409 `agent_killed`, then
    existing configured-limit refusal returns 429 `budget_exhausted`. These
    guards run before delivery reservation, including before a duplicate could
@@ -538,8 +553,12 @@ field and no other fields. Evaluate refusals in this order:
    the open claim until lease recovery. No terminal close admits a successor.
 
 Recheck current generation, source authority, pause, kill and limits under the
-gate before run mutation, using the same refusal vocabulary. Guard refusals
-create no run. Enqueue failure is the explicit exception because the open
+gate before run mutation. A generation mismatch returns 401
+`invalid_wake_signature`. Source rechecks return 409
+`wake_source_not_ordinary` or 503 `authority_unavailable` as in step 4; pause,
+kill and limit rechecks return 409 `hook_paused`, 409 `agent_killed` and 429
+`budget_exhausted`, respectively, as in step 5. Guard refusals create no run.
+Enqueue failure is the explicit exception because the open
 claim has already committed. Missing/invalid credentials are never separated
 into observable unknown-agent versus wrong-key responses.
 
@@ -554,7 +573,8 @@ is distinct from every credential derivation label. The namespace is separate
 from ordinary ingress claims and scoped to current generation.
 Retain the reservation strictly beyond the signed
 timestamp plus 300 seconds. At receipt time `now`, its integer TTL in seconds
-is `max(1, floor(int(timestamp) + 300 - now) + 1)`. This includes accepted
+is at least `max(1, floor(int(timestamp) + 300 - now) + 1)`, permitting an
+additional clock-skew margin. This includes accepted
 future timestamps and the inclusive acceptance boundary. No permanent receipt
 or follow-up state exists. A captured signed delivery remains coalesced after
 settlement while its reservation exists. Publication failure retains it too.
@@ -565,13 +585,14 @@ The dependent deploy slice adds `DeployOutput.wake_triggers`, an array of
 `HookWakeDeployReceipt` objects, with no credential:
 
 ```json
-{"wake_triggers":[{"name":"queue-ready","url":"https://api.example.com/hooks/00000000-0000-4000-8000-000000000001/queue-ready/wake","mode":"targetless"}]}
+{"wake_triggers":[{"name":"queue-ready","path":"/hooks/00000000-0000-4000-8000-000000000001/queue-ready/wake","mode":"targetless"}]}
 ```
 
-Each entry has exactly `name` (string), `url` (string or null) and `mode`
-(literal `targetless`). Use the target's configured external API base with
-trailing slashes removed. When that base is unknown, emit `url: null`; never
-guess from internal service addresses. An empty declaration set emits `[]`.
+Each entry has exactly `name` (string), `path` (string) and `mode`
+(literal `targetless`). The path is the exact route with the agent id and hook
+name filled in. There is no absolute `url` field. The connector operator
+prefixes the API base they reach the installation through. An empty
+declaration set emits `[]`.
 This array alone is not key-retrieval or runtime-isolation evidence.
 
 The connector owns queue polling. Configure a bounded cadence appropriate to

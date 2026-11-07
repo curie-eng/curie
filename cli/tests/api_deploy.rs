@@ -2073,6 +2073,55 @@ async fn optional_secrets_are_absent_from_local_and_cluster_deploy_records() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn hook_wake_local_deploy_reports_out_of_band_secret() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json(AGENT_ID, AGENT_NAME, BOUND, None)),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent(BOUND, None),
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    });
+    for (name, expected) in [
+        ("CURIE_HOOK_WAKE_KEY", "references the out-of-band Secret"),
+        ("CURIE_OTHER_KEY", "reserved platform boot-env"),
+        ("QUEUE_KEY", "references the out-of-band Secret"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        scaffold(dir.path(), AGENT_NAME).unwrap();
+        std::fs::write(
+            dir.path().join("connectors.yaml"),
+            serde_json::to_vec(&serde_json::json!({
+                "connectors": {"queue": {
+                    "image": "ghcr.io/acme-corp/queue:1",
+                    "secrets": [{"name": name, "from_secret": "acme-wake-credential"}]
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+        command
+            .args(["--json", "local", "deploy", "--plugin-dir"])
+            .arg(dir.path())
+            .args(["--api-url", &server.base_url])
+            .env("CURIE_CONFIG_DIR", config.path())
+            .env_remove("CURIE_CONNECTOR_START_TIMEOUT_SECONDS");
+        let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let error = payload["error"].as_str().unwrap();
+        assert!(error.contains(name), "{payload}");
+        assert!(error.contains(expected), "{payload}");
+        if expected.contains("out-of-band") {
+            assert!(error.contains("has no local equivalent"), "{payload}");
+            assert!(!error.contains("Rename the variable"), "{payload}");
+        }
+    }
+}
+
 // @spec #4129 optional-secret contract: an explicit optional binding follows normal local delivery.
 #[cfg(unix)]
 #[tokio::test]

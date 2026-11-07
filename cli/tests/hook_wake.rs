@@ -39,11 +39,7 @@ fn hook_wake_shared_cases_through_real_build() {
             let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(receipt["connectors"], serde_json::json!([]));
         } else {
-            let code = case
-                .get("rust_code")
-                .unwrap_or(&case["codes"][0])
-                .as_str()
-                .unwrap();
+            let code = case["codes"][0].as_str().unwrap();
             assert!(
                 String::from_utf8_lossy(&output.stdout).contains(code)
                     || String::from_utf8_lossy(&output.stderr).contains(code),

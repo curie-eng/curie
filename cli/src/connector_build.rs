@@ -845,6 +845,37 @@ pub fn validate_wake_manifest(bundle_dir: &Path) -> Result<()> {
                 bail!("triggers.duplicate_name: trigger names must be unique");
             }
         }
+        if wake {
+            if text("type") != Some("webhook") {
+                bail!("triggers.wake_type_invalid: wake requires type webhook");
+            }
+            let valid_name = text("name").is_some_and(|name| {
+                let alnum = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+                !name.is_empty()
+                    && name.len() <= 63
+                    && alnum(name.as_bytes()[0])
+                    && name
+                        .bytes()
+                        .all(|byte| alnum(byte) || b"._-".contains(&byte))
+            });
+            if !valid_name {
+                bail!("triggers.wake_invalid_name: invalid wake hook name");
+            }
+            if text("prompt").is_none_or(|value| trim(value).is_empty()) {
+                bail!("triggers.wake_missing_prompt: wake requires a standing prompt");
+            }
+            if trigger.contains_key("target") {
+                bail!("triggers.wake_target_forbidden: wake must not define target");
+            }
+            if trigger.contains_key("schedule") {
+                bail!("triggers.schedule_forbidden: webhook must not define schedule");
+            }
+            if trigger.contains_key("timezone")
+                && text("schedule").is_none_or(|value| trim(value).is_empty())
+            {
+                bail!("triggers.timezone_without_schedule: timezone requires a schedule");
+            }
+        }
         if trigger.contains_key("target")
             && text("target").is_none_or(|value| trim(value).is_empty())
         {
@@ -854,30 +885,6 @@ pub fn validate_wake_manifest(bundle_dir: &Path) -> Result<()> {
             && text("path").is_none_or(|value| trim(value).is_empty())
         {
             bail!("triggers.webhook_missing_path: webhook requires a path");
-        }
-        if !wake {
-            continue;
-        }
-        if text("type") != Some("webhook") {
-            bail!("triggers.wake_type_invalid: wake requires type webhook");
-        }
-        let valid_name = text("name").is_some_and(|name| {
-            let alnum = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
-            !name.is_empty()
-                && name.len() <= 63
-                && alnum(name.as_bytes()[0])
-                && name
-                    .bytes()
-                    .all(|byte| alnum(byte) || b"._-".contains(&byte))
-        });
-        if !valid_name {
-            bail!("triggers.wake_invalid_name: invalid wake hook name");
-        }
-        if text("prompt").is_none_or(|value| trim(value).is_empty()) {
-            bail!("triggers.wake_missing_prompt: wake requires a standing prompt");
-        }
-        if trigger.contains_key("target") {
-            bail!("triggers.wake_target_forbidden: wake must not define target");
         }
     }
     Ok(())
@@ -2558,16 +2565,22 @@ pub fn refuse_reserved_secret_names(decl: &ConnectorsFileDecl) -> Result<()> {
         if spec.url.is_some() || spec.unhosted_url.is_some() {
             continue;
         }
-        for name in declared_secret_names(spec)
-            .into_iter()
-            .chain(spec.secret_files.keys().cloned())
+        for name in spec
+            .secrets
+            .iter()
+            .filter_map(|secret| match secret {
+                SecretDecl::Ref { name, .. } if name == HOOK_WAKE_KEY_ENV => None,
+                SecretDecl::Name(name) | SecretDecl::Ref { name, .. } => Some(name),
+            })
+            .chain(spec.config.iter())
+            .chain(spec.secret_files.keys())
         {
-            crate::secrets::validate_name(&name).map_err(|err| {
+            crate::secrets::validate_name(name).map_err(|err| {
                 crate::exit::usage(format!(
                     "connectors.{connector}: `{name}` is not a usable secret name: {err}"
                 ))
             })?;
-            if is_reserved_secret_name(&name) {
+            if is_reserved_secret_name(name) {
                 return Err(crate::exit::usage(format!(
                     "connectors.{connector}: `{name}` is a reserved platform boot-env or \
                      model-credential key and cannot be a connector secret. Curie would resolve \
