@@ -1893,6 +1893,7 @@ def test_genuine_documentation_only_selects_no_runtime_e2e_tiers(
     [
         ("apps/ui/package.json", True),
         ("apps/ui/pnpm-lock.yaml", True),
+        ("apps/dispatcher/src/curie_dispatcher/app.py", True),
         ("packages/channel-gateway/src/curie_channel_gateway/slack/app.py", True),
         # Rule-ignored paths still run their impact readers on a pull request.
         ("scripts/README.md", True),

@@ -456,6 +456,7 @@ rules:
     docs: []
     apps/ui: []
     apps/dispatcher: []
+    packages/channel-gateway/src/curie_channel_gateway/slack: []
     # Nothing deploys the per-run Docker daemon image yet; its group in
     # image-proofs builds it and runs the escape tests against it.
     apps/docker-daemon: []
