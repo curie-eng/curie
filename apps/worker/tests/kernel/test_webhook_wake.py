@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 import pytest
 from aci_protocol import Final, SessionStatus
@@ -23,7 +23,8 @@ def test_stored_provenance_and_close_are_per_run(make_hook_run, monkeypatch, sou
             recorder = run.recorder()
             state = await recorder.get(run.ref)
             assert state.source == source
-            before = datetime.now(UTC)
+            async with run.engine.connect() as conn:
+                before = (await conn.execute(text("SELECT clock_timestamp()"))).scalar_one()
             assert await recorder.renew(run.ref, 900)
             assert await run.lease_expires_at() >= before + timedelta(seconds=900)
             assert await recorder.close(run.ref, "blocked", "hook_paused") is True
