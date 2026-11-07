@@ -5,14 +5,18 @@ egress and provider reads. This extraction is behavior-neutral. This first
 slice defines ports and regression fixtures only; no production composition
 uses this package yet. `slack/` and `mail/` are implementation destinations.
 
+The boundary proposal is recorded in
+[Draft ADR 0275](../../docs/adr/0275-channel-gateway-provider-boundary.md).
+
 ## Ports
 
 Import ports from `curie_channel_gateway.ports`; their defining modules are:
 
 | Module | Port or value |
 | --- | --- |
-| `ports/reply.py` | `AuthenticatedReplyTransport[Route]` |
+| `ports/reply.py` | `ReplyEventTransport[Route]`, `AuthenticatedReplyTransport[Route]`, `ReplyCapabilities`, `DeclaredReplyTransport[Route]` |
 | `ports/admission.py` | `AdmissionClient`, `AdmissionRequest`, `AdmissionAnswer` |
+| `ports/intake.py` | `TurnSubmission[Turn, Receipt]`, `ApprovalResolution[Outcome]` |
 | `ports/groups.py` | `GroupMembershipSource[Membership]` |
 | `ports/reads.py` | `IdentitySelection[Route]`, `FileSource`, `SenderIdentities`, `AddressIdentityLookup`, `ChannelReader[Route, Window, Page, Message]`, `CanvasReader[Route, File, Page, Document]` |
 
@@ -26,12 +30,27 @@ Generic parameters bind directly to today's worker `TargetRoute`, API
 `UserGroupMembership`, `BindingRoute`, `ResolvedWindow`, `ProviderPage`,
 `ChannelMessage`, `CanvasFile`, `CanvasPage` and `CanvasDocument`. They preserve
 the current typed signatures without importing applications or moving records.
-Existing reply and read implementations satisfy their ports structurally.
+Existing HTTP emitters satisfy `ReplyEventTransport`; read implementations satisfy
+their ports structurally. `AuthenticatedReplyTransport` also requires synchronous
+`edits_in_place(kind, route)` and `undeliverable_reason(kind, route)` hooks.
+`DeclaredReplyTransport` retains explicit `ReplyCapabilities` for each kind and
+route beside an HTTP emitter. Missing declarations raise rather than silently
+returning False or None. Composition supplies the provider configuration snapshot
+and replaces it when identities change, before admitting turns against it.
 Lookup errors retain their existing identity and semantics. The admission port
 is a wrapper contract: map `evidence` to the API's existing provider evidence
-field and preserve `None` as unavailable. It adds no platform endpoint.
+field and preserve `None` as unavailable. The lane adapter fixes `kind` as a class
+constant, never from the inbound request. `connect_url` is single-use and must
+never be cached or shared. The ports add no platform endpoint.
 
 ## Authority and storage
+
+The gateway authenticates Slack deliveries by verifying the Slack signature or
+using Socket Mode. It owns minting the chat-attester principal and signing the
+receiver answer proof over the exact resolve bytes and principal. The API checks
+our proof signatures and evidence shape and derives the principal from that
+evidence; it cannot confirm that a delivery actually came from Slack. Whoever
+holds the platform key and attester secret can assert any user.
 
 The API retains admission authority, authorization, verified-principal policy,
 approval decisions and resolve-once. Mandatory uncached group resolution stays
@@ -45,10 +64,19 @@ contract.
 Stock Slack still calls `/channels/admission`, claims dedupe, posts a
 placeholder, then enqueues. A refusal claims nothing and posts nothing. Mail
 retains authenticated `/channels/turns` ingress with its scoped credential and
-its standalone entrypoint. AgentMail still cannot authenticate inbound senders;
+its standalone entrypoint. `TurnSubmission` wraps that HTTP ingress and
+`ApprovalResolution` wraps the existing approval endpoint, preserving receipts
+and verdicts. AgentMail still cannot authenticate inbound senders;
 the positive intake fixture uses the existing verifying test provider.
 
 ## Move sequence
+
+Every move deletes the duplicated protocol it replaces and migrates all callers.
+U2 replaces dispatcher `AdmissionAnswer`; U4 replaces API `usergroups.py`
+`GroupMembershipSource` and `readers.py` `ChannelReader`/`CanvasReader`. Never keep
+both definitions or add a compatibility alias. Neutral value records needed by
+both gateway and applications belong in `channel-protocol`, with all callers
+migrated in the same move.
 
 1. U2 moves Slack intake and connection code and the mail adapter behind these
    ports, preserving entrypoints, admission order and all existing storage owners.
@@ -79,3 +107,9 @@ at the real dedupe write, placeholder call and stream append. HTTP fixtures
 send the shared corpus through the current worker transport to a real HTTP
 receiver. Keep these selectors and assertions working after each move; update
 only import wiring when a provider's module location changes.
+
+The sole named deselection is the selected-click ack timing fixture: it fails
+locally at the two baseline commits recorded in the argument file while CI
+passes it. The argument file carries that note as marker metadata because pytest
+argument files do not support comments. Run serially against private Valkey;
+shared Valkey plus parallel caller-admission tests can produce false failures.

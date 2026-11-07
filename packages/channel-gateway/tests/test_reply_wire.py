@@ -9,7 +9,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from channel_protocol import ReplyAck, ReplyEvent, ReplyUpdate
-from curie_channel_gateway.ports import AuthenticatedReplyTransport
+from curie_channel_gateway.ports import ReplyEventTransport
 from curie_worker.reply_sink import HttpReplyAdapter, TargetRoute
 from pydantic import TypeAdapter
 
@@ -55,7 +55,7 @@ def _round_trip(event: ReplyEvent) -> None:
         await server.start_server()
         adapter = HttpReplyAdapter({"acme-adapter": "test-egress-secret"})
         try:
-            transport: AuthenticatedReplyTransport[TargetRoute] = adapter
+            transport: ReplyEventTransport[TargetRoute] = adapter
             ack = await transport.emit(
                 event,
                 route=TargetRoute(endpoint=str(server.make_url("/reply")), adapter="acme-adapter"),

@@ -294,4 +294,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0272 | [Approver DM delivery uses one selected recipient](0272-approver-dm-delivery-uses-one-selected-recipient.md) | Accepted |
 | 0273 | [Approval routes own expiry and reminders](0273-approval-routes-own-expiry-and-reminders.md) | Accepted |
 | 0274 | [A declared webhook wake skips overlap until the next poll](0274-a-declared-webhook-wake-skips-overlap-until-the-next-poll.md) | Accepted |
+| 0275 | [A channel gateway owns provider authentication and I/O](0275-channel-gateway-provider-boundary.md) | Draft |
 <!-- END GENERATED: adr-index -->

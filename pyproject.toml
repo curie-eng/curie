@@ -117,6 +117,12 @@ root_packages = [
 # import-linter only tracks imports that leave the root packages when told to.
 include_external_packages = true
 
+[[tool.importlinter.contracts]]
+name = "Channel gateway ports stay provider and application independent"
+type = "forbidden"
+source_modules = ["curie_channel_gateway.ports"]
+forbidden_modules = ["slack_sdk", "curie_api", "curie_worker"]
+
 # @spec PROTECTED-HOOK-LANE-1: internal transport has no application/SDK authority.
 [[tool.importlinter.contracts]]
 name = "Protected hook primitives stay independent of applications and harnesses"
