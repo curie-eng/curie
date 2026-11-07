@@ -989,6 +989,27 @@ pub struct HookFireRecord {
     pub ended_at: Option<String>,
 }
 
+/// `GET /agents/{agent_id}/hooks/{hook}/wake-secret` (`HookWakeSecretOut`).
+///
+/// No `Debug`: the secret is printed only by the read command's success path.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HookWakeSecret {
+    pub agent_id: String,
+    pub hook: String,
+    pub generation: u64,
+    pub secret: String,
+}
+
+/// `POST /agents/{agent_id}/hooks/{hook}/wake-secret/rotate` (`HookWakeRotationOut`).
+///
+/// Unknown response fields, including a secret, are ignored and never displayed.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HookWakeRotation {
+    pub agent_id: String,
+    pub hook: String,
+    pub generation: u64,
+}
+
 /// Provenance nested on ``MemoryEntryOut`` (`MemoryProvenanceOut`).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct MemoryProvenance {
@@ -2388,6 +2409,36 @@ pub(crate) fn hook_run_path(agent: &str, name: &str, run_id: &str) -> String {
     hook_agent_path(agent, name, &["runs", run_id])
 }
 
+/// The percent-encoded request path for reading a targetless wake key:
+/// `/agents/{agent_id}/hooks/{hook}/wake-secret`.
+pub(crate) fn hook_wake_secret_path(agent_id: &str, hook: &str) -> String {
+    hook_agent_path(agent_id, hook, &["wake-secret"])
+}
+
+/// The percent-encoded request path for rotating a targetless wake key:
+/// `/agents/{agent_id}/hooks/{hook}/wake-secret/rotate`.
+pub(crate) fn hook_wake_secret_rotate_path(agent_id: &str, hook: &str) -> String {
+    hook_agent_path(agent_id, hook, &["wake-secret", "rotate"])
+}
+
+/// The deploy receipt route for one targetless wake: `/hooks/{agent_id}/{hook}/wake`.
+///
+/// This is the platform route, not the manifest webhook path and not an absolute URL.
+pub(crate) fn hook_wake_route(agent_id: &str, hook: &str) -> String {
+    let mut url = reqwest::Url::parse("http://hook.invalid").expect("static URL base parses");
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .expect("static URL base accepts path segments");
+        segments
+            .push("hooks")
+            .push(agent_id)
+            .push(hook)
+            .push("wake");
+    }
+    url.path().to_string()
+}
+
 /// Percent-encode an agent hook path by pushing each segment through a
 /// throwaway URL, mirroring how `control_schedule` builds its request URL.
 fn hook_agent_path(agent: &str, name: &str, tail: &[&str]) -> String {
@@ -2689,6 +2740,85 @@ impl ApiClient {
             .await
             .context("decoding hook secret response")?;
         required_response_string(&body, "secret", "hook secret response")
+    }
+
+    /// Read the current targetless wake key.
+    ///
+    /// `GET /agents/{agent_id}/hooks/{hook}/wake-secret` with no query and no body.
+    /// The secret stays inside the returned value; this method does not log it.
+    pub async fn read_hook_wake_key(&self, agent_id: &str, hook: &str) -> Result<HookWakeSecret> {
+        let url = reqwest::Url::parse(&format!(
+            "{}{}",
+            self.base_url,
+            hook_wake_secret_path(agent_id, hook)
+        ))?;
+        let resp = self
+            .send_request(
+                self.http.get(url).header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/hooks/{hook}/wake-secret",
+            )
+            .await?;
+        Self::expect_wake_ok(resp, "reading wake key")
+            .await?
+            .json()
+            .await
+            .context("decoding wake key")
+    }
+
+    /// Rotate the targetless wake key.
+    ///
+    /// `POST /agents/{agent_id}/hooks/{hook}/wake-secret/rotate` with no query and
+    /// zero body bytes. The decoded value has no secret field, so a secret on
+    /// the response is dropped and not logged.
+    pub async fn rotate_hook_wake_key(
+        &self,
+        agent_id: &str,
+        hook: &str,
+    ) -> Result<HookWakeRotation> {
+        let url = reqwest::Url::parse(&format!(
+            "{}{}",
+            self.base_url,
+            hook_wake_secret_rotate_path(agent_id, hook)
+        ))?;
+        let resp = self
+            .send_request(
+                self.http
+                    .post(url)
+                    .header("X-API-Key", &self.api_key)
+                    .body(Vec::<u8>::new()),
+                "POST /agents/{id}/hooks/{hook}/wake-secret/rotate",
+            )
+            .await?;
+        Self::expect_wake_ok(resp, "rotating wake key")
+            .await?
+            .json()
+            .await
+            .context("decoding wake key rotation")
+    }
+
+    /// A non-success wake-key response names the API `detail` and nothing else
+    /// from the body, so a success payload or a secret field is not printed.
+    async fn expect_wake_ok(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
+        if resp.status().is_success() {
+            return Ok(resp);
+        }
+        let status = resp.status();
+        if let Some(refusal) = redirect_refusal(status, resp.headers()) {
+            bail!("{what} failed: {refusal}");
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if is_unrouted(status, &body) {
+            bail!(
+                "{what} failed: this platform release does not have that endpoint, so it is \
+                 older than this CLI. Upgrade the release, or use a CLI matching it."
+            );
+        }
+        match api_detail_reason(&body) {
+            Some(detail) if !detail.is_empty() => {
+                bail!("{what} failed with {status}: {detail}")
+            }
+            _ => bail!("{what} failed with {status}"),
+        }
     }
 
     /// Poll one opaque disconnected cluster-message reply bucket.

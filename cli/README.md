@@ -329,12 +329,19 @@ The deploy receipt's `bundle_sha256` identifies the exact bundle used for
 local and cluster parity.
 
 Local and cluster deploy receipts list every cron declaration with its name,
-schedule, zone (default `UTC`), and target (`targetless` when absent). An explicit
-target that does not resolve to one bound channel produces a warning after a
-successful deploy; deploy still exits 0. With `--json`, deploy schema v1.2 always
-includes `cron_triggers` and `warnings` arrays, including empty arrays, and an
-absent target is `null`. Each result from `cluster deploy --all-targets` carries
-the same fields.
+schedule, zone (default `UTC`), and target (`targetless` when absent). They also
+list every webhook whose `wake` field is boolean true and that has a name.
+Each wake receipt has `name`, `path`, and `mode`. The path is
+`/hooks/{agent id}/{name}/wake`. The mode is `targetless`. An omitted wake, a
+false wake, a non-boolean wake, a cron row, or a row without a name is not a
+wake receipt. No wake declarations emit an empty `wake_triggers` array. The
+receipt carries no credential. An explicit cron target that does not resolve
+to one bound channel produces a warning after a successful deploy; deploy still
+exits 0. With `--json`, deploy schema v1.3 always includes `cron_triggers`,
+`wake_triggers`, and `warnings` arrays, including empty arrays, and an absent
+cron target is `null`. `wake_triggers` stays off the parent required list, the
+same way `cron_triggers` does. Each result from `cluster deploy --all-targets`
+carries the same fields.
 
 Run the same authored suite at each tier:
 

@@ -30,6 +30,34 @@ pub(crate) enum ClusterHookAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Read or rotate the targetless wake key for one named webhook.
+    #[command(subcommand_precedence_over_arg = true, subcommand_negates_reqs = true)]
+    WakeKey {
+        #[command(subcommand)]
+        command: Option<ClusterWakeKeyCommand>,
+        /// Agent name or id.
+        agent: Option<String>,
+        /// Trigger name on the in-force bundle.
+        name: Option<String>,
+        /// Print the route and the word redacted, and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// `cluster hook wake-key rotate`.
+#[derive(Subcommand)]
+pub(crate) enum ClusterWakeKeyCommand {
+    /// Rotate the wake key. The new secret is not printed.
+    Rotate {
+        /// Agent name or id.
+        agent: String,
+        /// Trigger name on the in-force bundle.
+        name: String,
+        /// Print the route and the word redacted, and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]

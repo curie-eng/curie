@@ -1522,6 +1522,15 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             let dry_run = match &action {
                 ClusterHookAction::Fire { dry_run, .. }
                 | ClusterHookAction::Record { dry_run, .. } => *dry_run,
+                ClusterHookAction::WakeKey {
+                    dry_run, command, ..
+                } => {
+                    *dry_run
+                        || matches!(
+                            command,
+                            Some(ClusterWakeKeyCommand::Rotate { dry_run: true, .. })
+                        )
+                }
             };
             let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
                 conn.api_url,
@@ -1565,6 +1574,35 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     })
                     .await?,
                 ),
+                ClusterHookAction::WakeKey {
+                    command,
+                    agent,
+                    name,
+                    dry_run,
+                } => {
+                    let (agent, name, rotate, dry_run) = match command {
+                        Some(ClusterWakeKeyCommand::Rotate {
+                            agent,
+                            name,
+                            dry_run,
+                        }) => (agent, name, true, dry_run),
+                        None => {
+                            let (agent, name) = commands::require_wake_key_target(agent, name)?;
+                            (agent, name, false, dry_run)
+                        }
+                    };
+                    emit(
+                        commands::hook_wake_key(commands::HookWakeKeyOpts {
+                            api_url,
+                            api_key,
+                            agent,
+                            name,
+                            rotate,
+                            dry_run,
+                        })
+                        .await?,
+                    )
+                }
             }
         }
         ClusterAction::Delete {

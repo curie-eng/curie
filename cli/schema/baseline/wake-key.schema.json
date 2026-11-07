@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/wake-key/v1.0.json",
+  "title": "curie <tier> hook wake-key --json",
+  "description": "The agent-facing payload of `curie local hook wake-key` and `curie cluster hook wake-key`: a dry-run plan, the current wake key, or a rotation receipt. Rotation omits the secret.",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": { "const": true },
+        "plan": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["dry_run", "plan"]
+    },
+    "secret": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent_id": { "type": "string" },
+        "hook": { "type": "string" },
+        "generation": { "type": "integer" },
+        "secret": { "type": "string" }
+      },
+      "required": ["agent_id", "hook", "generation", "secret"]
+    },
+    "rotation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent_id": { "type": "string" },
+        "hook": { "type": "string" },
+        "generation": { "type": "integer" }
+      },
+      "required": ["agent_id", "hook", "generation"]
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/dryRun" },
+    { "$ref": "#/$defs/secret" },
+    { "$ref": "#/$defs/rotation" }
+  ]
+}

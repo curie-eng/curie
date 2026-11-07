@@ -35,15 +35,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use curie::api::{
-    AgentAccessPolicy, ApprovalRecord, ChannelBinding, HookFireRecord, MemoryEntry, MetricPoint,
-    MetricSeries, MetricsSummary, ScheduleList, Version,
+    AgentAccessPolicy, ApprovalRecord, ChannelBinding, HookFireRecord, HookWakeRotation,
+    HookWakeSecret, MemoryEntry, MetricPoint, MetricSeries, MetricsSummary, ScheduleList, Version,
 };
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
     AccessPolicyOutput, ActionsOutput, ApprovalsOutput, BudgetOutput, CallersOutput,
     ChannelsOutput, DeleteOutput, DirectoryOutput, HookFireOutput, HookOutput, KillOutput,
     MemoryChannel, MemoryOutput, OverridesOutput, PublicationPolicyOutput, ResetThreadOutput,
-    ResumeOutput, SchedulesOutput, SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
+    ResumeOutput, SchedulesOutput, SkillApprovalsOutput, VersionsOutput, WakeKeyOutput,
+    WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::factory_intake::FactoryIntakeOutput;
@@ -665,6 +666,23 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 }))
                 .unwrap(),
             )),
+        ],
+    );
+    m.insert(
+        "WakeKeyOutput",
+        samples![
+            "DryRun" => WakeKeyOutput::DryRun(plan()),
+            "Secret" => WakeKeyOutput::Secret(HookWakeSecret {
+                agent_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                hook: "queue-ready".to_string(),
+                generation: 1,
+                secret: "example".to_string(),
+            }),
+            "Rotation" => WakeKeyOutput::Rotation(HookWakeRotation {
+                agent_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                hook: "queue-ready".to_string(),
+                generation: 2,
+            }),
         ],
     );
     m.insert(

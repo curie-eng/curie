@@ -51,6 +51,8 @@ fn run(args: &[&str], cluster: bool) -> Output {
         .env_remove("CURIE_API_KEY")
         .env_remove("CURIE_NAMESPACE")
         .env_remove("CURIE_RELEASE")
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .env("NO_COLOR", "1");
     if cluster {
         command.env("KUBECONFIG", MISSING_KUBECONFIG);
@@ -571,8 +573,10 @@ fn wake_operator_key_dry_run_makes_no_request() {
                 text.contains("redacted"),
                 "{tier} rotate={rotate}: dry run must say redacted: {text}"
             );
-            let read_path = wake_secret_path();
-            let rotate_path = wake_secret_rotate_path();
+            // Dry-run makes no request, so it can only name the identifier the
+            // operator typed. The live call resolves that name to the agent id.
+            let read_path = format!("/agents/{AGENT_NAME}/hooks/{HOOK}/wake-secret");
+            let rotate_path = format!("/agents/{AGENT_NAME}/hooks/{HOOK}/wake-secret/rotate");
             if rotate {
                 assert!(
                     text.contains(&rotate_path),
