@@ -14,9 +14,19 @@ FROM ${RUNNER_IMAGE}
 USER 0:0
 COPY packages/shell-supervisor /app/packages/shell-supervisor
 # --no-deps: aiohttp, its one dependency, is already in the runner venv.
+# Outside its claim directory the runner child may write only the scratch
+# roots the supervisor empties at every retirement (/tmp, /var/tmp, /dev/shm,
+# /run/lock, /dev/mqueue). The runner image's own home belongs to uid 1000, so
+# it is handed to root here; each claim gets a fresh HOME instead. The
+# supervisor checks the whole filesystem at startup and refuses to serve if
+# anything else is writable by the child, or if any setuid or setgid file
+# remains (the child also runs with no_new_privs).
 RUN /app/.venv/bin/pip install --no-cache-dir --no-deps /app/packages/shell-supervisor \
     && mkdir -p /var/lib/curie-shell \
-    && chmod 0711 /var/lib/curie-shell
+    && chmod 0711 /var/lib/curie-shell \
+    && chown -R 0:0 /home/runner \
+    && chmod -R go-w /home/runner \
+    && find / -xdev -type f -perm /6000 -exec chmod ug-s {} +
 
 EXPOSE 8443
 HEALTHCHECK --interval=15s --timeout=3s --start-period=10s \

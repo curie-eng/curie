@@ -11,6 +11,7 @@ import http.client
 import json
 import os
 import signal
+import ssl
 import subprocess
 import sys
 import textwrap
@@ -202,6 +203,8 @@ def test_retire_stops_the_process_group_and_leaves_nothing_behind(
     assert CONTROL_TOKEN not in child_env.values()
     assert child_env["CURIE_SANDBOX_ID"] == "claim-a"
     assert (supervisor.scrub_dir / "left-by-claim").exists()
+    assert (supervisor.scrub_dir / "escape-dir").is_symlink()
+    scratch_mode = supervisor.scrub_dir.stat().st_mode
 
     status, answer = _retire(supervisor, "claim-a", 1)
     assert status == 200 and answer["outcome"] == "cleaned"
@@ -209,6 +212,9 @@ def test_retire_stops_the_process_group_and_leaves_nothing_behind(
     assert not claim_root.exists()
     assert list((supervisor.state_root / "claims").iterdir()) == []
     assert list(supervisor.scrub_dir.iterdir()) == []
+    # The shared directory keeps its mode; the planted links were removed,
+    # never followed.
+    assert supervisor.scrub_dir.stat().st_mode == scratch_mode
     assert not supervisor.workspace_link.exists() and not supervisor.workspace_link.is_symlink()
     assert answer["shell"]["state"] == "idle" and answer["shell"]["claim"] is None
     # Retiring the same lease again answers the same outcome and does nothing.
@@ -224,7 +230,11 @@ def test_a_new_claim_gets_a_fresh_directory_and_home(
     _start(supervisor, records, claim="claim-b", generation=2, bearer=SECOND_BEARER)
     second_home = json.loads((records / "env.json").read_text())["HOME"]
     assert first_home != second_home
-    assert sorted(path.name for path in Path(second_home).iterdir()) == ["left-by-claim"]
+    assert sorted(path.name for path in Path(second_home).iterdir()) == [
+        "escape-dir",
+        "escape-file",
+        "left-by-claim",
+    ]
 
 
 def test_worker_disconnect_cancels_the_runner_turn(
@@ -378,3 +388,45 @@ def test_supervisor_refuses_to_start_without_tls_or_identity(
         capture_output=True,
     )
     assert result.returncode == 78
+
+
+@pytest.mark.parametrize("body", ["[]", "null", '"idle"', "{", "x" * 70_000])
+def test_a_malformed_runner_status_still_stops_cleans_and_quarantines(
+    supervisor: SupervisorProcess, records: Path, body: str
+) -> None:
+    _start(supervisor, records, FAKE_STATUS_BODY=body)
+    child = int((records / "pid").read_text())
+    status, answer = _retire(supervisor, "claim-a", 1)
+    assert (status, answer["outcome"]) == (200, "quarantined")
+    assert answer["shell"]["quarantine_reason"] == "history-unsettled"
+    assert wait_gone(child, 5)
+    assert list((supervisor.state_root / "claims").iterdir()) == []
+    assert supervisor.request("GET", "/_curie/supervisor/healthz", token=None)[0] == 503
+    assert _turn(supervisor, "claim-a", 1, BEARER)[0] == 410
+
+
+def test_retirement_cuts_every_open_stream_before_it_answers(
+    supervisor: SupervisorProcess, records: Path
+) -> None:
+    _start(supervisor, records)
+    connection = http.client.HTTPSConnection(
+        supervisor.host, supervisor.port, timeout=10, context=client_context(supervisor.tls)
+    )
+    connection.request(
+        "GET",
+        proxy_base_path("claim-a", 1) + "/v1/flood",
+        headers={"Authorization": f"Bearer {BEARER}"},
+    )
+    response = connection.getresponse()
+    assert len(response.read(1 << 20)) == 1 << 20
+    status, answer = _retire(supervisor, "claim-a", 1)
+    assert (status, answer["outcome"]) == (200, "cleaned")
+    # What is still in flight is bounded by socket buffers; the stream ends.
+    after = 0
+    try:
+        while chunk := response.read(65536):
+            after += len(chunk)
+            assert after < 4 << 20, "the stream kept flowing after retirement"
+    except (http.client.IncompleteRead, ConnectionError, ssl.SSLError):
+        pass
+    connection.close()

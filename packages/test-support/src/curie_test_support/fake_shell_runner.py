@@ -46,9 +46,23 @@ async def healthz(_request: web.Request) -> web.Response:
 
 
 async def status(_request: web.Request) -> web.Response:
+    raw = os.environ.get("FAKE_STATUS_BODY")
+    if raw is not None:
+        # A hostile or broken child answers anything at all.
+        return web.Response(body=raw.encode(), content_type="application/json")
     return web.json_response(
         {"turn_active": STATE["turn_active"], "history_durable": STATE["durable"]}
     )
+
+
+async def flood(request: web.Request) -> web.StreamResponse:
+    """Stream without end and without a turn: only retirement may cut it."""
+
+    response = web.StreamResponse()
+    await response.prepare(request)
+    chunk = b"x" * 65536
+    while True:
+        await response.write(chunk)
 
 
 async def event(request: web.Request) -> web.StreamResponse:
@@ -94,6 +108,10 @@ def main() -> None:
     for directory in (os.environ["HOME"], os.environ["TMPDIR"], os.environ.get("FAKE_SCRUB_DIR")):
         if directory:
             Path(directory, "left-by-claim").write_text("x")
+            # Links out of the claim's tree: cleanup must remove the links and
+            # never follow them.
+            Path(directory, "escape-dir").symlink_to("/")
+            Path(directory, "escape-file").symlink_to("/etc/hostname")
     # A descendant in the child's own group, as a tool subprocess would be.
     grandchild = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])  # noqa: S603
     record("grandchild", str(grandchild.pid))
@@ -105,6 +123,7 @@ def main() -> None:
             web.get("/v1/status", status),
             web.post("/v1/event", event),
             web.post("/v1/release", release),
+            web.get("/v1/flood", flood),
             web.post("/v1/crash", crash),
         ]
     )

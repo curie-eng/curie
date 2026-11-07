@@ -15,6 +15,7 @@ import contextlib
 import ctypes
 import logging
 import os
+import resource
 import signal
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+_PR_SET_NO_NEW_PRIVS = 38
 _PR_SET_PDEATHSIG = 1
 _PR_SET_CHILD_SUBREAPER = 36
 # Resolved before any fork: the preexec hook below runs between fork and exec
@@ -42,6 +44,11 @@ def _arm_parent_death(parent: int) -> Callable[[], None]:
         # credential change clears the parent-death signal.
         if _LIBC.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
             os._exit(127)
+        # No setuid or file-capability binary can raise the child's privileges,
+        # and a crash writes no core file that could outlive the claim.
+        if _LIBC.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+            os._exit(127)
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         if os.getppid() != parent:
             os._exit(127)
 

@@ -292,8 +292,11 @@ def link(path: Path, target: Path | None) -> None:
 
 
 def _writable(path: str) -> None:
+    """Let root list and empty a real directory; never touch a symlink's target."""
+
     with contextlib.suppress(OSError):
-        os.chmod(path, stat.S_IRWXU, follow_symlinks=False)
+        if stat.S_ISDIR(os.lstat(path).st_mode):
+            os.chmod(path, stat.S_IRWXU)
 
 
 def wipe(path: Path) -> bool:

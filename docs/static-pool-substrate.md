@@ -39,19 +39,27 @@ refuses any value other than `kubernetes` (the default), `docker` and `static`.
    different shell, under a new generation and a new runner bearer, and the
    runner rehydrates from the stored history. Deleting the suspended record
    never touches a later lease of the same slot.
-7. Retirement first asks the runner, through `/v1/status`, whether it is idle
-   with durable history, then stops the child's whole process group, removes
-   the claim directory, the workspace and attachment links and any files the
-   child uid left in the scrub paths, and only then answers. The worker frees
-   the slot only on that answer. The substrate revokes the claim's boot
+7. Retirement first refuses new requests for the claim and asks the runner,
+   through `/v1/status`, whether it is idle with durable history (any answer
+   but a small JSON object saying so counts as unsettled). It then cuts every
+   open proxy stream of the claim, stops the child's whole process group,
+   removes the claim directory and the workspace and attachment links,
+   returns every scratch root to the entries, mode and owner it had at
+   startup, removes every System V IPC object created since startup, and
+   checks the whole filesystem again. Only then does it answer. The worker
+   frees the slot only on that answer. The substrate revokes the claim's boot
    credential through its usual retirement path.
 
 A shell that cannot prove a clean retirement quarantines itself instead of
 taking another claim. The reasons are `processes-survived` (a process of the
-claim outlived the stop), `cleanup-failed` (a file or link could not be
-removed) and `history-unsettled` (the runner was busy or its history was not
-durable within the settle timeout; the child is still stopped and its files
-wiped). A quarantined shell answers 503 on its health path, so the container
+claim outlived the stop), `cleanup-unverified` (something the claim could
+have left was still there after cleanup; the supervisor logs what),
+`history-unsettled` (the runner was busy, gave a malformed answer, or its
+history was not durable within the settle timeout; the child is still
+stopped and its files wiped) and `retire-failed` (retirement itself raised).
+Any failure during a create or a retirement ends in quarantine, never in a
+shell that reports itself healthy. A create and a retirement run to their
+end even if the worker's connection drops. A quarantined shell answers 503 on its health path, so the container
 platform replaces it. The worker keeps the slot quarantined until a supervisor
 with a new incarnation answers idle on that slot's address, and then returns
 the slot to the pool. A shell the worker cannot reach keeps its slot leased
@@ -106,12 +114,13 @@ The supervisor reads its settings from its own environment.
 | `CURIE_SUPERVISOR_LISTEN_HOST`, `CURIE_SUPERVISOR_PORT` | `0.0.0.0`, `8443` | The control and proxy listener. |
 | `CURIE_SUPERVISOR_CHILD_PORT` | `8080` | The runner child's port. |
 | `CURIE_SUPERVISOR_RUNNER_COMMAND` | `python -m curie_runner` | The child command line. |
-| `CURIE_SUPERVISOR_CHILD_UID`, `CURIE_SUPERVISOR_CHILD_GID` | `1000` when the supervisor runs as root | The child's uid and gid. The child never runs as root. |
+| `CURIE_SUPERVISOR_CHILD_UID`, `CURIE_SUPERVISOR_CHILD_GID` | `1000` | The child's uid and gid, never 0. The supervisor must run as root, or it refuses to start. |
 | `CURIE_SUPERVISOR_CHILD_ENV` | empty | Comma separated names of secrets in the shell environment that the child receives, such as the model credential and connector secrets. An executor claim receives only the names its claim allows. |
 | `CURIE_SUPERVISOR_CHILD_ENV_PUBLIC` | empty | Comma separated names of non-secret settings the child receives, such as telemetry endpoints or connector endpoint maps set on the shell. |
 | `CURIE_SUPERVISOR_STATE_ROOT` | `/var/lib/curie-shell` | Where claim directories are staged. |
 | `CURIE_SUPERVISOR_WORKSPACE_PATH`, `CURIE_SUPERVISOR_ATTACHMENTS_PATH` | `/workspace`, `/attachments` | Links the supervisor points at the claim's workspace and attachments. Each must be absent, a link or an empty directory. |
-| `CURIE_SUPERVISOR_SCRUB_PATHS` | `/tmp,/var/tmp,/dev/shm,/home/runner` with a child uid | Directories from which every file owned by the child uid is removed at retirement. |
+| `CURIE_SUPERVISOR_SCRUB_PATHS` | `/tmp,/var/tmp,/dev/shm,/run/lock,/dev/mqueue` | The scratch roots: the only places outside its claim directory the child may write. Each is returned to its startup contents at every retirement. |
+| `CURIE_SUPERVISOR_UNISOLATED_FOR_TESTS` | unset | `1` runs an unprivileged supervisor whose child shares its uid, for tests only. Such a shell reports `isolated: false` and the worker never leases it. |
 | `CURIE_SUPERVISOR_SETTLE_TIMEOUT_SECONDS` | `15` | How long retirement waits for an idle runner with durable history. |
 | `CURIE_SUPERVISOR_STOP_GRACE_SECONDS` | `10` | How long a stopped child has after SIGTERM before SIGKILL. |
 | `CURIE_SUPERVISOR_MAX_STAGE_BYTES`, `CURIE_SUPERVISOR_MAX_STAGE_MEMBERS` | 2 GiB, 200000 | Upload limits. |
@@ -157,6 +166,16 @@ certificate key or other claims' directories. The runner bearer is per claim
 and must differ from the control credential. Each claim gets a new directory,
 `HOME` and `TMPDIR`, and its bundle is read only.
 
+Before it serves, the supervisor walks the whole filesystem (virtual
+filesystems excepted) and refuses to start, with exit code 78, when the child
+could write any path outside the scratch roots, when a setuid or setgid file
+exists, when System V IPC objects already exist, or when no mqueue
+filesystem is mounted inside a scratch root (POSIX message queues live
+there). The child runs with no_new_privs and a zero core file size.
+System V IPC objects are removed by a short helper running as the child's
+uid, because a container's root usually lacks the capability to remove
+objects another uid created.
+
 If the supervisor fails, it kills the child's process group and exits, so the
 whole container goes down and the platform replaces it. The child is also
 bound to the supervisor with a parent death signal. A shell never serves a
@@ -185,6 +204,10 @@ claim after its supervisor is gone.
 5. A health check on `/_curie/supervisor/healthz` that replaces an unhealthy
    container, and a restart policy that starts a new supervisor incarnation.
 6. A Valkey shared by every worker.
+7. The image built from `packages/shell-supervisor/Dockerfile`, run as root
+   with the container runtime's default `/dev/mqueue` mount and its own IPC
+   namespace. The Dockerfile hands the runner image's home to root and strips
+   setuid and setgid bits, so the startup check passes.
 
 ## What the static pool does not support
 
@@ -197,7 +220,14 @@ repository runner pools are refused, and `runner_resources` are not applied
 
 `packages/shell-supervisor/tests` runs real supervisors with a stand-in runner
 child and covers authentication, streaming, fencing, idempotent create,
-teardown, quarantine and fault handling.
+teardown, quarantine and fault handling, including a create or retirement
+whose client disconnects, a malformed runner status and streams open at
+retirement. `packages/shell-supervisor/tests/test_shell_container.py` runs
+the built image as a root container (CI runs it in the image proofs job): a
+hostile child plants files and symlinks in every directory it can write and
+creates named System V and POSIX IPC objects, and the next claim on the
+recycled shell finds none of it, with every shared directory's mode and
+owner unchanged.
 `apps/worker/tests/sandbox/test_static.py` runs the static client against real
 Valkey and real supervisors. `apps/worker/tests/sandbox/test_static_qualification.py`
 runs real supervisors with the real runner on the fake model through the

@@ -103,7 +103,7 @@ def test_restore_removes_ipc_created_since_startup_and_reports_survivors(
     (sysvipc / "msg").write_text("       key      msqid perms uid\n        43      9 600 1000\n")
     removed: list[IpcObject] = []
 
-    def remove(objects: object) -> None:
+    def remove(objects: object, **_identity: object) -> None:
         for item in objects:  # type: ignore[attr-defined]
             removed.append(item)
             if item.kind == "msg":

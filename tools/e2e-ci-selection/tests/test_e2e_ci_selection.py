@@ -493,7 +493,18 @@ def _path_needs_images(path: str) -> bool:
     name = path.rsplit("/", 1)[-1]
     if path in {"uv.lock", "pyproject.toml"} or name in {"uv.lock", "pyproject.toml"}:
         return True
+    if path.startswith("packages/shell-supervisor/"):
+        return True
     return "Dockerfile" in name or name.endswith(".dockerfile")
+
+
+def test_a_shell_supervisor_change_runs_the_image_proofs() -> None:
+    # The shell container proof runs only in the image job, so a supervisor
+    # source change must select it even with no Dockerfile in the diff.
+    assert _SELECTOR_MODULE._needs_images(
+        ["packages/shell-supervisor/src/curie_shell_supervisor/isolation.py"]
+    )
+    assert not _SELECTOR_MODULE._needs_images(["packages/telemetry/src/x.py"])
 
 
 def _path_needs_cli_release(path: str) -> bool:
@@ -2912,6 +2923,13 @@ IMAGE_PROOF_GROUPS = {
         "Tag the runner image as the harness default (curie-runner)",
         "Repository toolchain proof",
     ),
+    # The static-pool shell image, layered on the runner image the toolchain
+    # group loaded, proven as a root container.
+    "Shell: ": (
+        "Build the shell image on the runner image",
+        "Absent image fails in required mode (negative control)",
+        "Recycled shells hold nothing from the previous claim",
+    ),
 }
 
 
@@ -2936,7 +2954,7 @@ def _assert_image_proofs(workflow: dict[str, Any]) -> None:
     assert job["env"] == {"CURIE_REPO_TOOLCHAIN_PROOF": "required"}
     assert not {"defaults", "continue-on-error", "timeout-minutes"} & job.keys()
     steps = job["steps"]
-    assert len(steps) == 40
+    assert len(steps) == 43
     assert [step["name"] for step in steps] == [
         prefix + name for prefix, names in IMAGE_PROOF_GROUPS.items() for name in names
     ], "all former steps must retain group order, with UI before Toolchain"
@@ -2955,6 +2973,9 @@ def _assert_image_proofs(workflow: dict[str, Any]) -> None:
         )
     ]
     for prefix in IMAGE_PROOF_GROUPS:
+        if prefix == "Shell: ":
+            # Runs in the toolchain group's checkout.
+            continue
         checkout = by_name[prefix + "Checkout"]
         assert checkout["uses"].startswith("actions/checkout@")
         assert checkout["with"] == (

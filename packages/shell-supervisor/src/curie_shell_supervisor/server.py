@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
+import json
 import logging
 import os
 import signal
@@ -71,6 +72,7 @@ _HOP_HEADERS = frozenset(
         "content-length",
     }
 )
+_STATUS_MAX_BYTES = 64 * 1024
 _STREAM_CHUNK = 64 * 1024
 
 
@@ -84,7 +86,10 @@ class Lease:
     child: RunnerChild
     started_at: str
     ready: bool = False
+    stopping: bool = False
     tasks: list[asyncio.Task[None]] = field(default_factory=list)
+    # Proxy handlers serving this claim; retirement cancels and joins them.
+    streams: set[asyncio.Task[Any]] = field(default_factory=set)
 
 
 def _now() -> str:
@@ -117,6 +122,7 @@ class Supervisor:
         self._state = STATE_IDLE
         self._max_generation = 0
         self._quarantine: str | None = None
+        self._last_settled = True
         self._last: dict[str, Any] | None = None
         self._http: aiohttp.ClientSession | None = None
         self._baseline: isolation.Baseline | None = None
@@ -324,7 +330,11 @@ class Supervisor:
             return 201, self.status()
 
     async def _settled(self, lease: Lease) -> bool:
-        """Whether the runner is idle with durable history (or never served)."""
+        """Whether the runner is idle with durable history (or never served).
+
+        The answer comes from the untrusted child: anything but a small JSON
+        object saying exactly that counts as unsettled.
+        """
 
         if not lease.ready:
             # A runner that never answered healthz never accepted a turn.
@@ -336,14 +346,22 @@ class Supervisor:
         headers = {"Authorization": "Bearer " + lease.bearer.decode("utf-8")}
         deadline = time.monotonic() + self._config.settle_timeout_s
         while time.monotonic() < deadline:
+            body: object = None
             try:
                 async with self._http.get(
                     url, headers=headers, timeout=aiohttp.ClientTimeout(total=2.0)
                 ) as resp:
-                    body = await resp.json() if resp.status == 200 else {}
+                    if resp.status == 200:
+                        raw = await resp.content.read(_STATUS_MAX_BYTES + 1)
+                        if len(raw) <= _STATUS_MAX_BYTES:
+                            body = json.loads(raw)
             except (aiohttp.ClientError, TimeoutError, ValueError):
-                body = {}
-            if body.get("turn_active") is False and body.get("history_durable") is True:
+                body = None
+            if (
+                isinstance(body, dict)
+                and body.get("turn_active") is False
+                and body.get("history_durable") is True
+            ):
                 return True
             if lease.child.returncode is not None:
                 return False
@@ -378,6 +396,46 @@ class Supervisor:
         task.add_done_callback(self._operations.discard)
         return await asyncio.shield(task)
 
+    async def _end(self, lease: Lease) -> None:
+        """Stop ``lease``'s child, cut its streams, clean up, and judge the slot."""
+
+        try:
+            settled = await self._settled(lease)
+        except Exception:  # noqa: BLE001 - an unanswerable runner is unsettled
+            logger.exception("settle check of claim %s failed", lease.claim)
+            settled = False
+        # No byte of this claim's traffic moves after its retirement answers.
+        streams = list(lease.streams)
+        for task in streams:
+            task.cancel()
+        if streams:
+            await asyncio.gather(*streams, return_exceptions=True)
+        try:
+            stopped = await lease.child.stop(self._config.stop_grace_s)
+        except Exception:  # noqa: BLE001 - a failed stop proves nothing stopped
+            logger.exception("stopping claim %s failed", lease.claim)
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(lease.child.pid, signal.SIGKILL)
+            stopped = False
+        for task in lease.tasks:
+            task.cancel()
+        try:
+            problems = await asyncio.to_thread(self._clean_paths, lease.staged)
+        except Exception as exc:  # noqa: BLE001 - cleanup that raised is not clean
+            logger.exception("cleanup of claim %s failed", lease.claim)
+            problems = [f"cleanup raised {type(exc).__name__}"]
+        self._lease = None
+        if not stopped:
+            self._quarantine_now("processes-survived")
+        elif problems:
+            logger.error("claim %s left state behind: %s", lease.claim, "; ".join(problems))
+            self._quarantine_now("cleanup-unverified")
+        elif not settled:
+            self._quarantine_now("history-unsettled")
+        else:
+            self._state = STATE_IDLE
+        self._last_settled = settled
+
     async def retire(self, claim: str, generation: int, mode: str) -> tuple[int, dict[str, Any]]:
         async with self._lock:
             lease = self._lease
@@ -396,28 +454,22 @@ class Supervisor:
                 outcome = OUTCOME_QUARANTINED if self._quarantine else OUTCOME_ABSENT
                 return 200, {"outcome": outcome, "shell": self.status()}
             self._state = STATE_STOPPING
-            settled = await self._settled(lease)
-            stopped = await lease.child.stop(self._config.stop_grace_s)
-            for task in lease.tasks:
-                task.cancel()
-            problems = await asyncio.to_thread(self._clean_paths, lease.staged)
-            self._lease = None
-            if not stopped:
-                self._quarantine_now("processes-survived")
-            elif problems:
-                logger.error("claim %s left state behind: %s", claim, "; ".join(problems))
-                self._quarantine_now("cleanup-unverified")
-            elif not settled:
-                self._quarantine_now("history-unsettled")
-            else:
-                self._state = STATE_IDLE
+            lease.stopping = True
+            try:
+                await self._end(lease)
+            except BaseException:
+                # Whatever went wrong, the slot is not proven clean: it never
+                # serves again and its health check fails.
+                self._lease = None
+                self._quarantine_now("retire-failed")
+                raise
             outcome = OUTCOME_QUARANTINED if self._quarantine else OUTCOME_CLEANED
             self._last = {
                 "name": claim,
                 "generation": generation,
                 "outcome": outcome,
                 "mode": mode,
-                "settled": settled,
+                "settled": self._last_settled,
                 "at": _now(),
             }
             logger.info("claim %s generation %d %s (%s)", claim, generation, outcome, mode)
@@ -502,8 +554,19 @@ class Supervisor:
         presented = _bearer(request)
         if presented is None or not hmac.compare_digest(presented, lease.bearer):
             return web.json_response({"error": "invalid token"}, status=401)
+        if lease.stopping:
+            return web.json_response({"error": "claim is being retired"}, status=410)
         if lease.child.returncode is not None:
             return web.json_response({"error": "runner exited"}, status=503)
+        current = asyncio.current_task()
+        assert current is not None
+        lease.streams.add(current)
+        try:
+            return await self._forward(request, lease)
+        finally:
+            lease.streams.discard(current)
+
+    async def _forward(self, request: web.Request, lease: Lease) -> web.StreamResponse:
         assert self._http is not None
         tail = request.match_info["tail"]
         url = f"http://127.0.0.1:{self._config.child_port}/{tail}"

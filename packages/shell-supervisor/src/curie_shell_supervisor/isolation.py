@@ -22,8 +22,11 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import json
 import os
 import stat
+import subprocess
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -143,6 +146,42 @@ def changeable_paths(writer: Writer, *, root: Path, skip: Iterable[Path]) -> lis
     return found
 
 
+def privileged_files(*, root: Path, skip: Iterable[Path]) -> list[Path]:
+    """Every setuid or setgid file under ``root``.
+
+    The child runs with no_new_privs, so such a file grants it nothing; the
+    shell still refuses to start with one, so an image that grows one fails
+    its container test instead of relying on that one guard.
+    """
+
+    skipped = frozenset(skip)
+    found: list[Path] = []
+    stack = [root]
+    while stack:
+        directory = stack.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                if path not in skipped:
+                    stack.append(path)
+            elif stat.S_ISREG(info.st_mode) and info.st_mode & (stat.S_ISUID | stat.S_ISGID):
+                found.append(path)
+    return found
+
+
+def _identity(path: Path) -> tuple[int, int, int]:
+    info = path.lstat()
+    return (stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid)
+
+
 def snapshot(roots: Iterable[Path]) -> dict[Path, frozenset[str]]:
     """The entries under each existing scratch root, by path relative to it."""
 
@@ -226,17 +265,51 @@ def _libc() -> ctypes.CDLL:
     return ctypes.CDLL(None, use_errno=True)
 
 
-def remove_ipc(objects: Iterable[IpcObject]) -> None:
-    """Mark each object for removal (a segment goes once nothing attaches)."""
-
+def _remove_here(objects: Iterable[tuple[str, int]]) -> None:
     libc = _libc()
-    for item in objects:
-        if item.kind == "shm":
-            libc.shmctl(item.ident, _IPC_RMID, None)
-        elif item.kind == "sem":
-            libc.semctl(item.ident, 0, _IPC_RMID)
+    for kind, ident in objects:
+        if kind == "shm":
+            libc.shmctl(ident, _IPC_RMID, None)
+        elif kind == "sem":
+            libc.semctl(ident, 0, _IPC_RMID)
         else:
-            libc.msgctl(item.ident, _IPC_RMID, None)
+            libc.msgctl(ident, _IPC_RMID, None)
+
+
+_REMOVE_AS_CREATOR = (
+    "import json, sys\n"
+    "from curie_shell_supervisor.isolation import _remove_here\n"
+    "_remove_here(json.loads(sys.argv[1]))\n"
+)
+
+
+def remove_ipc(
+    objects: Iterable[IpcObject], *, uid: int | None = None, gid: int | None = None
+) -> None:
+    """Mark each object for removal (a segment goes once nothing attaches).
+
+    Removal needs the object's owner, its creator, or CAP_SYS_ADMIN, which a
+    container's root usually lacks. With ``uid`` the removal runs in a short
+    child process as that uid, which created everything the runner child
+    made; an owner change by the runner never changes the creator.
+    """
+
+    pending: list[tuple[str, int]] = [(item.kind, item.ident) for item in objects]
+    if not pending:
+        return
+    if uid is None:
+        _remove_here(pending)
+        return
+    subprocess.run(  # noqa: S603 - fixed interpreter and script
+        [sys.executable, "-c", _REMOVE_AS_CREATOR, json.dumps(pending)],
+        user=uid,
+        group=gid,
+        extra_groups=[],
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        check=False,
+        timeout=30,
+        capture_output=True,
+    )
 
 
 @dataclass
@@ -247,6 +320,8 @@ class Baseline:
     scratch: dict[Path, frozenset[str]]
     skip: tuple[Path, ...] = ()
     ipc: frozenset[IpcObject] = field(default_factory=frozenset)
+    # Mode, owner and group of each scratch root, which must never change.
+    owners: dict[Path, tuple[int, int, int]] = field(default_factory=dict)
 
     @classmethod
     def take(
@@ -265,8 +340,9 @@ class Baseline:
         """
 
         roots = tuple(scratch_roots)
+        owners = {base: _identity(base) for base in roots if base.is_dir()}
         if writer is None:
-            return cls(writer=None, scratch=snapshot(roots))
+            return cls(writer=None, scratch=snapshot(roots), owners=owners)
         table = mounts(mountinfo)
         skip = tuple(point for point, fstype in table if fstype in VIRTUAL_FILESYSTEMS)
         mqueue = [point for point, fstype in table if fstype == "mqueue"]
@@ -292,10 +368,14 @@ class Baseline:
                 f"{len(outside)} path(s) outside the scratch roots are writable by the "
                 f"runner child: {listed}"
             )
+        privileged = privileged_files(root=root, skip=skip)
+        if privileged:
+            listed = ", ".join(str(path) for path in sorted(privileged)[:_REPORT_LIMIT])
+            raise IsolationError(f"setuid or setgid files in the image: {listed}")
         ipc = ipc_objects(sysvipc)
         if ipc:
             raise IsolationError(f"{len(ipc)} System V IPC object(s) exist before any claim ran")
-        return cls(writer=writer, scratch=scratch, skip=skip, ipc=ipc)
+        return cls(writer=writer, scratch=scratch, skip=skip, ipc=ipc, owners=owners)
 
     def restore(
         self,
@@ -306,9 +386,21 @@ class Baseline:
         """Remove what a claim left, then prove it; return what still differs."""
 
         problems = [f"could not remove {path}" for path in reset_scratch(self.scratch)]
+        for base, expected in self.owners.items():
+            try:
+                found = _identity(base)
+            except FileNotFoundError:
+                problems.append(f"{base} is gone")
+                continue
+            if found != expected:
+                problems.append(
+                    f"{base} is mode {found[0]:o} owned by {found[1]}:{found[2]}, "
+                    f"was {expected[0]:o} owned by {expected[1]}:{expected[2]}"
+                )
         if self.writer is None:
             return problems
-        remove_ipc(ipc_objects(sysvipc) - self.ipc)
+        gid = min(self.writer.gids) if self.writer.gids else self.writer.uid
+        remove_ipc(ipc_objects(sysvipc) - self.ipc, uid=self.writer.uid, gid=gid)
         left = ipc_objects(sysvipc) - self.ipc
         problems += [
             f"System V {item.kind} {item.ident} remains"
