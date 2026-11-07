@@ -13,13 +13,13 @@ they are not substitutes for a supported quickstart.
 
 ## Get started
 
-- [Software Factory](software-factory.md): the primary engineering-team path,
-  from assigned issue to reviewed PR or merge request, or a clear failure reason.
-- [Factory quickstart](guides/dark-factory-quickstart.md): choose an issue tracker
-  and code host, install the released factory, and inspect a delegated ticket's result.
-  Start with [GitHub](guides/dark-factory-quickstart.md#what-you-need),
-  [GitLab](guides/factory-gitlab-quickstart.md), or
-  [Jira Cloud with GitHub](guides/factory-jira-github-quickstart.md).
+- [Software Factory user guide](guides/factory-user-guide.md): prepare an issue,
+  select it for the factory, and verify the resulting GitHub PR.
+- [Software Factory administrator guide](guides/factory-admin-guide.md): set up
+  a factory, onboard repositories, and improve it from observed outcomes.
+- [Software Factory overview](software-factory.md): workflow, review and CI limits.
+- [Factory quickstart](guides/dark-factory-quickstart.md): provider-specific
+  installation and recovery procedures.
 - [Bring your agent](bring-your-agent.md): compatibility and reuse of supported
   skills and tools.
 - [SRE co-worker](../examples/sre-bot/README.md): investigate Kubernetes workloads

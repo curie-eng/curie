@@ -21,7 +21,8 @@ agent's instructions and tools to the same platform.
 
 | Start here | First outcome |
 | --- | --- |
-| [Software Factory](#software-factory-on-your-laptop) | Label an issue and get a reviewed PR or merge request, or a clear failure reason. |
+| [Software Factory user guide](docs/guides/factory-user-guide.md) | Prepare an issue, start the factory, and verify a GitHub PR. |
+| [Software Factory administrator guide](docs/guides/factory-admin-guide.md) | Set up a factory and improve repository environments. |
 | [SRE co-worker](#sre-co-worker-on-your-laptop) | Ask about your local cluster in Slack; approve configured mutations. |
 | [Bring your existing agent](#make-your-existing-agent-a-co-worker) | Reuse its instructions and tools, then connect it to a workspace. |
 
@@ -51,17 +52,18 @@ available in a supported deployment.
 </a>
 
 [Watch the Software Factory demo](https://vimeo.com/1231115133/eadc6eb936), then
-follow the local quickstart below. The video features GitHub; the quickstarts
-also cover supported GitLab and Jira Cloud paths.
+follow the [user guide](docs/guides/factory-user-guide.md) or
+[administrator guide](docs/guides/factory-admin-guide.md). The video features
+GitHub; the guides also cover supported GitLab and Jira Cloud paths.
 
 ## Quickstart
 
-The software factory and SRE co-workers below run on **local kind clusters**. They use the
-same platform you can later install on your own Kubernetes infrastructure.
+The Software Factory guide and SRE walkthrough use **local kind clusters** for
+their trials. Both can later run on your own Kubernetes infrastructure.
 
 You need Docker running, kind, kubectl, Helm, and an Anthropic or OpenRouter
 model credential. Use a Bash terminal and keep the variables in that session.
-Allow enough Docker memory and disk for Curie and the SRE observability stack.
+Allow enough Docker memory and disk for the trial you choose.
 The [factory prerequisites](docs/guides/dark-factory-quickstart.md#what-you-need)
 list supported machines and tools.
 
@@ -91,130 +93,14 @@ export CURIE_MODEL
 
 ### Software Factory on your laptop
 
-Choose where your issues and code live:
+Use the [factory user guide](docs/guides/factory-user-guide.md) for one complete
+example, from local issue preparation and the factory label through PR testing
+and feedback. Use the [factory administrator guide](docs/guides/factory-admin-guide.md)
+to install the factory, onboard a repository, and improve its runner environment.
 
-| Issues | Code and result | Start here |
-| --- | --- | --- |
-| GitHub | GitHub pull request | Follow the GitHub steps below |
-| GitLab | GitLab merge request | [GitLab quickstart](docs/guides/factory-gitlab-quickstart.md), for gitlab.com or self-managed GitLab |
-| Jira Cloud | GitHub pull request | [Jira Cloud with GitHub quickstart](docs/guides/factory-jira-github-quickstart.md) |
-| Jira Cloud | Bitbucket Cloud or Data Center pull request | [Jira Cloud with Bitbucket quickstart](docs/guides/dark-factory-quickstart.md#run-quickstart-for-bitbucket), for Bitbucket Cloud or Data Center 9.4.0 or later |
-
-#### GitHub
-
-Create a GitHub repository with an initial commit, or use a small existing
-repository. Write a bounded issue with clear acceptance criteria.
-
-Before starting, check that you have a supported released CLI, Docker and kind,
-`kubectl`, Helm, a model credential with available credit, and permission to
-create and install a GitHub App on the repository. For the default local kind
-trial, plan for **at least 16 GiB allocated to Docker Desktop**: the factory
-trial. Larger repositories may need more. If you use an existing Kubernetes
-cluster, check its available capacity instead. See the
-[capacity and recovery details](docs/guides/dark-factory-quickstart.md#local-kind-capacity-and-recovery).
-Expect a reviewable PR or a stated failure reason, then inspect the final
-issue status after CI handling. Allow variable setup time plus about 190
-minutes of configured waiting windows; this is not a measured completion
-time. Provider credit and actual spend are separate from that time allowance.
-
-**1. Start the local factory setup.** A dedicated kubeconfig keeps this trial
-separate from your other clusters.
-
-```bash
-read -rp 'Repository (owner/name): ' CURIE_FACTORY_REPO
-CURIE_FACTORY_CLUSTER="curie-factory-$(date +%s)"
-CURIE_FACTORY_KUBECONFIG="$(mktemp)"
-KUBECONFIG="$CURIE_FACTORY_KUBECONFIG" curie factory quickstart \
-  --repo "$CURIE_FACTORY_REPO" --kind-name "$CURIE_FACTORY_CLUSTER" \
-  --model "$CURIE_MODEL"
-```
-
-The command creates a local kind cluster, installs Curie, and prints a GitHub
-App registration link. Open that link, create the App, generate its private key,
-and install it on the selected repository. Note the App ID and the absolute
-path of the downloaded key file.
-
-On Apple Silicon, an older released chart can stop here with an AVX preflight
-error. ARM64 does not use x86 AVX. Recover only that architecture-specific
-failure in this trial cluster, then rerun the quickstart command using the
-same variables. Do not repeat the cluster-name or kubeconfig initialization:
-
-```bash
-KUBECONFIG="$CURIE_FACTORY_KUBECONFIG" curie cluster up \
-  --context "kind-$CURIE_FACTORY_CLUSTER" --model "$CURIE_MODEL" \
-  --set preflights.avxCheck.enabled=false
-KUBECONFIG="$CURIE_FACTORY_KUBECONFIG" curie factory quickstart \
-  --repo "$CURIE_FACTORY_REPO" --kind-name "$CURIE_FACTORY_CLUSTER" \
-  --model "$CURIE_MODEL"
-```
-
-The current source chart detects native ARM64 with the preflight enabled.
-Keep the check enabled on x86. See the
-[ARM recovery details](docs/guides/dark-factory-quickstart.md#apple-silicon-recovery-for-older-charts).
-
-**2. Complete the setup with your App.**
-
-```bash
-read -rp 'GitHub App ID: ' CURIE_FACTORY_APP_ID
-read -rp 'Private key file (absolute path): ' CURIE_FACTORY_APP_KEY
-KUBECONFIG="$CURIE_FACTORY_KUBECONFIG" curie factory quickstart \
-  --repo "$CURIE_FACTORY_REPO" \
-  --kind-name "$CURIE_FACTORY_CLUSTER" \
-  --model "$CURIE_MODEL" \
-  --app-id "$CURIE_FACTORY_APP_ID" \
-  --private-key-file "$CURIE_FACTORY_APP_KEY"
-```
-
-**3. Prepare and delegate the issue.** In the repository checkout, install the
-preparation skill for your coding agent using a CLI build that contains it:
-
-```bash
-curie factory skills install --agent codex
-```
-
-In Codex, invoke `$prepare-factory-ticket <issue-url>`. Answer its questions,
-review the complete specification, then choose **publish and start the factory**.
-The agent verifies the published issue and applies the confirmed factory label.
-The [preparation guide](docs/guides/factory-preparation.md) covers Claude Code,
-Copilot, Gemini and Cursor, global installation, and source builds when your
-released CLI does not yet include this command. Skill installation does not
-replace the factory setup in steps 1 and 2.
-
-The same command installs the local admin skills for repository runner setup
-and maintenance. The [repository environment guide](docs/guides/factory-environments.md)
-shows how to review issues, PRs, toolchains, and failed factory work before
-changing a repository's sandbox image or configuration.
-
-You can also prepare the issue yourself and add `curie-factory` in GitHub. The
-account adding the label needs write or admin access to the repository.
-
-| Checkpoint | What you should see | If it stops here |
-| --- | --- | --- |
-| First command | `Kubernetes context:` names the trial cluster, then a prefilled App registration link. | Check the [install and context steps](docs/guides/dark-factory-quickstart.md#choose-the-target-and-run-the-command). |
-| App setup and second command | `Factory quickstart ready` names the same context, repository, intake label, and deployed runner. | Check [App setup and troubleshooting](docs/guides/dark-factory-quickstart.md#rerun-with-the-app). |
-| Issue admission | The App posts a status comment; `curie-factory:queued` then `curie-factory:running` mark progress. | Check [label authority and sandbox capacity](docs/guides/dark-factory-quickstart.md#troubleshooting). |
-| PR and final result | A PR opens under the App identity. Read its diff and verification, then check whether the issue says `Completed:` or `Could not complete:` after CI handling. | Follow the [status-comment reason](docs/guides/dark-factory-quickstart.md#what-a-repository-with-no-ci-sees); an open PR alone is not a completed run. |
-
-Mention the configured App in a new comment to request a revision. The
-[complete factory quickstart](docs/guides/dark-factory-quickstart.md) has the
-canonical commands, recovery steps, and cleanup.
-
-The trial enables automatic initial PR publication. Curie does not merge the PR;
-your team accepts the result. Production agents default to human publication
-approval. Configure implementation and reviewer models explicitly, then use
-usage estimates and your accepted outcomes to evaluate costs.
-
-The [factory overview](docs/software-factory.md) explains review and CI limits.
-
-When finished with the trial, delete its local cluster:
-
-```bash
-kind delete cluster --name "$CURIE_FACTORY_CLUSTER"
-rm -f -- "$CURIE_FACTORY_KUBECONFIG"
-```
-
-If you created an App only for this trial, remove it and its downloaded key
-when finished; keep an App and key that other repositories or runs still use.
+For the exact local installation commands and provider-specific setup, follow
+the [factory quickstart](docs/guides/dark-factory-quickstart.md). The
+[factory overview](docs/software-factory.md) explains review and CI limits.
 
 ### SRE co-worker on your laptop
 
