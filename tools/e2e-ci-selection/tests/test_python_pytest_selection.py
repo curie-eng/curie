@@ -1624,7 +1624,7 @@ def test_ci_policy_job_runs_after_changes_without_services() -> None:
         "Sync workspace", "Pytest",
     ]
     install, backoff, retry, sync, tests = steps[1:]
-    uv_action = "astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e"
+    uv_action = "astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2"
     assert install["uses"] == retry["uses"] == uv_action
     assert install["with"] == retry["with"] == {"python-version": "3.13"}
     assert install["id"] == "install_uv"
