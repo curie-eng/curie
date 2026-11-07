@@ -439,3 +439,133 @@ Deployment shape for capability probes to become eligible.
 - **Epic(s):** #1063 — bundles declare connectors and the platform derives the objects; #1184 — the in-cluster connector reconciler and its RBAC
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — connector hosting is not one of the six swap-readiness Jobs; not separately graded
 - **ADR(s):** [ADR-0086](../../adr/0086-bundles-declare-connectors-the-platform-hosts-them.md) — bundles declare connectors, the platform hosts them; [ADR-0087](../../adr/0087-the-api-renders-connector-objects-the-cli-applies-them.md) — the API renders connector objects and never applies them; [ADR-0090](../../adr/0090-a-reconciler-applies-connectors-so-agent-repos-need-no-cli.md) — a reconciler applies them, so agent repos need no CLI; [ADR-0009](../../adr/0009-per-agent-connector-auth.md) — per-agent secrets and connector credentials
+
+## Per-request approval tickets (ADR 0271)
+
+This section freezes the wire contract for
+[ADR 0271](../../adr/0271-per-request-approver-sets-and-separation-of-duties.md).
+The pure signer and verifier are available; approval creation, policy, nonce
+storage and proxy header wiring are separate implementation slices. The
+contracts below do not claim that those paths already enforce this policy.
+
+The connector signer is `sign_ticket` in
+`packages/curie-internal/src/curie_internal/approver_ticket.py`.
+It accepts a payload dictionary and a PyNaCl Ed25519 `SigningKey`.
+The API preparation entry point is `verify_ticket` in
+`apps/api/src/curie_api/approver_tickets.py`; it takes the registered public key
+and key id, complete execution arguments and an injected integer Unix clock.
+It reads the ticket only from `arguments["approval_ticket"]`; no separate token
+can select a different approver set. A missing or non-string member refuses.
+These helpers perform no database, route, current identity, registration,
+requester-association, ceiling or nonce-spend checks. Creation owners must add
+those checks atomically as required by ADR 0271, including comparison of the
+signed tenant, agent, connector, exact tool and route against the creation context.
+A parsed ticket is not an
+execution authorization.
+
+### Ticket bytes and payload
+
+Carry the opaque ticket in `granted_arguments.approval_ticket` as
+`cat1.<payload>.<signature>`. The payload is compact JSON with recursively sorted
+keys, comma and colon separators, ASCII escaping and no whitespace. Encode its
+ASCII bytes using unpadded base64url. Ed25519 signs exactly the ASCII bytes
+`cat1.<payload>`. Encode the 64-byte signature using unpadded base64url too.
+Reject padding, alternate base64 spellings, non-ASCII token text, incorrect
+segment counts, duplicate or unknown keys at any depth, non-finite numbers,
+wrong types and noncanonical JSON spellings. The entire ticket is at most
+16,384 ASCII characters.
+
+The top-level object has exactly these required members:
+
+| Member | Wire value |
+| --- | --- |
+| `version` | Integer `1`; booleans refuse. |
+| `purpose` | String `approval_request`. |
+| `tenant_id` | Canonical lowercase hyphenated tenant UUID. |
+| `agent_id` | Canonical lowercase hyphenated agent UUID. |
+| `connector` | Exact registered connector name. |
+| `tool` | Exact upstream execution tool name. |
+| `route` | Exact named approval route. |
+| `key_id` | Exact registered selector key id. |
+| `requester` | Original requester's canonical principal object. |
+| `nonce` | Unpadded base64url of 32 cryptographically random bytes, single use within the registered selector scope. |
+| `issued_at` | Integer Unix seconds in `[0, 9223372036854775807]`. |
+| `expires_at` | Integer Unix seconds, strictly after issue and at most 300 seconds later. |
+| `arguments_sha256` | 64 lowercase hexadecimal SHA-256 characters over execution arguments as described below. |
+| `approvers` | Array of 1 through 16 distinct selected canonical principals. |
+
+Each principal has exactly `tenant_id`, `issuer` and `subject`; its tenant
+must equal the payload tenant. Issuer and subject are exact canonical strings,
+without case folding or Unicode normalization. Every string field is 1 through
+256 UTF-8 bytes, has no leading or trailing whitespace, C0/C1 controls or lone
+surrogates. UUIDs must equal their standard lowercase hyphenated spelling.
+Selection uniqueness compares `(tenant_id, issuer, subject)` regardless of
+recipient metadata. Array order is signed and preserved; membership is a set.
+
+Only an approver may additionally have `recipient_accounts`, an array of 1
+through 16 objects, each with exactly `provider`, `installation_id`, `namespace`
+and `account_id`. All four are required exact bounded strings. Omit the optional
+member when absent; null refuses. These are candidate delivery accounts, not
+proof that an account belongs to the selected person. Delivery must verify that
+association through the identity owner before use.
+
+The execution digest removes only the top-level `approval_ticket` member.
+Nested members with that name remain execution data. Serialize the remaining
+object using the production canonical-arguments contract: recursively sorted
+keys, comma and colon separators, `ensure_ascii=False`, finite JSON values and
+UTF-8 bytes, then SHA-256. Preserve numeric spelling from the production JSON
+serializer, including the distinction between `1` and `1.0`, negative floating
+zero and its exponent spelling. Do not normalize Unicode. The shared
+`tests/vectors/action-canonical-arguments.json` corpus freezes those bytes;
+`tests/vectors/approver-ticket.json` freezes ticket payloads, signatures,
+refusals and size cases. The complete grant argument object still contains the
+ticket; only the preparation digest excludes it.
+
+Preparation verification accepts exactly `issued_at <= now < expires_at` with
+no clock-skew allowance. The preparation expiry is distinct from approval
+expiry. After accepted approval creation, connectors may use `parse_ticket` from the
+shared helper for signature and shape without preparation freshness. They must
+verify the ticket's
+signature, scope, requester and argument digest without reapplying preparation
+expiry to delayed execution. Creation dedupe and single-use nonce enforcement
+belong to the database transaction, not these pure helpers.
+
+### Executable size budget
+
+Before creating an approval, call `check_execution_size` from the shared helper
+with the complete persisted arguments, including the final ticket, and the
+exact agent name, connector and upstream tool the worker will use. It rejects
+canonical arguments over 16,384 UTF-8 bytes and any eventual `ccg` over 4,096
+ASCII characters. It calculates the existing grant payload, including JSON
+escaping of the complete canonical argument string, base64url expansion, prefix,
+separators and 86 signature characters. Its returned length reserves the largest
+signed 64-bit expiry and a 36-character canonical UUID `jti`, so it is an upper
+bound for the worker's actual token. A maximum-sized selected set may parse
+correctly yet exceed this execution budget; refuse before creating an approval.
+No grant or argument limit is widened by this contract.
+
+### Verified spent-grant header
+
+`X-Curie-Grant-Verified` carries the spent grant's canonical lowercase hyphenated
+UUID `jti`, never an approval row id or an approval boolean. The proxy must strip
+every inbound occurrence in every casing, including repeated headers. Only after
+successful signature, expiry, agent, connector, exact tool and complete argument
+verification and a successful single-use spend may it set exactly one header.
+Never emit it for a failed spend, a grant-less call, a batch or a non-tool route.
+An attested request must contain exactly one `tools/call`.
+
+A static `X-Curie-Connector-Grant` header can accompany unrelated calls after
+resume or warm reuse. For a gated tool, missing, invalid, mismatched or spent
+grants refuse. For an ungated tool, consider attestation only if the grant's
+signature, tool and canonical arguments match this call, then require all
+remaining checks and spend. A matching expired or spent grant refuses. Otherwise
+strip the incidental grant and forward under ordinary rules without attestation
+or spend. Batches never receive an attestation.
+
+The connector trusts this header only on its own proxy connection and reads it
+from per-request context. Direct callers cannot establish the attestation.
+A protected execution handler must refuse its absence even if the tool is absent
+from the proxy's gated list. The connector also checks its ticket and current
+local policy before the effect. API answer and resume checks own selected actor
+and separation policy; this header supplies no second approval policy or result
+lookup API. An uncertain upstream outcome never permits replay of a spent grant.

@@ -157,6 +157,33 @@
       },
       "canonical": "{\"expected_version\":\"rv-1041\",\"prior_state\":{\"ciphertext\":\"ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE=\",\"kid\":\"example-key-2026-10\",\"sealed\":\"curie.snapshot.v1\"},\"target\":{\"kind\":\"Deployment\",\"name\":\"example-web\",\"namespace\":\"example-ns\"}}",
       "sha256": "3e60bb4686f7193c573ce160cee6f29623f76106a1108b871e44dcccb69c065d"
+    },
+    {
+      "name": "ticket_metadata_is_preserved",
+      "arguments": {
+        "approval_ticket": "cat1.example.signature",
+        "nested": {
+          "approval_ticket": "execution data"
+        },
+        "number": 1.0,
+        "note": "café"
+      },
+      "canonical": "{\"approval_ticket\":\"cat1.example.signature\",\"nested\":{\"approval_ticket\":\"execution data\"},\"note\":\"café\",\"number\":1.0}",
+      "sha256": "0456365d60a673999724da6a632e09e3e922264d802119c0f13665093bdc018c"
+    },
+    {
+      "name": "numeric_and_unicode",
+      "arguments": {
+        "integer": 1,
+        "decimal": 1.0,
+        "negative_zero": -0.0,
+        "scientific": 1e-07,
+        "composed": "é",
+        "decomposed": "é",
+        "astral": "𝄞"
+      },
+      "canonical": "{\"astral\":\"𝄞\",\"composed\":\"é\",\"decimal\":1.0,\"decomposed\":\"é\",\"integer\":1,\"negative_zero\":-0.0,\"scientific\":1e-07}",
+      "sha256": "d142c1b6819fa64e4307231abda8a64ebb84e6ba6d5f864d6c856b5944f7a45c"
     }
   ],
   "restore": [
