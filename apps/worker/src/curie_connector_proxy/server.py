@@ -23,6 +23,7 @@ import logging
 import posixpath
 import re
 import time
+import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
@@ -150,8 +151,8 @@ def _resp(*parts: str) -> bytes:
     return head + body
 
 
-def _set_nx_ex(url: str, key: str, ttl: int, *, ca_file: str | None = None) -> bool:
-    """SET key 1 NX EX ttl over the Redis wire. True only when this call stored it.
+def _set_nx_ex(url: str, key: str, ttl: int, *, ca_file: str | None = None) -> bytes:
+    """The SET NX EX reply, preserving ACL refusal for the portable startup check.
 
     The proxy package cannot import the redis client. A missing store, a TLS
     failure, or any reply other than ``+OK`` is a failed spend.
@@ -164,7 +165,7 @@ def _set_nx_ex(url: str, key: str, ttl: int, *, ca_file: str | None = None) -> b
     parsed = urlparse(url)
     host = parsed.hostname or ""
     if not host or parsed.scheme not in {"redis", "rediss"}:
-        return False
+        return b""
     port = parsed.port or 6379
     password = unquote(parsed.password) if parsed.password else ""
     username = unquote(parsed.username) if parsed.username else ""
@@ -191,11 +192,15 @@ def _set_nx_ex(url: str, key: str, ttl: int, *, ca_file: str | None = None) -> b
             return reply()
 
         auth = (username, password) if username else (password,)
-        if password and command("AUTH", *auth) != b"+OK":
-            return False
-        if database != "0" and command("SELECT", database) != b"+OK":
-            return False
-        return command("SET", key, "1", "NX", "EX", str(ttl)) == b"+OK"
+        if password:
+            authenticated = command("AUTH", *auth)
+            if authenticated != b"+OK":
+                return authenticated
+        if database != "0":
+            selected = command("SELECT", database)
+            if selected != b"+OK":
+                return selected
+        return command("SET", key, "1", "NX", "EX", str(ttl))
     finally:
         conn.close()
         raw.close()
@@ -213,12 +218,27 @@ class _ValkeyGrantStore:
 
     def spend(self, jti: str, ttl: int) -> bool:
         try:
-            return _set_nx_ex(
-                self._url, f"{self._key_prefix}{jti}", max(ttl, 1), ca_file=self._ca_file
+            return (
+                _set_nx_ex(
+                    self._url, f"{self._key_prefix}{jti}", max(ttl, 1), ca_file=self._ca_file
+                )
+                == b"+OK"
             )
         except Exception:  # noqa: BLE001 - existing broad catch retained
             logger.warning("connector grant spend failed")
             return False
+
+    def require_scoped_acl(self) -> None:
+        probe = uuid.uuid4().hex
+        accepted = _set_nx_ex(
+            self._url, f"{self._key_prefix}scope-probe-{probe}", 1, ca_file=self._ca_file
+        )
+        denied = _set_nx_ex(
+            self._url, f"connector-grant:scope-probe:{probe}", 1, ca_file=self._ca_file
+        )
+        if accepted != b"+OK" or not denied.startswith(b"-NOPERM "):
+            logger.error("grant store scope check failed")
+            raise ValueError("grant store scope must permit own keys and refuse outside keys")
 
 
 def _gated_tools(env: Mapping[str, str]) -> tuple[str, ...]:

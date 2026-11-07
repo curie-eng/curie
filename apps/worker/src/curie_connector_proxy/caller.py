@@ -15,6 +15,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from nacl.bindings import crypto_core_ed25519_is_valid_point
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
 
@@ -80,6 +81,8 @@ def public_key(text: str) -> VerifyKey:
             f"a caller public key decodes to {len(raw)} bytes; an Ed25519 public key "
             f"is {_KEY_BYTES}"
         )
+    if not crypto_core_ed25519_is_valid_point(raw):
+        raise ValueError("a caller public key is not a valid Ed25519 point")
     return VerifyKey(raw)
 
 

@@ -19,7 +19,7 @@ from urllib.parse import quote
 from aiohttp import web
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from . import caller
+from . import caller, network
 from .server import ProxyConfig, RouteConfig, _ValkeyGrantStore, make_app
 
 CONFIG_ENV = "CURIE_CONNECTOR_SERVE_CONFIG"
@@ -54,12 +54,21 @@ class Listener(_Model):
     host: str
     port: Port
     tls: TLSConfig | None = None
+    insecure_http: bool = False
 
     @field_validator("host")
     @classmethod
     def bind_address(cls, value: str) -> str:
         ipaddress.ip_address(value)
         return value
+
+    @model_validator(mode="after")
+    def require_secure_transport(self) -> Self:
+        if self.tls is None and not self.insecure_http:
+            raise ValueError("plaintext listener requires insecure_http=true")
+        if self.tls is not None and self.insecure_http:
+            raise ValueError("TLS listener must not opt into plaintext")
+        return self
 
 
 class Implementation(_Model):
@@ -179,7 +188,7 @@ class HostConfig(_Model):
             raise ValueError("route and upload paths must be distinct")
         return self
 
-    def proxy_configs(self, env: Mapping[str, str]) -> tuple[ProxyConfig, ProxyConfig | None]:
+    def grant_spender(self, env: Mapping[str, str]) -> _ValkeyGrantStore:
         password = env.get(PASSWORD_ENV, "")
         if not password:
             raise ValueError("grant store password is required")
@@ -188,6 +197,11 @@ class HostConfig(_Model):
             f"rediss://{quote(store.username, safe='')}:{quote(password, safe='')}"
             f"@{store.host}:{store.port}/0"
         )
+        return _ValkeyGrantStore(
+            url, ca_file=store.ca_file, key_prefix=f"connector-grant:{self.connector}:"
+        )
+
+    def proxy_configs(self, env: Mapping[str, str]) -> tuple[ProxyConfig, ProxyConfig | None]:
         keys = tuple(caller.public_key(text) for text in self.public_keys)
         main = ProxyConfig(
             listen_port=self.listener.port,
@@ -198,9 +212,7 @@ class HostConfig(_Model):
             upstream_host=self.implementation.upstream_host,
             gated_tools=tuple(self.gated_tools),
             routes=tuple(route.proxy_route() for route in self.routes),
-            grant_store=_ValkeyGrantStore(
-                url, ca_file=store.ca_file, key_prefix=f"connector-grant:{self.connector}:"
-            ),
+            grant_store=self.grant_spender(env),
             upload_path=self.upload.path if self.upload is not None else None,
         )
         upload = None
@@ -248,6 +260,7 @@ async def serve(config: HostConfig, env: Mapping[str, str]) -> int:
     if config.upload is not None and upload is not None:
         listeners.append((config.upload.listener, upload))
     contexts = [listener.tls.context() if listener.tls else None for listener, _ in listeners]
+    await asyncio.to_thread(config.grant_spender(env).require_scoped_acl)
     stopped = asyncio.Event()
     stop_signal = signal.SIGTERM
 
@@ -266,16 +279,57 @@ async def serve(config: HostConfig, env: Mapping[str, str]) -> int:
     child_exit = asyncio.create_task(child.wait())
     stop = asyncio.create_task(stopped.wait())
     result = 0
+    ports = tuple(
+        sorted(
+            {
+                config.implementation.port,
+                *([config.upload.upstream_port] if config.upload is not None else []),
+            }
+        )
+    )
+
+    async def pause(seconds: float) -> None:
+        try:
+            await asyncio.wait_for(stopped.wait(), timeout=seconds)
+        except TimeoutError:
+            pass
+
+    async def monitor() -> None:
+        while not stopped.is_set():
+            await network.require_loopback_only(ports)
+            await pause(1)
+
+    watchdog: asyncio.Task[None] | None = None
     try:
-        for (listener, proxy), context in zip(listeners, contexts, strict=True):
-            runner = web.AppRunner(make_app(proxy), handler_cancellation=True, shutdown_timeout=5)
-            runners.append(runner)
-            await runner.setup()
-            await web.TCPSite(runner, listener.host, listener.port, ssl_context=context).start()
-        done, _ = await asyncio.wait((child_exit, stop), return_when=asyncio.FIRST_COMPLETED)
-        if child_exit in done:
-            result = max(child_exit.result(), 1)
+        deadline = loop.time() + 30
+        while not stopped.is_set():
+            await network.require_loopback_only(ports)
+            if all([await network.reachable("127.0.0.1", port) for port in ports]):
+                await network.require_loopback_only(ports)
+                break
+            if child.returncode is not None or loop.time() >= deadline:
+                raise ValueError("implementation did not start its loopback listeners")
+            await pause(0.1)
+        if not stopped.is_set():
+            for (listener, proxy), context in zip(listeners, contexts, strict=True):
+                runner = web.AppRunner(
+                    make_app(proxy), handler_cancellation=True, shutdown_timeout=5
+                )
+                runners.append(runner)
+                await runner.setup()
+                await web.TCPSite(runner, listener.host, listener.port, ssl_context=context).start()
+            watchdog = asyncio.create_task(monitor())
+            done, _ = await asyncio.wait(
+                (child_exit, stop, watchdog), return_when=asyncio.FIRST_COMPLETED
+            )
+            if watchdog in done:
+                watchdog.result()
+            if child_exit in done:
+                result = max(child_exit.result(), 1)
     finally:
+        if watchdog is not None:
+            watchdog.cancel()
+            await asyncio.gather(watchdog, return_exceptions=True)
         for runner in runners:
             await runner.cleanup()
         if child.returncode is None:

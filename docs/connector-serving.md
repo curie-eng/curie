@@ -3,8 +3,15 @@
 A connector can run as a long-running container on a managed container service
 without Kubernetes. The container runs the existing caller proxy and the
 unchanged connector implementation in one task. Only the proxy ports are public.
-Bind the implementation to task loopback. Publishing its port bypasses caller
-and grant verification.
+Bind the implementation to task loopback. Binding it to a task-network address
+or publishing its port bypasses caller and grant verification. The Linux host
+waits up to thirty seconds for all configured loopback implementation listeners,
+then connects to their ports on every non-loopback IPv4 and IPv6 task address
+before opening either public proxy. Any successful connection refuses startup.
+It enumerates addresses again and repeats this check every second, stopping the
+task with a failure status on an exposed listener or an uncheckable address.
+This detects later rebinding; it is not a network firewall, and a rebind can be
+reachable until the next check. Configure the implementation to stay on loopback.
 
 Build the base image from the repository root with
 `docker build -f apps/worker/Connector.Dockerfile -t connector-host .`.
@@ -82,7 +89,11 @@ This example serves the connector named `reviewer` for `acme-dev`:
 ```
 
 Replace the public key placeholder with the worker's standard-base64 Ed25519
-verification key. Rotation accepts several public keys. The same verification
+verification key. The verifier rejects encodings that are not valid Ed25519
+points, including a pasted worker seed that is not a point. Point validation
+cannot establish key provenance: a seed's bytes can coincidentally encode a
+valid point, so obtain keys from the worker's public-key output. Rotation accepts
+several public keys. The same verification
 keys check callers, tool grants, declared routes, and upload capabilities. Never
 give this task the worker's private caller or grant minting key. The TLS private
 key belongs to the listener certificate and grants no token-minting authority.
@@ -94,8 +105,10 @@ CURIE_CONNECTOR_SERVE_CONFIG=/run/connector/serve.json
 CURIE_CONNECTOR_GRANT_STORE_PASSWORD=<secret supplied by the container service>
 ```
 
-`listener.host` is an IP bind address, including IPv6. Omit `tls` when a trusted
-ingress terminates TLS. Restrict ingress to that gateway and configure the
+`listener.host` is an IP bind address, including IPv6. TLS is required by default
+on both listeners, including loopback. When a trusted ingress terminates TLS,
+omit `tls` and explicitly set `insecure_http: true` on that listener. These
+settings are mutually exclusive. Restrict ingress to that gateway and configure the
 external endpoint with HTTPS. Direct non-loopback HTTP requires the explicit
 endpoint opt-in described in [hosted connector endpoints](connector-endpoints.md).
 Never expose cleartext credentials to an untrusted network.
@@ -138,6 +151,20 @@ for the same connector must use the same Valkey store and key namespace. A TLS,
 authentication, ACL, or availability failure refuses the gated call before it
 reaches the implementation. The host requires a password even when the current
 gate list is empty.
+
+Before starting the implementation, the host must successfully SET a short-lived
+probe key inside its connector namespace and receive an explicit Valkey NOPERM
+refusal for a SET outside it. Broad wildcard ACLs, unavailable stores, wrong
+credentials, missing SET permissions, and failed TLS verification refuse startup.
+Probe keys expire after one second and require no DELETE permission. This check
+detects broad namespace grants; operators must still provision the exact ACL
+above, since one denied probe cannot prove every possible key is inaccessible.
+
+Never serve the same connector through Kubernetes and static hosting at the
+same time. Static hosting uses `connector-grant:<connector>:<grant-id>`; the
+Kubernetes proxy uses `connector-grant:<grant-id>`. A grant could otherwise be
+spent once through each layout. For a cutover, stop the old serving mode and let
+all outstanding grants expire before starting the other mode.
 
 ## Upload-only listener
 
@@ -192,3 +219,7 @@ and checks implementation execution counts, upload scope, non-root execution,
 and graceful SIGTERM. Resources carry one unique ownership label; cleanup removes
 and verifies every owned container, network, and image. No bind mount assumes
 that the Docker daemon shares the test host's filesystem.
+The same image is exercised with unsafe MCP and upload bindings, later rebinding
+of either implementation listener, and unsafe Valkey ACLs; each must stop with a
+failure status. The ordinary caller/grant and upload proof is the live control
+that the configured loopback listeners and scoped ACL still work.
