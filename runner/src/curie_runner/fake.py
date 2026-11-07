@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import anyio
-import httpx
+import httpx2
 from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
@@ -328,9 +328,12 @@ def _connector_failure(exc: BaseException) -> str:
 
 CONNECTOR_CALL_ATTEMPTS = 3
 _CONNECTOR_CALL_BACKOFF_S = 0.2
+# mcp's HTTP transport is httpx2 (installed with mcp; the runner image has no
+# httpx): a dial that never reached the server arrives as an exception group
+# whose leaf is one of these.
 _TRANSPORT_FAILURES = (
-    httpx.ConnectError,
-    httpx.ConnectTimeout,
+    httpx2.ConnectError,
+    httpx2.ConnectTimeout,
     ConnectionResetError,
     socket.gaierror,
 )
