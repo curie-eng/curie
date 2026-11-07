@@ -175,6 +175,7 @@ REQUIRED_CHECK_NAMES = frozenset(
         "Build sre-bot-self-upgrade image (no push)",
         "Build sre-bot-scaler image (no push)",
         "Build sre-bot-restarter image (no push)",
+        "Build sre-bot-metrics image (no push)",
         "Build github-activity-github image (no push)",
         "Image proofs (smoke, Docker daemon, toolchain)",
         "Eval falsifiability gate (fake model, offline)",

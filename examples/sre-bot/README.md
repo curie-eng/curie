@@ -36,8 +36,10 @@ change the default installation or treat intentionally suspended templates as he
 Installations preparing automated remediation can opt into the
 [remediation scaler connector](#remediation-scaler-connector-opt-in) and the
 [remediation restarter connector](#remediation-restarter-connector-opt-in),
-acting connectors whose replies the platform can record and qualify. The default
-bundle declares neither.
+acting connectors whose replies the platform can record and qualify, and the
+[remediation metrics connector](#remediation-metrics-connector-opt-in), a
+read-only Prometheus verifier for them. The default bundle declares none of
+them.
 
 Installations with existing paired adapter reply credentials can opt into
 the worker map reconciler described in
@@ -439,6 +441,59 @@ two `confirmed` approved forwards with the same `name` and `restart_at`, the
 second leaving the same `post_version`.
 `examples/tests/test_sre_bot_restarter_opt_in.py` applies the opt-in file to the
 shipped bundle and runs the intake validators on the result.
+
+## Remediation metrics connector (opt-in)
+
+Every automated remediation is checked before it runs (`precondition`) and
+judged after it ran (`verifier`) by a read-only tool of a connector other than
+the acting one. The platform applies one RFC 6901 pointer to the read's
+structured reply and one comparator to the value it finds
+([operator guide](../../docs/operations.md#automated-remediation)). The
+`metrics` connector in [`connectors/metrics`](connectors/metrics/server.py) is
+that read for the scaler and the restarter: one tool, `query_value(query)`, that runs a Prometheus
+instant query against one configured URL. It holds no Kubernetes credential and
+has no write verb.
+
+It is **off by default**, like the scaler.
+
+The reply is structured content shaped for the documented pointers:
+
+- a vector is `{"resultType": "vector", "data": [{"metric", "value": [<time>, "<sample>"]}]}`,
+  ordered by labels, so `/data/0/value/1` is the first series' sample as a
+  decimal string the ordering comparators read as a number. An empty vector
+  leaves that pointer absent; write `... or vector(0)` when no series should
+  read as zero, and aggregate (`max`, `sum`) to one series;
+- a scalar is `{"resultType": "scalar", "data": {"value": "<sample>", "time"}}`,
+  read at `/data/value`.
+
+Anything else is a tool error, which the platform records as an unsuccessful
+sample, never a pass: no `METRICS_URL`, a transport error, a timeout
+(`METRICS_TIMEOUT_SECONDS`), a redirect, a non-2xx answer, a Prometheus error, a
+range (`matrix`) or string result, a malformed sample, more than
+`METRICS_MAX_SERIES` series or a body past `METRICS_MAX_RESPONSE_BYTES`.
+
+To opt in, in your copy of the bundle:
+
+1. Merge [`connectors/metrics/opt-in.yaml`](connectors/metrics/opt-in.yaml): its
+   `connector` entry into `connectors.yaml` and its `plugin` entry into
+   `.claude-plugin/plugin.json`. Set `METRICS_URL` to your Prometheus; the
+   default is the bundled observability stack's.
+2. If your Prometheus needs a bearer token, store it in a Secret and declare it
+   as the SecretRef the opt-in file shows. It must not be a secret the acting
+   connector's headers expand, or the platform refuses the policy
+   `verifier_not_independent`.
+3. Build the connector image with `curie build --plugin-dir <bundle> --registry <ref>`,
+   then deploy the bundle.
+
+[`connectors/metrics/example-policy.json`](connectors/metrics/example-policy.json)
+pairs the two: restore `example-api` to one replica with the scaler when
+kube-state-metrics reports no available replica, and verify with the same query
+that at least one is available. It binds with `automatic: false`; the
+[drill order](../../docs/operations.md#qualifying-an-action-the-drill-order)
+still decides when it may run without a person.
+`examples/tests/test_sre_bot_metrics_opt_in.py` applies the opt-in file to the
+shipped bundle, runs the intake validators, validates the example policy with
+the platform's document validator and checks the two connectors' independence.
 
 ## Live demo
 
