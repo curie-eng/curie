@@ -9,20 +9,32 @@ step. ``prove`` exits nonzero unless every recorded step passed.
 
 Each step drives the install through the same boundaries an operator or a
 mail adapter uses (``Harness.send``, ``Harness.observe``, the platform API and
-the ``curie`` CLI). Direct SQL is reserved for deliberately corrupting stored
-state that no product surface can write, and every such change is restored in
-a ``finally`` block.
+the ``curie`` CLI), and reads what the product logged (the caller proxy's
+decisions through ``Harness.proxy_decisions``). Direct SQL is reserved for
+deliberately corrupting stored state that no product surface can write, and
+every such change is restored in a ``finally`` block.
 """
 
 from __future__ import annotations
 
 import contextlib
 import json
+import re
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
 from identity_e2e import Api, Harness, HarnessError, turn_summary
+
+# The fake model's test-only directive: the turn dials every hosted connector
+# of the agent through the runner's caller header path and answers one line
+# per connector (runner/src/curie_runner/fake.py).
+CONNECTOR_CALL = "[fake:connector-call]"
+_CONNECTOR_CALL_LINE = re.compile(
+    r"\bconnector-call(?: (?P<name>[^\s:]+))?: (?P<outcome>ok|failed|none)\b(?P<rest>[^\n]*)"
+)
+_TOOLS = re.compile(r"(?:^|\s)tools=(?P<tools>\d+)(?:\s|$)")
+_CALLER = re.compile(r"(?:^|\s)caller=(?P<caller>\S+)")
 
 ScenarioFunc = Callable[[Harness, Any, "Evidence"], None]
 SCENARIOS: dict[str, ScenarioFunc] = {}
@@ -160,7 +172,7 @@ def cli_requester_identity(
 
 def send_summary(sent: Mapping[str, Any]) -> dict[str, Any]:
     return {
-        key: sent[key]
+        key: sent.get(key)
         for key in ("sender", "delivery_id", "conversation_id", "http_status", "response")
     }
 
@@ -175,9 +187,200 @@ def observed_token(seen: Mapping[str, Any]) -> dict[str, Any]:
         "prefix",
         "claims",
         "signature",
+        "caller_fingerprint",
         "turn",
     )
     return {key: seen.get(key) for key in keep}
+
+
+def require_delivered(turn: Mapping[str, Any]) -> None:
+    """The turn completed, the worker delivered its reply, and the reply has text."""
+
+    outcome = turn.get("outcome")
+    check(
+        bool(turn.get("completed")),
+        f"the turn never completed (no turn.completed reply event; outcome {outcome!r})",
+    )
+    check(outcome == "delivered", f"the turn completed with outcome {outcome!r}, not delivered")
+    texts = turn.get("texts") or []
+    check(
+        any(isinstance(text, str) and text.strip() for text in texts),
+        "the turn was delivered with no reply text",
+    )
+
+
+def connector_calls(texts: Iterable[Any]) -> list[dict[str, Any]]:
+    """The ``connector-call`` lines in reply texts, parsed.
+
+    Each is ``{"name", "outcome", "tools", "reason", "caller"}``; ``name`` is
+    None for ``connector-call: none`` and ``caller`` is the fingerprint the
+    line carries, or None.
+    """
+
+    calls = []
+    for text in texts:
+        if not isinstance(text, str):
+            continue
+        for match in _CONNECTOR_CALL_LINE.finditer(text):
+            rest = match["rest"]
+            tools = _TOOLS.search(rest)
+            caller = _CALLER.search(rest)
+            words = rest.split()
+            calls.append(
+                {
+                    "name": match["name"],
+                    "outcome": match["outcome"],
+                    "tools": None if tools is None else int(tools["tools"]),
+                    "reason": words[0] if match["outcome"] == "failed" and words else None,
+                    "caller": None if caller is None else caller["caller"],
+                }
+            )
+    return calls
+
+
+def require_connector_admitted(
+    texts: Iterable[Any],
+    decisions: Sequence[Mapping[str, Any]],
+    *,
+    agent: str,
+    connectors: Sequence[str],
+    principal: bool,
+) -> dict[str, Any]:
+    """The reply dialled every connector and the caller proxy admitted ``agent``.
+
+    Requires a ``connector-call <c>: ok`` line for every connector and no
+    failed line; at least one admitted decision for ``agent`` (one per
+    connector when the decisions name their connector); no refusal for
+    ``agent``; and every admitted decision for ``agent`` logging
+    ``principal=present`` when ``principal`` is true, else
+    ``principal=absent``. Refusals for other callers are counted, not failed.
+    Returns a JSON summary carrying no token.
+    """
+
+    expected = "present" if principal else "absent"
+    check(bool(connectors), f"{agent} has no hosted connector to call")
+    calls = connector_calls(texts)
+    shown = [
+        f"{call['name'] or '-'}: {call['outcome']}"
+        + (f" {call['reason']}" if call["reason"] else "")
+        for call in calls
+    ]
+    failed = [call for call in calls if call["outcome"] == "failed"]
+    check(not failed, f"the reply reports a failed connector call: {shown}")
+    called = {call["name"] for call in calls if call["outcome"] == "ok"}
+    missing = [name for name in connectors if name not in called]
+    check(
+        not missing,
+        f"the reply has no `connector-call <c>: ok` line for {missing}; its lines: {shown}",
+    )
+
+    mine = [dict(item) for item in decisions if item.get("caller") == agent]
+    refused = [item for item in mine if item.get("outcome") != "admitted"]
+    check(not refused, f"the caller proxy refused {agent}: {refused}")
+    admitted = [item for item in mine if item.get("outcome") == "admitted"]
+    check(bool(admitted), f"the caller proxy logged no admitted request from {agent}")
+    if any("connector" in item for item in decisions):
+        unseen = [
+            name for name in connectors if not any(i.get("connector") == name for i in admitted)
+        ]
+        check(not unseen, f"no caller proxy admitted {agent} on connector(s) {unseen}")
+    logged = sorted({str(item.get("principal")) for item in admitted})
+    check(
+        all(item.get("principal") == expected for item in admitted),
+        f"every admitted request from {agent} should log principal={expected}; the proxy "
+        f"logged principal {logged} (None means no principal field: is the candidate "
+        "proxy deployed?)",
+    )
+    others = [item for item in decisions if item.get("caller") != agent]
+    return {
+        "agent": agent,
+        "connectors": list(connectors),
+        "calls": calls,
+        "unlisted_calls": sorted(
+            str(name) for name in called if name is not None and name not in connectors
+        ),
+        "expected_principal": expected,
+        "admitted": len(admitted),
+        "admitted_by_connector": {
+            name: sum(1 for item in admitted if item.get("connector") == name)
+            for name in connectors
+        },
+        "other_refusals": len(others),
+    }
+
+
+def require_caller_fingerprint(texts: Iterable[Any], fingerprint: str) -> list[str]:
+    """Every ``ok`` connector call sent the observed token (by its fingerprint)."""
+
+    ok = [call for call in connector_calls(texts) if call["outcome"] == "ok"]
+    check(bool(ok), "the reply has no `connector-call <c>: ok` line to tie to the token")
+    wrong = [f"{call['name']}: caller={call['caller']}" for call in ok]
+    check(
+        all(call["caller"] == fingerprint for call in ok),
+        f"a connector call sent another caller token than the claim's ({fingerprint}): {wrong}",
+    )
+    return [str(call["name"]) for call in ok]
+
+
+def human_turn_step(
+    harness: Harness,
+    evidence: Evidence,
+    *,
+    step_id: str,
+    title: str,
+    agent: str,
+    sender: str,
+    text: str,
+    expected_principal: Any,
+    wait: float,
+) -> None:
+    """One verified human's email turn to ``agent``, judged end to end.
+
+    The send is admitted; the claim's caller token names ``agent`` and carries
+    ``expected_principal`` (none when it is None); the turn completes with a
+    delivered reply; the reply's ``connector-call`` lines are ok for every
+    hosted connector and sent that token; and the caller proxy admitted the
+    agent with the principal present or absent to match.
+    """
+
+    with evidence.step(step_id, title) as seen:
+        started = time.time()
+        sent = harness.send(agent, sender, text)
+        seen["send"] = send_summary(sent)
+        check(sent.get("http_status") == 200, f"the email turn answered {sent.get('http_status')}")
+        observed = harness.observe(agent, wait=wait)
+        seen["observe"] = observed_token(observed)
+        check(
+            bool(observed.get("caller_token_present")),
+            "no connector caller token reached the claim",
+        )
+        claims = observed.get("claims") or {}
+        check(claims.get("agent") == agent, f"the token names agent {claims.get('agent')}")
+        if expected_principal is None:
+            check("principal" not in claims, f"the token carries {claims.get('principal')}")
+        else:
+            check(
+                claims.get("principal") == expected_principal,
+                f"the token principal is {claims.get('principal')}, expected {expected_principal}",
+            )
+        turn = observed.get("turn") or {}
+        require_delivered(turn)
+        connectors = harness.connectors(agent)
+        seen["connectors"] = connectors
+        decisions = harness.proxy_decisions(agent, since=started - 2)
+        seen["decisions"] = decisions
+        seen["connector_call"] = require_connector_admitted(
+            turn.get("texts") or [],
+            decisions,
+            agent=agent,
+            connectors=connectors,
+            principal=expected_principal is not None,
+        )
+        fingerprint = observed.get("caller_fingerprint")
+        if fingerprint is not None:
+            seen["caller_fingerprint_matched"] = require_caller_fingerprint(
+                turn.get("texts") or [], str(fingerprint)
+            )
 
 
 def wait_for_refusal(
@@ -228,6 +431,10 @@ def requester_claim(harness: Harness, args: Any, evidence: Evidence) -> None:
     principal, (2) the same turn to the control agent carries none and still
     completes, (3) `curie cluster message` to the flag agent carries none, (5)
     a corrupted stored flag refuses the next human turn before any claim.
+
+    Steps 1 to 3 send ``[fake:connector-call]``, so each turn also presents its
+    token to every hosted connector of the agent, and the caller proxy's own
+    decision log shows whether it admitted a token with a principal.
     """
 
     flag_agent, control_agent = two_agents(harness, args)
@@ -250,7 +457,9 @@ def requester_claim(harness: Harness, args: Any, evidence: Evidence) -> None:
     enabled_version: int | None = None
 
     with (
-        evidence.step("0", "preconditions: HTTP selection, registered bindings") as seen,
+        evidence.step(
+            "0", "preconditions: HTTP selection, registered bindings, hosted connectors"
+        ) as seen,
         harness.api() as api,
     ):
         rows = harness.target.sql(
@@ -266,6 +475,14 @@ def requester_claim(harness: Harness, args: Any, evidence: Evidence) -> None:
             check(
                 harness.agent_entry(name)["binding_id"] in registered,
                 f"{name}'s email binding is not in the receiver registration",
+            )
+        hosted = {name: harness.connectors(name) for name in (flag_agent, control_agent)}
+        seen["connectors"] = hosted
+        for name, connectors in hosted.items():
+            check(
+                bool(connectors),
+                f"{name} has no hosted connector, so no turn can present its token to one; "
+                "deploy the agents with `up --bundle examples/weather`",
             )
         control_flag, control_version = requester_flag(api, control_id)
         if control_flag:
@@ -381,37 +598,33 @@ def requester_claim(harness: Harness, args: Any, evidence: Evidence) -> None:
             "a valid access-policy write changed the flag or its version",
         )
 
-    with evidence.step("1", "a verified human's email turn to the flag agent names them") as seen:
-        sent = harness.send(flag_agent, sender, "requester-claim: flag on")
-        seen["send"] = send_summary(sent)
-        check(sent["http_status"] == 200, f"the email turn answered {sent['http_status']}")
-        observed = harness.observe(flag_agent, wait=args.wait)
-        seen["observe"] = observed_token(observed)
-        check(observed["caller_token_present"], "no connector caller token reached the claim")
-        claims = observed.get("claims") or {}
-        check(claims.get("agent") == flag_agent, f"the token names agent {claims.get('agent')}")
-        check(
-            claims.get("principal") == expected_principal,
-            f"the token principal is {claims.get('principal')}, expected {expected_principal}",
-        )
+    human_turn_step(
+        harness,
+        evidence,
+        step_id="1",
+        title="a verified human's email turn to the flag agent names them at its connector",
+        agent=flag_agent,
+        sender=sender,
+        text=f"requester-claim: flag on {CONNECTOR_CALL}",
+        expected_principal=expected_principal,
+        wait=args.wait,
+    )
 
-    with evidence.step("2", "the control agent's turn completes with no principal") as seen:
-        sent = harness.send(control_agent, sender, "requester-claim: flag off")
-        seen["send"] = send_summary(sent)
-        check(sent["http_status"] == 200, f"the email turn answered {sent['http_status']}")
-        observed = harness.observe(control_agent, wait=args.wait)
-        seen["observe"] = observed_token(observed)
-        check(observed["caller_token_present"], "no connector caller token reached the claim")
-        claims = observed.get("claims") or {}
-        check(claims.get("agent") == control_agent, "the token names another agent")
-        check("principal" not in claims, f"the flag-off token carries {claims.get('principal')}")
-        turn = observed["turn"]
-        check(
-            turn["completed"] and turn["outcome"] == "delivered" and bool(turn["texts"]),
-            f"the control turn did not complete with a delivered reply: {turn}",
-        )
+    human_turn_step(
+        harness,
+        evidence,
+        step_id="2",
+        title="the control agent's turn completes and reaches its connector with no principal",
+        agent=control_agent,
+        sender=sender,
+        text=f"requester-claim: flag off {CONNECTOR_CALL}",
+        expected_principal=None,
+        wait=args.wait,
+    )
 
-    with evidence.step("3", "`curie cluster message` to the flag agent names no one") as seen:
+    with evidence.step(
+        "3", "`curie cluster message` to the flag agent names no one at its connector"
+    ) as seen:
         started = time.time()
         result = harness.target.curie(
             "cluster",
@@ -421,7 +634,7 @@ def requester_claim(harness: Harness, args: Any, evidence: Evidence) -> None:
             "--timeout-secs",
             str(int(args.wait)),
             "--json",
-            "requester-claim: negative control",
+            f"requester-claim: negative control {CONNECTOR_CALL}",
             timeout=args.wait + 120,
         )
         try:
@@ -430,13 +643,31 @@ def requester_claim(harness: Harness, args: Any, evidence: Evidence) -> None:
             reply = None
         seen["cluster_message"] = {"exit": result.returncode, "reply": reply}
         check(result.returncode == 0, f"curie cluster message exited {result.returncode}")
+        text = reply.get("reply") if isinstance(reply, dict) else None
+        check(
+            isinstance(text, str) and bool(text.strip()),
+            "curie cluster message returned no reply text",
+        )
         observed = harness.observe(flag_agent, since=started - 2, wait=60)
         seen["observe"] = observed_token(observed)
         check(observed["caller_token_present"], "no connector caller token reached the claim")
         claims = observed.get("claims") or {}
+        check(claims.get("agent") == flag_agent, f"the token names agent {claims.get('agent')}")
         check(
             "principal" not in claims, f"a non-HTTP turn's token carries {claims.get('principal')}"
         )
+        connectors = harness.connectors(flag_agent)
+        seen["connectors"] = connectors
+        decisions = harness.proxy_decisions(flag_agent, since=started - 2)
+        seen["decisions"] = decisions
+        seen["connector_call"] = require_connector_admitted(
+            [text], decisions, agent=flag_agent, connectors=connectors, principal=False
+        )
+        fingerprint = observed.get("caller_fingerprint")
+        if fingerprint is not None:
+            seen["caller_fingerprint_matched"] = require_caller_fingerprint(
+                [text], str(fingerprint)
+            )
 
     with evidence.step("5", "a malformed stored flag refuses the next human turn") as seen:
         if enabled_version is None:

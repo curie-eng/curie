@@ -19,7 +19,9 @@ Actions:
 2. ``send`` signs an email receiver proof for exactly the submitted body, as
    the mail adapter does, and posts ``/channels/turns``.
 3. ``observe`` reads the newest sandbox claim's connector caller token for an
-   agent and prints its decoded payload with the signature redacted.
+   agent and prints its decoded payload with the signature redacted, plus a
+   short sha256 fingerprint of the token that the fake model's
+   ``[fake:connector-call]`` reply lines carry for the header they sent.
 4. ``prove --scenario <name>`` runs a scripted scenario from
    ``identity_scenarios.py`` and writes JSON evidence.
 5. ``down`` removes what ``up`` created and restores the helm values it
@@ -33,6 +35,7 @@ See docs/testing/identity-e2e.md.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import contextlib
 import copy
@@ -96,6 +99,35 @@ STATE_VERSION = 1
 CALLER_TOKEN_ENV = "CURIE_CONNECTOR_CALLER_TOKEN"
 CLAIM_RESOURCE = "sandboxclaims.extensions.agents.x-k8s.io"
 AGENT_LABEL = "curietech.ai/agent"
+# A hosted connector's objects, as plugin_format.connector_render renders them:
+# `_labels` puts the release in part-of and the object name (release, agent and
+# connector joined by `-mcp-`) in name, and both appliers stamp the owning
+# agent's name in the owner label (connector_reconcile.OWNER_LABEL). The caller
+# proxy container names its connector in its environment.
+CONNECTOR_COMPONENT_LABEL = "app.kubernetes.io/component"
+CONNECTOR_COMPONENT = "mcp-connector"
+CONNECTOR_RELEASE_LABEL = "app.kubernetes.io/part-of"
+CONNECTOR_OWNER_LABEL = "curie.dev/connector-owner"
+CONNECTOR_JOIN = "-mcp-"
+CALLER_PROXY_CONTAINER = "caller-proxy"
+CALLER_PROXY_CONNECTOR_ENV = "CURIE_CALLER_PROXY_CONNECTOR"
+FINGERPRINT_HEX = 16
+REPLY_TEXT_LIMIT = 2000
+
+# `kubectl logs --timestamps` puts an RFC 3339 stamp with nanoseconds first.
+_LOG_STAMP = re.compile(
+    r"(?P<stamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?P<fraction>\.\d+)?"
+    r"(?P<zone>Z|[+-]\d{2}:\d{2})\s+"
+)
+# The proxy's logging prefix: `LEVEL name ` from its basicConfig format, or the
+# logging default `LEVEL:name:`.
+_PROXY_LOG_PREFIX = re.compile(r"[A-Z]+[: ]curie_connector_proxy(?:\.[A-Za-z0-9_.]+)?[: ]")
+_QUOTED = r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\""
+_PROXY_DECISION = re.compile(
+    r"caller=(?P<caller>\S+) outcome=(?P<outcome>[a-z_]+) method=(?P<method>\S+) "
+    rf"path=(?P<path>{_QUOTED})(?P<rest>.*)"
+)
+_PROXY_SUFFIX = re.compile(rf"\s+(?P<key>[a-z_]+)=(?P<value>{_QUOTED}|\S+)")
 
 
 def slug(name: str) -> str:
@@ -126,6 +158,85 @@ def decode_caller_token(token: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise HarnessError("the connector caller token payload is not an object")
     return {"prefix": parts[0], "payload": payload, "signature": "redacted"}
+
+
+def proxied_connector(deployment: Mapping[str, Any]) -> str | None:
+    """The connector a Deployment's caller proxy names, or None without a proxy."""
+
+    containers = deployment.get("spec", {}).get("template", {}).get("spec", {}).get("containers")
+    for container in containers or []:
+        if container.get("name") != CALLER_PROXY_CONTAINER:
+            continue
+        for env in container.get("env") or []:
+            if env.get("name") == CALLER_PROXY_CONNECTOR_ENV and isinstance(env.get("value"), str):
+                return str(env["value"])
+    return None
+
+
+def caller_fingerprint(token: str) -> str:
+    """The first 16 hex of the token's sha256, as the fake model prints for a sent header."""
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:FINGERPRINT_HEX]
+
+
+def split_log_stamp(line: str) -> tuple[float | None, str]:
+    """Unix seconds of a leading ``kubectl logs --timestamps`` stamp, and the rest."""
+
+    match = _LOG_STAMP.match(line)
+    if match is None:
+        return None, line
+    # Nanoseconds are more than datetime parses; microseconds are enough here.
+    fraction = (match["fraction"] or "")[:7]
+    zone = "+00:00" if match["zone"] == "Z" else match["zone"]
+    return epoch(match["stamp"] + fraction + zone), line[match.end() :]
+
+
+def parse_proxy_decision(line: str) -> dict[str, Any] | None:
+    """One caller proxy decision line, or None for any other line.
+
+    The line is the proxy's per-request log, optionally after a kubectl
+    timestamp: ``caller=<agent|-> outcome=<admitted|refusal> method=<m>
+    path=<repr>`` then, in any order, ``route=<repr>``, ``grant=<reason>`` and
+    ``principal=<present|absent>``. ``principal`` is None when the line has none
+    (a refusal, a route decision, or a proxy that predates the field).
+    """
+
+    _, rest = split_log_stamp(line.strip())
+    prefix = _PROXY_LOG_PREFIX.match(rest)
+    if prefix is None:
+        return None
+    match = _PROXY_DECISION.fullmatch(rest[prefix.end() :].rstrip())
+    if match is None:
+        return None
+    try:
+        path = ast.literal_eval(match["path"])
+    except (ValueError, SyntaxError):
+        return None
+    suffixes: dict[str, Any] = {}
+    remaining = match["rest"]
+    while remaining.strip():
+        suffix = _PROXY_SUFFIX.match(remaining)
+        if suffix is None:
+            return None
+        value = suffix["value"]
+        if value[:1] in {"'", '"'}:
+            try:
+                value = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                return None
+        suffixes[suffix["key"]] = value
+        remaining = remaining[suffix.end() :]
+    decision: dict[str, Any] = {
+        "caller": match["caller"],
+        "outcome": match["outcome"],
+        "method": match["method"],
+        "path": path,
+        "principal": suffixes.pop("principal", None),
+    }
+    for key in ("route", "grant"):
+        if key in suffixes:
+            decision[key] = suffixes[key]
+    return decision
 
 
 def epoch(stamp: str) -> float:
@@ -657,12 +768,16 @@ class Harness:
         since: float | None = None,
         wait: float = 180,
         conversation: str | None = None,
+        reply_wait: float | None = None,
     ) -> dict[str, Any]:
         """The newest claim's caller token for ``name``, and the turn's outcome.
 
-        With no ``since``, the window starts at the agent's last ``send`` (for
+        The claim and its token are awaited for ``wait`` seconds. With no
+        ``since``, the window starts at the agent's last ``send`` (for
         ``conversation`` when given) and the turn's email reply events are
-        awaited too, until ``turn.completed`` arrives or ``wait`` runs out.
+        awaited too, until ``turn.completed`` arrives or ``reply_wait`` (default
+        ``wait``) runs out. That budget starts once the token is found, so a
+        slow claim does not shorten it; with no token the replies are read once.
         """
 
         self.agent_entry(name)
@@ -695,12 +810,19 @@ class Harness:
             "claim_created": None if claim is None else claim["created"],
             "caller_token_present": token is not None,
         }
+        reply_deadline = deadline
         if token is not None:
             decoded = decode_caller_token(token)
-            result.update(prefix=decoded["prefix"], claims=decoded["payload"], signature="redacted")
+            result.update(
+                prefix=decoded["prefix"],
+                claims=decoded["payload"],
+                signature="redacted",
+                caller_fingerprint=caller_fingerprint(token),
+            )
+            reply_deadline = time.monotonic() + (wait if reply_wait is None else reply_wait)
         replies = self.replies(name, since, conversation)
         while conversation is not None and not turn_completed(replies):
-            if time.monotonic() > deadline:
+            if time.monotonic() > reply_deadline:
                 break
             time.sleep(3)
             replies = self.replies(name, since, conversation)
@@ -726,10 +848,95 @@ class Harness:
                 continue
             at = str(record.get("at", ""))
             if epoch(at) >= since:
+                # Room for one `connector-call` line per connector in the text.
                 out.append(
-                    {"at": at, "status": record.get("status"), "event": summarize_event(event)}
+                    {
+                        "at": at,
+                        "status": record.get("status"),
+                        "event": summarize_event(event, REPLY_TEXT_LIMIT),
+                    }
                 )
         return out
+
+    # hosted connectors ----------------------------------------------------------
+
+    def _connector_deployments(self, name: str) -> dict[str, dict[str, Any]]:
+        """The agent's hosted connector Deployments, by connector name."""
+
+        self.agent_entry(name)
+        release = self.target.release
+        selector = ",".join(
+            (
+                f"{CONNECTOR_COMPONENT_LABEL}={CONNECTOR_COMPONENT}",
+                f"{CONNECTOR_RELEASE_LABEL}={release}",
+                f"{CONNECTOR_OWNER_LABEL}={name}",
+            )
+        )
+        found: dict[str, dict[str, Any]] = {}
+        for item in self.target.kubectl_json("get", "deployment", "-l", selector)["items"]:
+            deployment = str(item["metadata"]["name"])
+            connector = proxied_connector(item)
+            prefix = f"{release}-{name}{CONNECTOR_JOIN}"
+            if connector is None and deployment.startswith(prefix):
+                connector = deployment.removeprefix(prefix)
+            if not connector:
+                raise HarnessError(f"cannot tell which connector Deployment {deployment} serves")
+            if connector in found:
+                raise HarnessError(f"{name} has two Deployments for connector {connector}")
+            found[connector] = item
+        return found
+
+    def connectors(self, name: str) -> list[str]:
+        """The hosted connectors deployed for ``name``, sorted."""
+
+        return sorted(self._connector_deployments(name))
+
+    def proxy_decisions(self, name: str, since: float) -> list[dict[str, Any]]:
+        """Caller proxy decisions logged by ``name``'s connector pods at or after ``since``.
+
+        Each is a :func:`parse_proxy_decision` entry plus the ``connector`` whose
+        pod logged it and the log stamp ``at``. Kept: every decision whose
+        caller is ``name``, and every refusal whatever its caller, so a step
+        sees a refusal it did not expect.
+        """
+
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))
+        decisions: list[tuple[float, dict[str, Any]]] = []
+        for connector, deployment in sorted(self._connector_deployments(name).items()):
+            if proxied_connector(deployment) is None:
+                raise HarnessError(
+                    f"connector {connector} of {name} has no {CALLER_PROXY_CONTAINER} "
+                    "container; is connectorCaller configured?"
+                )
+            labels = deployment["spec"]["selector"]["matchLabels"]
+            selector = ",".join(f"{key}={value}" for key, value in sorted(labels.items()))
+            pods = self.target.kubectl_json("get", "pod", "-l", selector)["items"]
+            for pod in pods:
+                pod_name = str(pod["metadata"]["name"])
+                result = self.target.kubectl(
+                    "logs",
+                    pod_name,
+                    "-c",
+                    CALLER_PROXY_CONTAINER,
+                    "--timestamps",
+                    f"--since-time={stamp}",
+                    check=False,
+                )
+                if result.returncode != 0:
+                    log(f"no caller proxy log from {pod_name}: exit {result.returncode}")
+                    continue
+                for line in result.stdout.splitlines():
+                    at, rest = split_log_stamp(line)
+                    if at is not None and at < since:
+                        continue
+                    parsed = parse_proxy_decision(line)
+                    if parsed is None:
+                        continue
+                    if parsed["caller"] != name and parsed["outcome"] == "admitted":
+                        continue
+                    parsed.update(connector=connector, at=line[: len(line) - len(rest)].strip())
+                    decisions.append((since if at is None else at, parsed))
+        return [entry for _, entry in sorted(decisions, key=lambda pair: pair[0])]
 
     # down ---------------------------------------------------------------------
 
@@ -890,7 +1097,12 @@ def build_parser() -> argparse.ArgumentParser:
     observe.add_argument("--agent", required=True)
     observe.add_argument("--conversation")
     observe.add_argument("--since", type=float, help="unix seconds; default the last send")
-    observe.add_argument("--wait", type=float, default=180)
+    observe.add_argument("--wait", type=float, default=180, help="seconds to await the token")
+    observe.add_argument(
+        "--reply-wait",
+        type=float,
+        help="seconds to await the reply once the token is found (default: --wait)",
+    )
 
     prove = actions.add_parser("prove", parents=[common], help="run a scripted scenario")
     prove.add_argument("--scenario", required=True)
@@ -921,7 +1133,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "observe":
             harness.state.load()
             result = harness.observe(
-                args.agent, since=args.since, wait=args.wait, conversation=args.conversation
+                args.agent,
+                since=args.since,
+                wait=args.wait,
+                conversation=args.conversation,
+                reply_wait=args.reply_wait,
             )
         elif args.action == "prove":
             import identity_scenarios
