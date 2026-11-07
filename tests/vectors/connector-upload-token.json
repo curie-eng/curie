@@ -1,0 +1,13 @@
+{
+  "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+  "agent": "acme-dev",
+  "connector": "reviewer",
+  "exp": 2000000000,
+  "token": "ccu.eyJhZ2VudCI6ImFjbWUtZGV2IiwiY29ubmVjdG9yIjoicmV2aWV3ZXIiLCJleHAiOjIwMDAwMDAwMDB9.antNuS99OPCCN3ZgV_sbugXomDI_j-MGtTfhW-XzL1wp24sxEQ8ew3WA0JLz7BqOX9fiTz3UKDKZVrht-364Ag",
+  "refused": [
+    "ccu.eyJhZ2VudCI6ImFjbWUtZGV2IiwiY29ubmVjdG9yIjoicmV2aWV3ZXIiLCJleHAiOjIwMDAwMDAwMDAsInJ1biI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsIndvcmtfaXRlbSI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMiJ9.mqd9XCpuLgOPc81gquWp0Br0aGg2332dlYhvZcY_lCdMKQH9hKoCvDlCowmFsU2O8KRaC10MpaNiSoNvrF_yCg",
+    "ccu.eyJhZ2VudCI6ImFjbWUtZGV2IiwiYXVkIjoicmV2aWV3ZXIiLCJjb25uZWN0b3IiOiJyZXZpZXdlciIsImV4cCI6MjAwMDAwMDAwMH0.r9eNIRDKxy2iw2fepuWKmIVGqbvmAz5jGbBCy3z8cEhSZzEmLQ2MTIKHwc-v2uqPzCfFbh6Yu2h4A9osexwjAQ",
+    "ccu.eyJhZ2VudCI6ImFjbWUtZGV2IiwiY29ubmVjdG9yIjoicmV2aWV3ZXIiLCJleHAiOnRydWV9.5e01KI2wWbsz9xojlG8SSjw4e-smD6GsmazhuuxxHn06JThYMSbFdmKEDZiYptshp-dEaKkBzYdqoi35LYMlDA"
+  ]
+}

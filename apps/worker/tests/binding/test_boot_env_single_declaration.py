@@ -272,6 +272,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_CALLER_PROXY_UPSTREAM_HOST",
         "CURIE_CALLER_PROXY_PUBLIC_KEYS",
         "CURIE_CALLER_PROXY_ADMITS",
+        # Portable connector task configuration, never runner boot configuration.
+        "CURIE_CONNECTOR_SERVE_CONFIG",
+        "CURIE_CONNECTOR_GRANT_STORE_PASSWORD",
         "CURIE_EVAL_CONSUMER_GROUP",
         "CURIE_EVAL_MAX_CONCURRENT_CLAIMS",
         "CURIE_EVAL_STREAM",

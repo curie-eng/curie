@@ -68,6 +68,7 @@ release/tests/test_authorize.py
 release/tests/test_get_curie.py
 release/tests/test_kind_ci.py
 release/tests/test_sdk_approval_gate_workflow.py
+runner/tests/test_connector_endpoints.py
 runner/tests/test_dark_factory_runner_toolchain.py
 runner/tests/test_dockerfile_registry_layer.py
 runner/tests/test_factory_preflight.py
