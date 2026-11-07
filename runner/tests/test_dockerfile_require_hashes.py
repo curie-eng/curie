@@ -25,8 +25,8 @@ _PIP_REQUIREMENTS = _REPO_ROOT / "runner" / "pip-requirements.txt"
 _UV_LOCK = _REPO_ROOT / "uv.lock"
 _GENERATED_REQUIREMENTS = "/tmp/runner-dependency-pins.txt"
 _PIP_REQUIREMENTS_COPY = "COPY runner/pip-requirements.txt ./runner/pip-requirements.txt"
-_PIP_VERSION = "26.2.1"
-_PIP_WHEEL_HASH = "sha256:71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e"
+_PIP_VERSION = "26.3"
+_PIP_WHEEL_HASH = "sha256:f3b60b20ffaadd4415ed7957212a38ac63fa4c5fa375bd0f4a797777940fad13"
 _HASH_OPTION = re.compile(r"--hash=(sha256:[0-9a-f]{64})")
 _HASH_VALUE = re.compile(r"sha256:[0-9a-f]{64}")
 _REGISTRY = '{ registry = "https://pypi.org/simple" }'

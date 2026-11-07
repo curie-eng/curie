@@ -44,7 +44,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from aci_protocol import SideEffectFlag
 from plugin_format.connector_render import object_name
@@ -61,6 +61,13 @@ logger = logging.getLogger(__name__)
 
 # Per read. Two reads per action, so at most four seconds added to a turn.
 READ_TIMEOUT_SECONDS = 2.0
+
+
+class _RawDeploymentResponse(Protocol):
+    """HTTP response from a deployment read with ``_preload_content=False``."""
+
+    data: str | bytes
+
 
 # The container of a rendered connector Deployment that runs the connector's own
 # image (``plugin_format.connector_render``); the other one is the caller proxy.
@@ -258,7 +265,7 @@ class DigestAttributingRecorder:
                 _preload_content=False,
                 _request_timeout=READ_TIMEOUT_SECONDS,
             )
-            body = json.loads(response.data)
+            body = json.loads(cast(_RawDeploymentResponse, response).data)
             if not isinstance(body, dict):
                 raise ValueError("Deployment body is not an object")
             return body

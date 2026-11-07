@@ -787,7 +787,7 @@ def test_job_transport_round_trips_what_the_builder_wrote(
 
     assert publication_k8s.job_transport(resources.job) == transport
     # The real client hands back a V1Job model, not a dict.
-    model = ApiClient().deserialize(SimpleNamespace(data=json.dumps(resources.job)), "V1Job")
+    model = ApiClient().deserialize(json.dumps(resources.job), "V1Job", "application/json")
     assert isinstance(model, V1Job)
     assert publication_k8s.job_transport(model) == transport
     # The rebuilt resources match the adopted Job exactly.
@@ -2177,7 +2177,7 @@ def test_observe_reports_the_transport_the_existing_job_was_built_with(
     live = deepcopy(resources.job)
     live["metadata"]["uid"] = "job-uid-live"
     live["status"] = {"active": 1}
-    model = ApiClient().deserialize(SimpleNamespace(data=json.dumps(live)), "V1Job")
+    model = ApiClient().deserialize(json.dumps(live), "V1Job", "application/json")
     cluster = object.__new__(publication_k8s.KubernetesPublicationCluster)
     cluster.namespace = "curie"
     cluster._batch = SimpleNamespace(read_namespaced_job=lambda *_args: model)
@@ -2795,9 +2795,9 @@ def test_rejected_job_quiescence_uses_exact_uid_terminal_condition_and_stopped_p
     cluster = _quiescence_cluster(publication_k8s, job=job, pods=[stopped, foreign])
     if as_model:
         api = ApiClient()
-        job_model = api.deserialize(SimpleNamespace(data=json.dumps(job)), "V1Job")
+        job_model = api.deserialize(json.dumps(job), "V1Job", "application/json")
         pod_models = api.deserialize(
-            SimpleNamespace(data=json.dumps({"items": [stopped, foreign]})), "V1PodList"
+            json.dumps({"items": [stopped, foreign]}), "V1PodList", "application/json"
         )
         cluster._batch = SimpleNamespace(read_namespaced_job=lambda *_args: job_model)
         cluster._core = SimpleNamespace(list_namespaced_pod=lambda *_args, **_kwargs: pod_models)
@@ -2817,7 +2817,7 @@ def test_rejected_job_quiescence_refuses_same_name_foreign_uid_pod(
     cluster = _quiescence_cluster(publication_k8s, pods=pods)
     if as_model:
         pod_models = ApiClient().deserialize(
-            SimpleNamespace(data=json.dumps({"items": pods})), "V1PodList"
+            json.dumps({"items": pods}), "V1PodList", "application/json"
         )
         cluster._core = SimpleNamespace(list_namespaced_pod=lambda *_args, **_kwargs: pod_models)
 

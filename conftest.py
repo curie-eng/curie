@@ -46,6 +46,7 @@ boot is reported as a failure naming the tier, so lost coverage is loud. The
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import os
 import re
@@ -154,10 +155,16 @@ UNBOOTED_SERVICES = {
 }
 
 
-# tryfirst: xdist's loadgroup reads the group into the node id in its own
-# modifyitems hook, so the marker has to exist before that hook runs.
-@pytest.hookimpl(tryfirst=True)
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+# tryfirst wrapper: xdist's loadgroup hook reads the marker while it rewrites
+# the node id, so the marker has to exist before that hook. pytest 9.2 made
+# nodeid a read-only view of the structured id, and pytest-xdist 3.8 still
+# assigns the unused item._nodeid. After the other hooks, a worker stamps the
+# same @group suffix into the structured id so loadgroup still schedules one
+# group per worker. A controller collect, including --ci-shard, stays unsuffixed.
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> Generator[None]:
     groups: dict[str, list[pytest.Item]] = {}
     for item in items:
         path = item.path.relative_to(config.rootpath).as_posix()
@@ -174,28 +181,60 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     if shard is None:
         if tier_limits is not None:
             raise pytest.UsageError("--ci-shard-tiers requires --ci-shard")
-        return
-    index, count = shard
-    sizes = {group: len(members) for group, members in groups.items()}
-    if tier_limits is None or tier_limits == (count, count):
-        owner = assign_shards(sizes, count)
     else:
-        storage, full = tier_limits
-        if not full <= storage <= count:
-            raise pytest.UsageError(
-                f"--ci-shard-tiers needs FULL <= STORAGE <= {count}, got {storage},{full}"
+        index, count = shard
+        sizes = {group: len(members) for group, members in groups.items()}
+        if tier_limits is None or tier_limits == (count, count):
+            owner = assign_shards(sizes, count)
+        else:
+            storage, full = tier_limits
+            if not full <= storage <= count:
+                raise pytest.UsageError(
+                    f"--ci-shard-tiers needs FULL <= STORAGE <= {count}, got {storage},{full}"
+                )
+            owner = assign_shards(
+                sizes,
+                count,
+                group_tiers=_group_tiers(config.rootpath, groups),
+                tier_limits=tier_limits,
             )
-        owner = assign_shards(
-            sizes,
-            count,
-            group_tiers=_group_tiers(config.rootpath, groups),
-            tier_limits=tier_limits,
-        )
-    keep = [item for item in items if owner[_group_of(item, groups)] == index]
-    deselected = [item for item in items if owner[_group_of(item, groups)] != index]
-    if deselected:
-        config.hook.pytest_deselected(items=deselected)
-    items[:] = keep
+        keep = [item for item in items if owner[_group_of(item, groups)] == index]
+        deselected = [item for item in items if owner[_group_of(item, groups)] != index]
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
+        items[:] = keep
+    result = yield
+    _stamp_loadgroup_nodeids(config, items)
+    return result
+
+
+def _xdist_group_suffix(item: pytest.Item) -> str:
+    """The suffix pytest-xdist 3.8 appends: sorted unique marker names joined by _."""
+
+    names: set[str] = set()
+    for mark in item.iter_markers("xdist_group"):
+        name = mark.args[0] if mark.args else mark.kwargs.get("name", "default")
+        names.add(str(name))
+    return "_".join(sorted(names))
+
+
+def _stamp_loadgroup_nodeids(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Write xdist's @group suffix into the structured node id on a worker.
+
+    The worker clears ``dist`` and records the original mode on ``loadgroup``.
+    Skip a node id that already ends in that suffix, so a later xdist that
+    writes the real id is not stamped twice.
+    """
+
+    if not hasattr(config, "workerinput") or not getattr(config.option, "loadgroup", False):
+        return
+    for item in items:
+        suffix = _xdist_group_suffix(item)
+        if not suffix or item.nodeid.endswith("@" + suffix):
+            continue
+        updated = dataclasses.replace(item._id)
+        object.__setattr__(updated, "_str_cache", f"{item.nodeid}@{suffix}")
+        item._id = updated
 
 
 def _group_of(item: pytest.Item, groups: dict[str, list[pytest.Item]]) -> str:

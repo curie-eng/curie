@@ -1413,9 +1413,9 @@ def _build_e2e_reaper(
 
     # The same credential the connector reconciler loads (connector_k8s.py).
     try:
-        k8s_config.load_incluster_config()
+        k8s_config.load_incluster_config()  # type: ignore[no-untyped-call]
     except k8s_config.ConfigException:
-        k8s_config.load_kube_config()
+        k8s_config.load_kube_config()  # type: ignore[no-untyped-call]
     core = k8s_client.CoreV1Api()
     return E2EReaperLoop(
         clusters=lambda: connector_secret_clusters(

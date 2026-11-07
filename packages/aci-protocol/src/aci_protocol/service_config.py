@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Mapping
+from typing import Any
 
 from pydantic import AliasChoices
 from pydantic.fields import FieldInfo
@@ -135,8 +136,13 @@ class AliasOnlyEnvSource(EnvSettingsSource):
     only the field-name fallback is filtered, so both names keep resolving.
     """
 
-    def _extract_field_info(self, field: FieldInfo, field_name: str) -> list[tuple[str, str, bool]]:
-        infos = super()._extract_field_info(field, field_name)
+    def _extract_field_info(
+        self,
+        field: FieldInfo,
+        field_name: str,
+        model_config: Mapping[str, Any] | None = None,
+    ) -> list[tuple[str, str, bool]]:
+        infos = super()._extract_field_info(field, field_name, model_config)
         if field.validation_alias is not None:
             infos = [info for info in infos if info[0] != field_name]
         return infos

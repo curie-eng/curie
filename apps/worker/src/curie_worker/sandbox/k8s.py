@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 from aci_protocol import BootEnv
 from kubernetes import client as k8s_client
@@ -610,9 +610,9 @@ class KubernetesSandboxClient:
         kubeconfig: str | None = None,
     ) -> None:
         try:
-            k8s_config.load_incluster_config()
+            k8s_config.load_incluster_config()  # type: ignore[no-untyped-call]
         except k8s_config.ConfigException:
-            k8s_config.load_kube_config(config_file=kubeconfig)
+            k8s_config.load_kube_config(config_file=kubeconfig)  # type: ignore[no-untyped-call]
         configuration = k8s_client.Configuration.get_default_copy()
         # The installed client otherwise inherits urllib3's three retry
         # default. That would multiply every explicit request timeout by four
@@ -743,15 +743,18 @@ class KubernetesSandboxClient:
         )
         labels = {MANAGED_BY_LABEL: MANAGED_BY_VALUE, CLAIM_LABEL: claim}
         try:
-            created = self._api.create_namespaced_custom_object(
-                EXT_GROUP,
-                EXT_VERSION,
-                self._namespace,
-                "sandboxtemplates",
-                _extension_body(
-                    "SandboxTemplate", {"name": names.template, "labels": labels}, spec
+            created = cast(
+                dict[str, Any],
+                self._api.create_namespaced_custom_object(
+                    EXT_GROUP,
+                    EXT_VERSION,
+                    self._namespace,
+                    "sandboxtemplates",
+                    _extension_body(
+                        "SandboxTemplate", {"name": names.template, "labels": labels}, spec
+                    ),
+                    _request_timeout=_claim_timeout(deadline),
                 ),
-                _request_timeout=_claim_timeout(deadline),
             )
         except k8s_client.ApiException as exc:
             # Raised with no rollback: a template already at this name is not ours.
@@ -772,13 +775,16 @@ class KubernetesSandboxClient:
             files = {} if tool_daemon is None else dict(tool_daemon.files)
             self._core_api.create_namespaced_secret(
                 self._namespace,
-                {
-                    "apiVersion": "v1",
-                    "kind": "Secret",
-                    "type": "Opaque",
-                    "metadata": metadata,
-                    "stringData": {**tokens, **files},
-                },
+                cast(
+                    k8s_client.V1Secret,
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "type": "Opaque",
+                        "metadata": metadata,
+                        "stringData": {**tokens, **files},
+                    },
+                ),
                 _request_timeout=_claim_timeout(deadline),
             )
             self._api.create_namespaced_custom_object(
@@ -891,13 +897,19 @@ class KubernetesSandboxClient:
                 raise TimeoutError("sandbox capacity inventory deadline expired")
             return remaining
 
-        claims = self._api.list_namespaced_custom_object(
-            EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims",
-            _request_timeout=budget(),
+        claims = cast(
+            dict[str, Any],
+            self._api.list_namespaced_custom_object(
+                EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims",
+                _request_timeout=budget(),
+            ),
         )["items"]
-        sandboxes = self._api.list_namespaced_custom_object(
-            CORE_GROUP, CORE_VERSION, self._namespace, "sandboxes",
-            _request_timeout=budget(),
+        sandboxes = cast(
+            dict[str, Any],
+            self._api.list_namespaced_custom_object(
+                CORE_GROUP, CORE_VERSION, self._namespace, "sandboxes",
+                _request_timeout=budget(),
+            ),
         )["items"]
         pods = self._core_api.list_namespaced_pod(
             self._namespace, _request_timeout=budget()
@@ -942,11 +954,13 @@ class KubernetesSandboxClient:
         chargeable: dict[str, CapacityPod] = {}
         now = datetime.now(UTC)
         for pod in pods:
-            if pod.spec.priority_class_name != priority_class or pod.status.phase in {
-                "Succeeded", "Failed"
-            }:
+            spec = cast(k8s_client.V1PodSpec, pod.spec)
+            status = cast(k8s_client.V1PodStatus, pod.status)
+            if spec.priority_class_name != priority_class or (
+                status.phase == "Succeeded" or status.phase == "Failed"
+            ):
                 continue
-            metadata = pod.metadata
+            metadata = cast(k8s_client.V1ObjectMeta, pod.metadata)
             if metadata.deletion_timestamp is not None:
                 grace = metadata.deletion_grace_period_seconds
                 elapsed = (now - metadata.deletion_timestamp).total_seconds()
@@ -965,7 +979,7 @@ class KubernetesSandboxClient:
                 owner = (metadata.labels or {}).get(ADMISSION_CLAIM_LABEL)
             if not metadata.uid:
                 raise ValueError("sandbox capacity Pod has no UID")
-            footprint = pod_resources(pod.spec.to_dict())
+            footprint = pod_resources(spec.to_dict())
             chargeable[metadata.uid] = CapacityPod(
                 claim_name=owner,
                 resources=footprint,
@@ -1015,10 +1029,15 @@ class KubernetesSandboxClient:
         quota = self._core_api.read_namespaced_resource_quota(
             quota_name, self._namespace, _request_timeout=request_timeout_seconds
         )
+        metadata = cast(k8s_client.V1ObjectMeta, quota.metadata)
+        spec = cast(k8s_client.V1ResourceQuotaSpec, quota.spec)
+        status = cast(k8s_client.V1ResourceQuotaStatus, quota.status)
         return QuotaStatus(
-            name=quota.metadata.name, namespace=quota.metadata.namespace,
-            spec_hard=quota.spec.hard, status_hard=quota.status.hard,
-            status_used=quota.status.used,
+            name=cast(str, metadata.name),
+            namespace=cast(str, metadata.namespace),
+            spec_hard=cast(Mapping[str, str], spec.hard),
+            status_hard=cast(Mapping[str, str], status.hard),
+            status_used=cast(Mapping[str, str], status.used),
         )
 
     def _rollback_delete(self, plural: str, name: str) -> None:
@@ -1185,13 +1204,16 @@ class KubernetesSandboxClient:
             return
         claim_created = False
         try:
-            created = self._api.create_namespaced_custom_object(
-                EXT_GROUP,
-                EXT_VERSION,
-                self._namespace,
-                "sandboxclaims",
-                body,
-                _request_timeout=_claim_timeout(deadline),
+            created = cast(
+                dict[str, Any],
+                self._api.create_namespaced_custom_object(
+                    EXT_GROUP,
+                    EXT_VERSION,
+                    self._namespace,
+                    "sandboxclaims",
+                    body,
+                    _request_timeout=_claim_timeout(deadline),
+                ),
             )
             claim_created = True
             # Hand the template (and through it the Secret and pool) to the
@@ -1243,12 +1265,15 @@ class KubernetesSandboxClient:
                 raise
 
     def list_claims(self, *, label_selector: str) -> list[ClaimView]:
-        result = self._api.list_namespaced_custom_object(
-            EXT_GROUP,
-            EXT_VERSION,
-            self._namespace,
-            "sandboxclaims",
-            label_selector=label_selector,
+        result = cast(
+            dict[str, Any],
+            self._api.list_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxclaims",
+                label_selector=label_selector,
+            ),
         )
         return [_claim_view(item) for item in result.get("items", [])]
 
@@ -1263,12 +1288,15 @@ class KubernetesSandboxClient:
         there first and counts as deleted.
         """
 
-        result = self._api.list_namespaced_custom_object(
-            EXT_GROUP,
-            EXT_VERSION,
-            self._namespace,
-            "sandboxtemplates",
-            label_selector=f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE},{CLAIM_LABEL}",
+        result = cast(
+            dict[str, Any],
+            self._api.list_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxtemplates",
+                label_selector=f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE},{CLAIM_LABEL}",
+            ),
         )
         deleted: list[str] = []
         for item in result.get("items", []):
@@ -1619,7 +1647,7 @@ class KubernetesSandboxClient:
             if abandoned:
                 if forward is not None:
                     forward.close()
-                api_client.close()
+                api_client.close()  # type: ignore[no-untyped-call]
 
         threading.Thread(target=connect, name=f"daemon-portforward-{pod}", daemon=True).start()
         done.wait(timeout_seconds)
@@ -1630,7 +1658,7 @@ class KubernetesSandboxClient:
             raise SandboxError(f"port-forward to {pod} did not connect within {timeout_seconds}s")
         forward = state["forward"]
         if forward is None:
-            api_client.close()
+            api_client.close()  # type: ignore[no-untyped-call]
             error = state["error"]
             raise SandboxError(f"port-forward to {pod} failed ({type(error).__name__})") from error
         sock: socket.socket | None = None
@@ -1642,7 +1670,7 @@ class KubernetesSandboxClient:
             if sock is not None:
                 sock.close()
             forward.close()
-            api_client.close()
+            api_client.close()  # type: ignore[no-untyped-call]
 
     # -- helpers --------------------------------------------------------------
 
@@ -1676,4 +1704,4 @@ class KubernetesSandboxClient:
             raise KubeTransientError(
                 f"kube API transport error reading {plural}/{name}: {type(exc).__name__}"
             ) from exc
-        return dict(obj)
+        return dict(cast(dict[str, Any], obj))
