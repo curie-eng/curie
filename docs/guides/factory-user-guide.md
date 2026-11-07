@@ -24,7 +24,7 @@ use their provider quickstart.
 1. **Install the local skills** from your repository checkout:
 
    ```bash
-   curie factory skills install --help && curie factory skills install --agent codex
+   curie factory skills install --agent codex
    ```
 
    Replace `codex` with `claude-code`, `copilot`, `gemini`, or `cursor`

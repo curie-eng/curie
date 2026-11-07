@@ -38,7 +38,7 @@ for production settings.
 Install the local skills in the repository checkout:
 
 ```bash
-curie factory skills install --help && curie factory skills install --agent codex
+curie factory skills install --agent codex
 ```
 
 Replace `codex` with `claude-code`, `copilot`, `gemini`, or `cursor`
