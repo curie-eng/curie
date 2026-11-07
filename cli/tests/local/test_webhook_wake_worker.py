@@ -15,7 +15,6 @@ import subprocess
 import threading
 import time
 import uuid
-from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -188,6 +187,8 @@ class WakeStack:
             },
             "security": {"gvisor": {"mode": "off"}},
             "agentSandbox": {
+                "deploy": True,
+                "controller": {"deploy": True},
                 "poolAgents": ["acme-wake-idle", "acme-wake-gated", "acme-wake-http"],
                 "runner": {
                     "image": self.images["runner"].rsplit(":", 1)[0],
@@ -390,15 +391,17 @@ class WakeStack:
 
     def seed(self, agent="acme-wake-idle", *, queued=True):
         agent_id = self.agents[agent]
-        slot = datetime.now(UTC).isoformat()
         row = self.sql(
             "INSERT INTO curie.hook_runs "
             "(id, agent_id, name, slot_utc, version_id, source, started_at, lease_expires_at) "
-            f"SELECT '{uuid.uuid4()}', a.id, 'queue-ready', '{slot}', d.version_id, 'webhook', "
+            f"SELECT '{uuid.uuid4()}', a.id, 'queue-ready', clock_timestamp(), "
+            "d.version_id, 'webhook', "
             f"now(), now() + interval '{self.claim_lease_s} seconds' FROM curie.agents a "
             "JOIN curie.deployments d ON d.agent_id = a.id AND d.status = 'active' "
-            f"WHERE a.id = '{agent_id}' RETURNING json_build_object('id', id)"
+            f"WHERE a.id = '{agent_id}' "
+            "RETURNING json_build_object('id', id, 'slot', slot_utc)"
         )
+        slot = row["slot"]
         event = QueuedTurn(
             event_id=f"cron:{agent_id}:queue-ready:{slot}",
             conversation_id=hook_conversation_id(uuid.UUID(agent_id), "queue-ready"),
