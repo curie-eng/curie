@@ -12,12 +12,13 @@ from aiohttp.test_utils import TestServer
 from channel_protocol import ReplyEvent, ReplyUpdate
 from curie_channel_gateway.http_reply import HttpReplyTransport, reply_application
 from curie_channel_gateway.ports import ReplyCapabilities
-from curie_channel_gateway.reply_transport import (
+from curie_channel_gateway.reply_delivery import signed_reply_headers
+from curie_channel_gateway.reply_errors import (
     MissingAdapterCredentialError,
     RejectedAdapterResponseError,
 )
+from curie_channel_gateway.reply_route import ReplyDestination
 from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
-from curie_worker.reply_sink import ReplySinkRouter, TargetRoute
 from pydantic import TypeAdapter
 
 _CORPUS = json.loads(
@@ -42,7 +43,7 @@ _BODIES.append(
 
 
 @pytest.mark.parametrize("body", _BODIES)
-def test_gateway_reply_wire_and_provider_outcomes(body: dict[str, Any]) -> None:
+def test_gateway_reply_wire_and_provider_outcomes(body: dict[str, Any], tmp_path: Path) -> None:
     async def run() -> None:
         calls: list[dict[str, Any]] = []
 
@@ -55,7 +56,7 @@ def test_gateway_reply_wire_and_provider_outcomes(body: dict[str, Any]) -> None:
         slack_server = TestServer(provider_app)
         await slack_server.start_server()
         slack = SlackReplyAdapter("xoxb-test", base_url=str(slack_server.make_url("/")))
-        provider_route = TargetRoute()
+        provider_route = ReplyDestination()
         received: list[bytes] = []
 
         @web.middleware
@@ -66,13 +67,19 @@ def test_gateway_reply_wire_and_provider_outcomes(body: dict[str, Any]) -> None:
                 received.append(wire)
             return response
 
-        application = reply_application(slack, secret="test-egress", route=provider_route)
+        application = reply_application(
+            slack,
+            secret="test-egress",
+            route=provider_route,
+            kind="slack",
+            state_path=tmp_path / "replies.sqlite3",
+        )
         application.middlewares.append(capture)
         server = TestServer(application)
-        transport: HttpReplyTransport[TargetRoute] | None = None
+        transport: HttpReplyTransport[ReplyDestination] | None = None
         try:
             await server.start_server()
-            route = TargetRoute(endpoint=str(server.make_url("/reply")), adapter="acme-slack")
+            route = ReplyDestination(endpoint=str(server.make_url("/reply")), adapter="acme-slack")
             transport = HttpReplyTransport(
                 {"acme-slack": "test-egress"},
                 {
@@ -81,8 +88,8 @@ def test_gateway_reply_wire_and_provider_outcomes(body: dict[str, Any]) -> None:
                         undeliverable_reason=slack.undeliverable_reason("slack", provider_route),
                     )
                 },
+                allow_insecure_http=True,
             )
-            router = ReplySinkRouter(adapters={"slack": transport}, default=transport)
             event = _EVENTS.validate_python(body)
             async with aiohttp.ClientSession() as client:
                 for headers in ({}, {"X-Curie-Adapter-Secret": "wrong"}):
@@ -94,6 +101,7 @@ def test_gateway_reply_wire_and_provider_outcomes(body: dict[str, Any]) -> None:
             wrong = HttpReplyTransport(
                 {"acme-slack": "wrong"},
                 {("slack", route): ReplyCapabilities(True, None)},
+                allow_insecure_http=True,
             )
             try:
                 with pytest.raises(RejectedAdapterResponseError, match="401"):
@@ -106,13 +114,18 @@ def test_gateway_reply_wire_and_provider_outcomes(body: dict[str, Any]) -> None:
                     async with client.post(
                         server.make_url("/reply"),
                         data=wire,
-                        headers={"X-Curie-Adapter-Secret": "test-egress"},
+                        headers=signed_reply_headers(
+                            "test-egress",
+                            path="/reply",
+                            body=wire.encode(),
+                            best_effort_unreachable=False,
+                        ),
                     ) as response:
                         assert response.status == 400
                 assert calls == []
-            assert router.edits_in_place("slack", route)
-            assert router.undeliverable_reason("slack", route) is None
-            ack = await router.emit(event, route=route)
+            assert transport.edits_in_place("slack", route)
+            assert transport.undeliverable_reason("slack", route) is None
+            ack = await transport.emit(event, route=route)
             assert received == [event.model_dump_json().encode()]
             # Validation at the receiver preserves each version, including verbatim bytes.
             if event.event in {"reply.update", "reply.post"}:
@@ -126,7 +139,7 @@ def test_gateway_reply_wire_and_provider_outcomes(body: dict[str, Any]) -> None:
             if isinstance(event, ReplyUpdate) and event.text_mode == "verbatim":
                 assert calls[-1]["text"] == event.text
             with pytest.raises(KeyError):
-                await transport.emit(event, route=TargetRoute(adapter="undeclared"))
+                await transport.emit(event, route=ReplyDestination(adapter="undeclared"))
         finally:
             if transport is not None:
                 await transport.aclose()
@@ -136,10 +149,14 @@ def test_gateway_reply_wire_and_provider_outcomes(body: dict[str, Any]) -> None:
     asyncio.run(run())
 
 
-def test_gateway_reply_rejects_missing_credential_and_invalid_configuration() -> None:
+def test_gateway_reply_rejects_missing_credential_and_invalid_configuration(tmp_path: Path) -> None:
     async def run() -> None:
-        route = TargetRoute(endpoint="https://example.com/reply", adapter="acme-slack")
-        transport = HttpReplyTransport({}, {("slack", route): ReplyCapabilities(True, None)})
+        route = ReplyDestination(endpoint="https://example.com/reply", adapter="acme-slack")
+        transport = HttpReplyTransport(
+            {},
+            {("slack", route): ReplyCapabilities(True, None)},
+            allow_insecure_http=True,
+        )
         try:
             with pytest.raises(MissingAdapterCredentialError):
                 await transport.emit(_EVENTS.validate_python(_BODIES[0]), route=route)
@@ -148,10 +165,16 @@ def test_gateway_reply_rejects_missing_credential_and_invalid_configuration() ->
 
     asyncio.run(run())
     with pytest.raises(ValueError, match="secret"):
-        reply_application(SlackReplyAdapter("xoxb-test"), secret="", route=TargetRoute())
+        reply_application(
+            SlackReplyAdapter("xoxb-test"),
+            secret="",
+            route=ReplyDestination(),
+            kind="slack",
+            state_path=tmp_path / "replies.sqlite3",
+        )
 
 
-def test_gateway_http_routes_keep_each_slack_identity() -> None:
+def test_gateway_http_routes_keep_each_slack_identity(tmp_path: Path) -> None:
     async def run() -> None:
         tokens: list[str | None] = []
 
@@ -173,27 +196,33 @@ def test_gateway_http_routes_keep_each_slack_identity() -> None:
             application.add_subapp(
                 f"/{identity}",
                 reply_application(
-                    slack, secret=f"test-egress-{identity}", route=TargetRoute(adapter=identity)
+                    slack,
+                    secret=f"test-egress-{identity}",
+                    route=ReplyDestination(adapter=identity),
+                    kind="slack",
+                    state_path=tmp_path / "replies.sqlite3",
                 ),
             )
         server = TestServer(application)
-        transport: HttpReplyTransport[TargetRoute] | None = None
+        transport: HttpReplyTransport[ReplyDestination] | None = None
         try:
             await server.start_server()
             routes = [
-                TargetRoute(endpoint=str(server.make_url(f"/{identity}/reply")), adapter=identity)
+                ReplyDestination(
+                    endpoint=str(server.make_url(f"/{identity}/reply")), adapter=identity
+                )
                 for identity in ("alpha", "beta")
             ]
             transport = HttpReplyTransport(
                 {identity: f"test-egress-{identity}" for identity in ("alpha", "beta")},
                 {("slack", route): ReplyCapabilities(True, None) for route in routes},
+                allow_insecure_http=True,
             )
-            router = ReplySinkRouter(adapters={"slack": transport}, default=transport)
             event = ReplyUpdate(
                 version="1.0", event="reply.update", target=_BODIES[0]["target"], text="Reply"
             )
             for route in routes:
-                await router.emit(event, route=route)
+                await transport.emit(event, route=route)
             # Slack token headers: https://docs.slack.dev/authentication/tokens/
             assert tokens == ["Bearer xoxb-alpha", "Bearer xoxb-beta"]
         finally:
@@ -206,11 +235,15 @@ def test_gateway_http_routes_keep_each_slack_identity() -> None:
 
 
 @pytest.mark.parametrize("status", [410, 424])
-def test_gateway_preserves_explicit_provider_completion_refusals(status: int) -> None:
-    from curie_channel_gateway.reply_transport import (
+def test_gateway_preserves_explicit_provider_completion_refusals(
+    status: int, tmp_path: Path
+) -> None:
+    from curie_channel_gateway.reply_errors import (
         DeletedReplyTargetError,
-        HttpReplyAdapter,
         ProviderEgressRefusedError,
+    )
+    from curie_channel_gateway.reply_transport import (
+        HttpReplyAdapter,
     )
 
     async def run() -> None:
@@ -231,12 +264,14 @@ def test_gateway_preserves_explicit_provider_completion_refusals(status: int) ->
             reply_application(
                 inner,
                 secret="test-gateway",
-                route=TargetRoute(
+                route=ReplyDestination(
                     endpoint=str(provider_server.make_url("/reply")), adapter="provider"
                 ),
+                kind="email",
+                state_path=tmp_path / "replies.sqlite3",
             )
         )
-        outer: HttpReplyTransport[TargetRoute] | None = None
+        outer: HttpReplyTransport[ReplyDestination] | None = None
         try:
             await server.start_server()
             event = _EVENTS.validate_python(
@@ -246,10 +281,17 @@ def test_gateway_preserves_explicit_provider_completion_refusals(status: int) ->
                     if case["body"]["event"] == "turn.completed"
                 )
             )
-            route = TargetRoute(endpoint=str(server.make_url("/reply")), adapter="gateway")
+            event = _EVENTS.validate_python(
+                {
+                    **event.model_dump(mode="json"),
+                    "target": {**event.target.model_dump(mode="json"), "kind": "email"},
+                }
+            )
+            route = ReplyDestination(endpoint=str(server.make_url("/reply")), adapter="gateway")
             outer = HttpReplyTransport(
                 {"gateway": "test-gateway"},
                 {(event.target.kind, route): ReplyCapabilities(False, None)},
+                allow_insecure_http=True,
             )
             with pytest.raises(error):
                 await outer.emit(event, route=route, best_effort_unreachable=True)

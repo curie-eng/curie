@@ -38,19 +38,19 @@ from channel_protocol.reply import (
     ReplyUpdate,
     TurnCompleted,
 )
-from curie_channel_gateway.reply_transport import (
-    MAX_ACK_BODY_BYTES,
-    HttpReplyAdapter,
+from curie_channel_gateway.reply_errors import (
     InvalidReplyTargetError,
     MissingAdapterCredentialError,
     OversizedAdapterResponseError,
     ProviderEgressRefusedError,
     RedirectedAdapterEndpointError,
     RejectedAdapterResponseError,
-)
-from curie_channel_gateway.slack.slack_sink import (
     UnconfiguredSlackIdentityError,
     UntrustedSlackEndpointError,
+)
+from curie_channel_gateway.reply_transport import (
+    MAX_ACK_BODY_BYTES,
+    HttpReplyAdapter,
 )
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import (
@@ -1192,7 +1192,9 @@ def test_only_gone_completion_is_a_terminal_delivery_failure(
     terminal_response: bool,
     kind: str,
 ) -> None:
-    from curie_channel_gateway.reply_transport import DeletedReplyTargetError
+    from curie_channel_gateway.reply_errors import (
+        DeletedReplyTargetError,
+    )
 
     async def go() -> None:
         async def handler(request: web.Request) -> web.Response:

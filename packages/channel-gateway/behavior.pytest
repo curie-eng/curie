@@ -1,4 +1,6 @@
 packages/channel-gateway/tests
+apps/api/tests/test_gateway_group_reads.py
+apps/worker/tests/test_gateway_reply_capabilities.py
 packages/channel-protocol/tests/test_reply_corpus.py
 packages/channel-protocol/tests/test_reply_verbatim_wire.py
 apps/dispatcher/tests/test_gateway_ordering.py

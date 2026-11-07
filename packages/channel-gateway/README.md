@@ -51,6 +51,48 @@ field and preserve `None` as unavailable. The lane adapter fixes `kind` as a cla
 constant, never from the inbound request. `connect_url` is single-use and must
 never be cached or shared. The ports add no platform endpoint.
 
+## Authenticated HTTP replies
+
+`HttpReplyTransport` and `reply_application` compose the network boundary. The
+receiver requires a fixed provider `kind`, a server-owned `route`, and a durable
+`state_path`. `ReplyDestination` supplies gateway-owned route metadata without
+importing an application. Event JSON and reply wire versions remain unchanged.
+
+1. Transport endpoints target the configured `/reply` ingress and require HTTPS. `allow_insecure_http=True` is an explicit
+   development or test opt-out; other schemes remain refused. Each request also
+   signs its path, exact body digest, request key, best-effort flag, timestamp and
+   nonce. The receiver checks a 120-second freshness window and persists consumed
+   nonces. Replaying a signed attempt is refused, including after restart.
+2. The gateway fixes the provider route. Slack per-turn endpoint overrides,
+   including the CLI stub origin and its transport fallback, are refused over
+   HTTP. Existing direct Slack delivery retains those paths. Provider origins
+   configured when constructing the Slack adapter remain supported.
+3. The gateway bounds provider execution to 120 seconds. The client defaults to
+   180 seconds and refuses timeouts below 150 seconds. A request key identifies
+   exact event bytes and the best-effort flag at one destination; identical
+   attempts share an in-flight delivery and its persisted result. Distinct posts
+   with identical content must use distinct `delivery_id` values on wire 1.1.
+   A lost outcome, expired execution budget or unconfirmed claim after restart
+   fails with `IndeterminateReplyDeliveryError`; it never re-posts automatically.
+   An operator must reconcile that outcome before authorizing a new delivery.
+4. `best_effort_unreachable` travels in a signed request header and is passed to
+   the provider. An unreachable acknowledgement retains its marker across the
+   hop, so worker completion authority and delivery telemetry keep their meaning.
+   Responding refusals remain failures even when best effort was requested.
+5. `reply_errors.py` defines the closed status and fixed-detail vocabulary.
+   Permanent errors retain their exception class across the hop, without
+   forwarding provider diagnostics or credentials. The receiver defaults to an
+   explicit 64 MiB body limit, configurable by composition; larger events fail
+   permanently with `ReplyPayloadTooLargeError`. Answers above 1 MiB are supported.
+
+The SQLite ledger retains delivery claims and results, including failures, for
+as long as their request keys can be retried. It stores hashes, opaque result
+references and fixed diagnostics, not message bodies or bearer credentials.
+Only expired authentication nonces are pruned automatically. `HttpReplyAdapter`
+is the existing generic adapter HTTP client; it does not implement this signed
+gateway ingress protocol. Compose worker-to-gateway delivery with
+`HttpReplyTransport` and its explicit capability snapshot.
+
 ## Authority and storage
 
 The gateway authenticates Slack deliveries by verifying the Slack signature or
@@ -66,8 +108,9 @@ an API requirement through `fresh_members`; a provider read grants no authority.
 The worker retains resume enqueue, stream consumption, `_ThrottledReply`,
 completion/outbox and its neutral `ReplySink`. API admission state, Valkey
 dedupe/cache, the worker stream and mail's local SQLite delivery state keep
-their current owners. The gateway acquires no Postgres storage or coordination
-contract.
+their current owners. The gateway acquires no Postgres storage or worker coordination
+authority. The optional HTTP reply receiver owns a separate SQLite replay and
+delivery ledger; composition must preserve that file across restarts.
 
 Stock Slack still calls `/channels/admission`, claims dedupe, posts a
 placeholder, then enqueues. A refusal claims nothing and posts nothing. Mail
@@ -102,7 +145,7 @@ migrated in the same move.
 From the repository root, run:
 
 ```bash
-env -u CURIE_SLACK_TRUSTED_ORIGINS CI_REQUIRE_VALKEY_TESTS=1 uv run pytest -q @packages/channel-gateway/behavior.pytest
+env -u CURIE_SLACK_TRUSTED_ORIGINS CI_REQUIRE_VALKEY_TESTS=1 uv run pytest -q -n 0 @packages/channel-gateway/behavior.pytest
 ```
 
 Set `TEST_VALKEY_HOST`, `TEST_VALKEY_PORT` and `TEST_VALKEY_PW` for the isolated

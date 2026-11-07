@@ -53,8 +53,12 @@ from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
+from ..reply_errors import (
+    UnconfiguredSlackIdentityError,
+    UntrustedSlackEndpointError,
+)
 from ..reply_route import ReplyRoute
-from ..reply_transport import _redacted
+from ..reply_transport import redacted_endpoint
 from .approval_actions import parse_decision_time
 from .blocks import (
     approval_card,
@@ -199,21 +203,8 @@ def _thread_ts(conversation_id: str | None) -> str | None:
     return conversation_id
 
 
-class UntrustedSlackEndpointError(RuntimeError):
-    """A turn named a Slack endpoint outside the configured Slack origin.
-
-    Refused loudly and BEFORE any request: the route's bot token (ADR-0168
-    decision 5) authenticates every Slack call, so honoring an arbitrary
-    per-turn base URL hands that token to whoever named it (D4.4, finding 8).
-    """
 
 
-class UnconfiguredSlackIdentityError(RuntimeError):
-    """A Slack route names an identity this worker holds no bot token for.
-
-    Refused before any request (ADR-0168 decision 5): another identity's token
-    would post as the wrong bot.
-    """
 
 
 def _missing_token(identity: str) -> str:
@@ -332,7 +323,7 @@ async def _post_with_block_fallback(
 # aiohttp transport errors and asyncio timeouts, NOT SlackApiError: a SlackApiError
 # means the endpoint IS reachable and answered with an error (auth/channel), which
 # must keep its own text-only fallback and must NOT trigger a transport fallback.
-_UNREACHABLE_ERRORS: tuple[type[BaseException], ...] = (
+UNREACHABLE_REPLY_ERRORS: tuple[type[BaseException], ...] = (
     aiohttp.ClientError,
     asyncio.TimeoutError,
 )
@@ -531,9 +522,10 @@ class SlackReplyAdapter:
         """
         if endpoint and not self._is_trusted(endpoint):
             raise UntrustedSlackEndpointError(
-                f"refusing to send the Slack bot token to {_redacted(endpoint)}: its "
+                f"refusing to send the Slack bot token to {redacted_endpoint(endpoint)}: its "
                 f"origin is neither the configured Slack origin "
-                f"{_redacted(self._default_base_url or REAL_SLACK_BASE_URL)} nor a configured "
+                f"{redacted_endpoint(self._default_base_url or REAL_SLACK_BASE_URL)} "
+                "nor a configured "
                 "trusted dev origin (CURIE_SLACK_TRUSTED_ORIGINS)"
             )
         token = self._tokens.get(identity)
@@ -608,14 +600,14 @@ class SlackReplyAdapter:
         )
         try:
             return await _rate_limited_call(lambda: op(primary), operation)
-        except _UNREACHABLE_ERRORS as exc:
+        except UNREACHABLE_REPLY_ERRORS as exc:
             if has_distinct_default:
                 _record_reply_retry(operation, "transport-fallback")
                 logger.warning(
                     "%s: reply endpoint %s is unreachable (%s); falling back to the "
                     "default Slack transport",
                     describe,
-                    _redacted(endpoint),
+                    redacted_endpoint(endpoint),
                     exc,
                 )
                 return await _rate_limited_call(
@@ -642,7 +634,7 @@ class SlackReplyAdapter:
                     "transport; completing the resume turn best-effort without "
                     "delivering the reply",
                     describe,
-                    _redacted(endpoint),
+                    redacted_endpoint(endpoint),
                     exc,
                 )
                 return cast(_T, None)

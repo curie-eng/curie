@@ -19,9 +19,11 @@ from channel_protocol.reply import (
     ReplyTarget,
     ReplyUpdate,
 )
+from curie_channel_gateway.reply_errors import (
+    RejectedAdapterResponseError,
+)
 from curie_channel_gateway.reply_transport import (
     HttpReplyAdapter,
-    RejectedAdapterResponseError,
 )
 from curie_telemetry import operation_span, record_metric
 from curie_worker import reply_sink as reply_sink_module

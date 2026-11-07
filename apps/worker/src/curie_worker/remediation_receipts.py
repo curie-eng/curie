@@ -52,7 +52,9 @@ from typing import Final
 
 from channel_protocol import MESSAGE_VERSION, OutboundMessage
 from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyPost, ReplyTarget
-from curie_channel_gateway.reply_transport import InvalidReplyTargetError
+from curie_channel_gateway.reply_errors import (
+    InvalidReplyTargetError,
+)
 from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind
 from sqlalchemy import text

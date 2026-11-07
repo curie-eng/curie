@@ -44,8 +44,13 @@ from channel_protocol.reply import (
     SettledOutcome,
     TurnStatus,
 )
+from curie_channel_gateway.reply_errors import (
+    UntrustedSlackEndpointError,
+)
 from curie_channel_gateway.slack import slack_sink as slack_sink_module
-from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter, UntrustedSlackEndpointError
+from curie_channel_gateway.slack.slack_sink import (
+    SlackReplyAdapter,
+)
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import TargetRoute
 from slack_sdk.errors import SlackApiError
@@ -566,7 +571,7 @@ def test_slack_api_error_not_swallowed_even_with_best_effort() -> None:
     # A SlackApiError means the endpoint IS reachable but rejected the call; it is
     # NOT an unreachability, so best_effort_unreachable must NOT swallow it (that
     # would hide a real delivery rejection). Only transport-unreachable errors
-    # (_UNREACHABLE_ERRORS) are in scope for the best-effort resume swallow.
+    # (UNREACHABLE_REPLY_ERRORS) are in scope for the best-effort resume swallow.
     # Arranged on a PER-TURN target with a configured default, restoring the
     # dimension this case carried before the seam swap: a rejection on a second
     # target must be neither swallowed by the best-effort flag NOR re-sent to the

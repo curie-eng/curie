@@ -21,7 +21,9 @@ from channel_protocol.reply import (
     ReplyUpdate,
     SettledOutcome,
 )
-from curie_channel_gateway.reply_transport import InvalidReplyTargetError
+from curie_channel_gateway.reply_errors import (
+    InvalidReplyTargetError,
+)
 
 from .approval_cards import ApprovalCardRef, ApprovalCardStore
 from .approvals import decided_field

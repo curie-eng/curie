@@ -31,19 +31,21 @@ from uuid import UUID
 import aiohttp
 from channel_protocol.reply import ReplyAck, ReplyEvent
 from curie_channel_gateway.ports.reply import ReplyEventTransport
-from curie_channel_gateway.reply_transport import (
-    _REPLY_OBSERVATION_DEPTH,
-    _UNREACHABLE_ERRORS,
-    ADAPTER_SECRET_HEADER,
-    HttpReplyAdapter,
+from curie_channel_gateway.reply_errors import (
     InvalidReplyTargetError,
     MissingAdapterCredentialError,
     RedirectedAdapterEndpointError,
     RejectedAdapterResponseError,
-    _BestEffortUnreachableAck,
-    _observe_reply,
-    _read_capped,
-    _ref_from,
+)
+from curie_channel_gateway.reply_transport import (
+    ADAPTER_SECRET_HEADER,
+    REPLY_OBSERVATION_DEPTH,
+    UNREACHABLE_REPLY_ERRORS,
+    BestEffortUnreachableAck,
+    HttpReplyAdapter,
+    observe_reply,
+    read_capped_ack,
+    reply_ref_from,
 )
 from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 from pydantic import BaseModel, ConfigDict
@@ -99,13 +101,13 @@ class ObservedReplySink:
         route: TargetRoute,
         best_effort_unreachable: bool = False,
     ) -> ReplyAck:
-        if _REPLY_OBSERVATION_DEPTH.get():
+        if REPLY_OBSERVATION_DEPTH.get():
             return await self._sink.emit(
                 event,
                 route=route,
                 best_effort_unreachable=best_effort_unreachable,
             )
-        return await _observe_reply(
+        return await observe_reply(
             event,
             best_effort_unreachable=best_effort_unreachable,
             call=lambda: self._sink.emit(
@@ -230,8 +232,8 @@ class _ClusterMessageReplyAdapter:
         best_effort_unreachable: bool = False,
     ) -> ReplyAck:
         del route  # Selection only: a turn cannot supply this adapter's destination.
-        if not _REPLY_OBSERVATION_DEPTH.get():
-            return await _observe_reply(
+        if not REPLY_OBSERVATION_DEPTH.get():
+            return await observe_reply(
                 event,
                 best_effort_unreachable=best_effort_unreachable,
                 call=lambda: self._emit(
@@ -274,8 +276,8 @@ class _ClusterMessageReplyAdapter:
                         f"cluster message relay answered {response.status}; "
                         "the delivery failed"
                     )
-                payload = await _read_capped(response, endpoint)
-        except _UNREACHABLE_ERRORS as exc:
+                payload = await read_capped_ack(response, endpoint)
+        except UNREACHABLE_REPLY_ERRORS as exc:
             if best_effort_unreachable:
                 logger.warning(
                     "%s: cluster message relay is unreachable (%s); completing the turn "
@@ -283,9 +285,9 @@ class _ClusterMessageReplyAdapter:
                     event.event,
                     exc,
                 )
-                return _BestEffortUnreachableAck(ref=None)
+                return BestEffortUnreachableAck(ref=None)
             raise
-        ack_ref = _ref_from(payload)
+        ack_ref = reply_ref_from(payload)
         if ack_ref != reply_ref:
             raise RejectedAdapterResponseError(
                 "cluster message relay acknowledgement did not match the requested reply ref"

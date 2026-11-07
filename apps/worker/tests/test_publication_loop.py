@@ -26,7 +26,9 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from channel_protocol import scoped_conversation_id
 from channel_protocol.reply import ReplyAck, ReplyTarget
-from curie_channel_gateway.slack.slack_sink import UnconfiguredSlackIdentityError
+from curie_channel_gateway.reply_errors import (
+    UnconfiguredSlackIdentityError,
+)
 from curie_test_support.postgres import pg_connect_or_skip
 from curie_worker.approval_cards import ApprovalCardRef
 from curie_worker.config import WorkerConfig

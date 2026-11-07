@@ -15,7 +15,7 @@ from channel_protocol.reply import (
     TurnCompleted,
     TurnStatus,
 )
-from curie_channel_gateway.reply_transport import (
+from curie_channel_gateway.reply_errors import (
     DeletedReplyTargetError,
     ProviderEgressRefusedError,
 )

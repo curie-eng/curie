@@ -25,7 +25,12 @@ from channel_protocol.reply import (
     TurnCompleted,
     TurnStatus,
 )
-from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter, UnconfiguredSlackIdentityError
+from curie_channel_gateway.reply_errors import (
+    UnconfiguredSlackIdentityError,
+)
+from curie_channel_gateway.slack.slack_sink import (
+    SlackReplyAdapter,
+)
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import (
     CLUSTER_MESSAGE_ADAPTER,
