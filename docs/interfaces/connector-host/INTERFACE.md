@@ -445,35 +445,36 @@ Deployment shape for capability probes to become eligible.
 This section freezes the wire contract for
 [ADR 0271](../../adr/0271-per-request-approver-sets-and-separation-of-duties.md).
 The pure signer and verifier are available; approval creation, policy, nonce
-storage and proxy header wiring are separate implementation slices. The
-contracts below do not claim that those paths already enforce this policy.
+storage and proxy header wiring are separate implementation slices. These
+contracts do not claim that those paths already enforce this policy.
 
-The connector signer is `sign_ticket` in
+The connector helper is
 `packages/curie-internal/src/curie_internal/approver_ticket.py`.
-It accepts a payload dictionary and a PyNaCl Ed25519 `SigningKey`.
-The API preparation entry point is `verify_ticket` in
-`apps/api/src/curie_api/approver_tickets.py`; it takes the registered public key
-and key id, complete execution arguments and an injected integer Unix clock.
-It reads the ticket only from `arguments["approval_ticket"]`; no separate token
-can select a different approver set. A missing or non-string member refuses.
-These helpers perform no database, route, current identity, registration,
+`sign_ticket(payload, signing_key=...)` takes a closed payload and an Ed25519
+signing key. `execution_arguments_sha256(arguments)` hashes execution data.
+The API entry point `verify_ticket` in
+`apps/api/src/curie_api/approver_tickets.py` takes the registered public key,
+key id, complete execution arguments and an injected integer Unix clock.
+It reads only `arguments["approval_ticket"]`; a separate token cannot select
+another approver set. A missing or non-string carried member refuses.
+
+These helpers perform no database, route, current identity, key registration,
 requester-association, ceiling or nonce-spend checks. Creation owners must add
-those checks atomically as required by ADR 0271, including comparison of the
-signed tenant, agent, connector, exact tool and route against the creation context.
-A parsed ticket is not an
-execution authorization.
+those checks atomically, including comparison of the signed tenant, agent,
+connector, exact tool and route with the verified creation context. A parsed
+ticket is not execution authorization. JSONB numeric round-trip refusal belongs
+to the creation slice, not this pure contract.
 
 ### Ticket bytes and payload
 
 Carry the opaque ticket in `granted_arguments.approval_ticket` as
-`cat1.<payload>.<signature>`. The payload is compact JSON with recursively sorted
-keys, comma and colon separators, ASCII escaping and no whitespace. Encode its
-ASCII bytes using unpadded base64url. Ed25519 signs exactly the ASCII bytes
-`cat1.<payload>`. Encode the 64-byte signature using unpadded base64url too.
-Reject padding, alternate base64 spellings, non-ASCII token text, incorrect
-segment counts, duplicate or unknown keys at any depth, non-finite numbers,
-wrong types and noncanonical JSON spellings. The entire ticket is at most
-16,384 ASCII characters.
+`cat1.<payload>.<signature>`. Encode the canonical ASCII JSON payload bytes in
+unpadded base64url. Ed25519 signs exactly the ASCII bytes `cat1.<payload>`.
+Encode its 64-byte signature in unpadded base64url. Reject padding, alternate
+base64 spellings including nonzero trailing pad bits, non-ASCII ticket text,
+incorrect segment counts, duplicate or unknown keys at every object depth,
+non-finite numbers, wrong types and noncanonical JSON spellings. The entire
+ticket is at most 16,384 ASCII characters.
 
 The top-level object has exactly these required members:
 
@@ -483,66 +484,201 @@ The top-level object has exactly these required members:
 | `purpose` | String `approval_request`. |
 | `tenant_id` | Canonical lowercase hyphenated tenant UUID. |
 | `agent_id` | Canonical lowercase hyphenated agent UUID. |
-| `connector` | Exact registered connector name. |
-| `tool` | Exact upstream execution tool name. |
-| `route` | Exact named approval route. |
-| `key_id` | Exact registered selector key id. |
+| `connector` | Exact registered connector name, 1 through 256 UTF-8 bytes. |
+| `tool` | Exact upstream execution tool name, 1 through 256 UTF-8 bytes. |
+| `route` | Exact named approval route, 1 through 256 UTF-8 bytes. |
+| `key_id` | Exact registered selector key id, 1 through 256 UTF-8 bytes. |
 | `requester` | Original requester's canonical principal object. |
 | `nonce` | Unpadded base64url of 32 cryptographically random bytes, single use within the registered selector scope. |
 | `issued_at` | Integer Unix seconds in `[0, 9223372036854775807]`. |
 | `expires_at` | Integer Unix seconds, strictly after issue and at most 300 seconds later. |
-| `arguments_sha256` | 64 lowercase hexadecimal SHA-256 characters over execution arguments as described below. |
+| `arguments_sha256` | 64 lowercase SHA-256 hexadecimal characters over execution arguments as described below. |
 | `approvers` | Array of 1 through 16 distinct selected canonical principals. |
 
 Each principal has exactly `tenant_id`, `issuer` and `subject`; its tenant
-must equal the payload tenant. Issuer and subject are exact canonical strings,
-without case folding or Unicode normalization. Every string field is 1 through
-256 UTF-8 bytes, has no leading or trailing whitespace, C0/C1 controls or lone
-surrogates. UUIDs must equal their standard lowercase hyphenated spelling.
-Selection uniqueness compares `(tenant_id, issuer, subject)` regardless of
+must equal the payload tenant. The canonical identity types come directly from
+`packages/curie-internal/src/curie_internal/identity_context.py`:
+`CanonicalUUID`, `Issuer` and `Identifier`. A UUID is its exact lowercase
+hyphenated 36-character spelling. Issuer is 1 through 2,048 Unicode code points;
+subject is 1 through 256 Unicode code points. Count a non-BMP character once,
+not as two UTF-16 code units or its UTF-8 byte count. Values must encode as
+UTF-8, so lone surrogates refuse. Overall ticket and grant limits still apply
+when individual fields fit their own bounds.
+
+Compare issuer and subject exactly, without case folding, trimming or Unicode
+normalization. Selection uniqueness uses `(tenant_id, issuer, subject)`, ignoring
 recipient metadata. Array order is signed and preserved; membership is a set.
 
-Only an approver may additionally have `recipient_accounts`, an array of 1
-through 16 objects, each with exactly `provider`, `installation_id`, `namespace`
-and `account_id`. All four are required exact bounded strings. Omit the optional
-member when absent; null refuses. These are candidate delivery accounts, not
-proof that an account belongs to the selected person. Delivery must verify that
-association through the identity owner before use.
+### Candidate recipient accounts use the identity owner's scope
 
-The execution digest removes only the top-level `approval_ticket` member.
-Nested members with that name remain execution data. Serialize the remaining
-object using the production canonical-arguments contract: recursively sorted
-keys, comma and colon separators, `ensure_ascii=False`, finite JSON values and
-UTF-8 bytes, then SHA-256. Preserve numeric spelling from the production JSON
-serializer, including the distinction between `1` and `1.0`, negative floating
-zero and its exponent spelling. Do not normalize Unicode. The shared
-`tests/vectors/action-canonical-arguments.json` corpus freezes those bytes;
-`tests/vectors/approver-ticket.json` freezes ticket payloads, signatures,
-refusals and size cases. The complete grant argument object still contains the
-ticket; only the preparation digest excludes it.
+Only an approver may additionally have `recipient_accounts`, an array of 1
+through 16 closed objects. Omit the optional member when absent; null refuses.
+Each account has exactly these members, using the same vocabulary and limits as
+`InvocationScopeV1` and `ContextNamespaceV1` in the identity context owner:
+
+| Member | Meaning and limit |
+| --- | --- |
+| `provider` | The identity sender/namespace provider identifier, as in `InvocationScopeV1.provider`, such as `slack` or `email`; 1 through 256 Unicode code points. It is not the canonical person's IdP issuer. |
+| `installation_id` | The canonical UUID in `InvocationScopeV1.provider_installation_id`, naming the platform `ProviderInstallation.id` row, not a provider's external account id or application label. |
+| `namespace` | The closed object `{id, authority, kind, key}` described below, not a string workspace label. |
+| `account_id` | The provider-native person/account id, as in `InvocationScopeV1.native_id` and `IdentityLink.provider_native_id`; 1 through 256 Unicode code points. |
+
+The namespace object has exactly `id` (canonical UUID of the tenant's
+`IdentityNamespace` row), `authority` (0 through 2,048 Unicode code points),
+`kind` and `key` (each 1 through 256 Unicode code points). Authority is the
+receiving installation's endpoint authority; empty is valid for a global
+provider. Kind is the identity owner's exact namespace kind, such as
+`slack_workspace`, `slack_enterprise` or `email_domain`; key is that namespace's
+exact native key, such as a workspace id or canonical email domain. These are
+opaque identity values, not strings to reinterpret or normalize.
+
+Before delivery, the identity owner must verify the entire candidate scope:
+tenant, provider, installation UUID, namespace UUID and its authority/kind/key,
+and native account id. It must establish the active account-to-person link to
+the selected canonical tenant/issuer/subject and check current installation and
+namespace lifecycle. An unknown, inconsistent, inactive, revoked or unavailable
+association refuses. Candidate metadata itself proves none of those facts.
+Provider-specific account canonicalization belongs to the identity owner.
+
+### Canonical JSON and string hygiene for other implementations
+
+The ticket JSON encoding is Python's current production JSON spelling, frozen
+by the shared vectors. Its rules are:
+
+1. Object keys at every depth sort lexicographically by Unicode code point
+   sequence, not UTF-16 code unit order, locale or normalized text. Arrays retain
+   input order. Use one comma between members and one colon between key and
+   value, with no whitespace outside strings. JSON literals are lowercase.
+2. Quote strings with double quotes. Escape double quote and reverse solidus
+   with a reverse-solidus prefix. Use the conventional one-letter escapes
+   `b`, `t`, `n`, `f`, `r` for backspace, tab, line feed, form feed and carriage
+   return. Other C0 values use lowercase `\u00xx` escapes.
+3. Ticket payloads are ASCII: every code point from U+007F upward uses lowercase
+   hexadecimal `\uXXXX` spelling. Non-BMP scalar values use a lowercase UTF-16
+   surrogate pair, high surrogate first; U+1D11E is `\ud834\udd1e`. Reject lone
+   surrogates and alternate spellings, including uppercase hexadecimal digits.
+4. Do not escape solidus `/`, less-than `<`, greater-than `>`, ampersand `&` or
+   single quote. Do not use optional escapes for ordinary ASCII characters.
+   Thus an escaped solidus or HTML-style Unicode escape refuses even if it
+   would decode to the same string. Re-encoding must reproduce every payload
+   byte exactly. Raw UTF-8 non-ASCII and a raw BOM before the JSON object refuse.
+
+All ticket text obeys this deliberate hygiene rule, in addition to its length
+and grammar: refuse U+0000 through U+001F and U+007F through U+009F anywhere,
+including DEL U+007F. Also refuse leading or trailing code points from exactly
+this whitespace set: U+0009 through U+000D, U+001C through U+0020, U+0085,
+U+00A0, U+1680, U+2000 through U+200A, U+2028, U+2029, U+202F, U+205F and
+U+3000. The overlap with C0/C1 is intentional. Empty namespace authority is
+permitted. Internal whitespace outside C0/C1 is preserved.
+
+BOM U+FEFF and zero-width space U+200B are deliberately accepted in opaque
+identity text, including principal strings, and preserved even at either end;
+they are not whitespace in this rule. U+2028 and U+2029 are accepted internally
+but refused at either end. Ticket encoding escapes all of these; do not strip
+or normalize them when comparing identity facts. Shared positive and negative
+vectors cover these choices.
+
+### Execution argument digest and numeric spelling
+
+Remove only the top-level `approval_ticket` member. Nested members with that
+name remain execution data. Serialize the remaining object using production
+canonical arguments, then SHA-256 its UTF-8 bytes. Object sorting, separators,
+quote/reverse-solidus escaping and C0 escaping are as above. Unlike the ticket
+payload, argument JSON leaves DEL U+007F and all valid non-ASCII scalars as
+literal UTF-8, including BOM, zero-width space, U+2028/U+2029 and non-BMP values.
+Do not ASCII-escape, HTML-escape or normalize them. Ticket text hygiene does not
+restrict execution argument string contents.
+
+Integers use decimal with no plus sign or redundant leading zeroes. Floating
+values use finite IEEE 754 binary64, preserving their numeric type and negative
+zero. Use the shortest decimal significand that round-trips to the same
+binary64 value under round-to-nearest/even; choose the nearest such decimal,
+with an even final digit for a tie. For decimal exponent below -4 or at least
+16, use one digit before the decimal point and lowercase `e`; retain a negative
+exponent sign or an explicit positive `+`, with at least two exponent digits.
+Otherwise use fixed-point notation. Fixed-point integral floats retain `.0`;
+an integral scientific mantissa omits it. Examples are `1` versus `1.0`, `-0.0`,
+`0.0001`, `1e-05`, `1000000000000000.0`, `1e+16`, `1e-07` and
+`0.30000000000000004`. Reject non-finite numbers rather than emitting NaN or
+Infinity. Do not substitute another language's default JSON float formatter.
+
+The existing `tests/vectors/action-canonical-arguments.json` corpus freezes
+these bytes, including key sorting across the BMP boundary and float thresholds.
+Both new readers exercise it. `tests/vectors/approver-ticket.json` freezes
+payloads, signatures, character boundaries, namespace scope, refusal codes and
+size cases. The complete grant argument object still includes the ticket;
+only the preparation digest excludes it.
+
+### Key selection and preparation expiry
+
+`unverified_key_id(ticket)` reads a bounded, canonical, closed payload and
+returns its `key_id` without checking the signature or registration. This value
+is untrusted lookup input only. A well-shaped forged ticket can return any
+well-shaped key id. Select the current registered key within the expected
+selector/tenant/agent scope, then verify the original ticket with that key and
+compare its key id. Never use the peek result as proof of identity, selection,
+registration, freshness or execution authority. Unknown registrations refuse.
+The ordinary `parse_ticket` path verifies the Ed25519 signature before parsing
+claims; only the explicitly untrusted key-selection helper parses first.
 
 Preparation verification accepts exactly `issued_at <= now < expires_at` with
-no clock-skew allowance. The preparation expiry is distinct from approval
-expiry. After accepted approval creation, connectors may use `parse_ticket` from the
-shared helper for signature and shape without preparation freshness. They must
-verify the ticket's
-signature, scope, requester and argument digest without reapplying preparation
-expiry to delayed execution. Creation dedupe and single-use nonce enforcement
-belong to the database transaction, not these pure helpers.
+an integer clock and no clock-skew allowance. Preparation expiry is distinct
+from approval expiry. After accepted creation, connectors may use `parse_ticket`
+for signature and shape without freshness, then check scope, requester, argument
+digest and current local policy without reapplying preparation expiry. Creation
+dedupe and single-use nonce enforcement belong to the database transaction.
 
-### Executable size budget
+### Frozen refusal codes
 
-Before creating an approval, call `check_execution_size` from the shared helper
-with the complete persisted arguments, including the final ticket, and the
-exact agent name, connector and upstream tool the worker will use. It rejects
-canonical arguments over 16,384 UTF-8 bytes and any eventual `ccg` over 4,096
-ASCII characters. It calculates the existing grant payload, including JSON
-escaping of the complete canonical argument string, base64url expansion, prefix,
-separators and 86 signature characters. Its returned length reserves the largest
-signed 64-bit expiry and a 36-character canonical UUID `jti`, so it is an upper
-bound for the worker's actual token. A maximum-sized selected set may parse
-correctly yet exceed this execution budget; refuse before creating an approval.
-No grant or argument limit is widened by this contract.
+Every `TicketError` exposes its stable `code`; no supplied ticket content is
+included in the error. Evaluate framing/signature/shape before key-id comparison,
+then preparation time, then argument digest. The API validates argument data and
+the carried member before calling that verification path.
+
+| Code | Condition |
+| --- | --- |
+| `invalid_ticket` | Bad framing/encoding, parser or canonical-byte failure, bad signature, closed shape/type/bound violation, or missing/non-string carried ticket. Parsing an oversized ticket also uses this code. |
+| `invalid_arguments` | Execution arguments are not a JSON object or cannot be canonically encoded as finite UTF-8 JSON. |
+| `key_mismatch` | The signed key id differs from the expected registered key id supplied to the pure verifier. |
+| `preparation_expired` | The injected clock is not an integer, precedes issue, or is at or after preparation expiry. |
+| `arguments_mismatch` | The signed digest differs from the actual execution-argument digest. |
+| `ticket_too_large` | The signer would emit a ticket over 16,384 ASCII characters. |
+| `arguments_too_large` | The complete canonical execution arguments exceed 16,384 UTF-8 bytes. |
+| `grant_too_large` | The conservative complete `ccg` encoding exceeds 4,096 ASCII characters. |
+
+Each negative ticket vector carries its expected `code`, asserted by both
+readers. Validly signed malformed-payload cases also check their signature
+precondition independently, so a signature error cannot hide the intended
+parser refusal. Size and untrusted-key vectors assert their own named codes.
+
+### Executable size budget and realistic approver ceiling
+
+Before creating an approval, call `check_execution_size` with the complete
+persisted arguments, final ticket included, and the exact worker agent name,
+connector and upstream tool. It rejects canonical arguments over 16,384 UTF-8
+bytes or an eventual `ccg` over 4,096 ASCII characters. The calculation includes
+JSON escaping of the complete canonical argument string, base64url expansion,
+prefix, separators and 86 signature characters. It reserves the largest signed
+64-bit expiry and a 36-character canonical UUID `jti`, so the returned length is
+an upper bound on the actual grant. Nothing widens either existing limit.
+
+Sixteen is a shape ceiling, not a promise that sixteen approvers can execute.
+The shared capacity vectors use the same compact execution arguments, agent
+`acme-bot`, connector `access` and tool `execute`, with these observed budgets:
+
+| Principal shape | Largest fitting set and reserved grant length | First refusal |
+| --- | --- | --- |
+| Short synthetic issuer (22 characters), short subjects | 12 approvers, 3,943 characters | 13 approvers, 4,141 characters |
+| Okta-shaped issuer (39 characters), 20-character subjects | 10 approvers, 4,090 characters | 11 approvers, 4,335 characters |
+| Entra-shaped issuer (76 characters), UUID subjects | 7 approvers, 4,094 characters | 8 approvers, 4,431 characters |
+| Short principals, each with one full recipient account | 3 approvers, 3,481 characters | 4 approvers, 4,110 characters |
+
+These are examples, not provider limits: Entra-shaped sets are practically about
+six to seven in this compact example; seven leaves only two reserved characters.
+Larger arguments, longer scope strings, different key ids or recipient accounts
+reduce the ceiling further. Non-ASCII identity text also expands under ASCII
+escaping. The creation refusal is `grant_too_large`, before any pending approval
+is committed. Always compute the actual budget rather than relying on a count.
 
 ### Verified spent-grant header
 

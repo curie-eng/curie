@@ -200,7 +200,8 @@ as a whole; remembered only):
 30. Connector selector signer vs API approval preparation verifier (ADR 0271):
   `packages/curie-internal/src/curie_internal/approver_ticket.py` and
   `apps/api/src/curie_api/approver_tickets.py` consume the same signed payloads,
-  strict refusal cases and execution size cases. The API uses its production
+  strict refusal codes, identity-owner character bounds, recipient namespace
+  objects, untrusted key selection and execution size cases. The API uses its production
   argument canonicalizer; the signer checks the shared canonical argument corpus.
   No approval creation or proxy wiring is implied by this pure contract.
   [vector: `tests/vectors/approver-ticket.json`]

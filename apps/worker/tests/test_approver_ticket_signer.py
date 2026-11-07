@@ -19,7 +19,7 @@ from curie_internal.approver_ticket import (
     verify_preparation,
 )
 from curie_worker.connector_grant import mint
-from nacl.signing import SigningKey
+from nacl.signing import SigningKey, VerifyKey
 
 ROOT = Path(__file__).resolve().parents[3]
 CORPUS = json.loads((ROOT / "tests/vectors/approver-ticket.json").read_text())
@@ -44,7 +44,13 @@ def test_signer_produces_frozen_bytes(case: dict[str, Any]) -> None:
 
 @pytest.mark.parametrize("case", CORPUS["negative"], ids=lambda c: c["name"])
 def test_helper_rejects_frozen_negative(case: dict[str, Any]) -> None:
-    with pytest.raises(TicketError):
+    if case["signature_valid"]:
+        prefix, payload, signature = case["ticket"].split(".")
+        KEY.verify_key.verify(
+            (prefix + "." + payload).encode("ascii"),
+            base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4)),
+        )
+    with pytest.raises(TicketError) as refused:
         verify_preparation(
             case["arguments"].get("approval_ticket"),
             public_key=KEY.verify_key,
@@ -52,6 +58,11 @@ def test_helper_rejects_frozen_negative(case: dict[str, Any]) -> None:
             now=case["now"],
             arguments_sha256=execution_arguments_sha256(case["arguments"]),
         )
+    assert refused.value.code == case["code"]
+    if "payload" in case and case["code"] == "invalid_ticket":
+        with pytest.raises(TicketError) as refused:
+            sign_ticket(case["payload"], signing_key=KEY)
+        assert refused.value.code == case["code"]
 
 
 @pytest.mark.parametrize("case", CANONICAL["vectors"], ids=lambda c: c["name"])
@@ -85,8 +96,9 @@ def test_size_check_matches_real_grant_consumer(case: dict[str, Any]) -> None:
         assert check_execution_size(arguments, **kwargs) == len(token)
         assert caller.verify([KEY.verify_key], token) is not None
     else:
-        with pytest.raises(TicketError, match=case["error"]):
+        with pytest.raises(TicketError) as refused:
             check_execution_size(arguments, **kwargs)
+        assert refused.value.code == case["code"]
         assert caller.verify([KEY.verify_key], token) is None
 
 
@@ -111,3 +123,51 @@ def test_helper_rejects_invalid_execution_arguments(arguments: Any) -> None:
         execution_arguments_sha256(arguments)
     with pytest.raises(TicketError, match="invalid_arguments"):
         check_execution_size(arguments, agent="acme-bot", connector="access", tool="execute")
+
+
+@pytest.mark.parametrize("case", CORPUS["untrusted_key_id"], ids=lambda c: c["name"])
+def test_unverified_key_id_is_not_authentication(case: dict[str, Any]) -> None:
+    from curie_internal.approver_ticket import unverified_key_id
+
+    selected_key = VerifyKey(base64.b64decode(case["public_key"]))
+    if "code" in case:
+        with pytest.raises(TicketError) as refused:
+            unverified_key_id(case["ticket"])
+        assert refused.value.code == case["code"]
+    else:
+        assert unverified_key_id(case["ticket"]) == case["key_id"]
+        if "verification_code" in case:
+            with pytest.raises(TicketError) as refused:
+                parse_ticket(case["ticket"], public_key=selected_key)
+            assert refused.value.code == case["verification_code"]
+
+        else:
+            assert parse_ticket(case["ticket"], public_key=selected_key).key_id == case["key_id"]
+            if "payload" in case:
+                rotated = SigningKey(
+                    hashlib.sha256(CORPUS["rotation_fixture_seed_label"].encode()).digest()
+                )
+                assert sign_ticket(case["payload"], signing_key=rotated) == case["ticket"]
+
+
+@pytest.mark.parametrize("case", CORPUS["capacity_cases"], ids=lambda c: c["name"])
+def test_realistic_approver_budget_matches_proxy(case: dict[str, Any]) -> None:
+    assert sign_ticket(case["payload"], signing_key=KEY) == case["ticket"]
+    grant = mint(
+        base64.b64encode(bytes(KEY)).decode(),
+        **case["scope"],
+        args=json.dumps(
+            case["arguments"], sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ),
+        exp=9223372036854775807,
+        jti="00000000-0000-0000-0000-000000000000",
+    )
+    assert len(grant) == case["grant_chars"]
+    if case["accepted"]:
+        assert check_execution_size(case["arguments"], **case["scope"]) == len(grant)
+        assert caller.verify([KEY.verify_key], grant) is not None
+    else:
+        with pytest.raises(TicketError) as refused:
+            check_execution_size(case["arguments"], **case["scope"])
+        assert refused.value.code == case["code"]
+        assert caller.verify([KEY.verify_key], grant) is None

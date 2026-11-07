@@ -8,11 +8,12 @@ import hashlib
 import json
 import re
 from typing import Annotated, Any, Literal
-from uuid import UUID
 
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from .identity_context import CanonicalUUID, ContextNamespaceV1, Identifier, Issuer
 
 MAX_TICKET_CHARS = 16_384
 MAX_ARGUMENT_BYTES = 16_384
@@ -48,40 +49,49 @@ def _decode(text: str) -> bytes:
     return raw
 
 
+def _clean_text(value: str) -> str:
+    value.encode("utf-8")
+    if value != value.strip() or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value):
+        raise ValueError("invalid ticket string")
+    return value
+
+
+def _short_text(value: str) -> str:
+    if not 1 <= len(value.encode("utf-8")) <= 256:
+        raise ValueError("invalid ticket string length")
+    return value
+
+
+ShortText = Annotated[str, AfterValidator(_short_text)]
+
+
 class _Closed(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
     @field_validator("*")
     @classmethod
-    def _bounded_text(cls, value: Any) -> Any:
-        if isinstance(value, str):
-            if (
-                not 1 <= len(value.encode("utf-8")) <= 256
-                or value != value.strip()
-                or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value)
-            ):
-                raise ValueError("invalid ticket string")
-        return value
+    def _text(cls, value: Any) -> Any:
+        return _clean_text(value) if isinstance(value, str) else value
 
 
 class CanonicalPrincipal(_Closed):
-    tenant_id: str
-    issuer: str
-    subject: str
+    tenant_id: CanonicalUUID
+    issuer: Issuer
+    subject: Identifier
 
-    @field_validator("tenant_id")
+
+class RecipientNamespace(ContextNamespaceV1):
+    @field_validator("authority", "kind", "key")
     @classmethod
-    def _uuid(cls, value: str) -> str:
-        if str(UUID(value)) != value:
-            raise ValueError("noncanonical tenant UUID")
-        return value
+    def _text(cls, value: str) -> str:
+        return _clean_text(value)
 
 
 class RecipientAccount(_Closed):
-    provider: str
-    installation_id: str
-    namespace: str
-    account_id: str
+    provider: Identifier
+    installation_id: CanonicalUUID
+    namespace: RecipientNamespace
+    account_id: Identifier
 
 
 class SelectedApprover(CanonicalPrincipal):
@@ -100,12 +110,12 @@ class SelectedApprover(CanonicalPrincipal):
 class ApprovalTicket(_Closed):
     version: Literal[1]
     purpose: Literal["approval_request"]
-    tenant_id: str
-    agent_id: str
-    connector: str
-    tool: str
-    route: str
-    key_id: str
+    tenant_id: CanonicalUUID
+    agent_id: CanonicalUUID
+    connector: ShortText
+    tool: ShortText
+    route: ShortText
+    key_id: ShortText
     requester: CanonicalPrincipal
     nonce: str
     issued_at: Timestamp
@@ -118,13 +128,6 @@ class ApprovalTicket(_Closed):
     def _version(cls, value: object) -> object:
         if type(value) is not int:
             raise ValueError("version must be an integer")
-        return value
-
-    @field_validator("tenant_id", "agent_id")
-    @classmethod
-    def _uuid(cls, value: str) -> str:
-        if str(UUID(value)) != value:
-            raise ValueError("noncanonical UUID")
         return value
 
     @field_validator("nonce")
@@ -199,8 +202,7 @@ def _constant(value: str) -> Any:
     raise TicketError("invalid_ticket")
 
 
-def parse_ticket(token: str, *, public_key: VerifyKey) -> ApprovalTicket:
-    """Verify signature and closed wire shape, without preparation freshness."""
+def _ticket_envelope(token: str) -> tuple[bytes, bytes, bytes]:
     try:
         if type(token) is not str or len(token) > MAX_TICKET_CHARS or not token.isascii():
             raise ValueError
@@ -210,16 +212,42 @@ def parse_ticket(token: str, *, public_key: VerifyKey) -> ApprovalTicket:
         body, sig = _decode(payload), _decode(signature)
         if len(sig) != 64:
             raise ValueError
-        public_key.verify(("cat1." + payload).encode("ascii"), sig)
+        return ("cat1." + payload).encode("ascii"), body, sig
+    except (ValueError, TypeError):
+        raise TicketError("invalid_ticket") from None
+
+
+def _ticket_claims(body: bytes) -> ApprovalTicket:
+    try:
         parsed = json.loads(
             body.decode("ascii"), object_pairs_hook=_pairs, parse_constant=_constant
         )
         claims = ApprovalTicket.model_validate(parsed)
         if _json(claims.model_dump(exclude_none=True)).encode("ascii") != body:
             raise ValueError
-    except (ValueError, TypeError, RecursionError, BadSignatureError):
+        return claims
+    except (ValueError, TypeError, RecursionError):
         raise TicketError("invalid_ticket") from None
-    return claims
+
+
+def unverified_key_id(token: str) -> str:
+    """Read an UNTRUSTED key selector; never proves registration or signature.
+
+    Bounded framing, closed shape and canonical JSON are checked. Always verify
+    the original ticket with the registered key selected by this untrusted id.
+    """
+    _, body, _ = _ticket_envelope(token)
+    return _ticket_claims(body).key_id
+
+
+def parse_ticket(token: str, *, public_key: VerifyKey) -> ApprovalTicket:
+    """Verify signature and closed wire shape, without preparation freshness."""
+    message, body, signature = _ticket_envelope(token)
+    try:
+        public_key.verify(message, signature)
+    except (ValueError, TypeError, BadSignatureError):
+        raise TicketError("invalid_ticket") from None
+    return _ticket_claims(body)
 
 
 def verify_preparation(
