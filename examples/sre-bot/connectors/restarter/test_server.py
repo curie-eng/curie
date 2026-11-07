@@ -18,8 +18,10 @@ namespace, with the behavior the connector relies on:
 
 * ``GET .../deployments/<name>`` answers the Deployment;
 * ``PATCH`` with ``application/merge-patch+json`` merges the body; a
-  ``metadata.uid`` or ``metadata.resourceVersion`` in the body that is not the
-  live one answers ``409`` (the API server's patch preconditions);
+  ``metadata.resourceVersion`` in the body that is not the live one answers
+  ``409``, and a ``metadata.uid`` that is not the live one answers ``422``
+  (``uid`` is immutable), both writing nothing (observed from a v1.37 API
+  server on a disposable kind cluster);
 * a change of the pod template moves ``metadata.generation`` and
   ``resourceVersion``; a patch that changes nothing moves neither;
 * ``resourceVersion`` also moves while the controller writes status.
@@ -265,7 +267,7 @@ def _handler(api: _Api) -> type[http.server.BaseHTTPRequestHandler]:
                 deployment = api.deployments[name]
                 metadata = body.get("metadata") or {}
                 if metadata.get("uid") not in (None, deployment.uid):
-                    self._status(409, "Conflict")
+                    self._status(422, "Invalid")
                     return
                 expected = metadata.get("resourceVersion")
                 if expected is not None and expected != str(deployment.resource_version):
@@ -662,6 +664,28 @@ def test_a_concurrent_restart_between_read_and_write_refuses_with_nothing_writte
     assert reply == (False, {"ok": False, "refused": "version_conflict"})
     assert _outcome(reply) == ("failed", "version_conflict_at_write")
     assert state.deployments[_NAME].template_annotations[_ANNOTATION] == other
+
+
+def test_a_deployment_recreated_between_read_and_write_is_never_patched(
+    connector: Any, api: tuple[_Api, str]
+) -> None:
+    """The patch names the uid it read, so a new object under the name is refused."""
+
+    state, _ = api
+    current, _ = _key(_KID_A)
+
+    def recreate(deployment: _Deployment) -> None:
+        state.deployments[_NAME] = _Deployment()
+        state.deployments[_NAME].resource_version = deployment.resource_version
+
+    state.after_get = [recreate]
+    is_error, reply = connector(**_sealing(current)).call(
+        _TOOL, {"name": _NAME, "restart_at": _EARLIER}
+    )
+
+    assert is_error is True
+    assert reply is None or reply.get("ok") is not True
+    assert _ANNOTATION not in state.deployments[_NAME].template_annotations
 
 
 def test_a_status_write_between_read_and_write_is_retried(
