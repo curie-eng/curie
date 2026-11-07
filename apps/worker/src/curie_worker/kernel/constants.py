@@ -5,7 +5,7 @@ import logging
 import re
 import uuid
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from aci_protocol import (
@@ -23,7 +23,7 @@ from ..turn_progress import (
 from . import attachment_access, channel_read, hooks, memory
 
 if TYPE_CHECKING:
-    from ..sandbox.types import SandboxTermination
+    from ..sandbox.types import SandboxHandle, SandboxTermination
 
 logger = logging.getLogger(__name__)
 
@@ -597,6 +597,41 @@ _OWNED_WORK_ITEM: ContextVar[uuid.UUID | None] = ContextVar(
 
 _DELIVERY_LEASE: ContextVar[DeliveryLease | None] = ContextVar(
     "curie_worker_delivery_lease", default=None
+)
+
+
+@dataclass
+class OwnedExecution:
+    """One runner turn a delivery opened or steered into (ADR 0270 decision 3).
+
+    The claimed sandbox and the raw turn epoch the runner reported for that
+    turn, or None from a runner that reports none. The epoch is the turn's
+    private timeout credential: it lives in process memory only and is never
+    logged or written to Valkey, hence no repr.
+    """
+
+    handle: SandboxHandle = field(repr=False)
+    turn_epoch: str | None = field(default=None, repr=False)
+    # Set once a stop was attempted, so the lease-lost callback and the
+    # recorder never both stop one turn.
+    stopped: bool = False
+
+
+@dataclass
+class OwnedExecutions:
+    """What one fenced lease acquisition opened or steered into, newest last.
+
+    A lost lease stops exactly these turns, at the sandbox each recorded, and
+    nothing else: a delivery that opened or steered nothing stops nothing.
+    """
+
+    lease: DeliveryLease = field(repr=False)
+    entries: list[OwnedExecution] = field(default_factory=list, repr=False)
+
+
+# Per delivery, set by ``process_event`` for a fenced lease only.
+_OWNED_EXECUTIONS: ContextVar[OwnedExecutions | None] = ContextVar(
+    "curie_worker_owned_executions", default=None
 )
 
 _PUBLICATION_CONTEXT: ContextVar[PublicationContext | None] = ContextVar(

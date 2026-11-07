@@ -327,6 +327,30 @@ class LiveSessionBusy(ThreadBusyError):
     """
 
 
+class RequesterHandoffPending(LiveSessionBusy):
+    """A different requester met the thread's live turn (ADR 0270 decision 3).
+
+    Raised under the per-thread lock before any steer, start or interrupt, so
+    nothing reaches the runner. As a ``LiveSessionBusy`` it keeps every
+    deferral the kernel already gives a live session: the stream entry stays
+    pending and is redelivered, a cron fire records ``deferred``, and an
+    unstarted work item defers ``thread_busy``. The message names the thread
+    only, never the requester.
+    """
+
+
+class RequesterTokenWindowShort(RunnerError):
+    """A requester sandbox's caller token cannot cover the turn about to start.
+
+    ADR 0270 decision 3: the admission check right before the runner start.
+    A ``RunnerError``, so it is the retryable ``runner-error`` outcome; the
+    retry replaces the sandbox with one whose claim-time token covers the turn.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("requester_token_window_short")
+
+
 class CatchUpExpired(ThreadBusyError):
     """A deferred cron slot's retry reached its start after its catch-up bound."""
 

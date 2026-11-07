@@ -260,7 +260,8 @@ _ALICE_FIELDS = {"issuer": ISSUER, "subject": SUBJECT, "tenant_id": TENANT}
 _MALFORMED_PRINCIPALS: dict[str, Any] = {
     "partial": {"issuer": ISSUER, "subject": SUBJECT},
     "unknown-key": {**_ALICE_FIELDS, "role": "admin"},
-    "uppercase-tenant": {**_ALICE_FIELDS, "tenant_id": TENANT.upper()},
+    # TENANT has no hex letters, so upper() would leave it valid; this one has some.
+    "uppercase-tenant": {**_ALICE_FIELDS, "tenant_id": "abcdef01-2345-4678-89ab-cdef01234567".upper()},
     "empty-subject": {**_ALICE_FIELDS, "subject": ""},
     "typed-subject": {**_ALICE_FIELDS, "subject": 7},
     "string": "SyntheticRequesterSubject",

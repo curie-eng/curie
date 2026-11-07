@@ -47,6 +47,7 @@ from ..binding import (
     RUNNER_TOKEN_ENV,
     SANDBOX_TOKEN_TTL_SECONDS,
     boot_token_facts,
+    caller_requester_facts,
 )
 from ..workitem_dispatch import TerminationObservation
 from . import tool_daemon
@@ -2131,6 +2132,10 @@ class SandboxSubstrate:
         credential_agent, credential_id, credential_exp = boot_token_facts(
             (env or {}).get(HISTORY_TOKEN_ENV)
         )
+        # ADR 0270 decision 3: the requester this runner's cct booted with and
+        # its expiry, read from the env actually submitted (after the per-claim
+        # minter), so every boot records a fact and never None.
+        caller_requester, caller_token_exp = caller_requester_facts(env)
         handle = SandboxHandle(
             thread_key=thread_key,
             claim_name=name,
@@ -2153,6 +2158,8 @@ class SandboxSubstrate:
             carries_caller_token=CONNECTOR_CALLER_TOKEN_ENV in (env or {}),
             carries_turn_progress=TURN_PROGRESS_ELIGIBILITY_ENV in (env or {}),
             caller_run=caller_run,
+            caller_requester=caller_requester,
+            caller_token_exp=caller_token_exp,
             state_credential_agent=credential_agent,
             state_credential_id=credential_id,
             state_token_exp=credential_exp,

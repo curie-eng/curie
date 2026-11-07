@@ -53,6 +53,7 @@ from . import (
     channel_read,
     claim,
     completion,
+    constants,
     delivery,
     hooks,
     lifecycle,
@@ -256,6 +257,11 @@ class Kernel:
         # cancelled turn clears its own entry in ``process_event``'s finally, and
         # a FAILED one is cleared by the notice that reads it.
         self._terminal_reply_attempted: set[str] = set()
+        # ADR 0270 decision 3 [D2]: what each fenced lease acquisition opened or
+        # steered into, by its owner token, for exactly the life of its
+        # ``process_event``. A lost lease stops only these turns. Process
+        # memory only: an entry holds a turn's private epoch.
+        self._owned_executions: dict[str, constants.OwnedExecutions] = {}
 
     _finalize_settled_card = approval._finalize_settled_card
     _settle_remembered_card = approval._settle_remembered_card
@@ -300,6 +306,8 @@ class Kernel:
     _log_claim_latency = staticmethod(claim._log_claim_latency)
     _turn_active = claim._turn_active
     _cap_caller_token_to_deadline = claim._cap_caller_token_to_deadline
+    _requester_needed_exp = claim._requester_needed_exp
+    _require_requester_window = claim._require_requester_window
     _claim_or_resume = claim._claim_or_resume
     _keep_route_alive = claim._keep_route_alive
     _complete = completion._complete
@@ -315,6 +323,8 @@ class Kernel:
     notify_turn_not_started = delivery.notify_turn_not_started
     notify_broker_entry_vanished = delivery.notify_broker_entry_vanished
     interrupt_thread = delivery.interrupt_thread
+    stop_owned_execution = delivery.stop_owned_execution
+    _own_execution = delivery._own_execution
     release_thread = delivery.release_thread
     interrupt_agent = delivery.interrupt_agent
     _close_hook_run_after_error = hooks._close_hook_run_after_error

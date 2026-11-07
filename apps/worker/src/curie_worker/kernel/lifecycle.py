@@ -22,6 +22,7 @@ from ..behaviorpacks import (
     BehaviorPacks,
 )
 from ..binding import (
+    BOOT_TOKEN_GRACE_SECONDS,
     DECISION_ENV,
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
     GRANT_ARGUMENTS_ENV,
@@ -31,6 +32,7 @@ from ..binding import (
     MAX_TURNS_ENV,
     PROGRESS_TOKEN_ENV,
     PROGRESS_URL_ENV,
+    REQUESTER_CALLER_TOKEN_TTL_SECONDS,
     RESUMED_KIND_ENV,
     SANDBOX_TOKEN_TTL_SECONDS,
     AmbiguousRoute,
@@ -100,6 +102,17 @@ async def process_event(
     identity_token = identity.CURRENT.set(identity_carry)
     hook_token = constants._HOOK_RUN_CARRY.set(hooks._HookRunCarry())
     lease_token = constants._DELIVERY_LEASE.set(lease)
+    # ADR 0270 decision 3 [D2]: what this lease acquisition opens or steers
+    # into, so a lost lease stops exactly that and nothing else. The owner
+    # token is unique per acquisition.
+    owned = (
+        constants.OwnedExecutions(lease=lease)
+        if lease is not None and claim._is_fenced(lease)
+        else None
+    )
+    owned_executions_token = constants._OWNED_EXECUTIONS.set(owned)
+    if owned is not None:
+        self._owned_executions[owned.lease.owner] = owned
     termination_carry = constants._SandboxTerminationCarry()
     termination_token = constants._SANDBOX_TERMINATION_CARRY.set(termination_carry)
     # A redelivery must never inherit an earlier delivery's terminal-send mark
@@ -206,6 +219,9 @@ async def process_event(
             constants._LIFECYCLE_SPAN.reset(token)
             constants._HOOK_RUN_CARRY.reset(hook_token)
             constants._DELIVERY_LEASE.reset(lease_token)
+            constants._OWNED_EXECUTIONS.reset(owned_executions_token)
+            if owned is not None and self._owned_executions.get(owned.lease.owner) is owned:
+                del self._owned_executions[owned.lease.owner]
             constants._SANDBOX_TERMINATION_CARRY.reset(termination_token)
     if error is not None:
         raise error
@@ -922,6 +938,22 @@ async def _process_event(
                 await identity.requester_principal(self, resolved.agent_id) if selected else None
             )
             if principal is not None:
+                # ADR 0270 decision 3: a requester cct lives one hour from its
+                # claim-time mint. A turn whose runtime bound, boot grace and
+                # cold claim budget cannot fit in it refuses before boot, so no
+                # admitted configuration fails the window on every claim.
+                window_s = (
+                    float(boot_env_kwargs["token_ttl_s"])
+                    + BOOT_TOKEN_GRACE_SECONDS
+                    + self._substrate.claim_timeout_seconds
+                )
+                if window_s > REQUESTER_CALLER_TOKEN_TTL_SECONDS:
+                    logger.info(
+                        "requester turn %s refused before boot: its runtime bound "
+                        "exceeds the requester token window",
+                        event_id,
+                    )
+                    raise identity.HttpIdentityRefused()
                 boot_env_kwargs["caller_principal"] = principal
             try:
                 boot_env = self._binding.boot_env(
@@ -1115,7 +1147,13 @@ async def _process_event(
         if claim._is_fenced(lease) and lease is not None and lease.generation > 1:
             wait_scope = current_wait()
             if wait_scope is None:
-                await self._preflight_reclaimed_delivery(thread_key, lease)
+                await self._preflight_reclaimed_delivery(
+                    thread_key,
+                    lease,
+                    event_id=event_id,
+                    boot_env=boot_env,
+                    requester_enforced=identity.requester_enforced(),
+                )
             else:
                 record = await wait_scope[0].get(wait_scope[1])
                 if record is not None and record.grant_epoch is not None:

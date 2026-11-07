@@ -200,6 +200,10 @@ FALSE_COMPLETION_CHECK_ENV = "CURIE_FALSE_COMPLETION_CHECK"
 # this as its lifetime (#3823); the per-turn memory credential and the
 # connector caller token still do.
 SANDBOX_TOKEN_TTL_SECONDS = 24 * 60 * 60
+# ADR 0270 decision 3: a cct carrying a verified requester lives at most this
+# long from its own mint. A ccr, and a cct without a principal, keep the 24
+# hour (or run deadline) expiry above.
+REQUESTER_CALLER_TOKEN_TTL_SECONDS = 60 * 60
 # #3823: the boot-env state token outlives the turn by this many seconds, so
 # the runner can finish the state calls already in flight when the turn's
 # stream deadline lands. It is not a second lifetime.
@@ -1560,19 +1564,26 @@ class BindingResolver:
                 claims={"cred": credential_id},
             )
         # The caller token (ADR-0168 decision 7, ADR 0178): this sandbox's
-        # agent, signed for its hosted connectors. Its expiry stays the 24 hour
-        # cap, or the run's execution deadline when the kernel passed one. It
-        # does not follow the boot state token (#3823). No key mints none,
-        # which is the stock install. render_worker emits it only with the
-        # connector scope.
+        # agent, signed for its hosted connectors. Its expiry is the 24 hour
+        # cap, or the run's execution deadline when the kernel passed one, and
+        # with a verified requester never more than one hour from now (ADR
+        # 0270 decision 3). It does not follow the boot state token (#3823).
+        # No key mints none, which is the stock install. render_worker emits
+        # it only with the connector scope.
         connector_caller_token: str | None = None
         # ADR 0240 decision 2: one ccr per hosted connector that declares
-        # routes, with the caller token's own claims and expiry.
+        # routes, with the caller token's own agent and run claims.
         route_tokens: dict[str, str] = {}
         if self._config.connector_caller_signing_key.strip():
-            caller_exp = int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS
+            now = int(time.time())
+            route_exp = now + SANDBOX_TOKEN_TTL_SECONDS
             if caller_exp_ceiling is not None:
-                caller_exp = min(caller_exp, int(caller_exp_ceiling))
+                route_exp = min(route_exp, int(caller_exp_ceiling))
+            caller_exp = (
+                route_exp
+                if caller_principal is None
+                else min(route_exp, now + REQUESTER_CALLER_TOKEN_TTL_SECONDS)
+            )
             connector_caller_token = caller_token.mint(
                 self._config.connector_caller_signing_key,
                 agent=resolved.agent_name,
@@ -1583,15 +1594,15 @@ class BindingResolver:
             )
             # ADR 0270 decision 2 partially amends ADR 0240 decision 2: a ccr
             # never carries the principal, and its lifetime is no longer
-            # required to equal the cct's. It keeps today's 24 hour or run
-            # deadline expiry here; the separate one-hour cap on a
-            # requester-bearing cct lands in a later change.
+            # required to equal the cct's. A ccr is an agent/run credential, so
+            # it keeps the 24 hour or run deadline expiry; only the
+            # requester-bearing cct takes the one-hour cap (decision 3).
             for connector in sorted(route_connectors):
                 route_tokens[connector] = caller_token.mint_route(
                     self._config.connector_caller_signing_key,
                     agent=resolved.agent_name,
                     connector=connector,
-                    exp=caller_exp,
+                    exp=route_exp,
                     run=caller_run,
                     work_item=caller_work_item,
                 )
@@ -1922,9 +1933,15 @@ class BindingResolver:
         claim, so no claim boots with a credential an earlier claim released.
         Every other claim, the agent, scope, and expiry, is kept. A token
         without a credential id, or one this key did not sign, is left as is.
+
+        ADR 0270 decision 3: the requester ``cct`` is also re-minted here, at
+        claim time, so every boot carries one that lives one hour from its own
+        claim however long ago the delivery built ``env``. See
+        ``_remint_requester_caller_token`` for which tokens qualify.
         """
 
         out = dict(env)
+        self._remint_requester_caller_token(out)
         api_key = self._config.api_key
         if not api_key:
             return out
@@ -1945,6 +1962,44 @@ class BindingResolver:
                 reissued[token] = fresh
             out[key] = reissued[token]
         return out
+
+    def _remint_requester_caller_token(self, env: dict[str, str]) -> None:
+        """Replace ``env``'s requester ``cct`` with one minted now (ADR 0270 decision 3).
+
+        Only a ``cct`` this worker's key signed, naming exactly a valid
+        principal and no run, is re-minted: the identical principal and agent,
+        expiring one hour from now. Everything else keeps its bytes. A
+        principal-less token keeps its own lifetime, a run pair's expiry
+        belongs to the deadline re-sign and must never be undone, a malformed
+        principal is refused by the proxy anyway, and a principal this key did
+        not sign is never re-signed (no signing oracle for whatever reached
+        the env). Without a caller signing key nothing can be minted.
+        """
+
+        key_text = self._config.connector_caller_signing_key
+        token = env.get(CONNECTOR_CALLER_TOKEN_ENV)
+        if not key_text.strip() or not isinstance(token, str):
+            return
+        claims = caller_token.verified_claims(token, key_text)
+        if claims is None or "principal" not in claims:
+            return
+        if "run" in claims or "work_item" in claims:
+            return
+        agent = claims.get("agent")
+        if not isinstance(agent, str) or not agent:
+            return
+        try:
+            principal = caller_token.principal_of(token)
+        except ValueError:
+            return
+        if principal is None:
+            return
+        env[CONNECTOR_CALLER_TOKEN_ENV] = caller_token.mint(
+            key_text,
+            agent=agent,
+            exp=int(time.time()) + REQUESTER_CALLER_TOKEN_TTL_SECONDS,
+            principal=principal,
+        )
 
 
 def _reissue_boot_token(token: str, api_key: str, credential_id: str) -> str | None:
@@ -1991,6 +2046,19 @@ def boot_token_facts(token: str | None) -> tuple[str | None, str | None, int | N
     if not isinstance(agent, str) or not isinstance(cred, str) or type(exp) is not int:
         return None, None, None
     return agent, cred, exp
+
+
+def caller_requester_facts(env: Mapping[str, str] | None) -> tuple[str, int | None]:
+    """The requester fact and caller token expiry a boot env carries (ADR 0270 decision 3).
+
+    ``("absent", None)`` when the env has no ``cct`` at all, else
+    ``caller_token.unsigned_facts`` of the one it has. The substrate records
+    this for every boot and the kernel compares a delivery's env against it.
+    """
+
+    if env is None or CONNECTOR_CALLER_TOKEN_ENV not in env:
+        return caller_token.REQUESTER_ABSENT, None
+    return caller_token.unsigned_facts(env[CONNECTOR_CALLER_TOKEN_ENV])
 
 
 def _boot_state_token_exp(token_ttl_s: float | None) -> int:

@@ -76,6 +76,10 @@ class HttpTurnCarry:
     # requester. Never logged. @spec CONNECTOR-REQUESTER-1.
     requester: TurnRequesterV1 | None = field(default=None, repr=False)
     requester_checked: bool = False
+    # The validated operator flag read ``requester_principal`` made for this
+    # delivery's boot, False until then. True makes the route comparison
+    # refuse a route that recorded no requester. @spec CONNECTOR-REQUESTER-3.
+    requester_enabled: bool = False
 
 
 CURRENT: ContextVar[HttpTurnCarry | None] = ContextVar("http_turn_authority", default=None)
@@ -246,6 +250,21 @@ def requester() -> TurnRequesterV1 | None:
     return carry.requester
 
 
+def requester_enforced() -> bool:
+    """Whether this delivery is an opted-in requester turn (ADR 0270 decision 3).
+
+    True only for a live HTTP-context delivery whose operator flag read, made
+    immediately before boot, returned True. Such a turn cannot adopt a route
+    that recorded no requester. Every other delivery (flag off, an ended or
+    context-free carry, no carry) adopts a legacy route as before; the digest
+    rule applies to all of them regardless. @spec CONNECTOR-REQUESTER-3.
+    """
+    carry = CURRENT.get()
+    if carry is None or carry.context is None or not carry.requester_enabled:
+        return False
+    return is_live(carry)
+
+
 def _retain_requester(
     carry: HttpTurnCarry, result: TurnAuthorityResponseV1 | TurnAuthorityResponseV2,
 ) -> None:
@@ -304,6 +323,7 @@ async def requester_principal(self: Kernel, agent_id: uuid.UUID) -> CallerPrinci
         raise HttpIdentityRefused()
     if not is_live(carry):
         raise TurnAuthorityUnavailable()
+    carry.requester_enabled = enabled
     if retained is None:
         return None
     if (

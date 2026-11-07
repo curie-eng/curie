@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import contextlib
 import json
+import math
 import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from datetime import UTC, datetime
@@ -31,11 +30,14 @@ from ..behaviorpacks import (
     match_help,
 )
 from ..binding import (
+    BOOT_TOKEN_GRACE_SECONDS,
     CONNECTOR_CALLER_TOKEN_ENV,
     HISTORY_TOKEN_ENV,
     MAX_TURNS_ENV,
+    REQUESTER_CALLER_TOKEN_TTL_SECONDS,
     SANDBOX_TOKEN_TTL_SECONDS,
     boot_token_facts,
+    caller_requester_facts,
 )
 from ..capacity_wait import (
     CapacityWaitExpired,
@@ -101,18 +103,52 @@ def _remaining_budget(lease: DeliveryLease | None) -> float | None:
     return None if lease is None else lease.remaining_s()
 
 
+_PRINCIPAL_LESS_REQUESTERS = frozenset({caller_token.REQUESTER_ABSENT, caller_token.REQUESTER_NONE})
+
+
+def _is_requester_digest(fact: str | None) -> bool:
+    """Whether a recorded requester fact names a principal (ADR 0270 decision 3)."""
+
+    return isinstance(fact, str) and fact.startswith(caller_token.REQUESTER_DIGEST_PREFIX)
+
+
+def _requester_change(recorded: str | None, desired: str, *, enforced: bool) -> bool:
+    """Whether a route that booted for ``recorded`` must not serve ``desired``.
+
+    ADR 0270 decision 3. A digest on either side must match exactly, with or
+    without the operator flag: that is what makes a machine turn, or turning
+    the flag off, replace a person's sandbox instead of inheriting it. The two
+    principal-less facts (no cct, or a cct naming no principal) match each
+    other both ways. A route recorded before this field existed (None) cannot
+    prove a match for an opted-in turn (``enforced``) and is adopted by any
+    other as before. Any other recorded value cannot prove a match either.
+    """
+
+    if recorded is None:
+        return enforced or desired not in _PRINCIPAL_LESS_REQUESTERS
+    if recorded in _PRINCIPAL_LESS_REQUESTERS and desired in _PRINCIPAL_LESS_REQUESTERS:
+        return False
+    return recorded != desired
+
+
 def _boots_differently(
     handle: SandboxHandle,
     boot_env: Mapping[str, str] | None,
     *,
     caller_run: str | None = None,
+    requester_enforced: bool = False,
+    caller_needed: int | None = None,
 ) -> bool:
     """Whether a live runner booted with facts this delivery must not inherit.
 
     Read once at boot: ``CURIE_MAX_TURNS`` (#3071), the connector caller token
-    (ADR-0168 decision 7), and the run that token names (ADR 0178). A runner
-    claimed before the install had a caller key, or booted for a different
-    run, is replaced on the next new turn.
+    (ADR-0168 decision 7), the run that token names (ADR 0178), and the
+    requester it names (ADR 0270 decision 3). A runner claimed before the
+    install had a caller key, booted for a different run, or booted for a
+    different requester is replaced on the next new turn. ``caller_needed``
+    is the expiry a requester token must reach to cover this turn; a digest
+    route whose token does not reach it (or whose expiry is unknown) is
+    replaced too.
     """
 
     env = boot_env or {}
@@ -121,6 +157,15 @@ def _boots_differently(
     if (ELIGIBILITY_ENV in env) != handle.carries_turn_progress:
         return True
     if handle.caller_run != caller_run:
+        return True
+    desired, _exp = caller_requester_facts(env)
+    if _requester_change(handle.caller_requester, desired, enforced=requester_enforced):
+        return True
+    if (
+        caller_needed is not None
+        and _is_requester_digest(handle.caller_requester)
+        and (handle.caller_token_exp is None or handle.caller_token_exp < caller_needed)
+    ):
         return True
     # #3823: replace a warm sandbox whose boot token cannot cover the turn
     # this delivery is about to boot. Comparing with the new token expiry
@@ -135,21 +180,70 @@ def _boots_differently(
     return CONNECTOR_CALLER_TOKEN_ENV in env and not handle.carries_caller_token
 
 
-def _caller_token_exp(token: str) -> int | None:
-    """The ``exp`` claim of a caller token, or None when the token is unreadable."""
+def _requester_needed_exp(self: Kernel, remaining_s: float | None, run: WorkItemRun | None) -> int:
+    """The expiry a requester token must reach to cover a turn opened now.
 
-    parts = token.split(".")
-    if len(parts) != 3:
-        return None
-    try:
-        padded = parts[1] + "=" * (-len(parts[1]) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(padded))
-    except (ValueError, binascii.Error):
-        return None
-    exp = payload.get("exp") if isinstance(payload, dict) else None
-    if type(exp) is not int:
-        return None
-    return exp
+    ADR 0270 decision 3: now, plus the turn's runtime bound for this budget,
+    plus the boot grace, lowered to the run's execution deadline when the
+    delivery owns one (the turn cannot outlive it).
+    """
+
+    needed = (
+        int(clock.time.time())
+        + math.ceil(self._runner.turn_deadline_s(remaining_s))
+        + BOOT_TOKEN_GRACE_SECONDS
+    )
+    deadline = run.execution_deadline if run is not None else None
+    if deadline is not None:
+        needed = min(needed, int(deadline.timestamp()))
+    return needed
+
+
+def _require_requester_window(
+    self: Kernel, handle: SandboxHandle, remaining_s: float | None
+) -> None:
+    """Refuse to start a turn the sandbox's requester token cannot cover.
+
+    ADR 0270 decision 3, the admission check at the last point before the
+    runner starts a turn. Only a route that booted with a requester digest is
+    checked; a principal-less or unrecorded route has no requester window.
+    The refusal is the retryable ``RequesterTokenWindowShort``: the retry
+    replaces this sandbox with one whose claim-time token covers the turn.
+    """
+
+    if not _is_requester_digest(handle.caller_requester):
+        return
+    owned_id = constants._OWNED_WORK_ITEM.get()
+    run = self._work_item_runs.get(owned_id) if owned_id is not None else None
+    needed = self._requester_needed_exp(remaining_s, run)
+    if handle.caller_token_exp is not None and handle.caller_token_exp >= needed:
+        return
+    logger.warning(
+        "turn start refused for thread %s before any runner request: "
+        "reason=requester_token_window_short",
+        handle.thread_key,
+    )
+    raise failures.RequesterTokenWindowShort()
+
+
+def _requester_handoff_pending(thread_key: str, queued_event_id: str) -> BaseException:
+    """Log a different-requester deferral and return the exception to raise.
+
+    The line names the event and the thread only, never the requester or its
+    digest. Inside a capacity wait the deferral is that wait's own retry.
+    """
+
+    logger.info(
+        "requester handoff pending for event %s on thread %s: "
+        "a different requester's turn is live; deferring without steering",
+        queued_event_id,
+        thread_key,
+    )
+    if current_wait() is not None:
+        return CapacityWaitRequested()
+    return failures.RequesterHandoffPending(
+        f"thread {thread_key} has a live turn for a different requester; deferring"
+    )
 
 
 def _connector_tool_grant(
@@ -388,6 +482,22 @@ async def _route_and_start(
             or existing_handle.publication_visible_outcome_revision
             != publication_visible_outcome_revision
         )
+    # ADR 0270 decision 3: the requester this delivery's boot env names, and
+    # whether it is an opted-in turn (which cannot adopt an unrecorded route).
+    # Compared with the route record under this per-thread lock, before any
+    # steer, against the snapshot and again against the claimed handle.
+    from .identity import requester_enforced
+
+    enforced = requester_enforced()
+    desired_requester, _desired_exp = caller_requester_facts(boot_env)
+
+    def caller_needed_for(candidate: SandboxHandle) -> int | None:
+        # Only a requester route has a token window to cover; computed for
+        # this turn, never read from the env's own (possibly stale) token.
+        if not _is_requester_digest(candidate.caller_requester):
+            return None
+        return self._requester_needed_exp(remaining_s, owned_run)
+
     continuation = (
         source is TurnSource.CRON and sweep.parse_continuation(queued_event_id) is not None
     )
@@ -395,7 +505,13 @@ async def _route_and_start(
         existing_handle is None
         or force_lineage_replacement
         or (workspace_repo is not None and existing_handle.workspace_repo != workspace_repo)
-        or _boots_differently(existing_handle, boot_env, caller_run=caller_run)
+        or _boots_differently(
+            existing_handle,
+            boot_env,
+            caller_run=caller_run,
+            requester_enforced=enforced,
+            caller_needed=caller_needed_for(existing_handle),
+        )
     ):
         # ADR-0160: a sweep continues only on the claim it already holds.
         # Any state that would claim, resume or hand off a sandbox stops it.
@@ -435,6 +551,19 @@ async def _route_and_start(
         raise failures.ThreadBusyError(
             f"thread {thread_key} has not reached a durable workspace handoff boundary"
         )
+    # ADR 0270 decision 3: a different requester never steers into, adopts or
+    # interrupts another person's live turn. It defers here, before the turn
+    # budget block below would keep the route to steer a live turn. An
+    # unreadable runner counts as live. An idle route is replaced below
+    # through the same durable handoff a turn budget change uses.
+    if (
+        existing_handle is not None
+        and _requester_change(
+            existing_handle.caller_requester, desired_requester, enforced=enforced
+        )
+        and await self._turn_active(existing_handle, remaining_s=remaining_s)
+    ):
+        raise _requester_handoff_pending(thread_key, queued_event_id)
     # Turn budget fence (#3071), generalized to a runner booted without a
     # caller token (ADR-0168 decision 7). CURIE_MAX_TURNS and the caller
     # token both bind only at boot, so a live route booted with a
@@ -445,7 +574,11 @@ async def _route_and_start(
     # rule instead: it adopts and steers, and the replacement applies
     # from the next new turn.
     turn_budget_replacement = existing_handle is not None and _boots_differently(
-        existing_handle, boot_env, caller_run=caller_run
+        existing_handle,
+        boot_env,
+        caller_run=caller_run,
+        requester_enforced=enforced,
+        caller_needed=caller_needed_for(existing_handle),
     )
     if (
         turn_budget_replacement
@@ -586,6 +719,13 @@ async def _route_and_start(
                 attachment_fresh_only=attachment_fresh_only,
                 caller_run=caller_run,
             )
+            # ADR 0270 decision 3: the claimed handle, not only the snapshot.
+            # A claim can adopt a live route the snapshot never saw (no route
+            # then a concurrent one, or the workspace adopt). A fresh boot or
+            # handoff records this env's own requester, so this never fires
+            # there.
+            if _requester_change(handle.caller_requester, desired_requester, enforced=enforced):
+                raise _requester_handoff_pending(thread_key, queued_event_id)
         except Exception:
             if thread_set is not None:
                 await self._discard_unclaimed_thread_set(thread_key, thread_set, existing_handle)
@@ -803,6 +943,9 @@ async def _route_and_start(
         await check(self, "steer")
         active_before_steer = False
         live_turn_before_steer: str | None = None
+        # The raw epoch of the live turn a steer would join, kept in memory
+        # only: it is that turn's private timeout credential.
+        steered_turn_epoch: object = None
         channel_read_supported = False
         if retained_live_route:
             try:
@@ -832,6 +975,7 @@ async def _route_and_start(
                 # the steer both run under the per-thread lock, so no other
                 # attempt can open a turn on this thread between them.
                 live_turn_before_steer = memory._live_memory_turn(status.get("turn_epoch"))
+                steered_turn_epoch = status.get("turn_epoch")
                 # ADR 0100: renew the channel read capability only for a
                 # runner that enforces it; any other answer clears it.
                 channel_read_supported = status.get(CHANNEL_READ_STATUS_FIELD) is True
@@ -883,6 +1027,8 @@ async def _route_and_start(
                 handle.base_url, steer_event, token=handle.token or None, remaining_s=remaining_s
             )
         if steered:
+            # ADR 0270 decision 3 [D2]: a lost lease stops this joined turn.
+            await self._own_execution(handle, steered_turn_epoch if active_before_steer else None)
             memory_turns = constants._MEMORY_TURNS.get()
             if memory_turns is not None:
                 memory_turns.steered_into = live_turn_before_steer
@@ -904,7 +1050,17 @@ async def _route_and_start(
         # caller token both bind at boot, so a new turn must not open on
         # this runner. Retry: the redelivery finds the turn idle and
         # takes the replacement path above.
-        if _boots_differently(handle, boot_env, caller_run=caller_run):
+        # A fresh or replacement runner booted with this very env, so only a
+        # retained route can boot differently here. Its token window is
+        # judged only there too: a fresh claim whose window is already short
+        # is refused by the admission check, a retryable runner error.
+        if _boots_differently(
+            handle,
+            boot_env,
+            caller_run=caller_run,
+            requester_enforced=enforced,
+            caller_needed=caller_needed_for(handle) if retained_live_route else None,
+        ):
             raise failures.ThreadBusyError(
                 f"thread {thread_key} turn ended before its steer; "
                 "retrying to replace the runner's turn budget or caller token"
@@ -1111,6 +1267,13 @@ async def _cap_caller_token_to_deadline(
     Writes the corrected token back onto ``boot_env`` so a later claim of
     this same env, including a retry after the request has already started,
     does not restore the provisional expiry.
+
+    ADR 0270 decision 3: the re-signed token keeps the exact principal the
+    original carried and is only ever shorter: at most the signed expiry, the
+    deadline, and one hour from now with a principal (24 hours without). A
+    principal that cannot be read exactly raises ``ValueError`` before
+    anything changes; there is no fallback to a principal-less or longer
+    token.
     """
 
     if boot_env is None or run.execution_deadline is None:
@@ -1120,16 +1283,23 @@ async def _cap_caller_token_to_deadline(
     if not isinstance(agent_name, str) or not agent_name:
         return handle
     token = boot_env.get(CONNECTOR_CALLER_TOKEN_ENV)
-    signed_exp = _caller_token_exp(token) if isinstance(token, str) else None
+    if not isinstance(token, str):
+        return handle
+    _requester, signed_exp = caller_token.unsigned_facts(token)
     deadline_unix = int(run.execution_deadline.timestamp())
     if signed_exp is None or signed_exp <= deadline_unix:
         return handle
+    principal = caller_token.principal_of(token)
+    lifetime = (
+        SANDBOX_TOKEN_TTL_SECONDS if principal is None else REQUESTER_CALLER_TOKEN_TTL_SECONDS
+    )
     boot_env[CONNECTOR_CALLER_TOKEN_ENV] = caller_token.mint(
         self._config.connector_caller_signing_key,
         agent=agent_name,
-        exp=min(int(clock.time.time()) + SANDBOX_TOKEN_TTL_SECONDS, deadline_unix),
+        exp=min(signed_exp, deadline_unix, int(clock.time.time()) + lifetime),
         run=str(run.request_id),
         work_item=str(run.work_item_id),
+        principal=principal,
     )
     replaced = await self._claim_or_resume(
         thread_key,
