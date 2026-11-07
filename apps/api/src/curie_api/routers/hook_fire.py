@@ -147,12 +147,14 @@ def _record(
     row: Any,
 ) -> HookFireOut:
     outcome = row["outcome"]
+    # A wake run is queued with the CRON routing label, but its trigger is the
+    # webhook that admitted it (ADR 0274 decision 3), never a scheduled fire.
     return HookFireOut(
         id=row["id"],
         agent_id=agent_id,
         agent=agent,
         name=name,
-        trigger="cron",
+        trigger="webhook" if row["source"] == "webhook" else "cron",
         source=row["source"],
         slot_utc=row["slot_utc"],
         outcome=None if outcome is None else _OUTCOMES[str(outcome)],

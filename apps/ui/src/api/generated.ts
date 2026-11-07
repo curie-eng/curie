@@ -774,6 +774,52 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/{agent_id}/hooks/{hook}/wake-secret": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Wake Secret
+         * @description Read the current wake key of one declared webhook wake hook.
+         *
+         *     Repeated reads return the same key until rotation. Provision it into the
+         *     connector's operator-managed secret as ``CURIE_HOOK_WAKE_KEY``.
+         */
+        get: operations["get_wake_secret_agents__agent_id__hooks__hook__wake_secret_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/hooks/{hook}/wake-secret/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate Wake Secret
+         * @description Rotate one hook's wake key; the previous key stops working at once.
+         *
+         *     The answer carries the new generation and no key; read the key back with
+         *     the GET. Rotation does not cancel an admitted run.
+         */
+        post: operations["rotate_wake_secret_agents__agent_id__hooks__hook__wake_secret_rotate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/{agent_id}/hooks/{name}/fire": {
         parameters: {
             query?: never;
@@ -2523,6 +2569,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/hooks/{agent_id}/{hook}/wake": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Wake Hook
+         * @description Admit one targetless run of a declared webhook wake hook.
+         *
+         *     The body is exactly ``{}``, signed with the hook's wake key; there are no
+         *     query parameters. 202 ``queued`` names the admitted run; 200 ``coalesced``
+         *     means a run was already open or this delivery id was already reserved, so
+         *     poll again later with a fresh delivery id if work remains.
+         */
+        post: operations["wake_hook_hooks__agent_id___hook__wake_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/identity/admin/{tenant_id}/{resource}": {
         parameters: {
             query?: never;
@@ -2911,7 +2982,7 @@ export interface paths {
         put?: never;
         /**
          * Pause Schedule
-         * @description Pause a named cron hook without changing its in force bundle.
+         * @description Pause a named cron or webhook wake hook without changing its in force bundle.
          */
         post: operations["pause_schedule_schedules__agent___name__pause_post"];
         delete?: never;
@@ -2931,7 +3002,7 @@ export interface paths {
         put?: never;
         /**
          * Resume Schedule
-         * @description Resume a named cron hook with one bounded catch up opportunity.
+         * @description Resume a named hook: a cron hook gets one bounded catch up, a wake none.
          */
         post: operations["resume_schedule_schedules__agent___name__resume_post"];
         delete?: never;
@@ -7600,6 +7671,67 @@ export interface components {
             source_generation: string | null;
             /** Supported */
             supported: boolean;
+        };
+        /**
+         * HookWakeCoalescedOut
+         * @description 200: the wake joined a live open run, or its delivery id was already reserved.
+         */
+        HookWakeCoalescedOut: {
+            /**
+             * Status
+             * @constant
+             */
+            status: "coalesced";
+        };
+        /**
+         * HookWakeErrorOut
+         * @description Every wake and wake-key refusal: exactly one reason string.
+         */
+        HookWakeErrorOut: {
+            /** Detail */
+            detail: string;
+        };
+        /**
+         * HookWakeQueuedOut
+         * @description 202: one webhook run was admitted and its turn enqueued.
+         */
+        HookWakeQueuedOut: {
+            /**
+             * Run Id
+             * Format: uuid
+             */
+            run_id: string;
+            /**
+             * Status
+             * @constant
+             */
+            status: "queued";
+        };
+        /**
+         * HookWakeRotationOut
+         * @description The generation a rotation committed. Carries no key.
+         */
+        HookWakeRotationOut: {
+            /** Agent Id */
+            agent_id: string;
+            /** Generation */
+            generation: number;
+            /** Hook */
+            hook: string;
+        };
+        /**
+         * HookWakeSecretOut
+         * @description The current wake key of one agent hook. Served with ``Cache-Control: no-store``.
+         */
+        HookWakeSecretOut: {
+            /** Agent Id */
+            agent_id: string;
+            /** Generation */
+            generation: number;
+            /** Hook */
+            hook: string;
+            /** Secret */
+            secret: string;
         };
         /**
          * IssueReadContext
@@ -12956,6 +13088,146 @@ export interface operations {
             };
         };
     };
+    get_wake_secret_agents__agent_id__hooks__hook__wake_secret_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeSecretOut"];
+                };
+            };
+            /** @description wake_query_forbidden */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_not_declared */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_source_not_ordinary */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_body_invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description authority_unavailable or wake_declaration_unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+        };
+    };
+    rotate_wake_secret_agents__agent_id__hooks__hook__wake_secret_rotate_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeRotationOut"];
+                };
+            };
+            /** @description wake_query_forbidden */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_not_declared */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_source_not_ordinary */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_body_invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description authority_unavailable, wake_declaration_unavailable or wake_generation_exhausted */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+        };
+    };
     fire_hook_agents__agent_id__hooks__name__fire_post: {
         parameters: {
             query?: never;
@@ -16476,6 +16748,110 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HookSupportOut"];
+                };
+            };
+        };
+    };
+    wake_hook_hooks__agent_id___hook__wake_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Joined a live open run, or the delivery id is already reserved */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeCoalescedOut"];
+                };
+            };
+            /** @description One webhook run admitted and enqueued */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeQueuedOut"];
+                };
+            };
+            /** @description wake_query_forbidden */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description invalid_wake_signature */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_not_declared */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_source_not_ordinary, hook_paused or agent_killed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description hook body exceeds the maximum size */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_body_invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description budget_exhausted */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description authority_unavailable, wake_declaration_unavailable, wake_dedupe_unavailable or wake_enqueue_unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
                 };
             };
         };

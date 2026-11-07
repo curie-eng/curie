@@ -8069,6 +8069,114 @@
         "title": "HookSupportOut",
         "type": "object"
       },
+      "HookWakeCoalescedOut": {
+        "additionalProperties": false,
+        "description": "200: the wake joined a live open run, or its delivery id was already reserved.",
+        "properties": {
+          "status": {
+            "const": "coalesced",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "HookWakeCoalescedOut",
+        "type": "object"
+      },
+      "HookWakeErrorOut": {
+        "additionalProperties": false,
+        "description": "Every wake and wake-key refusal: exactly one reason string.",
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "HookWakeErrorOut",
+        "type": "object"
+      },
+      "HookWakeQueuedOut": {
+        "additionalProperties": false,
+        "description": "202: one webhook run was admitted and its turn enqueued.",
+        "properties": {
+          "run_id": {
+            "format": "uuid",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "const": "queued",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "run_id"
+        ],
+        "title": "HookWakeQueuedOut",
+        "type": "object"
+      },
+      "HookWakeRotationOut": {
+        "additionalProperties": false,
+        "description": "The generation a rotation committed. Carries no key.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "hook": {
+            "title": "Hook",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "hook",
+          "generation"
+        ],
+        "title": "HookWakeRotationOut",
+        "type": "object"
+      },
+      "HookWakeSecretOut": {
+        "additionalProperties": false,
+        "description": "The current wake key of one agent hook. Served with ``Cache-Control: no-store``.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "hook": {
+            "title": "Hook",
+            "type": "string"
+          },
+          "secret": {
+            "title": "Secret",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "hook",
+          "generation",
+          "secret"
+        ],
+        "title": "HookWakeSecretOut",
+        "type": "object"
+      },
       "IssueReadContext": {
         "description": "The execution scoped capability and the one issue it names: ``issue`` is\nhow a person names it (``curie-eng/curie#12`` on GitHub, ``PROJ-12`` on Jira).",
         "properties": {
@@ -19958,6 +20066,222 @@
         ]
       }
     },
+    "/agents/{agent_id}/hooks/{hook}/wake-secret": {
+      "get": {
+        "description": "Read the current wake key of one declared webhook wake hook.\n\nRepeated reads return the same key until rotation. Provision it into the\nconnector's operator-managed secret as ``CURIE_HOOK_WAKE_KEY``.",
+        "operationId": "get_wake_secret_agents__agent_id__hooks__hook__wake_secret_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeSecretOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_query_forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_not_declared"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_source_not_ordinary"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_body_invalid"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "authority_unavailable or wake_declaration_unavailable"
+          }
+        },
+        "summary": "Get Wake Secret",
+        "tags": [
+          "hooks"
+        ]
+      }
+    },
+    "/agents/{agent_id}/hooks/{hook}/wake-secret/rotate": {
+      "post": {
+        "description": "Rotate one hook's wake key; the previous key stops working at once.\n\nThe answer carries the new generation and no key; read the key back with\nthe GET. Rotation does not cancel an admitted run.",
+        "operationId": "rotate_wake_secret_agents__agent_id__hooks__hook__wake_secret_rotate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeRotationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_query_forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_not_declared"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_source_not_ordinary"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_body_invalid"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "authority_unavailable, wake_declaration_unavailable or wake_generation_exhausted"
+          }
+        },
+        "summary": "Rotate Wake Secret",
+        "tags": [
+          "hooks"
+        ]
+      }
+    },
     "/agents/{agent_id}/hooks/{name}/fire": {
       "post": {
         "description": "Run one named cron hook now and return its run record.",
@@ -26896,6 +27220,138 @@
         ]
       }
     },
+    "/hooks/{agent_id}/{hook}/wake": {
+      "post": {
+        "description": "Admit one targetless run of a declared webhook wake hook.\n\nThe body is exactly ``{}``, signed with the hook's wake key; there are no\nquery parameters. 202 ``queued`` names the admitted run; 200 ``coalesced``\nmeans a run was already open or this delivery id was already reserved, so\npoll again later with a fresh delivery id if work remains.",
+        "operationId": "wake_hook_hooks__agent_id___hook__wake_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeCoalescedOut"
+                }
+              }
+            },
+            "description": "Joined a live open run, or the delivery id is already reserved"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeQueuedOut"
+                }
+              }
+            },
+            "description": "One webhook run admitted and enqueued"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_query_forbidden"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "invalid_wake_signature"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_not_declared"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_source_not_ordinary, hook_paused or agent_killed"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "hook body exceeds the maximum size"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_body_invalid"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "budget_exhausted"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "authority_unavailable, wake_declaration_unavailable, wake_dedupe_unavailable or wake_enqueue_unavailable"
+          }
+        },
+        "summary": "Wake Hook",
+        "tags": [
+          "hooks"
+        ]
+      }
+    },
     "/identity/admin/{tenant_id}/{resource}": {
       "get": {
         "operationId": "identity_view_identity_admin__tenant_id___resource__get",
@@ -28609,7 +29065,7 @@
     },
     "/schedules/{agent}/{name}/pause": {
       "post": {
-        "description": "Pause a named cron hook without changing its in force bundle.",
+        "description": "Pause a named cron or webhook wake hook without changing its in force bundle.",
         "operationId": "pause_schedule_schedules__agent___name__pause_post",
         "parameters": [
           {
@@ -28677,7 +29133,7 @@
     },
     "/schedules/{agent}/{name}/resume": {
       "post": {
-        "description": "Resume a named cron hook with one bounded catch up opportunity.",
+        "description": "Resume a named hook: a cron hook gets one bounded catch up, a wake none.",
         "operationId": "resume_schedule_schedules__agent___name__resume_post",
         "parameters": [
           {
