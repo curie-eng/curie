@@ -9,6 +9,7 @@ import pytest
 from aci_protocol import Final, SessionStatus
 from sqlalchemy import text
 
+from .test_cron_loop import _entries, _later_pass, _seed, _trigger
 from .test_hook_runs import _capture_fire_metrics
 from .test_targetless_cron import _resolver_factory, _seed_deployments, _targetless
 
@@ -143,5 +144,26 @@ def test_webhook_success_is_silent_and_stale_delivery_cannot_restart(make_hook_r
             assert h.runner.opened == [event.text]
             assert h.sink.events == []
             assert (await run.state())[0] == "ran"
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("source", ["schedule", "manual", "webhook"])
+def test_scheduler_only_reopens_cron_provenance(sync_redis, names, source):
+    async def go():
+        async with _seed() as seed:
+            run_id = await seed.add_run(seed.slot, seed.slot, outcome="deferred")
+            async with seed.engine.begin() as conn:
+                await conn.execute(
+                    text("UPDATE curie.hook_runs SET source = :source WHERE id = :id"),
+                    {"source": source, "id": run_id},
+                )
+            await _later_pass(
+                seed, names["stream"], _trigger(seed), seed.slot + timedelta(seconds=20)
+            )
+            rows = await seed.runs()
+            assert len(rows) == 1
+            assert rows[0].outcome == ("deferred" if source == "webhook" else None)
+            assert len(_entries(sync_redis, names["stream"])) == (0 if source == "webhook" else 1)
 
     asyncio.run(go())
