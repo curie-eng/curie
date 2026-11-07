@@ -24,19 +24,21 @@ def recover_state_file(
     max_pending: int,
     max_bytes: int,
     keep: int | None = None,
+    exclusive_wal: bool = False,
 ) -> dict[str, Any]:
     """Compact terminal completion_events on ``path`` and VACUUM it in place."""
     target = Path(path)
     if not target.exists():
         raise FileNotFoundError(f"mail state {target} does not exist")
     before = target.stat().st_size
-    before_rows = _count_completions(target)
+    before_rows = _count_completions(target, exclusive_wal=exclusive_wal)
     state = MailState(
         str(target),
         max_pending=max_pending,
         max_bytes=max_bytes,
         terminal_completion_max=keep,
         enforce_size=False,
+        exclusive_wal=exclusive_wal,
     )
     try:
         with state.transaction() as connection:
@@ -47,7 +49,7 @@ def recover_state_file(
         state.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     finally:
         state.close()
-    _vacuum_file(target)
+    _vacuum_file(target, exclusive_wal=exclusive_wal)
     after = target.stat().st_size
     evicted = max(0, before_rows - survivors)
     return {
@@ -61,8 +63,17 @@ def recover_state_file(
     }
 
 
-def _count_completions(path: Path) -> int:
+def _connect(path: Path, *, exclusive_wal: bool) -> sqlite3.Connection:
+    """Open ``path``. Exclusive locking is set before the first WAL access."""
     connection = sqlite3.connect(str(path))
+    if exclusive_wal:
+        connection.execute("PRAGMA busy_timeout=0")
+        connection.execute("PRAGMA locking_mode=EXCLUSIVE")
+    return connection
+
+
+def _count_completions(path: Path, *, exclusive_wal: bool) -> int:
+    connection = _connect(path, exclusive_wal=exclusive_wal)
     try:
         row = connection.execute("SELECT count(*) FROM completion_events").fetchone()
         return int(row[0]) if row else 0
@@ -70,12 +81,12 @@ def _count_completions(path: Path) -> int:
         connection.close()
 
 
-def _vacuum_file(target: Path) -> None:
+def _vacuum_file(target: Path, *, exclusive_wal: bool) -> None:
     """Rebuild the file after the adapter connection has released it."""
     vacuumed = target.with_name(f"{target.name}.vacuum")
     if vacuumed.exists():
         vacuumed.unlink()
-    connection = sqlite3.connect(str(target))
+    connection = _connect(target, exclusive_wal=exclusive_wal)
     try:
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         escaped = str(vacuumed).replace("'", "''")
@@ -123,6 +134,7 @@ def main(argv: list[str] | None = None) -> int:
             max_pending=max_pending,
             max_bytes=max_bytes,
             keep=args.keep,
+            exclusive_wal=config.exclusive_wal,
         )
     except FileNotFoundError as error:
         print(str(error), file=sys.stderr)

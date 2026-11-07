@@ -7,10 +7,14 @@ before the first WAL access. These tests drive ``MailState`` and the real
 
 from __future__ import annotations
 
+import ctypes
+import os
+import struct
 import subprocess
 import sys
 import textwrap
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from _support import IngressState, MailState, adapter_env, exit_of, free_port, spawn_adapter
@@ -198,3 +202,101 @@ def test_boot_refuses_when_exclusive_wal_is_already_held(
     assert code != 0
     assert "CURIE_MAIL_EXCLUSIVE_WAL" in output
     assert "already held" in output
+
+
+_IN_CREATE = 0x100
+_IN_MOVED_TO = 0x80
+_IN_NONBLOCK = 0x800
+
+
+def _names_created_during[T](directory: Path, run: Callable[[], T]) -> tuple[T, list[str]]:
+    """File names created in ``directory`` while ``run`` executes.
+
+    SQLite deletes a ``-shm`` file when the connection closes, so checking the
+    directory afterwards cannot see it.
+    """
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.inotify_init1.argtypes = [ctypes.c_int]
+    libc.inotify_init1.restype = ctypes.c_int
+    libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+    libc.inotify_add_watch.restype = ctypes.c_int
+    fd = libc.inotify_init1(_IN_NONBLOCK)
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), "inotify_init1")
+    watch = libc.inotify_add_watch(fd, os.fsencode(directory), _IN_CREATE | _IN_MOVED_TO)
+    if watch < 0:
+        error = ctypes.get_errno()
+        os.close(fd)
+        raise OSError(error, "inotify_add_watch")
+    try:
+        result = run()
+        names: list[str] = []
+        while True:
+            try:
+                data = os.read(fd, 8192)
+            except BlockingIOError:
+                break
+            offset = 0
+            while offset + 16 <= len(data):
+                _wd, _mask, _cookie, length = struct.unpack_from("iIII", data, offset)
+                offset += 16
+                raw = data[offset : offset + length]
+                offset += length
+                name = raw.split(b"\x00", 1)[0]
+                if name:
+                    names.append(name.decode())
+        return result, names
+    finally:
+        os.close(fd)
+
+
+def test_exclusive_wal_recovery_creates_no_shared_memory_index(tmp_path: Path) -> None:
+    """Recovery with the setting on opens every connection without a wal index."""
+    path = tmp_path / "mail-state.sqlite3"
+    state = _open(path, exclusive_wal=True)
+    assert state.claim_event("ev-done", "thr-1", "msg-1", "owner-1") == "claimed"
+    state.finish_event("ev-done")
+    state.close()
+
+    def recover() -> subprocess.CompletedProcess[str]:
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(tmp_path),
+            "PYTHONUNBUFFERED": "1",
+            "CURIE_MAIL_EXCLUSIVE_WAL": "true",
+        }
+        if os.environ.get("PYTHONPATH"):
+            env["PYTHONPATH"] = os.environ["PYTHONPATH"]
+        return subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "curie_mail_adapter",
+                "recover",
+                "--state",
+                str(path),
+                "--json",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+    proc, created = _names_created_during(tmp_path, recover)
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert not any(name.endswith("-shm") for name in created), created
+    reopened = _open(path, exclusive_wal=True)
+    try:
+        assert reopened.send_attempted_at("ev-done") is None
+        assert (
+            reopened.connection.execute(
+                "SELECT delivered FROM completion_events WHERE event_id='ev-done'"
+            ).fetchone()
+            == (1,)
+        )
+        assert not Path(f"{path}-shm").exists()
+    finally:
+        reopened.close()

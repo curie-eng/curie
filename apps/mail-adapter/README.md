@@ -474,6 +474,8 @@ and `synchronous=FULL`, and a second opener fails closed at boot.
 6. Back up only from a stopped adapter, or with a consistent SQLite backup. Copying the live file is not a backup.
 7. Locking and crash recovery on EFS still need qualification on real tasks. A local disk test shows the process contract only.
 
+Run recovery only while the adapter is stopped.
+
 The chart keeps one `Recreate` replica on a ReadWriteOnce volume and does not
 set this variable, so a chart install stays on normal WAL locking.
 
