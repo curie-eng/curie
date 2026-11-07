@@ -54,12 +54,13 @@ T="--context kind-identity-e2e --namespace identity-e2e --release identity-e2e -
 ```
 
 1. `curie dev identity-e2e -- up $T --agent agent-a --agent agent-b --bundle examples/weather`
-   deploys any missing agent from the bundle, starts the provider, adopts the
+   first sets the connector caller key pair when it is unset and rolls the API
+   to it (hosted connectors render their verify key at agent deploy time),
+   then deploys any missing agent from the bundle, starts the provider, adopts the
    tenant's HTTP selection, binds one email address per agent, writes the
    API's `api-runtime.json` Secret listing those bindings in an email receiver
    registration, and runs `helm upgrade --reuse-values` to mount it and to set
-   the connector caller key pair and the email adapter's reply secret when they
-   are unset. It then rolls the API and worker and mints a channel token per
+   the email adapter's reply secret. It then rolls the API and worker and mints a channel token per
    binding. It is safe to run again, for example to add an agent. Use
    `examples/weather` for `requester-claim`: its one hosted connector,
    `netpol-probe`, is what the scenario's turns call. `--bundle` only deploys

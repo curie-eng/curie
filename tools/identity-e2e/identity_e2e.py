@@ -409,6 +409,11 @@ class Harness:
         )
         target.rollout(f"{self.prefix}-idp", timeout="300s")
 
+        # Hosted connectors render their proxy's verify key when an agent is
+        # deployed, so the release must carry the caller key pair, and the API
+        # must have rolled to it, before any agent is deployed.
+        self._ensure_caller_pair()
+
         with self.api() as api:
             self._agents(api, agents, bundle)
             tenant_id = self._tenant()
@@ -604,6 +609,38 @@ class Harness:
             log(f"email binding for {name}: {address}")
         self.state.save()
 
+    def _ensure_caller_pair(self) -> None:
+        """Set the connector caller key pair and roll the API to it, once."""
+
+        target = self.target
+        values = target.helm_values()
+        keys = self.data["keys"]
+        previous = self.data.setdefault("helm_previous", {})
+        caller_set = bool(
+            get_path(values, "connectorCaller.signingKey")
+            or get_path(values, "connectorCaller.existingSecret")
+        )
+        if caller_set and "connectorCaller.signingKey" not in previous:
+            return  # the operator's own pair stays; down has nothing to restore
+        if "caller_signing" not in keys:
+            keys["caller_signing"], keys["caller_verify"] = ed25519_pair(self.state.directory)
+            self.state.save()
+        changes = {
+            "connectorCaller.signingKey": keys["caller_signing"],
+            "connectorCaller.verifyKey": keys["caller_verify"],
+        }
+        overlay: dict[str, Any] = {}
+        for path, value in changes.items():
+            if path not in previous:
+                previous[path] = get_path(values, path)
+            set_path(overlay, path, value)
+        self.state.save()
+        if all(get_path(values, path) == value for path, value in changes.items()):
+            return
+        self._helm_upgrade(overlay, "caller-pair")
+        log("rolling the api to the caller key pair")
+        target.rollout(target.component("api"), restart=True)
+
     def _helm_overlay(self) -> None:
         target = self.target
         values = target.helm_values()
@@ -620,16 +657,6 @@ class Harness:
                 "adapter secret to a BYO Secret"
             )
         changes[f"worker.adapterCredentials.{ADAPTER}"] = keys["adapter_secret"]
-        caller_set = bool(
-            get_path(values, "connectorCaller.signingKey")
-            or get_path(values, "connectorCaller.existingSecret")
-        )
-        if not caller_set or "connectorCaller.signingKey" in previous:
-            if "caller_signing" not in keys:
-                keys["caller_signing"], keys["caller_verify"] = ed25519_pair(self.state.directory)
-                self.state.save()
-            changes["connectorCaller.signingKey"] = keys["caller_signing"]
-            changes["connectorCaller.verifyKey"] = keys["caller_verify"]
         for path, value in changes.items():
             if path not in previous:
                 previous[path] = get_path(values, path)
