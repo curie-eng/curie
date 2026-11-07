@@ -85,7 +85,7 @@ from test_factory_terminus import (
 )
 
 REPO = "acme-corp/acme-bot"
-WORKER_TOKEN = "remote-dev-publication-worker-token"
+WORKER_TOKEN = "example-publication-worker-token"
 WORKER_HEADERS = {"X-Curie-Worker-Token": WORKER_TOKEN}
 PATCH_LIMIT = 900_000
 BASE_SHA = "0123456789abcdef0123456789abcdef01234567"

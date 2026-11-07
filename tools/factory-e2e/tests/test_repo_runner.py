@@ -40,7 +40,7 @@ FIXTURES = ROOT / "fixtures" / "repo-runner"
 REPO_X = "acme-corp/repo-x"
 REPO_Y = "acme-corp/repo-y"
 REPO_U = "acme-corp/repo-u"
-CONTEXT = "k8-scratch"
+CONTEXT = "throwaway-cluster"
 THREAD_X = "thread-x"
 THREAD_Y = "thread-y"
 THREAD_U = "thread-u"
@@ -280,7 +280,7 @@ def test_module_contract_constants() -> None:
 # --------------------------------------------------------------------------
 
 CONTEXT_REFUSAL = (
-    "repo-runner requires an explicit --context (the throwaway cluster, for example k8-scratch)"
+    "repo-runner requires an explicit --context (the throwaway cluster, for example throwaway-cluster)"
 )
 
 

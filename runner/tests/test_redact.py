@@ -77,7 +77,7 @@ FAKE_SECRET_ASSIGNMENT = "secret=" + "0000FAKEFAKEFAKEVALUE"
 FAKE_JSON_FIELD_SECRET = "0000FAKEJSONFIELDSECRET"
 FAKE_DICT_FIELD_SECRET = "0000FAKEDICTFIELDSECRET"
 FAKE_COLON_FIELD_SECRET = "0000FAKECOLONFIELDSECRET"
-FAKE_HOME_PATH = "/home/theconnman/.config/curie/settings.json"
+FAKE_HOME_PATH = "/home/example-user/.config/curie/settings.json"
 FAKE_CHANNEL_TOKEN = "chn." + "ZXhhbXBsZWNoYW5uZWxwYXlsb2Fk." + "FAKEFAKEFAKESIG0000"
 # The local token minters use base64url payload and signature segments.
 # See curie_internal.sandbox_token.mint and curie_worker.caller_token.mint.
