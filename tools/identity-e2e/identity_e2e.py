@@ -111,6 +111,7 @@ CONNECTOR_OWNER_LABEL = "curie.dev/connector-owner"
 CONNECTOR_JOIN = "-mcp-"
 CALLER_PROXY_CONTAINER = "caller-proxy"
 CALLER_PROXY_CONNECTOR_ENV = "CURIE_CALLER_PROXY_CONNECTOR"
+WORKER_CONTAINER = "worker"
 FINGERPRINT_HEX = 16
 REPLY_TEXT_LIMIT = 2000
 
@@ -237,6 +238,27 @@ def parse_proxy_decision(line: str) -> dict[str, Any] | None:
         if key in suffixes:
             decision[key] = suffixes[key]
     return decision
+
+
+def worker_log_message(line: str) -> str:
+    """The searchable text of one worker log line, its kubectl stamp already removed.
+
+    A JSON record (curie_telemetry's formatter) gives its ``message``, then the
+    last line of its ``exception`` when it logged one, because an exception the
+    consumer logs carries its own text there. Any other line is kept as is.
+    """
+
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return line.strip()
+    if not isinstance(record, dict):
+        return line.strip()
+    message = str(record.get("message", ""))
+    exception = str(record.get("exception") or "").strip()
+    if exception:
+        message += " | " + exception.splitlines()[-1]
+    return message
 
 
 def epoch(stamp: str) -> float:
@@ -835,6 +857,7 @@ class Harness:
             "conversation_id": conversation,
             "claim": None if claim is None else claim["name"],
             "claim_created": None if claim is None else claim["created"],
+            "claim_created_epoch": None if claim is None else claim["created_epoch"],
             "caller_token_present": token is not None,
         }
         reply_deadline = deadline
@@ -964,6 +987,49 @@ class Harness:
                     parsed.update(connector=connector, at=line[: len(line) - len(rest)].strip())
                     decisions.append((since if at is None else at, parsed))
         return [entry for _, entry in sorted(decisions, key=lambda pair: pair[0])]
+
+    # worker log ---------------------------------------------------------------
+
+    def worker_log(self, since: float) -> list[dict[str, Any]]:
+        """The worker's log at or after ``since`` (unix seconds), oldest first.
+
+        Read from every pod of the worker Deployment, so a message logged by
+        whichever replica took a delivery is seen. Each entry is ``{"at",
+        "pod", "message"}`` with ``message`` from :func:`worker_log_message`,
+        unbounded so a caller can search it; bound it before recording it.
+        """
+
+        deployment = self.target.kubectl_json("get", "deployment", self.target.component("worker"))
+        labels = deployment["spec"]["selector"]["matchLabels"]
+        selector = ",".join(f"{key}={value}" for key, value in sorted(labels.items()))
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))
+        entries: list[dict[str, Any]] = []
+        for pod in self.target.kubectl_json("get", "pod", "-l", selector)["items"]:
+            pod_name = str(pod["metadata"]["name"])
+            result = self.target.kubectl(
+                "logs",
+                pod_name,
+                "-c",
+                WORKER_CONTAINER,
+                "--timestamps",
+                f"--since-time={stamp}",
+                check=False,
+            )
+            if result.returncode != 0:
+                log(f"no worker log from {pod_name}: exit {result.returncode}")
+                continue
+            for line in result.stdout.splitlines():
+                at, rest = split_log_stamp(line)
+                if at is not None and at < since:
+                    continue
+                entries.append(
+                    {
+                        "at": since if at is None else at,
+                        "pod": pod_name,
+                        "message": worker_log_message(rest),
+                    }
+                )
+        return sorted(entries, key=lambda entry: float(entry["at"]))
 
     # down ---------------------------------------------------------------------
 
@@ -1137,6 +1203,11 @@ def build_parser() -> argparse.ArgumentParser:
     prove.add_argument("--flag-agent", help="default: the first agent `up` registered")
     prove.add_argument("--control-agent", help="default: the second agent `up` registered")
     prove.add_argument("--sender", default="alice@example.test")
+    prove.add_argument(
+        "--second-sender",
+        default="bob@example.test",
+        help="the other verified human for requester-handoff (default: bob@example.test)",
+    )
     prove.add_argument("--wait", type=float, default=240)
 
     actions.add_parser("down", parents=[common], help="remove what up created")

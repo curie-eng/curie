@@ -62,8 +62,8 @@ T="--context kind-identity-e2e --namespace identity-e2e --release identity-e2e -
    registration, and runs `helm upgrade --reuse-values` to mount it and to set
    the email adapter's reply secret. It then rolls the API and worker and mints a channel token per
    binding. It is safe to run again, for example to add an agent. Use
-   `examples/weather` for `requester-claim`: its one hosted connector,
-   `netpol-probe`, is what the scenario's turns call. `--bundle` only deploys
+   `examples/weather` for `requester-claim` and `requester-handoff`: its one
+   hosted connector, `netpol-probe`, is what the scenarios' turns call. `--bundle` only deploys
    agents that do not exist yet, so an agent deployed earlier from a bundle
    with no hosted connector fails the scenario's preconditions.
 2. `curie dev identity-e2e -- send $T --agent agent-a --sender alice@example.test --text hello`
@@ -81,7 +81,12 @@ T="--context kind-identity-e2e --namespace identity-e2e --release identity-e2e -
    the token is found.
 4. `curie dev identity-e2e -- prove $T --scenario requester-claim --evidence out.json`
    runs a scenario, prints the evidence and exits nonzero unless every step
-   passed.
+   passed. The flag agent is `--flag-agent` (default: the first agent `up`
+   registered) and the control agent `--control-agent` (default: the second).
+   `--sender` (default `alice@example.test`) is the human who writes, and
+   `requester-handoff` also takes `--second-sender` (default
+   `bob@example.test`), a different verified human from the roster. `--wait`
+   (default 240) bounds each wait for a claim or a reply.
 5. `curie dev identity-e2e -- down $T` deletes the agents and bindings `up`
    created, restores the helm values it changed, deletes the provider and
    runtime objects, removes the tenant HTTP selection row when `up` created it,
@@ -129,6 +134,76 @@ message` (step 3), and logged no refusal for that agent in the step's window.
 The decoded token's claims agree: the principal is the sender in step 1 and
 absent in steps 2 and 3.
 
+## What requester-handoff proves
+
+Two verified humans write on one email conversation to an agent with
+`connector_requester_identity` on. The second human's connector call carries
+the second human's principal, never the first's, and a second human who
+writes while the first human's turn is live waits until that turn ends. Run
+it with:
+
+```bash
+curie dev identity-e2e -- prove $T --scenario requester-handoff --evidence handoff.json
+```
+
+A is `--sender` and B is `--second-sender`; both must be verified humans in
+the roster `up` installed. Every turn except the progress demos sends
+`[fake:connector-call]`, so its reply carries the fingerprint of the caller
+token each dial sent. The harness picks each human's reply out of the shared
+conversation by the event id the API's ingress receipt returned for that
+send, because one conversation carries both humans' replies. The evidence
+keeps claim names, creation times, principals and token fingerprints, never a
+token.
+
+The steps run in order and each needs the one before it, so the first failed
+step stops the run (the evidence records it under `aborted`):
+
+1. H0 checks the same preconditions as `requester-claim` step 0, then turns
+   the flag on for the flag agent and off for the control agent, each with
+   the version it currently has.
+2. H1: A writes on a new conversation C. The claim's caller token names A,
+   every `ok` line in A's reply carries that token's fingerprint, and the
+   caller proxy logged `outcome=admitted` with `principal=present`.
+3. H2: B writes on C while it is idle. B's turn runs on a new claim, created
+   after B's send (2 s of clock skew allowed), whose token fingerprint differs
+   from A's. That token names B, B's reply carries its fingerprint, and the
+   proxy admitted it with `principal=present`.
+4. H3: A writes on C again. The claim is replaced back the same way and names
+   A. This also leaves A's sandbox warm for H4.
+5. H4: A sends `[fake:progress-demo]`, a turn that stays live for about 8 s.
+   One second after A's send returns, B sends `[fake:connector-call]`. A's
+   reply must be delivered and end with `all done`, so A's turn was not
+   interrupted. The worker log since A's send must contain `requester handoff
+   pending` (the kernel's deferral of B's delivery) and must not contain
+   `interrupting before retry`. B's turn must then run on a new claim created
+   no earlier than A's reply (2 s of skew allowed), whose token names B, and
+   B's reply must carry that token's fingerprint. B is redelivered about one
+   delivery lease TTL (45 s) after A's turn ends, so B's reply usually
+   arrives about a minute after B's send. The step waits up to 6 minutes, or
+   `--wait` when that is longer.
+6. H5 is the control, on the flag-off agent and a new conversation. A first
+   sends a warm `[fake:connector-call]` turn, whose token carries no
+   principal, so the conversation's sandbox is booted. Then A sends
+   `[fake:progress-demo]` and B writes one second later, as in H4. Both turns
+   must be delivered, A's reply must include `all done`, the conversation
+   must have run on exactly one claim, and the worker must have logged no
+   `requester handoff pending`. B's turn must complete before A's, which
+   shows ordinary steering folded B into A's live turn.
+
+H4 only proves something when B reaches the worker while A's turn is live. If
+B arrives after A's turn has already ended, H4 fails with `deferral not
+exercised`. That failure alone makes the scenario run H3 and H4 once more on
+a new conversation, recorded as `H3-retry` and `H4-retry`. Any other H4
+failure stops the run at once. In the same way, H5 runs once more as
+`H5-retry` when it fails only with `steering not exercised`. A failed first
+attempt moves from `steps` to `retried` in the evidence, so it is kept but
+does not fail the run.
+
+H4 and H5 read the worker's log with `kubectl logs --timestamps` from every
+pod of the worker Deployment since the first send. For each JSON record they
+search the `message` and the last line of any logged `exception`. The
+deferral message has to reach the worker's log at its configured level.
+
 ## Add a scenario
 
 1. Write a function in `identity_scenarios.py` and register it with
@@ -136,11 +211,13 @@ absent in steps 2 and 3.
    arguments and an `Evidence` recorder.
 2. Put each claim in its own `with evidence.step("<id>", "<what it proves>") as seen:`
    block. Record what you observed in `seen` and assert with `check(...)`. A
-   failed step is recorded and the next step still runs.
+   failed step is recorded and the next step still runs. When later steps
+   build on a step, call `require_passed(evidence)` after it to stop the run.
 3. Drive the install only through `harness.send`, `harness.observe`,
    `harness.api()`, `harness.target.curie(...)` and `harness.records()`, and
    read connector evidence with `harness.connectors(...)` and
-   `harness.proxy_decisions(...)`. Use
+   `harness.proxy_decisions(...)` and worker messages with
+   `harness.worker_log(...)`. Use
    `harness.target.sql(...)` only to corrupt state that no product surface can
    write, and restore it in a `finally` block.
 4. If the scenario needs other humans, add them to the default roster or ship a
