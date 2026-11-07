@@ -96,6 +96,8 @@ as a whole; remembered only):
   and the proxy may not import the worker, so both read one frozen corpus; the
   CLI derives its generated public keys against the same seeds.
   [vector: `tests/vectors/connector-caller-token.json`]
+  The upload-only minter and verifier use the distinct `ccu` scope and share
+  [vector: `tests/vectors/connector-upload-token.json`].
 21. connector proxy refusal vs runner diagnosis -- the proxy's refusal body
   (`apps/worker/src/curie_connector_proxy/server.py`) and the runner's
   `caller_refused` reason (`runner/src/curie_runner/mcp_tool_capability.py`)

@@ -99,3 +99,5 @@ upload-specific authentication it requires. An upload URL grants no MCP
 credential. Do not reuse the MCP listener as an upload endpoint or embed a
 credential in either URL. Migrating downstream bundle upload clients and
 implementing that server boundary are separate from endpoint resolution.
+See [static connector serving](connector-serving.md) for the container recipe,
+portable configuration, and the separate upload authorization scope.

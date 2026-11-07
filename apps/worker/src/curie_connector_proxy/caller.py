@@ -33,6 +33,7 @@ GRANT_PREFIX = "ccg"
 # A route token (ADR 0240 decision 2): the caller's claims plus the one
 # connector whose declared routes it is good for.
 ROUTE_PREFIX = "ccr"
+UPLOAD_PREFIX = "ccu"
 
 _KEY_BYTES = 32
 _SIGNATURE_BYTES = 64
@@ -241,12 +242,39 @@ def decide_route(
     another connector are all ``invalid``. Never raises on its input.
     """
 
+    return _decide_scoped(keys, token, ROUTE_PREFIX, connector=connector, admits=admits, now=now)
+
+
+def decide_upload(
+    keys: Sequence[VerifyKey],
+    token: str | None,
+    *,
+    connector: str,
+    admits: frozenset[str],
+    now: int,
+) -> Decision:
+    """Admit only the upload scope, bound to this connector and an admitted agent."""
+
+    return _decide_scoped(keys, token, UPLOAD_PREFIX, connector=connector, admits=admits, now=now)
+
+
+def _decide_scoped(
+    keys: Sequence[VerifyKey],
+    token: str | None,
+    prefix: str,
+    *,
+    connector: str,
+    admits: frozenset[str],
+    now: int,
+) -> Decision:
     if not token:
         return Decision(agent=None, refusal=MISSING)
-    parsed = _opened(keys, token, ROUTE_PREFIX)
+    parsed = _opened(keys, token, prefix)
     if parsed is None:
         return Decision(agent=None, refusal=INVALID)
     present = set(parsed)
+    if prefix == UPLOAD_PREFIX and present != _ROUTE_CLAIMS:
+        return Decision(agent=None, refusal=INVALID)
     if present != _ROUTE_CLAIMS and present != _ROUTE_CLAIMS | _RUN_CLAIMS:
         return Decision(agent=None, refusal=INVALID)
     agent, named, exp = parsed["agent"], parsed["connector"], parsed["exp"]

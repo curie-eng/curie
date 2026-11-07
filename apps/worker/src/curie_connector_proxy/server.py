@@ -92,7 +92,8 @@ logger = logging.getLogger("curie_connector_proxy")
 # aiohttp's parse-error log quotes the bytes it refused, which can be a token
 # cut anywhere.
 _TOKEN_TEXT = re.compile(
-    rf"(?:{caller.PREFIX}|{caller.GRANT_PREFIX}|{caller.ROUTE_PREFIX})\.[A-Za-z0-9_.-]*"
+    rf"(?:{caller.PREFIX}|{caller.GRANT_PREFIX}|{caller.ROUTE_PREFIX}|{caller.UPLOAD_PREFIX})"
+    r"\.[A-Za-z0-9_.-]*"
     r"|[A-Za-z0-9_-]{32,}"
 )
 _REDACTED = "<redacted>"
@@ -149,7 +150,7 @@ def _resp(*parts: str) -> bytes:
     return head + body
 
 
-def _set_nx_ex(url: str, key: str, ttl: int) -> bool:
+def _set_nx_ex(url: str, key: str, ttl: int, *, ca_file: str | None = None) -> bool:
     """SET key 1 NX EX ttl over the Redis wire. True only when this call stored it.
 
     The proxy package cannot import the redis client. A missing store, a TLS
@@ -166,12 +167,13 @@ def _set_nx_ex(url: str, key: str, ttl: int) -> bool:
         return False
     port = parsed.port or 6379
     password = unquote(parsed.password) if parsed.password else ""
+    username = unquote(parsed.username) if parsed.username else ""
     database = (parsed.path or "/0").lstrip("/") or "0"
     raw = socket.create_connection((host, port), timeout=2)
+    conn: socket.socket = raw
     try:
-        conn: socket.socket = raw
         if parsed.scheme == "rediss":
-            context = ssl.create_default_context()
+            context = ssl.create_default_context(cafile=ca_file)
             context.minimum_version = ssl.TLSVersion.TLSv1_2
             conn = context.wrap_socket(raw, server_hostname=host)
 
@@ -188,24 +190,32 @@ def _set_nx_ex(url: str, key: str, ttl: int) -> bool:
             conn.sendall(_resp(*parts))
             return reply()
 
-        if password and command("AUTH", password) != b"+OK":
+        auth = (username, password) if username else (password,)
+        if password and command("AUTH", *auth) != b"+OK":
             return False
         if database != "0" and command("SELECT", database) != b"+OK":
             return False
         return command("SET", key, "1", "NX", "EX", str(ttl)) == b"+OK"
     finally:
+        conn.close()
         raw.close()
 
 
 class _ValkeyGrantStore:
     """SET ``connector-grant:<jti>`` NX EX without importing the redis client."""
 
-    def __init__(self, url: str) -> None:
+    def __init__(
+        self, url: str, *, ca_file: str | None = None, key_prefix: str = "connector-grant:"
+    ) -> None:
         self._url = url
+        self._ca_file = ca_file
+        self._key_prefix = key_prefix
 
     def spend(self, jti: str, ttl: int) -> bool:
         try:
-            return _set_nx_ex(self._url, f"connector-grant:{jti}", max(ttl, 1))
+            return _set_nx_ex(
+                self._url, f"{self._key_prefix}{jti}", max(ttl, 1), ca_file=self._ca_file
+            )
         except Exception:  # noqa: BLE001 - existing broad catch retained
             logger.warning("connector grant spend failed")
             return False
@@ -279,6 +289,8 @@ class ProxyConfig:
     upstream_host: str | None = None
     # ADR 0240: the routes a ``ccr`` token is admitted on.
     routes: tuple[RouteConfig, ...] = ()
+    upload_only: bool = False
+    upload_path: str | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> ProxyConfig:
@@ -586,7 +598,8 @@ def _decide_route(request: web.Request) -> caller.Decision:
     tokens = request.headers.getall(caller.HEADER, [])
     if len(tokens) > 1:
         return caller.Decision(agent=None, refusal=caller.INVALID)
-    return caller.decide_route(
+    decide = caller.decide_upload if config.upload_only else caller.decide_route
+    return decide(
         config.public_keys,
         tokens[0] if tokens else None,
         connector=config.connector,
@@ -622,7 +635,14 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
     # ADR 0240 decision 3: a declared route admits only a ``ccr``, and every
     # other path only a ``cct``, so neither token reaches the other's paths.
     # Another spelling of a route is neither: it is refused outright.
-    if route is None and _shadows_route(request):
+    config = request.app[_CONFIG]
+    if config.upload_path is not None and _spelling(request.rel_url.raw_path) == _spelling(
+        config.upload_path
+    ):
+        decision = caller.Decision(agent=None, refusal=caller.INVALID)
+    elif config.upload_only and (route is None or GRANT_HEADER in request.headers):
+        decision = caller.Decision(agent=None, refusal=caller.INVALID)
+    elif route is None and _shadows_route(request):
         decision = caller.Decision(agent=None, refusal=caller.INVALID)
     else:
         decision = _decide_route(request) if route is not None else _decide(request)
