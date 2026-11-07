@@ -213,8 +213,10 @@ claim after its supervisor is gone.
 
 The static pool has no Kubernetes quota, scheduler or tool daemon. Quota
 methods refuse, scheduling diagnostics report nothing, tool daemon profiles and
-repository runner pools are refused, and `runner_resources` are not applied
-(each shell has the resources its container was given).
+repository runner pools are refused, the worker refuses to start with the
+action executor enabled (its serving attestation reads Kubernetes), and
+`runner_resources` are not applied (each shell has the resources its
+container was given).
 
 ## Verification
 
@@ -234,4 +236,7 @@ runs real supervisors with the real runner on the fake model through the
 substrate and the runner client: a first turn, a follow-up on the retained
 route, an approval pause and cold resume on a recycled shell with the same
 history, refusal of the paused claim's route and bearer, a worker restart in
-the middle of a turn, pool exhaustion and cleanup.
+the middle of a turn, pool exhaustion and cleanup. It also builds a claim's
+environment with the worker's static connector binding and proves the
+connector endpoints, caller token, agent name and the shell's connector CA
+file reach the runner unchanged.

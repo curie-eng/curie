@@ -57,21 +57,25 @@ RUNNER_COMMAND = f"{sys.executable} -m curie_runner"
 _CAP = 65_536
 
 
-def _bundle() -> bytes:
+def _bundle(extra: dict[str, bytes] | None = None) -> bytes:
     manifest = {"name": "qualification", "description": "static pool", "version": "0.1.0"}
+    files = {".claude-plugin/plugin.json": json.dumps(manifest).encode(), **(extra or {})}
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w") as tar:
-        data = json.dumps(manifest).encode()
-        info = tarfile.TarInfo(".claude-plugin/plugin.json")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
     return gzip.compress(raw.getvalue())
 
 
 class _Bundles:
+    def __init__(self, extra: dict[str, bytes] | None = None) -> None:
+        self.extra = extra
+
     def get(self, key: str) -> bytes:
         assert key == BUNDLE_REF
-        return _bundle()
+        return _bundle(self.extra)
 
 
 class _StateApi:
@@ -192,7 +196,12 @@ class _Worker:
     """One worker process's view: its own clients over the shared Valkey and shells."""
 
     def __init__(
-        self, valkey: redis.Redis, prefix: str, tls: ShellTls, shells: list[SupervisorProcess]
+        self,
+        valkey: redis.Redis,
+        prefix: str,
+        tls: ShellTls,
+        shells: list[SupervisorProcess],
+        bundle: dict[str, bytes] | None = None,
     ) -> None:
         self.tls = tls
         self.client = StaticPoolSandboxClient(
@@ -200,7 +209,7 @@ class _Worker:
             redis_client=valkey,
             control_token=CONTROL_TOKEN,
             ssl_context=shell_ssl_context(str(tls.ca)),
-            bundle_store=_Bundles(),
+            bundle_store=_Bundles(bundle),
             key_prefix=prefix,
             retire_timeout_seconds=30.0,
             allow_unisolated_shells=True,
@@ -277,11 +286,11 @@ def _claim(worker: _Worker, thread: str, env: dict[str, str]) -> SandboxHandle:
 @pytest.fixture
 def worker_factory(
     valkey: redis.Redis, prefix: str, tls: ShellTls
-) -> Iterator[Callable[[list[SupervisorProcess]], _Worker]]:
+) -> Iterator[Callable[..., _Worker]]:
     made: list[_Worker] = []
 
-    def make(shells: list[SupervisorProcess]) -> _Worker:
-        worker = _Worker(valkey, prefix, tls, shells)
+    def make(shells: list[SupervisorProcess], bundle: dict[str, bytes] | None = None) -> _Worker:
+        worker = _Worker(valkey, prefix, tls, shells, bundle)
         made.append(worker)
         return worker
 
@@ -432,3 +441,100 @@ def test_an_exhausted_pool_refuses_truthfully_and_admits_after_a_release(
     admitted = _claim(worker, waiting, _boot_env(state, waiting))
     assert worker.turn(admitted, "my turn now").status == SessionStatus.DONE
     assert worker.substrate.release(waiting)
+
+
+def test_connector_endpoint_settings_reach_the_runner_on_a_shell(
+    tmp_path: Path,
+    state: _StateApi,
+    tls: ShellTls,
+    worker_factory: Callable[..., _Worker],
+) -> None:
+    """The worker's static connector binding arrives at the runner unchanged.
+
+    The claim env comes from the worker's own ``BindingResolver.boot_env`` with
+    static connector endpoints configured; the CA file is shell deployment
+    config forwarded by the supervisor. The runner command records the env it
+    was started with, then execs the real runner, which must boot with the
+    binding and answer a turn. The runner derives the upload map from the
+    binding itself (``CURIE_CONNECTOR_UPLOAD_ENDPOINTS``), covered by the
+    connector endpoint tests; the fake model skips the connector boot probe.
+    """
+
+    from curie_internal.connector_endpoints import (
+        BINDING_ENV,
+        CA_FILE_ENV,
+        UPLOADS_ENV,
+        StaticConnectorEndpoints,
+    )
+    from curie_worker.binding import BindingResolver, ResolvedDeployment
+    from curie_worker.config import WorkerConfig
+
+    record = tmp_path / "record"
+    record.mkdir()
+    ca = str(tls.ca)
+    shell = SupervisorProcess(
+        slot="q3",
+        tls=tls,
+        root=tmp_path / "q3",
+        runner_command=(
+            f"sh -c 'env -0 > \"{record}/$CURIE_SESSION_ID\" && exec {RUNNER_COMMAND}'"
+        ),
+        env={
+            "CURIE_SUPERVISOR_CHILD_ENV_PUBLIC": f"{CA_FILE_ENV},NODE_EXTRA_CA_CERTS",
+            CA_FILE_ENV: ca,
+            "NODE_EXTRA_CA_CERTS": ca,
+        },
+    ).start()
+    try:
+        worker = worker_factory(
+            [shell],
+            {"connectors.yaml": b"connectors:\n  reviewer:\n    image: example/reviewer:1\n"},
+        )
+        endpoints = {
+            "version": 1,
+            "agents": {
+                "acme-dev": {
+                    "reviewer": {
+                        "base_url": "https://reviewer.connectors.invalid",
+                        "upload_url": "https://reviewer.connectors.invalid/v1/upload",
+                    }
+                }
+            },
+        }
+        binding = BindingResolver.__new__(BindingResolver)
+        binding._config = WorkerConfig(
+            api_key="",
+            bundle_plugin_dir=str(tmp_path),
+            connector_caller_signing_key="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+            connector_endpoints=StaticConnectorEndpoints.model_validate(endpoints),
+        )
+        resolved = ResolvedDeployment(
+            agent_name="acme-dev",
+            agent_id=uuid.uuid4(),
+            version_id=uuid.uuid4(),
+            version_label="v1",
+            bundle_ref=BUNDLE_REF,
+            max_usd_per_day=5.0,
+            max_output_tokens_per_run=1000,
+        )
+        thread = f"t-{uuid.uuid4().hex[:8]}"
+        from_binding = binding.boot_env(resolved, thread)
+        assert BINDING_ENV in from_binding
+        env = {**from_binding, **_boot_env(state, thread)}
+
+        handle = _claim(worker, thread, env)
+        assert worker.turn(handle, "hello").status == SessionStatus.DONE
+
+        raw = (record / env["CURIE_SESSION_ID"]).read_bytes()
+        started = dict(item.split("=", 1) for item in raw.decode().split("\0") if item)
+        connector = {name: value for name, value in from_binding.items() if "CONNECTOR" in name}
+        expected = {BINDING_ENV, "CURIE_CONNECTOR_AGENT", "CURIE_CONNECTOR_CALLER_TOKEN"}
+        assert expected <= set(connector)
+        assert {name: started.get(name) for name in connector} == connector
+        assert json.loads(started[BINDING_ENV]) == json.loads(from_binding[BINDING_ENV])
+        assert (started[CA_FILE_ENV], started["NODE_EXTRA_CA_CERTS"]) == (ca, ca)
+        # The upload map is the runner's own derivation, never handed in.
+        assert UPLOADS_ENV not in started
+        assert worker.substrate.release(thread)
+    finally:
+        shell.stop()
