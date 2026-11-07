@@ -1352,6 +1352,17 @@
             ],
             "title": "Execution Deadline Seconds"
           },
+          "factory_slack_channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factory Slack Channel"
+          },
           "hook_partitions": {
             "anyOf": [
               {
@@ -1614,6 +1625,18 @@
               }
             ],
             "title": "Execution Deadline Seconds"
+          },
+          "factory_slack_channel": {
+            "anyOf": [
+              {
+                "pattern": "^[CG][A-Z0-9]{6,}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factory Slack Channel"
           },
           "hook_partitions": {
             "anyOf": [
@@ -4945,6 +4968,67 @@
         "title": "ClusterMessageReplyPage",
         "type": "object"
       },
+      "CodeHostLinkIn": {
+        "additionalProperties": false,
+        "description": "An operator's assertion that a principal holds one code host account (#5414).\n\nRecorded as an ``admin_mapped`` link in the host's ``github_host``\nnamespace (ADR 0198 decision 8). The account is named by its immutable id.",
+        "properties": {
+          "account_id": {
+            "pattern": "^[1-9][0-9]{0,19}$",
+            "title": "Account Id",
+            "type": "string"
+          },
+          "code_host_kind": {
+            "const": "github",
+            "title": "Code Host Kind",
+            "type": "string"
+          },
+          "created_by_principal_id": {
+            "format": "uuid",
+            "title": "Created By Principal Id",
+            "type": "string"
+          },
+          "host": {
+            "maxLength": 255,
+            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::[0-9]{1,5})?$",
+            "title": "Host",
+            "type": "string"
+          },
+          "principal_id": {
+            "format": "uuid",
+            "title": "Principal Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "principal_id",
+          "code_host_kind",
+          "host",
+          "account_id",
+          "created_by_principal_id"
+        ],
+        "title": "CodeHostLinkIn",
+        "type": "object"
+      },
+      "CodeHostLinkOut": {
+        "properties": {
+          "identity_namespace_id": {
+            "format": "uuid",
+            "title": "Identity Namespace Id",
+            "type": "string"
+          },
+          "link_id": {
+            "format": "uuid",
+            "title": "Link Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "link_id",
+          "identity_namespace_id"
+        ],
+        "title": "CodeHostLinkOut",
+        "type": "object"
+      },
       "Completed": {
         "additionalProperties": false,
         "properties": {
@@ -7101,6 +7185,139 @@
         "title": "FactoryContext",
         "type": "object"
       },
+      "FactorySlackSteerIn": {
+        "additionalProperties": false,
+        "description": "One threaded Slack mention in a factory run's root, as the worker consumed it.\n\n``receipt`` is the dispatcher's verified mention receipt\n(``curie_internal.slack_mention_receipt.SlackMentionReceipt``), validated by\nthe route so a malformed one is a refusal, not a retry. ``author`` is the\nturn's Slack user id; the receipt must name the same delivery, route and\nsender.",
+        "properties": {
+          "author": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Author",
+            "type": "string"
+          },
+          "channel": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Channel",
+            "type": "string"
+          },
+          "channel_identity": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Channel Identity",
+            "type": "string"
+          },
+          "delivery_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Delivery Id",
+            "type": "string"
+          },
+          "receipt": {
+            "additionalProperties": true,
+            "title": "Receipt",
+            "type": "object"
+          },
+          "root_ts": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Root Ts",
+            "type": "string"
+          }
+        },
+        "required": [
+          "delivery_id",
+          "channel_identity",
+          "channel",
+          "root_ts",
+          "author",
+          "receipt"
+        ],
+        "title": "FactorySlackSteerIn",
+        "type": "object"
+      },
+      "FactorySlackSteerOut": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "admitted",
+              "not_mapped",
+              "receipt_mismatch",
+              "sender_unverified",
+              "code_host_identity_missing",
+              "code_host_identity_ambiguous",
+              "code_host_identity_unsupported",
+              "code_host_mismatch",
+              "repository_mismatch",
+              "not_authorized",
+              "work_item_cancelled",
+              "lineage_closed",
+              "no_pull_request",
+              "pull_request_not_open",
+              "pull_request_branch_mismatch",
+              "authority_changed",
+              "objective_too_large",
+              "admission_refused"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "pull_request_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pull Request Url"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "replayed": {
+            "default": false,
+            "title": "Replayed",
+            "type": "boolean"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id"
+          },
+          "request_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Status"
+          }
+        },
+        "required": [
+          "outcome"
+        ],
+        "title": "FactorySlackSteerOut",
+        "type": "object"
+      },
       "FactoryWake": {
         "additionalProperties": false,
         "properties": {
@@ -8066,6 +8283,26 @@
           "reason"
         ],
         "title": "HookSupportOut",
+        "type": "object"
+      },
+      "IdentityLinkRevokedOut": {
+        "properties": {
+          "link_id": {
+            "format": "uuid",
+            "title": "Link Id",
+            "type": "string"
+          },
+          "revoked_at": {
+            "format": "date-time",
+            "title": "Revoked At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "link_id",
+          "revoked_at"
+        ],
+        "title": "IdentityLinkRevokedOut",
         "type": "object"
       },
       "IssueReadContext": {
@@ -26895,6 +27132,146 @@
         ]
       }
     },
+    "/identity/admin/{tenant_id}/code-host-links": {
+      "post": {
+        "description": "Map a principal to one GitHub account by its numeric id (#5414, ADR 0198).\n\nThe link is ``admin_mapped`` in the host's ``github_host`` namespace. A\nperson may hold several accounts; one account belongs to one active link.",
+        "operationId": "create_code_host_link_identity_admin__tenant_id__code_host_links_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CodeHostLinkIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodeHostLinkOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Code Host Link",
+        "tags": [
+          "identity-admin"
+        ]
+      }
+    },
+    "/identity/admin/{tenant_id}/links/{link_id}/revoke": {
+      "post": {
+        "description": "Revoke one link of any provider. Revocation is set once and kept.",
+        "operationId": "revoke_link_identity_admin__tenant_id__links__link_id__revoke_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "link_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Link Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentityLinkRevokedOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Link",
+        "tags": [
+          "identity-admin"
+        ]
+      }
+    },
     "/identity/admin/{tenant_id}/{resource}": {
       "get": {
         "operationId": "identity_view_identity_admin__tenant_id___resource__get",
@@ -29398,6 +29775,66 @@
         "summary": "Append Cluster Message Reply",
         "tags": [
           "internal-cluster-message-replies"
+        ]
+      }
+    },
+    "/v1/internal/factory-slack/steer": {
+      "post": {
+        "description": "Admit a revision of the run's pull request, or name why not.\n\nEvery refusal is final for the delivery and answers 200. A code host that\ncannot answer now is 503, so the worker keeps the delivery pending. A\ndatabase failure is 503 too, raised without its exception chain: the\ndriver's error carries the bound objective, which holds the Slack body.",
+        "operationId": "steer_factory_run_v1_internal_factory_slack_steer_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactorySlackSteerIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FactorySlackSteerOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Steer Factory Run",
+        "tags": [
+          "internal-factory-slack"
         ]
       }
     },

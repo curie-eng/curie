@@ -74,6 +74,8 @@ CAPABILITIES: Mapping[Operation, Support] = {
     Operation.CI_DIAGNOSTICS: Support.UNSUPPORTED,
     Operation.RERUN_FAILED: Support.UNSUPPORTED,
     Operation.USER_CAN_WRITE: Support.UNSUPPORTED,
+    # Account ids map to logins only on GitHub (ADR 0198, #5414).
+    Operation.ACCOUNT_LOGIN: Support.UNSUPPORTED,
     Operation.REQUIRED_CHECKS: Support.UNSUPPORTED,
     # UI evidence hosting is GitHub only (ADR 0197).
     Operation.STORE_EVIDENCE: Support.UNSUPPORTED,
@@ -751,6 +753,10 @@ class BitbucketDcCodeHost:
         # and omits inherited grants even then (decision 11).
         await self.ensure_version(Operation.USER_CAN_WRITE)
         raise Unsupported(Operation.USER_CAN_WRITE)
+
+    async def account_login(self, repository: RepositoryRef, account_id: str) -> str | None:
+        await self.ensure_version(Operation.ACCOUNT_LOGIN)
+        raise Unsupported(Operation.ACCOUNT_LOGIN)
 
     # Review feedback ---------------------------------------------------------
 

@@ -60,6 +60,8 @@ from .delivery_lease import DeliveryLeaseStore
 from .deploy_notice import DeployNoticeConsumer
 from .e2e_reaper import E2EReaperLoop
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
+from .factory_slack_progress import FactorySlackProgressLoop, PostgresFactorySlackStore
+from .factory_steering import FactorySteeringClient
 from .heartbeat import run_heartbeat
 from .hook_runs import HookRunRecorder
 from .hook_source_guard import CronHookSourceGuard
@@ -170,6 +172,10 @@ class Runtime:
     # one thread message per remediation stage, beside the card loop and outside
     # the consumer, the thread lock and the markers.
     remediation_receipts: RemediationReceiptLoop | None = None
+    # None unless factory Slack progress is on (#5414): posts each factory
+    # run's owed progress to its agent's Slack destination, outside the
+    # consumer, the thread lock and the markers.
+    factory_slack_progress: FactorySlackProgressLoop | None = None
     # None unless the action executor is enabled (ACTION-EXECUTOR-1). Launched
     # beside the connector reconcile loop, never inside the consumer.
     action_executor: ActionExecutorLoop | None = None
@@ -810,6 +816,9 @@ def build(
         # ADR 0100: the stored bundle is where a turn's channel read grant is
         # read from, so the kernel knows it without asking the API.
         bundles=BundleStore(config),
+        # Factory run steering (#5414): always built, so a factory run's Slack
+        # root never starts ordinary chat on any worker.
+        factory_steering=_build_factory_steering(config, engine, async_redis, client=eval_http),
     )
     owner.register_close("work-item-settlement", kernel.close, order=5)
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
@@ -939,6 +948,7 @@ def build(
         publication_loop=publication_loop,
         remediation_cards=_build_remediation_cards(config, engine, sink, card_store),
         remediation_receipts=_build_remediation_receipts(config, engine, sink),
+        factory_slack_progress=_build_factory_slack_progress(config, engine, sink),
         stream_retention=build_stream_retention(config, async_redis),
     )
 
@@ -1481,6 +1491,50 @@ def _build_remediation_receipts(
     )
 
 
+def _build_factory_steering(
+    config: WorkerConfig,
+    engine: AsyncEngine,
+    redis_client: AsyncRedis,
+    *,
+    client: httpx.AsyncClient,
+) -> FactorySteeringClient:
+    """The kernel's factory run steering client (#5414), always built.
+
+    The mapped root read needs only the database engine, so every worker
+    intercepts a factory run's Slack root and never lets it start ordinary
+    chat. A worker without the internal worker token refuses such a turn
+    locally with ``steering_unconfigured`` instead of asking the API.
+    """
+
+    return FactorySteeringClient(
+        engine=engine,
+        schema=config.db_schema,
+        redis=redis_client,
+        api_base_url=config.api_base_url,
+        worker_token=config.internal_worker_token or None,
+        client=client,
+    )
+
+
+def _build_factory_slack_progress(
+    config: WorkerConfig, engine: AsyncEngine, sink: ReplySinkRouter
+) -> FactorySlackProgressLoop | None:
+    """The factory Slack progress loop (#5414), behind the factory Slack progress switch.
+
+    Its own observed reply sink, as the remediation receipt loop has.
+    """
+
+    if not config.factory_slack_progress_enabled:
+        return None
+    return FactorySlackProgressLoop(
+        store=PostgresFactorySlackStore(
+            engine, schema=config.db_schema, lease_owner=config.consumer_name
+        ),
+        replies=ObservedReplySink(sink),
+        interval_seconds=config.factory_slack_interval_s,
+    )
+
+
 def _build_publication_loop(
     config: WorkerConfig,
     env: Mapping[str, str],
@@ -1717,6 +1771,13 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
     if getattr(rt, "remediation_receipts", None) is not None:
         tasks.append(
             launch("remediation-receipts", lambda: rt.remediation_receipts.run_forever(shutdown))  # type: ignore[union-attr]
+        )
+    if getattr(rt, "factory_slack_progress", None) is not None:
+        tasks.append(
+            launch(
+                "factory-slack-progress",
+                lambda: rt.factory_slack_progress.run_forever(shutdown),  # type: ignore[union-attr]
+            )
         )
     if sweeper is not None:
         tasks.append(launch("work-item-orphans", lambda: sweeper.run_forever(shutdown)))

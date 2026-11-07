@@ -282,6 +282,10 @@
       "value": "curie:work-item:review-feedback",
       "reason": "Canonical shared internal wire key declaration"
     },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:19": {
+      "value": "curie:slack-mention-receipt:",
+      "reason": "Canonical shared internal wire key declaration"
+    },
     "packages/curie-internal/src/curie_internal/keyspace.py:module:2": {
       "value": "curie:kill-events",
       "reason": "Canonical shared internal wire key declaration"

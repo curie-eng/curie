@@ -1450,6 +1450,17 @@ class WorkerConfig(BaseSettings):
     # The automated remediation switch (AUTOMATED-REMEDIATION-1), rendered from
     # the same chart or compose value as the API's. It requires the executor.
     remediation_enabled: bool = Field(default=False, validation_alias="CURIE_REMEDIATION_ENABLED")
+    # Factory Slack run progress (#5414). Enabled, the worker posts each factory
+    # run's owed progress to its agent's configured Slack channel. Nothing posts
+    # for an agent with no destination, so the default changes nothing. Off,
+    # this worker posts nothing; what is owed is derived from existing run
+    # records, so a worker with it on later still posts it.
+    factory_slack_progress_enabled: bool = Field(
+        default=True, validation_alias="CURIE_FACTORY_SLACK_PROGRESS_ENABLED"
+    )
+    factory_slack_interval_s: float = Field(
+        default=2.0, gt=0, validation_alias="CURIE_FACTORY_SLACK_INTERVAL_S"
+    )
     # The cron scheduler (ADR-0099, #268) is always on; this is only its tick.
     # A slot fires on the first tick at or after it, so the tick bounds lateness.
     cron_tick_interval_s: float = Field(
@@ -1613,6 +1624,12 @@ class WorkerConfig(BaseSettings):
 
     def side_effect_key(self, event_id: str) -> str:
         return f"{self.key_prefix}:sidefx:{event_id}"
+
+    def steering_sent_key(self, event_id: str) -> str:
+        # Set before a factory steering request is sent (#5414): from then on
+        # its admission may have committed with the answer lost, so no later
+        # attempt of the delivery may invite a resend.
+        return f"{self.key_prefix}:steering-sent:{event_id}"
 
     def delivery_lease_key(self, stream: str, group: str, entry_id: str) -> str:
         """The lease STRING key: the opaque owner token, TTL'd at

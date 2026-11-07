@@ -80,7 +80,11 @@ def graph_payload() -> dict[str, Any]:
         ("0145", False),
         ("0146", False),
         ("0147", False),
-        ("0148", True),
+        ("0148", False),
+        # 0149 is the factory Slack tables. The candidate minimum is 0150,
+        # the GitHub host namespaces.
+        ("0149", False),
+        ("0150", True),
         ("0000", True),
         ("future-expand", True),
     ],

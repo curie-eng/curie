@@ -174,6 +174,12 @@ class InMemoryHarness:
         self._faults = PageFaults()
         tracker_caps: dict[Operation, Support] = all_supported(TRACKER_OPERATIONS)
         code_caps: dict[Operation, Support] = all_supported(CODE_HOST_OPERATIONS)
+        # Code host account ids map to logins only on GitHub (#5414, ADR 0198).
+        # The member arrives with production; until then the in-memory host has
+        # nothing to refuse and the existing contract stays on today's operations.
+        account_login = getattr(Operation, "ACCOUNT_LOGIN", None)
+        if account_login is not None:
+            code_caps[account_login] = Support.UNSUPPORTED
         if minimal:
             tracker_caps[Operation.LINK_PULL_REQUEST] = Support.NOOP
             tracker_caps[Operation.DEPENDENCIES] = Support.NOOP
@@ -402,6 +408,19 @@ class GitHubHarness:
     def set_write_access(self, actor: Actor, allowed: bool) -> None:
         self.fake.permissions[actor.login] = (int(actor.id), "write" if allowed else "read")
 
+    def seed_account(self, account_id: str, login: str, *, payload_id: int | None = None) -> None:
+        """What `GET /user/{account_id}` answers; ``payload_id`` names another
+        account, the mismatch an id check must refuse (#5414).
+
+        Shape: https://docs.github.com/en/rest/users/users#get-a-user-using-their-id
+        """
+
+        self.fake.accounts[account_id] = {
+            "id": int(account_id) if payload_id is None else payload_id,
+            "login": login,
+            "type": "User",
+        }
+
     def feedback_allowlist(self) -> frozenset[str]:
         return frozenset()
 
@@ -506,6 +525,9 @@ class JiraGitHubHarness:
         self.tracker: Tracker = jira_fake.jira_tracker(self.jira, label=LABEL)
         self.code_host: CodeHost = self._github.code_host
         self.repository = self._github.repository
+
+    def seed_account(self, account_id: str, login: str, *, payload_id: int | None = None) -> None:
+        self._github.seed_account(account_id, login, payload_id=payload_id)
 
     def check_key(self, name: str) -> str:
         return self._github.check_key(name)

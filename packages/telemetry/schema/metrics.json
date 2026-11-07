@@ -542,6 +542,8 @@
           "/identity/resolve",
           "/identity/slack-reports",
           "/identity/admin/{tenant_id}/{resource}",
+          "/identity/admin/{tenant_id}/code-host-links",
+          "/identity/admin/{tenant_id}/links/{link_id}/revoke",
           "/directory/binding",
           "/directory/config/{tenant_id}",
           "/directory/credentials",
@@ -605,6 +607,7 @@
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/internal/work-items/issue-read/context",
+          "/v1/internal/factory-slack/steer",
           "/v1/internal/channel-read/context",
           "/v1/internal/thread-attachments/query",
           "/v1/internal/thread-attachments/append",
@@ -646,7 +649,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1656,
+      "cardinality_bound": 1680,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -776,6 +779,8 @@
           "/identity/resolve",
           "/identity/slack-reports",
           "/identity/admin/{tenant_id}/{resource}",
+          "/identity/admin/{tenant_id}/code-host-links",
+          "/identity/admin/{tenant_id}/links/{link_id}/revoke",
           "/directory/binding",
           "/directory/config/{tenant_id}",
           "/directory/credentials",
@@ -839,6 +844,7 @@
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/internal/work-items/issue-read/context",
+          "/v1/internal/factory-slack/steer",
           "/v1/internal/channel-read/context",
           "/v1/internal/thread-attachments/query",
           "/v1/internal/thread-attachments/append",
@@ -887,7 +893,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 8280,
+      "cardinality_bound": 8400,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -1017,6 +1023,8 @@
           "/identity/resolve",
           "/identity/slack-reports",
           "/identity/admin/{tenant_id}/{resource}",
+          "/identity/admin/{tenant_id}/code-host-links",
+          "/identity/admin/{tenant_id}/links/{link_id}/revoke",
           "/directory/binding",
           "/directory/config/{tenant_id}",
           "/directory/credentials",
@@ -1080,6 +1088,7 @@
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/internal/work-items/issue-read/context",
+          "/v1/internal/factory-slack/steer",
           "/v1/internal/channel-read/context",
           "/v1/internal/thread-attachments/query",
           "/v1/internal/thread-attachments/append",
@@ -1128,7 +1137,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 8280,
+      "cardinality_bound": 8400,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

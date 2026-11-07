@@ -155,6 +155,10 @@ class Agent(Base):
             "status IN ('active', 'paused', 'draining', 'retired')",
             name="agents_status_ck",
         ),
+        CheckConstraint(
+            "factory_slack_channel IS NULL OR factory_slack_channel ~ '^[CG][A-Z0-9]{6,}$'",
+            name="agents_factory_slack_channel_ck",
+        ),
         # Carries tenant_id, so the owning team must be a team of the same tenant.
         ForeignKeyConstraint(
             ["tenant_id", "owning_team_id"],
@@ -323,6 +327,15 @@ class Agent(Base):
     # agent (#1461, ADR-0167). Operator-owned; off by default. When on, the
     # worker hands the runner the binding-scoped channel memory URL.
     memory_writes: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # The one Slack channel this agent's factory runs post progress to (#5414).
+    # The posting identity is the agent's single Slack binding for that channel,
+    # checked on write. NULL posts nothing. ``factory_slack_since`` is the
+    # database time it was last set, so only runs live from then on are posted;
+    # both are cleared together.
+    factory_slack_channel: Mapped[str | None] = mapped_column(Text, default=None)
+    factory_slack_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     versions: Mapped[list[AgentVersion]] = relationship(
@@ -1421,6 +1434,85 @@ class ExecutionRequestPhaseReport(Base):
     loop_round: Mapped[int | None] = mapped_column(default=None)
     reported_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.clock_timestamp()
+    )
+
+
+class FactorySlackThread(Base):
+    """The one Slack root a WorkItem's factory progress posts into (#5414).
+
+    Bound for the WorkItem's whole life, across revisions. ``root_ts`` is NULL
+    until the root post is delivered. ``first_sequence`` is the first request
+    posted, set once at discovery and never advanced.
+    """
+
+    __tablename__ = "factory_slack_threads"
+    __table_args__ = (
+        UniqueConstraint(
+            "channel_identity", "channel", "root_ts", name="factory_slack_threads_root_key"
+        ),
+    )
+
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    channel_identity: Mapped[str] = mapped_column(Text)
+    channel: Mapped[str] = mapped_column(Text)
+    root_ts: Mapped[str | None] = mapped_column(Text, default=None)
+    first_sequence: Mapped[int] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+FACTORY_SLACK_POST_KINDS = ("root", "phase", "pull_request", "terminal")
+
+
+class FactorySlackPost(Base):
+    """One message owed to a factory Slack root, delivered at least once (#5414)."""
+
+    __tablename__ = "factory_slack_posts"
+    __table_args__ = (
+        CheckConstraint(
+            f"kind IN ({', '.join(repr(kind) for kind in FACTORY_SLACK_POST_KINDS)})",
+            name="factory_slack_posts_kind_ck",
+        ),
+        UniqueConstraint("work_item_id", "post_key", name="factory_slack_posts_post_key_key"),
+        Index(
+            "ix_factory_slack_posts_owed",
+            "work_item_id",
+            "sequence",
+            "rank",
+            "ordinal",
+            postgresql_where=text("posted_at IS NULL AND failed_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.factory_slack_threads.work_item_id", ondelete="CASCADE"),
+    )
+    post_key: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(Text)
+    sequence: Mapped[int] = mapped_column()
+    rank: Mapped[int] = mapped_column()
+    ordinal: Mapped[int] = mapped_column(BigInteger)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    posted_ref: Mapped[str | None] = mapped_column(Text, default=None)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    last_error: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
     )
 
 
@@ -3903,7 +3995,7 @@ class IdentityNamespace(Base):
     __table_args__ = (
         CheckConstraint(_PROVIDER_CK[:-1] + ", 'email')", name="identity_namespaces_provider_ck"),
         CheckConstraint(
-            "kind IN ('slack_workspace', 'email_domain', 'slack_enterprise')",
+            "kind IN ('slack_workspace', 'email_domain', 'slack_enterprise', 'github_host')",
             name="identity_namespaces_kind_ck",
         ),
         CheckConstraint(
@@ -3919,6 +4011,12 @@ class IdentityNamespace(Base):
         CheckConstraint(
             "kind <> 'slack_enterprise' OR (provider = 'slack' AND key ~ '^E[A-Z0-9]{2,}$')",
             name="identity_namespaces_slack_enterprise_key_ck",
+        ),
+        # Operator mapped GitHub accounts, one namespace per host (#5414).
+        CheckConstraint(
+            "kind <> 'github_host' OR (provider = 'github' AND authority <> '' "
+            "AND key = authority)",
+            name="identity_namespaces_github_host_key_ck",
         ),
         CheckConstraint("length(key) > 0", name="identity_namespaces_key_ck"),
         UniqueConstraint(

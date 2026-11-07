@@ -442,6 +442,9 @@ _HTTP_OPERATIONS = [
     "/identity/resolve",
     "/identity/slack-reports",
     "/identity/admin/{tenant_id}/{resource}",
+    # Operator code host links and link revocation (#5414).
+    "/identity/admin/{tenant_id}/code-host-links",
+    "/identity/admin/{tenant_id}/links/{link_id}/revoke",
     "/directory/binding",
     "/directory/config/{tenant_id}",
     "/directory/credentials",
@@ -507,6 +510,8 @@ _HTTP_OPERATIONS = [
     "/v1/internal/work-items/requests/{request_id}/termination/claim",
     "/v1/internal/work-items/requests/{request_id}/termination",
     "/v1/internal/work-items/issue-read/context",
+    # Factory Slack run steering (#5414).
+    "/v1/internal/factory-slack/steer",
     "/v1/internal/channel-read/context",
     # The thread attachment ledger (ADR 0205).
     "/v1/internal/thread-attachments/query",

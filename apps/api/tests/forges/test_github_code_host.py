@@ -51,6 +51,7 @@ from forge_fakes.github import GitHubRepositoryFake
 
 REPO = "acme-corp/acme-bot"
 REPO_ID = 4401
+OUTSIDER_REPO_ID = 4402
 BRANCH = "curie/thread-lineage-example"
 PR_URL = f"https://github.com/{REPO}/pull/123"
 REVISION_ID = uuid.UUID("44444444-4444-4444-8444-444444444444")
@@ -128,6 +129,8 @@ def _repository(settings: Settings | None = None) -> types.RepositoryRef:
 
 
 def _pull(**overrides: Any) -> dict[str, Any]:
+    # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+    # head.repo.id and base.repo.id are the repository's integer id.
     pull: dict[str, Any] = {
         "number": 123,
         "html_url": PR_URL,
@@ -135,8 +138,8 @@ def _pull(**overrides: Any) -> dict[str, Any]:
         "merged_at": None,
         "title": TITLE,
         "body": BODY,
-        "head": {"ref": BRANCH, "sha": REVISION_HEAD, "repo": {"full_name": REPO}},
-        "base": {"ref": "main", "repo": {"full_name": REPO}},
+        "head": {"ref": BRANCH, "sha": REVISION_HEAD, "repo": {"id": REPO_ID, "full_name": REPO}},
+        "base": {"ref": "main", "repo": {"id": REPO_ID, "full_name": REPO}},
     }
     pull.update(overrides)
     return pull
@@ -214,8 +217,12 @@ def test_stored_pull_number_is_the_only_identity_used_for_lineage_truth() -> Non
             json=_pull(
                 title="A human may edit this without changing identity",
                 body="Mutable prose is not a recovery key.",
-                head={"ref": BRANCH, "sha": REVISION_HEAD},
-                base={"ref": "main"},
+                head={
+                    "ref": BRANCH,
+                    "sha": REVISION_HEAD,
+                    "repo": {"id": REPO_ID, "full_name": REPO},
+                },
+                base={"ref": "main", "repo": {"id": REPO_ID, "full_name": REPO}},
             ),
         )
 
@@ -285,8 +292,12 @@ def test_enterprise_lineage_lookup_validates_the_configured_html_origin(
             200,
             json=_pull(
                 html_url=f"{returned_base}/{REPO}/pull/123",
-                head={"ref": BRANCH, "sha": REVISION_HEAD},
-                base={"ref": "main"},
+                head={
+                    "ref": BRANCH,
+                    "sha": REVISION_HEAD,
+                    "repo": {"id": REPO_ID, "full_name": REPO},
+                },
+                base={"ref": "main", "repo": {"id": REPO_ID, "full_name": REPO}},
             ),
         )
 
@@ -512,7 +523,15 @@ def test_first_pr_recovery_rejects_pull_whose_head_was_replaced() -> None:
         assert request.url.path == f"/repos/{REPO}/pulls"
         return httpx.Response(
             200,
-            json=[_pull(head={"ref": BRANCH, "sha": "c" * 40, "repo": {"full_name": REPO}})],
+            json=[
+                _pull(
+                    head={
+                        "ref": BRANCH,
+                        "sha": "c" * 40,
+                        "repo": {"id": REPO_ID, "full_name": REPO},
+                    }
+                )
+            ],
         )
 
     with pytest.raises(PullRequestRefused, match="expected commit"):
@@ -635,7 +654,7 @@ def test_recovery_posts_with_the_given_base_and_never_reads_the_repository() -> 
             return httpx.Response(
                 201,
                 json=_pull(
-                    base={"ref": body["base"], "repo": {"full_name": REPO}},
+                    base={"ref": body["base"], "repo": {"id": REPO_ID, "full_name": REPO}},
                     title=body["title"],
                     body=body["body"],
                 ),
@@ -664,7 +683,7 @@ def test_a_fork_pull_request_from_the_branch_is_never_adopted() -> None:
                     head={
                         "ref": BRANCH,
                         "sha": REVISION_HEAD,
-                        "repo": {"full_name": "outsider/acme-bot"},
+                        "repo": {"id": OUTSIDER_REPO_ID, "full_name": "outsider/acme-bot"},
                     }
                 )
             ],
@@ -712,7 +731,15 @@ def test_the_one_pull_request_listed_is_held_to_the_contract_branch() -> None:
         assert request.method == "GET", "a pull request was opened"
         return httpx.Response(
             200,
-            json=[_pull(head={"ref": "other", "sha": REVISION_HEAD, "repo": {"full_name": REPO}})],
+            json=[
+                _pull(
+                    head={
+                        "ref": "other",
+                        "sha": REVISION_HEAD,
+                        "repo": {"id": REPO_ID, "full_name": REPO},
+                    }
+                )
+            ],
         )
 
     with pytest.raises(PullRequestRefused, match="approved publication contract"):
@@ -1060,6 +1087,72 @@ def test_read_pull_request_reports_a_conflict_only_for_a_dirty_unmergeable_head(
     )
 
     assert pull.conflicted is expected
+
+
+# A captured repository id accepts only that integer on both sides.
+# https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+
+
+def _read_pull(payload: dict[str, Any]) -> types.PullRequest:
+    return _with_host(
+        lambda _request: httpx.Response(200, json=payload),
+        lambda host: host.read_pull_request(PullRequestRef(_repository(), "123")),
+    )
+
+
+def _pull_with_defect(side: str, defect: str) -> dict[str, Any]:
+    pull = _pull()
+    if defect == "repo_none":
+        pull[side] = {**pull[side], "repo": None}
+        return pull
+    repo = dict(pull[side]["repo"])
+    if defect == "missing_key":
+        del repo["id"]
+    elif defect == "null":
+        repo["id"] = None
+    elif defect == "string":
+        repo["id"] = str(REPO_ID)
+    elif defect == "boolean":
+        repo["id"] = True
+    elif defect == "float":
+        repo["id"] = 4401.0
+    elif defect == "other_int":
+        repo["id"] = OUTSIDER_REPO_ID
+    else:
+        raise AssertionError(defect)
+    pull[side] = {**pull[side], "repo": repo}
+    return pull
+
+
+@pytest.mark.parametrize("side", ["head", "base"])
+@pytest.mark.parametrize(
+    "defect",
+    ["missing_key", "null", "string", "boolean", "float", "other_int", "repo_none"],
+)
+def test_a_pull_request_without_the_captured_repository_id_is_refused(
+    side: str, defect: str
+) -> None:
+    live = _read_pull(_pull())
+    assert live.ref == PullRequestRef(_repository(), "123")
+    with pytest.raises(Unavailable, match="pull_request_mismatch"):
+        _read_pull(_pull_with_defect(side, defect))
+
+
+def test_a_path_only_repository_reads_its_pull_request_by_path() -> None:
+    """A row that predates its captured id has no id to compare (unchanged)."""
+
+    repository = repository_ref(_settings(), path=REPO, project_id=None)
+    payload = _pull()
+    base_repo = dict(payload["base"]["repo"])
+    del base_repo["id"]
+    payload["base"] = {**payload["base"], "repo": base_repo}
+    payload["head"] = {**payload["head"], "repo": None}
+    pull = _with_host(
+        lambda _request: httpx.Response(200, json=payload),
+        lambda host: host.read_pull_request(PullRequestRef(repository, "123")),
+    )
+
+    assert pull.ref.repository.project_id.startswith("path:")
 
 
 def _observe_with_pull(

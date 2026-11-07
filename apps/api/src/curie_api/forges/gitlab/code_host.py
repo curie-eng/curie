@@ -68,6 +68,8 @@ logger = logging.getLogger(__name__)
 
 CODE_HOST_CAPABILITIES: Mapping[Operation, Support] = {
     **dict.fromkeys(CODE_HOST_OPERATIONS, Support.SUPPORTED),
+    # Account ids map to logins only on GitHub (ADR 0198, #5414).
+    Operation.ACCOUNT_LOGIN: Support.UNSUPPORTED,
     Operation.REQUIRED_CHECKS: Support.UNSUPPORTED,
     # UI evidence hosting is GitHub only (ADR 0197).
     Operation.STORE_EVIDENCE: Support.UNSUPPORTED,
@@ -496,6 +498,9 @@ class GitLabCodeHost:
 
         self._project(repository)
         return await self._transport.can_write(repository.project_id, actor.id)
+
+    async def account_login(self, repository: RepositoryRef, account_id: str) -> str | None:
+        raise Unsupported(Operation.ACCOUNT_LOGIN)
 
     # Review feedback ---------------------------------------------------------------
 

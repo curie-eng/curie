@@ -277,6 +277,38 @@ def forget_delivery(self: Kernel, event_id: str) -> None:
     self._factory_work_item_events.discard(event_id)
 
 
+async def _steering_may_have_admitted(self: Kernel, event_id: str) -> bool:
+    """Whether a factory steering request of this delivery may have admitted.
+
+    Read from the durable marker the steering path writes before its request
+    is sent (#5414), so it holds on every attempt and in a replacement process.
+    Such a delivery never gets the generic notice: it invites a resend, and a
+    resend is a new delivery and so a second revision. FAIL CLOSED, like the
+    terminality read: an unreadable marker counts as set.
+    """
+    if self._factory_steering is None:
+        return False
+    try:
+        sent = await self._markers.saw_steering_sent(event_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
+        logger.warning(
+            "steering intent unreadable for event %s; skipping the not-started "
+            "notice rather than risk inviting a second revision",
+            event_id,
+            exc_info=True,
+        )
+        return True
+    if sent:
+        logger.warning(
+            "skipping the not-started notice for event %s: a factory steering "
+            "request may have admitted, and a resend would admit another",
+            event_id,
+        )
+    return sent
+
+
 async def notify_turn_not_started(
     self: Kernel, qevent: QueuedTurn, *, lease: DeliveryLease | None = None
 ) -> None:
@@ -376,6 +408,9 @@ async def notify_turn_not_started(
             "reply in place rather than promising a retry that cannot happen",
             event_id,
         )
+        return
+
+    if await self._steering_may_have_admitted(event_id):
         return
 
     if lease is not None:
@@ -485,6 +520,9 @@ async def notify_broker_entry_vanished(
             "reply in place rather than promising a retry that cannot happen",
             event_id,
         )
+        return
+
+    if await self._steering_may_have_admitted(event_id):
         return
 
     try:

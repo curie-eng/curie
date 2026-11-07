@@ -1170,6 +1170,7 @@ async def kernel_harness(
     pod_termination_wait_s: float = 0.0,
     attachment_access: object | None = None,
     recovery_factory: Callable[[object | None], object] | None = None,
+    factory_steering: object | None = None,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
     """Assemble a live kernel. @spec HTTP-INVOCATION-EXECUTION-18."""
@@ -1298,6 +1299,9 @@ async def kernel_harness(
         # The terminal recovery capture (#5143) is built over the same workspace
         # coordinator the kernel releases through; omitted, the kernel has none.
         **({"recovery": recovery_factory(workspace)} if recovery_factory is not None else {}),
+        # The factory Slack steering diversion (#5414); omitted, the kernel has
+        # none and every Slack turn takes the ordinary path.
+        **({"factory_steering": factory_steering} if factory_steering is not None else {}),
     )
     killswitch = None
     if with_killswitch:

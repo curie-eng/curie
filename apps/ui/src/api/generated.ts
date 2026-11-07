@@ -2523,6 +2523,49 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/identity/admin/{tenant_id}/code-host-links": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create Code Host Link
+         * @description Map a principal to one GitHub account by its numeric id (#5414, ADR 0198).
+         *
+         *     The link is ``admin_mapped`` in the host's ``github_host`` namespace. A
+         *     person may hold several accounts; one account belongs to one active link.
+         */
+        post: operations["create_code_host_link_identity_admin__tenant_id__code_host_links_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/admin/{tenant_id}/links/{link_id}/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revoke Link
+         * @description Revoke one link of any provider. Revocation is set once and kept.
+         */
+        post: operations["revoke_link_identity_admin__tenant_id__links__link_id__revoke_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/identity/admin/{tenant_id}/{resource}": {
         parameters: {
             query?: never;
@@ -3124,6 +3167,31 @@ export interface paths {
         put?: never;
         /** Append Cluster Message Reply */
         post: operations["append_cluster_message_reply_v1_internal_cluster_message_replies__reply_ref__post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/factory-slack/steer": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Steer Factory Run
+         * @description Admit a revision of the run's pull request, or name why not.
+         *
+         *     Every refusal is final for the delivery and answers 200. A code host that
+         *     cannot answer now is 503, so the worker keeps the delivery pending. A
+         *     database failure is 503 too, raised without its exception chain: the
+         *     driver's error carries the bound objective, which holds the Slack body.
+         */
+        post: operations["steer_factory_run_v1_internal_factory_slack_steer_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4750,6 +4818,8 @@ export interface components {
             deploy_notifications: boolean;
             /** Execution Deadline Seconds */
             execution_deadline_seconds?: number | null;
+            /** Factory Slack Channel */
+            factory_slack_channel?: string | null;
             /** Hook Partitions */
             hook_partitions: {
                 [key: string]: components["schemas"]["HookPartitionConfig"];
@@ -4847,6 +4917,8 @@ export interface components {
             deploy_notifications?: boolean | null;
             /** Execution Deadline Seconds */
             execution_deadline_seconds?: number | null;
+            /** Factory Slack Channel */
+            factory_slack_channel?: string | null;
             /** Hook Partitions */
             hook_partitions?: {
                 [key: string]: components["schemas"]["HookPartitionConfig"];
@@ -6187,6 +6259,47 @@ export interface components {
             /** Terminal */
             terminal: boolean;
         };
+        /**
+         * CodeHostLinkIn
+         * @description An operator's assertion that a principal holds one code host account (#5414).
+         *
+         *     Recorded as an ``admin_mapped`` link in the host's ``github_host``
+         *     namespace (ADR 0198 decision 8). The account is named by its immutable id.
+         */
+        CodeHostLinkIn: {
+            /** Account Id */
+            account_id: string;
+            /**
+             * Code Host Kind
+             * @constant
+             */
+            code_host_kind: "github";
+            /**
+             * Created By Principal Id
+             * Format: uuid
+             */
+            created_by_principal_id: string;
+            /** Host */
+            host: string;
+            /**
+             * Principal Id
+             * Format: uuid
+             */
+            principal_id: string;
+        };
+        /** CodeHostLinkOut */
+        CodeHostLinkOut: {
+            /**
+             * Identity Namespace Id
+             * Format: uuid
+             */
+            identity_namespace_id: string;
+            /**
+             * Link Id
+             * Format: uuid
+             */
+            link_id: string;
+        };
         /** Completed */
         Completed: {
             /** Sha256 */
@@ -7182,6 +7295,53 @@ export interface components {
              */
             tenant_id: string;
         };
+        /**
+         * FactorySlackSteerIn
+         * @description One threaded Slack mention in a factory run's root, as the worker consumed it.
+         *
+         *     ``receipt`` is the dispatcher's verified mention receipt
+         *     (``curie_internal.slack_mention_receipt.SlackMentionReceipt``), validated by
+         *     the route so a malformed one is a refusal, not a retry. ``author`` is the
+         *     turn's Slack user id; the receipt must name the same delivery, route and
+         *     sender.
+         */
+        FactorySlackSteerIn: {
+            /** Author */
+            author: string;
+            /** Channel */
+            channel: string;
+            /** Channel Identity */
+            channel_identity: string;
+            /** Delivery Id */
+            delivery_id: string;
+            /** Receipt */
+            receipt: {
+                [key: string]: unknown;
+            };
+            /** Root Ts */
+            root_ts: string;
+        };
+        /** FactorySlackSteerOut */
+        FactorySlackSteerOut: {
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "admitted" | "not_mapped" | "receipt_mismatch" | "sender_unverified" | "code_host_identity_missing" | "code_host_identity_ambiguous" | "code_host_identity_unsupported" | "code_host_mismatch" | "repository_mismatch" | "not_authorized" | "work_item_cancelled" | "lineage_closed" | "no_pull_request" | "pull_request_not_open" | "pull_request_branch_mismatch" | "authority_changed" | "objective_too_large" | "admission_refused";
+            /** Pull Request Url */
+            pull_request_url?: string | null;
+            /** Reason */
+            reason?: string | null;
+            /**
+             * Replayed
+             * @default false
+             */
+            replayed?: boolean;
+            /** Request Id */
+            request_id?: string | null;
+            /** Request Status */
+            request_status?: string | null;
+        };
         /** FactoryWake */
         FactoryWake: {
             /** Adapter */
@@ -7600,6 +7760,19 @@ export interface components {
             source_generation: string | null;
             /** Supported */
             supported: boolean;
+        };
+        /** IdentityLinkRevokedOut */
+        IdentityLinkRevokedOut: {
+            /**
+             * Link Id
+             * Format: uuid
+             */
+            link_id: string;
+            /**
+             * Revoked At
+             * Format: date-time
+             */
+            revoked_at: string;
         };
         /**
          * IssueReadContext
@@ -16480,6 +16653,77 @@ export interface operations {
             };
         };
     };
+    create_code_host_link_identity_admin__tenant_id__code_host_links_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodeHostLinkIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodeHostLinkOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    revoke_link_identity_admin__tenant_id__links__link_id__revoke_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+                link_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityLinkRevokedOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     identity_view_identity_admin__tenant_id___resource__get: {
         parameters: {
             query?: {
@@ -17760,6 +18004,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ClusterMessageReplyAck"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    steer_factory_run_v1_internal_factory_slack_steer_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorySlackSteerIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FactorySlackSteerOut"];
                 };
             };
             /** @description Validation Error */
