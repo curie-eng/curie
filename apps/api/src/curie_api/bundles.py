@@ -30,6 +30,7 @@ from plugin_format import (
     TOOL_POLICY_ENFORCEMENT,
     ApprovalPolicy,
     PluginManifest,
+    TriggerDeclaration,
     UnsupportedArchive,
     ValidationIssue,
     ValidationResult,
@@ -46,7 +47,7 @@ from plugin_format.connector_lock import (
 )
 from plugin_format.connectors import CONNECTORS_FILE, ConnectorsFile, validate_connectors
 from plugin_format.deploy_targets import DeployTargetsFile, validate_deploy_targets
-from plugin_format.validate import DEPLOY_FILE
+from plugin_format.validate import DEPLOY_FILE, load_wake_triggers
 from plugin_format.yaml_loader import safe_load_unique
 
 from curie_api.e2e_connector import (
@@ -350,6 +351,19 @@ def read_connectors(root: Path) -> ConnectorsFile:
     if errors or parsed is None:  # pragma: no cover -- validate_bundle gates this
         return ConnectorsFile()
     return parsed
+
+
+def read_manifest_wake_triggers(root: Path) -> dict[str, TriggerDeclaration]:
+    """Read required wake authority, refusing missing or malformed declarations."""
+
+    try:
+        manifest_path = resolve_manifest(bundle_root(root))
+        if manifest_path is None:
+            raise ValueError("wake declaration manifest is missing")
+        manifest = PluginManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise ValueError("wake declaration manifest could not be read") from None
+    return load_wake_triggers(manifest)
 
 
 def read_manifest_triggers(root: Path) -> list[Any]:

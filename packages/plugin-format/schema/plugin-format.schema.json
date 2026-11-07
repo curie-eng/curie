@@ -1221,7 +1221,7 @@
     },
     "TriggerDeclaration": {
       "additionalProperties": true,
-      "description": "One trigger that can wake the agent, declared in the bundle (#273/#270).\n\n``type`` is ``cron`` or ``webhook``. ``name``, ``timezone``, ``target``, and\n``prompt`` are optional. ``validate_bundle`` enforces the ADR-0099 cron shape\n(non-empty name and prompt, five-field schedule) while a webhook stays\n``{type, path}``.",
+      "description": "One trigger that can wake the agent, declared in the bundle (#273/#270).\n\n``type`` is ``cron`` or ``webhook``. ``name``, ``timezone``, ``target``, and\n``prompt`` are optional. ``validate_bundle`` enforces the ADR-0099 cron shape\nand the ADR-0274 explicit webhook wake shape. Other webhooks retain their\nexisting ``{type, path}`` contract.",
       "properties": {
         "name": {
           "anyOf": [
@@ -1298,6 +1298,11 @@
         "type": {
           "title": "Type",
           "type": "string"
+        },
+        "wake": {
+          "default": false,
+          "title": "Wake",
+          "type": "boolean"
         }
       },
       "required": [
