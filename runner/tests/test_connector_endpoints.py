@@ -425,3 +425,71 @@ def test_endpoint_identity_cannot_be_selected_by_a_caller(tmp_path: Path) -> Non
     for resolve in (derive_mcp_servers, connector_urls):
         with pytest.raises(ValueError, match="authenticated agent"):
             resolve(root, release=None, agent="acme-prod", namespace=None, endpoints=binding)
+
+
+@pytest.mark.parametrize("token", [None, "", "   "])
+def test_static_runner_boot_requires_a_caller_token(token: str | None) -> None:
+    binding = _binding(base_url="https://connectors.example.com/reviewer")
+    env = {
+        "CURIE_PLUGIN_DIR": "/bundle",
+        "CURIE_SESSION_ID": "test",
+        "CURIE_SANDBOX_ID": "test",
+        "CURIE_BUDGET": '{"max_output_tokens_per_run":100,"max_usd_per_day":1.0}',
+        "CURIE_HOSTED_CONNECTOR_ENDPOINTS": binding.model_dump_json(),
+    }
+    if token is not None:
+        env["CURIE_CONNECTOR_CALLER_TOKEN"] = token
+    with pytest.raises(ValueError, match="caller token"):
+        RunnerConfig.from_env(env)
+
+
+def test_static_runner_boot_refuses_duplicate_json_keys() -> None:
+    env = {
+        "CURIE_PLUGIN_DIR": "/bundle",
+        "CURIE_SESSION_ID": "test",
+        "CURIE_SANDBOX_ID": "test",
+        "CURIE_BUDGET": '{"max_output_tokens_per_run":100,"max_usd_per_day":1.0}',
+        "CURIE_HOSTED_CONNECTOR_ENDPOINTS": '{"version":1,"agent":"acme-dev","agent":"acme-prod","connectors":{}}',
+        "CURIE_CONNECTOR_CALLER_TOKEN": "cct.test",
+    }
+    with pytest.raises(ValueError, match="duplicate"):
+        RunnerConfig.from_env(env)
+
+
+def test_remote_connectors_in_static_mode_receive_no_platform_headers(tmp_path: Path) -> None:
+    root = _bundle(tmp_path)
+    with (root / "connectors.yaml").open("a") as output:
+        output.write("  external:\n    url: https://remote.example.com/mcp\n")
+    entries = derive_mcp_servers(
+        root,
+        **_SCOPE,
+        endpoints=_binding(base_url="https://connectors.example.com/reviewer"),
+        caller_header=True,
+        env={"CURIE_CONNECTOR_TOOL_GRANT": "ccg.test"},
+    )
+    assert entries["external"] == {"type": "http", "url": "https://remote.example.com/mcp"}
+
+
+def test_upload_urls_are_not_transferred_in_the_route_pipe(tmp_path: Path) -> None:
+    from curie_runner.route_callers import caller_launch
+
+    binding = _binding(
+        base_url="https://connectors.example.com/reviewer",
+        upload_url="https://uploads.example.com/reviewer",
+    )
+    root = _bundle(tmp_path)
+    urls = connector_urls(root, **_SCOPE, endpoints=binding)
+    launch = caller_launch(
+        {"command": "true"},
+        routes={"reviewer": {"url": urls["reviewer"], "token": "ccr.test"}},
+        source_env={},
+        lock_library="/opt/lock.so",
+        cwd=None,
+    )
+    assert json.loads(launch.routes_document) == {
+        "reviewer": {
+            "url": "https://connectors.example.com/reviewer",
+            "token": "ccr.test",
+        }
+    }
+    assert b"uploads.example.com" not in launch.routes_document

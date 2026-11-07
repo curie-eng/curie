@@ -114,3 +114,58 @@ def test_invalid_static_configuration_fails_worker_boot(
     monkeypatch.setenv("CURIE_CONNECTOR_ENDPOINTS", value)
     with pytest.raises(ValueError):
         WorkerConfig()
+
+
+def test_static_endpoints_refuse_the_action_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    _config(monkeypatch)
+    with pytest.raises(ValueError, match="static.*action executor"):
+        WorkerConfig(action_executor_enabled=True)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"version":1,"version":1,"agents":{}}',
+        '{"version":1,"agents":{"acme-dev":{},"acme-dev":{}}}',
+        '{"version":1,"agents":{"acme-dev":{"reviewer":{"base_url":"https://one.example.com","base_url":"https://two.example.com"}}}}',
+    ],
+)
+def test_duplicate_keys_are_refused_by_worker_configuration(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv("CURIE_CONNECTOR_ENDPOINTS", raw)
+    with pytest.raises(ValueError, match="duplicate"):
+        WorkerConfig()
+
+
+def test_eval_static_configuration_error_returns_a_failed_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    class UnboundAgent:
+        async def secrets_for(self, agent_id):
+            return None
+
+        async def eval_connector_settings_for(self, agent_id):
+            return None
+
+    consumer = EvalStreamConsumer.__new__(EvalStreamConsumer)
+    consumer._config = _config(monkeypatch)
+    consumer._repo_lookup = UnboundAgent()
+    item = EvalJob(
+        version_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        bundle_ref="bundles/example.zip",
+        sha="example",
+        suite="smoke",
+        requested_at="2026-01-01T00:00:00Z",
+    )
+    assert asyncio.run(
+        consumer._acquire_target(
+            item,
+            model=None,
+            reviewer_model=None,
+            thinking=None,
+        )
+    ) == (None, None, None)

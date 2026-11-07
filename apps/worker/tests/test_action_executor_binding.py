@@ -133,6 +133,7 @@ def _bindings(
     bundle: bytes | None = None,
     manifests: list[dict[str, Any]] | None = None,
     local: bool = False,
+    static_endpoints: bool = False,
 ) -> tuple[ExecutorBindings, FakeBinding]:
     binding = FakeBinding(resolved if resolved is not None else _resolved())
     source = None if local else FakeManifests(manifests or [])
@@ -142,6 +143,7 @@ def _bindings(
             bundle if bundle is not None else _bundle({"connectors.yaml": CONNECTORS_YAML})
         ),
         manifests=source,  # type: ignore[arg-type]
+        static_endpoints=static_endpoints,
         release=RELEASE,
         namespace=NAMESPACE,
         max_uncompressed_bytes=10_000_000,
@@ -247,3 +249,9 @@ async def test_an_agent_without_an_in_force_deployment_has_no_executor_boot() ->
         await bindings.executor_boot(
             str(AGENT_ID), CONNECTOR, thread_key=f"action-exec:{EXECUTION_ID}"
         )
+
+
+async def test_static_mode_never_derives_a_kubernetes_header_entry() -> None:
+    bindings, _ = _bindings(static_endpoints=True)
+    with pytest.raises(ValueError, match="static.*action executor"):
+        await bindings.executor_boot(str(AGENT_ID), CONNECTOR, thread_key="static-proof")
