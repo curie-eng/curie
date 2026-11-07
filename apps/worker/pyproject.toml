@@ -16,6 +16,8 @@ dependencies = [
     # @spec PROTECTED-HOOK-LANE-1: shared internal source/transport authority.
     "curie-protected-hooks",
     "curie-upgrade-pause",
+    # The static-pool shell wire contract (protocol constants only).
+    "curie-shell-supervisor",
     "curie-telemetry",
     "curie-channel-protocol",
     "plugin-format",

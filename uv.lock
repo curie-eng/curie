@@ -21,6 +21,7 @@ members = [
     "curie-mail-adapter",
     "curie-protected-hooks",
     "curie-runner",
+    "curie-shell-supervisor",
     "curie-telemetry",
     "curie-telemetry-schema",
     "curie-test-support",
@@ -1065,6 +1066,17 @@ requires-dist = [
 ]
 
 [[package]]
+name = "curie-shell-supervisor"
+version = "0.0.0"
+source = { editable = "packages/shell-supervisor" }
+dependencies = [
+    { name = "aiohttp" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "aiohttp", specifier = ">=3.11" }]
+
+[[package]]
 name = "curie-telemetry"
 version = "0.0.0"
 source = { editable = "packages/telemetry" }
@@ -1139,6 +1151,7 @@ dependencies = [
     { name = "curie-e2e-connector" },
     { name = "curie-internal" },
     { name = "curie-protected-hooks" },
+    { name = "curie-shell-supervisor" },
     { name = "curie-telemetry" },
     { name = "curie-upgrade-pause" },
     { name = "httpx" },
@@ -1166,6 +1179,7 @@ requires-dist = [
     { name = "curie-e2e-connector", editable = "apps/e2e-connector" },
     { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-protected-hooks", editable = "packages/protected-hooks" },
+    { name = "curie-shell-supervisor", editable = "packages/shell-supervisor" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "curie-upgrade-pause", editable = "packages/upgrade-pause" },
     { name = "httpx", specifier = ">=0.28" },
@@ -1196,6 +1210,7 @@ dependencies = [
     { name = "curie-mail-adapter" },
     { name = "curie-protected-hooks" },
     { name = "curie-runner" },
+    { name = "curie-shell-supervisor" },
     { name = "curie-telemetry" },
     { name = "curie-telemetry-schema" },
     { name = "curie-upgrade-pause" },
@@ -1233,6 +1248,7 @@ requires-dist = [
     { name = "curie-mail-adapter", editable = "apps/mail-adapter" },
     { name = "curie-protected-hooks", editable = "packages/protected-hooks" },
     { name = "curie-runner", editable = "runner" },
+    { name = "curie-shell-supervisor", editable = "packages/shell-supervisor" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "curie-telemetry-schema", editable = "packages/telemetry-schema" },
     { name = "curie-upgrade-pause", editable = "packages/upgrade-pause" },
