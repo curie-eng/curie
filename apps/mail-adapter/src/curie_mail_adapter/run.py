@@ -118,8 +118,8 @@ def main() -> None:
         try:
             adapter = MailAdapter(config, provider=provider)
         except RuntimeError as error:
-            # The state file belongs to another provider: ids from two mail
-            # services must never mix, so this is a configuration error.
+            # The state file belongs to another provider, or exclusive WAL found
+            # another process already holding it. Either way this is a boot error.
             logger.error("%s", error)
             raise SystemExit(1) from error
         server = make_server(adapter, config.port)

@@ -89,6 +89,8 @@ the enforceable-rule summary.
   Every poller and egress transaction uses the adapter-owned lock. Adding a
   second replica or changing `Recreate` to rolling update creates two writers;
   horizontal scale needs a separately accepted shared-store design.
+  `CURIE_MAIL_EXCLUSIVE_WAL` (default off) is the single-process network-volume
+  opt-in: exclusive locking before the first WAL access, still one writer.
 
 ## Inbound gate
 

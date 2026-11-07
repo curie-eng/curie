@@ -2831,6 +2831,15 @@ credentials or a platform database credential. Back up with a storage snapshot
 that is consistent for SQLite, or stop the Deployment before copying the file.
 Restore the claim before starting the writer.
 
+That claim is local single-writer storage. A network filesystem is a different
+deployment: set `CURIE_MAIL_EXCLUSIVE_WAL=true` so the process takes SQLite
+exclusive locking before it touches the WAL, and still run one replica with
+stop-before-start. Give that adapter its own access point, mount it as the
+process UID, and encrypt the mount. Backups on that volume follow the same
+rule, a stopped adapter or a consistent SQLite backup. EFS locking and crash
+recovery still need qualification on real tasks. The chart does not set the
+variable. See the mail adapter README for the process contract.
+
 A disposable synthetic restore of postgres records, immutable bundle objects,
 that SQLite delivery state, and a Valkey dump is `curie dev restore-drill`
 (#2427). It uses those existing export/restore mechanisms, requires operator

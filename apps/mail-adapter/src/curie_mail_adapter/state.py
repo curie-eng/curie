@@ -4,6 +4,11 @@ The chart deliberately runs one adapter replica on one RWO volume.  This module
 keeps that ownership boundary explicit: one SQLite connection, one re-entrant
 lock, and short transactions around every state transition.  Provider and
 platform network calls never run while the lock is held.
+
+``exclusive_wal`` (``CURIE_MAIL_EXCLUSIVE_WAL``) is the opt-in for one process
+whose file is on a network filesystem. It sets ``locking_mode=EXCLUSIVE`` before
+the first WAL access, so SQLite does not create a shared-memory wal index
+(https://www.sqlite.org/wal.html#use_of_wal_without_shared_memory). Default off.
 """
 
 from __future__ import annotations
@@ -52,6 +57,16 @@ EventClaim = Literal["claimed", "busy", "done", "deleted"]
 ApprovalRefState = Literal["live", "answered", "settling", "spent"]
 
 
+def _refuse_if_held(error: sqlite3.OperationalError, path: Path) -> None:
+    """Turn a lock conflict into a boot refusal. Any other SQLite error stays as it is."""
+    if error.sqlite_errorcode not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        return
+    raise RuntimeError(
+        f"mail state {path} is already held by another process; "
+        "CURIE_MAIL_EXCLUSIVE_WAL allows one owner and refuses to start"
+    ) from error
+
+
 class MailState:
     """The adapter's serialized SQLite owner."""
 
@@ -63,10 +78,12 @@ class MailState:
         max_bytes: int,
         terminal_completion_max: int | None = None,
         enforce_size: bool = True,
+        exclusive_wal: bool = False,
     ) -> None:
         self.path = Path(path)
         self.max_pending = max_pending
         self.max_bytes = max_bytes
+        self.exclusive_wal = exclusive_wal
         self.lock = threading.RLock()
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if enforce_size and self.path.exists() and self.path.stat().st_size > max_bytes:
@@ -77,62 +94,96 @@ class MailState:
             )
         self.connection = sqlite3.connect(
             self.path,
-            timeout=30.0,
+            timeout=0.0 if exclusive_wal else 30.0,
             isolation_level=None,
             check_same_thread=False,
         )
-        os.chmod(self.path, 0o600)
-        with self.lock:
-            self.connection.execute("PRAGMA busy_timeout=30000")
-            self.connection.execute("PRAGMA journal_mode=WAL")
-            self.connection.execute("PRAGMA synchronous=FULL")
-            self.connection.execute("PRAGMA foreign_keys=ON")
-            for suffix in ("-wal", "-shm"):
-                companion = Path(f"{self.path}{suffix}")
-                if companion.exists():
-                    os.chmod(companion, 0o600)
-            version = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
-            if version > SCHEMA_VERSION:
-                self.connection.close()
-                raise RuntimeError(
-                    f"mail state schema {version} is newer than supported {SCHEMA_VERSION}; "
-                    "refusing to start"
+        try:
+            os.chmod(self.path, 0o600)
+            with self.lock:
+                if exclusive_wal:
+                    self.connection.execute("PRAGMA busy_timeout=0")
+                    self.connection.execute("PRAGMA locking_mode=EXCLUSIVE")
+                else:
+                    self.connection.execute("PRAGMA busy_timeout=30000")
+                try:
+                    journal = self.connection.execute("PRAGMA journal_mode=WAL").fetchone()
+                except sqlite3.OperationalError as error:
+                    if exclusive_wal:
+                        _refuse_if_held(error, self.path)
+                    raise
+                self.connection.execute("PRAGMA synchronous=FULL")
+                self.connection.execute("PRAGMA foreign_keys=ON")
+                if exclusive_wal:
+                    self._require_exclusive_wal(journal)
+                    self.connection.execute("PRAGMA busy_timeout=30000")
+                for suffix in ("-wal", "-shm"):
+                    companion = Path(f"{self.path}{suffix}")
+                    if companion.exists():
+                        os.chmod(companion, 0o600)
+                version = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
+                if version > SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"mail state schema {version} is newer than supported {SCHEMA_VERSION}; "
+                        "refusing to start"
+                    )
+                self._migrate(version)
+                page_size = int(self.connection.execute("PRAGMA page_size").fetchone()[0])
+                page_count = int(self.connection.execute("PRAGMA page_count").fetchone()[0])
+                # A terminal receipt is deliberately tiny, but it still consumes a
+                # b-tree slot. Bound those receipts by both a fixed ceiling and a
+                # fraction of the configured page budget so rejected public-mailbox
+                # traffic cannot claim the journal needed by live deliveries.
+                self.terminal_receipt_max = max(
+                    8,
+                    min(TERMINAL_RECEIPT_MAX, max(1, max_bytes // page_size) // 4),
                 )
-            self._migrate(version)
-            page_size = int(self.connection.execute("PRAGMA page_size").fetchone()[0])
-            page_count = int(self.connection.execute("PRAGMA page_count").fetchone()[0])
-            # A terminal receipt is deliberately tiny, but it still consumes a
-            # b-tree slot. Bound those receipts by both a fixed ceiling and a
-            # fraction of the configured page budget so rejected public-mailbox
-            # traffic cannot claim the journal needed by live deliveries.
-            self.terminal_receipt_max = max(
-                8,
-                min(TERMINAL_RECEIPT_MAX, max(1, max_bytes // page_size) // 4),
-            )
-            derived_completion_max = max(
-                8,
-                min(TERMINAL_COMPLETION_MAX, max(1, max_bytes // page_size) // 4),
-            )
-            self.terminal_completion_max = (
-                derived_completion_max
-                if terminal_completion_max is None
-                else max(0, int(terminal_completion_max))
-            )
-            page_limit = max(page_count, max_bytes // page_size)
-            self.connection.execute(f"PRAGMA max_page_count={page_limit}")
-            # A replacement is the sole writer. A lease left behind by SIGKILL
-            # cannot still have an owner, so reclaim it immediately on open.
-            self.connection.execute(
-                "UPDATE completion_events SET lease_owner=NULL, lease_until=NULL WHERE delivered=0"
-            )
+                derived_completion_max = max(
+                    8,
+                    min(TERMINAL_COMPLETION_MAX, max(1, max_bytes // page_size) // 4),
+                )
+                self.terminal_completion_max = (
+                    derived_completion_max
+                    if terminal_completion_max is None
+                    else max(0, int(terminal_completion_max))
+                )
+                page_limit = max(page_count, max_bytes // page_size)
+                self.connection.execute(f"PRAGMA max_page_count={page_limit}")
+                # A replacement is the sole writer. A lease left behind by SIGKILL
+                # cannot still have an owner, so reclaim it immediately on open.
+                self.connection.execute(
+                    "UPDATE completion_events SET lease_owner=NULL, lease_until=NULL "
+                    "WHERE delivered=0"
+                )
+                self.connection.execute("BEGIN IMMEDIATE")
+                try:
+                    self._compact_terminal_completions(self.connection)
+                    self.connection.commit()
+                except BaseException:
+                    if self.connection.in_transaction:
+                        self.connection.rollback()
+                    raise
+        except BaseException:
+            self.connection.close()
+            raise
+
+    def _require_exclusive_wal(self, journal: tuple[Any, ...] | None) -> None:
+        """Force the exclusive lock, then refuse unless WAL and that lock stuck."""
+        try:
             self.connection.execute("BEGIN IMMEDIATE")
-            try:
-                self._compact_terminal_completions(self.connection)
-                self.connection.commit()
-            except BaseException:
-                if self.connection.in_transaction:
-                    self.connection.rollback()
-                raise
+            self.connection.commit()
+        except sqlite3.OperationalError as error:
+            _refuse_if_held(error, self.path)
+            raise
+        locking = self.connection.execute("PRAGMA locking_mode").fetchone()
+        seen = self.connection.execute("PRAGMA journal_mode").fetchone()
+        if journal == ("wal",) and seen == ("wal",) and locking == ("exclusive",):
+            return
+        raise RuntimeError(
+            f"mail state {self.path} did not hold exclusive WAL "
+            f"(journal_mode={None if seen is None else seen[0]}, "
+            f"locking_mode={None if locking is None else locking[0]}); refusing to start"
+        )
 
     def _migrate(self, version: int) -> None:
         if version == 0:

@@ -25,6 +25,7 @@ Env mapping:
     CURIE_MAIL_INGRESS_RETRY_DELAY_SECONDS  -> ingress_retry_delay_seconds
     CURIE_MAIL_PORT                         -> port
     CURIE_MAIL_STATE_PATH                   -> state_path
+    CURIE_MAIL_EXCLUSIVE_WAL                -> exclusive_wal
     CURIE_MAIL_MAX_PENDING_DELIVERIES       -> max_pending_deliveries
     CURIE_MAIL_MAX_BODY_BYTES               -> max_body_bytes
     CURIE_MAIL_MAX_REPLY_BYTES              -> max_reply_bytes
@@ -131,6 +132,8 @@ class MailAdapterConfig(BaseSettings):
         default="/var/lib/curie-mail/state.sqlite3",
         validation_alias="CURIE_MAIL_STATE_PATH",
     )
+    # One process on a network volume. Default off keeps normal WAL locking.
+    exclusive_wal: bool = Field(default=False, validation_alias="CURIE_MAIL_EXCLUSIVE_WAL")
     max_pending_deliveries: int = Field(
         default=1000, validation_alias="CURIE_MAIL_MAX_PENDING_DELIVERIES"
     )

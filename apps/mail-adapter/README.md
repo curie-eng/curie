@@ -229,6 +229,7 @@ stray generic `PORT` or `POLL_INTERVAL` in the pod environment cannot reach one.
 | `CURIE_MAIL_INGRESS_RETRY_DELAY_SECONDS` | `2.0` | base delay between those attempts; 429 may extend it with `Retry-After` |
 | `CURIE_MAIL_PORT` | `8080` | port the egress server binds |
 | `CURIE_MAIL_STATE_PATH` | `/var/lib/curie-mail/state.sqlite3` | local SQLite delivery-state file. The chart mounts it on a RWO PVC |
+| `CURIE_MAIL_EXCLUSIVE_WAL` | `false` | opt in for one process whose SQLite file is on a network filesystem. Sets `locking_mode=EXCLUSIVE` before the first WAL access so the journal does not use shared memory, keeps `journal_mode=WAL` and `synchronous=FULL`, and refuses to start if another process already holds the file. Default `false` keeps normal WAL locking |
 | `CURIE_MAIL_MAX_PENDING_DELIVERIES` | `1000` | maximum unresolved inbound deliveries admitted to SQLite; capacity refusal leaves provider mail recoverable |
 | `CURIE_MAIL_MAX_BODY_BYTES` | `1048576` | maximum provider message body read or stored, in bytes |
 | `CURIE_MAIL_MAX_REPLY_BYTES` | `1048576` | maximum accumulated outbound reply, in bytes |
@@ -455,6 +456,26 @@ python -m curie_mail_adapter recover --state /path/to/copy.sqlite3
 Do not point recover at a live writer. The command compacts terminal
 completions, VACUUMs the copy, and exits 0 only when the file is under the byte
 budget.
+
+### Network volume
+
+`CURIE_MAIL_EXCLUSIVE_WAL=true` is for a single adapter process whose SQLite
+file sits on a network filesystem. Normal WAL keeps its index in shared memory,
+which that filesystem does not provide. Exclusive locking set before the first
+WAL access skips the index. SQLite documents this in the "Use of WAL without
+shared memory" section of its WAL page. The mode still uses `journal_mode=WAL`
+and `synchronous=FULL`, and a second opener fails closed at boot.
+
+1. Give each adapter its own network-volume access point. Do not share one access point between adapters.
+2. Mount it with the same UID the process runs as.
+3. Encrypt the mount.
+4. Run one replica.
+5. Stop the old process before starting the new one.
+6. Back up only from a stopped adapter, or with a consistent SQLite backup. Copying the live file is not a backup.
+7. Locking and crash recovery on EFS still need qualification on real tasks. A local disk test shows the process contract only.
+
+The chart keeps one `Recreate` replica on a ReadWriteOnce volume and does not
+set this variable, so a chart install stays on normal WAL locking.
 
 ## Run it
 

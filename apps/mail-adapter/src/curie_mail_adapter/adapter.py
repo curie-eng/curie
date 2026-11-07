@@ -161,7 +161,8 @@ class MailAdapter:
             provider: the mail provider; defaults to AgentMail over ``client``.
 
         Raises:
-            RuntimeError: the state file belongs to another provider.
+            RuntimeError: the state file belongs to another provider, or
+                exclusive WAL found another process already holding it.
         """
         self.config = config
         # The email receiver this adapter signs for (ADR 0260), or None to post
@@ -185,6 +186,7 @@ class MailAdapter:
             config.state_path,
             max_pending=config.max_pending_deliveries,
             max_bytes=config.max_state_bytes,
+            exclusive_wal=config.exclusive_wal,
         )
         try:
             self.state.bind_provider(self.provider.name)
