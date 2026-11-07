@@ -9,6 +9,7 @@ signature withheld.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -233,3 +234,133 @@ def test_down_removes_paths_that_were_absent_and_keeps_other_changes() -> None:
         "connectorCaller": {"signingKey": "operator-seed"},
     }
     assert current["worker"]["adapterCredentials"]["identity-e2e"] == "synthetic"
+
+
+class _OrderTarget:
+    """A target that records every operation `up` performs, in order."""
+
+    release = "rel"
+    namespace = "ns"
+    context = "kind-synthetic"
+    fullname = "rel-curie"
+    chart = Path("chart")
+
+    def __init__(self) -> None:
+        self.ops: list[tuple[str, Any]] = []
+        self.values: dict[str, Any] = {}
+        self.private_config = ""
+        self.deployed_with: list[Any] = []
+
+    def api_image(self) -> str:
+        return "registry.example.test/curie-api:candidate"
+
+    def component(self, component: str) -> str:
+        return f"rel-curie-{component}"
+
+    def kubectl(self, *args: str, **_kwargs: Any) -> Any:
+        self.ops.append(("kubectl", args[0]))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def rollout(self, *deployments: str, restart: bool = False, timeout: str = "600s") -> None:
+        self.ops.append(("rollout", (deployments, restart)))
+
+    def helm_values(self) -> dict[str, Any]:
+        return json.loads(json.dumps(self.values))
+
+    def helm(self, *args: str, **_kwargs: Any) -> Any:
+        assert args[0] == "upgrade"
+        overlay = json.loads(Path(args[args.index("-f") + 1]).read_text())
+        self.ops.append(("helm", overlay))
+        _merge(self.values, overlay)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def pod_python(self, _script: str, _params: Any) -> Any:
+        self.ops.append(("pod_python", None))
+        return {"created_row": False, "previous": None}
+
+    def sql(self, *statements: Any) -> list[Any]:
+        self.ops.append(("sql", None))
+        if "DISTINCT tenant_id" in statements[0][0]:
+            return [[{"tenant_id": TENANT}]]
+        return [[{"id": str(uuid.uuid4())}]]
+
+    def curie(self, *args: str, **_kwargs: Any) -> Any:
+        agent = args[args.index("--agent") + 1]
+        self.ops.append(("deploy", agent))
+        self.deployed_with.append(self.helm_values().get("connectorCaller"))
+        return subprocess.CompletedProcess(args, 0, "{}", "")
+
+
+def _merge(into: dict[str, Any], overlay: dict[str, Any]) -> None:
+    for key, value in overlay.items():
+        if isinstance(value, dict):
+            _merge(into.setdefault(key, {}), value)
+        else:
+            into[key] = value
+
+
+class _OrderApi:
+    def __init__(self, target: _OrderTarget) -> None:
+        self._target = target
+
+    def agents(self) -> dict[str, dict[str, Any]]:
+        deployed = [op[1] for op in self._target.ops if op[0] == "deploy"]
+        return {name: {"id": str(uuid.uuid4()), "name": name} for name in deployed}
+
+    def ok(self, method: str, path: str, body: Any = None) -> Any:
+        return {"version": 1}
+
+    def mint_channel_token(self, address: str) -> dict[str, Any]:
+        return {"token": "synthetic-channel-value", "expires_at": 2_000_000_000}
+
+
+def test_up_sets_the_caller_key_pair_and_rolls_the_api_before_deploying_any_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed, verify = "synthetic-" + "s" * 12, "synthetic-" + "v" * 12
+
+    def fake_certificates(directory: Path, hosts: Any) -> None:
+        for name in ("ca.pem", "server.pem", "server.key"):
+            (directory / name).write_bytes(b"synthetic")
+
+    monkeypatch.setattr(harness, "make_certificates", fake_certificates)
+    monkeypatch.setattr(harness, "ed25519_pair", lambda _directory: (seed, verify))
+    target = _OrderTarget()
+    monkeypatch.setattr(
+        harness.Harness,
+        "api",
+        contextlib.contextmanager(lambda self: (yield _OrderApi(target))),
+    )
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    subject = harness.Harness(target, harness.State(tmp_path / "state"))  # type: ignore[arg-type]
+
+    subject.up(["agent-a", "agent-b"], bundle, assets.DEFAULT_ROSTER)
+
+    ops = target.ops
+    first_deploy = next(i for i, op in enumerate(ops) if op[0] == "deploy")
+    assert [op[1] for op in ops if op[0] == "deploy"] == ["agent-a", "agent-b"]
+
+    def sets_pair(overlay: dict[str, Any]) -> bool:
+        caller = overlay.get("connectorCaller", {})
+        return caller.get("signingKey") == seed and caller.get("verifyKey") == verify
+
+    pair_upgrades = [i for i, op in enumerate(ops) if op[0] == "helm" and sets_pair(op[1])]
+    assert pair_upgrades, "no helm upgrade set the caller key pair"
+    assert pair_upgrades[0] < first_deploy
+    # The API (the verifier of the worker's tokens) rolled to the pair first.
+    rolled = [
+        i
+        for i, op in enumerate(ops)
+        if op[0] == "rollout" and "rel-curie-api" in op[1][0] and i > pair_upgrades[0]
+    ]
+    assert rolled and rolled[0] < first_deploy
+    # Every agent was deployed while the release already carried the pair.
+    assert target.deployed_with == [{"signingKey": seed, "verifyKey": verify}] * 2
+    # No later upgrade (the runtime-document overlay) changes the pair again.
+    for op in ops[pair_upgrades[0] + 1 :]:
+        if op[0] == "helm":
+            caller = op[1].get("connectorCaller", {})
+            assert caller.get("signingKey", seed) == seed
+            assert caller.get("verifyKey", verify) == verify
+    assert target.values["connectorCaller"] == {"signingKey": seed, "verifyKey": verify}

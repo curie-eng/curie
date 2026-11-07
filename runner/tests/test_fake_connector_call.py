@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 import anyio
+import httpx
 import pytest
 import uvicorn
 from aci_protocol import Event
@@ -47,6 +48,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from curie_runner.connectors import CALLER_HEADER
 from curie_runner import fake as fake_module
+from curie_runner import mcp_tool_capability as capability
 from curie_runner.fake import FakeModelSession, default_turn
 from curie_runner.otel import RunTracer
 from curie_runner.session import SessionRunner
@@ -564,3 +566,118 @@ def test_a_session_without_connector_servers_keeps_the_default_turn() -> None:
         return await _session_turn(FakeModelSession(), "hello")
 
     assert anyio.run(go) == default_turn()
+
+
+# --------------------------------------------------------------------------- #
+# A transport failure before the server answered is retried (<= 3 dials)
+# --------------------------------------------------------------------------- #
+
+_TRANSPORT_FAILURES = [
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    ConnectionResetError,
+    socket.gaierror,
+]
+
+
+def _count_dials(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fail_first: int,
+    failure: type[BaseException] = httpx.ConnectError,
+) -> list[int]:
+    """Count every transport open; the first ``fail_first`` raise ``failure``.
+
+    The wrapper replaces ``server_streams`` wherever the dial could look it up
+    (the fake's own import, the shared module, and the probe's private alias),
+    so the count holds however the retry is arranged. Later opens go to the
+    real transport. Back-off sleeps are skipped so no test waits.
+    """
+
+    real = capability.server_streams
+    dials: list[int] = []
+
+    @asynccontextmanager
+    async def counting(
+        config: Mapping[str, Any], *, plugin_dir: Any, inherited_env: Mapping[str, str]
+    ) -> AsyncIterator[tuple[Any, Any]]:
+        dials.append(1)
+        if len(dials) <= fail_first:
+            raise failure("simulated transport failure before the server answered")
+        async with real(config, plugin_dir=plugin_dir, inherited_env=inherited_env) as streams:
+            yield streams
+
+    for module, name in (
+        (fake_module, "server_streams"),
+        (capability, "server_streams"),
+        (capability, "_server_streams"),
+    ):
+        if hasattr(module, name):
+            monkeypatch.setattr(module, name, counting)
+
+    async def no_sleep(_delay: float = 0, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(anyio, "sleep", no_sleep)
+    return dials
+
+
+# @spec CONNECTOR-REQUESTER-2
+def test_a_first_dial_that_fails_at_the_transport_is_retried_and_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _mcp_connector("paired") as stub:
+        dials = _count_dials(monkeypatch, fail_first=1)
+        session = FakeModelSession(connector_servers={"weather": _server_config(stub.url)})
+
+        async def go() -> dict[str, Any]:
+            _raw, final = await _runner_turn(session, _prompt())
+            return final
+
+        final = anyio.run(go)
+        assert final["status"] == "done"
+        assert _call_lines(final["text"]) == [_ok("weather", _tool_count("paired"))]
+        assert len(dials) == 2
+        # The failed attempt never reached the server, so the server saw one
+        # clean handshake, not two.
+        methods = stub.methods()
+        assert methods.count("initialize") == 1
+        assert methods.count("tools/list") == 1
+        _assert_every_request_carried(stub, _CALLER_VALUE)
+
+
+# @spec CONNECTOR-REQUESTER-2
+def test_a_refusing_proxy_is_dialed_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = json.dumps(_refusal_body("invalid")).encode("utf-8")
+    dials = _count_dials(monkeypatch, fail_first=0)
+
+    async def go() -> tuple[dict[str, Any], _Stub]:
+        async with _refusing_proxy(_REFUSAL["status"], body, _REFUSAL["content_type"]) as stub:
+            session = FakeModelSession(connector_servers={"weather": _server_config(stub.url)})
+            _raw, final = await _runner_turn(session, _prompt())
+        return final, stub
+
+    final, stub = anyio.run(go)
+    assert final["status"] == "done"
+    assert _call_lines(final["text"]) == [_failed("weather", "invalid")]
+    assert len(dials) == 1
+    assert len(stub.http) == 1
+
+
+# @spec CONNECTOR-REQUESTER-2
+@pytest.mark.parametrize("failure", _TRANSPORT_FAILURES, ids=lambda f: f.__name__)
+def test_a_permanently_unreachable_connector_is_dialed_three_times_then_reported(
+    monkeypatch: pytest.MonkeyPatch, failure: type[BaseException]
+) -> None:
+    dials = _count_dials(monkeypatch, fail_first=10_000, failure=failure)
+    url = f"http://127.0.0.1:{_closed_port()}/mcp"
+    session = FakeModelSession(connector_servers={"weather": _server_config(url)})
+
+    async def go() -> dict[str, Any]:
+        _raw, final = await _runner_turn(session, _prompt())
+        return final
+
+    final = anyio.run(go)
+    assert final["status"] == "done"
+    assert _call_lines(final["text"]) == [_failed("weather", failure.__name__)]
+    assert len(dials) == 3
