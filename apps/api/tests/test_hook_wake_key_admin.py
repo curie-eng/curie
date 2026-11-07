@@ -32,7 +32,6 @@ from _hook_wake_support import (
     assert_queued,
     assert_refused,
     drive,
-    generation_column_max,
     get_bundle_object,
     hook_runs,
     put_bundle_object,
@@ -284,8 +283,11 @@ def test_wake_secret_admin_refuses_a_configured_source(wake_db: str, kind: str) 
 def test_wake_secret_rotation_at_the_stored_maximum_is_exhausted(wake_db: str) -> None:
     async def scenario() -> None:
         async with wake_app() as ctx:
-            maximum = await generation_column_max(ctx.app)
-            await seed_generation(ctx.app, ctx.agent_id, WAKE, maximum)
+            maximum = 2**63 - 1  # the contract's bound, not read from the code under test
+            await seed_generation(ctx.app, ctx.agent_id, WAKE, maximum - 1)
+            rotated = await admin(ctx, "rotate")
+            assert rotated.status_code == 200, rotated.text
+            assert rotated.json() == {"agent_id": ctx.agent_id, "hook": WAKE, "generation": maximum}
             current = await admin(ctx, "read")
             assert current.status_code == 200, current.text
             assert current.json()["generation"] == maximum

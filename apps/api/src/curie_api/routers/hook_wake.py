@@ -71,7 +71,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from redis.exceptions import ResponseError
 from sqlalchemy import TextClause, select, text
-from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -112,9 +112,6 @@ _ENQUEUE = "wake_enqueue_unavailable"
 _EXHAUSTED = "wake_generation_exhausted"
 
 _NO_STORE = {"Cache-Control": "no-store"}
-
-# Postgres numeric_value_out_of_range.
-_OUT_OF_RANGE = "22003"
 
 # The statements below repeat ``hook_fire``'s, which this module may not import
 # (``scripts/check-private-imports.py``). The in-force rule is the platform's
@@ -186,15 +183,14 @@ WHERE agent_id = :agent_id AND name = :name
 RETURNING id, slot_utc
 """
 
-# Absent metadata is generation 1, so the first rotation writes 2. The bound is
-# cast because an INTEGER column would otherwise type the parameter as int4,
-# which cannot carry the contract's 2^63-1.
+# Absent metadata is generation 1, so the first rotation writes 2. The guard
+# refuses rotation at the maximum generation without mutation.
 _ROTATE_SQL = """
 INSERT INTO {schema}.hook_wake_keys (agent_id, hook, generation)
 VALUES (:agent_id, :hook, 2)
 ON CONFLICT (agent_id, hook) DO UPDATE
 SET generation = hook_wake_keys.generation + 1, updated_at = now()
-WHERE hook_wake_keys.generation < CAST(:max AS bigint)
+WHERE hook_wake_keys.generation < :max
 RETURNING generation
 """
 
@@ -602,16 +598,6 @@ async def _admin_target(request: Request, raw_agent: str, hook: str) -> tuple[st
     return agent_id, uuid.UUID(agent_id)
 
 
-def _out_of_range(exc: DBAPIError) -> bool:
-    """Whether the driver reported numeric_value_out_of_range (SQLSTATE 22003)."""
-
-    orig = exc.orig
-    return any(
-        getattr(candidate, "sqlstate", None) == _OUT_OF_RANGE
-        for candidate in (orig, getattr(orig, "__cause__", None))
-    )
-
-
 @admin_router.get(
     "/{agent_id}/hooks/{hook}/wake-secret",
     response_model=HookWakeSecretOut,
@@ -669,27 +655,20 @@ async def rotate_wake_secret(
             await _declaration(session, store, agent_uuid, hook)
             await _require_ordinary(session, held, agent_uuid, hook)
             await session.commit()
-            try:
-                async with session.begin():
-                    await session.execute(_sql(_LOCK_SQL), {"agent_id": canonical, "name": hook})
-                    await _require_ordinary(session, held, agent_uuid, hook)
-                    await ensure_source_gate_live(held)
-                    generation = await session.scalar(
-                        _sql(_ROTATE_SQL),
-                        {
-                            "agent_id": agent_uuid,
-                            "hook": hook,
-                            "max": hook_wake_signing.MAX_GENERATION,
-                        },
-                    )
-                    if generation is None:
-                        raise _Refusal(status.HTTP_503_SERVICE_UNAVAILABLE, _EXHAUSTED)
-            except DBAPIError as exc:
-                # The INTEGER column overflows before the contract's 2^63-1 bound;
-                # that is the same exhaustion, and the rollback mutated nothing.
-                if _out_of_range(exc):
-                    raise _Refusal(status.HTTP_503_SERVICE_UNAVAILABLE, _EXHAUSTED) from None
-                raise
+            async with session.begin():
+                await session.execute(_sql(_LOCK_SQL), {"agent_id": canonical, "name": hook})
+                await _require_ordinary(session, held, agent_uuid, hook)
+                await ensure_source_gate_live(held)
+                generation = await session.scalar(
+                    _sql(_ROTATE_SQL),
+                    {
+                        "agent_id": agent_uuid,
+                        "hook": hook,
+                        "max": hook_wake_signing.MAX_GENERATION,
+                    },
+                )
+                if generation is None:
+                    raise _Refusal(status.HTTP_503_SERVICE_UNAVAILABLE, _EXHAUSTED)
         out = HookWakeRotationOut(agent_id=canonical, hook=hook, generation=generation)
         return _answer(status.HTTP_200_OK, out, no_store=True)
     except _Refusal as refusal:

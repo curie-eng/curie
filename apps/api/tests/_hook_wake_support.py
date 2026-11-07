@@ -742,18 +742,6 @@ async def seed_generation(app: Any, agent: str, hook: str, generation: int) -> N
         )
 
 
-async def generation_column_max(app: Any) -> int:
-    """The largest value the stored generation column's type accepts."""
-    async with app.state.engine.connect() as conn:
-        data_type = await conn.scalar(
-            text(
-                "SELECT data_type FROM information_schema.columns WHERE table_schema='curie' "
-                "AND table_name='hook_wake_keys' AND column_name='generation'"
-            )
-        )
-    return {"smallint": 2**15 - 1, "integer": 2**31 - 1, "bigint": 2**63 - 1}[str(data_type)]
-
-
 async def settle_run(app: Any, run_id: Any, outcome: str = "ran") -> None:
     """Stand-in for the worker settling a run (outside the API)."""
     async with app.state.engine.begin() as conn:
