@@ -142,16 +142,20 @@ class ReplyDeliveryStore:
         if str(path) == ":memory:":
             raise ValueError("reply delivery state requires a persistent file")
         self._db = sqlite3.connect(path, isolation_level=None)
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.executescript("""
-            CREATE TABLE IF NOT EXISTS gateway_reply_nonces (
-                nonce TEXT PRIMARY KEY, expires_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS gateway_reply_deliveries (
-                request_key TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
-                status INTEGER, body BLOB, unreachable INTEGER NOT NULL DEFAULT 0
-            );
-        """)
+        try:
+            self._db.execute("PRAGMA journal_mode=WAL")
+            self._db.executescript("""
+                CREATE TABLE IF NOT EXISTS gateway_reply_nonces (
+                    nonce TEXT PRIMARY KEY, expires_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS gateway_reply_deliveries (
+                    request_key TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
+                    status INTEGER, body BLOB, unreachable INTEGER NOT NULL DEFAULT 0
+                );
+            """)
+        except BaseException:
+            self._db.close()
+            raise
 
     def consume_nonce(self, scope: str, timestamp: int) -> None:
         self._db.execute("BEGIN IMMEDIATE")

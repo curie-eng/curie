@@ -1,6 +1,7 @@
 """Exercise the authenticated gateway boundary through real HTTP requests."""
 
 import asyncio
+import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -491,3 +492,24 @@ def test_client_oversize_is_permanent_even_with_best_effort() -> None:
             await server.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("unusable", ["corrupt", "missing-parent", "memory"])
+def test_gateway_refuses_unusable_durable_state(tmp_path: Path, unusable: str) -> None:
+    path = tmp_path / "replies.sqlite3"
+    if unusable == "corrupt":
+        path.write_bytes(b"not a SQLite delivery ledger")
+    elif unusable == "missing-parent":
+        path = tmp_path / "missing-parent" / "replies.sqlite3"
+    else:
+        path = Path(":memory:")
+    with pytest.raises((sqlite3.DatabaseError, ValueError)):
+        reply_application(
+            HttpReplyAdapter({}),
+            secret="test-gateway",
+            kind="email",
+            route=ReplyDestination(),
+            state_path=path,
+        )
+    if unusable == "corrupt":
+        assert path.read_bytes() == b"not a SQLite delivery ledger"

@@ -59,7 +59,7 @@ receiver requires a fixed provider `kind`, a server-owned `route`, and a durable
 importing an application. Event JSON and reply wire versions remain unchanged.
 
 1. Transport endpoints target the configured `/reply` ingress and require HTTPS. `allow_insecure_http=True` is an explicit
-   development or test opt-out; other schemes remain refused. Each request also
+   development or test opt-out; other schemes remain refused. Use a dedicated reply secret, separate from the chat-attester key. Each request
    signs its path, exact body digest, request key, best-effort flag, timestamp and
    nonce. The receiver checks a 120-second freshness window and persists consumed
    nonces. Replaying a signed attempt is refused, including after restart.
@@ -86,8 +86,8 @@ importing an application. Event JSON and reply wire versions remain unchanged.
    permanently with `ReplyPayloadTooLargeError`. Answers above 1 MiB are supported.
 
 The SQLite ledger retains delivery claims and results, including failures, for
-as long as their request keys can be retried. It stores hashes, opaque result
-references and fixed diagnostics, not message bodies or bearer credentials.
+as long as their request keys can be retried. It stores request hashes, authentication nonces, opaque result references and
+fixed diagnostics, not message bodies or bearer credentials.
 Only expired authentication nonces are pruned automatically. `HttpReplyAdapter`
 is the existing generic adapter HTTP client; it does not implement this signed
 gateway ingress protocol. Compose worker-to-gateway delivery with
