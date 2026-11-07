@@ -11,6 +11,7 @@ resolution-markers = [
 members = [
     "aci-protocol",
     "curie-api",
+    "curie-channel-gateway",
     "curie-channel-protocol",
     "curie-discord-adapter",
     "curie-dispatcher",
@@ -834,6 +835,17 @@ requires-dist = [
 ]
 
 [[package]]
+name = "curie-channel-gateway"
+version = "0.1.0"
+source = { editable = "packages/channel-gateway" }
+dependencies = [
+    { name = "curie-channel-protocol" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "curie-channel-protocol", editable = "packages/channel-protocol" }]
+
+[[package]]
 name = "curie-channel-protocol"
 version = "0.1.0"
 source = { editable = "packages/channel-protocol" }
@@ -1149,6 +1161,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "aci-protocol" },
     { name = "curie-api" },
+    { name = "curie-channel-gateway" },
     { name = "curie-channel-protocol" },
     { name = "curie-discord-adapter" },
     { name = "curie-dispatcher" },
@@ -1185,6 +1198,7 @@ dev = [
 requires-dist = [
     { name = "aci-protocol", editable = "packages/aci-protocol" },
     { name = "curie-api", editable = "apps/api" },
+    { name = "curie-channel-gateway", editable = "packages/channel-gateway" },
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
     { name = "curie-discord-adapter", editable = "adapters/discord" },
     { name = "curie-dispatcher", editable = "apps/dispatcher" },

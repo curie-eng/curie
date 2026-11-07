@@ -7,6 +7,7 @@ dependencies = [
     "aci-protocol",
     "curie-internal",
     "curie-channel-protocol",
+    "curie-channel-gateway",
     "curie-protected-hooks",
     "curie-telemetry-schema",
     "curie-upgrade-pause",
@@ -29,6 +30,7 @@ members = [
     "packages/aci-protocol",
     "packages/curie-internal",
     "packages/channel-protocol",
+    "packages/channel-gateway",
     "packages/protected-hooks",
     "packages/plugin-format",
     "packages/telemetry-schema",
@@ -50,6 +52,7 @@ members = [
 aci-protocol = { workspace = true }
 curie-internal = { workspace = true }
 curie-channel-protocol = { workspace = true }
+curie-channel-gateway = { workspace = true }
 curie-protected-hooks = { workspace = true }
 curie-telemetry-schema = { workspace = true }
 curie-upgrade-pause = { workspace = true }
@@ -95,6 +98,7 @@ root_packages = [
     "curie_connector_proxy",
     "curie_commissioning_ingress",
     "curie_commissioning_worker",
+    "curie_channel_gateway",
     "curie_dispatcher",
     "curie_discord_adapter",
     "curie_mail_adapter",
@@ -533,6 +537,7 @@ norecursedirs = [
 testpaths = [
     "packages/aci-protocol/tests",
     "packages/channel-protocol/tests",
+    "packages/channel-gateway/tests",
     "packages/plugin-format/tests",
     "packages/test-support/tests",
     "packages/upgrade-pause/tests",
@@ -629,6 +634,7 @@ mypy_path = [
     "packages/aci-protocol/src",
     "packages/curie-internal/src",
     "packages/channel-protocol/src",
+    "packages/channel-gateway/src",
     "packages/protected-hooks/src",
     "packages/plugin-format/src",
     "packages/telemetry-schema/src",
@@ -649,6 +655,7 @@ files = [
     "packages/aci-protocol/src",
     "packages/curie-internal/src",
     "packages/channel-protocol/src",
+    "packages/channel-gateway/src",
     "packages/protected-hooks/src",
     "packages/plugin-format/src",
     "packages/telemetry-schema/src",

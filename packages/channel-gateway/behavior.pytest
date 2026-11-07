@@ -1,0 +1,13 @@
+packages/channel-gateway/tests
+packages/channel-protocol/tests/test_reply_corpus.py
+packages/channel-protocol/tests/test_reply_verbatim_wire.py
+apps/dispatcher/tests/test_gateway_ordering.py
+apps/dispatcher/tests/test_dispatch.py::test_duplicate_delivery_enqueues_exactly_once
+apps/dispatcher/tests/test_caller_admission.py::test_a_listed_mention_is_admitted_and_the_question_names_the_route
+apps/dispatcher/tests/test_caller_admission.py::test_an_unlisted_mention_gets_no_placeholder_no_turn_and_no_claim
+apps/dispatcher/tests/test_approval_actions.py
+apps/worker/tests/test_reply_sink.py
+apps/mail-adapter/tests/test_provider_conformance.py
+apps/mail-adapter/tests/test_provider_intake.py
+apps/mail-adapter/tests/test_authentication_gate.py
+apps/mail-adapter/tests/test_egress.py
