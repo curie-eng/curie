@@ -18,7 +18,7 @@ from alembic import command
 from alembic.config import Config
 from curie_api.config import get_settings
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 API_DIR = Path(__file__).resolve().parents[1]
@@ -153,6 +153,25 @@ def test_0149_preserves_history_accepts_webhook_and_refuses_a_lossy_downgrade(
                 {"agent": agent_id, "hook": "generation-zero"},
             )
         assert getattr(zero.value.orig, "sqlstate", None) == "23514"
+        maximum = 2**63 - 1
+        _sql(
+            "INSERT INTO curie.hook_wake_keys (agent_id, hook, generation) "
+            "VALUES (:agent, :hook, :generation)",
+            {"agent": agent_id, "hook": "generation-max", "generation": maximum},
+        )
+        assert _sql(
+            "SELECT generation FROM curie.hook_wake_keys "
+            "WHERE agent_id = :agent AND hook = :hook",
+            {"agent": agent_id, "hook": "generation-max"},
+        ) == [{"generation": maximum}]
+        with pytest.raises(DBAPIError) as overflow:
+            _sql(
+                "INSERT INTO curie.hook_wake_keys (agent_id, hook, generation) "
+                "VALUES (:agent, 'generation-overflow', 9223372036854775808)",
+                {"agent": agent_id},
+            )
+        assert getattr(overflow.value.orig, "sqlstate", None) == "22003"
+        _sql("DELETE FROM curie.hook_wake_keys WHERE hook = 'generation-max'")
         assert _wake_keys() == [{"agent_id": agent_id, "hook": HOOK, "generation": 1}]
 
         runs_with_webhook = _runs()

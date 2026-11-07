@@ -59,7 +59,7 @@ def upgrade() -> None:
         sa.Column("hook", sa.String(63), nullable=False),
         sa.Column(
             "generation",
-            sa.Integer(),
+            sa.BigInteger(),
             nullable=False,
             server_default=sa.text("1"),
         ),

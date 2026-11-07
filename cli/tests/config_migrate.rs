@@ -2481,6 +2481,65 @@ fn removed_metadata_ci_extra_env_is_refused_by_the_chart() {
     assert!(!stderr.contains("sentinel-4397-do-not-print"), "{stderr}");
 }
 
+/// ADR 0274: a released worker extraEnv lease migrates to the chart value
+/// and then renders. The reserved name fails the chart until promotion.
+#[test]
+fn retained_hook_claim_lease_extra_env_migrates_and_renders() {
+    let values = json!({
+        "worker": {
+            "extraEnv": [{
+                "name": "CURIE_HOOK_CLAIM_LEASE_S",
+                "value": "14400"
+            }]
+        }
+    });
+    if !helm_is_absent() {
+        let refused = helm_template_with_values(&values);
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            !refused.status.success(),
+            "retained extraEnv must fail the chart"
+        );
+        assert!(
+            stderr.contains(
+                "worker.extraEnv contains chart-owned environment variable CURIE_HOOK_CLAIM_LEASE_S"
+            ) && stderr.contains("worker.hookClaimLeaseSeconds"),
+            "the refusal must name the successor: {stderr}"
+        );
+    }
+    let outcome = migrate_installed_config(
+        values,
+        Some("curie-0.8.5"),
+        &FactoryMigrationContext::NotRequired,
+    )
+    .unwrap();
+    assert_eq!(
+        number_at(&outcome.values, &["worker", "hookClaimLeaseSeconds"]),
+        Some(14400.0)
+    );
+    assert!(!extra_env_names(&outcome.values, &["worker", "extraEnv"])
+        .iter()
+        .any(|name| name == "CURIE_HOOK_CLAIM_LEASE_S"));
+    if helm_is_absent() {
+        return;
+    }
+    let rendered = helm_template_with_values(&outcome.values);
+    let stdout = String::from_utf8_lossy(&rendered.stdout);
+    let stderr = String::from_utf8_lossy(&rendered.stderr);
+    assert!(
+        rendered.status.success(),
+        "migrated lease must render: {stderr}"
+    );
+    let lease_lines = stdout
+        .lines()
+        .filter(|line| line.contains("CURIE_HOOK_CLAIM_LEASE_S"))
+        .count();
+    assert!(
+        lease_lines >= 2 && stdout.contains("value: \"14400\""),
+        "api and worker must both publish the migrated lease, saw {lease_lines} names"
+    );
+}
+
 /// Reserved names that map to a single Helm key yet need no extraEnv
 /// migration: no released guide ever told an operator to set them through
 /// extraEnv. Adding a reservation to `charts/curie/files/reserved-env.yaml`
@@ -2569,8 +2628,6 @@ const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     "CURIE_E2E_WORKER_CLUSTER_ROLE",
     "CURIE_FACTORY_PUBLICATION_LABELS",
     "CURIE_FAKE_MODEL",
-    // ADR 0274: the hook claim lease is a Helm value from introduction.
-    "CURIE_HOOK_CLAIM_LEASE_S",
     "CURIE_INTERNAL_WORKER_TOKEN",
     "CURIE_MODEL",
     "CURIE_PLUGIN_DIR",
