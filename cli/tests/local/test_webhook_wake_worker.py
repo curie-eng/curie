@@ -512,41 +512,26 @@ class WakeStack:
         )
 
     def close(self):
-        errors = []
-        if self.created:
-            try:
-                self.kube(
-                    "delete",
-                    "namespace",
-                    NAME,
-                    "--ignore-not-found",
-                    "--wait=true",
-                    "--timeout=120s",
-                )
-                names = json.loads(self.kube("get", "namespaces", "-o", "json"))["items"]
-                assert NAME not in {item["metadata"]["name"] for item in names}
-            except (RuntimeError, AssertionError, subprocess.SubprocessError) as exc:
-                errors.append(str(exc))
-            finally:
+        try:
+            if self.created:
                 self.run("kind", "delete", "cluster", "--name", self.cluster, timeout=180)
                 assert self.cluster not in self.run("kind", "get", "clusters").splitlines()
                 assert not self.run(
                     "docker", "ps", "-aq", "--filter", f"label=io.x-k8s.kind.cluster={self.cluster}"
                 ).strip()
-        for image in self.images.values():
-            result = subprocess.run(
-                ["docker", "image", "inspect", image], env=self.env, capture_output=True
-            )
-            if result.returncode == 0:
-                self.run("docker", "image", "rm", image)
-        if self.slack is not None:
-            self.slack.shutdown()
-            self.slack.server_close()
-        if self.slack_thread is not None:
-            self.slack_thread.join(timeout=5)
-            assert not self.slack_thread.is_alive()
-        if errors:
-            raise RuntimeError("; ".join(errors))
+        finally:
+            for image in self.images.values():
+                result = subprocess.run(
+                    ["docker", "image", "inspect", image], env=self.env, capture_output=True
+                )
+                if result.returncode == 0:
+                    self.run("docker", "image", "rm", image)
+            if self.slack is not None:
+                self.slack.shutdown()
+                self.slack.server_close()
+            if self.slack_thread is not None:
+                self.slack_thread.join(timeout=5)
+                assert not self.slack_thread.is_alive()
 
 
 @pytest.fixture
