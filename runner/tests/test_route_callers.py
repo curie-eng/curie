@@ -289,24 +289,35 @@ def test_a_later_session_reuses_the_caller_and_its_first_initialize(
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the environ lock is Linux only")
-def test_the_lock_library_makes_the_caller_unreadable_to_its_peers(tmp_path: Path) -> None:
+@pytest.mark.parametrize("backend", ["kubernetes", "static"])
+def test_the_lock_library_makes_the_caller_unreadable_to_its_peers(
+    tmp_path: Path, backend: str
+) -> None:
     # @spec ADR-0240 d4: the real library, the real /proc check, no stand-in.
+    from curie_internal.connector_endpoints import ConnectorEndpointBinding
     from curie_runner.subprocess_env import proc_dumpable_library
 
     root = _bundle(tmp_path)
+    url = _REVIEWER_URL
+    endpoints = None
+    if backend == "static":
+        url = "https://connectors.example.com/reviewer"
+        endpoints = ConnectorEndpointBinding.model_validate(
+            {"version": 1, "agent": "acme-dev", "connectors": {"reviewer": {"base_url": url}}}
+        )
     servers = bundle_mcp_servers(str(root))
     mount_route_callers(
         servers,
         callers=route_callers(root, agent="acme-dev"),
         tokens=_TOKENS,
-        connector_urls=connector_urls(root, **_SCOPE),
+        connector_urls=connector_urls(root, **_SCOPE, endpoints=endpoints),
         source_env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
         lock_library=proc_dumpable_library(os.environ),
         cwd=str(root),
     )
     relay = servers["plugin:b:review-tools"]["instance"]
     report = anyio.run(_call, relay)
-    assert report["routes"] == {"reviewer": {"url": _REVIEWER_URL, "token": _TOKENS["reviewer"]}}
+    assert report["routes"] == {"reviewer": {"url": url, "token": _TOKENS["reviewer"]}}
     with pytest.raises(PermissionError):
         Path(f"/proc/{report['pid']}/environ").read_bytes()
 

@@ -95,6 +95,8 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # run.build and AttachmentCoordinator. Never injected into a sandbox
         # claim -- runner-bound refs and attachment-access enablement use the
         # separately declared BootEnv contract.
+        # WorkerConfig reads the operator map; only a bound projection reaches a runner.
+        "CURIE_CONNECTOR_ENDPOINTS",
         "CURIE_ATTACHMENT_ENABLED",
         # ADR 0244: WorkerConfig selects the worker's eager/lazy routing in
         # run.build and Kernel. BindingResolver emits only the separately

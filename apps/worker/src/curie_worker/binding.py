@@ -84,6 +84,7 @@ from aci_protocol.turn import (
     matching_routes,
 )
 from curie_internal import sandbox_token
+from curie_internal.connector_endpoints import BINDING_ENV
 from curie_internal.identity_approval import ApprovalGrantExpectationV1
 from curie_internal.identity_authority import (
     BindingClassificationRequestV1,
@@ -1606,6 +1607,9 @@ class BindingResolver:
             channel_bound=True if kind and address else None,
             channel_kind=kind if kind else None,
         )
+        apply_connector_endpoints(
+            env, self._config, agent_name=resolved.agent_name, caller_token=connector_caller_token
+        )
         # #517/#669 opt-in false-completion check: NOT a BootEnv.render_worker
         # kwarg (it is deliberately kept out of the frozen ACI contract, see
         # FALSE_COMPLETION_CHECK_ENV above), so it is written directly here
@@ -2060,6 +2064,27 @@ def apply_model_env(
 SANDBOX_WITHHELD_CONNECTOR_SECRETS = frozenset(
     {"E2E_CLUSTER_KUBECONFIG", "E2E_REGISTRY_PUSH_CONFIG", "E2E_BUILD_CACHE_CONFIG"}
 )
+
+
+def apply_connector_endpoints(
+    env: dict[str, str],
+    config: WorkerConfig,
+    *,
+    agent_name: str | None,
+    caller_token: str | None,
+) -> None:
+    """Project operator endpoints for the authenticated runs or eval agent."""
+
+    if config.connector_endpoints is None:
+        return
+    if not agent_name or not caller_token:
+        raise ValueError("static hosted connectors require an authenticated agent and caller token")
+    binding = config.connector_endpoints.bind(agent_name)
+    env[BINDING_ENV] = binding.model_dump_json(exclude_none=True)
+    env[BootEnv.env_key("connector_agent")] = agent_name
+    env[CONNECTOR_CALLER_TOKEN_ENV] = caller_token
+    for field_name in ("connector_release", "connector_namespace"):
+        env.pop(BootEnv.env_key(field_name), None)
 
 
 def inject_connector_secrets(

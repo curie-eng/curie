@@ -12,11 +12,12 @@ assigned by whoever ran ``cluster up`` and ``cluster deploy``. Since #1116 the
 name is agent-scoped, so a hand-written URL is now *guaranteed* wrong for at
 least one of two agents sharing a bundle.
 
-Derivation reuses ``plugin_format.connector_render.mcp_entry`` -- the same
+The default Kubernetes resolver reuses ``plugin_format.connector_render.mcp_entry`` -- the same
 function the API calls when it renders the Service. One function, so the URL the
 agent dials and the Service that exists cannot disagree. Re-deriving the format
 here would be a second copy of that rule, free to drift, and the failure would
-be a connection refused at turn time.
+be a connection refused at turn time. Static deployments instead receive a
+worker-bound endpoint map; MCP and protected route callers share its resolver.
 
 The entries ride ``ClaudeAgentOptions.mcp_servers``, alongside Curie's approval
 and state servers -- platform-supplied servers, which is exactly what these are.
@@ -43,6 +44,7 @@ from typing import Any
 
 import yaml
 from aci_protocol import BootEnv
+from curie_internal.connector_endpoints import ConnectorEndpointBinding
 from plugin_format.connector_render import (
     AmbiguousObjectName,
     mcp_entry,
@@ -61,6 +63,8 @@ from plugin_format.deploy_targets import (
 )
 from plugin_format.validate import DEPLOY_FILE
 from plugin_format.yaml_loader import safe_load_unique
+
+from .connector_endpoints import endpoint_resolver
 
 logger = logging.getLogger(__name__)
 
@@ -161,12 +165,13 @@ def derive_mcp_servers(
     release: str | None,
     agent: str | None,
     namespace: str | None,
+    endpoints: ConnectorEndpointBinding | None = None,
     caller_header: bool = False,
     env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """The MCP server entries for this bundle's declared connectors.
 
-    Empty when the bundle declares none, or when the connector scope is absent.
+    Empty when the bundle declares none, or no endpoint configuration is present.
     An absent scope is not a degraded boot: the ``skill`` tier hosts nothing, so
     there is no Service to point at and a declared connector is correctly not
     exercisable there (#1093). A hosted connector declared with no scope is
@@ -185,7 +190,10 @@ def derive_mcp_servers(
         if not declared.connectors:
             return {}
 
-    if not (release and agent and namespace):
+    resolver = endpoint_resolver(
+        release=release, agent=agent, namespace=namespace, endpoints=endpoints
+    )
+    if resolver is None:
         # The scope is emitted as a set or not at all (BootEnv, ACI 0.2.8), so
         # this is "no scope", never a partial one.
         stranded = sorted(
@@ -213,7 +221,8 @@ def derive_mcp_servers(
     try:
         entries = {
             name: _without_unreachable_bearer(
-                mcp_entry(release, agent, namespace, name, spec), spec
+                resolver.mcp(name, spec) if spec.is_hosted else mcp_entry("", "", "", name, spec),
+                spec,
             )
             for name, spec in sorted(declared.connectors.items())
         }
@@ -240,7 +249,7 @@ def derive_mcp_servers(
             exc,
         )
         return {}
-    # Only a Service Curie created gets the token. The scope-less branch above
+    # Only a hosted endpoint gets the token. The scope-less branch above
     # returns first, so a fallback URL never sees it, and a remote connector is
     # somebody else's server.
     grant_value = ""
@@ -255,6 +264,25 @@ def derive_mcp_servers(
                     headers[GRANT_HEADER] = _GRANT_PLACEHOLDER
                 entries[name] = {**entry, "headers": headers}
     return entries
+
+
+def upload_endpoints(
+    plugin_dir: str | Path | None,
+    *,
+    agent: str | None,
+    endpoints: ConnectorEndpointBinding | None,
+) -> dict[str, str]:
+    """Upload-only URLs for bundle code. No caller, grant or route credentials."""
+
+    if endpoints is None:
+        return {}
+    if agent != endpoints.agent:
+        raise ValueError("connector endpoint identity does not match authenticated agent")
+    return {
+        name: url
+        for name, spec in declared_connectors(plugin_dir, agent=agent).items()
+        if spec.is_hosted and (url := endpoints.endpoint(name).upload_url) is not None
+    }
 
 
 def proxied_connector_servers(servers: Mapping[str, Any]) -> frozenset[str]:

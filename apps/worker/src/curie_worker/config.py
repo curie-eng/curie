@@ -38,6 +38,7 @@ from aci_protocol.service_config import (
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
 from curie_internal import keyspace
+from curie_internal.connector_endpoints import StaticConnectorEndpoints
 from curie_upgrade_pause import authoritative_key, legacy_key
 from pydantic import AliasChoices, BeforeValidator, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -314,6 +315,9 @@ class WorkerConfig(BaseSettings):
     # scope that names a Service which cannot exist.
     connector_release: str = Field(default="", validation_alias="CURIE_RELEASE")
     connector_namespace: str = Field(default="", validation_alias="CURIE_NAMESPACE")
+    connector_endpoints: StaticConnectorEndpoints | None = Field(
+        default=None, validation_alias="CURIE_CONNECTOR_ENDPOINTS"
+    )
 
     # The Ed25519 seed that signs each sandbox's connector caller token
     # (ADR-0168 decision 7), standard base64. Empty mints no token. The chart

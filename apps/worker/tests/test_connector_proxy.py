@@ -991,3 +991,66 @@ def test_a_replayed_grant_logs_not_spent(caplog: pytest.LogCaptureFixture) -> No
     lines = [r.getMessage() for r in caplog.records if "outcome=" in r.getMessage()]
     assert lines[0].endswith("outcome=admitted method=POST path='/mcp'")
     assert lines[1].endswith(f"grant={server.GRANT_NOT_SPENT}")
+
+
+def test_static_resolver_headers_enforce_one_shot_grants_with_real_valkey(
+    tmp_path: Path,
+    sync_redis: Any,
+) -> None:
+    import uuid
+    from urllib.parse import quote
+
+    from curie_internal.connector_endpoints import ConnectorEndpointBinding
+    from curie_runner.connectors import derive_mcp_servers, materialize_connector_caller_headers
+
+    connection = sync_redis.connection_pool.connection_kwargs
+    password = quote(connection.get("password") or "", safe="")
+    auth = f":{password}@" if password else ""
+    store_url = f"redis://{auth}{connection['host']}:{connection['port']}/0"
+    jti = uuid.uuid4().hex
+    (tmp_path / "connectors.yaml").write_text(
+        "connectors:\n  github:\n    image: example/connector:1\n"
+    )
+
+    async def go() -> None:
+        async with _gated(grant_store=server._ValkeyGrantStore(store_url)) as (upstream, proxy):
+            binding = ConnectorEndpointBinding.model_validate(
+                {
+                    "version": 1,
+                    "agent": "acme-dev",
+                    "connectors": {"github": {"base_url": str(proxy.make_url("/")).rstrip("/")}},
+                }
+            )
+            env = {"CURIE_CONNECTOR_CALLER_TOKEN": _TOKEN}
+            entries = derive_mcp_servers(
+                tmp_path,
+                release=None,
+                agent="acme-dev",
+                namespace=None,
+                endpoints=binding,
+                caller_header=True,
+                env=env,
+            )
+            materialize_connector_caller_headers(entries, env)
+            entry = entries["github"]
+            headers = {**entry["headers"], "Content-Type": "application/json"}
+            async with aiohttp.ClientSession() as client:
+
+                async def call() -> int:
+                    async with client.post(
+                        entry["url"], data=_MERGE_CALL, headers=headers
+                    ) as response:
+                        return response.status
+
+                assert await call() == 403
+                assert not upstream.seen
+                headers[server.GRANT_HEADER] = _mint_grant("merge_pull_request", {"n": 1}, jti=jti)
+                assert await call() == 201
+                assert await call() == 403
+                assert len(upstream.seen) == 1
+                assert sync_redis.exists(f"connector-grant:{jti}") == 1
+
+    try:
+        _run(go)
+    finally:
+        sync_redis.delete(f"connector-grant:{jti}")

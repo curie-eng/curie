@@ -24,6 +24,7 @@ import anyio
 from aci_protocol import BootEnv
 from aiohttp import web
 from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+from curie_internal.connector_endpoints import UPLOADS_ENV
 from curie_telemetry import bootstrap_service_telemetry
 from plugin_format import CHANNEL_READ_SERVER_NAME
 
@@ -75,6 +76,7 @@ from .connectors import (
     materialize_connector_caller_headers,
     materialize_hosted_bearer_headers,
     proxied_connector_servers,
+    upload_endpoints,
 )
 from .executor import EXECUTOR_MODE, RUNNER_MODE_ENV
 from .fake import FakeModelSession
@@ -1092,6 +1094,7 @@ def build_runner(
         release=config.connector_release,
         agent=config.connector_agent,
         namespace=config.connector_namespace,
+        endpoints=config.connector_endpoints,
         caller_header=config.connector_caller_token is not None,
         env=os.environ,
     )
@@ -1103,6 +1106,15 @@ def build_runner(
     # cannot read the PAT from the process env (#2559). The on-disk catalog
     # keeps the placeholder; derive_mcp_servers never sees a value.
     spawn_env = sdk_env if sdk_env is not None else os.environ
+    uploads = upload_endpoints(
+        config.session.plugin_dir,
+        agent=config.connector_agent,
+        endpoints=config.connector_endpoints,
+    )
+    for target_env in (spawn_env, os.environ):
+        target_env.pop(UPLOADS_ENV, None)
+        if uploads:
+            target_env[UPLOADS_ENV] = json.dumps(uploads, sort_keys=True)
     # Snapshot optional binding presence before hosted credential custody.
     # Reuse the same immutable projection for redaction and actual mounting.
     bundle_servers = bundle_mcp_servers(config.session.plugin_dir)
@@ -1140,6 +1152,7 @@ def build_runner(
                 release=config.connector_release,
                 agent=config.connector_agent,
                 namespace=config.connector_namespace,
+                endpoints=config.connector_endpoints,
             ),
             source_env=os.environ,
             lock_library=route_caller_lock_library(os.environ),
@@ -1781,6 +1794,7 @@ async def _load_boot_fetches(
         release=config.connector_release,
         agent=config.connector_agent,
         namespace=config.connector_namespace,
+        endpoints=config.connector_endpoints,
         caller_header=config.connector_caller_token is not None,
         env=os.environ,
     )
@@ -1889,6 +1903,7 @@ def _serve_executor(config: RunnerConfig, serving_token: str | None) -> None:
         release=config.connector_release,
         agent=config.connector_agent,
         namespace=config.connector_namespace,
+        endpoints=config.connector_endpoints,
         caller_header=config.connector_caller_token is not None,
         env=os.environ,
     )

@@ -64,6 +64,7 @@ from redis.asyncio import Redis
 from .. import caller_token
 from ..binding import (
     SANDBOX_TOKEN_TTL_SECONDS,
+    apply_connector_endpoints,
     apply_model_env,
     inject_connector_secrets,
 )
@@ -795,8 +796,10 @@ class EvalStreamConsumer(StreamConsumer):
         token = None
         if (
             agent_name
-            and self._config.connector_release
-            and self._config.connector_namespace
+            and (
+                self._config.connector_endpoints is not None
+                or (self._config.connector_release and self._config.connector_namespace)
+            )
             and self._config.connector_caller_signing_key.strip()
         ):
             token = caller_token.mint(
@@ -818,6 +821,9 @@ class EvalStreamConsumer(StreamConsumer):
             connector_agent=agent_name,
             connector_caller_token=token,
             approval_required_tools=required_tools,
+        )
+        apply_connector_endpoints(
+            env, self._config, agent_name=agent_name, caller_token=token
         )
         # Eval conversations stay isolated from ambient durable state. Use the
         # shared scope renderer without adding the binding lane's state refs.

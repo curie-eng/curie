@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from aci_protocol import BootEnv, SessionConfig
+from curie_internal.connector_endpoints import BINDING_ENV, ConnectorEndpointBinding
 
 from .harness.registry import DEFAULT_HARNESS
 from .memory_facts import MAX_FACTS_PER_MEMORY
@@ -169,6 +170,7 @@ class RunnerConfig:
     # Per-agent reviewer override. None lets the adapter choose the credential's
     # provider default for the SDK's Opus alias (#4120).
     reviewer_model: str | None = None
+    connector_endpoints: ConnectorEndpointBinding | None = None
 
     @property
     def memory_writes_on(self) -> bool:
@@ -225,6 +227,13 @@ class RunnerConfig:
         """
 
         boot = BootEnv.from_env(env)
+        endpoints = (
+            ConnectorEndpointBinding.model_validate_json(env[BINDING_ENV])
+            if BINDING_ENV in env
+            else None
+        )
+        if endpoints is not None and boot.connector_agent not in (None, endpoints.agent):
+            raise ValueError("connector endpoint identity does not match authenticated agent")
         # A runner-local read, not a BootEnv contract key (#517): the false-
         # completion check is observe-only, so it stays a direct env read parsed
         # to an explicit 1/true/yes truthy rather than a declared BootEnv field.
@@ -254,7 +263,8 @@ class RunnerConfig:
             harness=harness,
             max_turns=boot.max_turns if boot.max_turns is not None else 20,
             connector_release=boot.connector_release,
-            connector_agent=boot.connector_agent,
+            connector_agent=endpoints.agent if endpoints is not None else boot.connector_agent,
+            connector_endpoints=endpoints,
             connector_namespace=boot.connector_namespace,
             history_ref=boot.history_ref,
             channel_memory_ref=boot.channel_memory_ref,
