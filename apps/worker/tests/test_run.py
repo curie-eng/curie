@@ -1931,6 +1931,8 @@ def test_the_static_client_needs_its_inventory_ca_and_lease_store(tmp_path: Path
     generic = SubstrateConfig(namespace="default", warm_pool="curie-runner-pool")
     sync = redis.Redis()
     env = {"CURIE_SANDBOX_SUBSTRATE": "static", "CURIE_STATIC_SHELLS": shells}
+    with pytest.raises(ValueError, match="action executor"):
+        _sandbox_client(WorkerConfig(action_executor_enabled=True), env, generic, redis_client=sync)
     with pytest.raises(ValueError, match="Valkey"):
         _sandbox_client(WorkerConfig(), env, generic)
     with pytest.raises(ValueError, match="CURIE_STATIC_SHELL_CA_FILE"):

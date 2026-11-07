@@ -403,7 +403,7 @@ def _static_pool_client(
     config: WorkerConfig,
     env: Mapping[str, str],
     sub_config: SubstrateConfig,
-    redis_client: redis.Redis | None,
+    redis_client: Redis | None,
 ) -> StaticPoolSandboxClient:
     """The static shell pool (``CURIE_SANDBOX_SUBSTRATE=static``).
 
@@ -414,6 +414,11 @@ def _static_pool_client(
     in the worker's own Valkey beside the routes.
     """
 
+    if config.action_executor_enabled:
+        # The executor's serving attestation reads Kubernetes Deployments,
+        # which a static pool has none of; static connector endpoints refuse
+        # it for the same reason.
+        raise ValueError("the static substrate does not run the action executor")
     if redis_client is None:
         raise ValueError("the static substrate keeps its leases in the worker's Valkey")
     slots = parse_static_shells(env.get("CURIE_STATIC_SHELLS"))
@@ -457,7 +462,7 @@ def _sandbox_client(
     env: Mapping[str, str],
     sub_config: SubstrateConfig,
     *,
-    redis_client: redis.Redis | None = None,
+    redis_client: Redis | None = None,
 ) -> SandboxClient:
     """The cluster/Docker/static seam, chosen by ``CURIE_SANDBOX_SUBSTRATE``.
 
