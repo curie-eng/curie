@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -39,11 +40,17 @@ from pathlib import Path
 from typing import Any
 
 import anyio
+import httpx2
+from curie_internal.connector_endpoints import CA_FILE_ENV
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
-from mcp.shared._httpx_utils import create_mcp_http_client
+from mcp.shared._httpx_utils import (
+    MCP_DEFAULT_SSE_READ_TIMEOUT,
+    MCP_DEFAULT_TIMEOUT,
+    create_mcp_http_client,
+)
 from mcp.shared.exceptions import MCPError
 from mcp.shared.tool_name_validation import validate_tool_name
 from mcp.types import PaginatedRequestParams
@@ -382,6 +389,30 @@ def _bundle_server_configs(
     return configs
 
 
+def _hosted_http_client(
+    headers: dict[str, str] | None = None,
+    timeout: httpx2.Timeout | None = None,
+    auth: httpx2.Auth | None = None,
+) -> httpx2.AsyncClient:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    paths = ssl.get_default_verify_paths()
+    context.load_verify_locations(
+        cafile=paths.openssl_cafile if Path(paths.openssl_cafile).is_file() else None,
+        capath=paths.openssl_capath if Path(paths.openssl_capath).is_dir() else None,
+    )
+    if ca_file := os.environ.get(CA_FILE_ENV):
+        if not Path(ca_file).is_absolute():
+            raise _ProbeConfigurationError("hosted connector CA file must be absolute")
+        context.load_verify_locations(cafile=ca_file)
+    return httpx2.AsyncClient(
+        headers=headers,
+        auth=auth,
+        verify=context,
+        trust_env=False,
+        timeout=timeout or httpx2.Timeout(MCP_DEFAULT_TIMEOUT, read=MCP_DEFAULT_SSE_READ_TIMEOUT),
+    )
+
+
 @asynccontextmanager
 async def server_streams(
     config: Mapping[str, Any],
@@ -439,12 +470,16 @@ async def server_streams(
         if isinstance(raw_headers, Mapping)
         else None
     )
+    hosted = any(name.lower() == "x-curie-caller" for name in (headers or {}))
+    client_factory = _hosted_http_client if hosted else create_mcp_http_client
     if config.get("type") == "sse":
-        async with sse_client(expanded_url, headers=headers) as streams:
+        async with sse_client(
+            expanded_url, headers=headers, httpx_client_factory=client_factory
+        ) as streams:
             yield streams
         return
 
-    async with create_mcp_http_client(headers=headers) as http_client:
+    async with client_factory(headers=headers) as http_client:
         async with streamable_http_client(expanded_url, http_client=http_client) as streams:
             read_stream, write_stream = streams
             yield read_stream, write_stream

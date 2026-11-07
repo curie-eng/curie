@@ -38,7 +38,7 @@ from aci_protocol.service_config import (
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
 from curie_internal import keyspace
-from curie_internal.connector_endpoints import StaticConnectorEndpoints
+from curie_internal.connector_endpoints import StaticConnectorEndpoints, parse_endpoint_json
 from curie_upgrade_pause import authoritative_key, legacy_key
 from pydantic import AliasChoices, BeforeValidator, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -315,9 +315,9 @@ class WorkerConfig(BaseSettings):
     # scope that names a Service which cannot exist.
     connector_release: str = Field(default="", validation_alias="CURIE_RELEASE")
     connector_namespace: str = Field(default="", validation_alias="CURIE_NAMESPACE")
-    connector_endpoints: StaticConnectorEndpoints | None = Field(
-        default=None, validation_alias="CURIE_CONNECTOR_ENDPOINTS"
-    )
+    connector_endpoints: Annotated[
+        StaticConnectorEndpoints | None, NoDecode, BeforeValidator(parse_endpoint_json)
+    ] = Field(default=None, validation_alias="CURIE_CONNECTOR_ENDPOINTS")
 
     # The Ed25519 seed that signs each sandbox's connector caller token
     # (ADR-0168 decision 7), standard base64. Empty mints no token. The chart
@@ -482,6 +482,12 @@ class WorkerConfig(BaseSettings):
     dead_letter_maxlen: int = Field(
         default=10000, ge=1, validation_alias="CURIE_DEAD_LETTER_MAXLEN"
     )
+
+    @model_validator(mode="after")
+    def _static_endpoints_exclude_action_executor(self) -> WorkerConfig:
+        if self.connector_endpoints is not None and self.action_executor_enabled:
+            raise ValueError("static connector endpoints do not support the action executor")
+        return self
 
     @model_validator(mode="after")
     def _remediation_requires_the_executor(self) -> WorkerConfig:

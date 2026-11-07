@@ -103,6 +103,7 @@ def test_eval_uses_the_same_static_projection(monkeypatch: pytest.MonkeyPatch) -
     "value",
     [
         "{}",
+        "null",
         '{"version":2,"agents":{}}',
         '{"version":1,"agents":{},"fallback":true}',
         '{"version":1,"agents":{"acme-dev":{"reviewer":{"base_url":"http://"}}}}',
@@ -169,3 +170,35 @@ def test_eval_static_configuration_error_returns_a_failed_target(
             thinking=None,
         )
     ) == (None, None, None)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "ALL_PROXY",
+        "NODE_TLS_REJECT_UNAUTHORIZED",
+        "NODE_OPTIONS",
+        "ssl_cert_file",
+        "ssl_cert_dir",
+        "all_proxy",
+        "node_tls_reject_unauthorized",
+        "node_options",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "NODE_EXTRA_CA_CERTS",
+    ],
+)
+def test_connector_secrets_cannot_set_transport_controls(name: str) -> None:
+    from curie_worker.binding import inject_connector_secrets
+
+    env: dict[str, str] = {}
+    inject_connector_secrets(
+        env, {name: "untrusted", "EXAMPLE_TOKEN": "allowed"}, agent_label="acme-dev"
+    )
+    assert name not in env
+    assert env["EXAMPLE_TOKEN"] == "allowed"
+    assert env["CURIE_CONNECTOR_SECRET_KEYS"] == "EXAMPLE_TOKEN"

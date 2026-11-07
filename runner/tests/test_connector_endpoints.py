@@ -170,11 +170,13 @@ def tls_certificate(tmp_path: Path) -> tuple[Path, Path]:
 
 
 @pytest.mark.parametrize("trusted", [True, False])
+@pytest.mark.parametrize("transport", ["python", "cli"])
 def test_static_https_uses_validated_mcp_transport(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     tls_certificate: tuple[Path, Path],
     trusted: bool,
+    transport: str,
 ) -> None:
     import asyncio
     import ssl
@@ -186,10 +188,29 @@ def test_static_https_uses_validated_mcp_transport(
     from mcp import ClientSession
 
     cert_file, key_file = tls_certificate
-    if trusted:
+    monkeypatch.delenv("CURIE_CONNECTOR_CA_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    if transport == "python":
         monkeypatch.setenv("SSL_CERT_FILE", str(cert_file))
-    else:
-        monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+        monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path))
+        monkeypatch.setenv("ssl_cert_file", str(cert_file))
+        monkeypatch.setenv("ssl_cert_dir", str(tmp_path))
+        monkeypatch.setenv("NO_PROXY", "")
+        monkeypatch.setenv("no_proxy", "")
+        for name in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ):
+            monkeypatch.setenv(name, "http://127.0.0.1:1")
+        if trusted:
+            monkeypatch.setenv("CURIE_CONNECTOR_CA_FILE", str(cert_file))
+    monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
+    monkeypatch.delenv("NODE_TLS_REJECT_UNAUTHORIZED", raising=False)
+    monkeypatch.delenv("NODE_OPTIONS", raising=False)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert_file, key_file)
     seen: list[str] = []
@@ -199,6 +220,9 @@ def test_static_https_uses_validated_mcp_transport(
             return web.Response(status=405)
         message = await request.json()
         seen.append(request.headers["X-Curie-Caller"])
+        if transport == "python":
+            assert request.headers["X-Curie-Connector-Grant"] == "ccg.test"
+            assert request.headers["Authorization"] == "Bearer test"
         if "id" not in message:
             return web.Response(status=202)
         return web.json_response(
@@ -230,6 +254,14 @@ def test_static_https_uses_validated_mcp_transport(
                 entries, {"CURIE_CONNECTOR_CALLER_TOKEN": "cct.test"}
             )
 
+            if transport == "python":
+                entries["reviewer"]["headers"].update(
+                    {
+                        "X-Curie-Connector-Grant": "ccg.test",
+                        "Authorization": "Bearer test",
+                    }
+                )
+
             async def initialize() -> None:
                 async with server_streams(
                     entries["reviewer"], plugin_dir=None, inherited_env={}
@@ -238,7 +270,23 @@ def test_static_https_uses_validated_mcp_transport(
                         result = await session.initialize()
                         assert result.server_info.name == "example"
 
-            if trusted:
+            if transport == "cli":
+                from test_strict_mcp_config import _options, _registered
+
+                deployment_env = {"NODE_EXTRA_CA_CERTS": str(cert_file)} if trusted else {}
+                servers = await _registered(
+                    _options(
+                        mcp_servers=entries,
+                        cwd=str(tmp_path),
+                        env=deployment_env,
+                    )
+                )
+                reviewer = next(server for server in servers if server["name"] == "reviewer")
+                assert reviewer["status"] == ("connected" if trusted else "failed")
+                assert bool(seen) is trusted
+                if trusted:
+                    assert set(seen) == {"cct.test"}
+            elif trusted:
                 await initialize()
                 assert seen and set(seen) == {"cct.test"}
             else:
@@ -449,7 +497,9 @@ def test_static_runner_boot_refuses_duplicate_json_keys() -> None:
         "CURIE_SESSION_ID": "test",
         "CURIE_SANDBOX_ID": "test",
         "CURIE_BUDGET": '{"max_output_tokens_per_run":100,"max_usd_per_day":1.0}',
-        "CURIE_HOSTED_CONNECTOR_ENDPOINTS": '{"version":1,"agent":"acme-dev","agent":"acme-prod","connectors":{}}',
+        "CURIE_HOSTED_CONNECTOR_ENDPOINTS": (
+            '{"version":1,"agent":"acme-dev","agent":"acme-prod","connectors":{}}'
+        ),
         "CURIE_CONNECTOR_CALLER_TOKEN": "cct.test",
     }
     with pytest.raises(ValueError, match="duplicate"):

@@ -178,12 +178,12 @@ affinity:
      IMPORTANT: the pin scans this body for env-name-shaped uppercase tokens, so
      the body must contain EXACTLY these eight keys and no other stray ones (this
      comment lives OUTSIDE the define so it is never scanned): the four runner
-     credential keys plus the four redirect/capture-capable keys (#487). The whole
+     credential keys plus the transport-control keys. The whole
      CURIE_ namespace is fenced separately by the hasPrefix rule in the
      connector-secret guard, so it is intentionally absent here. Emitted
      space-separated for consumption via `splitList " "`. */}}
 {{- define "curie.reservedConnectorSecretNames" -}}
-ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN HTTPS_PROXY HTTP_PROXY NODE_EXTRA_CA_CERTS ANTHROPIC_CUSTOM_HEADERS
+ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN HTTPS_PROXY HTTP_PROXY ALL_PROXY SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS NODE_TLS_REJECT_UNAUTHORIZED NODE_OPTIONS ANTHROPIC_CUSTOM_HEADERS https_proxy http_proxy all_proxy ssl_cert_file ssl_cert_dir node_extra_ca_certs node_tls_reject_unauthorized node_options anthropic_custom_headers
 {{- end -}}
 
 {{/* @spec ACTION-EXECUTOR-16: the reserved snapshot sealing key names. The

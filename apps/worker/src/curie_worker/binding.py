@@ -2080,7 +2080,7 @@ def apply_connector_endpoints(
     if not agent_name or not caller_token:
         raise ValueError("static hosted connectors require an authenticated agent and caller token")
     binding = config.connector_endpoints.bind(agent_name)
-    env[BINDING_ENV] = binding.model_dump_json(exclude_none=True)
+    env[BINDING_ENV] = binding.model_dump_json(exclude_none=True, exclude_defaults=True)
     env[BootEnv.env_key("connector_agent")] = agent_name
     env[CONNECTOR_CALLER_TOKEN_ENV] = caller_token
     for field_name in ("connector_release", "connector_namespace"):

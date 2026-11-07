@@ -1254,6 +1254,7 @@ def _build_action_executor(
             app_name=config.connector_app_name,
         )
     bindings = ExecutorBindings(
+        static_endpoints=config.connector_endpoints is not None,
         binding=binding,
         bundles=bundles,
         manifests=manifests,

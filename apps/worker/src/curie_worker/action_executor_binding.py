@@ -59,12 +59,14 @@ class ExecutorBindings:
         binding: BindingResolver,
         bundles: BundleReader,
         manifests: HttpManifestSource | None,
+        static_endpoints: bool,
         release: str,
         namespace: str,
         max_uncompressed_bytes: int,
         max_compression_ratio: float,
         max_members: int,
     ) -> None:
+        self._static_endpoints = static_endpoints
         self._binding = binding
         self._bundles = bundles
         # None on the local tier, which renders no connector Deployment.
@@ -121,6 +123,8 @@ class ExecutorBindings:
     ) -> frozenset[str]:
         """Names the connector's derived MCP entry headers expand (``${NAME}``)."""
 
+        if self._static_endpoints:
+            raise ValueError("static connector endpoints do not support the action executor")
         if not bundle_ref:
             return frozenset()
         data = self._bundles.get(bundle_ref)

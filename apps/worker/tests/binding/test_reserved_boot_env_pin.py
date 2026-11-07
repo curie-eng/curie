@@ -158,7 +158,7 @@ _HELPERS_TPL = (
 )
 
 # An env-name token: uppercase, at least one underscore (ANTHROPIC_BASE_URL etc).
-_ENV_NAME_RE = re.compile(r"[A-Z0-9]+(?:_[A-Z0-9]+)+")
+_ENV_NAME_RE = re.compile(r"[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+")
 
 
 def _reserved_names_from_helpers() -> set[str]:

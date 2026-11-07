@@ -2518,15 +2518,29 @@ pub fn restrict_to(decl: &ConnectorsFileDecl, allowlist: Option<&[String]>) -> C
 /// `apps/worker/tests/binding/test_reserved_boot_env_pin.py` is the drift pin
 /// that fails CI if the two lists diverge -- the same mechanism that pins the
 /// Helm list.
-pub const RESERVED_CONNECTOR_SECRET_NAMES: [&str; 8] = [
+pub const RESERVED_CONNECTOR_SECRET_NAMES: [&str; 22] = [
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_API_KEY",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_AUTH_TOKEN",
     "HTTPS_PROXY",
     "HTTP_PROXY",
+    "ALL_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
     "NODE_EXTRA_CA_CERTS",
+    "NODE_TLS_REJECT_UNAUTHORIZED",
+    "NODE_OPTIONS",
     "ANTHROPIC_CUSTOM_HEADERS",
+    "https_proxy",
+    "http_proxy",
+    "all_proxy",
+    "ssl_cert_file",
+    "ssl_cert_dir",
+    "node_extra_ca_certs",
+    "node_tls_reject_unauthorized",
+    "node_options",
+    "anthropic_custom_headers",
 ];
 
 /// Whether `name` is reserved: an enumerated platform credential or
@@ -2852,6 +2866,18 @@ connectors:
             "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    config: [ANTHROPIC_API_KEY]\n",
         );
         assert!(refuse_reserved_secret_names(&decl).is_err());
+    }
+
+    #[test]
+    fn node_tls_controls_are_refused_before_secret_resolution() {
+        for name in ["NODE_TLS_REJECT_UNAUTHORIZED", "NODE_OPTIONS"] {
+            let declared = decl(&format!(
+                "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    secrets: [{name}]\n"
+            ));
+            assert!(refuse_reserved_secret_names(&declared).is_err());
+            assert!(refuse_reserved_env_secret_name(name).is_err());
+        }
+        assert!(refuse_reserved_env_secret_name("EXAMPLE_API_TOKEN").is_ok());
     }
 
     const NO_CLIENT_AUTH: &str = r#"

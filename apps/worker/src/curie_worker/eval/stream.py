@@ -746,7 +746,7 @@ class EvalStreamConsumer(StreamConsumer):
                 )
         except AdmissionUnavailableError:
             raise
-        except SandboxError:
+        except (SandboxError, ValueError):
             logger.exception("could not provision a runner for eval %s", item.sha)
             return None, None, None
         return handle.base_url, release_key, handle.token or None

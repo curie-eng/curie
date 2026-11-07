@@ -19,7 +19,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from aci_protocol import BootEnv, SessionConfig
-from curie_internal.connector_endpoints import BINDING_ENV, ConnectorEndpointBinding
+from curie_internal.connector_endpoints import (
+    BINDING_ENV,
+    ConnectorEndpointBinding,
+    parse_endpoint_json,
+)
 
 from .harness.registry import DEFAULT_HARNESS
 from .memory_facts import MAX_FACTS_PER_MEMORY
@@ -228,10 +232,12 @@ class RunnerConfig:
 
         boot = BootEnv.from_env(env)
         endpoints = (
-            ConnectorEndpointBinding.model_validate_json(env[BINDING_ENV])
+            ConnectorEndpointBinding.model_validate(parse_endpoint_json(env[BINDING_ENV]))
             if BINDING_ENV in env
             else None
         )
+        if endpoints is not None and not (boot.connector_caller_token or "").strip():
+            raise ValueError("static hosted connector endpoints require a caller token")
         if endpoints is not None and boot.connector_agent not in (None, endpoints.agent):
             raise ValueError("connector endpoint identity does not match authenticated agent")
         # A runner-local read, not a BootEnv contract key (#517): the false-
