@@ -80,7 +80,10 @@ def graph_payload() -> dict[str, Any]:
         ("0145", False),
         ("0146", False),
         ("0147", False),
-        ("0148", True),
+        ("0148", False),
+        # @spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 columns.
+        ("0149", False),
+        ("0151", True),
         ("0000", True),
         ("future-expand", True),
     ],
@@ -103,11 +106,11 @@ def test_installed_candidate_decision_preserves_unknown_revision_policy(
     )
 
 
-def test_candidate_window_keeps_the_0148_floor() -> None:
-    """0149 stores webhook provenance and a wake-key generation and does not raise the floor."""
+def test_candidate_window_raises_the_floor_to_0151() -> None:
+    """@spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 requester columns."""
     window = shared().load_metadata().window
-    assert window.schema_min == "0148"
-    assert window.schema_head == "0149"
+    assert window.schema_min == "0151"
+    assert window.schema_head == "0151"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])

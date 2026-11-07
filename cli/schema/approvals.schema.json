@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/approvals/v2.4.json",
+  "$id": "https://schemas.curietech.ai/cli/approvals/v2.5.json",
   "title": "curie <tier> approvals --json",
-  "description": "The agent-facing payload of `curie <tier> approvals <agent>`: the dry-run plan; the gate list (`manifest_unreadable` non-null when the deployed manifest could not be read); the pending approval records (`truncated` true when the server page cap was hit); a single resolved record; one-time operator-principal or console-login-code delivery; or the agent's approval route bindings. Each binding separates its verified interactive Slack `resolution`, optional text-only `notification`, and optional `approvers` authority. Administrative recovery (#2753) adds two further shapes: `identity_report`, the installation-wide report of approval identity FACTS (`facts`, a string array per row) plus the `declarations` skeleton, forwarded verbatim from the API so an unknown field still reaches the operator; and `recovered`, one approval administratively rejected under the recovery grant.",
+  "description": "The agent-facing payload of `curie <tier> approvals <agent>`: the dry-run plan; the gate list (`manifest_unreadable` non-null when the deployed manifest could not be read); the pending approval records (`truncated` true when the server page cap was hit); a single resolved record; one-time operator-principal or console-login-code delivery; or the agent's approval route bindings. Each binding separates its verified interactive Slack `resolution`, optional text-only `notification`, and optional `approvers` authority. Administrative recovery (#2753) adds two further shapes: `identity_report`, the installation-wide report of approval identity FACTS (`facts`, a string array per row) plus the `declarations` skeleton, forwarded verbatim from the API so an unknown field still reaches the operator; and `recovered`, one approval administratively rejected under the recovery grant. The connector requester identity readback (ADR 0270 decision 1) adds one more: the agent's name and id, whether its hosted connector calls carry the verified requester (`connector_requester_identity`), and the version its next compare-and-set write must name (`connector_requester_identity_version`).",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -435,6 +435,31 @@
       },
       "required": [
         "recovered"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "agent_id": {
+          "type": "string"
+        },
+        "connector_requester_identity": {
+          "type": "boolean"
+        },
+        "connector_requester_identity_version": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "agent",
+        "agent_id",
+        "connector_requester_identity",
+        "connector_requester_identity_version"
       ]
     }
   ]

@@ -1,14 +1,22 @@
-"""Resume current checks and exact grant scope. @spec HTTP-APPROVAL-CONTINUITY-12."""
+"""Resume current checks and exact grant scope. @spec HTTP-APPROVAL-CONTINUITY-12.
+
+An opted-in agent's resume projects the original requester, never the
+approver or the system-authored queue actor. The grant check never carries a
+projection. @spec CONNECTOR-REQUESTER-1.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import uuid
-from typing import Literal
 
 from curie_internal import identity_approval as wire
 from curie_internal import identity_context as codec
-from curie_internal.identity_authority import TurnAuthorityRequestV1, TurnAuthorityResponseV1
+from curie_internal.identity_authority import (
+    TurnAuthorityRequestV1,
+    TurnAuthorityResponseV1,
+    TurnAuthorityResponseV2,
+)
 from fastapi import HTTPException, Request
 from redis.exceptions import RedisError
 from sqlalchemy import select
@@ -17,11 +25,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api import identity_fence
 from curie_api.identity.http_approval import canonical_json, verified_capsule
-from curie_api.identity.http_approval_answer import approved_resume_authority
+from curie_api.identity.http_approval_answer import approved_resume_current
 from curie_api.identity.http_invocation import (
     HttpInvocationRuntime,
     check_http_turn_authority,
     current_source_authority,
+    current_turn_answer,
     turn_authority_response,
     turn_invocation_source,
 )
@@ -108,10 +117,11 @@ async def _read_row(session: AsyncSession, approval_id: str) -> Approval | None:
 async def _check_resume(
     request: Request, check: TurnAuthorityRequestV1,
     grant: wire.ApprovalGrantExpectationV1 | None,
-) -> TurnAuthorityResponseV1:
+) -> TurnAuthorityResponseV1 | TurnAuthorityResponseV2:
     """One current boundary for a selected resume. @spec HTTP-APPROVAL-CONTINUITY-8/12.
 
-    Rejected and expired resumes check the original invoker only.
+    Rejected and expired resumes check the original invoker only, and an
+    opted-in agent projects that invoker. @spec CONNECTOR-REQUESTER-1.
     """
     runtime = getattr(request.app.state, "http_identity_runtime", None)
     client = getattr(request.app.state, "http_identity_client", None)
@@ -148,7 +158,7 @@ async def _check_resume(
         if saved is None:
             return turn_authority_response(check, "refuse", "invalid_context")
         return await _check_approved(request, check, runtime, resume, grant, saved)
-    reason: Literal["current_authority", "invalid_context"] = "invalid_context"
+    answer: TurnAuthorityResponseV1 | TurnAuthorityResponseV2 | None = None
     try:
         async with current_source_authority(
             request, runtime=runtime, client=client, registration=registration,
@@ -157,7 +167,12 @@ async def _check_resume(
             # The final reader still holds the unchanged protected row.
             row = await _read_row(current.session, resume.approval_id)
             if _row_matches(runtime, row, resume, grant):
-                reason = "current_authority"
+                answer = await current_turn_answer(
+                    check, current.session,
+                    sealed=resume.canonical, sealed_human=resume.principal is not None,
+                    current=current.verified_identity(),
+                    current_human=current.principal_ref is not None,
+                )
     except HTTPException as error:
         if error.status_code == 401:
             return turn_authority_response(check, "refuse", "invalid_context")
@@ -166,8 +181,8 @@ async def _check_resume(
         return turn_authority_response(check, "unavailable", "authority_unavailable")
     except (SQLAlchemyError, RedisError, identity_fence.IdentityWriterUnavailable):
         return turn_authority_response(check, "unavailable", "authority_unavailable")
-    if reason == "current_authority":
-        return turn_authority_response(check, "continue", "current_authority")
+    if answer is not None:
+        return answer
     return turn_authority_response(check, "refuse", "invalid_context")
 
 
@@ -175,20 +190,28 @@ async def _check_approved(
     request: Request, check: TurnAuthorityRequestV1, runtime: HttpInvocationRuntime,
     resume: wire.ResumeContextV1, grant: wire.ApprovalGrantExpectationV1 | None,
     saved: wire.ApprovalContextV1,
-) -> TurnAuthorityResponseV1:
+) -> TurnAuthorityResponseV1 | TurnAuthorityResponseV2:
     """Both subjects of an approved resume inside one final boundary.
 
     The composition approved-resume publication uses: a change to either
     subject after capture is unavailable, never answered from an earlier
     observation. @spec HTTP-APPROVAL-CONTINUITY-8/11/12.
+
+    An opted-in agent projects the freshly verified original invoker, never
+    the approver. @spec CONNECTOR-REQUESTER-1.
     """
-    reason: Literal["current_authority", "invalid_context"] = "invalid_context"
+    answer: TurnAuthorityResponseV1 | TurnAuthorityResponseV2 | None = None
     try:
-        async with approved_resume_authority(request.app.state)(saved) as current:
+        async with approved_resume_current(request.app.state)(saved) as current:
             # The final reader still holds the unchanged protected row.
-            row = await _read_row(current.session, resume.approval_id)
+            session = current.authority.session
+            row = await _read_row(session, resume.approval_id)
             if _row_matches(runtime, row, resume, grant):
-                reason = "current_authority"
+                answer = await current_turn_answer(
+                    check, session,
+                    sealed=resume.canonical, sealed_human=resume.principal is not None,
+                    current=current.invoker, current_human=current.invoker_human,
+                )
     except HTTPException as error:
         if error.status_code == 403 and error.detail in {
             "caller_not_allowed", "invalid_http_receiver",
@@ -199,14 +222,14 @@ async def _check_approved(
         return turn_authority_response(check, "unavailable", "authority_unavailable")
     except Exception:  # noqa: BLE001 - provider, credential and SQL details never cross.
         return turn_authority_response(check, "unavailable", "authority_unavailable")
-    if reason == "current_authority":
-        return turn_authority_response(check, "continue", "current_authority")
+    if answer is not None:
+        return answer
     return turn_authority_response(check, "refuse", "invalid_context")
 
 
 async def check_current_turn_authority(
     request: Request, check: TurnAuthorityRequestV1,
-) -> TurnAuthorityResponseV1:
+) -> TurnAuthorityResponseV1 | TurnAuthorityResponseV2:
     """Invocation contexts need approval_id=null; resume contexts name it exactly.
 
     @spec HTTP-INVOCATION-EXECUTION-16 HTTP-APPROVAL-CONTINUITY-12.
@@ -229,13 +252,20 @@ async def check_http_approval_grant(
     """
     check = body.check
     runtime = getattr(request.app.state, "http_identity_runtime", None)
+    answer: TurnAuthorityResponseV1 | TurnAuthorityResponseV2
     if type(runtime) is HttpInvocationRuntime and isinstance(
         codec.open_invocation_context(check.context, runtime._context_keys),
         codec.InvocationContextV1,
     ):
-        result = await check_http_turn_authority(request, check)
+        answer = await check_http_turn_authority(request, check)
     else:
-        result = await _check_resume(request, check, body.grant)
+        answer = await _check_resume(request, check, body.grant)
+    # @spec CONNECTOR-REQUESTER-1: the grant check never carries the projection.
+    result = TurnAuthorityResponseV1(
+        schema_version=1, request_id=answer.request_id, stage=answer.stage,
+        event_id=answer.event_id, context_sha256=answer.context_sha256, scope=answer.scope,
+        decision=answer.decision, reason=answer.reason,
+    )
     return wire.ApprovalGrantAuthorityResponseV1(
         schema_version=1, check=result,
         grant_sha256=hashlib.sha256(

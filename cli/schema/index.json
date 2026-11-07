@@ -43,7 +43,13 @@
       "result": "ApprovalsOutput",
       "kind": "CliOutput",
       "schema": "approvals.schema.json",
-      "version": "2.4"
+      "version": "2.5"
+    },
+    {
+      "result": "RequesterIdentityOutput",
+      "kind": "CliOutput",
+      "schema": "approvals.schema.json",
+      "version": "2.5"
     },
     {
       "result": "BudgetOutput",

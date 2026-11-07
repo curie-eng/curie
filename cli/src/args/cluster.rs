@@ -1329,5 +1329,7 @@ pub(crate) enum ClusterAction {
         clear_routes: bool,
         #[command(flatten)]
         recovery: ApprovalRecoveryArgs,
+        #[command(flatten)]
+        requester: RequesterIdentityArgs,
     },
 }

@@ -1332,6 +1332,16 @@
             "title": "Channels",
             "type": "array"
           },
+          "connector_requester_identity": {
+            "default": false,
+            "title": "Connector Requester Identity",
+            "type": "boolean"
+          },
+          "connector_requester_identity_version": {
+            "default": 1,
+            "title": "Connector Requester Identity Version",
+            "type": "integer"
+          },
           "created_at": {
             "format": "date-time",
             "title": "Created At",
@@ -1590,6 +1600,30 @@
               }
             ],
             "title": "Approval Routes"
+          },
+          "connector_requester_identity": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connector Requester Identity"
+          },
+          "connector_requester_identity_expected_version": {
+            "anyOf": [
+              {
+                "maximum": 2147483646.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connector Requester Identity Expected Version"
           },
           "deploy_notifications": {
             "anyOf": [
@@ -14871,6 +14905,87 @@
         "title": "TurnAuthorityResponseV1",
         "type": "object"
       },
+      "TurnAuthorityResponseV2": {
+        "additionalProperties": false,
+        "description": "Every version 1 field plus the required-nullable requester projection.\n\nThe API answers version 2 only for a continue on an agent that opted in to\nconnector requester identity; a null requester means no verified human. A\nrequester is bound to this answer's own checked scope and never rides a\nrefused or unavailable answer. @spec CONNECTOR-REQUESTER-1.",
+        "properties": {
+          "context_sha256": {
+            "title": "Context Sha256",
+            "type": "string"
+          },
+          "decision": {
+            "enum": [
+              "continue",
+              "refuse",
+              "unavailable"
+            ],
+            "title": "Decision",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "current_authority",
+              "caller_not_allowed",
+              "invalid_context",
+              "unsupported_resume",
+              "authority_unavailable"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "requester": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TurnRequesterV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "schema_version": {
+            "const": 2,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/TurnAuthorityScopeV1"
+          },
+          "stage": {
+            "enum": [
+              "prepare",
+              "claim_or_resume",
+              "start",
+              "steer"
+            ],
+            "title": "Stage",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "stage",
+          "event_id",
+          "context_sha256",
+          "scope",
+          "decision",
+          "reason",
+          "requester"
+        ],
+        "title": "TurnAuthorityResponseV2",
+        "type": "object"
+      },
       "TurnAuthorityScopeV1": {
         "additionalProperties": false,
         "description": "@spec HTTP-INVOCATION-EXECUTION-16.",
@@ -14961,6 +15076,35 @@
           "seq"
         ],
         "title": "TurnProgressBody",
+        "type": "object"
+      },
+      "TurnRequesterV1": {
+        "additionalProperties": false,
+        "description": "The verified original requester: tenant and canonical issuer and subject only.\n\nCompared exactly; never normalized. @spec CONNECTOR-REQUESTER-1.",
+        "properties": {
+          "issuer": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Issuer",
+            "type": "string"
+          },
+          "subject": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Subject",
+            "type": "string"
+          },
+          "tenant_id": {
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "issuer",
+          "subject"
+        ],
+        "title": "TurnRequesterV1",
         "type": "object"
       },
       "TurnSource": {
@@ -29720,7 +29864,7 @@
     },
     "/v1/internal/identity/turn-authority/check": {
       "post": {
-        "description": "@spec HTTP-INVOCATION-EXECUTION-8/16.",
+        "description": "@spec HTTP-INVOCATION-EXECUTION-8/16 CONNECTOR-REQUESTER-1.",
         "operationId": "check_turn_authority_v1_internal_identity_turn_authority_check_post",
         "parameters": [
           {
@@ -29755,7 +29899,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/TurnAuthorityResponseV1"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/TurnAuthorityResponseV1"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TurnAuthorityResponseV2"
+                    }
+                  ],
+                  "title": "Response Check Turn Authority V1 Internal Identity Turn Authority Check Post"
                 }
               }
             },

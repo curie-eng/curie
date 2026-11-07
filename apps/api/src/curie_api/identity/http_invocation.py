@@ -19,6 +19,9 @@ from curie_internal.identity_authority import (
     IDENTITY_CALLER_WAIT_SECONDS,
     TurnAuthorityRequestV1,
     TurnAuthorityResponseV1,
+    TurnAuthorityResponseV2,
+    TurnAuthorityScopeV1,
+    TurnRequesterV1,
 )
 from fastapi import HTTPException, Request
 from pydantic import Field, model_validator
@@ -413,6 +416,45 @@ def registers_binding_identity(
     )
 
 
+def registered_binding_ids(runtime: object, tenant_id: uuid.UUID) -> frozenset[str]:
+    """Binding ids an operator receiver registration of this tenant lists.
+
+    Both Slack registrations (``ReceiverRegistrationV1``) and email
+    registrations (``EmailReceiverRegistrationV1``) count, by their explicit
+    ``binding_ids`` only. HTTP classification is deliberately not consulted: a
+    migrated or filtered role classifies a binding as HTTP-required with no
+    receiver behind it. No runtime, or anything that is not the API's own
+    runtime, registers nothing. @spec CONNECTOR-REQUESTER-1.
+    """
+    if type(runtime) is not HttpInvocationRuntime:
+        return frozenset()
+    tenant = str(tenant_id)
+    registrations: tuple[AnyReceiverRegistration, ...] = (
+        *runtime._receivers.values(),
+        *runtime._email_receivers.values(),
+    )
+    return frozenset(
+        binding
+        for registration in registrations
+        if registration.tenant_id == tenant
+        for binding in registration.binding_ids
+    )
+
+
+async def tenant_selects_http_identity(session: AsyncSession, tenant_id: uuid.UUID) -> bool:
+    """Whether the tenant has an HTTP identity selection.
+
+    SQL presence keeps corrupt JSON null out of the legacy path (criteria 15
+    and 17). @spec HTTP-INVOCATION-EXECUTION-22 CONNECTOR-REQUESTER-1.
+    """
+    selected = await session.scalar(
+        select(TenantIdentityProvider.http_selection.is_not(None)).where(
+            TenantIdentityProvider.tenant_id == tenant_id,
+        )
+    )
+    return selected is True
+
+
 async def binding_requires_http_identity(
     session: AsyncSession, runtime: HttpInvocationRuntime | None, binding: AgentChannel,
 ) -> bool:
@@ -425,12 +467,7 @@ async def binding_requires_http_identity(
     continuity all ask this. @spec HTTP-INVOCATION-EXECUTION-22
     HTTP-APPROVAL-CONTINUITY-14.
     """
-    selected = await session.scalar(
-        select(TenantIdentityProvider.http_selection.is_not(None)).where(
-            TenantIdentityProvider.tenant_id == binding.tenant_id,
-        )
-    )
-    if selected is not True:
+    if not await tenant_selects_http_identity(session, binding.tenant_id):
         return False
     if registers_binding_identity(
         runtime, tenant_id=binding.tenant_id, kind=binding.kind, adapter=binding.adapter,
@@ -888,6 +925,15 @@ class CurrentHttpInvocation:
     _sealable: bool = field(default=True, repr=False)
     _open: bool = field(default=True, repr=False)
 
+    def verified_identity(self) -> codec.ContextCanonicalV1 | None:
+        """The freshly verified canonical identity, only for a resolved outcome.
+
+        Valid only while the boundary is open. @spec CONNECTOR-REQUESTER-1.
+        """
+        if not self._open or not self.session.in_transaction():
+            _unavailable()
+        return resolved_identity(self._facts)
+
     def publication_window(self) -> tuple[str, DeliveryValidityWindow]:
         """The stable fence read under this open reader and its T1 window.
 
@@ -1172,6 +1218,82 @@ async def current_source_authority(
     _unavailable()
 
 
+def resolved_identity(facts: ValidatedFacts) -> codec.ContextCanonicalV1 | None:
+    """A fresh lookup's canonical identity when, and only when, it resolved.
+
+    @spec CONNECTOR-REQUESTER-1.
+    """
+    identity = facts.identity
+    if facts.outcome != "resolved" or identity is None:
+        return None
+    return codec.ContextCanonicalV1(issuer=identity.issuer, subject=identity.subject)
+
+
+class RequesterIdentityStateInvalid(Exception):
+    """The agent row is missing, or its opt-in is not a stored boolean.
+
+    @spec CONNECTOR-REQUESTER-1.
+    """
+
+
+async def requester_identity_opted_in(
+    session: AsyncSession, scope: TurnAuthorityScopeV1,
+) -> bool:
+    """The operator's connector requester identity opt-in, read in this reader.
+
+    A missing agent row or a value that is not a boolean raises
+    ``RequesterIdentityStateInvalid``. @spec CONNECTOR-REQUESTER-1.
+    """
+    row = (
+        await session.execute(
+            select(Agent.connector_requester_identity).where(
+                Agent.id == uuid.UUID(scope.agent_id),
+                Agent.tenant_id == uuid.UUID(scope.tenant_id),
+            )
+        )
+    ).first()
+    if row is None or type(row[0]) is not bool:
+        raise RequesterIdentityStateInvalid
+    return row[0]
+
+
+def verified_requester(
+    tenant_id: str, *, sealed: codec.ContextCanonicalV1 | None, sealed_human: bool,
+    current: codec.ContextCanonicalV1 | None, current_human: bool,
+) -> TurnRequesterV1 | None:
+    """The original requester, projected only after an explicit equality check.
+
+    ``sealed`` is the canonical association the original invocation sealed,
+    ``current`` the one this check just verified fresh (None unless resolved).
+    A resolved identity that differs from a sealed one refuses
+    (``caller_not_allowed``): the raw-account exception in
+    ``source_permission`` tolerates that mismatch for admission, so the
+    projection never relies on it. A requester exists only when both sides
+    name the same human with an applied principal; otherwise it is null.
+    @spec CONNECTOR-REQUESTER-1 HTTP-APPROVAL-CONTINUITY-8.
+    """
+    if current is None:
+        return None
+    if sealed is not None and (sealed.issuer, sealed.subject) != (current.issuer, current.subject):
+        _deny()
+    if sealed is None or not sealed_human or not current_human:
+        return None
+    return TurnRequesterV1(tenant_id=tenant_id, issuer=sealed.issuer, subject=sealed.subject)
+
+
+def turn_authority_projection(
+    check: TurnAuthorityRequestV1, requester: TurnRequesterV1 | None,
+) -> TurnAuthorityResponseV2:
+    """The version 2 continue of an opted-in agent. @spec CONNECTOR-REQUESTER-1."""
+    return TurnAuthorityResponseV2(
+        schema_version=2, request_id=check.request_id, stage=check.stage,
+        event_id=check.event_id,
+        context_sha256=hashlib.sha256(check.context.encode("ascii")).hexdigest(),
+        scope=check.scope, decision="continue", reason="current_authority",
+        requester=requester,
+    )
+
+
 def turn_authority_response(
     check: TurnAuthorityRequestV1,
     decision: Literal["continue", "refuse", "unavailable"],
@@ -1267,8 +1389,11 @@ def turn_invocation_source(
 
 async def check_http_turn_authority(
     request: Request, check: TurnAuthorityRequestV1,
-) -> TurnAuthorityResponseV1:
-    """@spec HTTP-INVOCATION-EXECUTION-5/8/16."""
+) -> TurnAuthorityResponseV1 | TurnAuthorityResponseV2:
+    """Version 2 only for a continue on an opted-in agent; otherwise exactly version 1.
+
+    @spec HTTP-INVOCATION-EXECUTION-5/8/16 CONNECTOR-REQUESTER-1.
+    """
     runtime = getattr(request.app.state, "http_identity_runtime", None)
     client = getattr(request.app.state, "http_identity_client", None)
     if type(runtime) is not HttpInvocationRuntime or not isinstance(client, HttpIdentityClient):
@@ -1294,8 +1419,13 @@ async def check_http_turn_authority(
         async with current_source_authority(
             request, runtime=runtime, client=client, registration=registration,
             source=source, original=context,
-        ):
-            result = turn_authority_response(check, "continue", "current_authority")
+        ) as current:
+            result = await current_turn_answer(
+                check, current.session,
+                sealed=context.canonical, sealed_human=context.principal is not None,
+                current=current.verified_identity(),
+                current_human=current.principal_ref is not None,
+            )
         return result
     except HTTPException as error:
         if error.status_code == 401:
@@ -1305,6 +1435,32 @@ async def check_http_turn_authority(
         return turn_authority_response(check, "unavailable", "authority_unavailable")
     except (SQLAlchemyError, RedisError, identity_fence.IdentityWriterUnavailable):
         return turn_authority_response(check, "unavailable", "authority_unavailable")
+
+
+async def current_turn_answer(
+    check: TurnAuthorityRequestV1, session: AsyncSession, *,
+    sealed: codec.ContextCanonicalV1 | None, sealed_human: bool,
+    current: codec.ContextCanonicalV1 | None, current_human: bool,
+) -> TurnAuthorityResponseV1 | TurnAuthorityResponseV2:
+    """The continue answer, decided inside the final current-authority reader.
+
+    An agent that has not opted in gets today's exact version 1 continue. An
+    opted-in agent gets version 2 with the verified original requester, or a
+    null one; a changed canonical association refuses. A missing agent row or
+    an opt-in that is not a boolean refuses as ``invalid_context``.
+    @spec CONNECTOR-REQUESTER-1.
+    """
+    try:
+        opted_in = await requester_identity_opted_in(session, check.scope)
+    except RequesterIdentityStateInvalid:
+        return turn_authority_response(check, "refuse", "invalid_context")
+    if not opted_in:
+        return turn_authority_response(check, "continue", "current_authority")
+    requester = verified_requester(
+        check.scope.tenant_id, sealed=sealed, sealed_human=sealed_human,
+        current=current, current_human=current_human,
+    )
+    return turn_authority_projection(check, requester)
 
 
 @asynccontextmanager

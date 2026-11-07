@@ -1476,6 +1476,159 @@ pub async fn approvals(
     })
 }
 
+// --- Connector requester identity (ADR 0270 decision 1) ------------------------
+//
+// The operator's opt-in for hosted connectors receiving the verified human
+// requester. It lives on the agent row beside a version, and the API writes it
+// only as a compare-and-set that is alone in its PATCH, so this verb sends
+// exactly the flag and the version and never retries a conflict with a version
+// it read itself: the operator must see what changed first.
+
+/// `--requester-identity <on|off|show>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum RequesterIdentityMode {
+    /// Enable requester transport (needs HTTP identity and a registered receiver).
+    On,
+    /// Disable requester transport.
+    Off,
+    /// Show the flag and the version its next write must name.
+    Show,
+}
+
+/// The flag as read back from the agent row. @spec CONNECTOR-REQUESTER-1.
+#[derive(Debug)]
+pub struct RequesterIdentityOutput {
+    pub agent: String,
+    pub agent_id: String,
+    pub connector_requester_identity: bool,
+    pub connector_requester_identity_version: u64,
+}
+
+impl RequesterIdentityOutput {
+    fn from_agent(agent: crate::api::Agent) -> Result<Self> {
+        match (
+            agent.connector_requester_identity,
+            agent.connector_requester_identity_version,
+        ) {
+            (Some(enabled), Some(version)) => Ok(Self {
+                agent: agent.name,
+                agent_id: agent.id,
+                connector_requester_identity: enabled,
+                connector_requester_identity_version: version,
+            }),
+            _ => Err(crate::exit::CliError::failure(format!(
+                "the platform API did not report connector requester identity for agent {}, so \
+                 it is older than this CLI",
+                agent.name
+            ))
+            .with_fix("upgrade the release to one that carries the flag, or use a CLI matching it")
+            .into()),
+        }
+    }
+}
+
+impl crate::ui::CliOutput for RequesterIdentityOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "agent": self.agent,
+            "agent_id": self.agent_id,
+            "connector_requester_identity": self.connector_requester_identity,
+            "connector_requester_identity_version": self.connector_requester_identity_version,
+        })
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        let state = if self.connector_requester_identity {
+            "on"
+        } else {
+            "off"
+        };
+        ui.payload(&format!(
+            "{}: connector requester identity {state} (version {})",
+            self.agent, self.connector_requester_identity_version
+        ));
+    }
+}
+
+/// `<tier> approvals <agent> --requester-identity <on|off|show>
+/// [--expected-version N]`. `show` reads; `on`/`off` send one compare-and-set
+/// PATCH, naming `expected_version` or, when omitted, the version just read.
+/// @spec CONNECTOR-REQUESTER-1.
+pub async fn approvals_requester_identity(
+    opts: AgentActionOpts,
+    mode: RequesterIdentityMode,
+    expected_version: Option<u64>,
+) -> Result<Box<dyn crate::ui::CliOutput>> {
+    let enabled = match mode {
+        RequesterIdentityMode::On => Some(true),
+        RequesterIdentityMode::Off => Some(false),
+        RequesterIdentityMode::Show => None,
+    };
+    if enabled.is_none() && expected_version.is_some() {
+        return Err(crate::exit::usage(
+            "--expected-version names the version an on/off write compares against; drop it \
+             with --requester-identity show",
+        ));
+    }
+    if expected_version == Some(0) {
+        return Err(crate::exit::usage(
+            "--expected-version starts at 1; read the current one with --requester-identity show",
+        ));
+    }
+    if opts.dry_run {
+        let line = match enabled {
+            Some(enabled) => {
+                let version = expected_version.map_or_else(
+                    || "<the version read from the agent first>".to_string(),
+                    |version| version.to_string(),
+                );
+                format!(
+                    "PATCH {}/agents/<id> {{\"connector_requester_identity\": {enabled}, \
+                     \"connector_requester_identity_expected_version\": {version}}}  (alone in \
+                     its request; would resolve agent {:?} first)",
+                    opts.api_url, opts.agent
+                )
+            }
+            None => format!(
+                "GET {}/agents (show connector requester identity; would resolve agent {:?})",
+                opts.api_url, opts.agent
+            ),
+        };
+        return Ok(Box::new(crate::ui::DryRunPlan { lines: vec![line] }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let Some(enabled) = enabled else {
+        return Ok(Box::new(RequesterIdentityOutput::from_agent(agent)?));
+    };
+    let expected = match expected_version {
+        Some(version) => version,
+        None => {
+            RequesterIdentityOutput::from_agent(agent.clone())?.connector_requester_identity_version
+        }
+    };
+    let ui = crate::ui::ui();
+    let cl = ui.checklist();
+    let step = cl.step(&format!(
+        "setting connector requester identity {} for {}",
+        if enabled { "on" } else { "off" },
+        agent.name
+    ));
+    match client
+        .set_connector_requester_identity(&agent.id, enabled, expected)
+        .await
+    {
+        Ok(updated) => {
+            step.done("updated");
+            Ok(Box::new(RequesterIdentityOutput::from_agent(updated)?))
+        }
+        Err(err) => {
+            step.fail("failed");
+            Err(err)
+        }
+    }
+}
+
 /// The one-time credential a `--mint-*` flag asks the API to issue.
 #[derive(Clone, Copy)]
 enum MintKind {

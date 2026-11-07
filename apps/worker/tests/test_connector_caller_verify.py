@@ -1,10 +1,11 @@
-"""The caller proxy's token check (ADR-0168 decision 7).
+"""The caller proxy's token check (ADR-0168 decision 7, ADR 0270 decision 2).
 
 It reads the same frozen corpus the worker's minter is pinned to
 (tests/vectors/connector-caller-token.json), so the minter and the verifier
-cannot drift apart. The refusal cases are derived from the accept vectors
-here rather than frozen, so the corpus and its reader stay exactly as the
-minter's test left them.
+cannot drift apart. The agent-only refusal cases are derived from the accept
+vectors here rather than frozen. The principal refusals are frozen in the
+corpus (`malformed_principals`, `tampered_principals`), because a duplicate
+key can only be written down as the exact text that was signed.
 """
 
 from __future__ import annotations
@@ -12,7 +13,9 @@ from __future__ import annotations
 import base64
 import json
 import tomllib
+import unicodedata
 from pathlib import Path
+from typing import Any
 
 import pytest
 from curie_connector_proxy import caller
@@ -20,8 +23,11 @@ from nacl.signing import SigningKey, VerifyKey
 
 _VECTOR = Path(__file__).resolve().parents[3] / "tests" / "vectors" / "connector-caller-token.json"
 _CORPUS = json.loads(_VECTOR.read_text(encoding="utf-8"))
-_VECTORS: list[dict[str, object]] = _CORPUS["vectors"]
+_VECTORS: list[dict[str, Any]] = _CORPUS["vectors"]
 _BY_NAME = {str(v["name"]): v for v in _VECTORS}
+_MALFORMED: list[dict[str, Any]] = _CORPUS["malformed_principals"]
+_TAMPERED: list[dict[str, Any]] = _CORPUS["tampered_principals"]
+_PRINCIPAL_VECTORS = [v for v in _VECTORS if "principal" in v]
 _OTHER_SEED = {
     "a_plain_agent_name": "the_same_claims_under_another_seed",
     "the_same_claims_under_another_seed": "a_plain_agent_name",
@@ -30,7 +36,16 @@ _OTHER_SEED = {
     ),
     "a_work_item_run": "the_same_claims_under_another_seed",
     "the_same_work_item_under_another_run": "the_same_claims_under_another_seed",
+    "a_human_requester": "the_same_claims_under_another_seed",
+    "the_same_requester_on_a_work_item_run": "the_same_claims_under_another_seed",
+    "another_subject_under_the_same_issuer": "the_same_claims_under_another_seed",
+    "a_non_ascii_subject_is_carried_escaped": "the_same_claims_under_another_seed",
+    "a_principal_at_its_field_bounds": "the_same_claims_under_another_seed",
+    "a_control_character_is_carried_escaped": "the_same_claims_under_another_seed",
 }
+_MALFORMED_BY_NAME = {str(e["name"]): e for e in _MALFORMED}
+# Every malformed and tampered principal is signed with the first vector's seed.
+_SIGNER = _VECTORS[0]
 
 
 def _key(vector: dict[str, object]) -> list[VerifyKey]:
@@ -51,6 +66,17 @@ def _decide(
     return caller.decide(_key(vector), token, admits=frozenset(admits), now=now)
 
 
+def _principal(vector: dict[str, Any]) -> caller.Principal | None:
+    fields = vector.get("principal")
+    if fields is None:
+        return None
+    return caller.Principal(
+        tenant_id=str(fields["tenant_id"]),
+        issuer=str(fields["issuer"]),
+        subject=str(fields["subject"]),
+    )
+
+
 # @spec ADR-0168 d7
 def test_the_prefix_and_header_match_the_minter_and_the_runner() -> None:
     from curie_worker import caller_token
@@ -59,7 +85,20 @@ def test_the_prefix_and_header_match_the_minter_and_the_runner() -> None:
     assert caller.HEADER == "X-Curie-Caller"
 
 
+# @spec CONNECTOR-REQUESTER-4
+def test_the_principal_header_is_the_one_the_corpus_names() -> None:
+    assert caller.PRINCIPAL_HEADER == _CORPUS["forged_principal_headers"]["header"]
+    assert caller.PRINCIPAL_HEADER == "X-Curie-Principal"
+
+
+def test_every_vector_has_a_counterpart_under_another_seed() -> None:
+    assert set(_OTHER_SEED) == set(_BY_NAME)
+    for name, other in _OTHER_SEED.items():
+        assert _BY_NAME[name]["public"] != _BY_NAME[other]["public"], name
+
+
 # @spec ADR-0168 d7
+# @spec CONNECTOR-REQUESTER-2
 @pytest.mark.parametrize("vector", _VECTORS, ids=lambda v: str(v["name"]))
 def test_every_frozen_token_is_admitted_before_it_expires(vector: dict[str, object]) -> None:
     decision = _decide(
@@ -70,8 +109,200 @@ def test_every_frozen_token_is_admitted_before_it_expires(vector: dict[str, obje
         refusal=None,
         run=str(vector["run"]) if "run" in vector else None,
         work_item=str(vector["work_item"]) if "work_item" in vector else None,
+        principal=_principal(vector),
     )
     assert decision.admitted
+    # An agent-only token names no human, and a principal-bearing one names
+    # exactly the signed one.
+    assert decision.principal == _principal(vector)
+    assert caller.claims(_key(vector), str(vector["minted"])) is not None
+
+
+# @spec CONNECTOR-REQUESTER-2
+def test_the_principal_corpus_is_not_vacuous() -> None:
+    assert len(_PRINCIPAL_VECTORS) >= 4
+    assert any("run" in v for v in _PRINCIPAL_VECTORS)
+    human = _BY_NAME["a_human_requester"]
+    other = _BY_NAME["another_subject_under_the_same_issuer"]
+    # Two humans who differ only in subject come back as two principals.
+    assert _principal(human) != _principal(other)
+    assert {k: v for k, v in human["principal"].items() if k != "subject"} == {
+        k: v for k, v in other["principal"].items() if k != "subject"
+    }
+    now = _exp(human) - 1
+    first = _decide(human, str(human["minted"]), admits={"acme-dev"}, now=now)
+    second = _decide(other, str(other["minted"]), admits={"acme-dev"}, now=now)
+    assert first.principal is not None and second.principal is not None
+    assert first.principal.subject != second.principal.subject
+
+
+# @spec CONNECTOR-REQUESTER-2
+@pytest.mark.parametrize("entry", _MALFORMED, ids=lambda e: str(e["name"]))
+def test_a_malformed_principal_is_invalid(entry: dict[str, Any]) -> None:
+    # Signed by the configured key (the minter's tests check that), so the
+    # refusal is the claims', and the same key admits a well-formed principal.
+    token = str(entry["minted"])
+    decision = _decide(_SIGNER, token, admits={"acme-dev"}, now=_exp(_SIGNER) - 1)
+    assert decision == caller.Decision(agent=None, refusal=caller.INVALID), entry["name"]
+    assert decision.principal is None
+    assert caller.claims(_key(_SIGNER), token) is None
+
+
+# @spec CONNECTOR-REQUESTER-2
+@pytest.mark.parametrize("entry", _TAMPERED, ids=lambda e: str(e["name"]))
+def test_a_tampered_principal_is_invalid(entry: dict[str, Any]) -> None:
+    token = str(entry["minted"])
+    decision = _decide(_SIGNER, token, admits={"acme-dev"}, now=_exp(_SIGNER) - 1)
+    assert decision == caller.Decision(agent=None, refusal=caller.INVALID), entry["name"]
+    assert decision.principal is None
+    assert caller.claims(_key(_SIGNER), token) is None
+
+
+# @spec CONNECTOR-REQUESTER-2
+def test_the_key_that_refuses_the_malformed_principals_admits_a_well_formed_one() -> None:
+    human = _BY_NAME["a_human_requester"]
+    assert human["public"] == _SIGNER["public"]
+    decision = _decide(_SIGNER, str(human["minted"]), admits={"acme-dev"}, now=_exp(human) - 1)
+    assert decision.admitted
+    assert decision.principal == _principal(human)
+
+
+# @spec CONNECTOR-REQUESTER-2
+@pytest.mark.parametrize("offset", [0, 1])
+@pytest.mark.parametrize("vector", _PRINCIPAL_VECTORS, ids=lambda v: str(v["name"]))
+def test_an_expired_principal_token_names_no_principal(vector: dict[str, Any], offset: int) -> None:
+    decision = _decide(
+        vector, str(vector["minted"]), admits={"acme-dev"}, now=_exp(vector) + offset
+    )
+    assert decision == caller.Decision(
+        agent=str(vector["agent"]),
+        refusal=caller.EXPIRED,
+        run=vector.get("run"),
+        work_item=vector.get("work_item"),
+    )
+    assert decision.principal is None
+
+
+# @spec CONNECTOR-REQUESTER-2
+@pytest.mark.parametrize("vector", _PRINCIPAL_VECTORS, ids=lambda v: str(v["name"]))
+def test_a_principal_never_carries_an_agent_past_admission(vector: dict[str, Any]) -> None:
+    decision = _decide(vector, str(vector["minted"]), admits={"someone-else"}, now=_exp(vector) - 1)
+    assert decision == caller.Decision(
+        agent=str(vector["agent"]),
+        refusal=caller.NOT_ADMITTED,
+        run=vector.get("run"),
+        work_item=vector.get("work_item"),
+    )
+    assert decision.principal is None
+
+
+def _signed_route(claims: dict[str, object]) -> str:
+    seed = base64.b64decode(str(_SIGNER["seed"]))
+    payload = json.dumps(claims, separators=(",", ":"), sort_keys=True).encode("ascii")
+    head = f"ccr.{_b64url(payload)}"
+    signature = SigningKey(seed).sign(head.encode("ascii")).signature
+    return f"{head}.{_b64url(signature)}"
+
+
+# @spec CONNECTOR-REQUESTER-2
+def test_a_route_token_carrying_a_principal_is_invalid() -> None:
+    # ADR 0270 decision 2: ccr keeps its closed claims; human authority on a
+    # route would need its own amendment.
+    human = _BY_NAME["a_human_requester"]
+    base: dict[str, object] = {"agent": "acme-dev", "connector": "reviewer", "exp": _exp(human)}
+    keys = _key(_SIGNER)
+    now = _exp(human) - 1
+    # Liveness: the same claims without the principal are admitted.
+    plain = caller.decide_route(
+        keys, _signed_route(base), connector="reviewer", admits=frozenset({"acme-dev"}), now=now
+    )
+    assert plain == caller.Decision(agent="acme-dev", refusal=None)
+    for extra in (
+        {"principal": human["principal"]},
+        {
+            "principal": human["principal"],
+            "run": "11111111-1111-4111-8111-111111111111",
+            "work_item": "22222222-2222-4222-8222-222222222222",
+        },
+        {"principal": None},
+    ):
+        decision = caller.decide_route(
+            keys,
+            _signed_route({**base, **extra}),
+            connector="reviewer",
+            admits=frozenset({"acme-dev"}),
+            now=now,
+        )
+        assert decision == caller.Decision(agent=None, refusal=caller.INVALID), extra
+        assert decision.principal is None
+
+
+# @spec CONNECTOR-REQUESTER-2
+def test_a_principal_at_its_field_bounds_crosses_from_minter_to_verifier() -> None:
+    from curie_worker import caller_token
+
+    principal = caller_token.CallerPrincipal(
+        tenant_id="44444444-4444-4444-8444-444444444444",
+        issuer="https://idp.example.test/" + "a" * (2048 - 25),
+        subject="s" * 256,
+    )
+    token = caller_token.mint(
+        str(_SIGNER["seed"]), agent="acme-dev", exp=_exp(_SIGNER), principal=principal
+    )
+    decision = _decide(_SIGNER, token, admits={"acme-dev"}, now=_exp(_SIGNER) - 1)
+    assert decision.admitted
+    assert decision.principal == caller.Principal(
+        tenant_id=principal.tenant_id, issuer=principal.issuer, subject=principal.subject
+    )
+
+
+def _refused(entry: dict[str, Any]) -> bool:
+    token = str(entry["minted"])
+    decision = _decide(_SIGNER, token, admits={"acme-dev"}, now=_exp(_SIGNER) - 1)
+    return decision == caller.Decision(agent=None, refusal=caller.INVALID)
+
+
+# @spec CONNECTOR-REQUESTER-2
+def test_the_field_bounds_admit_at_the_bound_and_refuse_one_past_it() -> None:
+    # The bounds are identity_context ContextCanonicalV1's, pinned through the
+    # corpus: exactly 2048 and 256 characters admit, one more refuses.
+    vector = _BY_NAME["a_principal_at_its_field_bounds"]
+    fields = vector["principal"]
+    assert (len(fields["issuer"]), len(fields["subject"])) == (2048, 256)
+    decision = _decide(vector, str(vector["minted"]), admits={"acme-dev"}, now=_exp(vector) - 1)
+    assert decision.admitted
+    assert decision.principal == _principal(vector)
+    for name, field, length in (
+        ("an_issuer_of_2049_characters", "issuer", 2049),
+        ("a_subject_of_257_characters", "subject", 257),
+    ):
+        entry = _MALFORMED_BY_NAME[name]
+        assert len(json.loads(str(entry["payload"]))["principal"][field]) == length
+        assert _refused(entry), name
+
+
+# @spec CONNECTOR-REQUESTER-2
+def test_a_control_character_is_admitted_and_exposed_exactly() -> None:
+    # A principal valid for HTTP identity is valid in the token, and identity
+    # admits control characters; the subject comes back verbatim, not cleaned.
+    vector = _BY_NAME["a_control_character_is_carried_escaped"]
+    subject = str(vector["principal"]["subject"])
+    assert any(unicodedata.category(char) == "Cc" for char in subject)
+    decision = _decide(vector, str(vector["minted"]), admits={"acme-dev"}, now=_exp(vector) - 1)
+    assert decision.admitted
+    assert decision.principal is not None
+    assert decision.principal.subject == subject
+
+
+# @spec CONNECTOR-REQUESTER-2
+def test_a_lone_surrogate_is_refused() -> None:
+    # Identity text must encode to UTF-8; a lone surrogate escape decodes to a
+    # string that does not.
+    entry = _MALFORMED_BY_NAME["a_lone_surrogate_in_subject"]
+    subject = json.loads(str(entry["payload"]))["principal"]["subject"]
+    with pytest.raises(UnicodeEncodeError):
+        subject.encode("utf-8")
+    assert _refused(entry)
 
 
 # @spec ADR-0168 d7
@@ -174,6 +405,13 @@ def _tampered() -> list[tuple[str, str]]:
         ("agent_not_a_string", signed(b'{"agent":7,"exp":1890000000}')),
         ("an_empty_agent", signed(b'{"agent":"","exp":1890000000}')),
         ("an_extra_claim", signed(b'{"agent":"acme-dev","aud":"x","exp":1890000000}')),
+        # ADR 0270 decision 2: a duplicate key anywhere in the signed payload
+        # refuses, so a first-wins and a last-wins reader cannot disagree.
+        (
+            "a_duplicate_agent_key",
+            signed(b'{"agent":"other-agent","agent":"acme-dev","exp":1890000000}'),
+        ),
+        ("a_duplicate_exp_key", signed(b'{"agent":"acme-dev","exp":1,"exp":1890000000}')),
         (
             "only_run",
             signed(

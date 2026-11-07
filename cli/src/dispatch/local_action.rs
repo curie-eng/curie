@@ -424,32 +424,45 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                     reason,
                     recovery_key,
                 },
-        } => emit(
-            commands::approvals(
-                target.into(),
-                gate,
-                clear,
-                commands::ApprovalCmd {
-                    list,
-                    resolve,
-                    reject,
-                    note,
-                    mint_operator_principal,
-                    mint_remediation_principal,
-                    mint_console_login_code,
-                    route_resolution,
-                    route_approvers,
-                    routes_from,
-                    list_routes,
-                    clear_routes,
-                    report_identity,
-                    recover,
-                    reason,
-                    recovery_key,
+            requester:
+                RequesterIdentityArgs {
+                    requester_identity,
+                    expected_version,
                 },
-            )
-            .await?,
-        ),
+        } => match requester_identity {
+            // ADR 0270 decision 1: clap has already refused every gate, route,
+            // pending-record and recovery flag beside it.
+            Some(mode) => emit_boxed(
+                commands::approvals_requester_identity(target.into(), mode, expected_version)
+                    .await?,
+            ),
+            None => emit(
+                commands::approvals(
+                    target.into(),
+                    gate,
+                    clear,
+                    commands::ApprovalCmd {
+                        list,
+                        resolve,
+                        reject,
+                        note,
+                        mint_operator_principal,
+                        mint_remediation_principal,
+                        mint_console_login_code,
+                        route_resolution,
+                        route_approvers,
+                        routes_from,
+                        list_routes,
+                        clear_routes,
+                        report_identity,
+                        recover,
+                        reason,
+                        recovery_key,
+                    },
+                )
+                .await?,
+            ),
+        },
         // @spec ACTION-EXECUTOR-23
         LocalAction::Actions { verb } => {
             let (verb, conn) = verb.into_parts();

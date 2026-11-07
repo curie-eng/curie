@@ -94,6 +94,7 @@ from curie_internal.sealing_key import is_sealing_key_name
 from plugin_format import is_reserved_boot_env_name
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from . import caller_token
@@ -712,6 +713,18 @@ class ChannelReadGrantAbsent(Exception):
     and stop asking; every other refusal or failure is None."""
 
 
+class RequesterIdentityStateInvalid(RuntimeError):
+    """The stored connector requester identity opt-in is not a readable boolean.
+
+    NULL, a non-boolean value or a failed read. The kernel refuses the turn
+    before boot rather than guessing either way. @spec CONNECTOR-REQUESTER-1.
+    """
+
+    def __init__(self, message: str = "requester_identity_state_invalid") -> None:
+        """@spec CONNECTOR-REQUESTER-1: a fixed message; no stored value is echoed."""
+        super().__init__(message)
+
+
 class BindingIdentityClassifier(Protocol):
     """The API's per-identity answer. @spec HTTP-INVOCATION-EXECUTION-22."""
 
@@ -1296,6 +1309,36 @@ class BindingResolver:
             row = result.first()
         return bool(row is not None and row[0])
 
+    async def connector_requester_identity_for(self, agent_id: uuid.UUID) -> bool:
+        """Whether the operator opted this agent in to connector requester identity.
+
+        Read fresh on every call, apart from deployment resolution, so a schema
+        that predates the column still resolves. A missing agent row reads as
+        off. NULL or a non-boolean value raises
+        ``RequesterIdentityStateInvalid``, a terminal refusal. A failed read
+        (connect or SELECT) is transient and raises ``TurnAuthorityUnavailable``
+        so the accepted turn is retried, never dropped; neither degrades to
+        either answer. Cancellation propagates. @spec CONNECTOR-REQUESTER-1.
+        """
+        sql = text(
+            f"SELECT connector_requester_identity FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
+        try:
+            async with self._engine.connect() as conn:
+                result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
+                row = result.first()
+        except (SQLAlchemyError, OSError, TimeoutError):
+            from .identity_authority import TurnAuthorityUnavailable
+
+            raise TurnAuthorityUnavailable() from None
+        if row is None:
+            return False
+        value = row[0]
+        if type(value) is not bool:
+            raise RequesterIdentityStateInvalid()
+        return value
+
     async def execution_deadline_seconds_for(self, agent_id: uuid.UUID) -> int:
         """The agent's work item execution span, or the platform default.
 
@@ -1382,6 +1425,7 @@ class BindingResolver:
         caller_exp_ceiling: int | None = None,
         token_ttl_s: float | None = None,
         route_connectors: frozenset[str] = frozenset(),
+        caller_principal: caller_token.CallerPrincipal | None = None,
     ) -> dict[str, str]:
         """The env injected into the sandbox claim for a bound run.
 
@@ -1398,6 +1442,12 @@ class BindingResolver:
         intent with the legacy eval-prefixed ``thread_key``; the kernel passes
         ``isolate_memory`` explicitly because its internal key also includes
         the channel kind and address.
+
+        ``caller_principal`` is the verified requester of an opted-in HTTP
+        turn (ADR 0270 decision 2). It is signed into the ``cct`` only; every
+        ``ccr`` stays an agent/run credential. A principal the minter refuses
+        (an invalid one, or a token over the verifier bound) raises
+        ``ValueError`` before any env exists. @spec CONNECTOR-REQUESTER-2.
         """
         # The memory ref (#264): the agent's scoped namespace on the durable
         # state store (#23/#248). The runner dereferences it at boot to load
@@ -1529,7 +1579,13 @@ class BindingResolver:
                 exp=caller_exp,
                 run=caller_run,
                 work_item=caller_work_item,
+                principal=caller_principal,
             )
+            # ADR 0270 decision 2 partially amends ADR 0240 decision 2: a ccr
+            # never carries the principal, and its lifetime is no longer
+            # required to equal the cct's. It keeps today's 24 hour or run
+            # deadline expiry here; the separate one-hour cap on a
+            # requester-bearing cct lands in a later change.
             for connector in sorted(route_connectors):
                 route_tokens[connector] = caller_token.mint_route(
                     self._config.connector_caller_signing_key,

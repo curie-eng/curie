@@ -914,11 +914,27 @@ async def _process_event(
                 if selected and qevent.tool_access is None
                 else None
             )
-            boot_env = self._binding.boot_env(
-                resolved,
-                thread_key,
-                **boot_env_kwargs,
+            # @spec CONNECTOR-REQUESTER-1/2: an HTTP-context turn reads the
+            # operator opt-in here, immediately before boot. The verified
+            # requester rides the cct only for an opted-in agent; an invalid
+            # opt-in, or a requester without it, refuses before any claim.
+            principal = (
+                await identity.requester_principal(self, resolved.agent_id) if selected else None
             )
+            if principal is not None:
+                boot_env_kwargs["caller_principal"] = principal
+            try:
+                boot_env = self._binding.boot_env(
+                    resolved,
+                    thread_key,
+                    **boot_env_kwargs,
+                )
+            except ValueError:
+                if principal is None:
+                    raise
+                # The minter refused the principal (a token over the verifier
+                # bound): the turn refuses before any sandbox claim.
+                raise identity.HttpIdentityRefused() from None
             # The deployment id is the server-side authority used to select
             # and redeem a repository at initial claim time.  The legacy
             # per-deployment workspace_enabled bit is deliberately not a

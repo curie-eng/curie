@@ -83,6 +83,10 @@ _NOT_FORWARDED = frozenset(
         caller.AGENT_HEADER.lower(),
         caller.RUN_HEADER.lower(),
         caller.WORK_ITEM_HEADER.lower(),
+        # Inbound copies are forged, on cct and ccr paths alike. ADR 0270
+        # decision 4 sets it from the verified claim in a later change; until
+        # then the connector never sees one.
+        caller.PRINCIPAL_HEADER.lower(),
     }
 )
 

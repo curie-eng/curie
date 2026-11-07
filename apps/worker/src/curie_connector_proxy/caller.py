@@ -4,6 +4,11 @@ The verifying half of ``curie_worker.caller_token``. Both halves read the wire
 frozen in ``tests/vectors/connector-caller-token.json``. The signature is
 checked over the received ``cct.<payload>`` text before anything is parsed, and
 nothing here re-serializes the claims.
+
+ADR 0270 decision 2: a ``cct`` may carry ``principal``, the verified human
+requester, complete or absent. Its rules are restated here rather than imported,
+because the proxy does not depend on the worker package. Principal values are
+never logged.
 """
 
 from __future__ import annotations
@@ -20,6 +25,8 @@ from nacl.signing import VerifyKey
 
 PREFIX = "cct"
 HEADER = "X-Curie-Caller"
+# ADR 0270 decision 4: only this proxy may set it. Inbound copies are forged.
+PRINCIPAL_HEADER = "X-Curie-Principal"
 
 MISSING = "missing"
 INVALID = "invalid"
@@ -43,12 +50,35 @@ _SEGMENT = re.compile(r"[A-Za-z0-9_-]+")
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _CLAIMS = frozenset({"agent", "exp"})
 _RUN_CLAIMS = frozenset({"run", "work_item"})
+# ADR 0270 decision 2. The ``cct`` key sets this module admits, and no other.
+_PRINCIPAL_CLAIM = "principal"
+_CALLER_CLAIM_SETS = frozenset(
+    {
+        _CLAIMS,
+        _CLAIMS | _RUN_CLAIMS,
+        _CLAIMS | {_PRINCIPAL_CLAIM},
+        _CLAIMS | _RUN_CLAIMS | {_PRINCIPAL_CLAIM},
+    }
+)
+_PRINCIPAL_FIELDS = frozenset({"tenant_id", "issuer", "subject"})
+# The bounds the worker's ``CallerPrincipal`` enforces.
+_ISSUER_MAX_CHARS = 2048
+_SUBJECT_MAX_CHARS = 256
 _GRANT_CLAIMS = frozenset({"agent", "connector", "tool", "args", "exp", "jti"})
 _ROUTE_CLAIMS = frozenset({"agent", "connector", "exp"})
 
 AGENT_HEADER = "X-Curie-Agent"
 RUN_HEADER = "X-Curie-Run"
 WORK_ITEM_HEADER = "X-Curie-Work-Item"
+
+
+@dataclass(frozen=True)
+class Principal:
+    """The verified human requester a ``cct`` carried (ADR 0270 decision 2)."""
+
+    tenant_id: str
+    issuer: str
+    subject: str
 
 
 @dataclass(frozen=True)
@@ -61,6 +91,9 @@ class Decision:
     # refusal and on a token that names only the agent.
     run: str | None = None
     work_item: str | None = None
+    # ADR 0270 decision 2. Set only on an admitted ``cct`` that carried one;
+    # never on a refusal and never on a ``ccr``.
+    principal: Principal | None = None
 
     @property
     def admitted(self) -> bool:
@@ -106,8 +139,25 @@ def _signed_by(keys: Sequence[VerifyKey], message: bytes, signature: bytes) -> b
     return False
 
 
-def _opened(keys: Sequence[VerifyKey], token: str, prefix: str) -> dict[str, object] | None:
-    """The signed JSON object, or None. The same segment rules as ``claims``."""
+class _DuplicateKey(ValueError):
+    pass
+
+
+def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    # A first-wins and a last-wins reader would each see a different claim.
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise _DuplicateKey
+    return dict(pairs)
+
+
+def _opened(
+    keys: Sequence[VerifyKey], token: str, prefix: str, *, unique_keys: bool = False
+) -> dict[str, object] | None:
+    """The signed JSON object, or None. The same segment rules as ``claims``.
+
+    ``unique_keys`` refuses a payload that repeats a key at any depth.
+    """
 
     if len(token) > _MAX_TOKEN_CHARS or not token.isascii():
         return None
@@ -121,7 +171,11 @@ def _opened(keys: Sequence[VerifyKey], token: str, prefix: str) -> dict[str, obj
     if not _signed_by(keys, f"{parts[0]}.{parts[1]}".encode("ascii"), signature):
         return None
     try:
-        parsed = json.loads(payload)
+        parsed = (
+            json.loads(payload, object_pairs_hook=_unique_keys)
+            if unique_keys
+            else json.loads(payload)
+        )
     except ValueError:
         return None
     if not isinstance(parsed, dict):
@@ -129,14 +183,40 @@ def _opened(keys: Sequence[VerifyKey], token: str, prefix: str) -> dict[str, obj
     return parsed
 
 
-def claims(keys: Sequence[VerifyKey], token: str) -> Decision | None:
-    """The signed caller, or None. ``run`` and ``work_item`` are a pair or absent."""
+def _bounded_text(value: object, max_chars: int) -> str | None:
+    """``value`` when it is 1..``max_chars`` characters of UTF-8 text, else None."""
 
-    parsed = _opened(keys, token, PREFIX)
+    if not isinstance(value, str) or not 1 <= len(value) <= max_chars:
+        return None
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return value
+
+
+def _principal(value: object) -> Principal | None:
+    """The complete principal object, or None for any other form."""
+
+    if not isinstance(value, dict) or set(value) != _PRINCIPAL_FIELDS:
+        return None
+    tenant_id = value["tenant_id"]
+    issuer = _bounded_text(value["issuer"], _ISSUER_MAX_CHARS)
+    subject = _bounded_text(value["subject"], _SUBJECT_MAX_CHARS)
+    if not isinstance(tenant_id, str) or _UUID.fullmatch(tenant_id) is None:
+        return None
+    if issuer is None or subject is None:
+        return None
+    return Principal(tenant_id=tenant_id, issuer=issuer, subject=subject)
+
+
+def _caller(keys: Sequence[VerifyKey], token: str) -> tuple[Decision, int] | None:
+    """The signed caller and its ``exp``, or None for any malformed ``cct``."""
+
+    parsed = _opened(keys, token, PREFIX, unique_keys=True)
     if parsed is None:
         return None
-    keys_present = set(parsed)
-    if keys_present != _CLAIMS and keys_present != _CLAIMS | _RUN_CLAIMS:
+    if frozenset(parsed) not in _CALLER_CLAIM_SETS:
         return None
     agent, exp = parsed["agent"], parsed["exp"]
     if not isinstance(agent, str) or not agent or type(exp) is not int:
@@ -153,7 +233,23 @@ def claims(keys: Sequence[VerifyKey], token: str) -> Decision | None:
         ):
             return None
         run, work_item = run_value, work_value
-    return Decision(agent=agent, refusal=None, run=run, work_item=work_item)
+    principal: Principal | None = None
+    if _PRINCIPAL_CLAIM in parsed:
+        principal = _principal(parsed[_PRINCIPAL_CLAIM])
+        if principal is None:
+            return None
+    decision = Decision(
+        agent=agent, refusal=None, run=run, work_item=work_item, principal=principal
+    )
+    return decision, exp
+
+
+def claims(keys: Sequence[VerifyKey], token: str) -> Decision | None:
+    """The signed caller, or None. ``run`` and ``work_item`` are a pair or absent,
+    and ``principal`` is complete or absent (ADR 0270 decision 2)."""
+
+    carried = _caller(keys, token)
+    return carried[0] if carried is not None else None
 
 
 @dataclass(frozen=True)
@@ -204,14 +300,13 @@ def decide(
 
     if not token:
         return Decision(agent=None, refusal=MISSING)
-    carried = claims(keys, token)
-    if carried is None:
+    opened = _caller(keys, token)
+    if opened is None:
         return Decision(agent=None, refusal=INVALID)
+    carried, exp = opened
     # Accept is `exp > now`, the comparison `sandbox_token.verify` makes.
-    # Read exp back from the signed payload. ``claims`` already checked the type.
-    opened = _opened(keys, token, PREFIX)
-    exp = opened["exp"] if opened is not None else 0
-    if not isinstance(exp, int) or exp <= now:
+    # A refusal never carries the principal (ADR 0270 decision 2).
+    if exp <= now:
         return Decision(
             agent=carried.agent,
             refusal=EXPIRED,
@@ -243,9 +338,11 @@ def decide_route(
 
     if not token:
         return Decision(agent=None, refusal=MISSING)
-    parsed = _opened(keys, token, ROUTE_PREFIX)
+    parsed = _opened(keys, token, ROUTE_PREFIX, unique_keys=True)
     if parsed is None:
         return Decision(agent=None, refusal=INVALID)
+    # Closed: a ``principal`` here is invalid. ADR 0270 decision 2 keeps a
+    # route an agent/run credential without human authority.
     present = set(parsed)
     if present != _ROUTE_CLAIMS and present != _ROUTE_CLAIMS | _RUN_CLAIMS:
         return Decision(agent=None, refusal=INVALID)

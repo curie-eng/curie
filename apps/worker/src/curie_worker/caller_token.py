@@ -4,6 +4,9 @@ The worker signs one per boot, naming the agent the binding resolved, and the
 runner sends it to each hosted connector in the ``X-Curie-Caller`` header. The
 wire is frozen in ``tests/vectors/connector-caller-token.json``.
 
+ADR 0270 decision 2: a ``cct`` may also carry ``principal``, the verified human
+requester (tenant, issuer, subject), complete or absent. A ``ccr`` never does.
+
 Ed25519 rather than the HMAC ``sandbox_token`` uses, because whatever checks
 this token sits beside a third-party connector: it can hold a public key, and
 it must never hold a key that can mint.
@@ -15,6 +18,7 @@ import base64
 import binascii
 import json
 import re
+from dataclasses import dataclass
 
 from nacl.signing import SigningKey
 
@@ -22,9 +26,46 @@ PREFIX = "cct"
 # A route token (ADR 0240 decision 2): the caller's claims plus one connector.
 ROUTE_PREFIX = "ccr"
 
+# The verifier's bound (``curie_connector_proxy.caller``). A principal-bearing
+# token past it is refused before boot rather than minted for the proxy to drop.
+MAX_TOKEN_CHARS = 4096
+
 _SEED_BYTES = 32
 # ADR 0178 decision 1: lowercase hyphenated UUID text, one spelling.
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+# ADR 0270 decision 2, the bounds of ``identity_context`` Issuer and Identifier.
+_ISSUER_MAX_CHARS = 2048
+_SUBJECT_MAX_CHARS = 256
+
+
+def _bounded_text(value: object, field: str, max_chars: int) -> None:
+    """Refuse ``value`` without naming it: the refusal may be logged at boot."""
+
+    if not isinstance(value, str) or not 1 <= len(value) <= max_chars:
+        raise ValueError(f"a caller principal {field} is a string of 1 to {max_chars} characters")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"a caller principal {field} is not valid unicode text") from None
+
+
+@dataclass(frozen=True)
+class CallerPrincipal:
+    """The verified human requester a ``cct`` carries (ADR 0270 decision 2).
+
+    Validated on construction, so a principal the proxy would refuse cannot be
+    built. Errors never carry the values.
+    """
+
+    tenant_id: str
+    issuer: str
+    subject: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tenant_id, str) or _UUID.fullmatch(self.tenant_id) is None:
+            raise ValueError("a caller principal tenant_id must be a lowercase hyphenated uuid")
+        _bounded_text(self.issuer, "issuer", _ISSUER_MAX_CHARS)
+        _bounded_text(self.subject, "subject", _SUBJECT_MAX_CHARS)
 
 
 def _b64url(raw: bytes) -> str:
@@ -56,12 +97,15 @@ def mint(
     exp: int,
     run: str | None = None,
     work_item: str | None = None,
+    principal: CallerPrincipal | None = None,
 ) -> str:
     """Sign ``agent`` with absolute expiry ``exp`` (unix seconds).
 
     ``run`` and ``work_item`` are present together or not at all (ADR 0178).
-    Omitted, the payload stays ``{agent, exp}``. Deterministic: Ed25519
-    signatures are, and the caller supplies ``exp``.
+    ``principal`` adds the verified requester (ADR 0270 decision 2). Omitted,
+    the payload stays ``{agent, exp}``. Deterministic: Ed25519 signatures are,
+    and the caller supplies ``exp``. Raises ``ValueError``, without the claim
+    values, when a principal-bearing token would exceed ``MAX_TOKEN_CHARS``.
     """
 
     _check_run_pair(run, work_item)
@@ -69,7 +113,22 @@ def mint(
     if run is not None:
         body["run"] = run
         body["work_item"] = work_item
-    return _signed(signing_key_text, PREFIX, body)
+    if principal is not None:
+        body["principal"] = {
+            "issuer": principal.issuer,
+            "subject": principal.subject,
+            "tenant_id": principal.tenant_id,
+        }
+    token = _signed(signing_key_text, PREFIX, body)
+    # Only a principal-bearing token is bounded: ADR 0270 refuses an oversized
+    # projection, and agent-only minting (agent names are unbounded) stays as
+    # it was.
+    if principal is not None and len(token) > MAX_TOKEN_CHARS:
+        raise ValueError(
+            f"the caller token is {len(token)} characters; the verifier reads at most "
+            f"{MAX_TOKEN_CHARS}"
+        )
+    return token
 
 
 def mint_route(
@@ -81,10 +140,11 @@ def mint_route(
     run: str | None = None,
     work_item: str | None = None,
 ) -> str:
-    """A ``ccr`` route token: ``mint``'s claims plus the one ``connector``.
+    """A ``ccr`` route token: ``mint``'s agent and run claims plus the one ``connector``.
 
     ADR 0240 decision 2. The proxy admits it only on that connector's declared
-    routes, and a ``cct`` never there.
+    routes, and a ``cct`` never there. ADR 0270 decision 2: it never carries a
+    principal, so a route holds no human authority.
     """
 
     if not connector:

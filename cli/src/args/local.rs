@@ -591,6 +591,8 @@ pub(crate) enum LocalAction {
         clear_routes: bool,
         #[command(flatten)]
         recovery: ApprovalRecoveryArgs,
+        #[command(flatten)]
+        requester: RequesterIdentityArgs,
     },
     /// Show the local observability surfaces (Curie Console + Langfuse traces/cost + API base).
     Observability {

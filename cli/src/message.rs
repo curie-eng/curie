@@ -6595,6 +6595,8 @@ mod tests {
             publication_policy_version: 1,
             publication_draft: false,
             publication_branch_prefix: None,
+            connector_requester_identity: None,
+            connector_requester_identity_version: None,
         }
     }
 
@@ -8196,6 +8198,8 @@ mod tests {
                 publication_policy_version: 1,
                 publication_draft: false,
                 publication_branch_prefix: None,
+                connector_requester_identity: None,
+                connector_requester_identity_version: None,
             },
             Agent {
                 id: "a2".into(),
@@ -8223,6 +8227,8 @@ mod tests {
                 publication_policy_version: 1,
                 publication_draft: false,
                 publication_branch_prefix: None,
+                connector_requester_identity: None,
+                connector_requester_identity_version: None,
             },
         ];
         // Explicit channel picks the matching agent's id.
