@@ -25,8 +25,7 @@ import httpx
 import pytest
 import redis
 from curie_channel_gateway.slack.app import build_app
-from curie_channel_gateway.slack.config import DispatcherConfig
-from curie_dispatcher.approval_actions import (
+from curie_channel_gateway.slack.approval_actions import (
     _APPROVAL_ACTION_IDS,
     _DECISION_BY_ACTION_ID,
     APPROVE_ACTION_ID,
@@ -37,7 +36,8 @@ from curie_dispatcher.approval_actions import (
     _refusal_text,
     settled_verdict_line,
 )
-from curie_dispatcher.approval_principal import mint_chat_principal
+from curie_channel_gateway.slack.approval_principal import mint_chat_principal
+from curie_channel_gateway.slack.config import DispatcherConfig
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
@@ -946,7 +946,7 @@ class _JsonHttpClient:
 
 
 def test_ownership_miss_detail_matches_the_frozen_vector() -> None:
-    from curie_dispatcher.approval_actions import _APPROVAL_NOT_FOUND_DETAIL
+    from curie_channel_gateway.slack.approval_actions import _APPROVAL_NOT_FOUND_DETAIL
 
     vector = json.loads(_OWNERSHIP_VECTOR.read_text(encoding="utf-8"))
     assert set(vector) == _EXPECTED_OWNERSHIP_VECTOR_KEYS
@@ -1191,7 +1191,7 @@ def test_a_verdict_with_no_decision_time_keeps_the_bare_attribution() -> None:
 
 
 def test_dispatcher_mints_shared_test_driver_wire_vector() -> None:
-    from curie_dispatcher.approval_principal import mint_test_driver_principal
+    from curie_channel_gateway.slack.approval_principal import mint_test_driver_principal
 
     vector = json.loads(
         (Path(__file__).parents[3] / "tests/vectors/approval-principal.json").read_text()
@@ -1222,7 +1222,7 @@ def test_dispatcher_mints_shared_slack_evidence_vector() -> None:
 def test_click_signs_sender_team_evidence_inside_principal() -> None:
     import base64
 
-    from curie_dispatcher.approval_actions import resolve_approval_action
+    from curie_channel_gateway.slack.approval_actions import resolve_approval_action
 
     captured = []
     def transport(request):

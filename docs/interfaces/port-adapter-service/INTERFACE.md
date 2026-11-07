@@ -200,7 +200,7 @@ service is material:
   re-sent reply content to the default transport. `HttpReplyAdapter` now uses a
   per-adapter secret selected by the route's `adapter` slug, with no transport
   fallback; `SlackReplyAdapter`
-  (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) refuses an
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter`) refuses an
   endpoint outside the worker's configured trusted Slack origin rather than
   handing it the platform bot token.
 - **Fixed (#1459, ADR-0096) — authenticated ingress and the binding surface.**

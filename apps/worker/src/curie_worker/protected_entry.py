@@ -18,6 +18,8 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+from curie_channel_gateway.reply_transport import HttpReplyAdapter
+from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 from curie_protected_hooks.artifact_measurement import ArtifactMeasurementDirectory, _open_root
 from curie_protected_hooks.authority_records import parse_qualification, parse_readiness
 from curie_protected_hooks.worker_artifact_selection import select_artifact
@@ -40,8 +42,7 @@ from .protected_worker_bootstrap import (
     _require,
     load_worker_bootstrap,
 )
-from .reply_sink import HttpReplyAdapter, ReplySinkRouter
-from .slack_sink import SlackReplyAdapter
+from .reply_sink import ReplySinkRouter
 
 
 @dataclass(frozen=True, slots=True, repr=False)

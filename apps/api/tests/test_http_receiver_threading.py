@@ -21,9 +21,9 @@ from channel_protocol import parse_scoped_conversation_id
 from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyUpdate
 from curie_api.identity.http_transport import HttpIdentityClient
 from curie_api.main import create_app
+from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 from curie_worker.kernel.routing import _target_for, _thread_key_for
 from curie_worker.reply_sink import TargetRoute
-from curie_worker.slack_sink import SlackReplyAdapter
 from fastapi.testclient import TestClient
 from slack_sdk.web import WebClient
 

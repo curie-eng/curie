@@ -16,11 +16,12 @@ from channel_protocol.reply import (
     ReplyTarget,
     ReplyUpdate,
 )
-from curie_worker import reply_sink, slack_sink
-from curie_worker.blocks import render
+from curie_channel_gateway import reply_transport
+from curie_channel_gateway.slack import slack_sink
+from curie_channel_gateway.slack.blocks import render
+from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
+from curie_channel_gateway.slack.slack_text import split_answer, split_verbatim_answer
 from curie_worker.reply_sink import ObservedReplySink, TargetRoute
-from curie_worker.slack_sink import SlackReplyAdapter
-from curie_worker.slack_text import split_answer, split_verbatim_answer
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
@@ -50,7 +51,7 @@ def outcomes(monkeypatch):
     def record(name, *_args, **kwargs):
         seen.append((name, (kwargs.get("attributes") or {}).get("outcome")))
 
-    monkeypatch.setattr(reply_sink.curie_telemetry, "record_metric", record)
+    monkeypatch.setattr(reply_transport.curie_telemetry, "record_metric", record)
     return seen
 
 

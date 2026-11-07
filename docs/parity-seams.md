@@ -13,26 +13,26 @@ as a whole; remembered only):
   together in `tests/vectors/model-credential-forwarding.json`.
   [vector: `tests/vectors/model-credential-forwarding.json`]
 2. dispatcher vs CLI approval action ids -- the approval-card action-id constants
-  (`apps/dispatcher/src/curie_dispatcher/approval_actions.py`) and the CLI's
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/approval_actions.py`) and the CLI's
   `APPROVE_ACTION_ID_PREFIX` (`cli/src/chat.rs`) can't share code across
   Python/Rust, so they are frozen together in
   `tests/vectors/approval-action-ids.json`.
   [vector: `tests/vectors/approval-action-ids.json`]
 3. worker vs CLI progress block ids -- the Slack progress card and milestone
   `block_id` prefixes (`PROGRESS_CARD_BLOCK_ID_PREFIX` and
-  `PROGRESS_MILESTONE_BLOCK_ID_PREFIX` in `apps/worker/src/curie_worker/blocks.py`)
+  `PROGRESS_MILESTONE_BLOCK_ID_PREFIX` in `packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py`)
   and the CLI stub's copies (`cli/src/chat.rs`), which tell a progress post or
   edit from the turn's answer, can't share code across Python/Rust, so they are
   frozen together in `tests/vectors/progress-blocks.json`.
   [vector: `tests/vectors/progress-blocks.json`]
 4. dispatcher vs API approval-principal tokens -- the dispatcher mint codec
-  (`apps/dispatcher/src/curie_dispatcher/approval_principal.py`) and API verifier
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/approval_principal.py`) and API verifier
   (`apps/api/src/curie_api/approval_principal.py`) are frozen together in
   `tests/vectors/approval-principal.json`.
   [vector: `tests/vectors/approval-principal.json`]
 5. dispatcher vs API approval-row miss -- the API 404 detail
   (`apps/api/src/curie_api/routers/approvals.py`) and the dispatcher's
-  ownership-miss match (`apps/dispatcher/src/curie_dispatcher/approval_actions.py`)
+  ownership-miss match (`packages/channel-gateway/src/curie_channel_gateway/slack/approval_actions.py`)
   cannot share code, so they are frozen together in
   `tests/vectors/approval-ownership.json`.
   [vector: `tests/vectors/approval-ownership.json`]

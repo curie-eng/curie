@@ -236,7 +236,7 @@ def test_operator_principal_mint_rejects_blank_subject(
 
 
 def test_test_driver_attestation_is_bound_and_matches_dispatcher_codec() -> None:
-    from curie_dispatcher import approval_principal as dispatcher_codec
+    from curie_channel_gateway.slack import approval_principal as dispatcher_codec
 
     token = dispatcher_codec.mint_test_driver_principal(
         "test-attester-secret",

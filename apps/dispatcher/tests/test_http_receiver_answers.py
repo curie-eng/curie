@@ -14,8 +14,8 @@ from typing import Any
 
 import httpx
 import redis
+from curie_channel_gateway.slack.approval_actions import APPROVE_ACTION_ID, APPROVE_NOTE_ACTION_ID
 from curie_channel_gateway.slack.config import DispatcherConfig
-from curie_dispatcher.approval_actions import APPROVE_ACTION_ID, APPROVE_NOTE_ACTION_ID
 from curie_internal import identity_approval as wire
 from curie_internal import identity_context as codec
 from slack_bolt.adapter.socket_mode import SocketModeHandler

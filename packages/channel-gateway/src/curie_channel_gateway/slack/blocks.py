@@ -17,17 +17,14 @@ valid block (including a half-streamed one) falls back to the existing text
 path, so streaming partials never show raw JSON and a malformed block degrades
 to plain text rather than breaking the reply.
 
-Ported from the CurieTech agent-ss-template ``blocks.py`` (the 3000-char section
-cap, mrkdwn normalization, nav-leftmost button ordering); rendering reuses this
-package's ``mrkdwn.to_mrkdwn``. Buttons are rendered here but only become
-interactive once the dispatcher handles their clicks (a separate change).
+The renderer preserves the section cap, mrkdwn normalization and navigation
+button ordering. Click handling lives beside it in ``approval_actions``.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -37,13 +34,14 @@ from channel_protocol import (
     OutboundMessage,
     ProgressCard,
     ProgressMilestone,
+    Reply,
     progress_heading,
     progress_text,
 )
 from pydantic import ValidationError
 
-from .behaviorpacks import BehaviorPacks, NavPack, ensure_hub_button
 from .mrkdwn import to_mrkdwn
+from .navigation import Navigation, navigation_buttons
 
 # Slack hard-caps a section's text at 3000 chars; stay under it with margin.
 _CHUNK_TARGET = 2900
@@ -70,28 +68,6 @@ def _truncate(text: str, limit: int) -> str:
 _FENCE = re.compile(r"```curie-reply\s*\n(.*?)\n```", re.DOTALL)
 _FENCE_OPEN = "```curie-reply"
 
-
-@dataclass
-class Reply:
-    """A formatted reply, independent of Block Kit. ``text`` is markdown (also
-    the plain-text fallback); ``status`` a leading context line (rendered
-    as-authored, like ``footer``); ``header`` a header block; ``fields`` a
-    two-column section; ``buttons`` an actions block of ``(label, action_id)``
-    pairs; ``links`` an actions block of ``(label, url)`` URL buttons; ``footer``
-    a trailing context line."""
-
-    text: str = ""
-    status: str | None = None
-    header: str | None = None
-    fields: list[tuple[str, str]] = field(default_factory=list)
-    buttons: list[tuple[str, str]] = field(default_factory=list)
-    links: list[tuple[str, str]] = field(default_factory=list)
-    footer: str | None = None
-    # The question attached to `buttons` (ChoiceIntent/ConfirmIntent's `prompt`,
-    # #454) -- distinct from `text`, the reply's main body. Rendered immediately
-    # before the actions block so an approver/chooser sees the actual question
-    # next to the buttons, not just bare labels.
-    action_prompt: str | None = None
 
 
 def chunk(text: str, limit: int = _CHUNK_TARGET) -> list[str]:
@@ -159,7 +135,7 @@ def _link_button(label: str, url: str) -> dict[str, Any]:
     return {**_button_shell(label), "url": url}
 
 
-def to_blocks(reply: Reply, nav: NavPack | None = None) -> list[dict[str, Any]]:
+def to_blocks(reply: Reply, nav: Navigation | None = None) -> list[dict[str, Any]]:
     """Render a ``Reply`` to a Block Kit blocks array. Order: status (context) ->
     header -> fields -> body section(s) (chunked) -> action prompt (chunked) ->
     buttons (nav-leftmost) -> links (URL buttons) -> footer.
@@ -199,7 +175,7 @@ def to_blocks(reply: Reply, nav: NavPack | None = None) -> list[dict[str, Any]]:
     # ``reply.buttons`` are already (label, action_id) pairs, the same (label,
     # command) shape ensure_hub_button operates on, so no conversion is needed.
     buttons = (
-        reply.buttons if nav is None else ensure_hub_button(BehaviorPacks(nav=nav), reply.buttons)
+        reply.buttons if nav is None else navigation_buttons(nav, reply.buttons)
     )
     if buttons:
         ordered = sorted(buttons, key=lambda b: 0 if _is_nav(b[0]) else 1)
@@ -290,7 +266,7 @@ def parse_reply(text: str) -> Reply | None:
     )
 
 
-def render(text: str, nav: NavPack | None = None) -> tuple[str, list[dict[str, Any]] | None]:
+def render(text: str, nav: Navigation | None = None) -> tuple[str, list[dict[str, Any]] | None]:
     """Map an outbound reply string to ``(text, blocks)`` for ``chat.update``.
 
     - A complete ``curie-reply`` block -> (plain fallback text, blocks).
@@ -331,7 +307,7 @@ def approval_card(
     """The Block Kit approval card: what needs approval plus Approve/Reject.
 
     The button action ids are the dispatcher's click-to-resolve contract
-    (``curie_dispatcher.approval_actions``); each button's ``value`` carries
+    (``curie_channel_gateway.slack.approval_actions``); each button's ``value`` carries
     the durable record id, so a click resolves exactly this approval. Returns
     ``(fallback_text, blocks)`` for ``chat.postMessage``.
 
@@ -346,7 +322,7 @@ def approval_card(
 
     # Imported here (not module top) to keep the module importable in isolation;
     # the worker package already depends on the dispatcher for the queue seam.
-    from curie_dispatcher.approval_actions import (
+    from curie_channel_gateway.slack.approval_actions import (
         APPROVAL_CARD_HEADER,
         APPROVE_ACTION_ID,
         APPROVE_NOTE_ACTION_ID,
@@ -402,7 +378,7 @@ def resolved_approval_card(
 ) -> tuple[str, list[dict[str, Any]]]:
     """The approval card rebuilt in its RESOLVED form (#1084).
 
-    A thin adapter over ``curie_dispatcher.approval_actions.settled_approval_card``
+    A thin adapter over ``curie_channel_gateway.slack.approval_actions.settled_approval_card``
     and ``settled_verdict_line`` rather than a second renderer: the dispatcher's
     click path settles the very same card, and two renderers on one surface is
     exactly the divergence #1084 was filed to stop. Same import direction as the
@@ -413,7 +389,7 @@ def resolved_approval_card(
     states only that nobody did.
     """
 
-    from curie_dispatcher.approval_actions import (
+    from curie_channel_gateway.slack.approval_actions import (
         settled_approval_card,
         settled_card_header,
         settled_verdict_line,
@@ -442,7 +418,10 @@ def expired_approval_card(
     blocks)`` for ``chat.update``.
     """
 
-    from curie_dispatcher.approval_actions import settled_approval_card, settled_card_header
+    from curie_channel_gateway.slack.approval_actions import (
+        settled_approval_card,
+        settled_card_header,
+    )
 
     return settled_approval_card(
         summary=_truncate(to_mrkdwn(summary), _APPROVAL_SUMMARY_MAX),

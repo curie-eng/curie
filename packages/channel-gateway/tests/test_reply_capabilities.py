@@ -11,8 +11,12 @@ from curie_channel_gateway.ports import (
     DeclaredReplyTransport,
     ReplyCapabilities,
 )
-from curie_worker.reply_sink import HttpReplyAdapter, ReplySinkRouter, TargetRoute
-from curie_worker.slack_sink import SlackReplyAdapter
+from curie_channel_gateway.reply_transport import HttpReplyAdapter
+from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
+from curie_worker.reply_sink import (
+    ReplySinkRouter,
+    TargetRoute,
+)
 from pydantic import TypeAdapter
 
 

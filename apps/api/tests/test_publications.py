@@ -1167,8 +1167,8 @@ def test_publication_splits_scoped_thread_identity_from_slack_reply_identity(
     auth_headers: dict[str, str],
     clean_db: None,
 ) -> None:
+    from curie_channel_gateway.slack.slack_sink import _thread_ts
     from curie_worker.publication_store import PostgresPublicationStore
-    from curie_worker.slack_sink import _thread_ts
 
     client, _ = publication_stack
     deployment = _create_deployment(client, auth_headers)

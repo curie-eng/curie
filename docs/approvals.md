@@ -621,7 +621,7 @@ upgrade, because a guessed reply route is a silent misroute.
 | Raising a request, and the tool gate | `runner/src/curie_runner/approval.py` |
 | Pausing, routing the card, suspending | `apps/worker/src/curie_worker/kernel/core.py` |
 | Remembering the card so an expiry can disable it | `apps/worker/src/curie_worker/approval_cards.py` |
-| Click to resolve, and rendering the verdict | `apps/dispatcher/src/curie_dispatcher/approval_actions.py` |
+| Click to resolve, and rendering the verdict | `packages/channel-gateway/src/curie_channel_gateway/slack/approval_actions.py` |
 | The resolve endpoint, claim, and audit | `apps/api/src/curie_api/routers/approvals.py` |
 | Break-glass recovery | `apps/api/src/curie_api/routers/approval_recovery.py` |
 | Who may resolve | `apps/api/src/curie_api/authorizer.py`, `apps/api/src/curie_api/approvers.py`, `apps/api/src/curie_api/slack_approvers.py` |

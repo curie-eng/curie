@@ -34,7 +34,7 @@ from channel_protocol import (
     ProgressState,
 )
 from channel_protocol.progress import progress_heading, progress_text
-from curie_worker.blocks import (
+from curie_channel_gateway.slack.blocks import (
     PROGRESS_CARD_BLOCK_ID_PREFIX,
     PROGRESS_MILESTONE_BLOCK_ID_PREFIX,
     progress_card,

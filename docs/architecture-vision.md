@@ -245,7 +245,7 @@ wire. Slack still owns interactive approvals (Choice / Confirm cards). A
 complete third-party adapter lifecycle has not been exercised. Slack-specific
 rendering and interaction handling remain below the port: mrkdwn and Block Kit,
 including approval-card buttons and their settlement forms, live in
-`apps/worker/src/curie_worker/slack_sink.py`.
+`packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py`.
 
 **Remaining channel work:** `QueuedTurn` carries `{event_id, conversation_id,
 author, text, reply_handle, received_at}`

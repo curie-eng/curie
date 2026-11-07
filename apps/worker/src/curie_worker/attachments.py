@@ -63,10 +63,11 @@ from typing import Any, Protocol
 
 from aci_protocol import Attachment, BootEnv, ReplyHandle
 from aci_protocol.turn import DEFAULT_IDENTITY, slack_speaking_identity
+from curie_channel_gateway.reply_transport import ADAPTER_SECRET_HEADER
 from curie_internal.workspace_objects import WorkspaceObjectPort
 
 from .ledger_client import ThreadAttachmentRef
-from .reply_sink import ADAPTER_SECRET_HEADER, SLACK_KIND
+from .reply_sink import SLACK_KIND
 
 # The attachment lane's own object namespace. Never the workspace archives':
 # the two object classes have different owners, different TTLs and different

@@ -18,6 +18,7 @@ dependencies = [
     "curie-upgrade-pause",
     "curie-telemetry",
     "curie-channel-protocol",
+    "curie-channel-gateway",
     "plugin-format",
     "curie-e2e-connector",
     "curie-dispatcher",

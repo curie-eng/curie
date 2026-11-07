@@ -71,6 +71,7 @@ from curie_api.github_factory_events import parse_factory_event
 from curie_channel_gateway.mail.adapter import MailAdapter
 from curie_channel_gateway.mail.config import MailAdapterConfig
 from curie_channel_gateway.mail.egress import EgressHandler, EgressServer
+from curie_channel_gateway.reply_transport import HttpReplyAdapter
 from curie_discord_adapter.config import DiscordConfig
 from curie_discord_adapter.egress import DiscordReplyService
 from curie_discord_adapter.http import create_reply_app
@@ -78,7 +79,6 @@ from curie_discord_adapter.ingress import DiscordBinding
 from curie_discord_adapter.main import DiscordAdapter
 from curie_discord_adapter.state import DiscordState
 from curie_worker.reply_sink import (
-    HttpReplyAdapter,
     ReplySinkRouter,
     TargetRoute,
     TrackerReplySink,

@@ -25,6 +25,7 @@ from channel_protocol.reply import (
     TurnCompleted,
     TurnStatus,
 )
+from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter, UnconfiguredSlackIdentityError
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import (
     CLUSTER_MESSAGE_ADAPTER,
@@ -33,7 +34,6 @@ from curie_worker.reply_sink import (
     TargetRoute,
     build_reply_sink,
 )
-from curie_worker.slack_sink import SlackReplyAdapter, UnconfiguredSlackIdentityError
 
 _DEFAULT_TOKEN = "xoxb-default-sentinel"
 _OPS_TOKEN = "xoxb-ops-bot-sentinel"

@@ -35,6 +35,7 @@ import zlib
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from curie_channel_gateway.slack.navigation import navigation_buttons
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 logger = logging.getLogger(__name__)
@@ -334,13 +335,4 @@ def ensure_hub_button(
     ``<-`` (the hub is where you came from). Pure and idempotent; operates on
     (label, command) pairs so it needs no reply model. The display surface calls
     this on a rendered reply's buttons (deferred wiring, see docs)."""
-    nav = packs.nav
-    result = list(buttons)
-    if not nav.enabled or not nav.hub_command:
-        return result
-    if any(command == nav.hub_command for _, command in result):
-        return result
-    arrow = "↑" if any(label.lstrip().startswith("←") for label, _ in result) else "←"
-    label = f"{arrow} {nav.hub_label}".strip()
-    result.append((label, nav.hub_command))
-    return result
+    return navigation_buttons(packs.nav, buttons)

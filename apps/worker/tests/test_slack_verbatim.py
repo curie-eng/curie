@@ -3,10 +3,10 @@
 import pytest
 from channel_protocol import VERBATIM_REPLY_WIRE_VERSION
 from channel_protocol.reply import ReplyTarget, ReplyUpdate
-from curie_worker import slack_sink
+from curie_channel_gateway.slack import slack_sink
+from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
+from curie_channel_gateway.slack.slack_text import SLACK_VERBATIM_MAX_BYTES, split_verbatim_answer
 from curie_worker.reply_sink import TargetRoute
-from curie_worker.slack_sink import SlackReplyAdapter
-from curie_worker.slack_text import SLACK_VERBATIM_MAX_BYTES, split_verbatim_answer
 from slack_sdk.errors import SlackApiError
 
 _ID = "00000000-0000-4000-8000-000000000001"

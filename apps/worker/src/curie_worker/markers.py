@@ -55,6 +55,7 @@ from typing import Any, Literal
 
 from aci_protocol.service_config import STREAM_PAYLOAD_FIELD
 from channel_protocol.reply import ReplyUpdate, TurnCompleted
+from curie_channel_gateway.reply_transport import ProviderEgressRefusedError
 from curie_internal.channel_read_ledger import LEDGER_TTL_S as _CHANNEL_READ_PIN_TTL_S
 from curie_internal.channel_read_ledger import refresh_owner as _refresh_channel_read_owner
 from curie_internal.channel_read_ledger import revoke_by_owner as _revoke_channel_read_by_owner
@@ -64,7 +65,7 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 
 from .config import WorkerConfig
-from .reply_sink import ProviderEgressRefusedError, TargetRoute
+from .reply_sink import TargetRoute
 
 DoneMarkerValue = Literal["1", "history_capacity"]
 

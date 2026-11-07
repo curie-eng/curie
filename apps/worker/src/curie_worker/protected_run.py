@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, cast
 
+from curie_channel_gateway.reply_transport import HttpReplyAdapter
 from curie_protected_hooks.authority_records import Manifest
 from curie_protected_hooks.execution_namespace import derive_lane_namespace
 from curie_protected_hooks.worker_transport import (
@@ -31,7 +32,7 @@ from .protected_nomination import GuardedRunner, HttpNominationSubmitter, Nomina
 from .protected_runner import ProtectedRunnerClient
 from .protected_substrate import ProtectedSandboxSubstrate
 from .protected_worker_bootstrap import ProtectedWorkerBootstrap
-from .reply_sink import HttpReplyAdapter, ReplySinkRouter
+from .reply_sink import ReplySinkRouter
 from .runner_client import RunnerClient
 from .sandbox import SandboxSubstrate
 from .threadlock import ThreadLock

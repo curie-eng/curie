@@ -68,7 +68,16 @@ from typing import TYPE_CHECKING, Any
 from aci_protocol import Attachment, QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.turn import DEFAULT_IDENTITY
 from curie_dispatcher.admission import AdmissionGate, build_admission
-from curie_dispatcher.approval_actions import (
+from curie_dispatcher.queue import claim_event, enqueue
+from curie_telemetry import operation_span, record_metric
+from opentelemetry.trace import SpanKind
+from slack_bolt import App
+from slack_bolt.response import BoltResponse
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web import WebClient
+
+from curie_channel_gateway.ports.intake import TurnSubmission
+from curie_channel_gateway.slack.approval_actions import (
     APPROVE_ACTION_ID,
     APPROVE_NOTE_ACTION_ID,
     NOTE_MODAL_CALLBACK_ID,
@@ -88,15 +97,6 @@ from curie_dispatcher.approval_actions import (
     resolve_note_submission,
     this_release_owns_action,
 )
-from curie_dispatcher.queue import claim_event, enqueue
-from curie_telemetry import operation_span, record_metric
-from opentelemetry.trace import SpanKind
-from slack_bolt import App
-from slack_bolt.response import BoltResponse
-from slack_sdk.errors import SlackApiError
-from slack_sdk.web import WebClient
-
-from curie_channel_gateway.ports.intake import TurnSubmission
 
 from .config import DispatcherConfig, release_identity
 from .dm_continuity import SlackDmContinuity

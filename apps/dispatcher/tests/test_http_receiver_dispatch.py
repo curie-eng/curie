@@ -17,10 +17,10 @@ import httpx
 import pytest
 import redis
 from curie_channel_gateway.slack.app import build_app
+from curie_channel_gateway.slack.approval_actions import APPROVE_ACTION_ID, APPROVE_NOTE_ACTION_ID
 from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_channel_gateway.slack.identities import SlackIdentityCredentials
 from curie_channel_gateway.slack.preflight import PreflightedIdentity
-from curie_dispatcher.approval_actions import APPROVE_ACTION_ID, APPROVE_NOTE_ACTION_ID
 from curie_dispatcher.queue import from_stream_fields
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.socket_mode.request import SocketModeRequest

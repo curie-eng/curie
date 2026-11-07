@@ -10,7 +10,8 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from channel_protocol import ReplyAck, ReplyEvent, ReplyUpdate
 from curie_channel_gateway.ports import ReplyEventTransport
-from curie_worker.reply_sink import HttpReplyAdapter, TargetRoute
+from curie_channel_gateway.reply_transport import HttpReplyAdapter
+from curie_worker.reply_sink import TargetRoute
 from pydantic import TypeAdapter
 
 _CORPUS = json.loads(

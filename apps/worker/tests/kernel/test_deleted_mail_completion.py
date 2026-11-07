@@ -16,10 +16,10 @@ from aiohttp.test_utils import TestServer
 from curie_channel_gateway.mail.adapter import MailAdapter
 from curie_channel_gateway.mail.config import MailAdapterConfig
 from curie_channel_gateway.mail.egress import make_server
+from curie_channel_gateway.reply_transport import HttpReplyAdapter
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.markers import Markers
-from curie_worker.reply_sink import HttpReplyAdapter
 
 from .test_completion_outbox import (
     _dispatch_and_settle,

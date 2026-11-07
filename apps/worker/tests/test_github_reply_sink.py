@@ -24,10 +24,10 @@ from channel_protocol.reply import (
     ReplyUpdate,
     TurnCompleted,
 )
+from curie_channel_gateway.reply_transport import MissingAdapterCredentialError
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import (
     TRACKER_KINDS,
-    MissingAdapterCredentialError,
     TargetRoute,
     TrackerReplySink,
     build_reply_sink,

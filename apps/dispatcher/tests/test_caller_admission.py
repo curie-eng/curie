@@ -30,11 +30,11 @@ import httpx
 import pytest
 import redis
 from curie_channel_gateway.ports.admission import AdmissionRequest
+from curie_channel_gateway.slack.approval_actions import APPROVE_ACTION_ID
 from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_channel_gateway.slack.handlers import process_action
 from curie_channel_gateway.slack.relevance import DropReason
 from curie_dispatcher.admission import AdmissionGate, SlackAdmissionClient, build_admission
-from curie_dispatcher.approval_actions import APPROVE_ACTION_ID
 from curie_dispatcher.queue import from_stream_fields
 from curie_telemetry import build_resource, configure_meter_provider
 from opentelemetry.sdk.metrics import MeterProvider

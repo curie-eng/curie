@@ -47,14 +47,14 @@ from channel_protocol import (
     ReplyPost,
     ReplyTarget,
 )
-from curie_dispatcher.queue import to_stream_fields
-from curie_worker.attachments import SlackFileClient, SlackFileError
-from curie_worker.blocks import (
+from curie_channel_gateway.slack.blocks import (
     PROGRESS_CARD_BLOCK_ID_PREFIX,
     PROGRESS_MILESTONE_BLOCK_ID_PREFIX,
 )
+from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
+from curie_dispatcher.queue import to_stream_fields
+from curie_worker.attachments import SlackFileClient, SlackFileError
 from curie_worker.reply_sink import TargetRoute
-from curie_worker.slack_sink import SlackReplyAdapter
 from redis import Redis
 from redis.exceptions import RedisError
 from slack_sdk.errors import SlackApiError

@@ -15,6 +15,10 @@ from channel_protocol.reply import (
     TurnCompleted,
     TurnStatus,
 )
+from curie_channel_gateway.reply_transport import (
+    DeletedReplyTargetError,
+    ProviderEgressRefusedError,
+)
 
 from .. import sweep
 from ..behaviorpacks import (
@@ -33,9 +37,7 @@ from ..markers import (
     delivery_order_token,
 )
 from ..reply_sink import (
-    DeletedReplyTargetError,
     ObservedReplySink,
-    ProviderEgressRefusedError,
     TargetRoute,
 )
 from ..workitem_dispatch import (

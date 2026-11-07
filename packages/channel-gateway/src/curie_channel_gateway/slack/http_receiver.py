@@ -14,12 +14,13 @@ from typing import Annotated, Any, ClassVar, Literal, Never, Self, SupportsIndex
 from urllib.parse import urlsplit
 
 import httpx
-from curie_dispatcher.approval_actions import ResolveOutcome, parse_decision_time
-from curie_dispatcher.approval_principal import mint_chat_principal
 from curie_internal import identity_approval as approval_wire
 from curie_internal import identity_context as codec
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 from slack_sdk.web import WebClient
+
+from curie_channel_gateway.slack.approval_actions import ResolveOutcome, parse_decision_time
+from curie_channel_gateway.slack.approval_principal import mint_chat_principal
 
 from .identities import bot_ids_from_auth_test
 from .identity import slack_evidence

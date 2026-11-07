@@ -17,14 +17,14 @@ import redis
 from curie_channel_gateway.slack import app as app_module
 from curie_channel_gateway.slack import handlers as handlers_module
 from curie_channel_gateway.slack.app import build_app, build_web_client
-from curie_channel_gateway.slack.config import DispatcherConfig
-from curie_channel_gateway.slack.handlers import process_action, process_event
-from curie_channel_gateway.slack.identities import SlackIdentityCredentials
-from curie_dispatcher.approval_actions import (
+from curie_channel_gateway.slack.approval_actions import (
     APPROVE_ACTION_ID,
     APPROVE_NOTE_ACTION_ID,
     ResolveOutcome,
 )
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.handlers import process_action, process_event
+from curie_channel_gateway.slack.identities import SlackIdentityCredentials
 from curie_dispatcher.queue import from_stream_fields
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler

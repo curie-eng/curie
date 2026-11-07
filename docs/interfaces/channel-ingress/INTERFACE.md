@@ -127,7 +127,7 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   keeps ordinary behavior only for an ordinary source.
 - **Egress** — the `ReplySink` Protocol (`apps/worker/src/curie_worker/reply_sink.py::ReplySink`),
   whose one method is `async def emit(self, event, *, route, best_effort_unreachable=False)`
-  (`apps/worker/src/curie_worker/reply_sink.py::ReplySink.emit`) — four versioned neutral
+  (`packages/channel-gateway/src/curie_channel_gateway/ports/reply.py::ReplyEventTransport.emit`) — four versioned neutral
   events (`turn.status`, `reply.update`, `reply.post`, `turn.completed`) over a
   worker-local `TargetRoute`. Beside the verb, the kernel asks two optional capability
   questions that are not on the Protocol: `undeliverable_reason(kind, route)`, which drops a
@@ -156,11 +156,11 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
     empty status is the clear.
 
   Slack dialect and widget shape stay BELOW that port, in `SlackReplyAdapter`
-  (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) — its edit-in-place
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter`) — its edit-in-place
   `chat.update`, its `chat.postMessage`, and its assistant-thread status — plus `to_mrkdwn`
-  (`apps/worker/src/curie_worker/mrkdwn.py::to_mrkdwn`) and the Block Kit rendering in
-  `render` (`apps/worker/src/curie_worker/blocks.py::render`) and `approval_card`
-  (`apps/worker/src/curie_worker/blocks.py::approval_card`).
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/mrkdwn.py::to_mrkdwn`) and the Block Kit rendering in
+  `render` (`packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py::render`) and `approval_card`
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py::approval_card`).
   The third sink is the built-in cluster-message relay,
   `_ClusterMessageReplyAdapter`
   (`apps/worker/src/curie_worker/reply_sink.py::_ClusterMessageReplyAdapter`), selected by
@@ -230,7 +230,7 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
 Slack and Discord provide production ingress and egress; email provides HTTP egress,
 with AgentMail inbound admission disabled. There is also a CLI transport stub. Slack ingress
 is `apps/dispatcher` (Bolt / Socket Mode); Slack egress is `SlackReplyAdapter`
-(`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) on the Slack
+(`packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter`) on the Slack
 Web API. Discord (`adapters/discord`) and email's reply receiver (`apps/mail-adapter`) join on
 the authenticated HTTP edge: they neither construct a `QueuedTurn` nor implement
 `ReplySink`; the worker delivers through `HttpReplyAdapter`
@@ -493,7 +493,7 @@ implemented through `packages/channel-gateway/src/curie_channel_gateway/mail/egr
    `ReplyHandle.endpoint`, so a real Slack workspace and a no-Slack CLI stub can coexist on
    one deployment. `WorkerConfig.slack_api_base_url` (`apps/worker/src/curie_worker/config.py::WorkerConfig`)
    is now only the default when a turn sets no `endpoint`, fed to `SlackReplyAdapter`
-   (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.__init__`), which
+   (`packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter.__init__`), which
    also makes it the only TRUSTED Slack origin, so a per-turn endpoint elsewhere is
    refused rather than handed the platform bot token.
 3. **Still leaks: egress semantics.** The streamed reply is edit-a-placeholder: it runs on
@@ -506,8 +506,8 @@ implemented through `packages/channel-gateway/src/curie_channel_gateway/mail/egr
 4. **Still leaks: Slack-only capability queries.** The kernel calls
    `undeliverable_reason` and `edits_in_place` on its sink
    (`apps/worker/src/curie_worker/kernel/core.py::Kernel`), but only `SlackReplyAdapter`
-   (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.undeliverable_reason`,
-   `apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.edits_in_place`) implements
+   (`packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter.undeliverable_reason`,
+   `packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter.edits_in_place`) implements
    them. They are duck-typed rather than declared on `ReplySink`, so a second adapter that
    edits in place or holds per-identity credentials gets the defaults silently, with no
    conformance failure.

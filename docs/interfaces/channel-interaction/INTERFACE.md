@@ -155,31 +155,31 @@ returns a new interaction.
 Four renderers consume the same `OutboundMessage`, and none leaks its widgets
 back into the contract:
 
-1. **Slack (Block Kit)** — `apps/worker/src/curie_worker/blocks.py`. The worker
+1. **Slack (Block Kit)** — `packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py`. The worker
    parses the `curie-reply` envelope out of the runner's final text
-   (`apps/worker/src/curie_worker/blocks.py::parse_reply`), maps it onto the
-   internal `apps/worker/src/curie_worker/blocks.py::Reply` shape
-   (`apps/worker/src/curie_worker/blocks.py::_reply_from_message`), and renders
+   (`packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py::parse_reply`), maps it onto the
+   shared `packages/channel-protocol/src/channel_protocol/formatted.py::Reply` shape
+   (`packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py::_reply_from_message`), and renders
    Block Kit sections/buttons via
-   `apps/worker/src/curie_worker/blocks.py::to_blocks`. `apps/worker/src/curie_worker/blocks.py::render`
+   `packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py::to_blocks`. `packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py::render`
    is the fallback boundary: anything that is not a complete, valid envelope
    degrades to plain text, so a half-streamed block never shows raw JSON. Slack's
    3000-char section cap is absorbed here by
-   `apps/worker/src/curie_worker/blocks.py::chunk`, not pushed onto the agent.
+   `packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py::chunk`, not pushed onto the agent.
    The approval card (ADR-0010) travels the same seam: the kernel emits a
    `confirm` intent and the adapter renders it below the line via
-   `apps/worker/src/curie_worker/blocks.py::approval_card` inside
-   `apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.emit`, so no Block
+   `packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py::approval_card` inside
+   `packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter.emit`, so no Block
    Kit is built above the seam. Its settled forms are split by which outcome
    arrived: nobody decided renders the expired form via
-   `apps/worker/src/curie_worker/blocks.py::expired_approval_card`, and a
+   `packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py::expired_approval_card`, and a
    decision renders the resolved form via
-   `apps/worker/src/curie_worker/blocks.py::resolved_approval_card`, both reached
+   `packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py::resolved_approval_card`, both reached
    through the same adapter on a settling `reply.update`.
    `allow_free_text` on that intent is rendered here
    too: Slack expresses "this decision may carry free text" as a dialog opened by
    the click, so the card carries the note-collecting action ids and the
-   dispatcher's `apps/dispatcher/src/curie_dispatcher/approval_actions.py::open_note_dialog`
+   dispatcher's `packages/channel-gateway/src/curie_channel_gateway/slack/approval_actions.py::open_note_dialog`
    opens the view. Stamping a settled card re-reads the original through
    `conversations.replies` rather than `conversations.history`, because the
    default card is a thread reply and the channel timeline does not carry one
@@ -188,9 +188,9 @@ back into the contract:
 
    Block Kit for that card is built in **two** modules, not one. The dispatcher
    owns the settled form:
-   `apps/dispatcher/src/curie_dispatcher/approval_actions.py::settled_approval_card`
+   `packages/channel-gateway/src/curie_channel_gateway/slack/approval_actions.py::settled_approval_card`
    assembles the header, summary, requested-by and verdict blocks, and
-   `apps/dispatcher/src/curie_dispatcher/approval_actions.py::_resolved_card_blocks`
+   `packages/channel-gateway/src/curie_channel_gateway/slack/approval_actions.py::_resolved_card_blocks`
    strips the actions block off a clicked card and appends the verdict context
    line. `resolved_approval_card` above is a thin adapter over the first of those,
    not a second renderer. The direction is deliberate (#1084): the worker already
@@ -221,14 +221,14 @@ carries it through for both intents
 (`cli/src/channel.rs`, consumed by `cli/src/interactive.rs`). The Slack one reads
 it on exactly one path, the kernel-emitted `confirm` that becomes the approval
 card (#1053, at
-`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.emit`); the
+`packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter.emit`); the
 agent-authored envelope path drops it, since
-`apps/worker/src/curie_worker/blocks.py::_reply_from_message` never reads the
+`packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py::_reply_from_message` never reads the
 field. See Known leakage for why that is not simply a bug.
 
 The Slack answer and approval renderers build Block Kit in the two modules named
 above (`blocks.py` and `approval_actions.py`).
-`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter._deliver_answer`
+`packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter._deliver_answer`
 also builds rich-text section blocks, with literal URL links, for verbatim
 replies (ADR 0250), preserving the approved text while bypassing envelope and
 Markdown rendering. Separately,
@@ -239,10 +239,10 @@ mapping is parsed in `cli/src/channel.rs` and drawn as a numbered selector in
 
 The Slack and Discord renderers consume progress; the terminal and mail ones do not. A card and a
 milestone become Block Kit in
-`apps/worker/src/curie_worker/blocks.py::progress_card` and
-`apps/worker/src/curie_worker/blocks.py::progress_milestone`, every text element
+`packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py::progress_card` and
+`packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py::progress_milestone`, every text element
 `plain_text` so a model-authored summary cannot mention anyone, and
-`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.emit` routes a
+`packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter.emit` routes a
 progress body to them before any answer or approval path. The channel-neutral
 text for a channel with nothing richer is
 `packages/channel-protocol/src/channel_protocol/progress.py::progress_text`, which the Discord adapter posts and edits as plain text. The mail adapter drops a progress-bearing post or update silently, because one message per turn has no card to edit. Nothing produces a progress body yet: the worker's coordinator stores what it
@@ -281,7 +281,7 @@ owes, and no deliverer calls an adapter with it.
 3. **`allow_free_text` reaches the Slack renderer on one path only.** The terminal
   renderer carries the field for both `choice` and `confirm`; the Slack renderer
   reads it only for the kernel's approval-card `confirm`, because
-  `apps/worker/src/curie_worker/blocks.py::_reply_from_message` projects
+  `packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py::_reply_from_message` projects
   `OutboundMessage` onto its internal `Reply` shape without it. Part of this is
   inherent: a Slack channel is always typeable, so `allow_free_text: true` needs
   no affordance and `false` cannot be enforced there at all, where the TUI can and

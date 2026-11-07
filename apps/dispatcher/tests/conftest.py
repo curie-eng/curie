@@ -24,8 +24,8 @@ from typing import Any
 
 import pytest
 import redis
+from curie_channel_gateway.slack.approval_actions import ResolveOutcome
 from curie_channel_gateway.slack.config import DispatcherConfig
-from curie_dispatcher.approval_actions import ResolveOutcome
 from curie_test_support.valkey import (
     VALKEY_HOST as _VALKEY_HOST,
 )
@@ -35,9 +35,7 @@ from curie_test_support.valkey import (
 from curie_test_support.valkey import (
     VALKEY_PW as _VALKEY_PW,
 )
-from curie_test_support.valkey import (
-    connect_or_skip,
-)
+from curie_test_support.valkey import connect_or_skip
 from slack_bolt.authorization import AuthorizeResult
 from slack_sdk.socket_mode.builtin import client as builtin_socket_mode_client
 

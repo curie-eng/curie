@@ -7,15 +7,17 @@ import math
 import time
 
 from channel_protocol.reply import ReplyAck, ReplyEvent, TurnCompleted
+from curie_channel_gateway.reply_transport import (
+    DeletedReplyTargetError,
+    HttpReplyAdapter,
+    _BestEffortUnreachableAck,
+)
 
 from .protected_markers import ProtectedMarkers, ProtectedSettlementError
 from .reply_sink import (
-    DeletedReplyTargetError,
-    HttpReplyAdapter,
     ReplySink,
     ReplySinkRouter,
     TargetRoute,
-    _BestEffortUnreachableAck,
 )
 
 

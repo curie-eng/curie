@@ -28,11 +28,12 @@ from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
 import httpx
+from curie_telemetry import inject_trace_context
+from slack_sdk.web import WebClient
+
 from curie_channel_gateway.ports.intake import ApprovalResolution
 from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_channel_gateway.slack.identity import slack_evidence
-from curie_telemetry import inject_trace_context
-from slack_sdk.web import WebClient
 
 from .approval_principal import mint_chat_principal, mint_test_driver_principal
 
@@ -73,7 +74,7 @@ _NOTE_MAX_LENGTH = 2000
 # ``_verdict_line`` so a non-modal caller is guarded too. It mirrors the value
 # the codebase already settled on for the same class of problem: the worker's
 # ``_APPROVAL_SUMMARY_MAX`` and ``_CHUNK_TARGET``, both in
-# ``curie_worker.blocks``, are the same 2900 (copied rather than imported: the
+# ``curie_channel_gateway.slack.blocks``, are the same 2900 (copied rather than imported: the
 # dispatcher must not depend on apps/worker). The three share a derivation from
 # Slack's text-object limit, not a coupling to each other -- two of them guard
 # different block types in a different service, and nothing gates any of the
@@ -88,12 +89,12 @@ _VERDICT_LINE_MAX = 2900
 
 # The ``chat_update`` ``text`` argument is the notification/preview/screen-reader
 # fallback, NOT a block text object, and Slack caps it far higher (the worker's
-# own renderer clamps at 39000 in ``curie_worker.blocks``). It gets its own bound
+# own renderer clamps at 39000 in ``curie_channel_gateway.slack.blocks``). It gets its own bound
 # because #1073 made it carry the card summary as well as the verdict, so the
 # verdict's context-block clamp above no longer covers it.
 _FALLBACK_TEXT_MAX = 39000
 
-# The live card's header. ``curie_worker.blocks.approval_card`` imports this
+# The live card's header. ``curie_channel_gateway.slack.blocks.approval_card`` imports this
 # rather than repeating the literal. A settled card is headed with its outcome
 # instead (ADR-0179), through ``settled_card_header`` on both settling paths.
 _APPROVAL_CARD_HEADER = "Approval required"
@@ -399,12 +400,12 @@ def settled_approval_card(
     context line.
 
     "Exactly" is asserted rather than asserted-in-a-docstring: a test renders a
-    live card through ``curie_worker.blocks.approval_card``, settles it both
+    live card through ``curie_channel_gateway.slack.blocks.approval_card``, settles it both
     ways, and compares. That test is the contract; this docstring only says why
     it exists.
 
     Lives here, not in the worker's renderer, because the dependency runs one
-    way: ``curie_worker.blocks`` already imports this module for the action ids,
+    way: ``curie_channel_gateway.slack.blocks`` already imports this module for the action ids,
     for the same anti-drift reason, and the reverse import would be a cycle.
     """
 
@@ -618,7 +619,7 @@ def _verdict_line(
     # marked so a reader can tell the card is showing an excerpt; the durable
     # record still holds the whole note, and the requester's resume turn
     # interpolates that one. The marker is the same single ellipsis character
-    # the worker's ``_truncate`` in ``curie_worker.blocks`` uses, so a truncated
+    # the worker's ``_truncate`` in ``curie_channel_gateway.slack.blocks`` uses, so a truncated
     # note ends the same way whichever service stamped the card.
     line = f"{decision.capitalize()} by <@{user}>"
     if resolved_at is not None:

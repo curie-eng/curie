@@ -8,7 +8,7 @@ tests mock; everything else runs for real.
 
 Everything Slack-shaped lives below ``emit``: the Web API method names, Block Kit
 rendering, the assistant-thread "shimmer" caption, and the #530 transport
-fallback. The kernel above it knows only ``ReplyEvent`` + ``TargetRoute``.
+fallback. The kernel above it knows only ``ReplyEvent`` + ``ReplyRoute``.
 
 **A per-turn endpoint is honored only at the CONFIGURED Slack origin** (D4.4).
 Before ADR-0096 phase 2 this class built ``AsyncWebClient(token=self._token,
@@ -32,11 +32,11 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import Any, TypeVar, cast
 from urllib.parse import urlsplit
 
 import aiohttp
-from aci_protocol.turn import DEFAULT_IDENTITY
+from aci_protocol.turn import DEFAULT_IDENTITY, slack_speaking_identity
 from channel_protocol import ConfirmIntent, OutboundMessage, ProgressCard, ProgressMilestone
 from channel_protocol.reply import (
     NavAffordance,
@@ -53,8 +53,9 @@ from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
-from .approvals import decided_at
-from .behaviorpacks import NavPack
+from ..reply_route import ReplyRoute
+from ..reply_transport import _redacted
+from .approval_actions import parse_decision_time
 from .blocks import (
     approval_card,
     expired_approval_card,
@@ -65,11 +66,8 @@ from .blocks import (
     resolved_approval_card,
     to_blocks,
 )
+from .navigation import ReplyNavigation
 from .slack_text import split_answer, split_verbatim_answer, verbatim_rich_text
-from .slack_tokens import token_identity
-
-if TYPE_CHECKING:  # pragma: no cover - import cycle: reply_sink builds this adapter
-    from .reply_sink import TargetRoute
 
 logger = logging.getLogger(__name__)
 
@@ -233,29 +231,6 @@ def _origin(url: str) -> tuple[str, str, int]:
     return scheme, (parts.hostname or "").lower(), port
 
 
-def _redacted(url: str | None) -> str:
-    """A URL reduced to scheme and host, for a message a human will read.
-
-    The ONE definition for the worker's whole egress path -- ``reply_sink``
-    imports this one rather than keeping a byte-identical twin. (The API side's
-    copy in ``alembic/versions/0024_...`` stays separate on purpose: a migration
-    is frozen at the revision that wrote it and must not import live code.)
-
-    A per-turn endpoint can carry a token in its path or query, and refusals and
-    unreachability warnings land in worker logs and dead-letter rows. The origin
-    is the whole point of these messages anyway -- the trust check is an ORIGIN
-    check.
-    """
-
-    if not url:
-        return "unset"
-    parts = urlsplit(url)
-    if not parts.scheme or not parts.hostname:
-        return "an unparseable endpoint"
-    port = f":{parts.port}" if parts.port else ""
-    return f"{parts.scheme}://{parts.hostname}{port}"
-
-
 def _configured_origins(origins: Sequence[str]) -> set[_TrustedOrigin]:
     """Configured dev origins as (scheme, host, port-or-None) triples.
 
@@ -276,18 +251,18 @@ def _configured_origins(origins: Sequence[str]) -> set[_TrustedOrigin]:
     return configured
 
 
-def _nav_pack(nav: NavAffordance | None) -> NavPack | None:
+def _nav_pack(nav: NavAffordance | None) -> ReplyNavigation | None:
     """The wire affordance in the renderer's own vocabulary.
 
     ``blocks.render`` (and ``ensure_hub_button`` under it) is the platform-owned
-    append policy and speaks ``NavPack``; the wire owns ``NavAffordance`` because
+    append policy and speaks ``ReplyNavigation``; the wire owns ``NavAffordance`` because
     ``behaviorpacks`` cannot cross into ``channel_protocol`` (finding 16). The
     map is here, at the render call, so the disabled form stays "absent on the
     wire" rather than "a pack with a false flag".
     """
     if nav is None:
         return None
-    return NavPack(enabled=True, hub_label=nav.label, hub_command=nav.command)
+    return ReplyNavigation(enabled=True, hub_label=nav.label, hub_command=nav.command)
 
 
 def _adopt_posted_ts(response: Mapping[str, Any] | AsyncSlackResponse | None) -> str | None:
@@ -407,13 +382,13 @@ class SlackReplyAdapter:
         self._trusted_origins = frozenset(trusted)
         self._clients: dict[tuple[str, str | None], AsyncWebClient] = {}
 
-    def undeliverable_reason(self, kind: str, route: TargetRoute) -> str | None:
+    def undeliverable_reason(self, kind: str, route: ReplyRoute) -> str | None:
         """Why this adapter cannot speak on ``route``, or None when it can."""
 
-        identity = token_identity(route.adapter, route.endpoint)
+        identity = slack_speaking_identity("slack", route.adapter, route.endpoint)
         return None if identity in self._tokens else _missing_token(identity)
 
-    def edits_in_place(self, kind: str, route: TargetRoute) -> bool:
+    def edits_in_place(self, kind: str, route: ReplyRoute) -> bool:
         """Slack's update edits a message its reader already sees (ADR-0168 decision 6)."""
 
         return True
@@ -422,7 +397,7 @@ class SlackReplyAdapter:
         self,
         event: ReplyEvent,
         *,
-        route: TargetRoute,
+        route: ReplyRoute,
         best_effort_unreachable: bool = False,
     ) -> ReplyAck:
         """Render one neutral event as the Slack call that expresses it.
@@ -439,7 +414,7 @@ class SlackReplyAdapter:
         passes it as ``client_msg_id``.
         """
         endpoint = route.endpoint
-        identity = token_identity(route.adapter, endpoint)
+        identity = slack_speaking_identity("slack", route.adapter, endpoint)
         target = event.target
         if isinstance(event, TurnStatus):
             await self._set_status(
@@ -1127,7 +1102,13 @@ class SlackReplyAdapter:
                 decision=settled.decision,
                 resolver=settled.resolver or "",
                 note=settled.note,
-                resolved_at=decided_at(message),
+                resolved_at=next(
+                    (
+                        parse_decision_time(item.value)
+                        for item in message.fields if item.label == "Decided"
+                    ),
+                    None,
+                ),
             )
 
         # A rejected Block Kit payload falls back to text-only, mirroring

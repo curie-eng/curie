@@ -33,6 +33,11 @@ import pytest
 import redis
 from curie_channel_gateway.slack import identity as identity_module
 from curie_channel_gateway.slack.app import build_app
+from curie_channel_gateway.slack.approval_actions import (
+    APPROVE_ACTION_ID,
+    NOTE_MODAL_CALLBACK_ID,
+    ResolveOutcome,
+)
 from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_channel_gateway.slack.identities import SlackIdentityCredentials
 from curie_channel_gateway.slack.identity import (
@@ -42,11 +47,6 @@ from curie_channel_gateway.slack.identity import (
     slack_evidence,
 )
 from curie_dispatcher.admission import build_admission
-from curie_dispatcher.approval_actions import (
-    APPROVE_ACTION_ID,
-    NOTE_MODAL_CALLBACK_ID,
-    ResolveOutcome,
-)
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.socket_mode.request import SocketModeRequest

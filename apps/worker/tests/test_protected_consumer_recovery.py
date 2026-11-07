@@ -22,7 +22,11 @@ owned_worker = actual.wb.owned_worker
 async def retained_ref_reply():
     """External Slack alone is synthetic; adapter and reply router are real."""
     from aiohttp import web
-    from curie_worker.reply_sink import HttpReplyAdapter, ReplySinkRouter, SlackReplyAdapter
+    from curie_channel_gateway.reply_transport import HttpReplyAdapter
+    from curie_worker.reply_sink import (
+        ReplySinkRouter,
+        SlackReplyAdapter,
+    )
 
     calls = []
     posted = 0

@@ -28,7 +28,7 @@ from typing import Any, Protocol
 import httpx
 from aci_protocol import READER_CONTEXT, ApprovalRequest, PublicationContext, QueuedTurn
 from channel_protocol import MessageField, OutboundMessage
-from curie_dispatcher.approval_actions import parse_decision_time
+from curie_channel_gateway.slack.approval_actions import parse_decision_time
 from curie_internal.identity_approval import (
     ApprovalCreationIdentityV1,
     ApprovalCreationRequestV1,

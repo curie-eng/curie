@@ -21,6 +21,7 @@ from channel_protocol.reply import (
     ReplyUpdate,
     SettledOutcome,
 )
+from curie_channel_gateway.reply_transport import InvalidReplyTargetError
 
 from .approval_cards import ApprovalCardRef, ApprovalCardStore
 from .approvals import decided_field
@@ -38,7 +39,10 @@ from .publication_k8s import (
     publication_resource_names,
     valid_repository_path,
 )
-from .reply_sink import InvalidReplyTargetError, ReplySink, TargetRoute
+from .reply_sink import (
+    ReplySink,
+    TargetRoute,
+)
 
 # The Job's one marker: the commit it pushed, printed after the push.
 _COMMIT_MARKER = re.compile(r"^CURIE_COMMIT_SHA=([0-9a-f]{40,64})$", re.MULTILINE)

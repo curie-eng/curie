@@ -102,7 +102,7 @@ def deliver_receipts(
     """
 
     receipts = importlib.import_module("curie_worker.remediation_receipts")
-    from curie_worker.slack_sink import SlackReplyAdapter
+    from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 
     sender = sender or Sender()
     before = len(sender.posts)

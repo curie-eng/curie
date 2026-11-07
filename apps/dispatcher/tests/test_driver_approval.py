@@ -14,10 +14,10 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 import redis
+from curie_channel_gateway.slack.approval_actions import ApprovalResolveClient
 from curie_channel_gateway.slack.handlers import process_event
 from curie_channel_gateway.slack.marked_actions import reserve_turn
 from curie_dispatcher.admission import build_admission
-from curie_dispatcher.approval_actions import ApprovalResolveClient
 
 from .conftest import FakeAdmissionApi
 from .test_test_actions import DRIVER, _configured
