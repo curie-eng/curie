@@ -331,6 +331,10 @@ class Supervisor:
         async with self._lock:
             lease = self._lease
             if lease is None or (lease.claim, lease.generation) != (claim, generation):
+                # Retiring a lease this shell never started fences it: a create
+                # for it still in flight (its creator lost the lease) is
+                # refused as stale when it lands.
+                self._max_generation = max(self._max_generation, generation)
                 last = self._last
                 if last is not None and (last["name"], last["generation"]) == (claim, generation):
                     return 200, {"outcome": last["outcome"], "shell": self.status()}

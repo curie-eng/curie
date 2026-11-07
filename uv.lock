@@ -1105,7 +1105,9 @@ name = "curie-test-support"
 version = "0.0.0"
 source = { editable = "packages/test-support" }
 dependencies = [
+    { name = "aiohttp" },
     { name = "asyncpg" },
+    { name = "cryptography" },
     { name = "pytest" },
     { name = "redis" },
     { name = "sqlalchemy", extra = ["asyncio"] },
@@ -1113,7 +1115,9 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.11" },
     { name = "asyncpg", specifier = ">=0.30" },
+    { name = "cryptography", specifier = ">=50.0.2" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "redis", specifier = ">=8.1.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },

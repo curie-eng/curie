@@ -1875,3 +1875,81 @@ def test_supervise_keeps_tracebacks_for_local_os_errors_during_boot(
 
     records = [r for r in caplog.records if r.name == "curie_worker.run"]
     assert all(r.levelno == logging.ERROR and r.exc_info for r in records)
+
+
+@pytest.mark.parametrize("value", ["kube", "k8s", "Docker-compose", "fargate", ""])
+def test_an_unknown_sandbox_substrate_refuses_worker_start(value: str) -> None:
+    # It used to select Kubernetes silently.
+    with pytest.raises(ValueError, match="not a sandbox substrate"):
+        run.sandbox_substrate({"CURIE_SANDBOX_SUBSTRATE": value})
+    with pytest.raises(ValueError, match="not a sandbox substrate"):
+        _substrate_config({"CURIE_SANDBOX_SUBSTRATE": value})
+
+
+@pytest.mark.parametrize(
+    ("value", "kind"),
+    [
+        (None, "kubernetes"),
+        ("kubernetes", "kubernetes"),
+        (" Docker ", "docker"),
+        ("static", "static"),
+    ],
+)
+def test_sandbox_substrate_names_one_of_the_three_backends(value: str | None, kind: str) -> None:
+    env = {} if value is None else {"CURIE_SANDBOX_SUBSTRATE": value}
+    assert run.sandbox_substrate(env) == kind
+
+
+def test_the_static_substrate_refuses_quota_admission_and_repository_pools() -> None:
+    with pytest.raises(ValueError, match="quota admission"):
+        _substrate_config(
+            {
+                "CURIE_SANDBOX_SUBSTRATE": "static",
+                "CURIE_SANDBOX_ADMISSION": json.dumps(_admission_contract()),
+            }
+        )
+    with pytest.raises(ValueError, match="CURIE_REPO_RUNNER_POOLS"):
+        _substrate_config(
+            {
+                "CURIE_SANDBOX_SUBSTRATE": "static",
+                "CURIE_REPO_RUNNER_POOLS": json.dumps(
+                    {
+                        "acme/app": {
+                            "pool": "curie-repo-app",
+                            "digests": ["sha256:" + c * 64 for c in "acd"],
+                            "base": "sha256:" + "b" * 64,
+                            "docker": False,
+                        }
+                    }
+                ),
+            }
+        )
+
+
+def test_the_static_client_needs_its_inventory_ca_and_lease_store(tmp_path: Path) -> None:
+    shells = json.dumps([{"slot": "s0", "host": "shell.internal", "pool": "curie-runner-pool"}])
+    generic = SubstrateConfig(namespace="default", warm_pool="curie-runner-pool")
+    sync = redis.Redis()
+    env = {"CURIE_SANDBOX_SUBSTRATE": "static", "CURIE_STATIC_SHELLS": shells}
+    with pytest.raises(ValueError, match="Valkey"):
+        _sandbox_client(WorkerConfig(), env, generic)
+    with pytest.raises(ValueError, match="CURIE_STATIC_SHELL_CA_FILE"):
+        _sandbox_client(WorkerConfig(), env, generic, redis_client=sync)
+    from curie_test_support.static_shell import CONTROL_TOKEN, make_shell_tls
+
+    tls = make_shell_tls(tmp_path)
+    full = {
+        **env,
+        "CURIE_STATIC_SHELL_CA_FILE": str(tls.ca),
+        "CURIE_STATIC_SHELL_CONTROL_TOKEN": CONTROL_TOKEN,
+    }
+    agents = SubstrateConfig(
+        namespace="default", warm_pool="curie-runner-pool", agent_pools=frozenset({"sre"})
+    )
+    with pytest.raises(ValueError, match="no static shell: sre"):
+        _sandbox_client(WorkerConfig(), full, agents, redis_client=sync)
+    client = _sandbox_client(WorkerConfig(), full, generic, redis_client=sync)
+    from curie_worker.sandbox import StaticPoolSandboxClient
+
+    assert isinstance(client, StaticPoolSandboxClient)
+    assert client.pools == frozenset({"curie-runner-pool"})
