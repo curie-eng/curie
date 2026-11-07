@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any
 
 import anyio
-import httpx
+import httpx2
 import pytest
 import uvicorn
 from aci_protocol import Event
@@ -572,9 +572,12 @@ def test_a_session_without_connector_servers_keeps_the_default_turn() -> None:
 # A transport failure before the server answered is retried (<= 3 dials)
 # --------------------------------------------------------------------------- #
 
+# The MCP client's transport is httpx2 (mcp 2.x), not httpx; a dial to a
+# closed port or an unresolvable name arrives as an exception group whose leaf
+# is httpx2.ConnectError (recorded from the runner image).
 _TRANSPORT_FAILURES = [
-    httpx.ConnectError,
-    httpx.ConnectTimeout,
+    httpx2.ConnectError,
+    httpx2.ConnectTimeout,
     ConnectionResetError,
     socket.gaierror,
 ]
@@ -584,7 +587,7 @@ def _count_dials(
     monkeypatch: pytest.MonkeyPatch,
     *,
     fail_first: int,
-    failure: type[BaseException] = httpx.ConnectError,
+    failure: type[BaseException] = httpx2.ConnectError,
 ) -> list[int]:
     """Count every transport open; the first ``fail_first`` raise ``failure``.
 
@@ -681,3 +684,40 @@ def test_a_permanently_unreachable_connector_is_dialed_three_times_then_reported
     assert final["status"] == "done"
     assert _call_lines(final["text"]) == [_failed("weather", failure.__name__)]
     assert len(dials) == 3
+
+
+# @spec CONNECTOR-REQUESTER-2
+def test_the_real_transport_failure_to_a_closed_port_is_retried_then_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No injected failure: the real MCP transport dials a closed port, so the
+    # retry classifies the shape the runner actually sees.
+    dials = _count_dials(monkeypatch, fail_first=0)
+    url = f"http://127.0.0.1:{_closed_port()}/mcp"
+    session = FakeModelSession(connector_servers={"weather": _server_config(url)})
+
+    async def go() -> dict[str, Any]:
+        _raw, final = await _runner_turn(session, _prompt())
+        return final
+
+    final = anyio.run(go)
+    assert final["status"] == "done"
+    assert _call_lines(final["text"]) == [_failed("weather", "ConnectError")]
+    assert len(dials) == 3
+
+
+def test_the_runner_package_imports_without_httpx() -> None:
+    # The runner image installs only the runner's lock closure, which has no
+    # httpx; importing curie_runner (what `python -m curie_runner` does) must
+    # not need it.
+    import subprocess
+    import sys
+
+    script = (
+        "import sys; sys.modules['httpx'] = None; "
+        "import curie_runner, curie_runner.fake, curie_runner.__main__"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
