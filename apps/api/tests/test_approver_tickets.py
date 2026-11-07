@@ -206,3 +206,22 @@ def test_complete_argument_size_refusal_codes(case: dict[str, Any]) -> None:
         with pytest.raises(TicketError) as refused:
             check_execution_size(arguments, **scope)
         assert refused.value.code == case["code"]
+
+
+def test_delivery_candidates_do_not_change_canonical_person_uniqueness() -> None:
+    from curie_internal.approver_ticket import SelectedApprover
+
+    case = next(
+        c for c in CORPUS["negative"] if c["name"] == "same_person_distinct_delivery_accounts"
+    )
+    people = [SelectedApprover.model_validate(p) for p in case["payload"]["approvers"]]
+    assert people[0].recipient_accounts is None
+    assert people[1].recipient_accounts is not None
+    with pytest.raises(TicketError) as refused:
+        verify_ticket(
+            public_key=KEY,
+            key_id="selector-test-1",
+            arguments=case["arguments"],
+            clock=lambda: case["now"],
+        )
+    assert refused.value.code == case["code"]
