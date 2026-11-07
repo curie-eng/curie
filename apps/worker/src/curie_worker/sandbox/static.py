@@ -86,7 +86,7 @@ from plugin_format import (
 )
 
 from ..attachments import ATTACHMENTS_REF_ENV, AttachmentLimits
-from ..binding import BUNDLE_REF_ENV, RUNNER_TOKEN_ENV
+from ..binding import BUNDLE_REF_ENV, CONNECTOR_SECRET_KEYS_ENV, RUNNER_TOKEN_ENV
 from ..bundle_store import BundleReader
 from ..workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV, WorkspaceLimits
 from .claim_tokens import executor_claim_env, executor_withheld_names
@@ -587,6 +587,12 @@ class StaticPoolSandboxClient(ClaimInputStaging):
         if executor_secret_names is not None:
             withheld = executor_withheld_names(env)
             env = executor_claim_env(env, executor_secret_names)
+        # Connector secret values never leave the worker: the shell supplies
+        # them from its own environment by name, as a pool template does on
+        # Kubernetes. The marker (names only) still reaches the runner so it
+        # redacts whatever the shell supplies under those names.
+        secret_names = {key for key in env.get(CONNECTOR_SECRET_KEYS_ENV, "").split(",") if key}
+        env = {key: value for key, value in env.items() if key not in secret_names}
         if not env.get(RUNNER_TOKEN_ENV):
             # The bearer is what fences one claim's requests from the next
             # claim's child on the same shell; a claim without one is refused.

@@ -97,9 +97,15 @@ ShellFactory = Callable[..., SupervisorProcess]
 def shells(tls: ShellTls, tmp_path: Path) -> Iterator[ShellFactory]:
     started: list[SupervisorProcess] = []
 
-    def start(slot: str, *, port: int | None = None) -> SupervisorProcess:
+    def start(
+        slot: str, *, port: int | None = None, env: dict[str, str] | None = None
+    ) -> SupervisorProcess:
         shell = SupervisorProcess(
-            slot=slot, tls=tls, root=tmp_path / slot, runner_command=FAKE_RUNNER_COMMAND
+            slot=slot,
+            tls=tls,
+            root=tmp_path / slot,
+            runner_command=FAKE_RUNNER_COMMAND,
+            env=dict(env or {}),
         )
         if port is not None:
             shell.port = port
@@ -373,29 +379,54 @@ def test_unsupported_profiles_and_missing_inputs_are_refused(
     assert valkey.exists(f"{prefix}:static:claim:c") == 0
 
 
-def test_an_executor_claim_stages_without_model_credentials(
-    valkey: redis.Redis, prefix: str, tls: ShellTls, shells: ShellFactory, records: Path
+def test_connector_secrets_come_from_the_shell_and_never_from_the_worker(
+    valkey: redis.Redis, prefix: str, tls: ShellTls, shells: ShellFactory, tmp_path: Path
 ) -> None:
-    client = _client(valkey, prefix, tls, [shells("s0")])
-    env = {
-        **_env(records),
+    shell_env = {
+        "CURIE_SUPERVISOR_CHILD_ENV": "KEEP_SECRET,DROP_SECRET,MODEL_KEY",
+        "KEEP_SECRET": "shell-k",
+        "DROP_SECRET": "shell-d",
+        "MODEL_KEY": "shell-model",
+    }
+    client = _client(valkey, prefix, tls, [shells("s0", env=shell_env)])
+    worker_values = {
         "CURIE_CONNECTOR_SECRET_KEYS": "KEEP_SECRET,DROP_SECRET",
-        "KEEP_SECRET": "k",
-        "DROP_SECRET": "d",
+        "KEEP_SECRET": "worker-k",
+        "DROP_SECRET": "worker-d",
         "CURIE_CREDENTIALS": "model-credential",
         "VALKEY_PASSWORD": "host-secret",
     }
+    ordinary, action = tmp_path / "ordinary", tmp_path / "action"
+    for records in (ordinary, action):
+        records.mkdir()
+
+    client.create_claim(
+        "agent-claim",
+        pool=POOL,
+        env={**_env(ordinary), **worker_values},
+        deadline=time.monotonic() + 30,
+    )
+    _await_ready(client, "agent-claim")
+    child = json.loads((ordinary / "env.json").read_text())
+    assert (child["KEEP_SECRET"], child["DROP_SECRET"]) == ("shell-k", "shell-d")
+    assert child["MODEL_KEY"] == "shell-model"
+    # The names still reach the runner, so it redacts what the shell supplied.
+    assert child["CURIE_CONNECTOR_SECRET_KEYS"] == "KEEP_SECRET,DROP_SECRET"
+    for absent in ("CURIE_CREDENTIALS", "VALKEY_PASSWORD"):
+        assert absent not in child
+    client.delete_claim("agent-claim", request_timeout_seconds=20)
+
     client.create_claim(
         "action-claim",
         pool=POOL,
-        env=env,
+        env={**_env(action), **worker_values},
         deadline=time.monotonic() + 30,
         executor_secret_names=frozenset({"KEEP_SECRET"}),
     )
     _await_ready(client, "action-claim")
-    child = json.loads((records / "env.json").read_text())
-    assert child["KEEP_SECRET"] == "k"
-    for absent in ("DROP_SECRET", "CURIE_CREDENTIALS", "VALKEY_PASSWORD"):
+    child = json.loads((action / "env.json").read_text())
+    assert child["KEEP_SECRET"] == "shell-k"
+    for absent in ("DROP_SECRET", "MODEL_KEY", "CURIE_CREDENTIALS", "VALKEY_PASSWORD"):
         assert absent not in child
 
 
