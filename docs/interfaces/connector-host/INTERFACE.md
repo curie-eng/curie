@@ -322,13 +322,24 @@ before the forward
 release does not yet set that header from the verified claim, so a connector
 sees no principal header at all; decision 4's projection is a later change.
 
-Enable `connector_requester_identity` only after the api, the worker and the
-agent's connector proxies all run this release, and redeploy the agent first
-if its connector proxies predate it. A mixed state fails closed rather than
-leaking or widening authority: an older worker cannot read the turn authority
-answer that carries the requester and refuses the turn, and an older proxy
-refuses a principal-bearing `cct` as `invalid`, so the agent's connector calls
-are refused until the rollout completes.
+`connector_requester_identity` is experimental in this release and should stay
+off outside test installs. When it is on, an opted-in agent's hosted-connector
+caller tokens carry the verified human requester and the connector proxy
+verifies it, but the proxy does not yet pass the requester to connectors (a
+later release adds that), so connectors cannot act on it yet. The worker
+replaces a sandbox before serving a different requester and never runs one
+person's message under another person's token. A different person's message
+that arrives during a live turn waits for that turn to end, and if the turn
+outlasts the existing redelivery budget the message is settled visibly without
+running.
+
+As a precondition, the api, the worker and the agent's connector proxies must
+all run this release, and the agent must be redeployed first if its connector
+proxies predate it. A mixed state fails closed rather than leaking or widening
+authority: an older worker cannot read the turn authority answer that carries
+the requester and refuses the turn, and an older proxy refuses a
+principal-bearing `cct` as `invalid`, so the agent's connector calls are
+refused until the rollout completes.
 
 ## Implementations today
 
