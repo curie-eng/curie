@@ -72,10 +72,12 @@ def _scalar(sample: str) -> dict[str, Any]:
 class _Prometheus:
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        # What the next queries answer: (status code, body bytes), or a delay.
+        # What the next queries answer: (status code, body bytes).
         self.status = 200
         self.body: bytes = json.dumps(_vector(({"job": "example-api"}, "1"))).encode()
-        self.delay = 0.0
+        # While set, every answer is held until it is cleared (a hung Prometheus).
+        self.hang = False
+        self.released = threading.Event()
         self.redirect_to: str | None = None
         self.requests: list[tuple[str, str, dict[str, list[str]], str | None]] = []
 
@@ -103,8 +105,8 @@ def _handler(prometheus: _Prometheus) -> type[http.server.BaseHTTPRequestHandler
 
         def _serve(self) -> None:
             path, _query = self._record()
-            if prometheus.delay:
-                time.sleep(prometheus.delay)
+            if prometheus.hang:
+                prometheus.released.wait(timeout=30)
             if prometheus.redirect_to is not None:
                 self.send_response(302)
                 self.send_header("Location", prometheus.redirect_to)
@@ -135,6 +137,7 @@ def prometheus() -> Iterator[tuple[_Prometheus, str]]:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     yield state, f"http://127.0.0.1:{server.server_address[1]}"
+    state.released.set()
     server.shutdown()
     server.server_close()
     thread.join(timeout=5)
@@ -166,19 +169,27 @@ class _Connector:
             stderr=subprocess.STDOUT,
         )
         self.url = f"http://127.0.0.1:{port}/mcp"
-        self.output = ""
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            if self.process.poll() is not None:
-                self.output = self.process.stdout.read().decode("utf-8", "replace")  # type: ignore[union-attr]
-                return
-            try:
-                socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
-                return
-            except OSError:
-                time.sleep(0.05)
-        self.stop()
-        pytest.fail("metrics connector did not listen within 20s")
+        self._lines: list[str] = []
+        self._settled = threading.Event()
+        self._reader = threading.Thread(target=self._read, daemon=True)
+        self._reader.start()
+        # Uvicorn's ready line, or the process ending, settles startup: no polling.
+        if not self._settled.wait(timeout=20):
+            self.stop()
+            pytest.fail("metrics connector did not listen within 20s")
+
+    def _read(self) -> None:
+        assert self.process.stdout is not None
+        for raw in self.process.stdout:
+            line = raw.decode("utf-8", "replace")
+            self._lines.append(line)
+            if "Uvicorn running on" in line:
+                self._settled.set()
+        self._settled.set()
+
+    @property
+    def output(self) -> str:
+        return "".join(self._lines)
 
     def stop(self) -> str:
         if self.process.poll() is None:
@@ -188,8 +199,8 @@ class _Connector:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=5)
-        if self.process.stdout is not None and not self.process.stdout.closed:
-            self.output += self.process.stdout.read().decode("utf-8", "replace")
+        self._reader.join(timeout=5)
+        if self.process.stdout is not None:
             self.process.stdout.close()
         return self.output
 
@@ -418,7 +429,7 @@ def test_a_slow_prometheus_times_out_as_a_tool_error(
     connector: Any, prometheus: tuple[_Prometheus, str]
 ) -> None:
     state, _url = prometheus
-    state.delay = 2.0
+    state.hang = True
     process = connector(METRICS_TIMEOUT_SECONDS="0.5")
     started = time.monotonic()
     _assert_unsuccessful(process)
