@@ -34,7 +34,6 @@ FULLNAME = f"{NAME}-curie"
 class WakeStack:
     def __init__(self, root: Path):
         self.root = root
-        self.context = f"kind-{NAME}"
         self.env = {
             k: v
             for k, v in os.environ.items()
@@ -43,6 +42,8 @@ class WakeStack:
         self.env.update(KUBECONFIG=str(root / "kubeconfig"), CURIE_CONFIG_DIR=str(root / "config"))
         self.cli = os.environ.get("CURIE_BIN", "curie")
         self.tag = uuid.uuid4().hex[:12]
+        self.cluster = f"{NAME}-{self.tag}"
+        self.context = f"kind-{self.cluster}"
         self.images = {
             role: f"curie-wake-{role}:{self.tag}" for role in ("api", "worker", "runner")
         }
@@ -151,14 +152,22 @@ class WakeStack:
             "create",
             "cluster",
             "--name",
-            NAME,
+            self.cluster,
             "--image",
             "kindest/node:v1.31.0",
             "--kubeconfig",
             self.env["KUBECONFIG"],
             timeout=300,
         )
-        self.run("kind", "load", "docker-image", "--name", NAME, *self.images.values(), timeout=900)
+        self.run(
+            "kind",
+            "load",
+            "docker-image",
+            "--name",
+            self.cluster,
+            *self.images.values(),
+            timeout=900,
+        )
         self.kube("create", "namespace", NAME)
         values = {
             "api": {"image": self.image("api")},
@@ -186,7 +195,7 @@ class WakeStack:
                     "imagePullPolicy": "Never",
                     "prewarm": {"enabled": False},
                     "fakeModel": True,
-                }
+                },
             },
         }
         path = self.root / "values.yaml"
@@ -240,8 +249,7 @@ class WakeStack:
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             if self.redis("EXISTS", "curie:runs") and any(
-                item["name"] == "curie-workers"
-                for item in self.redis("XINFO GROUPS", "curie:runs")
+                item["name"] == "curie-workers" for item in self.redis("XINFO GROUPS", "curie:runs")
             ):
                 break
             time.sleep(0.1)
@@ -520,10 +528,10 @@ class WakeStack:
             except (RuntimeError, AssertionError, subprocess.SubprocessError) as exc:
                 errors.append(str(exc))
             finally:
-                self.run("kind", "delete", "cluster", "--name", NAME, timeout=180)
-                assert NAME not in self.run("kind", "get", "clusters").splitlines()
+                self.run("kind", "delete", "cluster", "--name", self.cluster, timeout=180)
+                assert self.cluster not in self.run("kind", "get", "clusters").splitlines()
                 assert not self.run(
-                    "docker", "ps", "-aq", "--filter", f"label=io.x-k8s.kind.cluster={NAME}"
+                    "docker", "ps", "-aq", "--filter", f"label=io.x-k8s.kind.cluster={self.cluster}"
                 ).strip()
         for image in self.images.values():
             result = subprocess.run(
