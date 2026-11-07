@@ -86,6 +86,7 @@ from .routers import (
     deployments,
     directory,
     evals,
+    factory_slack,
     factory_status,
     forge_credential_health,
     gitflow_routing,
@@ -730,6 +731,7 @@ def create_app(
     app.include_router(publication_ui_evidence.router)
     app.include_router(work_item_issue.router)
     app.include_router(work_item_issue.internal_router)
+    app.include_router(factory_slack.internal_router)
     app.include_router(attachment_access.router)
     app.include_router(attachment_access.internal_router)
     app.include_router(channel_read.router)

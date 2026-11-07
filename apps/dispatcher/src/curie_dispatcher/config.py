@@ -33,6 +33,7 @@ Env mapping:
     CURIE_ADMISSION_CACHE_PREFIX      -> admission_cache_prefix
     CURIE_THREAD_CONTEXT_CACHE_PREFIX -> thread_context_cache_prefix
     CURIE_THREAD_CONTEXT_TTL_SECONDS  -> thread_context_ttl_seconds
+    CURIE_MENTION_RECEIPT_TTL_SECONDS -> mention_receipt_ttl_seconds
     CURIE_DM_CONTINUITY_MAX_MESSAGES  -> dm_continuity_max_messages
     CURIE_HEARTBEAT_FILE             -> heartbeat_file
     CURIE_HEARTBEAT_INTERVAL_SECONDS -> heartbeat_interval_s
@@ -238,6 +239,13 @@ class DispatcherConfig(BaseSettings):
         default=30 * 24 * 60 * 60,
         gt=0,
         validation_alias="CURIE_THREAD_CONTEXT_TTL_SECONDS",
+    )
+    # How long a threaded human mention's receipt (#5414) is kept for the
+    # worker's factory steering check; past it, a mapped root refuses the turn.
+    mention_receipt_ttl_seconds: int = Field(
+        default=7 * 24 * 60 * 60,
+        gt=0,
+        validation_alias="CURIE_MENTION_RECEIPT_TTL_SECONDS",
     )
     # How many earlier direct messages a top-level im may quote. Zero turns
     # the read off. The alias is the only env name; a boolean is not a count.

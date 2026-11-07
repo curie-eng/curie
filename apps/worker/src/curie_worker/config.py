@@ -1625,6 +1625,12 @@ class WorkerConfig(BaseSettings):
     def side_effect_key(self, event_id: str) -> str:
         return f"{self.key_prefix}:sidefx:{event_id}"
 
+    def steering_sent_key(self, event_id: str) -> str:
+        # Set before a factory steering request is sent (#5414): from then on
+        # its admission may have committed with the answer lost, so no later
+        # attempt of the delivery may invite a resend.
+        return f"{self.key_prefix}:steering-sent:{event_id}"
+
     def delivery_lease_key(self, stream: str, group: str, entry_id: str) -> str:
         """The lease STRING key: the opaque owner token, TTL'd at
         ``delivery_lease_ttl_s``. Keyed by the delivery triple

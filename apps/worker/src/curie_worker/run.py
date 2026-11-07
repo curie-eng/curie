@@ -61,6 +61,7 @@ from .deploy_notice import DeployNoticeConsumer
 from .e2e_reaper import E2EReaperLoop
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .factory_slack_progress import FactorySlackProgressLoop, PostgresFactorySlackStore
+from .factory_steering import FactorySteeringClient
 from .heartbeat import run_heartbeat
 from .hook_runs import HookRunRecorder
 from .hook_source_guard import CronHookSourceGuard
@@ -815,6 +816,9 @@ def build(
         # ADR 0100: the stored bundle is where a turn's channel read grant is
         # read from, so the kernel knows it without asking the API.
         bundles=BundleStore(config),
+        # Factory run steering (#5414): always built, so a factory run's Slack
+        # root never starts ordinary chat on any worker.
+        factory_steering=_build_factory_steering(config, engine, async_redis, client=eval_http),
     )
     owner.register_close("work-item-settlement", kernel.close, order=5)
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
@@ -1484,6 +1488,31 @@ def _build_remediation_receipts(
             engine, schema=config.db_schema, lease_owner=config.consumer_name
         ),
         replies=ObservedReplySink(sink),
+    )
+
+
+def _build_factory_steering(
+    config: WorkerConfig,
+    engine: AsyncEngine,
+    redis_client: AsyncRedis,
+    *,
+    client: httpx.AsyncClient,
+) -> FactorySteeringClient:
+    """The kernel's factory run steering client (#5414), always built.
+
+    The mapped root read needs only the database engine, so every worker
+    intercepts a factory run's Slack root and never lets it start ordinary
+    chat. A worker without the internal worker token refuses such a turn
+    locally with ``steering_unconfigured`` instead of asking the API.
+    """
+
+    return FactorySteeringClient(
+        engine=engine,
+        schema=config.db_schema,
+        redis=redis_client,
+        api_base_url=config.api_base_url,
+        worker_token=config.internal_worker_token or None,
+        client=client,
     )
 
 

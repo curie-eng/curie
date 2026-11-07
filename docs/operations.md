@@ -2627,7 +2627,18 @@ The worker's progress lane derives what is owed from existing run records on eac
 
 Delivery is at least once and ordered per WorkItem: the root first, then each post only after every earlier one. A rejected send, including one for an identity whose token this worker lacks, stays owed and retries with backoff; only an invalid target fails permanently. A worker that stops mid-send posts that message again after a restart, and a worker restarted after a long outage posts everything owed since. A phase report that commits late is still posted when a later pass finds it, so it can land out of order.
 
-Steering a run from its Slack thread is not available yet: a mention of the app in a run thread is ordinary chat.
+### Factory Slack steering
+
+A person steers a run by explicitly mentioning the app in that run's Slack thread; the [Software Factory guide](software-factory.md#follow-a-runs-progress-in-slack) describes what a steering mention does. Membership in the channel and having tagged the original issue confer no authority. Steering needs an operator-managed account link from the person to a code-host account, created with the platform key:
+
+1. `POST /identity/admin/{tenant_id}/code-host-links` with `principal_id`, `code_host_kind` (`github`), `host` (for example `github.com`), the numeric `account_id`, and `created_by_principal_id`. An account already actively linked answers 409 `link_exists`.
+2. `POST /identity/admin/{tenant_id}/links/{link_id}/revoke` ends a link. A revoked link, a disabled principal or a lost write permission refuses a mention that was queued before the change.
+
+The dispatcher stores a short-lived receipt for each threaded human app mention it receives over Socket Mode, before its dedupe claim, so the worker can verify the sender and the exact message. `CURIE_MENTION_RECEIPT_TTL_SECONDS` (default 604800) sets how long it is kept; a mention whose receipt has expired is refused in a mapped root. Turns selected through the HTTP receiver stay outside native steering and are refused in a mapped root.
+
+Every worker intercepts a mention in a mapped run root before any sandbox starts. A worker without its internal worker token refuses it with `steering_unconfigured`; a delivery with too little budget left is refused with `steering_budget_expired`. When the worker cannot read a decision, the delivery stays pending under its usual lease and delivery cap, and a request whose answer was lost is replied to as unconfirmed rather than with an invitation to send it again. Each reply names its outcome code.
+
+Live Slack Socket Mode delivery and the runner's checkout of the revised branch are not covered by the automated verification of this feature.
 
 ### Connecting email
 

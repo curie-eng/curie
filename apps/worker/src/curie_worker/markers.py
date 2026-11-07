@@ -722,6 +722,17 @@ class Markers:
         )
         return int(settled) == 1
 
+    async def mark_steering_sent(self, event_id: str) -> None:
+        """Record that a steering request may reach the API (#5414).
+
+        One SET, kept as long as the done marker, so every redelivery the
+        dedupe window still admits sees it.
+        """
+        await self._redis.set(self._config.steering_sent_key(event_id), "1", ex=self._done_ttl_s())
+
+    async def saw_steering_sent(self, event_id: str) -> bool:
+        return bool(await self._redis.exists(self._config.steering_sent_key(event_id)))
+
     async def saw_side_effect(self, event_id: str) -> bool:
         return bool(await self._redis.exists(self._config.side_effect_key(event_id)))
 

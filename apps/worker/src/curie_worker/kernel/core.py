@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from typing import TYPE_CHECKING
 
 from ..actions import ActionRecorder
 from ..approval_cards import ApprovalCardStore
@@ -66,6 +67,9 @@ from . import (
 )
 from .work_items import _SettlingWorkItem
 
+if TYPE_CHECKING:
+    from ..factory_steering import FactorySteeringClient
+
 
 class Kernel:
     """Routes events to runner turns and enforces the concurrency rules."""
@@ -105,6 +109,7 @@ class Kernel:
         progress: ProgressStore | None = None,
         bundles: BundleReader | None = None,
         recovery: WorkspaceRecoveryCapture | None = None,
+        factory_steering: FactorySteeringClient | None = None,
     ) -> None:
         self._substrate = substrate
         self._runner = runner
@@ -188,6 +193,10 @@ class Kernel:
         self._sibling_limit = sibling_limit
         # Deliberate progress (ADR 0130). None sends no capability to any turn.
         self._progress = progress
+        # Factory run steering (#5414). None leaves every Slack turn on the
+        # ordinary path; wired, a mention in a factory run's Slack root is
+        # answered by the API's steering decision and never claims a sandbox.
+        self._factory_steering = factory_steering
         # ADR 0100: where a turn's channel read grant is read from (the stored
         # bundle's manifest). None means the grant is never known locally.
         self._bundles = bundles
@@ -313,6 +322,7 @@ class Kernel:
     _emit_status = completion._emit_status
     forget_delivery = delivery.forget_delivery
     notify_turn_not_started = delivery.notify_turn_not_started
+    _steering_may_have_admitted = delivery._steering_may_have_admitted
     notify_broker_entry_vanished = delivery.notify_broker_entry_vanished
     interrupt_thread = delivery.interrupt_thread
     release_thread = delivery.release_thread

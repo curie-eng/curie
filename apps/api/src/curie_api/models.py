@@ -3995,7 +3995,7 @@ class IdentityNamespace(Base):
     __table_args__ = (
         CheckConstraint(_PROVIDER_CK[:-1] + ", 'email')", name="identity_namespaces_provider_ck"),
         CheckConstraint(
-            "kind IN ('slack_workspace', 'email_domain', 'slack_enterprise')",
+            "kind IN ('slack_workspace', 'email_domain', 'slack_enterprise', 'github_host')",
             name="identity_namespaces_kind_ck",
         ),
         CheckConstraint(
@@ -4011,6 +4011,12 @@ class IdentityNamespace(Base):
         CheckConstraint(
             "kind <> 'slack_enterprise' OR (provider = 'slack' AND key ~ '^E[A-Z0-9]{2,}$')",
             name="identity_namespaces_slack_enterprise_key_ck",
+        ),
+        # Operator mapped GitHub accounts, one namespace per host (#5414).
+        CheckConstraint(
+            "kind <> 'github_host' OR (provider = 'github' AND authority <> '' "
+            "AND key = authority)",
+            name="identity_namespaces_github_host_key_ck",
         ),
         CheckConstraint("length(key) > 0", name="identity_namespaces_key_ck"),
         UniqueConstraint(

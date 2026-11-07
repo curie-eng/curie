@@ -280,6 +280,49 @@ async def _process_event(
             return
 
         await identity.prepare(self)
+        # Factory run steering (#5414): a turn in a factory run's Slack root
+        # never enters ordinary chat. The client returns None for every other
+        # turn; an unavailable decision raises and leaves the delivery pending.
+        # The client refuses a mapped root whose remaining delivery budget is at
+        # or below ``_MIN_ATTEMPT_BUDGET_S`` with no API call, and bounds the API
+        # call by the rest. The reply completes through the lease-fenced
+        # ``_complete``, so the completion outbox records the turn: an
+        # admission as delivered, every refusal as dropped. The order lock is
+        # released by the ``finally`` below on every exit.
+        if self._factory_steering is not None:
+            from ..factory_steering import SteeringUnavailable
+
+            try:
+                steered = await self._factory_steering.steer(
+                    qevent,
+                    budget_s=None if lease is None else lease.remaining_s(),
+                    record_intent=lambda: self._markers.mark_steering_sent(event_id),
+                )
+            except SteeringUnavailable as exc:
+                # Steering may own this delivery, and an earlier attempt may
+                # have admitted with its answer lost, so the consumer's generic
+                # not-started notice (an invitation to resend) never follows.
+                # An attempt whose request may have reached the API says so as
+                # its result; any other keeps what the thread already shows.
+                # The delivery stays pending either way.
+                if exc.pending_text is not None:
+                    if lease is not None:
+                        lease.raise_if_lost()
+                    await self._reply_for(qevent, route, exc.pending_text)
+                else:
+                    self._terminal_reply_attempted.add(event_id)
+                raise
+            if steered is not None:
+                if lease is not None:
+                    lease.raise_if_lost()
+                if steered.admitted:
+                    await self._reply_for(qevent, route, steered.text)
+                    await self._complete(
+                        qevent, route, "delivered", telemetry_outcome="done", lease=lease
+                    )
+                else:
+                    await self._drop_with_message(qevent, route, steered.text, lease=lease)
+                return
         if qevent.source is TurnSource.CRON:
             if self._hook_runs is None or qevent.hook_run is None:
                 logger.error(
