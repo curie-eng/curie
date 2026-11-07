@@ -6,6 +6,13 @@ mail intake, provider I/O and durable delivery state live in `mail/`. The
 dispatcher retains its Valkey construction, admission cache and queue transport,
 and the standalone mail executable delegates to this package.
 
+Slack intentionally imports dispatcher helpers while the dispatcher depends on
+this package: Redis construction, queue publication, admission caching and the
+existing approval client retain their owners until those extractions land.
+This reverse dependency is temporary. Mail must remain independently installable;
+the import-linter contract forbids `curie_channel_gateway.mail` from importing
+`curie_channel_gateway.slack` or `curie_dispatcher`, including indirectly.
+
 The boundary proposal is recorded in
 [Draft ADR 0275](../../docs/adr/0275-channel-gateway-provider-boundary.md).
 

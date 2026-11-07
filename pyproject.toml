@@ -123,6 +123,12 @@ type = "forbidden"
 source_modules = ["curie_channel_gateway.ports"]
 forbidden_modules = ["slack_sdk", "curie_api", "curie_worker"]
 
+[[tool.importlinter.contracts]]
+name = "Gateway mail stays independent of Slack and dispatcher"
+type = "forbidden"
+source_modules = ["curie_channel_gateway.mail"]
+forbidden_modules = ["curie_channel_gateway.slack", "curie_dispatcher"]
+
 # @spec PROTECTED-HOOK-LANE-1: internal transport has no application/SDK authority.
 [[tool.importlinter.contracts]]
 name = "Protected hook primitives stay independent of applications and harnesses"

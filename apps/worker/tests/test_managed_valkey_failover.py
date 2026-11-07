@@ -17,9 +17,9 @@ import redis
 from curie_api.cluster_message_replies import ClusterMessageReplyStore
 from curie_api.config import Settings, get_settings
 from curie_api.routers.cluster_message_replies import internal_router, router
+from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_connector_proxy.server import _set_nx_ex
 from curie_dispatcher.app import build_redis
-from curie_dispatcher.config import DispatcherConfig
 from curie_internal.keyspace import KILL_CHANNEL
 from curie_internal.valkey import AsyncRedis
 from curie_worker.killswitch import KillSwitch
