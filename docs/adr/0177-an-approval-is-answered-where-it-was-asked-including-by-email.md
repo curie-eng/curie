@@ -4,6 +4,16 @@ Date: 2026-09-25
 
 Status: Accepted
 
+**Partially amended by [ADR 0273](0273-approval-routes-own-expiry-and-reminders.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0273 extends decision 5 with non-interactive reminder replies and decision 6
+with pending-lifetime reference retention and bounded terminal retention.
+
+**Partially amended by [ADR 0272](0272-approver-dm-delivery-uses-one-selected-recipient.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0272 adds `approver_dm` to the opening location rule and decisions 1 and 2,
+and extends decision 6's single-card lifecycle to that surface.
+
 **Superseded in part by [ADR 0220](0220-one-identity-provider-decides-who-may-invoke-and-approve-on-every-channel.md)**
 (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 for an agent that names an approver team, approver-team membership replaces

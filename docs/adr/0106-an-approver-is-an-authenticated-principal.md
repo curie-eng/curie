@@ -4,6 +4,12 @@ Date: 2026-08-14
 
 Status: Accepted
 
+**Partially amended by [ADR 0271](0271-per-request-approver-sets-and-separation-of-duties.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0271 realizes the distinct separation policy reserved here. Dynamic routes
+default to canonical separation, with an audited operator opt-out and narrow
+current-group exemptions, leaving ordinary self-confirmations unchanged.
+
 Amended by [ADR 0202](0202-a-test-installation-admits-a-listed-bots-actions-and-approval-replies.md): one new principal kind, `test_driver`, which only an
 explicit approver list accepts.
 

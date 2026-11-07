@@ -4,6 +4,11 @@ Date: 2026-11-03
 
 Status: Accepted
 
+**Partially amended by [ADR 0272](0272-approver-dm-delivery-uses-one-selected-recipient.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0272 amends decisions 1 and 5 so an email-origin approval's card may be in
+the selected approver's DM while its original email reply handle remains.
+
 Accepted 2026-11-03 under ADR 0102 coordinated acceptance with explicit
 approval by Junwon Jung (jw3329), recorded as "Yes, next + ADR", including
 merging alongside its realizing code path in one combined pull request. His

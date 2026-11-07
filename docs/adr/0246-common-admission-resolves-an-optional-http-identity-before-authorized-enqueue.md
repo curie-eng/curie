@@ -4,6 +4,11 @@ Date: 2026-10-23
 
 Status: Accepted
 
+**Partially amended by [ADR 0271](0271-per-request-approver-sets-and-separation-of-duties.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0271 extends decision 3 with canonical selection and ceiling constraints
+that a raw surface-account grant cannot satisfy independently.
+
 Partially superseded by [ADR 0254](0254-http-identity-applies-to-the-channel-identities-an-operator-registers.md):
 decision 2's tenant-wide scope. The selected HTTP mode applies to the channel
 identities an operator registers; other clauses remain unchanged.
