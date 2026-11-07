@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import redis
-from curie_dispatcher.config import DispatcherConfig
+from curie_channel_gateway.slack.config import DispatcherConfig
 
 from .conftest import FakeAdmissionApi
 from .test_dispatch import _drain, _events_api_request

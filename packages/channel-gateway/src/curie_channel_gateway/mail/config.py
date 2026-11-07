@@ -1,7 +1,7 @@
 """Typed configuration for the mail adapter, read from the process environment.
 
 ``MailAdapterConfig`` is a frozen ``pydantic_settings.BaseSettings`` (the house
-pattern, see ``apps/dispatcher/src/curie_dispatcher/config.py``): construct it
+pattern, see ``packages/channel-gateway/src/curie_channel_gateway/slack/config.py``): construct it
 with no arguments and it reads the environment on init, falling back to the
 defaults below for anything absent.
 

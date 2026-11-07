@@ -199,7 +199,7 @@ sets, without waiting for this ADR.
    `apps/api/src/curie_api/approvers.py`: the requester-only set.
 4. `apps/worker/src/curie_worker/kernel.py`: `_parse_approval_targets` accepts
    the mode, and the escalation in decision 3.
-5. `apps/mail-adapter/src/curie_mail_adapter/`: render the intent, keep
+5. `packages/channel-gateway/src/curie_channel_gateway/mail/`: render the intent, keep
    references, read replies, send the follow-up.
 6. `cli/src/commands.rs` and `cli/src/api.rs`: route validation.
 7. `docs/interfaces/approval/INTERFACE.md` and

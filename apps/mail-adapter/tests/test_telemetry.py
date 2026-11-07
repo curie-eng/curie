@@ -85,7 +85,7 @@ def json_records(output: str) -> list[dict[str, object]]:
     Strict on purpose: `bootstrap_service_telemetry` is the first statement in
     `main()`, so nothing in this process may legitimately reach stderr before the
     JSON handler is installed. A plain-text line here means a logger escaped the
-    `curie_mail_adapter` package — exactly the regression this file exists to
+    `curie_channel_gateway.mail` package — exactly the regression this file exists to
     catch — so it is a failure, not something to filter out.
     """
     records = []
@@ -231,7 +231,7 @@ def test_the_service_logger_owns_the_three_module_loggers(
 
     `run`, `adapter` and `egress` each hold their own `logging.getLogger(__name__)`
     and are only reached because `Logger.callHandlers` walks up to the
-    `curie_mail_adapter` package logger. A future module named outside that
+    `curie_channel_gateway.mail` package logger. A future module named outside that
     package, or a stray `basicConfig` restoring a plain-text root handler, shows
     up here as a line that is not JSON or a record without the service name.
     """
@@ -256,9 +256,9 @@ def test_the_service_logger_owns_the_three_module_loggers(
         )
     loggers = {str(record.get("logger")) for record in records}
     assert {
-        "curie_mail_adapter.run",
-        "curie_mail_adapter.adapter",
-        "curie_mail_adapter.egress",
+        "curie_channel_gateway.mail.run",
+        "curie_channel_gateway.mail.adapter",
+        "curie_channel_gateway.mail.egress",
     } <= loggers, (
         f"fewer than the three module loggers were observed, so this proves "
         f"nothing about coverage; saw {sorted(loggers)}"

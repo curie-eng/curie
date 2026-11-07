@@ -21,13 +21,15 @@ import urllib.parse
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal, cast
 
 from channel_protocol import SettledOutcome
 from curie_internal import identity_approval, identity_context
 from curie_internal.operator_file import decode_key_material
 
-from .agentmail import AgentMailClient, AgentMailProvider, request
+from curie_channel_gateway.ports.intake import ApprovalResolution, TurnSubmission
+
+from .agentmail import AgentMailClient, AgentMailProvider, HttpResult, request
 from .config import MailAdapterConfig
 from .provider import Failure, MailProvider, Message, MessageSummary
 from .state import MailState
@@ -165,6 +167,12 @@ class MailAdapter:
                 exclusive WAL found another process already holding it.
         """
         self.config = config
+        self.turn_submission: TurnSubmission[dict[str, Any], IngressOutcome] = (
+            MailTurnSubmission(self)
+        )
+        self.approval_resolution: ApprovalResolution[HttpResult | None] = (
+            MailApprovalResolution(self)
+        )
         # The email receiver this adapter signs for (ADR 0260), or None to post
         # unsigned exactly as before. The config already refused a partial set.
         self.receiver_keys: identity_context.IdentityKeyring | None = None
@@ -643,7 +651,7 @@ class MailAdapter:
 
     def _deliver_turn(self, message_id: str, turn: dict[str, Any]) -> bool:
         """Post a stored turn; settle it on a caller-list refusal, defer it otherwise."""
-        outcome = self.post_turn(turn)
+        outcome = self.turn_submission.submit(turn)
         if outcome == "accepted":
             self.state.accept_ingress(message_id)
             return True
@@ -906,45 +914,20 @@ class MailAdapter:
         on it: the follow-up, sent when the card is settled whatever ended the
         approval, goes to everyone on the winning answer (ADR-0177 amendment A5).
         """
-        url = (
-            f"{self.config.api_base_url.rstrip('/')}/approvals/"
-            f"{urllib.parse.quote(ref['approval_id'], safe='')}/resolve"
-        )
-        body: dict[str, Any] = {"decision": decision}
-        if note:
-            body["note"] = note
         correlation = _correlation(message_id)
-        headers = {
-            ADAPTER_PRINCIPAL_HEADER: self.config.adapter_principal,
-            APPROVAL_ACTOR_HEADER: actor,
-        }
-        payload: dict[str, Any] | bytes = body
-        if self.receiver_keys is None:
-            # A legacy approval accepts this; one under HTTP identity refuses it.
-            logger.info(
-                "approval answer correlation=%s carried without an email approval answer "
-                "proof: no CURIE_MAIL_RECEIVER_* is configured",
-                correlation,
-            )
-        else:
-            signed = self._signed_answer(
-                str(ref["approval_id"]), actor, body, self.receiver_keys
-            )
-            if signed is None:
-                logger.warning(
-                    "approval answer correlation=%s refused: it cannot be signed for the "
-                    "configured email receiver; nothing was resolved",
-                    correlation,
-                )
-                self._notify(
-                    message_id, "Your answer could not be accepted for this approval.",
-                    correlation,
-                )
-                return "not_an_answer"
-            payload, headers[APPROVAL_PROOF_HEADER] = signed
-        result = request(
-            "POST", url, payload, headers, max_response_bytes=self.config.max_body_bytes,
+        result = self.approval_resolution.resolve(
+            str(ref["approval_id"]),
+            decision=cast(Literal["approved", "rejected"], decision),
+            actor=actor,
+            actor_channel=ref["conversation_id"],
+            note=note,
+            evidence={"correlation": correlation},
         )
+        if result is None:
+            self._notify(
+                message_id, "Your answer could not be accepted for this approval.", correlation,
+            )
+            return "not_an_answer"
         logger.info("approval answer correlation=%s status=%s", correlation, result.status)
         if result.status == 200:
             self.state.record_approval_answer(
@@ -1534,3 +1517,65 @@ def _token_expiry(token: str) -> int | None:
     if isinstance(exp, int) and not isinstance(exp, bool) and 0 < exp < 253_402_300_800:
         return exp
     return None
+
+
+class MailTurnSubmission:
+    kind: ClassVar[str] = CHANNEL_KIND
+
+    def __init__(self, adapter: MailAdapter) -> None:
+        self._adapter = adapter
+
+    def submit(self, turn: dict[str, Any]) -> IngressOutcome:
+        return self._adapter.post_turn(turn)
+
+
+class MailApprovalResolution:
+    def __init__(self, adapter: MailAdapter) -> None:
+        self._adapter = adapter
+
+    def resolve(
+        self,
+        approval_id: str,
+        *,
+        decision: Literal["approved", "rejected"],
+        actor: str,
+        actor_channel: str | None,
+        note: str | None = None,
+        evidence: Mapping[str, object] | None = None,
+    ) -> HttpResult | None:
+        url = (
+            f"{self._adapter.config.api_base_url.rstrip('/')}/approvals/"
+            f"{urllib.parse.quote(approval_id, safe='')}/resolve"
+        )
+        body: dict[str, Any] = {"decision": decision}
+        if note:
+            body["note"] = note
+        correlation = str((evidence or {}).get("correlation", ""))
+        headers = {
+            ADAPTER_PRINCIPAL_HEADER: self._adapter.config.adapter_principal,
+            APPROVAL_ACTOR_HEADER: actor,
+        }
+        payload: dict[str, Any] | bytes = body
+        if self._adapter.receiver_keys is None:
+            # A legacy approval accepts this; one under HTTP identity refuses it.
+            logger.info(
+                "approval answer correlation=%s carried without an email approval answer "
+                "proof: no CURIE_MAIL_RECEIVER_* is configured",
+                correlation,
+            )
+        else:
+            signed = self._adapter._signed_answer(
+                approval_id, actor, body, self._adapter.receiver_keys
+            )
+            if signed is None:
+                logger.warning(
+                    "approval answer correlation=%s refused: it cannot be signed for the "
+                    "configured email receiver; nothing was resolved",
+                    correlation,
+                )
+                return None
+            payload, headers[APPROVAL_PROOF_HEADER] = signed
+        result = request(
+            "POST", url, payload, headers, max_response_bytes=self._adapter.config.max_body_bytes,
+        )
+        return result

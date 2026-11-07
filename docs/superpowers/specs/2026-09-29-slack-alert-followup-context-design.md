@@ -203,13 +203,13 @@ accepted rather than special-cased.
 
 ## Files and ownership
 
-- `apps/dispatcher/src/curie_dispatcher/thread_context.py` owns root validation,
+- `packages/channel-gateway/src/curie_channel_gateway/slack/thread_context.py` owns root validation,
   the size bound, cache serialization, Slack lookup, prompt rendering, and
   slash neutralization for mixed-version workers.
-- `apps/dispatcher/src/curie_dispatcher/handlers.py` invokes that helper after
+- `packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py` invokes that helper after
   the event-ID claim and before the shared placeholder/enqueue tail, passing
   Bolt's `bot_user_id` and `bot_id`.
-- `apps/dispatcher/src/curie_dispatcher/config.py` and
+- `packages/channel-gateway/src/curie_channel_gateway/slack/config.py` and
   `apps/dispatcher/README.md` own the cache retention and prefix settings.
 - Dispatcher and worker tests own the behavior matrix, including the old
   worker's raw repository parser. Slack is faked because it is an external

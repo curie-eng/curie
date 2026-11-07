@@ -25,7 +25,7 @@ from _support import (
     settled_card,
     update,
 )
-from curie_mail_adapter.adapter import (
+from curie_channel_gateway.mail.adapter import (
     APPROVAL_CARD_REF_PREFIX,
     APPROVAL_INSTRUCTIONS,
     APPROVAL_REF_PATTERN,

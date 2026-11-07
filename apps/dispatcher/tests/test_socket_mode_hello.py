@@ -13,7 +13,7 @@ import time
 from typing import Any
 
 import pytest
-from curie_dispatcher.app import SocketModeConnection
+from curie_channel_gateway.slack.app import SocketModeConnection
 from slack_bolt import App
 
 from .conftest import _authorize, deliver_frames

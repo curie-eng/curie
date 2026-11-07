@@ -16,15 +16,16 @@ from dataclasses import dataclass
 from typing import Any
 
 import redis
-from curie_telemetry import bootstrap_service_telemetry
+from curie_dispatcher import __version__
+from curie_dispatcher.admission import build_admission
+from curie_dispatcher.app import build_redis
+from curie_dispatcher.heartbeat import start_heartbeat
+from curie_telemetry import bootstrap_service_telemetry, configure_service_logging
 from slack_bolt import App
 from slack_sdk.web import WebClient
 
-from . import __version__
-from .admission import build_admission
-from .app import SocketModeConnection, build_app, build_redis, build_web_client
+from .app import SocketModeConnection, build_app, build_web_client
 from .config import DispatcherConfig
-from .heartbeat import start_heartbeat
 from .http_receiver import HttpReceiverRuntime
 from .http_receiver_initializer import (
     HttpReceiverInitializationError,
@@ -265,6 +266,11 @@ def main() -> None:
         service_version=__version__,
         logger=logger,
         environ=os.environ,
+    )
+    configure_service_logging(
+        logging.getLogger("curie_channel_gateway.slack"),
+        service_name="curie-dispatcher",
+        logger_provider=telemetry.logger_provider,
     )
     try:
         # BaseSettings supplies the required chat-attester secret from the

@@ -143,6 +143,7 @@ source_modules = [
     "curie_api",
     "curie_worker",
     "curie_dispatcher",
+    "curie_channel_gateway",
     "curie_runner",
     "curie_internal",
     "curie_upgrade_pause",
@@ -414,6 +415,7 @@ source_modules = [
     "curie_api",
     "curie_worker",
     "curie_dispatcher",
+    "curie_channel_gateway",
     "curie_runner",
     "curie_internal",
     "curie_protected_hooks",
@@ -439,6 +441,7 @@ forbidden_modules = [
     "curie_api",
     "curie_worker",
     "curie_dispatcher",
+    "curie_channel_gateway",
     "curie_runner",
     "aci_protocol",
     "channel_protocol",
@@ -462,7 +465,7 @@ forbidden_modules = ["curie_worker", "kubernetes", "sqlalchemy", "redis", "boto3
 # direction that is hardest to see in review.
 name = "The platform never imports a harness SDK"
 type = "forbidden"
-source_modules = ["curie_api", "curie_worker", "curie_dispatcher", "curie_discord_adapter", "curie_mail_adapter", "curie_e2e_connector"]
+source_modules = ["curie_api", "curie_worker", "curie_dispatcher", "curie_channel_gateway", "curie_discord_adapter", "curie_mail_adapter", "curie_e2e_connector"]
 forbidden_modules = ["claude_agent_sdk"]
 
 [[tool.importlinter.contracts]]

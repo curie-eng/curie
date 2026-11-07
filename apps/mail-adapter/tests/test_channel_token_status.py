@@ -9,7 +9,7 @@ from collections.abc import Callable
 import pytest
 from _support import IngressState, MailState, get
 from curie_api.channel_token import CHANNEL_ENQUEUE_SCOPE, mint
-from curie_mail_adapter.adapter import MailAdapter
+from curie_channel_gateway.mail.adapter import MailAdapter
 
 
 def token(exp: int) -> str:
@@ -68,7 +68,7 @@ def test_platform_rejection_degrades_probe_and_success_recovers(
         url = serve_egress(adapter)
         turn = {"delivery_id": "msg-rejected", "conversation_id": "thr-rejected"}
         ingress.response = (401, {"detail": "invalid token"})
-        with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.adapter"):
+        with caplog.at_level(logging.WARNING, logger="curie_channel_gateway.mail.adapter"):
             adapter.post_turn(turn)
             adapter.post_turn(turn)
         assert get(url + "/readyz") == (503, {"status": "starting"})

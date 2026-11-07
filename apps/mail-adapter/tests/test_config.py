@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 
 import pytest
-from curie_mail_adapter.config import MailAdapterConfig
+from curie_channel_gateway.mail.config import MailAdapterConfig
 from pydantic import AliasChoices
 
 README = Path(__file__).resolve().parent.parent / "README.md"

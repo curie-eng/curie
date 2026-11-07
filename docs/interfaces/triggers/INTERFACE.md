@@ -49,9 +49,9 @@ ACI protocol; this file catalogs its trigger producers.
 The cross-trigger contract is the queued turn, nothing more: a new trigger means adding
 another handler that mints a `QueuedTurn` with the right `source`. The ten hardcoded producers that exist:
 
-1. **Slack mention**: `apps/dispatcher/src/curie_dispatcher/handlers.py::process_event`:
+1. **Slack mention**: `packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::process_event`:
   the `@app.event("app_mention")` listener (wired in
-  `apps/dispatcher/src/curie_dispatcher/handlers.py::register_handlers`) calls
+  `packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::register_handlers`) calls
   `process_event(...)` to enqueue a run. (An adjacent `@app.event("message")` DM handler
   in the same `register_handlers`, gated to `channel_type == "im"`, shares the path.)
 2. **GitHub push**: `apps/api/src/curie_api/routers/github.py::github_webhook`:
@@ -286,7 +286,7 @@ two platform-internal paths and one operator-driven path also turn an event into
 the same `curie:runs` stream, and a truthful inventory names them:
 
 - **Slack block-action (button click)** —
-  `apps/dispatcher/src/curie_dispatcher/handlers.py::process_action` normalizes a Block
+  `packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::process_action` normalizes a Block
   Kit button click into a `QueuedTurn` (dedupe, in-thread placeholder, enqueue) so a click
   is answered exactly as if the user had typed the button's command. Approval-card clicks
   are excluded here and resolve through the API instead.
@@ -618,7 +618,7 @@ channel reply or fabricated human is required.
 Ten hardcoded trigger producers in two different processes, plus the declared per-agent cron
 scheduler in the worker:
 
-1. Slack `app_mention` in the dispatcher (`apps/dispatcher/src/curie_dispatcher/handlers.py::process_event`).
+1. Slack `app_mention` in the dispatcher (`packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::process_event`).
 2. GitHub `push` webhook in the API (`apps/api/src/curie_api/routers/github.py::github_webhook`).
 3. Commit poll in the API (`apps/api/src/curie_api/commitpoller.py::CommitPoller.run_forever`),
    opt-in via `api.commitPollIntervalSeconds`. Timer-driven wake is therefore no longer
@@ -663,7 +663,7 @@ scheduler in the worker:
 
 Plus three further wake paths that also enqueue a run without going through any of those
 ten: the Slack block-action handler
-(`apps/dispatcher/src/curie_dispatcher/handlers.py::process_action`), the approval-resume
+(`packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::process_action`), the approval-resume
 enqueue (`apps/api/src/curie_api/resumequeue.py::ResumeQueue.enqueue`), and the CLI's own
 enqueue (`cli/src/message.rs` via `synthetic_turn`/`xadd`/`new_event_id` in
 `cli/src/queue.rs`), which is operator-driven rather than platform-internal.
@@ -681,10 +681,10 @@ stays where its source arrives.
 
 A second, narrower leak the CLI path exposes: **the dedupe id is minted by whoever enqueues**,
 under a different rule per producer, with nothing enforcing that the rules stay disjoint.
-`apps/dispatcher/src/curie_dispatcher/handlers.py::process_event` uses Slack's own `event_id`,
-and `apps/dispatcher/src/curie_dispatcher/handlers.py::process_action` synthesizes
+`packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::process_event` uses Slack's own `event_id`,
+and `packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::process_action` synthesizes
 `action-<interaction id>`. Both pass their id through
-`apps/dispatcher/src/curie_dispatcher/identities.py::delivery_key`, which keeps it
+`packages/channel-gateway/src/curie_channel_gateway/slack/identities.py::delivery_key`, which keeps it
 unchanged for the default identity and appends `:identity` for every other identity.
 `apps/api/src/curie_api/resumequeue.py::resume_event_id` returns a
 deterministic `approval-<id>-resolved`; GitHub review feedback first claims the delivery UUID

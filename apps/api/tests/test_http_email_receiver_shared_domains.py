@@ -29,8 +29,8 @@ from curie_api.identity.http_invocation import HttpInvocationRuntime
 from curie_api.identity.http_transport import HttpIdentityClient, ProviderBearer
 from curie_api.main import create_app
 from curie_api.models import AgentChannel
-from curie_mail_adapter.adapter import MailAdapter
-from curie_mail_adapter.config import MailAdapterConfig
+from curie_channel_gateway.mail.adapter import MailAdapter
+from curie_channel_gateway.mail.config import MailAdapterConfig
 from fastapi.testclient import TestClient
 from role_policy_support import run
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker

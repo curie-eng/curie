@@ -8,8 +8,8 @@ from contextlib import contextmanager
 
 import redis
 from aci_protocol import QueuedTurn, ReplyHandle
+from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_dispatcher import enqueue_once
-from curie_dispatcher.config import DispatcherConfig
 from curie_dispatcher.queue import from_stream_fields
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
 from curie_telemetry.tracing import configure_tracer_provider

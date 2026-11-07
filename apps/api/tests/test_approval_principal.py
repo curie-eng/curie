@@ -57,7 +57,7 @@ def test_operator_principal_round_trip_and_claim_shape() -> None:
     assert claims.approval_id is None
 
 
-def test_chat_principal_carries_attested_channel() -> None:
+def test_chat_principal_carries_actor_channel() -> None:
     token = approval_principal.mint(
         get_settings().approval_chat_attester_secret,
         subject=SUBJECT,

@@ -22,17 +22,19 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, Literal, cast
 
 import httpx
+from curie_channel_gateway.ports.intake import ApprovalResolution
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.identity import slack_evidence
 from curie_telemetry import inject_trace_context
 from slack_sdk.web import WebClient
 
 from .approval_principal import mint_chat_principal, mint_test_driver_principal
-from .config import DispatcherConfig
-from .identity import slack_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -284,27 +286,7 @@ def approval_slack_evidence(body: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def evidence_kwargs(evidence: dict[str, Any] | None) -> dict[str, Any]:
-    return {"slack": evidence} if evidence is not None else {}
-
-
-class ApprovalResolver(Protocol):
-    """What the click, dialog and submission flows need from a resolver.
-
-    The legacy client below and the selected receiver's bounded answer
-    submission both satisfy it. @spec HTTP-APPROVAL-CONTINUITY-7.
-    """
-
-    def resolve(
-        self,
-        approval_id: str,
-        *,
-        decision: str,
-        attested_user: str,
-        attested_channel: str,
-        note: str | None = None,
-        test_driver: bool = False,
-        slack: dict[str, Any] | None = None,
-    ) -> ResolveOutcome: ...
+    return {"evidence": evidence} if evidence is not None else {}
 
 
 class ApprovalResolveClient:
@@ -328,11 +310,11 @@ class ApprovalResolveClient:
         approval_id: str,
         *,
         decision: str,
-        attested_user: str,
-        attested_channel: str,
+        actor: str,
+        actor_channel: str | None,
         note: str | None = None,
         test_driver: bool = False,
-        slack: dict[str, Any] | None = None,
+        evidence: Mapping[str, object] | None = None,
     ) -> ResolveOutcome:
         body: dict[str, Any] = {"decision": decision}
         # Only send the key when the approver typed something. The field is
@@ -342,14 +324,15 @@ class ApprovalResolveClient:
         if note:
             body["note"] = note
         mint_args: dict[str, Any] = {
-            "subject": attested_user,
-            "actor_channel": attested_channel,
+            "subject": actor,
+            "actor_channel": actor_channel,
             "approval_id": approval_id,
         }
         attestation = (
             mint_test_driver_principal(self._approval_chat_attester_secret, **mint_args)
             if test_driver else mint_chat_principal(
-                self._approval_chat_attester_secret, **mint_args, slack=slack
+                self._approval_chat_attester_secret, **mint_args,
+                slack=dict(evidence) if evidence is not None else None
             )
         )
         headers = {**self._headers, "X-Curie-Approval-Principal": attestation}
@@ -696,7 +679,7 @@ def open_note_dialog(
     body: dict[str, Any],
     decision: str,
     web_client: WebClient,
-    resolver: ApprovalResolver,
+    resolver: ApprovalResolution[ResolveOutcome],
     logger: logging.Logger | None = None,
 ) -> ResolveOutcome | None:
     """Open the note dialog for a click, or fall forward and resolve without one.
@@ -776,7 +759,7 @@ def open_note_dialog(
 def resolve_note_submission(
     *,
     body: dict[str, Any],
-    resolver: ApprovalResolver,
+    resolver: ApprovalResolution[ResolveOutcome],
     logger: logging.Logger | None = None,
 ) -> NoteSubmission | None:
     """Decide a submitted note dialog, making no Slack call at all (#1053, #1077).
@@ -821,9 +804,9 @@ def resolve_note_submission(
 
     outcome = resolver.resolve(
         approval_id,
-        decision=decision,
-        attested_user=user,
-        attested_channel=channel,
+        decision=cast(Literal["approved", "rejected"], decision),
+        actor=user,
+        actor_channel=channel,
         note=note,
         **evidence_kwargs(approval_slack_evidence(body)),
     )
@@ -1006,7 +989,7 @@ def _resolve_and_render(
     message: dict[str, Any],
     note: str | None,
     web_client: WebClient,
-    resolver: ApprovalResolver,
+    resolver: ApprovalResolution[ResolveOutcome],
     log: logging.Logger,
     slack: dict[str, Any] | None = None,
 ) -> ResolveOutcome:
@@ -1021,9 +1004,9 @@ def _resolve_and_render(
 
     outcome = resolver.resolve(
         approval_id,
-        decision=decision,
-        attested_user=user,
-        attested_channel=channel,
+        decision=cast(Literal["approved", "rejected"], decision),
+        actor=user,
+        actor_channel=channel,
         note=note,
         **evidence_kwargs(slack),
     )
@@ -1146,7 +1129,7 @@ def resolve_approval_action(
     *,
     body: dict[str, Any],
     decision: str,
-    resolver: ApprovalResolver,
+    resolver: ApprovalResolution[ResolveOutcome],
     logger: logging.Logger | None = None,
 ) -> ImmediateClick | None:
     """Parse one immediate card click and POST resolve. No Slack I/O."""
@@ -1165,9 +1148,9 @@ def resolve_approval_action(
 
     outcome = resolver.resolve(
         approval_id,
-        decision=decision,
-        attested_user=user,
-        attested_channel=channel,
+        decision=cast(Literal["approved", "rejected"], decision),
+        actor=user,
+        actor_channel=channel,
         note=None,
         **evidence_kwargs(approval_slack_evidence(body)),
     )
@@ -1335,9 +1318,9 @@ def resolve_driver_reply(
     message = matches[0]
     outcome = resolver.resolve(
         approval_id,
-        decision=decision,
-        attested_user=subject,
-        attested_channel=channel,
+        decision=cast(Literal["approved", "rejected"], decision),
+        actor=subject,
+        actor_channel=channel,
         test_driver=True,
     )
     # Match the click ownership signal: another release's card stays unchanged.

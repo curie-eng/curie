@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from curie_dispatcher.config import DispatcherConfig
+from curie_channel_gateway.slack.config import DispatcherConfig
 from pydantic import ValidationError
 
 _CHAT_ATTESTER_SECRET = "dispatcher-attester-test-secret"

@@ -65,7 +65,7 @@ the enforceable-rule summary.
   content into the cluster log-retention system.
 - **Every log record leaves through the shared service logger, and that filter
   is a backstop, not a licence.** `main()` calls `bootstrap_service_telemetry`
-  on the *package* logger `curie_mail_adapter`, which installs one redacting
+  on the *package* logger `curie_channel_gateway.mail`, which installs one redacting
   single-line-JSON stderr handler and sets `propagate=False` there; `run`,
   `adapter` and `egress` each hold a `getLogger(__name__)` child, so one
   bootstrap covers all three and nothing walks past it to a root handler. Do not
@@ -168,7 +168,7 @@ both providers.
 
 Only the two external dependencies are faked, both as real local
 `ThreadingHTTPServer` instances: AgentMail's API and the platform's channel
-ingress. Nothing inside `curie_mail_adapter` is patched. The fake AgentMail
+ingress. Nothing inside `curie_channel_gateway.mail` is patched. The fake AgentMail
 server exercises the adapter's own admission decision, including unlabelled
 spoofed mail, allowlisted senders without verifiable verdicts, and approval
 answers. Provider filtering cannot stand in for that decision. A new test that

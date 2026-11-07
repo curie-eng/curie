@@ -839,11 +839,31 @@ name = "curie-channel-gateway"
 version = "0.1.0"
 source = { editable = "packages/channel-gateway" }
 dependencies = [
+    { name = "aci-protocol" },
     { name = "curie-channel-protocol" },
+    { name = "curie-internal" },
+    { name = "curie-telemetry" },
+    { name = "curie-upgrade-pause" },
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "redis" },
+    { name = "slack-bolt" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "curie-channel-protocol", editable = "packages/channel-protocol" }]
+requires-dist = [
+    { name = "aci-protocol", editable = "packages/aci-protocol" },
+    { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
+    { name = "curie-internal", editable = "packages/curie-internal" },
+    { name = "curie-telemetry", editable = "packages/telemetry" },
+    { name = "curie-upgrade-pause", editable = "packages/upgrade-pause" },
+    { name = "httpx", specifier = ">=0.28" },
+    { name = "pydantic", specifier = ">=2.10" },
+    { name = "pydantic-settings", specifier = ">=2.15.0" },
+    { name = "redis", specifier = ">=5.2" },
+    { name = "slack-bolt", specifier = ">=1.30.0" },
+]
 
 [[package]]
 name = "curie-channel-protocol"
@@ -887,6 +907,7 @@ version = "0.0.0"
 source = { editable = "apps/dispatcher" }
 dependencies = [
     { name = "aci-protocol" },
+    { name = "curie-channel-gateway" },
     { name = "curie-internal" },
     { name = "curie-telemetry" },
     { name = "curie-upgrade-pause" },
@@ -900,6 +921,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "aci-protocol", editable = "packages/aci-protocol" },
+    { name = "curie-channel-gateway", editable = "packages/channel-gateway" },
     { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "curie-upgrade-pause", editable = "packages/upgrade-pause" },
@@ -969,6 +991,7 @@ version = "0.0.0"
 source = { editable = "apps/mail-adapter" }
 dependencies = [
     { name = "aci-protocol" },
+    { name = "curie-channel-gateway" },
     { name = "curie-channel-protocol" },
     { name = "curie-internal" },
     { name = "curie-telemetry" },
@@ -980,6 +1003,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "aci-protocol", editable = "packages/aci-protocol" },
+    { name = "curie-channel-gateway", editable = "packages/channel-gateway" },
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
     { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-telemetry", editable = "packages/telemetry" },

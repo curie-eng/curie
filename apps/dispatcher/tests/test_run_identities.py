@@ -2,7 +2,7 @@
 
 ADR-0168 decision 2. The Slack transport is recorded, never opened: Bolt's App,
 the Web client and the Socket Mode handler are replaced with recorders at the
-module seam `curie_dispatcher.app` builds them through.
+module seam `curie_channel_gateway.slack.app` builds them through.
 """
 
 from __future__ import annotations
@@ -15,15 +15,15 @@ from typing import Any
 
 import pytest
 import redis
-from curie_dispatcher import app as app_module
-from curie_dispatcher.app import SocketModeConnection
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.identities import (
+from curie_channel_gateway.slack import app as app_module
+from curie_channel_gateway.slack.app import SocketModeConnection
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.identities import (
     SlackBotIds,
     SlackIdentityCredentials,
     default_identity_credentials,
 )
-from curie_dispatcher.preflight import PreflightedIdentity
+from curie_channel_gateway.slack.preflight import PreflightedIdentity
 from slack_bolt import App
 from slack_sdk.web import WebClient
 
@@ -127,7 +127,7 @@ def _run_connection_and_capture(
 def test_a_stock_config_builds_one_connection_from_the_legacy_settings(
     config: DispatcherConfig, redis_client: redis.Redis, recorded: SimpleNamespace
 ) -> None:
-    from curie_dispatcher.run import build_identity_connections, build_supervisor
+    from curie_channel_gateway.slack.run import build_identity_connections, build_supervisor
 
     (connection,) = build_identity_connections(
         config,
@@ -149,7 +149,7 @@ def test_a_stock_config_builds_one_connection_from_the_legacy_settings(
 def test_two_identities_build_two_connections_each_from_its_own_tokens(
     config: DispatcherConfig, redis_client: redis.Redis, recorded: SimpleNamespace
 ) -> None:
-    from curie_dispatcher.run import build_identity_connections
+    from curie_channel_gateway.slack.run import build_identity_connections
 
     ids = SlackBotIds(team_id="T1", app_id=None, bot_id="B0OPS", bot_user_id="U0OPS")
     connections = build_identity_connections(
@@ -195,7 +195,7 @@ def test_a_lone_survivor_of_a_declared_pair_still_names_its_identity(
     Two identities are declared and only ``ops-bot`` is admitted; its
     connection is still built as one of a pair, not as a lone stock survivor.
     """
-    from curie_dispatcher.run import build_identity_connections
+    from curie_channel_gateway.slack.run import build_identity_connections
 
     (connection,) = build_identity_connections(
         config,
@@ -212,7 +212,7 @@ def test_a_lone_survivor_of_a_declared_pair_still_names_its_identity(
 def test_build_supervisor_with_two_identities_builds_two_labelled_members(
     config: DispatcherConfig, recorded: SimpleNamespace
 ) -> None:
-    from curie_dispatcher.run import build_supervisor
+    from curie_channel_gateway.slack.run import build_supervisor
 
     group = build_supervisor(
         config,
@@ -240,7 +240,7 @@ def test_a_stock_connections_log_lines_name_no_identity(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from curie_dispatcher.run import build_identity_connections
+    from curie_channel_gateway.slack.run import build_identity_connections
 
     monkeypatch.setenv("CURIE_RELEASE_IDENTITY", "curie-run-identities-stock")
     logger_name = "test-run-stock-lines"
@@ -269,7 +269,7 @@ def test_two_identities_log_lines_each_name_their_own_identity(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from curie_dispatcher.run import build_identity_connections
+    from curie_channel_gateway.slack.run import build_identity_connections
 
     monkeypatch.setenv("CURIE_RELEASE_IDENTITY", "curie-run-identities-two")
     logger_name = "test-run-two-lines"
@@ -305,7 +305,7 @@ def test_two_identities_log_lines_each_name_their_own_identity(
 def test_run_main_connects_only_the_identities_that_passed_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from curie_dispatcher import run
+    from curie_channel_gateway.slack import run
 
     _set_run_env(monkeypatch)
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-default")
@@ -413,7 +413,7 @@ def test_the_shutdown_signal_handler_takes_no_lock_the_interrupted_thread_may_ho
     landing inside the supervisor's critical section would. Every acquire is
     bounded, so a handler that takes the lock itself fails here, not hangs.
     """
-    from curie_dispatcher import run
+    from curie_channel_gateway.slack import run
 
     _set_run_env(monkeypatch)
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-default")

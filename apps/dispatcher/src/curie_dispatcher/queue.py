@@ -34,10 +34,9 @@ import logging
 from typing import Any, Protocol, cast, runtime_checkable
 
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, parse_queued_turn
+from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_telemetry import inject_trace_context, operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
-
-from .config import DispatcherConfig
 
 logger = logging.getLogger(__name__)
 

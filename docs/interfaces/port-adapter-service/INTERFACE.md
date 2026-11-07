@@ -83,7 +83,7 @@ generic endpoints as a plugin API:
   settling it would drop real traffic for good. The code is frozen in
   `tests/vectors/channel-port-refusal.json`. An adapter that retries every error
   retries the refusal forever;
-  `apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.post_turn`
+  `packages/channel-gateway/src/curie_channel_gateway/mail/adapter.py::MailAdapter.post_turn`
   is the worked example of settling on the code and only on it.
   The [common API admission extraction contract](../../superpowers/specs/2026-10-23-common-admission-extraction.md)
   preserves this marker and pre-claim refusal boundary while sharing the existing

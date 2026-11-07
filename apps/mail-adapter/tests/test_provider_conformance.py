@@ -14,10 +14,10 @@ from typing import Any
 import pytest
 from _support import AGENTMAIL_API_KEY, INBOX, MailState
 from _verifying_provider import VerifyingTestProvider, verified
-from curie_mail_adapter.agentmail import AgentMailProvider
-from curie_mail_adapter.config import MailAdapterConfig
-from curie_mail_adapter.provider import FailureKind, MailProvider, SenderVerdict
-from curie_mail_adapter.provider_conformance import (
+from curie_channel_gateway.mail.agentmail import AgentMailProvider
+from curie_channel_gateway.mail.config import MailAdapterConfig
+from curie_channel_gateway.mail.provider import FailureKind, MailProvider, SenderVerdict
+from curie_channel_gateway.mail.provider_conformance import (
     CHECKS,
     SENDER_DOMAIN,
     ConformanceFailure,

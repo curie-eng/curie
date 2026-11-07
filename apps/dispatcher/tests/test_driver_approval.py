@@ -14,10 +14,10 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 import redis
+from curie_channel_gateway.slack.handlers import process_event
+from curie_channel_gateway.slack.marked_actions import reserve_turn
 from curie_dispatcher.admission import build_admission
 from curie_dispatcher.approval_actions import ApprovalResolveClient
-from curie_dispatcher.handlers import process_event
-from curie_dispatcher.marked_actions import reserve_turn
 
 from .conftest import FakeAdmissionApi
 from .test_test_actions import DRIVER, _configured
@@ -298,7 +298,7 @@ def test_socket_mode_driver_reply_declines_only_exact_release_miss(
     redis_client: redis.Redis,
     owned: bool | None,
 ) -> None:
-    from curie_dispatcher.app import build_app
+    from curie_channel_gateway.slack.app import build_app
     from slack_bolt.adapter.socket_mode import SocketModeHandler
 
     from .conftest import FakeSocketClient, _authorize, deliver_once
@@ -376,7 +376,7 @@ def test_owner_probe_deadline_saturation_and_late_completion() -> None:
     import threading
     import time
 
-    from curie_dispatcher.handlers import _DriverApprovalProbe
+    from curie_channel_gateway.slack.handlers import _DriverApprovalProbe
 
     probe = _DriverApprovalProbe()
     started = threading.Event()
@@ -411,13 +411,13 @@ def test_owner_probe_deadline_saturation_and_late_completion() -> None:
 
 @pytest.mark.parametrize("status", [None, 200, 404, 503])
 def test_owner_probe_keeps_completed_verdicts_distinct(status: int | None) -> None:
-    from curie_dispatcher.handlers import _DriverApprovalProbe
+    from curie_channel_gateway.slack.handlers import _DriverApprovalProbe
 
     assert _DriverApprovalProbe().check(lambda: status) == status
 
 
 def test_owner_probe_exception_is_retryable() -> None:
-    from curie_dispatcher.handlers import _DriverApprovalProbe
+    from curie_channel_gateway.slack.handlers import _DriverApprovalProbe
 
     def unavailable() -> None:
         raise RuntimeError("example unavailable")
@@ -429,8 +429,8 @@ def test_owner_probe_exception_is_retryable() -> None:
 def test_socket_mode_caller_denial_and_unknown_never_probe_or_claim(
     config: Any, redis_client: redis.Redis, allowed: bool | None
 ) -> None:
-    from curie_dispatcher.admission import AdmissionClient, AdmissionGate
-    from curie_dispatcher.app import build_app
+    from curie_channel_gateway.slack.app import build_app
+    from curie_dispatcher.admission import AdmissionGate, SlackAdmissionClient
     from slack_bolt.adapter.socket_mode import SocketModeHandler
 
     from .conftest import FakeSocketClient, _authorize, deliver_once
@@ -447,7 +447,7 @@ def test_socket_mode_caller_denial_and_unknown_never_probe_or_claim(
         )
 
     gate = AdmissionGate(
-        AdmissionClient(
+        SlackAdmissionClient(
             api_base_url="http://api.example.com",
             api_key="example-key",
             client=httpx.Client(transport=httpx.MockTransport(api)),
@@ -498,8 +498,8 @@ def test_socket_mode_deadline_saturation_and_late_read_cannot_ack_or_resolve(
     import threading
     import time
 
-    from curie_dispatcher.admission import AdmissionClient, AdmissionGate
-    from curie_dispatcher.app import build_app
+    from curie_channel_gateway.slack.app import build_app
+    from curie_dispatcher.admission import AdmissionGate, SlackAdmissionClient
     from slack_bolt.adapter.socket_mode import SocketModeHandler
 
     from .conftest import FakeSocketClient, _authorize
@@ -522,7 +522,7 @@ def test_socket_mode_deadline_saturation_and_late_read_cannot_ack_or_resolve(
 
     client = httpx.Client(transport=httpx.MockTransport(api))
     gate = AdmissionGate(
-        AdmissionClient(
+        SlackAdmissionClient(
             api_base_url="http://api.example.com", api_key="example-key", client=client
         ),
         ttl_s=30,
@@ -580,7 +580,7 @@ def test_socket_mode_deadline_saturation_and_late_read_cannot_ack_or_resolve(
 
 
 def test_owner_probe_discards_completion_racing_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
-    from curie_dispatcher import handlers
+    from curie_channel_gateway.slack import handlers
 
     times = iter([0.0, 0.0, 2.0])
     monkeypatch.setattr(handlers.time, "monotonic", lambda: next(times))

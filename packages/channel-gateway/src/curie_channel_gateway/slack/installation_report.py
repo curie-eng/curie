@@ -26,7 +26,7 @@ import httpx
 from curie_telemetry import inject_trace_context
 from slack_sdk.web import WebClient
 
-report_logger = logging.getLogger("curie_dispatcher.installation_report")
+report_logger = logging.getLogger("curie_channel_gateway.slack.installation_report")
 
 # Every phase named, as in admission. Off every Slack path, so this only bounds
 # how long one reporter thread waits before its next retry.

@@ -27,7 +27,8 @@ from unittest.mock import MagicMock
 
 import httpx
 import redis
-from curie_dispatcher.app import build_app, build_web_client
+from curie_channel_gateway.slack.app import build_app, build_web_client
+from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_dispatcher.approval_actions import (
     _VERDICT_LINE_MAX,
     APPROVE_NOTE_ACTION_ID,
@@ -37,7 +38,6 @@ from curie_dispatcher.approval_actions import (
     ResolveOutcome,
     _refusal_text,
 )
-from curie_dispatcher.config import DispatcherConfig
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.errors import SlackApiError
@@ -300,8 +300,8 @@ def test_submitting_the_dialog_resolves_with_the_typed_note(
         {
             "approval_id": APPROVAL_ID,
             "decision": "approved",
-            "attested_user": "U_MANAGER",
-            "attested_channel": CARD_CHANNEL,
+            "actor": "U_MANAGER",
+            "actor_channel": CARD_CHANNEL,
             "note": "approved for Q3",
         }
     ]
@@ -947,8 +947,8 @@ def test_a_real_api_conflict_carries_no_resolver_id_and_names_the_approver_in_it
         outcome = client.resolve(
             APPROVAL_ID,
             decision="approved",
-            attested_user="U_MANAGER",
-            attested_channel=CARD_CHANNEL,
+            actor="U_MANAGER",
+            actor_channel=CARD_CHANNEL,
             note="mine",
         )
     finally:
@@ -1024,8 +1024,8 @@ def test_the_resolver_gives_up_inside_the_ack_budget() -> None:
             outcome = client.resolve(
                 APPROVAL_ID,
                 decision="approved",
-                attested_user="U_MANAGER",
-                attested_channel=CARD_CHANNEL,
+                actor="U_MANAGER",
+                actor_channel=CARD_CHANNEL,
             )
             elapsed = time.monotonic() - started
         finally:

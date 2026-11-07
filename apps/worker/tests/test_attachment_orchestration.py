@@ -33,10 +33,10 @@ from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.models import Agent, AgentChannel, AgentVersion, Deployment, Environment
 from curie_api.storage import BundleStore
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.handlers import process_event
 from curie_dispatcher import admission as dispatcher_admission
 from curie_dispatcher.admission import build_admission
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.handlers import process_event
 from curie_runner import RunnerConfig
 from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner

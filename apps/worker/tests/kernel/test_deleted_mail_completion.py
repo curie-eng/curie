@@ -13,9 +13,9 @@ import pytest
 from aci_protocol import Final, SessionStatus
 from aiohttp import web
 from aiohttp.test_utils import TestServer
-from curie_mail_adapter.adapter import MailAdapter
-from curie_mail_adapter.config import MailAdapterConfig
-from curie_mail_adapter.egress import make_server
+from curie_channel_gateway.mail.adapter import MailAdapter
+from curie_channel_gateway.mail.config import MailAdapterConfig
+from curie_channel_gateway.mail.egress import make_server
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.markers import Markers
@@ -179,7 +179,8 @@ def test_admitted_mail_completion_dead_letters_deleted_thread_only(
     lines = [
         r.getMessage()
         for r in caplog.records
-        if r.name == "curie_mail_adapter.adapter" and "thread deleted at provider" in r.getMessage()
+        if r.name == "curie_channel_gateway.mail.adapter"
+        and "thread deleted at provider" in r.getMessage()
     ]
     assert len(lines) == (1 if deleted else 0)
 

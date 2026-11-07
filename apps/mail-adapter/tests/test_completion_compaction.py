@@ -18,9 +18,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from curie_mail_adapter.adapter import EMPTY_REPLY_TEXT, EVENT_MARKER, MailAdapter
-from curie_mail_adapter.agentmail import AgentMailClient
-from curie_mail_adapter.state import MailState
+from curie_channel_gateway.mail.adapter import EMPTY_REPLY_TEXT, EVENT_MARKER, MailAdapter
+from curie_channel_gateway.mail.agentmail import AgentMailClient
+from curie_channel_gateway.mail.state import MailState
 
 SMALL_CAP = 128 * 1024
 TERMINAL_COMPLETION_MAX = 4096
@@ -470,7 +470,7 @@ def test_evicted_tombstone_replays_confirmed_404_and_refuses_ambiguous(
 def test_boot_refusal_survives_delete_alone_and_recover_shrinks_a_copy(
     tmp_path: Path,
 ) -> None:
-    from curie_mail_adapter.recover import recover_state_file
+    from curie_channel_gateway.mail.recover import recover_state_file
 
     path = tmp_path / "s.sqlite3"
     state = open_state(path, terminal_completion_max=1_000_000)

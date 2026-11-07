@@ -13,8 +13,8 @@ import logging
 from collections.abc import Iterator, Mapping
 
 import pytest
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.identities import (
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.identities import (
     SlackBotIds,
     SlackIdentityCredentials,
     bot_ids_from_auth_test,

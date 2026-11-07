@@ -99,7 +99,7 @@ def main() -> None:
     telemetry = bootstrap_service_telemetry(
         "curie-mail-adapter",
         service_version=__version__,
-        logger=logging.getLogger("curie_mail_adapter"),
+        logger=logging.getLogger("curie_channel_gateway.mail"),
         environ=os.environ,
     )
     try:

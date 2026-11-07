@@ -15,7 +15,7 @@ from unittest.mock import call
 import httpx
 import pytest
 import redis
-from curie_dispatcher.config import DispatcherConfig
+from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_internal import identity_context as codec
 
 from .test_http_receiver import (

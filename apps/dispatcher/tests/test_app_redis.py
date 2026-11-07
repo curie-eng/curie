@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import pytest
 import redis
+from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_dispatcher.app import build_redis
-from curie_dispatcher.config import DispatcherConfig
 
 # An independent, non-secret placeholder credential -- unrelated to any real
 # deployment. DispatcherConfig requires it non-blank and distinct from

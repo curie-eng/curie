@@ -25,18 +25,18 @@ from _support import (
     spawn_adapter,
 )
 from _verifying_provider import VerifyingTestProvider
-from curie_mail_adapter.adapter import MailAdapter
-from curie_mail_adapter.agentmail import AgentMailProvider
-from curie_mail_adapter.config import MailAdapterConfig
-from curie_mail_adapter.provider import (
+from curie_channel_gateway.mail.adapter import MailAdapter
+from curie_channel_gateway.mail.agentmail import AgentMailProvider
+from curie_channel_gateway.mail.config import MailAdapterConfig
+from curie_channel_gateway.mail.provider import (
     INTERFACE_VERSION,
     ProviderLoadError,
     check_interface_version,
     provider_problems,
     resolve_factory,
 )
-from curie_mail_adapter.state import SCHEMA_VERSION
-from curie_mail_adapter.state import MailState as DurableMailState
+from curie_channel_gateway.mail.state import SCHEMA_VERSION
+from curie_channel_gateway.mail.state import MailState as DurableMailState
 
 GROUP = "curie.mail_provider"
 

@@ -22,7 +22,7 @@ from curie_api.models import (
     Tenant,
     TenantIdentityProvider,
 )
-from curie_dispatcher.admission import AdmissionClient, AdmissionGate
+from curie_dispatcher.admission import AdmissionGate, SlackAdmissionClient
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -49,7 +49,7 @@ def test_real_api_snapshot_and_status_revoke_cached_dispatcher_allow(namespaced_
             base_url=namespaced_identity_api.url, timeout=10, trust_env=False
         ) as http:
             gate = AdmissionGate(
-                AdmissionClient(
+                SlackAdmissionClient(
                     api_base_url=namespaced_identity_api.url,
                     api_key="access-log-test-key",
                     client=http

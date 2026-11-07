@@ -8,18 +8,19 @@ import json
 import re
 import uuid
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Annotated, Any, Literal, Never, Self, SupportsIndex
+from typing import Annotated, Any, ClassVar, Literal, Never, Self, SupportsIndex
 from urllib.parse import urlsplit
 
 import httpx
+from curie_dispatcher.approval_actions import ResolveOutcome, parse_decision_time
+from curie_dispatcher.approval_principal import mint_chat_principal
 from curie_internal import identity_approval as approval_wire
 from curie_internal import identity_context as codec
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 from slack_sdk.web import WebClient
 
-from .approval_actions import ResolveOutcome, parse_decision_time
-from .approval_principal import mint_chat_principal
 from .identities import bot_ids_from_auth_test
 from .identity import slack_evidence
 from .inbound_attachments import derive_attachments
@@ -528,7 +529,7 @@ class HttpReceiverRuntime:
 
 
     def submit_answer(
-        self, *, approval_id: str, decision: str, note: str | None, user: str, channel: str,
+        self, *, approval_id: str, decision: str, note: str | None, user: str, channel: str | None,
         slack: dict[str, Any] | None, attester_secret: str,
     ) -> ResolveOutcome:
         """One bounded, proved answer from the authenticated Bolt listener.
@@ -632,6 +633,22 @@ class HttpReceiverRuntime:
             return _UNAVAILABLE
 
 
+@dataclass(frozen=True)
+class ReceiverTurn:
+    prepared: PreparedSubmission
+    reply_ref: str
+
+
+class SlackTurnSubmission:
+    kind: ClassVar[str] = "slack"
+
+    def __init__(self, runtime: HttpReceiverRuntime) -> None:
+        self._runtime = runtime
+
+    def submit(self, turn: ReceiverTurn) -> ReceiverSubmission:
+        return self._runtime.send(turn.prepared, reply_ref=turn.reply_ref)
+
+
 class SelectedApprovalAnswers:
     """The resolver the approval listeners use on a selected receiver.
 
@@ -646,15 +663,17 @@ class SelectedApprovalAnswers:
         self._attester_secret = attester_secret
 
     def resolve(
-        self, approval_id: str, *, decision: str, attested_user: str, attested_channel: str,
-        note: str | None = None, test_driver: bool = False, slack: dict[str, Any] | None = None,
+        self, approval_id: str, *, decision: str, actor: str, actor_channel: str | None,
+        note: str | None = None, test_driver: bool = False,
+        evidence: Mapping[str, object] | None = None,
     ) -> ResolveOutcome:
         """@spec HTTP-APPROVAL-CONTINUITY-7."""
         if test_driver:
             return _ANSWER_REFUSED
         return self._runtime.submit_answer(
-            approval_id=approval_id, decision=decision, note=note, user=attested_user,
-            channel=attested_channel, slack=slack, attester_secret=self._attester_secret,
+            approval_id=approval_id, decision=decision, note=note, user=actor,
+            channel=actor_channel, slack=dict(evidence) if evidence is not None else None,
+            attester_secret=self._attester_secret,
         )
 
 

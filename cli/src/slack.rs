@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn post_body_threads_the_placeholder_when_a_parent_is_given() {
         // Observed behavior of the real dispatcher against real Slack
-        // (apps/dispatcher/src/curie_dispatcher/handlers.py:90-98,113): it passes
+        // (packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py): it passes
         // `thread_ts=` to chat.postMessage so the placeholder lands IN the thread,
         // and enqueues that same value as the turn's conversation_id.
         let body = post_body("C-real", "\u{2026}", Some("1717171717.000100"));

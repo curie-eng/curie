@@ -29,12 +29,13 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 import redis
-from curie_dispatcher.admission import AdmissionClient, AdmissionGate, build_admission
+from curie_channel_gateway.ports.admission import AdmissionRequest
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.handlers import process_action
+from curie_channel_gateway.slack.relevance import DropReason
+from curie_dispatcher.admission import AdmissionGate, SlackAdmissionClient, build_admission
 from curie_dispatcher.approval_actions import APPROVE_ACTION_ID
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.handlers import process_action
 from curie_dispatcher.queue import from_stream_fields
-from curie_dispatcher.relevance import DropReason
 from curie_telemetry import build_resource, configure_meter_provider
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
@@ -147,7 +148,7 @@ def store(redis_client: redis.Redis) -> Iterator[_Store]:
 
 def _gate(api: FakeAdmissionApi, clock: _Clock, store: _Store, **kwargs: Any) -> AdmissionGate:
     return AdmissionGate(
-        AdmissionClient(api_base_url=api.url, api_key="curie-dev-key"),
+        SlackAdmissionClient(api_base_url=api.url, api_key="curie-dev-key"),
         ttl_s=TTL,
         stale_s=STALE,
         clock=clock,
@@ -552,12 +553,12 @@ def test_any_unusable_answer_counts_as_the_api_being_unable_to_answer(
     be read as "allowed". The transport is httpx's own mock: this pins the
     client's parsing, not the API."""
 
-    client = AdmissionClient(
+    client = SlackAdmissionClient(
         api_base_url="http://api.example.com",
         api_key="k",
         client=httpx.Client(transport=httpx.MockTransport(lambda _request: response)),
     )
-    assert client.ask(address=CHANNEL, adapter=None, callers=(STRANGER,)) is None
+    assert client.ask(AdmissionRequest(CHANNEL, None, (STRANGER,))) is None
     gate = AdmissionGate(client, ttl_s=TTL, stale_s=STALE, clock=_Clock(), redis_client=None)
     assert gate.refusal(address=CHANNEL, adapter=None, callers=[STRANGER]) is (
         DropReason.ADMISSION_UNAVAILABLE
@@ -568,8 +569,8 @@ def test_an_unreachable_api_is_unavailable_not_an_exception() -> None:
     with fake_admission_api() as api:
         url = api.url
     # The server is gone; the port refuses.
-    client = AdmissionClient(api_base_url=url, api_key="k")
-    assert client.ask(address=CHANNEL, adapter=None, callers=(STRANGER,)) is None
+    client = SlackAdmissionClient(api_base_url=url, api_key="k")
+    assert client.ask(AdmissionRequest(CHANNEL, None, (STRANGER,))) is None
 
 
 # --- configuration --------------------------------------------------------------
@@ -869,8 +870,8 @@ def test_fresh_connect_refusal_is_ephemeral_and_never_cached_or_replayed(
 ) -> None:
     from unittest.mock import MagicMock
 
-    from curie_dispatcher.handlers import process_event
-    from curie_dispatcher.identity import slack_evidence
+    from curie_channel_gateway.slack.handlers import process_event
+    from curie_channel_gateway.slack.identity import slack_evidence
     from slack_sdk.web import WebClient
 
     requests: list[dict[str, Any]] = []
@@ -889,7 +890,7 @@ def test_fresh_connect_refusal_is_ephemeral_and_never_cached_or_replayed(
         )
 
     gate = AdmissionGate(
-        AdmissionClient(
+        SlackAdmissionClient(
             api_base_url="https://api.example.com",
             api_key="test",
             client=httpx.Client(transport=httpx.MockTransport(reply)),
@@ -1029,7 +1030,7 @@ def test_generation_changed_during_fetch_is_not_persisted(store: _Store) -> None
             )
 
         gate = AdmissionGate(
-            AdmissionClient(
+            SlackAdmissionClient(
                 api_base_url="https://api.example.com",
                 api_key="test",
                 client=httpx.Client(transport=httpx.MockTransport(reply)),
@@ -1080,7 +1081,7 @@ def test_every_native_turn_lane_transports_sender_workspace_evidence(
     redis_client: redis.Redis,
     admission_api: FakeAdmissionApi,
 ) -> None:
-    from curie_dispatcher.identity import slack_evidence
+    from curie_channel_gateway.slack.identity import slack_evidence
 
     if lane == "action":
         body = _block_action_body(

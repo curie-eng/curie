@@ -12,9 +12,9 @@ from typing import Any
 
 import pytest
 import redis
-from curie_dispatcher.config import DispatcherConfig
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.relevance import DropReason
 from curie_dispatcher.queue import from_stream_fields
-from curie_dispatcher.relevance import DropReason
 from pydantic import ValidationError
 from pydantic_settings.exceptions import SettingsError
 

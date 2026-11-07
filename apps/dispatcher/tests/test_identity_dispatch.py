@@ -14,17 +14,17 @@ from unittest.mock import MagicMock
 
 import pytest
 import redis
-from curie_dispatcher import app as app_module
-from curie_dispatcher import handlers as handlers_module
-from curie_dispatcher.app import build_app, build_web_client
+from curie_channel_gateway.slack import app as app_module
+from curie_channel_gateway.slack import handlers as handlers_module
+from curie_channel_gateway.slack.app import build_app, build_web_client
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.handlers import process_action, process_event
+from curie_channel_gateway.slack.identities import SlackIdentityCredentials
 from curie_dispatcher.approval_actions import (
     APPROVE_ACTION_ID,
     APPROVE_NOTE_ACTION_ID,
     ResolveOutcome,
 )
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.handlers import process_action, process_event
-from curie_dispatcher.identities import SlackIdentityCredentials
 from curie_dispatcher.queue import from_stream_fields
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler

@@ -3,7 +3,18 @@ name = "curie-channel-gateway"
 version = "0.1.0"
 description = "Provider implementations and neutral ports for Curie channels"
 requires-python = ">=3.13"
-dependencies = ["curie-channel-protocol"]
+dependencies = [
+    "aci-protocol",
+    "curie-channel-protocol",
+    "curie-internal",
+    "curie-telemetry",
+    "curie-upgrade-pause",
+    "slack-bolt>=1.30.0",
+    "redis>=5.2",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.15.0",
+    "httpx>=0.28",
+]
 
 [build-system]
 requires = ["hatchling"]

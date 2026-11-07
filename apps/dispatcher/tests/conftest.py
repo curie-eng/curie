@@ -15,7 +15,7 @@ import socket
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -24,8 +24,8 @@ from typing import Any
 
 import pytest
 import redis
+from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_dispatcher.approval_actions import ResolveOutcome
-from curie_dispatcher.config import DispatcherConfig
 from curie_test_support.valkey import (
     VALKEY_HOST as _VALKEY_HOST,
 )
@@ -84,6 +84,8 @@ def person_rooted_thread(**kwargs: Any) -> dict[str, Any]:
 
 class _TestTelemetry:
     """A telemetry stand-in for ``run.main`` tests: ``shutdown`` is a no-op."""
+
+    logger_provider = None
 
     def shutdown(self) -> None:
         pass
@@ -309,11 +311,11 @@ class ScriptedResolver:
         approval_id: str,
         *,
         decision: str,
-        attested_user: str,
-        attested_channel: str,
+        actor: str,
+        actor_channel: str,
         note: str | None = None,
         test_driver: bool = False,
-        slack: dict[str, Any] | None = None,
+        evidence: Mapping[str, object] | None = None,
     ) -> ResolveOutcome:
         # `note` is recorded, not ignored: the dialog path's whole point is that
         # the approver's reason reaches the record, and a stand-in that dropped
@@ -321,14 +323,14 @@ class ScriptedResolver:
         call: dict[str, Any] = {
             "approval_id": approval_id,
             "decision": decision,
-            "attested_user": attested_user,
-            "attested_channel": attested_channel,
+            "actor": actor,
+            "actor_channel": actor_channel,
             "note": note,
         }
         if test_driver:
             call["test_driver"] = True
-        if slack is not None:
-            call["slack"] = dict(slack)
+        if evidence is not None:
+            call["slack"] = dict(evidence)
         self.calls.append(call)
         return self.outcome
 
@@ -440,7 +442,7 @@ def offline_identity_client(monkeypatch: pytest.MonkeyPatch) -> IdentityClientBu
         return None
 
     monkeypatch.setattr(
-        "curie_dispatcher.handlers.build_identity_client", _offline_build, raising=False
+        "curie_channel_gateway.slack.handlers.build_identity_client", _offline_build, raising=False
     )
     return builds
 
@@ -468,6 +470,6 @@ def offline_installation_reports(monkeypatch: pytest.MonkeyPatch) -> Installatio
         return []
 
     monkeypatch.setattr(
-        "curie_dispatcher.run.start_installation_reports", _offline_start, raising=False
+        "curie_channel_gateway.slack.run.start_installation_reports", _offline_start, raising=False
     )
     return starts

@@ -21,9 +21,9 @@ from collections.abc import Callable
 
 import pytest
 from _support import MailState, RedirectState, SinkState
-from curie_mail_adapter.adapter import MailAdapter
-from curie_mail_adapter.agentmail import AgentMailClient
-from curie_mail_adapter.config import MailAdapterConfig
+from curie_channel_gateway.mail.adapter import MailAdapter
+from curie_channel_gateway.mail.agentmail import AgentMailClient
+from curie_channel_gateway.mail.config import MailAdapterConfig
 
 
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])

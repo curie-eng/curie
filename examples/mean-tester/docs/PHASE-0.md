@@ -49,7 +49,7 @@ following with the workspace dependencies active (the observation used
 dispatcher source):
 
 ```python
-from curie_dispatcher.inbound_attachments import derive_attachments
+from curie_channel_gateway.slack.inbound_attachments import derive_attachments
 print('missing_name_refs=', len(derive_attachments({
     'files': [{'id': 'F0EXAMPLE1', 'title': 'acme-report.pdf'}]})))
 print('named_refs=', len(derive_attachments({

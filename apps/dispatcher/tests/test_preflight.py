@@ -35,8 +35,8 @@ from typing import Any
 import httpx
 import pytest
 import yaml
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.preflight import (
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.preflight import (
     ApiUnreachableError,
     SlackChannelPreflightError,
     check_api_reachable,
@@ -1217,7 +1217,7 @@ def test_production_slack_clients_are_per_destination_bounded_and_nonretrying(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Production probes cannot hide an unattempted destination behind retries."""
-    from curie_dispatcher import preflight
+    from curie_channel_gateway.slack import preflight
 
     clock = _FakeClock()
     constructor_calls: list[dict[str, Any]] = []
@@ -1329,7 +1329,7 @@ def test_production_provider_error_uses_silent_sdk_logger_and_safe_aggregate(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """SDK diagnostics cannot bypass the preflight's redaction boundary."""
-    from curie_dispatcher import preflight
+    from curie_channel_gateway.slack import preflight
 
     constructor_calls: list[dict[str, Any]] = []
     raw_message = "hostile-production-sdk-message-sentinel"
@@ -1515,7 +1515,7 @@ def test_files_read_recovery_message_is_the_shipped_constant() -> None:
     would let the reinstall step be dropped, which is the one instruction a
     workspace with a stale bot-token grant actually needs.
     """
-    from curie_dispatcher import preflight
+    from curie_channel_gateway.slack import preflight
 
     assert preflight._MISSING_FILES_READ_MESSAGE == MISSING_FILES_READ_MESSAGE
     # The two recoveries stay separate so each names exactly one scope; an
@@ -1971,7 +1971,7 @@ def test_production_files_probe_is_bounded_to_one_file_and_reuses_the_client(
     than opening a second provider connection -- both are the same
     workspace-level question, already bounded by the same remaining budget.
     """
-    from curie_dispatcher import preflight
+    from curie_channel_gateway.slack import preflight
 
     constructor_calls: list[dict[str, Any]] = []
     files_calls: list[dict[str, object]] = []
@@ -2160,7 +2160,7 @@ def test_run_main_gates_before_connecting_slack(monkeypatch: pytest.MonkeyPatch)
     first. The API is a genuinely dead port, so nothing is stubbed on the path
     under test.
     """
-    from curie_dispatcher import run
+    from curie_channel_gateway.slack import run
 
     reached_after_api: list[str] = []
 
@@ -2202,7 +2202,7 @@ def test_run_main_orders_api_then_slack_preflight_then_supervisor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A successful boot reaches Socket Mode only after both ordered gates."""
-    from curie_dispatcher import run
+    from curie_channel_gateway.slack import run
 
     events: list[str] = []
 
@@ -2266,7 +2266,7 @@ def test_run_main_missing_scope_exits_before_supervisor_without_leaking(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The actionable Slack refusal is terminal before Socket Mode wiring."""
-    from curie_dispatcher import run
+    from curie_channel_gateway.slack import run
 
     events: list[str] = []
 
@@ -2315,13 +2315,15 @@ def test_run_main_waits_for_delayed_api_then_starts_supervisor_once(
     signals, and telemetry are process boundaries, so record them without opening
     external connections or changing this pytest process's signal handlers.
     """
-    from curie_dispatcher import run
+    from curie_channel_gateway.slack import run
 
     events: list[str] = []
     health_requests: list[str] = []
     heartbeat_stop = threading.Event()
 
     class Telemetry:
+        logger_provider = None
+
         def shutdown(self) -> None:
             events.append("telemetry.shutdown")
 
@@ -2406,7 +2408,7 @@ def test_run_main_times_out_before_slack_with_actionable_sanitized_log(
     Logical time advances only after a real response, so startup load cannot
     consume the budget before the production client reaches the server.
     """
-    from curie_dispatcher import run
+    from curie_channel_gateway.slack import run
 
     events: list[str] = []
     clock = _FakeClock()
@@ -2414,6 +2416,8 @@ def test_run_main_times_out_before_slack_with_actionable_sanitized_log(
     sleep_delays: list[float] = []
 
     class Telemetry:
+        logger_provider = None
+
         def shutdown(self) -> None:
             events.append("telemetry.shutdown")
 

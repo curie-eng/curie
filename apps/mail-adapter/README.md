@@ -21,7 +21,7 @@ Two halves, and neither one knows anything about Slack:
 ## Mail providers
 
 ADR 0228 puts every mail service behind one interface, `MailProvider` in
-`src/curie_mail_adapter/provider.py`. The neutral adapter keeps the channel
+`packages/channel-gateway/src/curie_channel_gateway/mail/provider.py`. The neutral adapter keeps the channel
 protocol, delivery state, the inbound gate, the intake path and approvals by
 email; a provider lists and reads messages, replies in a thread, finds the reply
 marker in a thread, and reports the sender verdict. `CURIE_MAIL_PROVIDER`
@@ -41,7 +41,7 @@ The gate, in order, each refusal leaving the same id-only `rejected` receipt:
    `verified`, and the verdict's domain must equal the From domain exactly (no
    parent domain, no subdomain).
 
-`curie_mail_adapter.provider_conformance` is the kit an out-of-tree provider
+`curie_channel_gateway.mail.provider_conformance` is the kit an out-of-tree provider
 author runs from their own tests. Passing it does not make a provider
 trustworthy: the provider runs inside the approval trust boundary, and
 installing one is a decision equal to handing it `CURIE_ADAPTER_PRINCIPAL`.
@@ -493,7 +493,7 @@ uv run pytest apps/mail-adapter/tests -q
 
 Only the two external dependencies are faked, both as real local HTTP servers:
 AgentMail's API and the platform's channel ingress. Everything inside
-`curie_mail_adapter` runs for real, the egress server included, and the boot
+`curie_channel_gateway.mail` runs for real, the egress server included, and the boot
 gates are driven through the real `python -m curie_mail_adapter` entry point in a
 subprocess.
 

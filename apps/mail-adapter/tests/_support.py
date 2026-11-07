@@ -8,7 +8,7 @@ resolves in every test module, and holds the fixtures that wire what is here.
 
 Only the two EXTERNAL dependencies are faked, both as real local
 `ThreadingHTTPServer` instances: AgentMail's HTTP API and the platform's
-channel-ingress endpoint. Everything inside `curie_mail_adapter` runs for real,
+channel-ingress endpoint. Everything inside `curie_channel_gateway.mail` runs for real,
 including its own egress HTTP server, the poll path, and both halves of the
 completion dedupe. Nothing internal is patched.
 
@@ -39,8 +39,8 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from typing import Any, cast
 
-from curie_mail_adapter.egress import ADAPTER_SECRET_HEADER
-from curie_mail_adapter.state import MailState as DurableMailState
+from curie_channel_gateway.mail.egress import ADAPTER_SECRET_HEADER
+from curie_channel_gateway.mail.state import MailState as DurableMailState
 
 INBOX = "sandbox@agentmail.to"
 AGENTMAIL_API_KEY = "amk-tst"

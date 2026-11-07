@@ -1,1 +1,1 @@
-"""Slack implementation destination for the behavior-neutral extraction."""
+"""Slack intake and connection runtime."""

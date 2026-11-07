@@ -201,16 +201,16 @@ back into the contract:
    (`REPLY_FENCE`) into a `TerminalMessage` of plain lines plus actions, which the
    TUI renders as a numbered selector per the TUI behavior above. It expresses
    `allow_free_text` as a typed reply alongside the numbered actions.
-3. **Mail**: `apps/mail-adapter/src/curie_mail_adapter/egress.py`. A `ReplyPost`
+3. **Mail**: `packages/channel-gateway/src/curie_channel_gateway/mail/egress.py`. A `ReplyPost`
    whose interaction is a `ConfirmIntent` becomes an approval-card email through
-   `apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.record_approval_card`,
+   `packages/channel-gateway/src/curie_channel_gateway/mail/adapter.py::MailAdapter.record_approval_card`,
    carrying APPROVE or REJECT reply instructions (ADR-0177). The reply interpreter is
    implemented, but the current AgentMail inbound gate refuses every message before
    reaching it because sender authentication cannot be verified
-   (`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.handle_inbound`). Other
+   (`packages/channel-gateway/src/curie_channel_gateway/mail/adapter.py::MailAdapter.handle_inbound`). Other
    posts and updates are recorded as the turn's one reply text. A settling
    `reply.update` closes the card through
-   `apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.settle_approval_card`.
+   `packages/channel-gateway/src/curie_channel_gateway/mail/adapter.py::MailAdapter.settle_approval_card`.
 4. **Discord**: `adapters/discord/src/curie_discord_adapter/egress.py`. It renders
    the message text and progress as plain text posts and edits, and appends the
    settled decision to the text of a settling update. It builds no component
@@ -232,7 +232,7 @@ above (`blocks.py` and `approval_actions.py`).
 also builds rich-text section blocks, with literal URL links, for verbatim
 replies (ADR 0250), preserving the approved text while bypassing envelope and
 Markdown rendering. Separately,
-`apps/dispatcher/src/curie_dispatcher/handlers.py::_refused_caller` builds the
+`packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::_refused_caller` builds the
 private account-connect prompt's section and button blocks. The terminal action
 mapping is parsed in `cli/src/channel.rs` and drawn as a numbered selector in
 `cli/src/interactive.rs`; the agent authors none of these widgets.
@@ -305,11 +305,11 @@ owes, and no deliverer calls an adapter with it.
   a routing, credential, delivery or budget field is refused at validation. The
   terminal mirror in `cli/src/channel.rs` does not model progress either.
 5. **The mail renderer keys an approval card on a display label.**
-  `apps/mail-adapter/src/curie_mail_adapter/egress.py::EgressHandler` collects the
+  `packages/channel-gateway/src/curie_channel_gateway/mail/egress.py::EgressHandler` collects the
   approver addresses by comparing each `MessageField.label` with
   `APPROVER_FIELD_LABEL`, the string `"Approver"`. The constant is defined twice, in
   `apps/worker/src/curie_worker/approvals.py` (the producer) and in
-  `apps/mail-adapter/src/curie_mail_adapter/adapter.py` (the reader), and nothing
+  `packages/channel-gateway/src/curie_channel_gateway/mail/adapter.py` (the reader), and nothing
   gates the two against each other. Rewording the label on the worker side silently
   leaves the email naming no approvers, because a field label is display text, not a
   typed key. Only the platform decides who may answer; the label only words the email.

@@ -51,7 +51,7 @@ log = logging.getLogger("synthetic-selected-reply-slot")
 
 def _orchestrator() -> Callable[..., Any]:
     """@spec HTTP-INVOCATION-EXECUTION-27: a missing owner fails in the test body."""
-    handlers = importlib.import_module("curie_dispatcher.handlers")
+    handlers = importlib.import_module("curie_channel_gateway.slack.handlers")
     owner = getattr(handlers, "submit_selected_mention", None)
     assert callable(owner), "submit_selected_mention is not implemented"
     return owner  # type: ignore[no-any-return]
@@ -59,7 +59,7 @@ def _orchestrator() -> Callable[..., Any]:
 
 def _dispatcher_config() -> Any:
     """@spec HTTP-INVOCATION-EXECUTION-27: the placeholder text the legacy lane posts."""
-    config = importlib.import_module("curie_dispatcher.config")
+    config = importlib.import_module("curie_channel_gateway.slack.config")
     return config.DispatcherConfig(slack_app_token="xapp-test", slack_bot_token="xoxb-test")
 
 
@@ -117,7 +117,7 @@ class Rig:
 
     def _runtime(self) -> Any:
         """@spec HTTP-INVOCATION-EXECUTION-27."""
-        receiver = importlib.import_module("curie_dispatcher.http_receiver")
+        receiver = importlib.import_module("curie_channel_gateway.slack.http_receiver")
         scope = self.scope
         return receiver.build_http_receiver_runtime(
             receiver.HttpReceiverScopeV1(

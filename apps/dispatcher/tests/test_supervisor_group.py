@@ -10,7 +10,7 @@ import threading
 import time
 
 import pytest
-from curie_dispatcher.supervisor import BackoffPolicy, Supervisor, SupervisorGroup
+from curie_channel_gateway.slack.supervisor import BackoffPolicy, Supervisor, SupervisorGroup
 
 from .test_supervisor import BlockingConnection, _signalling_logger, _wait_for
 

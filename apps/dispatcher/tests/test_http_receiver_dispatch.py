@@ -16,11 +16,11 @@ from unittest.mock import MagicMock, call
 import httpx
 import pytest
 import redis
-from curie_dispatcher.app import build_app
+from curie_channel_gateway.slack.app import build_app
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.identities import SlackIdentityCredentials
+from curie_channel_gateway.slack.preflight import PreflightedIdentity
 from curie_dispatcher.approval_actions import APPROVE_ACTION_ID, APPROVE_NOTE_ACTION_ID
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.identities import SlackIdentityCredentials
-from curie_dispatcher.preflight import PreflightedIdentity
 from curie_dispatcher.queue import from_stream_fields
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.socket_mode.request import SocketModeRequest
@@ -131,7 +131,7 @@ def _owned_keys(redis_client: redis.Redis, config: DispatcherConfig) -> set[str]
 
 def _finish_owned_listeners(app: Any) -> None:
     """@spec HTTP-INVOCATION-EXECUTION-19: join this process's optional observer work too."""
-    from curie_dispatcher import identity
+    from curie_channel_gateway.slack import identity
     _drain(app)
     pool = identity._pool
     identity.shutdown_identity_lookups()
@@ -685,7 +685,7 @@ def test_supervisor_constructor_passes_selected_runtime_to_its_actual_bolt_conne
 ) -> None:
     """@spec HTTP-INVOCATION-EXECUTION-19: exercise the full existing constructor chain."""
     module = api()
-    from curie_dispatcher import run
+    from curie_channel_gateway.slack import run
 
     rig = HttpRig()
     runtime = rig.runtime(module)
@@ -726,7 +726,7 @@ def test_startup_rejects_duplicate_or_unknown_receiver_identity_selection(
 ) -> None:
     """@spec HTTP-INVOCATION-EXECUTION-19: unknown receiver selections refuse."""
     module = api()
-    from curie_dispatcher import run
+    from curie_channel_gateway.slack import run
 
     rig = HttpRig()
     runtime = rig.runtime(

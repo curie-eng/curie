@@ -58,16 +58,20 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal
 from urllib.parse import urlsplit
 
 import httpx
 import redis
+from curie_channel_gateway.ports.admission import (
+    AdmissionAnswer,
+    AdmissionClient,
+    AdmissionRequest,
+)
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.relevance import DropReason
 from curie_internal.keyspace import ADMISSION_KEY_PREFIX_DEFAULT
 from curie_telemetry import inject_trace_context
-
-from .config import DispatcherConfig
-from .relevance import DropReason
 
 if TYPE_CHECKING:
     from redis import Redis
@@ -120,24 +124,7 @@ _ADMIT: Final = "admit"
 Verdict = Literal["admit"] | DropReason
 
 
-@dataclass(frozen=True)
-class AdmissionAnswer:
-    """What the API said about one caller on one route.
-
-    Attributes:
-        allowed: whether the caller may start a turn.
-        restricted: whether the route carries a list at all.
-        install_restricted: whether any binding on the install carries one.
-            An API that omits it is read as True, the side that fails closed.
-    """
-
-    allowed: bool
-    restricted: bool
-    install_restricted: bool = True
-    connect_url: str | None = None
-
-
-class AdmissionClient:
+class SlackAdmissionClient:
     """The HTTP half: one ``POST /channels/admission`` per question.
 
     Holds the platform key (the dispatcher already holds it for approvals) and
@@ -147,6 +134,8 @@ class AdmissionClient:
     exception is FastAPI's route-miss 404, which is an answer: see the module
     docstring.
     """
+
+    kind: ClassVar[str] = SLACK_KIND
 
     def __init__(
         self,
@@ -160,34 +149,17 @@ class AdmissionClient:
         self._client = client or httpx.Client(timeout=_ADMISSION_TIMEOUT)
         self._skew_logged = False
 
-    def ask(
-        self,
-        *,
-        address: str,
-        adapter: str | None,
-        callers: tuple[str, ...],
-        slack: dict[str, Any] | None = None,
-    ) -> AdmissionAnswer | None:
-        """Ask whether ``callers`` may start a turn on the Slack route.
-
-        Args:
-            address: the Slack conversation id the delivery arrived in.
-            adapter: the identity half of the route, None for the default app.
-            callers: every id Slack reports for the caller.
-
-        Returns:
-            The API's answer, or None when it could not be obtained.
-        """
-
+    def ask(self, request: AdmissionRequest) -> AdmissionAnswer | None:
+        """Ask the API using the route and provider evidence from the gateway."""
         body: dict[str, object] = {
-            "kind": SLACK_KIND,
-            "address": address,
-            "callers": list(callers),
+            "kind": self.kind,
+            "address": request.address,
+            "callers": list(request.callers),
         }
-        if adapter is not None:
-            body["adapter"] = adapter
-        if slack is not None:
-            body["slack"] = slack
+        if request.adapter is not None:
+            body["adapter"] = request.adapter
+        if request.evidence is not None:
+            body["slack"] = dict(request.evidence)
         headers = dict(self._headers)
         inject_trace_context(headers)
         try:
@@ -348,7 +320,7 @@ class AdmissionGate:
                     else DropReason.ADMISSION_UNAVAILABLE
                 )
         try:
-            answer = self._client.ask(address=address, adapter=adapter, callers=ids, slack=slack)
+            answer = self._client.ask(AdmissionRequest(address, adapter, ids, evidence=slack))
         except BaseException:
             if leader:
                 self._land_flight(flight_key, flight, failed=True)
@@ -375,7 +347,7 @@ class AdmissionGate:
         slack: dict[str, Any] | None,
         on_connect: Callable[[str], None] | None,
     ) -> DropReason | None:
-        answer = self._client.ask(address=address, adapter=adapter, callers=ids, slack=slack)
+        answer = self._client.ask(AdmissionRequest(address, adapter, ids, evidence=slack))
         if answer is None:
             return DropReason.ADMISSION_UNAVAILABLE
         return self._answer_refusal(answer, on_connect)
@@ -582,7 +554,7 @@ def build_admission(config: DispatcherConfig, redis_client: Redis | None) -> Adm
     """The production gate, from the dispatcher's API, cache and Valkey settings."""
 
     return AdmissionGate(
-        AdmissionClient(api_base_url=config.api_base_url, api_key=config.api_key),
+        SlackAdmissionClient(api_base_url=config.api_base_url, api_key=config.api_key),
         ttl_s=config.admission_cache_ttl_s,
         stale_s=config.admission_stale_s,
         redis_client=redis_client,

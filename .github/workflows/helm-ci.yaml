@@ -995,7 +995,7 @@ jobs:
 
       # Prove the first-class bot-thread allowlist (#2437) renders a value the
       # REAL dispatcher parser accepts, not a hand-copied regex: the rendered
-      # env string is fed through curie_dispatcher.config.DispatcherConfig, so a
+      # env string is fed through curie_channel_gateway.slack.config.DispatcherConfig, so a
       # future drift in ThreadedBotAdmission breaks this chart gate. Needs the
       # uv workspace above, which is why it sits here rather than beside the
       # other reserved-env assertions earlier in this job.

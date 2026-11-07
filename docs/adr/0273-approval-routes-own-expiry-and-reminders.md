@@ -242,7 +242,7 @@ The named proposed owners are:
    `kernel/approval.py::_settle_remembered_card`/
    `_settle_if_decided_before_registration` own retention and settlement.
    `reply_sink.py::ReplySinkRouter` and `slack_sink.py` deliver the reply.
-   `apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter._handle_approval_reply`
+   `packages/channel-gateway/src/curie_channel_gateway/mail/adapter.py::MailAdapter._handle_approval_reply`
    retains its original-reference matching; reminders add no new answer parser.
 
 At implementation record exact commands, candidate commit and outcomes:

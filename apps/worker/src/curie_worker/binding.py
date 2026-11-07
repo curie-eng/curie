@@ -449,7 +449,7 @@ WHERE c.kind = :kind AND c.address = :address
 # ADR-0168 decision 6: the identity bound at an address, if any. A channel-port
 # identity is one adapter deployment on one address and writes as that
 # address. Case-insensitive because the mail adapter lowercases a sender
-# (`curie_mail_adapter.adapter._bare_address`).
+# (`curie_channel_gateway.mail.adapter._bare_address`).
 _ADDRESS_IDENTITY_SQL = """
 SELECT c.adapter AS adapter
 FROM {schema}.agent_channels c

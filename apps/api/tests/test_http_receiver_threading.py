@@ -43,7 +43,7 @@ def test_http_receiver_preserves_native_parent_through_queue_and_actual_slack_re
     synthetic_provider: SimpleNamespace,
 ) -> None:
     """@spec HTTP-INVOCATION-EXECUTION-19: channel scoping belongs only to the worker key."""
-    receiver = importlib.import_module("curie_dispatcher.http_receiver")
+    receiver = importlib.import_module("curie_channel_gateway.slack.http_receiver")
     scope = membership._scope(synthetic_provider.url)
     identity_client = HttpIdentityClient(tls_context=synthetic_provider.tls)
     requests: list[httpx.Request] = []

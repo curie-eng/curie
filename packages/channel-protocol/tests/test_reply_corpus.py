@@ -4,7 +4,7 @@ ADR-0130 section 4 adds reply wire 1.1 and requires regenerated compatibility
 fixtures with it. ``schema/reply-wire.corpus.json`` is those fixtures, and this
 file reads them through ``TypeAdapter(ReplyEvent)``, the same decoder the
 Discord adapter (``adapters/discord/src/curie_discord_adapter/http.py``) and
-the mail adapter (``apps/mail-adapter/src/curie_mail_adapter/egress.py``) run.
+the mail adapter (``apps/mail-adapter/src/curie_channel_gateway.mail/egress.py``) run.
 
 The mail adapter enters the same adapter through ``validate_python`` on the
 parsed body, so accepted bodies are decoded that way too.

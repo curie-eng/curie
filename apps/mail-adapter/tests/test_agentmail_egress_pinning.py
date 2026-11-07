@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from curie_mail_adapter.config import MailAdapterConfig
+from curie_channel_gateway.mail.config import MailAdapterConfig
 
 HOST = "agentmail.invalid"
 ROTATED_EDGE = "203.0.113.9"
@@ -81,7 +81,7 @@ class _Dns:
 
         # A dial to the unroutable rotated edge would otherwise hang for the full
         # production timeout before failing; bound it so a regression fails fast.
-        from curie_mail_adapter import agentmail
+        from curie_channel_gateway.mail import agentmail
 
         monkeypatch.setattr(agentmail, "HTTP_TIMEOUT_SECONDS", 2.0)
         monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
@@ -144,7 +144,7 @@ def test_invalid_egress_cidr_is_a_validation_error(monkeypatch: pytest.MonkeyPat
 def test_rotated_edge_is_never_dialed_admitted_address_is(
     edge: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from curie_mail_adapter.agentmail import AgentMailClient
+    from curie_channel_gateway.mail.agentmail import AgentMailClient
 
     dns = _Dns(monkeypatch, [ROTATED_EDGE])
     client = AgentMailClient(_config(tmp_path, edge, ["127.0.0.1/32"]))
@@ -160,7 +160,7 @@ def test_rotated_edge_is_never_dialed_admitted_address_is(
 def test_admitted_address_is_preferred_over_non_admitted(
     edge: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from curie_mail_adapter.agentmail import AgentMailClient
+    from curie_channel_gateway.mail.agentmail import AgentMailClient
 
     dns = _Dns(monkeypatch, [ROTATED_EDGE, "127.0.0.1"])
     client = AgentMailClient(_config(tmp_path, edge, ["127.0.0.0/8"]))
@@ -179,7 +179,7 @@ def test_without_cidrs_resolution_is_used_unchanged(
     DNS answers 127.0.0.1 on a closed port, so the unpinned dial fails fast with
     status 0, while the server that WOULD answer is never reachable by the name.
     """
-    from curie_mail_adapter.agentmail import AgentMailClient
+    from curie_channel_gateway.mail.agentmail import AgentMailClient
 
     closed = socket.socket()
     closed.bind(("127.0.0.1", 0))
@@ -198,7 +198,7 @@ def test_without_cidrs_resolution_is_used_unchanged(
 def test_no_admitted_address_reports_status_zero(
     edge: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from curie_mail_adapter.agentmail import AgentMailClient
+    from curie_channel_gateway.mail.agentmail import AgentMailClient
 
     dns = _Dns(monkeypatch, [ROTATED_EDGE])
     client = AgentMailClient(_config(tmp_path, edge, ["10.0.0.0/8"]))
@@ -212,7 +212,7 @@ def test_no_admitted_address_reports_status_zero(
 
 def test_module_request_is_not_pinned(edge: int, monkeypatch: pytest.MonkeyPatch) -> None:
     """Platform API posts go through the module opener, never the pinned one."""
-    from curie_mail_adapter import agentmail
+    from curie_channel_gateway.mail import agentmail
 
     monkeypatch.setenv("CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS", "10.0.0.0/8")
     dns = _Dns(monkeypatch, ["127.0.0.1"])
@@ -350,7 +350,7 @@ def test_https_dial_is_pinned_and_keeps_sni_and_verification(
     tls_edge_factory: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The production path: HTTPS with DNS answers wholly outside the policy."""
-    from curie_mail_adapter.agentmail import AgentMailClient
+    from curie_channel_gateway.mail.agentmail import AgentMailClient
 
     assert ssl.create_default_context().verify_mode == ssl.CERT_REQUIRED
     tls = tls_edge_factory(HOST)
@@ -369,7 +369,7 @@ def test_https_dial_is_pinned_and_keeps_sni_and_verification(
 def test_https_pinned_dial_still_rejects_a_certificate_for_another_host(
     tls_edge_factory: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from curie_mail_adapter.agentmail import AgentMailClient
+    from curie_channel_gateway.mail.agentmail import AgentMailClient
 
     tls = tls_edge_factory("other.invalid")
     dns = _Dns(monkeypatch, [ROTATED_EDGE])

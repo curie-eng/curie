@@ -17,10 +17,10 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from curie_dispatcher import http_receiver_initializer, run
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.identities import SlackIdentityCredentials
-from curie_dispatcher.preflight import PreflightedIdentity
+from curie_channel_gateway.slack import http_receiver_initializer, run
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.identities import SlackIdentityCredentials
+from curie_channel_gateway.slack.preflight import PreflightedIdentity
 from slack_sdk.web import WebClient
 
 from .conftest import _set_run_env, _TestTelemetry

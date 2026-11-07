@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 from curie_api.identity.slack import SlackEvidence, derive_registered_sender
-from curie_dispatcher.identity import slack_evidence
+from curie_channel_gateway.slack.identity import slack_evidence
 
 USER = "U0EXAMPLE1"
 OTHER_USER = "U0EXAMPLE2"

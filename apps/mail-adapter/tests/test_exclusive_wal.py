@@ -18,7 +18,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from _support import IngressState, MailState, adapter_env, exit_of, free_port, spawn_adapter
-from curie_mail_adapter.state import MailState as DurableMailState
+from curie_channel_gateway.mail.state import MailState as DurableMailState
 
 _MAX_PENDING = 20
 _MAX_BYTES = 8 * 1024 * 1024
@@ -39,7 +39,7 @@ def _child_open(path: Path) -> subprocess.CompletedProcess[str]:
         """
         import sys
 
-        from curie_mail_adapter.state import MailState
+        from curie_channel_gateway.mail.state import MailState
 
         try:
             state = MailState(
@@ -103,7 +103,7 @@ def test_exclusive_wal_restart_after_sigkill_recovers_committed_work(tmp_path: P
         import sys
         import time
 
-        from curie_mail_adapter.state import MailState
+        from curie_channel_gateway.mail.state import MailState
 
         state = MailState(
             sys.argv[1], max_pending=20, max_bytes=8 * 1024 * 1024, exclusive_wal=True

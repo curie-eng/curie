@@ -519,7 +519,7 @@ os.environ["CURIE_API_KEY"] = "example-api-key"
 os.environ["CURIE_APPROVAL_CHAT_ATTESTER_SECRET"] = "example-attester-secret"
 
 from curie_api.config import Settings
-from curie_dispatcher.config import DispatcherConfig
+from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_worker.config import WorkerConfig
 from aci_protocol.slack_identities import IDENTITY_NAME_PATTERN
 from curie_worker.sandbox.types import filter_agent_child_env

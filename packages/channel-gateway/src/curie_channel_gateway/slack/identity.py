@@ -34,7 +34,7 @@ from .config import DispatcherConfig
 
 # Its own logger, not the injected drop logger, so the #2006 drop-reason
 # oracle never sees these records.
-logger = logging.getLogger("curie_dispatcher.identity")
+logger = logging.getLogger("curie_channel_gateway.slack.identity")
 
 PROVIDER = "slack"
 # Put into ``enterprise_ids`` for an ``is_enterprise_install: true`` that names

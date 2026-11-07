@@ -15,17 +15,17 @@ from unittest.mock import MagicMock
 
 import pytest
 import redis
-from curie_dispatcher import app as app_module
-from curie_dispatcher.app import build_app
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.identities import (
+from curie_channel_gateway.slack import app as app_module
+from curie_channel_gateway.slack.app import build_app
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.identities import (
     SlackBotIds,
     SlackIdentityCredentials,
     default_identity_credentials,
 )
-from curie_dispatcher.preflight import PreflightedIdentity
+from curie_channel_gateway.slack.preflight import PreflightedIdentity
+from curie_channel_gateway.slack.relevance import DropReason, classify
 from curie_dispatcher.queue import from_stream_fields
-from curie_dispatcher.relevance import DropReason, classify
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.web import WebClient
 
@@ -173,7 +173,7 @@ def test_the_apps_own_bot_is_still_dropped_by_bolt(
 def test_every_app_is_told_the_bots_of_every_identity_auth_test_answered_for(
     config: DispatcherConfig, redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from curie_dispatcher.run import build_identity_connections
+    from curie_channel_gateway.slack.run import build_identity_connections
 
     seen: list[Any] = []
     real = app_module.register_handlers

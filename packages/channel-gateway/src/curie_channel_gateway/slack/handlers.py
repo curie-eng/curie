@@ -67,15 +67,8 @@ from typing import TYPE_CHECKING, Any
 
 from aci_protocol import Attachment, QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.turn import DEFAULT_IDENTITY
-from curie_telemetry import operation_span, record_metric
-from opentelemetry.trace import SpanKind
-from slack_bolt import App
-from slack_bolt.response import BoltResponse
-from slack_sdk.errors import SlackApiError
-from slack_sdk.web import WebClient
-
-from .admission import AdmissionGate, build_admission
-from .approval_actions import (
+from curie_dispatcher.admission import AdmissionGate, build_admission
+from curie_dispatcher.approval_actions import (
     APPROVE_ACTION_ID,
     APPROVE_NOTE_ACTION_ID,
     NOTE_MODAL_CALLBACK_ID,
@@ -95,12 +88,24 @@ from .approval_actions import (
     resolve_note_submission,
     this_release_owns_action,
 )
+from curie_dispatcher.queue import claim_event, enqueue
+from curie_telemetry import operation_span, record_metric
+from opentelemetry.trace import SpanKind
+from slack_bolt import App
+from slack_bolt.response import BoltResponse
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web import WebClient
+
+from curie_channel_gateway.ports.intake import TurnSubmission
+
 from .config import DispatcherConfig, release_identity
 from .dm_continuity import SlackDmContinuity
 from .http_receiver import (
     HttpReceiverRuntime,
     ReceiverSubmission,
+    ReceiverTurn,
     SelectedApprovalAnswers,
+    SlackTurnSubmission,
     is_plain_direct_message,
     is_reply_slot,
 )
@@ -115,7 +120,6 @@ from .inbound_attachments import derive_attachments
 from .inbound_text import derive_text
 from .inbound_text import strip_self_mention as _strip_self_mention
 from .marked_actions import MARK, REFUSAL, declared_driver, reserve_turn
-from .queue import claim_event, enqueue
 from .relevance import (
     NON_CONTENT_SUBTYPES,
     DropReason,
@@ -489,10 +493,11 @@ def submit_selected_mention(
         thread_ts=prepared.thread_ts,
     )
     # A ts outside the slot grammar is kept but never submitted as a slot.
-    result = runtime.send(
+    submission: TurnSubmission[ReceiverTurn, ReceiverSubmission] = SlackTurnSubmission(runtime)
+    result = submission.submit(ReceiverTurn(
         prepared,
-        reply_ref=placeholder if placeholder is not None and is_reply_slot(placeholder) else "",
-    )
+        placeholder if placeholder is not None and is_reply_slot(placeholder) else "",
+    ))
     if (
         placeholder is not None and result.status == "accepted" and result.duplicate
         and result.reply_ref is not None and result.reply_ref != placeholder

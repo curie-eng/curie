@@ -67,7 +67,7 @@ bearing where they sit:
   nothing about who asked, and the same reply-routing property applies: the
   platform mints the route from the binding, never from the request.
 - **Slack is closed on purpose.** `is_user_message` in
-  `apps/dispatcher/src/curie_dispatcher/handlers.py` drops any event carrying a
+  `packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py` drops any event carrying a
   `bot_id`. An agent posting into a channel cannot wake another agent. Without
   that filter the dispatcher's own placeholder would re-trigger it, so the filter
   is load-bearing and not an oversight to remove.

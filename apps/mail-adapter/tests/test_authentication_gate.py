@@ -32,8 +32,8 @@ from _support import (
     wait_for_healthz,
     wait_until,
 )
-from curie_mail_adapter.adapter import MailAdapter
-from curie_mail_adapter.provider import MessageSummary
+from curie_channel_gateway.mail.adapter import MailAdapter
+from curie_channel_gateway.mail.provider import MessageSummary
 
 
 @pytest.mark.parametrize(
@@ -85,7 +85,8 @@ def test_unverifiable_agentmail_authentication_refuses_a_turn(
     warnings = [
         record.getMessage()
         for record in caplog.records
-        if record.name.startswith("curie_mail_adapter") and record.levelno >= logging.WARNING
+        if record.name.startswith("curie_channel_gateway.mail")
+        and record.levelno >= logging.WARNING
     ]
     assert len(warnings) == 1
     assert "authentication_unverifiable" in warnings[0]

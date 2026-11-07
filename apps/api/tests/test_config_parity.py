@@ -20,7 +20,7 @@ import json
 
 import pytest
 from curie_api.config import Settings
-from curie_dispatcher.config import DispatcherConfig
+from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_worker import workitem_dispatch as worker_workitem_dispatch
 from curie_worker.config import WorkerConfig
 from pydantic import ValidationError

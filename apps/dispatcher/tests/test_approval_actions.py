@@ -24,7 +24,8 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 import redis
-from curie_dispatcher.app import build_app
+from curie_channel_gateway.slack.app import build_app
+from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_dispatcher.approval_actions import (
     _APPROVAL_ACTION_IDS,
     _DECISION_BY_ACTION_ID,
@@ -37,7 +38,6 @@ from curie_dispatcher.approval_actions import (
     settled_verdict_line,
 )
 from curie_dispatcher.approval_principal import mint_chat_principal
-from curie_dispatcher.config import DispatcherConfig
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
@@ -194,8 +194,8 @@ def test_authorized_click_resolves_and_stamps_the_card(
         {
             "approval_id": APPROVAL_ID,
             "decision": "approved",
-            "attested_user": "U_MANAGER",
-            "attested_channel": "C_MGRS",
+            "actor": "U_MANAGER",
+            "actor_channel": "C_MGRS",
             # The immediate pair carries no note by construction; only the
             # dialog pair can collect one (#1053).
             "note": None,
@@ -355,7 +355,7 @@ def test_resolve_reads_the_decision_time_off_the_response(
     )
 
     outcome = resolver.resolve(
-        APPROVAL_ID, decision="approved", attested_user="U_MANAGER", attested_channel="C_MGRS"
+        APPROVAL_ID, decision="approved", actor="U_MANAGER", actor_channel="C_MGRS"
     )
 
     assert outcome.resolved_at == expected
@@ -873,8 +873,8 @@ def test_resolve_request_carries_the_dispatcher_action_parent() -> None:
         outcome = resolver.resolve(
             APPROVAL_ID,
             decision="approved",
-            attested_user="U_MANAGER",
-            attested_channel="C_MGRS",
+            actor="U_MANAGER",
+            actor_channel="C_MGRS",
         )
 
     assert outcome.status_code == 200
@@ -907,8 +907,8 @@ def test_non_json_403_body_is_not_captured_as_detail() -> None:
     outcome = resolver.resolve(
         APPROVAL_ID,
         decision="approved",
-        attested_user="U_MANAGER",
-        attested_channel="C_MGRS",
+        actor="U_MANAGER",
+        actor_channel="C_MGRS",
     )
 
     assert outcome.status_code == 403

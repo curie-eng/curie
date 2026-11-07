@@ -29,10 +29,10 @@ import pytest
 import redis
 from aci_protocol import QueuedTurn
 from aci_protocol.turn import DEFAULT_IDENTITY
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.handlers import process_event
+from curie_channel_gateway.slack.inbound_text import derive_text
 from curie_dispatcher.admission import build_admission
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.handlers import process_event
-from curie_dispatcher.inbound_text import derive_text
 from curie_dispatcher.queue import from_stream_fields
 
 PLACEHOLDER_TS = "1700000000.000200"

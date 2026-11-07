@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 import pytest
 from _support import ALLOWED_SENDER, STRANGER, IngressState, MailState
-from curie_mail_adapter.adapter import MailAdapter
+from curie_channel_gateway.mail.adapter import MailAdapter
 
 
 @pytest.mark.parametrize("gate", ["provider-label", "sender-allow-list"])

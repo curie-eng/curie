@@ -1,9 +1,10 @@
 # Channel gateway
 
 `curie_channel_gateway` owns provider connections, intake, rendering, clicks,
-egress and provider reads. This extraction is behavior-neutral. This first
-slice defines ports and regression fixtures only; no production composition
-uses this package yet. `slack/` and `mail/` are implementation destinations.
+egress and provider reads. This extraction is behavior-neutral. Slack intake and connections live in `slack/`;
+mail intake, provider I/O and durable delivery state live in `mail/`. The
+dispatcher retains its Valkey construction, admission cache and queue transport,
+and the standalone mail executable delegates to this package.
 
 The boundary proposal is recorded in
 [Draft ADR 0275](../../docs/adr/0275-channel-gateway-provider-boundary.md).

@@ -43,7 +43,7 @@ exists (ADR-0007); only the port is extracted.
 A second broker must honor the stream key, the payload encoding, and the Stream verbs:
 
 - **Stream key** — `"curie:runs"`, defaulted identically on both ends:
-  `DispatcherConfig.stream` (`apps/dispatcher/src/curie_dispatcher/config.py::DispatcherConfig`,
+  `DispatcherConfig.stream` (`packages/channel-gateway/src/curie_channel_gateway/slack/config.py::DispatcherConfig`,
   env `CURIE_STREAM`) and `WorkerConfig.stream`
   (`apps/worker/src/curie_worker/config.py::WorkerConfig`).
 - **Payload encoding** — one Stream field, `STREAM_PAYLOAD_FIELD = "payload"`

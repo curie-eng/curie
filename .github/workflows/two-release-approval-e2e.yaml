@@ -9,7 +9,7 @@ on:
     branches: [next]
     paths:
       - "apps/dispatcher/src/curie_dispatcher/approval_actions.py"
-      - "apps/dispatcher/src/curie_dispatcher/handlers.py"
+      - "packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py"
       - "apps/dispatcher/tests/test_approval_actions.py"
       - "cli/scripts/two-release-approval-e2e.sh"
       - "cli/tests/two_release_approval_e2e.rs"

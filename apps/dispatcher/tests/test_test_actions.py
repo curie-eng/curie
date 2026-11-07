@@ -12,9 +12,9 @@ from unittest.mock import MagicMock
 
 import pytest
 import redis
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.handlers import process_event
 from curie_dispatcher.admission import build_admission
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.handlers import process_event
 from curie_dispatcher.queue import from_stream_fields
 from curie_internal.driver_declaration import DeclaredDriver
 from pydantic import ValidationError

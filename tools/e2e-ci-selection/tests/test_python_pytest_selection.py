@@ -353,7 +353,7 @@ def test_docs_only_path_runs_impact_readers(tmp_path: Path, path: str) -> None:
         "packages/aci-protocol/src/aci_protocol/wire.py",
         "apps/api/src/curie_api/main.py",
         "apps/worker/src/curie_worker/binding.py",
-        "apps/dispatcher/src/curie_dispatcher/app.py",
+        "packages/channel-gateway/src/curie_channel_gateway/slack/app.py",
         "runner/src/curie_runner/session.py",
         "examples/tests/test_example.py",
         "cli/src/main.rs",

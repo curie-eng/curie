@@ -14,12 +14,13 @@ import os
 import sys
 
 from aci_protocol import QueuedTurn, parse_queued_turn
+from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_telemetry import bootstrap_service_telemetry, operation_span
 from opentelemetry.trace import SpanKind
 
+from curie_dispatcher.app import build_redis
+
 from . import __version__
-from .app import build_redis
-from .config import DispatcherConfig
 from .queue import StreamPublisher, enqueue
 
 _LOG = logging.getLogger("curie_dispatcher.enqueue_once")

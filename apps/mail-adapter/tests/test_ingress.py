@@ -11,7 +11,7 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 
-import curie_mail_adapter.adapter as adapter_module
+import curie_channel_gateway.mail.adapter as adapter_module
 import pytest
 from _support import (
     ALLOWED_SENDER,
@@ -26,7 +26,7 @@ from _support import (
     stop,
     wait_until,
 )
-from curie_mail_adapter.adapter import MailAdapter
+from curie_channel_gateway.mail.adapter import MailAdapter
 
 REFUSAL_VECTOR = (
     Path(__file__).resolve().parents[3] / "tests" / "vectors" / "channel-port-refusal.json"
@@ -103,7 +103,7 @@ def test_channel_post_transport_classifies_the_exact_caller_refusal(
     ingress: IngressState, adapter: MailAdapter, caplog: pytest.LogCaptureFixture
 ) -> None:
     ingress.response = _refusal()
-    with caplog.at_level("WARNING", logger="curie_mail_adapter.adapter"):
+    with caplog.at_level("WARNING", logger="curie_channel_gateway.mail.adapter"):
         assert adapter.post_turn(_turn()) == "refused"
     assert ingress.attempts == 1
     refusal_logs = [r.getMessage() for r in caplog.records if "ingress refused" in r.getMessage()]

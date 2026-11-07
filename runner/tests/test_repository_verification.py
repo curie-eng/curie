@@ -23,7 +23,7 @@ SERVICE_PATHS = (
     "apps/worker/src/curie_worker/config.py",
     "apps/worker/tests/binding/test_approval_grant.py",
     "apps/dispatcher/src/curie_dispatcher/queue.py",
-    "apps/mail-adapter/src/curie_mail_adapter/server.py",
+    "packages/channel-gateway/src/curie_channel_gateway/mail/egress.py",
     "packages/test-support/src/curie_test_support/postgres.py",
     "tests/vectors/channel-port-refusal.json",
     "conftest.py",

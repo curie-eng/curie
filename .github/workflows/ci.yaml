@@ -2203,7 +2203,7 @@ jobs:
         run: docker tag curie-ci/dispatcher:candidate curie-dispatcher:ci-smoke
       - name: "Dispatcher: Entrypoint imports resolve in the built image"
         if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
-        run: docker run --rm --entrypoint python curie-dispatcher:ci-smoke -c "import curie_dispatcher; import aci_protocol"
+        run: docker run --rm --entrypoint python curie-dispatcher:ci-smoke -c "import curie_channel_gateway.slack.run; import curie_dispatcher; import aci_protocol"
 
       # Same gap, same shape (issue #428). The mail adapter image also builds with
       # `uv sync --no-editable`, so it installs only the package's DECLARED
@@ -2226,7 +2226,7 @@ jobs:
         run: docker tag curie-ci/mail-adapter:candidate curie-mail-adapter:ci-smoke
       - name: "Mail adapter: Entrypoint imports resolve in the built image"
         if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
-        run: docker run --rm --entrypoint python curie-mail-adapter:ci-smoke -c "import curie_mail_adapter; import aci_protocol; import pydantic_settings"
+        run: docker run --rm --entrypoint python curie-mail-adapter:ci-smoke -c "import curie_channel_gateway.mail.run; import curie_mail_adapter; import aci_protocol; import pydantic_settings"
 
       # The console UI image serves its build through an nginx template that lives
       # as a heredoc in apps/ui/Dockerfile, not as a checked-in config file, so

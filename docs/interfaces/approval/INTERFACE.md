@@ -725,7 +725,7 @@ notification contains no interaction. Email cards have a separate adapter-princi
 resolution path, checked against the served binding, its allowed callers, and the route's
 email approvers. The shipped AgentMail adapter currently refuses all inbound mail before
 approval handling because it cannot verify positive sender authentication
-(`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.handle_inbound`),
+(`packages/channel-gateway/src/curie_channel_gateway/mail/adapter.py::MailAdapter.handle_inbound`),
 so that API path does not prove working approval replies through AgentMail.
 The policy gate `ApprovalGate`
 (`runner/src/curie_runner/approval.py::ApprovalGate`) contains no Claude SDK

@@ -18,10 +18,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from curie_mail_adapter.adapter import MailAdapter
-from curie_mail_adapter.agentmail import AgentMailClient
-from curie_mail_adapter.config import MailAdapterConfig
-from curie_mail_adapter.egress import make_server
+from curie_channel_gateway.mail.adapter import MailAdapter
+from curie_channel_gateway.mail.agentmail import AgentMailClient
+from curie_channel_gateway.mail.config import MailAdapterConfig
+from curie_channel_gateway.mail.egress import make_server
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 

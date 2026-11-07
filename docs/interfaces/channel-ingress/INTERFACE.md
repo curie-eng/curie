@@ -81,7 +81,7 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   Its `text` is the person's message, except in a thread whose root this bot
   posted: there the root is quoted ahead of it as untrusted context inside a
   `<prior_assistant_reply>` block
-  (`apps/dispatcher/src/curie_dispatcher/thread_context.py::SlackThreadContext`),
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/thread_context.py::SlackThreadContext`),
   with root slashes neutralized as XML entities so repository-looking alert
   text stays inert even to an older worker's raw repository parser during a
   rolling upgrade.
@@ -193,7 +193,7 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   linked account who passes `admit`: when OIDC is enabled with an HTTPS redirect
   origin, `POST /channels/admission` may return a
   `connect_url`, and the dispatcher's `_refused_caller`
-  (`apps/dispatcher/src/curie_dispatcher/handlers.py`) posts it as a private
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py`) posts it as a private
   ephemeral "Connect your account, then ask again." offer while still refusing the
   turn;
   the dispatcher logs `caller_not_allowed` or `admission_unavailable` and counts
@@ -212,7 +212,7 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   `CURIE_SLACK_DELIVERY_CANARY_CHANNELS` proves that Slack still delivers to that
   identity, and nothing more. The dispatcher counts it on
   `curie.slack.delivery_canary` and refuses it as `delivery_canary` in
-  `process_event` (`apps/dispatcher/src/curie_dispatcher/handlers.py::process_event`),
+  `process_event` (`packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::process_event`),
   after envelope validation and before relevance, admission and `claim_event`. It
   never asks the API, posts a placeholder or enqueues a turn (#4960).
 - **Binding** — a channel resolves to a deployment by exact `(kind, address)` equality in
@@ -265,10 +265,10 @@ Anything decidable from the routed payload belongs at the routing seam
 (`BindingResolver.resolve` above), so what stays in `apps/dispatcher` is normalization plus
 the few refusals that seam structurally cannot make. Every drop the adapter's own code
 makes is an enumerated member of
-`apps/dispatcher/src/curie_dispatcher/relevance.py::DropReason`, carries a documented
-rationale in `apps/dispatcher/src/curie_dispatcher/relevance.py::DROP_RATIONALES`, and is
+`packages/channel-gateway/src/curie_channel_gateway/slack/relevance.py::DropReason`, carries a documented
+rationale in `packages/channel-gateway/src/curie_channel_gateway/slack/relevance.py::DROP_RATIONALES`, and is
 emitted as exactly one INFO record by
-`apps/dispatcher/src/curie_dispatcher/relevance.py::drop`. There are no silent drops inside
+`packages/channel-gateway/src/curie_channel_gateway/slack/relevance.py::drop`. There are no silent drops inside
 the adapter: a bare `return None` on the ingest path is the defect #2006 closed, not a
 style preference. The module is the system of record for this table, and the dispatcher's
 tests assert the two sets equal in both directions.
@@ -289,14 +289,14 @@ tests assert the two sets equal in both directions.
 | `UNADDRESSABLE_ACTION` | An App Home or modal click carries no channel and no message, so there is no thread in which a reply could be delivered. |
 
 The last three sit on the Block Kit click lane, which is a real ingest lane:
-`apps/dispatcher/src/curie_dispatcher/handlers.py::process_action` mints a `QueuedTurn`
-exactly as `apps/dispatcher/src/curie_dispatcher/handlers.py::process_event` does, so a
+`packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::process_action` mints a `QueuedTurn`
+exactly as `packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::process_event` does, so a
 dropped click is inbound loss of the same class. Of the three, only `UNADDRESSABLE_ACTION`
 is a disposition Bolt actually delivers today: an App Home or modal click really does
 arrive with no channel and no message. `NO_ACTION_IN_PAYLOAD` and `EMPTY_ACTION_COMMAND`
 are **defensive guards on that lane that the current matcher does not reach**. The
 catch-all registration in
-`apps/dispatcher/src/curie_dispatcher/handlers.py::register_handlers` is
+`packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::register_handlers` is
 `@app.action(re.compile(r".+"))`, and `slack_bolt` resolves the clicked action inside its
 own matcher before invoking the listener: a payload with an empty `actions` list raises
 there rather than arriving at `process_action`, and an empty `action_id` never matches
@@ -310,7 +310,7 @@ absent — it is *handled* by the dedicated approval listener, not dropped.
 
 - **The framework's admission boundary sits above the adapter, and is documented rather
   than re-implemented.** Three of Bolt's own mechanisms admit or refuse an event before any
-  listener in `apps/dispatcher/src/curie_dispatcher/handlers.py` runs, so none of them can
+  listener in `packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py` runs, so none of them can
   be a `DropReason`. `slack_bolt`'s built-in `IgnoringSelfEvents` middleware compares the
   incoming identity against the authorized bot identity and acks a self-authored event
   without invoking a listener, logging only at DEBUG — so at production log levels that
@@ -332,7 +332,7 @@ absent — it is *handled* by the dedicated approval listener, not dropped.
   `(kind, channel)` pair, so the routing seam has no field on which to tell a mention from
   ordinary chatter and would simply mint a turn.
 - **Subtype handling is open-world.**
-  `apps/dispatcher/src/curie_dispatcher/relevance.py::NON_CONTENT_SUBTYPES` is a small
+  `packages/channel-gateway/src/curie_channel_gateway/slack/relevance.py::NON_CONTENT_SUBTYPES` is a small
   closed denylist of things that are structurally not new user content; everything else,
   including subtypes Slack ships after this was written, is admitted and left to routing.
   The inverse rule this replaced — refuse *any* subtype — swallowed `file_share` (a person
@@ -359,7 +359,7 @@ absent — it is *handled* by the dedicated approval listener, not dropped.
 - **Bot authorship is a mention-lane rule, and its cost is accepted.** A foreign bot's
   *root* `@`-mention is admitted — the alert-app case this work exists for, whose body
   typically arrives as Block Kit and is normalized by
-  `apps/dispatcher/src/curie_dispatcher/inbound_text.py::derive_text` rather than read off
+  `packages/channel-gateway/src/curie_channel_gateway/slack/inbound_text.py::derive_text` rather than read off
   an empty top-level `text`. A bot-authored mention carrying `thread_ts` is refused as
   `BOT_AUTHORED_THREAD_REPLY` for the cross-installation loop above, unless the event's
   exact channel/bot pair is in `CURIE_SLACK_THREADED_BOT_ALLOWLIST` or its `bot_id`
@@ -481,10 +481,10 @@ only for a provider that verifies senders. The AgentMail provider exposes labels
 arbitrary headers without a trusted aligned authentication verdict or header
 provenance guarantee, so it declares that it cannot verify senders, and
 `MailAdapter._listing_rejection`
-(`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter._listing_rejection`)
+(`packages/channel-gateway/src/curie_channel_gateway/mail/adapter.py::MailAdapter._listing_rejection`)
 refuses all of its inbound messages, including approval replies, before any fetch. An
 allowed sender list cannot replace that authentication evidence. Outbound reply and approval-card rendering remain
-implemented through `apps/mail-adapter/src/curie_mail_adapter/egress.py::EgressHandler`.
+implemented through `packages/channel-gateway/src/curie_channel_gateway/mail/egress.py::EgressHandler`.
 
 1. **Fixed (#7).** The ingress field names were Slack's (`slack_event_id`, `thread_ts`,
    `placeholder_ts`); the payload was promoted into `packages/aci-protocol` as `QueuedTurn`
@@ -502,7 +502,7 @@ implemented through `apps/mail-adapter/src/curie_mail_adapter/egress.py::EgressH
    posts platform-owned messages such as approval cards and settles them in place afterwards.
    Email is another datapoint: it accumulates reply events per
    `(conversation_id, reply_ref)` and sends one threaded mail on `turn.completed`
-   (`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.send_reply`).
+   (`packages/channel-gateway/src/curie_channel_gateway/mail/adapter.py::MailAdapter.send_reply`).
 4. **Still leaks: Slack-only capability queries.** The kernel calls
    `undeliverable_reason` and `edits_in_place` on its sink
    (`apps/worker/src/curie_worker/kernel/core.py::Kernel`), but only `SlackReplyAdapter`
