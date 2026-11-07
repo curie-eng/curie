@@ -60,7 +60,7 @@ pub fn is_eval_isolate_thread(thread_key: &str) -> bool {
 }
 
 /// RFC 3986 unreserved set, matching Python `urllib.parse.quote(s, safe="")`.
-fn percent_encode_unreserved(s: &str) -> String {
+pub(crate) fn percent_encode_unreserved(s: &str) -> String {
     let mut out = String::new();
     for byte in s.as_bytes() {
         match byte {

@@ -13,7 +13,7 @@ production deployments.
 import json
 from functools import lru_cache
 from typing import Annotated, Any, Literal
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from aci_protocol import (
     DEAD_LETTER_STREAM_ENV,
@@ -1024,7 +1024,8 @@ class Settings(BaseSettings):
         # `rediss://` alone, so this one character is what carries valkey_tls
         # through from_url to the pool (#2315).
         scheme = "rediss" if self.valkey_tls else "redis"
-        return f"{scheme}://:{self.valkey_password}@{self.valkey_host}:{self.valkey_port}/0"
+        password = quote(self.valkey_password, safe="")
+        return f"{scheme}://:{password}@{self.valkey_host}:{self.valkey_port}/0"
 
     def upgrade_quiesce_key(self) -> str:
         return authoritative_key(self.worker_key_prefix, self.installation_id)
