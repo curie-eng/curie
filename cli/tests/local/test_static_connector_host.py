@@ -69,6 +69,14 @@ def certificates(directory: Path) -> None:
     )
 
 
+def proxy_ready(docker: Any, container: str) -> bool:
+    script = (
+        "import http.client; c=http.client.HTTPConnection('127.0.0.1',8081); "
+        "c.request('POST','/mcp'); assert c.getresponse().status == 403"
+    )
+    return docker("exec", container, "python3", "-c", script, check=False).returncode == 0
+
+
 @dataclass
 class Host:
     docker: Any
@@ -77,6 +85,7 @@ class Host:
     uploads: str
     seed: str
     ca: Path
+    variant: Any
 
 
 @pytest.fixture(scope="module")
@@ -127,6 +136,8 @@ def host(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Host]:
         docker("network", "create", "--label", label, network)
         (directory / "users.acl").write_text(
             f"user default off\nuser reviewer on >{PASSWORD} ~connector-grant:reviewer:* +set\n"
+            f"user broad on >{PASSWORD} ~connector-grant:* +set\n"
+            f"user authonly on >{PASSWORD} -@all\n"
         )
         (directory / "valkey.conf").write_text(
             "port 0\ntls-port 6379\n"
@@ -198,7 +209,7 @@ def host(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Host]:
                 "ca_file": "/config/cert.pem",
             },
             "upload": {
-                "listener": {"host": "0.0.0.0", "port": 8081},
+                "listener": {"host": "0.0.0.0", "port": 8081, "insecure_http": True},
                 "upstream_port": 8001,
                 "path": "/v1/upload",
                 "max_body_bytes": 1024,
@@ -237,9 +248,45 @@ def host(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Host]:
             )
         )
 
+        wait_until(lambda: proxy_ready(docker, containers[1]))
+
         def address(port: int, scheme: str) -> str:
             published = docker("port", containers[1], str(port)).stdout.decode().strip()
             return f"{scheme}://localhost:{published.rsplit(':', 1)[1]}"
+
+        def variant(mode: str, username: str = "reviewer") -> str:
+            name = f"connector-variant-{token}-{len(containers)}"
+            containers.append(name)
+            variant_config = json.loads(json.dumps(config))
+            variant_config["implementation"]["command"].append(mode)
+            variant_config["grant_store"]["username"] = username
+            variant_directory = directory / name
+            variant_directory.mkdir(mode=0o755)
+            (variant_directory / "serve.json").write_text(json.dumps(variant_config))
+            for file in ("cert.pem", "key.pem"):
+                (variant_directory / file).write_bytes((directory / file).read_bytes())
+            docker(
+                "create",
+                "--name",
+                name,
+                "--label",
+                label,
+                "--network",
+                network,
+                "-e",
+                "CURIE_CONNECTOR_SERVE_CONFIG=/config/serve.json",
+                "-e",
+                f"CURIE_CONNECTOR_GRANT_STORE_PASSWORD={PASSWORD}",
+                image,
+            )
+            docker("cp", str(variant_directory), f"{name}:/config")
+            docker(
+                "cp",
+                str(ROOT / "apps/worker/tests/fixtures/connector_host_implementation.py"),
+                f"{name}:/opt/connector/implementation.py",
+            )
+            docker("start", name)
+            return name
 
         yield Host(
             docker,
@@ -248,6 +295,7 @@ def host(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Host]:
             address(8081, "http"),
             seed,
             directory / "cert.pem",
+            variant,
         )
     finally:
         for container in reversed(containers):
@@ -352,3 +400,39 @@ def test_static_connector_container_authorization_and_shutdown(host: Host) -> No
         "valid caller+grant executed once; refusals executed zero times; "
         "upload scope held; SIGTERM exited 0"
     )
+
+
+@pytest.mark.parametrize("mode", ["public", "upload-public", "late-public", "late-upload-public"])
+def test_host_refuses_network_exposed_implementation(host: Host, mode: str) -> None:
+    container = host.variant(mode)
+    if mode.startswith("late-"):
+        wait_until(
+            lambda: (
+                host.docker("exec", container, "test", "-f", "/tmp/ready", check=False).returncode
+                == 0
+            )
+        )
+        wait_until(lambda: proxy_ready(host.docker, container))
+        host.docker("exec", container, "touch", "/tmp/rebind")
+    wait_until(
+        lambda: (
+            host.docker("inspect", "-f", "{{.State.Running}}", container).stdout.strip() == b"false"
+        ),
+        timeout=15,
+    )
+    assert host.docker("wait", container).stdout.strip() != b"0"
+    assert b"outside task loopback" in host.docker("logs", container).stderr
+
+
+@pytest.mark.parametrize("username", ["broad", "authonly"])
+def test_host_refuses_unsafe_grant_store_acl(host: Host, username: str) -> None:
+    container = host.variant("loopback", username)
+    wait_until(
+        lambda: (
+            host.docker("inspect", "-f", "{{.State.Running}}", container).stdout.strip() == b"false"
+        ),
+        timeout=15,
+    )
+    assert host.docker("wait", container).stdout.strip() != b"0"
+    logs = host.docker("logs", container).stderr
+    assert b"grant store scope" in logs

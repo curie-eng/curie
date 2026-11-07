@@ -73,7 +73,7 @@ def host_document() -> dict[str, Any]:
     return {
         "version": 1,
         "connector": "reviewer",
-        "listener": {"host": "0.0.0.0", "port": 8080},
+        "listener": {"host": "0.0.0.0", "port": 8080, "insecure_http": True},
         "implementation": {"command": ["python3", "/opt/connector/server.py"], "port": 8000},
         "public_keys": [_PUBLIC],
         "admits": ["acme-dev"],
@@ -81,7 +81,7 @@ def host_document() -> dict[str, Any]:
         "routes": [{"path": "/review", "methods": ["POST"], "max_body_bytes": 10}],
         "grant_store": {"host": "valkey", "port": 6379, "username": "reviewer"},
         "upload": {
-            "listener": {"host": "0.0.0.0", "port": 8081},
+            "listener": {"host": "0.0.0.0", "port": 8081, "insecure_http": True},
             "upstream_port": 8001,
             "path": "/v1/upload",
             "max_body_bytes": 16,
@@ -111,15 +111,19 @@ def test_mounted_config_and_secret_env_build_both_listeners(tmp_path: Path) -> N
         (("version",), 2),
         (("public_keys",), []),
         (("public_keys",), [_SEED + "invalid"]),
+        (("public_keys",), [_SEED]),
         (("private_key",), _SEED),
         (("listener", "port"), True),
         (("listener", "host"), "example.com"),
+        (("listener", "insecure_http"), False),
         (("listener", "tls"), {"cert_file": "/cert.pem"}),
+        (("listener", "tls"), {"cert_file": "/cert.pem", "key_file": "/key.pem"}),
         (("implementation", "port"), 8080),
         (("implementation", "command"), []),
         (("grant_store", "username"), "default"),
         (("grant_store", "tls"), False),
         (("upload", "listener", "port"), 8080),
+        (("upload", "listener", "insecure_http"), False),
         (("upload", "path"), "/mcp"),
         (("upload", "path"), "/v1/%75pload"),
         (("routes",), [{"path": "/mcp", "methods": ["GET"], "max_body_bytes": 5}]),
@@ -150,6 +154,24 @@ def test_missing_config_is_refused(tmp_path: Path) -> None:
         hosting.load_config({})
     with pytest.raises(ValueError):
         hosting.load_config({hosting.CONFIG_ENV: str(tmp_path / "absent")})
+
+
+def test_private_worker_seed_is_not_a_verification_point() -> None:
+    worker_seed = base64.b64encode(bytes(caller_token.signing_key(_SEED))).decode()
+    with pytest.raises(ValueError, match="Ed25519 point"):
+        caller.public_key(worker_seed)
+    assert (
+        caller.public_key(_PUBLIC).encode() == caller_token.signing_key(_SEED).verify_key.encode()
+    )
+
+
+def test_plaintext_requires_explicit_opt_in_even_on_loopback() -> None:
+    document = host_document()
+    document["listener"] = {"host": "127.0.0.1", "port": 8080}
+    with pytest.raises(ValueError):
+        hosting.HostConfig.model_validate(document)
+    document["listener"]["insecure_http"] = True
+    assert hosting.HostConfig.model_validate(document).listener.port == 8080
 
 
 def test_upload_scope_is_exclusive_and_cannot_call_mcp() -> None:
