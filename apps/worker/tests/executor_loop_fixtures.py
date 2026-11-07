@@ -1008,7 +1008,9 @@ class FakeDeployments:
         # Typed path: the same body through the client's own deserializer.
         from kubernetes import client as k8s_client
 
-        return k8s_client.ApiClient().deserialize(raw, "V1Deployment")
+        return k8s_client.ApiClient().deserialize(
+            raw.data.decode(), "V1Deployment", "application/json"
+        )
 
     def __getattr__(self, attr: str) -> Any:
         raise AssertionError(f"the executor may only get one Deployment by name, not {attr}")
