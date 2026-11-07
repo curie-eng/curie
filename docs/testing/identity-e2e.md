@@ -45,6 +45,19 @@ curie cluster up --context kind-identity-e2e --namespace identity-e2e \
 Do not use the release name `curie` on a cluster another install shares; some
 chart objects are cluster scoped and named from the release.
 
+On a single-node kind cluster, scale CoreDNS to one replica before running a
+connector scenario:
+
+```bash
+kubectl --context kind-identity-e2e -n kube-system scale deploy coredns --replicas=1
+```
+
+With two replicas, a sandbox's dual-stack lookup (the A and AAAA queries sent
+together from one socket) can lose one reply to a UDP conntrack race, so about
+one lookup in three stalls for 3 to 9 seconds or fails. The runner's connector
+dial then times out before the connector answers, and `[fake:connector-call]`
+reports `failed TimeoutError`. With one replica every lookup returns at once.
+
 ## Run it
 
 Set the target once:
