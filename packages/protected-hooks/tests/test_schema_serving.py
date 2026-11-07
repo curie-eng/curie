@@ -81,8 +81,10 @@ def graph_payload() -> dict[str, Any]:
         ("0146", False),
         ("0147", False),
         ("0148", False),
-        # The candidate minimum is 0149, the factory Slack tables the worker reads.
-        ("0149", True),
+        # 0149 is the factory Slack tables. The candidate minimum is 0150,
+        # the GitHub host namespaces.
+        ("0149", False),
+        ("0150", True),
         ("0000", True),
         ("future-expand", True),
     ],

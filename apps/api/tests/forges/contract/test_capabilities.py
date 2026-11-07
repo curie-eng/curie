@@ -46,6 +46,7 @@ async def _optional_calls(harness: AdapterHarness) -> dict[Operation, Call]:
         ),
         Operation.RERUN_FAILED: lambda: code_host.rerun_failed(repository, jobs),
         Operation.USER_CAN_WRITE: lambda: code_host.user_can_write(repository, harness.writer),
+        Operation.ACCOUNT_LOGIN: lambda: code_host.account_login(repository, harness.writer.id),
         Operation.REQUIRED_CHECKS: lambda: code_host.required_checks(repository, "main"),
         Operation.STORE_EVIDENCE: lambda: code_host.store_evidence(
             repository,

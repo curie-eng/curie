@@ -66,8 +66,9 @@ CONTRACT = "0041"
 # Factory base transition ORM reads require the 0144 transition table.
 # The 0145 join requires both the stable deadline backport (0140) and 0144.
 # The UI evidence tables and deleted-issue cancellation meet at 0148, and the
-# factory Slack progress loop reads the 0149 thread tables.
-APP_SCHEMA_MIN = "0149"
+# factory Slack progress loop reads the 0149 thread tables. GitHub host
+# namespaces are the 0150 candidate minimum.
+APP_SCHEMA_MIN = "0150"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -175,6 +176,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0147",
             "0148",
             "0149",
+            "0150",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -212,8 +214,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0147",
             "0148",
             "0149",
+            "0150",
         }
-    assert current_revision() == "0149"
+    assert current_revision() == "0150"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -312,8 +315,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # Factory base transition reads require the 0144 table, and the 0145 join
     # also requires the stable deadline backport (0140). The 0148 join
     # includes UI evidence and deleted-issue cancellation, and factory Slack
-    # progress reads the 0149 tables.
-    for revision in sorted(known - {"0149"}):
+    # progress reads the 0149 tables. GitHub host namespaces require 0150.
+    for revision in sorted(known - {"0150"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
@@ -323,7 +326,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     assert can_serve("0146", window, known) is False
     assert can_serve("0147", window, known) is False
     assert can_serve("0148", window, known) is False
-    assert can_serve("0149", window, known) is True
+    assert can_serve("0149", window, known) is False
+    assert can_serve("0150", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

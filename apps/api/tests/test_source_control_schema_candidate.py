@@ -46,8 +46,8 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # The 0145 join requires both the stable deadline backport (0140) and 0144.
     # The UI evidence reconciler reads the 0146 tables, and the 0148 join
     # also requires main's deleted issue cancellation (0147). The factory Slack
-    # progress loop reads the 0149 tables.
-    assert window == {"schema_min": "0149", "schema_head": "0149"}
+    # progress loop reads the 0149 tables. GitHub host namespaces require 0150.
+    assert window == {"schema_min": "0150", "schema_head": "0150"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -79,7 +79,6 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.3") == {"schema_min": "0140", "schema_head": "0140"}
     assert data["windows"].get("0.14.4") == {"schema_min": "0140", "schema_head": "0140"}
     assert data["revisions"][-33:] == [
-        "0095",
         "0096",
         "0097",
         "0098",
@@ -112,6 +111,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0147",
         "0148",
         "0149",
+        "0150",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -141,6 +141,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0147"] == "expand"
     assert kinds["0148"] == "expand"
     assert kinds["0149"] == "expand"
+    assert kinds["0150"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -239,7 +240,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0149"
+    assert current_revision() == "0150"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]
