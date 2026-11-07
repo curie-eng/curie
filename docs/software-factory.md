@@ -1,5 +1,9 @@
 # Software Factory
 
+Start with the [user guide](guides/factory-user-guide.md) for a complete issue
+to PR walkthrough or the [administrator guide](guides/factory-admin-guide.md)
+for setup and improvement. This page explains the workflow and its limits.
+
 Delegate an issue to a Curie co-worker and get a pull request or merge request to review,
 or a stated reason it could not complete. You can leave the work running
 asynchronously, inspect progress on the issue, and request revisions on the
