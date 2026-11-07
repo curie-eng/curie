@@ -1372,6 +1372,40 @@ class Settings(BaseSettings):
             )
         return self
 
+    # Cron claim lease. The chart's 10800 budget is a deployment value. Unset
+    # here, the process default matches the worker: 600 seconds. A set lease
+    # must cover that budget. Empty is not a lease.
+    delivery_budget_s: float = Field(
+        default=600.0,
+        ge=60.0,
+        le=43200.0,
+        validation_alias="CURIE_DELIVERY_BUDGET_S",
+    )
+    hook_claim_lease_s: float | None = Field(
+        default=None,
+        gt=0,
+        validation_alias="CURIE_HOOK_CLAIM_LEASE_S",
+    )
+
+    @model_validator(mode="after")
+    def _hook_claim_lease_covers_the_budget(self) -> "Settings":
+        """Fail at construction if a cron claim's lease is shorter than a turn."""
+        lease = self.hook_claim_lease_s
+        if lease is not None and lease < self.delivery_budget_s:
+            raise ValueError(
+                f"CURIE_HOOK_CLAIM_LEASE_S ({lease!r}) must be at least "
+                f"CURIE_DELIVERY_BUDGET_S ({self.delivery_budget_s!r}): a shorter "
+                "lease reclaims a scheduled turn that is still running"
+            )
+        return self
+
+    @property
+    def effective_hook_claim_lease_s(self) -> float:
+        """The cron claim lease; the delivery budget when none is configured."""
+        if self.hook_claim_lease_s is None:
+            return self.delivery_budget_s
+        return self.hook_claim_lease_s
+
 
 @lru_cache
 def get_settings() -> Settings:

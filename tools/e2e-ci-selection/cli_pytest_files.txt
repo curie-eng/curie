@@ -8,6 +8,7 @@ apps/api/tests/test_factory_progress.py
 apps/api/tests/test_factory_settings_gate.py
 apps/api/tests/test_gitflow_integration.py
 apps/api/tests/test_gitflow_targets.py
+apps/api/tests/test_hook_run_source_webhook.py
 apps/api/tests/test_migration_0133_agent_role_configuration.py
 apps/api/tests/test_publications.py
 apps/api/tests/test_schema_window_gate.py

@@ -270,6 +270,15 @@ spec:
             # the render when it is on and the executor is off.
             - name: CURIE_REMEDIATION_ENABLED
               value: {{ include "curie.remediationEnabled" . | quote }}
+            # Delivery budget and optional cron claim lease. Both come from the
+            # worker values, the same source the worker Deployment renders, so
+            # the pair cannot be split. Null leaves the lease unset.
+            - name: CURIE_DELIVERY_BUDGET_S
+              value: {{ .Values.worker.deliveryBudgetSeconds | quote }}
+            {{- if .Values.worker.hookClaimLeaseSeconds }}
+            - name: CURIE_HOOK_CLAIM_LEASE_S
+              value: {{ .Values.worker.hookClaimLeaseSeconds | quote }}
+            {{- end }}
             # The test installation declaration (ADR 0202 decision 1). The
             # dispatcher renders the same two values from the same helpers;
             # secrets.yaml refuses the render when it is on and unsafe.

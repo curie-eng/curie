@@ -2348,6 +2348,13 @@ worker:
   # bounds an unconfigured agent. Raising these defaults raises rendered
   # termination grace to budget + reserve (10860) for every install.
   deliveryBudgetSeconds: 10800
+  # Optional cron claim lease, rendered as CURIE_HOOK_CLAIM_LEASE_S on the API
+  # and the worker from this one value. Null or omitted leaves the variable
+  # unset, so each process uses its delivery budget. A positive number with no
+  # chart maximum, matching the released worker. The process refuses a lease
+  # shorter than the delivery budget at boot. There is no cross-field check
+  # in the schema.
+  hookClaimLeaseSeconds: null
   # Positive per-request ceiling for runner work within the overall delivery
   # budget. Must be at most 10800 seconds and no greater than
   # deliveryBudgetSeconds; fractional seconds are supported. values.schema.json

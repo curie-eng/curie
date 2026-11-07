@@ -3097,7 +3097,7 @@ class HookRun(Base):
             name="hook_runs_outcome_ck",
         ),
         CheckConstraint(
-            "source IN ('schedule', 'manual')",
+            "source IN ('schedule', 'manual', 'webhook')",
             name="hook_runs_source_ck",
         ),
     )
@@ -3124,6 +3124,31 @@ class HookRun(Base):
     )
     # When an open claim becomes reclaimable by the hook's next fire (#2931).
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class HookWakeKey(Base):
+    """The generation of one hook's wake key. Key material is not stored."""
+
+    __tablename__ = "hook_wake_keys"
+    __table_args__ = (
+        CheckConstraint("generation >= 1", name="hook_wake_keys_generation_ck"),
+    )
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    hook: Mapped[str] = mapped_column(String(63), primary_key=True)
+    generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("1")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class Tenant(Base):
