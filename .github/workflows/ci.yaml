@@ -1974,6 +1974,11 @@ jobs:
             context: examples/sre-bot/connectors/scaler
             dockerfile: examples/sre-bot/connectors/scaler/Dockerfile
             platforms: linux/amd64,linux/arm64
+          # Opt-in and undeclared by default, like the scaler it verifies.
+          - name: sre-bot-metrics
+            context: examples/sre-bot/connectors/metrics
+            dockerfile: examples/sre-bot/connectors/metrics/Dockerfile
+            platforms: linux/amd64,linux/arm64
           - name: github-activity-github
             context: examples/github-activity/connectors/github
             dockerfile: examples/github-activity/connectors/github/Dockerfile

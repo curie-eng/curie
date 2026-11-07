@@ -201,6 +201,27 @@ anything, and cannot act in another namespace. A leaked token can set those
 Deployments' replica counts, zero included, and nothing else; RBAC stays the
 ceiling even if the connector's own allowlist is wider than the Role.
 
+## `query_value()` (opt-in metrics connector)
+
+Tool: `mcp__metrics__query_value(query)`, only after an operator opts in. The
+default bundle does not declare the `metrics` connector and names none of its
+tools. The opt-in declaration is `connectors/metrics/opt-in.yaml`; it adds
+`metrics/query_value` as `allow`, with no gate.
+
+The tool runs one PromQL instant query (`GET /api/v1/query`) against the one
+Prometheus in `METRICS_URL` and returns its vector or scalar. It is the read a
+remediation policy declares as its `precondition` and `verifier`, sampled by
+the platform's executor without a grant; the model may call it too. It cannot
+write: Prometheus's query API is read-only, the connector sends nothing but
+that `GET`, and it never follows a redirect.
+
+It holds no Kubernetes credential. By default it holds no credential at all;
+an operator whose Prometheus requires one adds `METRICS_BEARER_TOKEN` as a
+SecretRef. A leaked token reads whatever that Prometheus serves, which can
+include every scraped metric and label in the cluster. The connector does not
+narrow the queries it runs, so treat that Prometheus's contents as readable by
+the bot.
+
 ## Retention and evidence
 
 Kubernetes Events and pod logs are short-lived. Approval records show a call
