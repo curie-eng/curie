@@ -15,6 +15,8 @@ order: 11
 > **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 1 (redis-py) behind the broker port &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
+The managed ElastiCache swap for this seam is [managed-valkey-compat.md](./managed-valkey-compat.md). A redis-compatible store is not only a URL change when the managed service cannot keep AOF fsync.
+
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
 
 ## The black line
