@@ -2298,3 +2298,105 @@ def test_a_channel_port_turn_hands_the_lane_the_binding_it_arrived_on(make_harne
             ]
 
     asyncio.run(go())
+
+
+# --- ADR 0270 decision 3 [D5]: the retained attachment handoff re-mints at claim -----------
+
+
+def _requester_handoff() -> Any:
+    """The requester fixtures, imported late: their import chain imports this module."""
+    from . import test_requester_handoff
+
+    return test_requester_handoff
+
+
+def _retained_file_turn(thread: str) -> QueuedTurn:
+    return _qevent(
+        "read the file",
+        thread=thread,
+        attachments=[Attachment(id="F3", name="requester-notes.txt", mime_type="text/plain")],
+    )
+
+
+@pytest.mark.parametrize(
+    ("first_handoff_delay_s", "recovers_on_retry"),
+    [(200.0, True), (0.0, False)],
+    ids=["delayed-attempt", "timely-control"],
+)
+def test_a_retained_attachment_turn_recovers_after_a_delayed_attempt(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    first_handoff_delay_s: float,
+    recovers_on_retry: bool,
+) -> None:
+    """[D5] ADR 0270 decision 3: the retained-file handoff gets a claim-time token.
+
+    The retained attachment path hands an idle route off with the delivery's
+    own boot env, so the requester ``cct`` is refreshed only by the claim-time
+    minter. The first handoff's claim spends 200 s with a 3400 s runner bound,
+    so admission refuses that sandbox (``RequesterTokenWindowShort``); the
+    second attempt hands off again with a token minted at its own claim: the
+    same principal field for field, an expiry at most its mint time plus one
+    hour and later than the refused token's. The file turn opens exactly once.
+    Control (``timely-control``, the plan's
+    ``test_a_timely_retained_attachment_turn_starts_once``): no delay, one
+    handoff, one start, expiry exactly its mint time plus one hour.
+    """
+    handoff = _requester_handoff()
+    short_cls = handoff.window_short()
+    clock = handoff.install_clock(monkeypatch)
+
+    async def go() -> None:
+        binding, alice, _bob, core = handoff.parties()
+        binding.resolved.deployment_id = uuid.uuid4()
+        async with make_harness(
+            binding=binding,
+            identity_authority=core,
+            per_sandbox_runners=3,
+            runner_total_timeout_s=3400.0,
+            delivery_budget_s=3600.0,
+        ) as h:
+            lane = _FakeAttachmentLane()
+            probe = _WorkspaceProbe(h.substrate, selected_repo=None)
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            await handoff.process(h, _qevent("first", thread="tRequesterFile"))
+            assert len(h.fake_k8s.claim_envs) == 1
+            retained = handoff.route(h, _thread_key("tRequesterFile"))
+
+            delays = [first_handoff_delay_s]
+            handoff.delay_claims(h, clock, lambda: delays.pop(0) if delays else 0.0)
+            outcomes = handoff.observe_starts(h)
+            file_turn = _retained_file_turn("tRequesterFile")
+            await handoff.process(h, file_turn)
+
+            envs = h.fake_k8s.claim_envs
+            assert len(binding.boot_ccts) == 2, "the file turn's boot env was rebuilt per attempt"
+            started_env = envs[-1]
+            assert started_env is not None and started_env[ATTACHMENTS_REF_ENV] == REF_VALUE
+            started_cct = handoff.cct_of(started_env)
+            started = handoff.cct_claims(started_cct)
+            assert started["principal"] == handoff.principal_dict(alice)
+            run = binding.minter_runs[len(envs) - 1]
+            assert run.cct == started_cct, "the handoff did not carry a claim-time token"
+            handoff.assert_signed_by(started_cct, binding.signing_key)
+            if recovers_on_retry:
+                assert outcomes == [short_cls, "started"]
+                assert len(envs) == 3, "the refused sandbox was not handed off again"
+                refused = handoff.cct_claims(handoff.cct_of(envs[1]))
+                assert started["exp"] <= int(run.after) + 3600
+                assert started["exp"] > refused["exp"]
+            else:
+                assert outcomes == ["started"]
+                assert len(envs) == 2
+                assert int(run.before) + 3600 <= started["exp"] <= int(run.after) + 3600
+
+            opened = [text for runner in h.runners.values() for text in runner.opened]
+            assert opened.count("read the file") == 1
+            final = handoff.route(h, _thread_key("tRequesterFile"))
+            assert final.claim_name != retained.claim_name
+            assert handoff.runner_at(h, final).opened == ["read the file"]
+            assert handoff.recorded(final) == (handoff.requester_digest(alice), started["exp"])
+            assert await handoff.is_done(h, file_turn)
+
+    asyncio.run(go())

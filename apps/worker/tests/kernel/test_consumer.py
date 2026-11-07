@@ -5966,3 +5966,352 @@ def test_live_worker_lock_still_serializes_a_replacement(make_harness) -> None:
             await live_lock.release(h.config.lock_key(_thread_key(thread)), live_token)
 
     asyncio.run(go())
+
+
+# --- ADR 0270 decision 3 [D2]: a lost lease stops only what the delivery owns -----------
+#
+# The lease-lost callback used to interrupt the thread's live turn for every
+# ordinary delivery, so a second requester whose lease was lost while it waited
+# (on the order lock, the authority answer or the liveness probe) killed the
+# first requester's turn. It now stops only a turn this lease acquisition opened
+# or steered into, at the sandbox it recorded, and only while that runner still
+# reports the recorded turn epoch. Each test runs with the requester flag on and
+# off: the change applies to every agent. The loss is a renewal refusal, which
+# the real heartbeat loop turns into ``lease.lost`` and the callback.
+
+_LOSS_KNOBS: dict[str, object] = {
+    "delivery_budget_s": 60.0,
+    "delivery_lease_ttl_s": 1.5,
+    "delivery_lease_heartbeat_s": 0.3,
+    "runner_total_timeout_s": 30.0,
+}
+
+
+def _handoff() -> Any:
+    """The requester fixtures, imported late: their import chain reaches sibling modules."""
+    from . import test_requester_handoff
+
+    return test_requester_handoff
+
+
+def _loss_parties(flag_on: bool) -> tuple[Any, Any, Any, Any]:
+    """The binding, the core, and Alice and Bob (None when the agent is not opted in)."""
+    handoff = _handoff()
+    binding = handoff.MintingRequesterBinding(flag=flag_on)
+    alice = binding.requester_wire() if flag_on else None
+    bob = binding.requester_wire(handoff.BOB_SUBJECT) if flag_on else None
+    core = handoff.RequesterCore(alice, version=2 if flag_on else 1)
+    return binding, core, alice, bob
+
+
+class _LeaseLoss:
+    """Refuse the next lease renewal and wait for the lease-lost callback to finish."""
+
+    def __init__(
+        self, consumer: Consumer, store: DeliveryLeaseStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.done = asyncio.Event()
+        self._store = store
+        self._monkeypatch = monkeypatch
+        real = consumer._on_lease_lost
+        assert real is not None
+
+        async def on_lost(entry_id: str, fields: dict[str, str]) -> None:
+            try:
+                await real(entry_id, fields)
+            finally:
+                self.done.set()
+
+        consumer._on_lease_lost = on_lost
+
+    async def inject(self) -> None:
+        async def refused(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        self._monkeypatch.setattr(self._store, "heartbeat", refused)
+        await asyncio.wait_for(self.done.wait(), timeout=5.0)
+
+
+def _loss_consumer(h: Any, monkeypatch: pytest.MonkeyPatch) -> tuple[Consumer, _LeaseLoss]:
+    store = DeliveryLeaseStore(h.async_redis, h.config)
+    consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+    return consumer, _LeaseLoss(consumer, store, monkeypatch)
+
+
+async def _dispatch_http(h: Any, consumer: Consumer, event: QueuedTurn) -> str:
+    """Deliver ``event`` as an HTTP-context stream entry through the real consumer."""
+    handoff = _handoff()
+    fields = {"payload": event.model_dump_json(), "curie_identity_context_v1": handoff.CAPSULE}
+    entry_id, observed = await handoff.pending_entry(h, consumer, fields)
+    await consumer._dispatch(entry_id, observed)
+    return str(entry_id)
+
+
+async def _settle_consumer(consumer: Consumer) -> None:
+    await asyncio.gather(*list(consumer._inflight), return_exceptions=True)
+    await asyncio.gather(*list(consumer._lease_loss_tasks), return_exceptions=True)
+
+
+@pytest.mark.parametrize("blocked_in", ["authority-check", "order-lock"])
+@pytest.mark.parametrize("flag_on", [True, False], ids=["flag-on", "flag-off"])
+def test_lease_loss_before_any_turn_leaves_another_live_turn_running(
+    make_harness, monkeypatch: pytest.MonkeyPatch, flag_on: bool, blocked_in: str
+) -> None:
+    """[D2] A delivery that opened or steered nothing stops nothing (ADR 0270 decision 3).
+
+    Alice's turn is live with epoch E. Bob's delivery is blocked before it
+    starts anything, in the authority check or behind the per-thread order
+    lock, when its lease is lost. Alice's turn keeps running with E. Released,
+    Bob's delivery opens nothing and stays pending.
+    """
+    handoff = _handoff()
+
+    async def go() -> None:
+        binding, core, _alice, bob = _loss_parties(flag_on)
+        async with make_harness(
+            binding=binding, identity_authority=core, per_sandbox_runners=2, **_LOSS_KNOBS
+        ) as h:
+            consumer, loss = _loss_consumer(h, monkeypatch)
+            holds = handoff.hold_turns(h)
+            alice_turn = _qevent("alice is working", thread="loss-before-start")
+            key = kernel_routing._thread_key_for(alice_turn)
+            opener = asyncio.create_task(handoff.process(h, alice_turn))
+            order_entry: Any = None
+            try:
+                await _wait_until(lambda: handoff.any_turn_active(h), "alice's turn is live")
+                alice_runner = handoff.runner_at(h, handoff.route(h, key))
+                epoch = alice_runner.turn_epoch
+                assert epoch is not None
+
+                core.requester = bob
+                bob_turn = _qevent("bob waits", thread="loss-before-start")
+                if blocked_in == "authority-check":
+                    core.pause_event = bob_turn.event_id
+                else:
+                    order_entry = h.kernel._acquire_order_entry(key)
+                    await order_entry.lock.acquire()
+                await _dispatch_http(h, consumer, bob_turn)
+                if blocked_in == "authority-check":
+                    await asyncio.wait_for(core.entered.wait(), timeout=5.0)
+                else:
+                    await _wait_until(lambda: order_entry.refs >= 2, "bob queued on the order")
+                await loss.inject()
+
+                assert alice_runner.interrupts == 0, "a delivery that opened nothing stopped Alice"
+                assert alice_runner.turn_active and alice_runner.turn_epoch == epoch
+                assert not opener.done()
+
+                if blocked_in == "authority-check":
+                    core.release.set()
+                else:
+                    order_entry.lock.release()
+                    h.kernel._release_order_entry(key, order_entry)
+                    order_entry = None
+                await _settle_consumer(consumer)
+
+                assert alice_runner.interrupts == 0
+                assert alice_runner.turn_active and alice_runner.turn_epoch == epoch
+                assert "bob waits" not in handoff.all_opened(h)
+                assert handoff.all_steers(h) == []
+                assert len(h.fake_k8s.claim_envs) == 1
+                pending = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+                assert pending["pending"] == 1
+            finally:
+                core.release.set()
+                if order_entry is not None:
+                    order_entry.lock.release()
+                    h.kernel._release_order_entry(key, order_entry)
+                handoff.release(holds)
+                await opener
+                await _settle_consumer(consumer)
+            assert alice_runner.opened == ["alice is working"]
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("flag_on", [True, False], ids=["flag-on", "flag-off"])
+def test_lease_loss_stops_the_turn_this_delivery_opened(
+    make_harness, monkeypatch: pytest.MonkeyPatch, flag_on: bool
+) -> None:
+    """[D2] control: the turn this delivery opened is stopped at its recorded sandbox.
+
+    The thread's route is moved to another sandbox before the loss, so a stop
+    that looked the thread up would hit the wrong runner. The stop follows the
+    handle the delivery recorded, with that sandbox's token.
+    """
+    handoff = _handoff()
+
+    async def go() -> None:
+        binding, core, _alice, _bob = _loss_parties(flag_on)
+        async with make_harness(
+            binding=binding, identity_authority=core, per_sandbox_runners=2, **_LOSS_KNOBS
+        ) as h:
+            consumer, loss = _loss_consumer(h, monkeypatch)
+            decoy = _qevent("decoy", thread="loss-opened-decoy")
+            await handoff.process(h, decoy)
+            decoy_key = kernel_routing._thread_key_for(decoy)
+            decoy_runner = handoff.runner_at(h, handoff.route(h, decoy_key))
+            holds = handoff.hold_turns(h)
+            turn = _qevent("this delivery opens", thread="loss-opened")
+            key = kernel_routing._thread_key_for(turn)
+            try:
+                await _dispatch_http(h, consumer, turn)
+                await _wait_until(lambda: handoff.any_turn_active(h), "the delivery's turn is live")
+                handle = handoff.route(h, key)
+                runner = handoff.runner_at(h, handle)
+                assert runner is not decoy_runner
+                handoff.hand_route(h, source_key=decoy_key, target_key=key)
+
+                await loss.inject()
+                await _wait_until(lambda: runner.interrupts >= 1, "the opened turn was stopped")
+                assert runner.interrupts == 1
+                assert handoff.bearer(runner.interrupt_headers[-1]) == f"Bearer {handle.token}"
+                assert decoy_runner.interrupts == 0, "the stop followed a thread lookup"
+            finally:
+                handoff.release(holds)
+                await _settle_consumer(consumer)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("flag_on", [True, False], ids=["flag-on", "flag-off"])
+def test_lease_loss_with_a_stale_epoch_stops_nothing(
+    make_harness, monkeypatch: pytest.MonkeyPatch, flag_on: bool
+) -> None:
+    """[D2] control: a recorded epoch the runner no longer runs is never stopped.
+
+    The runner still reports a live turn, under another epoch: the turn this
+    delivery opened is no longer the one running there.
+    """
+    handoff = _handoff()
+
+    async def go() -> None:
+        binding, core, _alice, _bob = _loss_parties(flag_on)
+        async with make_harness(
+            binding=binding, identity_authority=core, per_sandbox_runners=2, **_LOSS_KNOBS
+        ) as h:
+            consumer, loss = _loss_consumer(h, monkeypatch)
+            holds = handoff.hold_turns(h)
+            turn = _qevent("this delivery opens", thread="loss-stale")
+            key = kernel_routing._thread_key_for(turn)
+            try:
+                await _dispatch_http(h, consumer, turn)
+                await _wait_until(lambda: handoff.any_turn_active(h), "the delivery's turn is live")
+                runner = handoff.runner_at(h, handoff.route(h, key))
+                opened_epoch = runner.turn_epoch
+                assert opened_epoch is not None
+                runner.turn_epoch = uuid.uuid4().hex
+                assert runner.turn_epoch != opened_epoch
+
+                await loss.inject()
+                assert runner.interrupts == 0, "a turn under another epoch was stopped"
+                assert runner.turn_active
+            finally:
+                handoff.release(holds)
+                await _settle_consumer(consumer)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("flag_on", [True, False], ids=["flag-on", "flag-off"])
+def test_lease_lost_while_start_is_in_flight_is_stopped_once_recorded(
+    make_harness, monkeypatch: pytest.MonkeyPatch, flag_on: bool
+) -> None:
+    """[D2] control: a loss during ``start_turn`` stops the turn once it is recorded.
+
+    The runner has received the start but not answered it when the lease is
+    lost: the callback has nothing recorded and stops nothing. When the start
+    returns, the recorder sees the lost lease and stops that turn, once.
+    """
+    handoff = _handoff()
+
+    async def go() -> None:
+        binding, core, _alice, _bob = _loss_parties(flag_on)
+        async with make_harness(
+            binding=binding, identity_authority=core, per_sandbox_runners=2, **_LOSS_KNOBS
+        ) as h:
+            consumer, loss = _loss_consumer(h, monkeypatch)
+            holds = handoff.hold_turns(h)
+            gates = [asyncio.Event() for _ in h.runners]
+            for runner, gate in zip(h.runners.values(), gates, strict=True):
+                runner.accept = gate
+            turn = _qevent("start in flight", thread="loss-in-flight")
+            key = kernel_routing._thread_key_for(turn)
+            try:
+                await _dispatch_http(h, consumer, turn)
+                await _wait_until(
+                    lambda: turn.text in handoff.all_opened(h), "the start is in flight"
+                )
+                await loss.inject()
+                assert handoff.all_interrupts(h) == 0, "a turn nobody recorded was stopped"
+
+                for gate in gates:
+                    gate.set()
+                await _wait_until(
+                    lambda: handoff.all_interrupts(h) >= 1, "the recorded turn was stopped"
+                )
+                await _settle_consumer(consumer)
+                runner = handoff.runner_at(h, handoff.route(h, key))
+                assert runner.interrupts == 1
+                assert handoff.all_interrupts(h) == 1
+            finally:
+                for gate in gates:
+                    gate.set()
+                handoff.release(holds)
+                await _settle_consumer(consumer)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("flag_on", [True, False], ids=["flag-on", "flag-off"])
+def test_lease_loss_after_a_steer_stops_the_steered_turn(
+    make_harness, monkeypatch: pytest.MonkeyPatch, flag_on: bool
+) -> None:
+    """[D2] control: the live turn this delivery steered into is stopped.
+
+    The same requester's follow-up steers Alice's live turn; its lease is lost
+    after the steer was recorded and before the delivery finishes.
+    """
+    handoff = _handoff()
+
+    async def go() -> None:
+        binding, core, _alice, _bob = _loss_parties(flag_on)
+        async with make_harness(
+            binding=binding, identity_authority=core, per_sandbox_runners=2, **_LOSS_KNOBS
+        ) as h:
+            consumer, loss = _loss_consumer(h, monkeypatch)
+            holds = handoff.hold_turns(h)
+            first = _qevent("alice is working", thread="loss-steer")
+            key = kernel_routing._thread_key_for(first)
+            opener = asyncio.create_task(handoff.process(h, first))
+            try:
+                await _wait_until(lambda: handoff.any_turn_active(h), "alice's turn is live")
+                runner = handoff.runner_at(h, handoff.route(h, key))
+                follow_up = _qevent("alice adds", thread="loss-steer")
+                real_reply_for = h.kernel._reply_for
+                gated: list[str] = []
+
+                async def reply_for(qevent: QueuedTurn, *args: Any, **kwargs: Any) -> Any:
+                    if (
+                        qevent.event_id == follow_up.event_id
+                        and follow_up.text in runner.steers
+                        and not gated
+                    ):
+                        gated.append(qevent.event_id)
+                        await loss.inject()
+                    return await real_reply_for(qevent, *args, **kwargs)
+
+                h.kernel._reply_for = reply_for
+                await _dispatch_http(h, consumer, follow_up)
+                await _wait_until(lambda: loss.done.is_set(), "the steering lease was lost")
+                await _wait_until(lambda: runner.interrupts >= 1, "the steered turn was stopped")
+                await _settle_consumer(consumer)
+                assert gated == [follow_up.event_id]
+                assert runner.steers == [follow_up.text]
+                assert runner.interrupts == 1
+            finally:
+                handoff.release(holds)
+                await opener
+                await _settle_consumer(consumer)
+
+    asyncio.run(go())
