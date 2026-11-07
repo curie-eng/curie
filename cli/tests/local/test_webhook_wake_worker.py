@@ -8,12 +8,13 @@ and teardown failures are fixture errors.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
 import subprocess
+import sys
 import threading
-import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,6 +27,10 @@ from curie_internal.keyspace import kill_key
 from curie_worker.config import WorkerConfig
 
 REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO / "apps/worker/tests"))
+
+from queue_fixtures import wait_until  # noqa: E402
+
 NAME = "test-adr0274-wake-worker"
 FULLNAME = f"{NAME}-curie"
 
@@ -247,15 +252,13 @@ class WakeStack:
                 "print(json.dumps(WorkerConfig().effective_hook_claim_lease_s))",
             )
         )
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            if self.redis("EXISTS", "curie:runs") and any(
+
+        def consumer_ready():
+            return self.redis("EXISTS", "curie:runs") and any(
                 item["name"] == "curie-workers" for item in self.redis("XINFO GROUPS", "curie:runs")
-            ):
-                break
-            time.sleep(0.1)
-        else:
-            raise RuntimeError("worker did not establish its consumer group")
+            )
+
+        asyncio.run(wait_until(consumer_ready, "worker consumer group", timeout=20, interval=0.1))
         self.worker(False)
         self.deploy("acme-wake-idle")
         self.deploy("acme-wake-gated")
@@ -420,12 +423,14 @@ class WakeStack:
         self.redis("XADD", "curie:runs", "*", "payload", event.model_dump_json())
 
     def wait_done(self, event):
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            if self.redis("EXISTS", WorkerConfig().done_key(event.event_id)) == 1:
-                return
-            time.sleep(0.1)
-        raise AssertionError("worker did not settle the stream delivery")
+        asyncio.run(
+            wait_until(
+                lambda: self.redis("EXISTS", WorkerConfig().done_key(event.event_id)) == 1,
+                "stream delivery settlement",
+                timeout=10,
+                interval=0.1,
+            )
+        )
 
     def transcripts(self, agent):
         return self.sql(
@@ -441,15 +446,20 @@ class WakeStack:
         )
 
     def settled(self, run, outcome, reason=None):
-        deadline = time.monotonic() + 120
-        while time.monotonic() < deadline:
+        state = None
+
+        def terminal():
+            nonlocal state
             state = self.state(run)
-            if state["outcome"] is not None:
-                assert (state["outcome"], state["reason"]) == (outcome, reason), state
-                return state
-            time.sleep(0.5)
-        self.capture_failure()
-        raise AssertionError("worker did not settle the seeded run")
+            return state["outcome"] is not None
+
+        try:
+            asyncio.run(wait_until(terminal, "terminal hook outcome", timeout=120, interval=0.5))
+        except AssertionError:
+            self.capture_failure()
+            raise
+        assert (state["outcome"], state["reason"]) == (outcome, reason), state
+        return state
 
     def pause(self, agent, enabled):
         agent_id = self.agents[agent]
@@ -537,9 +547,9 @@ class WakeStack:
                 assert not self.slack_thread.is_alive()
 
 
-@pytest.fixture
-def stack(tmp_path):
-    runtime = WakeStack(tmp_path)
+@pytest.fixture(scope="module")
+def stack(tmp_path_factory):
+    runtime = WakeStack(tmp_path_factory.mktemp("webhook-wake-worker"))
     try:
         runtime.start()
         yield runtime
