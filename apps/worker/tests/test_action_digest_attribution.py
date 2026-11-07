@@ -146,7 +146,9 @@ class FakeAppsV1Api:
         if kwargs.get("_preload_content") is False:
             return raw
         # Typed path: the same body through the client's own deserializer.
-        return k8s_client.ApiClient().deserialize(raw, "V1Deployment")
+        return k8s_client.ApiClient().deserialize(
+            raw.data.decode(), "V1Deployment", "application/json"
+        )
 
     def __getattr__(self, attr: str) -> Any:
         self.violations.append(attr)
