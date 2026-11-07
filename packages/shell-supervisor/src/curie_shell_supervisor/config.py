@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import stat
 import uuid
 from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass, field
@@ -37,6 +38,26 @@ RUNNER_UID = 1000
 
 class ConfigError(ValueError):
     """The shell environment cannot start a supervisor."""
+
+
+def check_private(path: Path, *, child_uid: int | None, child_gid: int | None) -> None:
+    """Refuse a credential file the runner child's uid or gid could read.
+
+    The TLS key and a control credential file are the supervisor's alone. A
+    deployment that mounts them world readable, or owned by the runner's uid
+    or group, would hand them to every claim, so the shell does not start.
+    """
+
+    if child_uid is None:
+        return
+    info = path.stat()
+    readable = (
+        info.st_uid == child_uid
+        or info.st_mode & stat.S_IROTH
+        or (info.st_mode & stat.S_IRGRP and info.st_gid == child_gid)
+    )
+    if readable:
+        raise ConfigError(f"{path} is readable by the runner child; make it private to root")
 
 
 def _names(raw: str | None) -> tuple[str, ...]:

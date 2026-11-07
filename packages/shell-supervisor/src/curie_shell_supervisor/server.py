@@ -219,7 +219,7 @@ class Supervisor:
 
     async def _reap_while_running(self, lease: Lease) -> None:
         code = await lease.child.wait()
-        if self._lease is lease:
+        if self._lease is lease and self._state != STATE_STOPPING:
             logger.warning("runner child of claim %s exited with %s", lease.claim, code)
         reap_orphans()
 

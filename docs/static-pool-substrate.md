@@ -174,7 +174,10 @@ claim after its supervisor is gone.
 1. One container per inventory slot, each with a stable address the worker can
    reach on port 8443 and nothing else exposed.
 2. A server certificate per shell whose names cover its inventory host, signed
-   by the CA in `CURIE_STATIC_SHELL_CA_FILE`, and its key, mounted read only.
+   by the CA in `CURIE_STATIC_SHELL_CA_FILE`, and its key, mounted read only
+   and readable by root alone. The supervisor refuses to start (exit code 78)
+   when the key or a control credential file is owned by the runner's uid,
+   readable by its group, or readable by everyone.
 3. One control credential shared by the workers and the shells, delivered as a
    secret.
 4. The secrets each pool's agents need (the model credential and connector

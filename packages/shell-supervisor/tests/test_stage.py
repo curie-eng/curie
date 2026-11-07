@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 from curie_shell_supervisor import stage
-from curie_shell_supervisor.config import ConfigError, SupervisorConfig
+from curie_shell_supervisor.config import ConfigError, SupervisorConfig, check_private
 from curie_test_support.static_shell import CONTROL_TOKEN, claim_archive
 
 BEARER = "bearer-" + "a" * 40
@@ -152,3 +152,20 @@ def test_a_link_never_replaces_a_real_directory(tmp_path: Path) -> None:
     assert link.resolve() == target.resolve()
     stage.link(link, None)
     assert not link.exists() and not link.is_symlink()
+
+
+def test_a_credential_file_the_child_could_read_is_refused(tmp_path: Path) -> None:
+    key = tmp_path / "server.key"
+    key.write_text("key")
+    other = os.getuid() + 4242
+    key.chmod(0o600)
+    check_private(key, child_uid=other, child_gid=other)
+    check_private(key, child_uid=None, child_gid=None)
+    for mode, uid, gid in (
+        (0o644, other, other),
+        (0o640, other, key.stat().st_gid),
+        (0o600, os.getuid(), other),
+    ):
+        key.chmod(mode)
+        with pytest.raises(ConfigError, match="readable by the runner child"):
+            check_private(key, child_uid=uid, child_gid=gid)

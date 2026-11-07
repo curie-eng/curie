@@ -8,11 +8,12 @@ import os
 import signal
 import ssl
 import sys
+from pathlib import Path
 
 from aiohttp import web
 
 from .child import become_subreaper
-from .config import ConfigError, SupervisorConfig
+from .config import ConfigError, SupervisorConfig, check_private
 from .server import Supervisor
 
 logger = logging.getLogger("curie_shell_supervisor")
@@ -66,7 +67,10 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     try:
+        token_file = os.environ.get("CURIE_SUPERVISOR_CONTROL_TOKEN_FILE")
         config = SupervisorConfig.from_env(os.environ)
+        for private in (config.tls_key_file, *([Path(token_file)] if token_file else [])):
+            check_private(private, child_uid=config.child_uid, child_gid=config.child_gid)
     except (ConfigError, OSError) as exc:
         logger.critical("supervisor configuration refused: %s", exc)
         sys.exit(78)
