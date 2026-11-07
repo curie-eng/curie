@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import subprocess
 import time
@@ -19,12 +20,17 @@ from curie_api.routers.cluster_message_replies import internal_router, router
 from curie_connector_proxy.server import _set_nx_ex
 from curie_dispatcher.app import build_redis
 from curie_dispatcher.config import DispatcherConfig
+from curie_internal.keyspace import KILL_CHANNEL
 from curie_internal.valkey import AsyncRedis
+from curie_worker.killswitch import KillSwitch
 from curie_worker.stream_consumer import ReadLoopSpec, StreamConsumer
 from curie_worker.threadlock import ThreadLock
 from fastapi import FastAPI
 from redis.exceptions import ConnectionError as RedisConnectionError
-from redis.exceptions import ReadOnlyError
+from redis.exceptions import ReadOnlyError, ResponseError
+from redis.exceptions import TimeoutError as RedisTimeoutError
+
+from .queue_fixtures import wait_until
 
 # An independent fixture password, including URL-reserved characters.
 _PASSWORD = "example#managed%token+123"
@@ -108,6 +114,7 @@ class Endpoint:
         self.drop_remaining = 1
         self.dropped = 0
         self.rejected = asyncio.Queue[None]()
+        self.unblocked = asyncio.Queue[None]()
 
     async def connect(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         upstream_reader, upstream_writer = await asyncio.open_connection("127.0.0.1", self.target)
@@ -140,11 +147,16 @@ class Endpoint:
         async def replies() -> None:
             buffered = bytearray()
             readonly_tail = b""
+            unblocked_tail = b""
             while data := await upstream_reader.read(65536):
                 observed = readonly_tail + data
                 if b"READONLY" in observed:
                     self.rejected.put_nowait(None)
                 readonly_tail = observed[-7:]
+                unblocked = unblocked_tail + data
+                if b"UNBLOCKED" in unblocked:
+                    self.unblocked.put_nowait(None)
+                unblocked_tail = unblocked[-8:]
                 if drop_this_reply:
                     buffered.extend(data)
                     # EXEC's integer array proves the transaction committed;
@@ -354,6 +366,130 @@ async def _failover(servers: tuple[redis.Redis, redis.Redis, str, str]) -> None:
         await api.aclose()
         await worker.aclose()
         dispatcher.close()
+        server.close()
+        await server.wait_closed()
+        await endpoint.close()
+
+
+def test_kill_subscriber_survives_unrelated_timeout_and_socket_loss(
+    servers: tuple[redis.Redis, redis.Redis, str, str],
+) -> None:
+    asyncio.run(_kill_subscriber(servers))
+
+
+async def _kill_subscriber(servers: tuple[redis.Redis, redis.Redis, str, str]) -> None:
+    primary = next(
+        client for client in servers[:2] if client.info("replication")["role"] == "master"
+    )
+    port = primary.connection_pool.connection_kwargs["port"]
+    client = AsyncRedis(
+        host="127.0.0.1", port=port, password=_PASSWORD, decode_responses=True, socket_timeout=0.05
+    )
+    delivered: asyncio.Queue[uuid.UUID] = asyncio.Queue()
+
+    async def on_kill(agent_id: uuid.UUID) -> None:
+        delivered.put_nowait(agent_id)
+
+    switch = KillSwitch(client, on_kill=on_kill)
+    task = asyncio.create_task(switch.run())
+
+    def subscribers() -> list[dict[str, str]]:
+        return [row for row in primary.client_list() if "P" in row["flags"]]
+
+    async def kill() -> None:
+        agent_id = uuid.uuid4()
+        primary.publish(KILL_CHANNEL, json.dumps({"agent_id": str(agent_id), "action": "kill"}))
+        assert await asyncio.wait_for(delivered.get(), 3) == agent_id
+        assert not task.done()
+
+    try:
+        await wait_until(lambda: bool(subscribers()), "kill subscription")
+        original_id = subscribers()[0]["id"]
+        await kill()
+        with pytest.raises(RedisTimeoutError):
+            await client.blpop("test:unrelated-timeout", timeout=1)
+        await kill()
+        assert subscribers()[0]["id"] == original_id, "a timeout reset the unrelated subscription"
+        # An unrelated response error must also preserve the live subscription.
+        with pytest.raises(ResponseError, match="NOGROUP"):
+            await client.xreadgroup("absent-group", "reader", {"absent-stream": ">"})
+        await kill()
+        assert subscribers()[0]["id"] == original_id
+        primary.client_kill_filter(_type="pubsub")
+        await wait_until(
+            lambda: bool(subscribers()) and subscribers()[0]["id"] != original_id,
+            "kill resubscription",
+        )
+        await kill()
+    finally:
+        switch.request_stop()
+        await asyncio.gather(task, return_exceptions=True)
+        await client.aclose()
+
+
+def test_blocked_stream_read_survives_primary_demotion(
+    servers: tuple[redis.Redis, redis.Redis, str, str],
+) -> None:
+    asyncio.run(_blocked_demotion(servers))
+
+
+async def _blocked_demotion(servers: tuple[redis.Redis, redis.Redis, str, str]) -> None:
+    first, second, first_name, second_name = servers
+    if first.info("replication")["role"] == "master":
+        primary, replica, primary_name, replica_name = first, second, first_name, second_name
+    else:
+        primary, replica, primary_name, replica_name = second, first, second_name, first_name
+    replica.replicaof(primary_name, 6379)
+    endpoint = Endpoint(primary.connection_pool.connection_kwargs["port"])
+    server = await asyncio.start_server(endpoint.connect, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    client = AsyncRedis(
+        host="127.0.0.1", port=port, password=_PASSWORD, decode_responses=True, socket_timeout=6
+    )
+    consumer = StreamConsumer(client)
+    stream = "test:blocked-demotion"
+    received: asyncio.Queue[str] = asyncio.Queue()
+
+    async def handled(entry_id: str, fields: dict[str, str]) -> None:
+        await client.xack(stream, "group", entry_id)
+        received.put_nowait(fields["value"])
+
+    task = None
+    try:
+        await client.xgroup_create(stream, "group", id="0", mkstream=True)
+        assert primary.wait(1, 10000) == 1
+        spec = ReadLoopSpec(
+            stream,
+            "group",
+            "consumer",
+            1,
+            5000,
+            0.01,
+            "idle %s",
+            "reconnecting %s",
+            logging.getLogger(__name__),
+        )
+        task = asyncio.create_task(consumer._consume(spec, handled))
+        await wait_until(
+            lambda: any(
+                row["cmd"] == "xreadgroup" and "b" in row["flags"] for row in primary.client_list()
+            ),
+            "blocked XREADGROUP",
+        )
+        replica.execute_command("REPLICAOF", "NO", "ONE")  # type: ignore[no-untyped-call]
+        primary.replicaof(replica_name, 6379)
+        await asyncio.wait_for(endpoint.unblocked.get(), 3)
+        assert not task.done(), "UNBLOCKED escaped the shared read loop"
+        endpoint.target = replica.connection_pool.connection_kwargs["port"]
+        replica.xadd(stream, {"value": "after-blocked-demotion"})
+        assert await asyncio.wait_for(received.get(), 5) == "after-blocked-demotion"
+        assert not task.done()
+    finally:
+        consumer.request_stop()
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await client.aclose()
         server.close()
         await server.wait_closed()
         await endpoint.close()

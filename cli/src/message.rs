@@ -2065,7 +2065,10 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             local_dry_run_channel_line(opts.agent.as_deref(), opts.channel.as_deref(), &api_base);
         let human_lines = vec![
             "local mode (compose stack; no kubectl/helm)".to_string(),
-            format!("enqueue onto redis {valkey_url}"),
+            format!(
+                "enqueue onto redis redis://{}:{}",
+                resources.valkey_host, resources.valkey_port
+            ),
             format!("stub advertised at {reply_endpoint}"),
             channel_line,
             format!("enqueue a synthetic QueuedTurn on stream {}", opts.stream),
@@ -3885,14 +3888,12 @@ pub fn eval_dry_run_lines(
     )];
     if opts.local {
         let resources = crate::local::current_resources()?;
-        let valkey_url = local_valkey_url(
-            &opts.valkey_password,
-            &resources.valkey_host,
-            resources.valkey_port,
-        );
         let api_base = local_api_base(opts.api_url.as_deref().or(Some(resources.api_url.as_str())));
         lines.push("local mode (compose stack; no kubectl/helm)".to_string());
-        lines.push(format!("enqueue onto redis {valkey_url}"));
+        lines.push(format!(
+            "enqueue onto redis redis://{}:{}",
+            resources.valkey_host, resources.valkey_port
+        ));
         lines.push(format!(
             "stub advertised at http://localhost:{}/api/",
             resources.stub_port
@@ -7989,6 +7990,15 @@ mod tests {
     }
 
     #[test]
+    fn local_eval_dry_run_hides_raw_and_encoded_valkey_passwords() {
+        let mut opts = eval_opts(true, Some("C123"));
+        opts.valkey_password = "example#private%token".into();
+        let lines = eval_dry_run_lines(&opts, "smoke", 1).unwrap().join("\n");
+        assert!(!lines.contains(&opts.valkey_password));
+        assert!(!lines.contains(&queue::percent_encode_unreserved(&opts.valkey_password)));
+    }
+
+    #[test]
     fn local_eval_dry_run_plan_names_the_tier_suite_and_enqueue() {
         // The `local eval` path with no live stack: the plan is a pure render.
         let lines = eval_dry_run_lines(&eval_opts(true, Some("C123")), "smoke", 3)
@@ -8002,7 +8012,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l == "enqueue onto redis redis://:valkeypass@localhost:26379"),
+                .any(|l| l == "enqueue onto redis redis://localhost:26379"),
             "{lines:?}"
         );
         assert!(lines.iter().any(|l| l == "channel C123"), "{lines:?}");

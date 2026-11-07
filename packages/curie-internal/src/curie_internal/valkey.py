@@ -17,10 +17,17 @@ from redis.asyncio.client import Pipeline as AsyncPipeline
 from redis.asyncio.retry import Retry as AsyncRetry
 from redis.backoff import NoBackoff
 from redis.client import Pipeline
-from redis.exceptions import ConnectionError, ReadOnlyError, TimeoutError
+from redis.exceptions import ConnectionError, ReadOnlyError, ResponseError
 from redis.retry import Retry
 
-_TRANSIENT = (ConnectionError, TimeoutError, ReadOnlyError)
+
+def is_failover_error(error: BaseException) -> bool:
+    """A stale primary connection, including a demoted server's blocked read."""
+    return isinstance(error, (ConnectionError, ReadOnlyError)) or (
+        isinstance(error, ResponseError) and str(error).startswith("UNBLOCKED")
+    )
+
+
 _READ_COMMANDS = frozenset(
     {
         "PING",
@@ -74,7 +81,9 @@ class _Pipeline(Pipeline):
     def execute(self, raise_on_error: bool = True) -> Any:
         try:
             return super().execute(raise_on_error=raise_on_error)
-        except _TRANSIENT:
+        except (ConnectionError, ResponseError) as error:
+            if not is_failover_error(error):
+                raise
             self.connection_pool.disconnect()
             raise
 
@@ -83,7 +92,9 @@ class _AsyncPipeline(AsyncPipeline):
     async def execute(self, raise_on_error: bool = True) -> Any:
         try:
             return await super().execute(raise_on_error=raise_on_error)
-        except _TRANSIENT:
+        except (ConnectionError, ResponseError) as error:
+            if not is_failover_error(error):
+                raise
             await self.connection_pool.disconnect()
             raise
 
@@ -102,7 +113,9 @@ class Redis(redis.Redis):
         for attempt in range(retries + 1):
             try:
                 return super()._execute_command(*args, **options)  # type: ignore[no-untyped-call]
-            except _TRANSIENT:
+            except (ConnectionError, ResponseError) as error:
+                if not is_failover_error(error):
+                    raise
                 self.connection_pool.disconnect()
                 if attempt == retries:
                     raise
@@ -126,7 +139,9 @@ class AsyncRedis(aioredis.Redis):
         for attempt in range(retries + 1):
             try:
                 return await super().execute_command(*args, **options)  # type: ignore[no-untyped-call]
-            except _TRANSIENT:
+            except (ConnectionError, ResponseError) as error:
+                if not is_failover_error(error):
+                    raise
                 await self.connection_pool.disconnect()
                 if attempt == retries:
                     raise

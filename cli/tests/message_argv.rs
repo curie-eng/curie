@@ -427,3 +427,52 @@ fn cluster_versions_help_still_takes_agent() {
         "cluster versions help must keep the AGENT positional\n{text}"
     );
 }
+
+#[test]
+fn local_message_and_eval_dry_runs_never_print_valkey_credentials() {
+    let bundle = tempfile::tempdir().expect("temporary eval bundle");
+    fs::create_dir(bundle.path().join("evals")).unwrap();
+    fs::write(
+        bundle.path().join("evals/cases.json"),
+        r#"{
+        "name":"redaction",
+        "cases":[{"id":"one","input":"ping","grader":{"kind":"contains","expected":"pong"}}]
+    }"#,
+    )
+    .unwrap();
+    for json in [false, true] {
+        for verb in ["message", "eval"] {
+            let mut command = Command::new(bin());
+            if json {
+                command.arg("--json");
+            }
+            command.args(["local", verb]);
+            if verb == "message" {
+                command.arg("ping");
+            }
+            let output = command
+                .args(["--dry-run", "--valkey-password", "example#private%token"])
+                .current_dir(bundle.path())
+                .env("CURIE_CONFIG_DIR", bundle.path().join("config"))
+                .env("CURIE_LOCAL_STUB_HOST", "127.0.0.1")
+                .output()
+                .unwrap();
+            let text = combined(&output);
+            assert!(output.status.success(), "{verb}: {text}");
+            assert!(!text.contains("example#private%token"), "{verb}: {text}");
+            assert!(
+                !text.contains("example%23private%25token"),
+                "{verb}: {text}"
+            );
+            if json {
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["dry_run"], true);
+            } else {
+                assert!(
+                    text.contains("enqueue onto redis redis://"),
+                    "{verb}: {text}"
+                );
+            }
+        }
+    }
+}

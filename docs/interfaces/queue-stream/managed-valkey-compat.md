@@ -35,7 +35,8 @@ is not under a `docs/operations/` directory.
    below. Leave durability disabled. Turning it on would require cluster mode,
    which this swap does not take.
 2. **Reconnect recovery is implemented; write outcomes remain uncertain.**
-   On READONLY, connection errors and timeouts, ordinary shared clients
+   On READONLY, connection errors and `UNBLOCKED` responses from a demoted
+   server, ordinary shared clients
    disconnect the pool, including in-use connections. The next command opens
    a new socket and resolves the primary endpoint again. Observational commands
    in the explicit read allowlist retry at most three times after 0.1, 0.2 and
@@ -43,8 +44,14 @@ is not under a `docs/operations/` directory.
    never automatically retried by this policy; redis-py's generic command
    retry is disabled so a lost reply cannot silently replay an `INCR` or `EVAL`.
    Existing callers receive those errors and retain their own recovery logic.
-   The shared stream read loop catches READONLY and backs off without exiting
-   or canceling its handlers. DNS convergence is still required, and a pool
+   The shared stream read loop catches READONLY and `UNBLOCKED` and backs off
+   without exiting or canceling its handlers. Timeouts do not reset the pool;
+   redis-py disconnects only the timed-out command connection. Other response
+   errors still propagate to the existing supervisor, and this recovery does
+   not recreate lost stream or group data. The kill subscriber owns a separate
+   stop-aware reconnect/resubscribe loop, preserving its subscription state
+   across connection errors and its own timeouts without retrying writes.
+   DNS convergence is still required, and a pool
    reset may interrupt sibling commands, whose outcomes must be treated as
    unknown. The bounded pressure probe opts out of read retries. Use the
    primary endpoint, never the reader endpoint or a node endpoint.
@@ -198,15 +205,15 @@ means an acknowledged write that the replica did not have at failover.
 
 | Path | Verdict | Lost write |
 | --- | --- | --- |
-| API, worker, and dispatcher connections (`Settings.valkey_dsn`, `WorkerConfig.valkey_client_kwargs`, `build_redis`) | Client config: `VALKEY_TLS=true`, primary host, auth token; shared failover clients. | Pool invalidation on READONLY and transport errors; bounded observational retries. Writes and Lua surface errors. |
+| API, worker, and dispatcher connections (`Settings.valkey_dsn`, `WorkerConfig.valkey_client_kwargs`, `build_redis`) | Client config: `VALKEY_TLS=true`, primary host, auth token; shared failover clients. | Pool invalidation on READONLY, `UNBLOCKED` and connection errors, excluding timeouts; bounded observational retries. Writes and Lua surface errors. |
 | Connector proxy grant spend (`_set_nx_ex` in `apps/worker/src/curie_connector_proxy/server.py`) | Compatible. `rediss://` uses the system CA and TLS 1.2 or newer. `AUTH` is the password only. `SELECT` runs only when the URL path is not 0. Any reply other than `+OK`, including a connection error, is a failed spend. | An acknowledged `SET` that then disappears lets the same grant id be spent again. An error during failover fails closed. |
 | Streams and consumer groups (`XADD`, `XGROUP`, `XREADGROUP`, `XACK`, `XAUTOCLAIM`, `XCLAIM`, `XPENDING`, `XINFO`, `XRANGE`, `XREVRANGE`, `XLEN`, `XTRIM`) | Compatible. The broker port and the direct producers use these verbs. Multi-key scripts that also touch a stream are safe only because cluster mode stays disabled. | A lost `XADD` drops a turn the producer already treated as queued. A lost `XACK` leaves the entry pending and the group redelivers it, which is the existing at-least-once window. |
 | `SET NX EX` dedupe, locks, leases, and single-use grants | Compatible as commands. The parameter group must be `noeviction` or a full node evicts these TTL keys. | The key is gone, so a duplicate event is accepted, a second holder takes a lock or lease, or a grant is spent twice. |
 | Lua, including multi-key scripts and `TIME` | Compatible on this mode. Production scripts call the verbs listed below. No script calls `CONFIG`, `DEBUG`, `RANDOMKEY`, or `math.random`. `INFO server` is the protected run-id fence. Multi-key `EVAL` (resume, delivery, channel-read ledger, capacity wait, admission, commissioning, protected markers) hashes to more than one slot and is why cluster mode stays off. `EVAL` is sent directly at most sites. `register_script` uses `EVALSHA` and redis-py recovers `NOSCRIPT` with `SCRIPT LOAD` then `EVALSHA`, including after a new primary with an empty script cache. | A script the primary acknowledged and the replica did not apply is the same class of loss as the writes inside it. A script that errors mid-failover may have applied or not. Callers that retry a non-idempotent script can double the effect. |
 | `MULTI` / `EXEC` and pipelines | Compatible. One primary, so a transaction is not a cross-slot error. | A transaction the replica missed is lost as a group. |
 | `SCAN` | Compatible. Production iteration uses `scan_iter`. `KEYS` is not the production path. | None. `SCAN` does not create durable state. |
-| Pub/sub kill channel | Compatible. The API `PUBLISH`es and the worker `SUBSCRIBE`s. `EXISTS` on the kill flag still refuses a new run when the publish was missed. No other production pub/sub subscriber was found. Revocation of grants and channel reads is key state, not pub/sub. | A lost `SET` of the kill flag lets a killed agent accept new turns until the flag is written again. A lost `PUBLISH` with the flag still present does not interrupt a turn that is already running. |
-| Blocking `XREADGROUP` | Compatible to connect. The socket timeout sits above the block. | The blocked call can fail with READONLY or a transport error. Pool invalidation reconnects through DNS, and the shared consumer loop backs off and continues without a restart. A lost reply can leave an entry pending, recovered by the existing reclaim path. |
+| Pub/sub kill channel | The API publishes and the worker subscribes. The subscriber reconnects and resubscribes after a connection fault or its own timeout; an unrelated command timeout leaves its connection intact. DNS alone does not move a still-connected subscription: a connection fault or shared-pool reset must break it first. | Pub/sub has no replay. Events published during a disconnected gap can be missed, so active turns may require reissuing a kill after resubscription. A surviving kill flag refuses new turns but does not interrupt an already-running turn. A lost kill flag also requires state reconciliation. |
+| Blocking `XREADGROUP` | Compatible to connect. The socket timeout sits above the block. | A demotion can reject a new read with READONLY or interrupt an already-blocked read with plain `ResponseError` starting `UNBLOCKED`. Both, and connection errors, invalidate the pool; the shared loop backs off and reconnects through DNS without a supervisor restart. A socket timeout backs off without resetting unrelated connections. Lost replies can leave pending entries for the existing reclaim path; lost stream/group state remains a separate recovery problem. |
 | Database index | Compatible while every client stays on 0. The API DSN hardcodes `/0`. | None by itself. |
 | `CONFIG`, `DEBUG`, `SAVE`, `BGSAVE`, `FLUSHALL`, `MONITOR`, `REPLICAOF`, `SHUTDOWN`, `MIGRATE`, `SYNC` | The main services do not call them. `cli/scripts/restore-drill.sh` does issue `SAVE`; that Compose-specific restore procedure does not apply to ElastiCache. Use AWS snapshot and restore APIs instead. ElastiCache removes its restricted set at the engine. | None. |
 | Protected-hook commissioning (`ACL SETUSER`, `ACL GETUSER`, `ACL WHOAMI`, `CLIENT KILL`) | Unsupported for both commissioning and protected-worker continuity on this configuration. Named users require excluded RBAC, and TLS/run-id/no-reconnect fences reject a replacement server. See open item 4. | Same as the keys those scripts write. |
@@ -316,6 +323,11 @@ It asserts that the same stream read task handles and acknowledges a new entry,
 the same threadlock acquires and releases again, dispatcher writes recover,
 and an authenticated API reply append changes from 503 to 200 and reads back
 the expected events. No application client or consumer is restarted.
+A second promotion case holds an actual `block=5000` read across demotion,
+observes the server's `UNBLOCKED` response, and verifies that the same read task
+consumes afterward. A kill-subscription case proves that an unrelated blocking
+command timeout and an ordinary NOGROUP error preserve its connection, then
+kills the pub/sub socket and confirms resubscription and subsequent kill delivery.
 It also drops replies after real writes and checks that `INCR`, Lua and a
 transaction are not repeated by either sync or async clients, while an
 observational `GET` retries at most three times and then surfaces failure.
