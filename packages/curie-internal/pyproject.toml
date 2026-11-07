@@ -6,6 +6,7 @@ requires-python = ">=3.13"
 dependencies = [
     "aci-protocol",
     "pydantic>=2.9",
+    "pynacl>=1.5",
     "redis>=5.2",
     "sqlalchemy[asyncio]>=2.0",
 ]

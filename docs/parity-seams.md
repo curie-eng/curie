@@ -197,6 +197,16 @@ as a whole; remembered only):
   each boundary.
   [vector: `tests/vectors/ui-evidence-cases.json`]
 
+30. Connector selector signer vs API approval preparation verifier (ADR 0271):
+  `packages/curie-internal/src/curie_internal/approver_ticket.py` and
+  `apps/api/src/curie_api/approver_tickets.py` consume the same signed payloads,
+  strict refusal codes, identity-owner character bounds, recipient namespace
+  objects, untrusted key selection and execution size cases. The API uses its production
+  argument canonicalizer; the signer checks the shared canonical argument corpus.
+  No approval creation or proxy wiring is implied by this pure contract.
+  [vector: `tests/vectors/approver-ticket.json`]
+  [vector: `tests/vectors/action-canonical-arguments.json`]
+
 A PR touching one side of a seam must route the behavior through a shared helper
 both sides call, change both sides in the same PR, or name the sibling in the PR
 body with a follow-up issue number. Prefer parity by construction over remembered

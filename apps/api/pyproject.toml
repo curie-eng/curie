@@ -11,6 +11,7 @@ dependencies = [
     "asyncpg>=0.30",
     "alembic>=1.14",
     "pydantic>=2.9",
+    "pynacl>=1.5",
     "pydantic-settings>=2.15.0",
     "httpx>=0.28",
     "boto3>=1.43.55",
