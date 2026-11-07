@@ -280,7 +280,8 @@ def test_module_contract_constants() -> None:
 # --------------------------------------------------------------------------
 
 CONTEXT_REFUSAL = (
-    "repo-runner requires an explicit --context (the throwaway cluster, for example throwaway-cluster)"
+    "repo-runner requires an explicit --context "
+    "(the throwaway cluster, for example throwaway-cluster)"
 )
 
 
