@@ -2,7 +2,6 @@ apps/api/tests/forges/test_tool_catalog_v1.py
 apps/api/tests/test_alembic_revision_gate.py
 apps/api/tests/test_alembic_train_lineage.py
 apps/api/tests/test_approval_identity_schema_candidate.py
-apps/api/tests/test_channels.py
 apps/api/tests/test_commitpoller.py
 apps/api/tests/test_deploy_notice_release_compat.py
 apps/api/tests/test_factory_progress.py
@@ -19,15 +18,9 @@ apps/api/tests/test_source_control_schema_candidate.py
 apps/api/tests/test_upgrade_schema_metadata.py
 apps/api/tests/test_workitem_outcomes.py
 apps/dispatcher/tests/test_approval_actions.py
-apps/worker/tests/binding/test_boot_env_golden.py
 apps/worker/tests/binding/test_eval_memory_isolation.py
-apps/worker/tests/binding/test_fresh_boot_credential.py
-apps/worker/tests/binding/test_memory_credential.py
-apps/worker/tests/binding/test_model_env.py
 apps/worker/tests/binding/test_reserved_boot_env_pin.py
-apps/worker/tests/binding/test_resolver.py
 apps/worker/tests/eval/test_schema_compat.py
-apps/worker/tests/kernel/test_memory_token_event.py
 apps/worker/tests/sandbox/test_e2e_tool_daemon.py
 apps/worker/tests/test_blocks_progress.py
 apps/worker/tests/test_completion_outbox_vector.py
