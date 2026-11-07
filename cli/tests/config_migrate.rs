@@ -2569,6 +2569,8 @@ const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     "CURIE_E2E_WORKER_CLUSTER_ROLE",
     "CURIE_FACTORY_PUBLICATION_LABELS",
     "CURIE_FAKE_MODEL",
+    // ADR 0274: the hook claim lease is a Helm value from introduction.
+    "CURIE_HOOK_CLAIM_LEASE_S",
     "CURIE_INTERNAL_WORKER_TOKEN",
     "CURIE_MODEL",
     "CURIE_PLUGIN_DIR",
