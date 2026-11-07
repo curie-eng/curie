@@ -10,7 +10,7 @@ is faked. Use it to prove any behavior that depends on who sent a turn.
 The driver is [`tools/identity-e2e/identity_e2e.py`](../../tools/identity-e2e/identity_e2e.py).
 It is standard library Python on the host. Product calls that need signing keys
 or the database run inside the release's own API pod, so they use the deployed
-build. The provider is [`tools/identity-e2e/test_idp.py`](../../tools/identity-e2e/test_idp.py)
+build. The provider is [`tools/identity-e2e/fake_idp.py`](../../tools/identity-e2e/fake_idp.py)
 and the scenarios are in [`tools/identity-e2e/identity_scenarios.py`](../../tools/identity-e2e/identity_scenarios.py).
 
 ## What you need
@@ -118,7 +118,7 @@ The default roster in `identity_e2e.py` has, all in the reserved
 4. `robot@example.test`, a service account.
 
 Any other sender is unresolved. `up --roster <file>` replaces the roster; the
-format is documented at the top of `test_idp.py`. Every lookup answer is a copy
+format is documented at the top of `fake_idp.py`. Every lookup answer is a copy
 of a recorded response from `tests/vectors/http-identity-v1.json` with only the
 request echo, issuer, subject, groups and observation times changed. The
 provider also serves the email reply endpoint and keeps a record of lookups and

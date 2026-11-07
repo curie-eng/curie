@@ -177,7 +177,7 @@ def test_the_provider_manifests_mount_what_the_command_reads() -> None:
     kinds = {item["kind"]: item for item in manifests}
     assert set(kinds) == {"ConfigMap", "Secret", "Deployment", "Service"}
     code, secret = kinds["ConfigMap"]["data"], kinds["Secret"]["data"]
-    assert code["test_idp.py"] == assets.PROVIDER_SCRIPT.read_text()
+    assert code["fake_idp.py"] == assets.PROVIDER_SCRIPT.read_text()
     assert json.loads(code["roster.json"]) == assets.DEFAULT_ROSTER
     assert "synthetic-bearer" not in json.dumps(kinds["Deployment"])
     command = kinds["Deployment"]["spec"]["template"]["spec"]["containers"][0]["command"]

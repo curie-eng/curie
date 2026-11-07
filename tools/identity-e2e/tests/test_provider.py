@@ -22,9 +22,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import fake_idp
 import identity_assets as assets
 import pytest
-import test_idp
 from curie_api.identity.http_initializer import load_provider_tls_context
 from curie_api.schemas.http_identity import (
     FactsRefusal,
@@ -54,18 +54,18 @@ def provider(tmp_path: Path) -> Iterator[SimpleNamespace]:
     os.chmod(bundle, 0o440)
     client_tls = load_provider_tls_context(str(trust))
     assert client_tls is not None
-    state = test_idp.Provider(
+    state = fake_idp.Provider(
         roster=assets.DEFAULT_ROSTER,
         vectors=VECTORS,
         bearer=BEARER,
         adapter_secret=ADAPTER_SECRET,
     )
-    lookup, sink = test_idp.serve(
+    lookup, sink = fake_idp.serve(
         state,
         host="127.0.0.1",
         lookup_port=0,
         sink_port=0,
-        tls=test_idp.server_tls(str(tmp_path / "server.pem"), str(tmp_path / "server.key")),
+        tls=fake_idp.server_tls(str(tmp_path / "server.pem"), str(tmp_path / "server.key")),
     )
     try:
         yield SimpleNamespace(
@@ -233,7 +233,7 @@ def test_the_provider_main_serves_from_its_files(tmp_path: Path) -> None:
         "--host", "127.0.0.1", "--lookup-port", "0", "--sink-port", "0",
     ]  # fmt: skip
     result: list[int] = []
-    thread = threading.Thread(target=lambda: result.append(test_idp.main(argv, wait=wait)))
+    thread = threading.Thread(target=lambda: result.append(fake_idp.main(argv, wait=wait)))
     thread.start()
     assert ready.wait(10)
     stop.set()

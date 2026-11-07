@@ -10,7 +10,7 @@ a copy of it. Every action names its target explicitly with ``--context``,
 Actions:
 
 1. ``up`` overlays HTTP identity onto an existing install: a TLS test identity
-   provider (``test_idp.py``) inside the namespace, the API's protected
+   provider (``fake_idp.py``) inside the namespace, the API's protected
    ``api-runtime.json`` Secret with an email receiver registration, a helm
    upgrade with ``--reuse-values`` that mounts it and supplies the connector
    caller signing key and the email adapter's reply secret, the tenant's HTTP

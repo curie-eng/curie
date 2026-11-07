@@ -56,7 +56,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
     # Workspace recovery reads require the 0141 outcome ledger.
     # 0149 stores webhook provenance and a wake-key generation.
-    # @spec CONNECTOR-REQUESTER-1: 0151 adds the connector requester identity columns that agent ORM reads require.
+    # @spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 requester columns.
     candidate = {"schema_min": "0151", "schema_head": "0151"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released

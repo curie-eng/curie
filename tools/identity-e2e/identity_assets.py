@@ -21,7 +21,7 @@ from typing import Any
 from identity_target import HERE, REPO, HarnessError, run
 
 VECTORS = REPO / "tests" / "vectors" / "http-identity-v1.json"
-PROVIDER_SCRIPT = HERE / "test_idp.py"
+PROVIDER_SCRIPT = HERE / "fake_idp.py"
 OWNER_LABEL = "curietech.ai/identity-e2e"
 DOMAIN = "example.test"
 INBOX_DOMAIN = "inbox.example.test"
@@ -216,7 +216,7 @@ def provider_manifests(
     """The test provider's ConfigMap, Secret, Deployment and Service."""
 
     code = {
-        "test_idp.py": PROVIDER_SCRIPT.read_text(),
+        "fake_idp.py": PROVIDER_SCRIPT.read_text(),
         "vectors.json": VECTORS.read_text(),
         "roster.json": json.dumps(roster, indent=2, sort_keys=True),
     }
@@ -267,7 +267,7 @@ def provider_manifests(
                                 "imagePullPolicy": "IfNotPresent",
                                 "command": [
                                     "python",
-                                    "/idp/code/test_idp.py",
+                                    "/idp/code/fake_idp.py",
                                     "--roster",
                                     "/idp/code/roster.json",
                                     "--vectors",
