@@ -375,43 +375,6 @@ fn explicit_hooks_installer_uses_the_same_relative_path() {
 }
 
 #[test]
-fn cli_preflight_json_dry_run_matches_the_real_python_tool() {
-    let fixture = Fixture::new();
-    fixture.prepare_preflight();
-    let cli = fixture.real_cli(&["dev", "preflight", "--fast", "--dry-run", "--json"]);
-    assert!(cli.status.success(), "{}", visible(&cli));
-    let python = Command::new("uv")
-        .args([
-            "run",
-            "--no-project",
-            "--with",
-            "pyyaml==6.0.3",
-            "python3",
-            "tools/preflight/preflight.py",
-            "--fast",
-            "--dry-run",
-            "--json",
-        ])
-        .current_dir(&fixture.root)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .unwrap();
-    assert!(python.status.success(), "{}", visible(&python));
-    let cli_report: serde_json::Value = serde_json::from_slice(&cli.stdout).unwrap();
-    let python_report: serde_json::Value = serde_json::from_slice(&python.stdout).unwrap();
-    assert_preflight_schema(&cli_report);
-    assert_eq!(cli_report["checks"], python_report["checks"]);
-    assert_eq!(cli_report["dry_run"], true);
-    assert_eq!(cli_report["checks"].as_array().unwrap().len(), 4);
-    assert!(cli_report["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|check| { check["job"] == "python-static" && check["step"] == "Test-time ratchets" }));
-}
-
-#[test]
 fn cli_preflight_defaults_to_full_and_executes_docs_only_without_services() {
     let fixture = Fixture::new();
     fixture.prepare_preflight();

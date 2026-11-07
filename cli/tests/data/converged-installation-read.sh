@@ -1,11 +1,9 @@
 # Common external-process replies for tests focused on pre-installation
 # inference/credentials. The convergence-specific consumer tests independently
 # exercise failure/secondary paths; these callers need a healthy target after
-# their existing successful Helm mutation. Do not answer helm history here:
-# this file is prepended, and a shared not-found reply would shadow fixtures
-# that classify history (gVisor retry, failed-only discard). Callers answer
-# history in their own helm fake. No earlier mutation/preflight reply or
-# assertion is changed here.
+# their existing successful Helm mutation. Only a successful Helm apply records
+# this fixture's serving state with only a Deployment. Earlier history reads still reach
+# each caller's fake, including failed-install and gVisor recovery cases.
 # Opted-in install fixtures answer the additional advisory reads without
 # replacing fixtures that exercise their own node/pod behavior. Shapes follow
 # https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/
@@ -28,6 +26,26 @@ curie_test_capacity_read() {
     return 1
 }
 case "${0##*/}:$1:${2:-}" in
+    helm:upgrade:*)
+        trap 'curie_mock_status=$?; if [ "$curie_mock_status" -eq 0 ]; then : > "${0%/*}/converged-helm-applied"; fi; exit "$curie_mock_status"' EXIT
+        ;;
+    helm:history:*)
+        if [ -f "${0%/*}/converged-helm-applied" ] && [ ! -f "${0%/*}/convergence-release-failed" ]; then
+            printf '%s\n' '[{"revision":1,"status":"deployed"}]'
+            exit 0
+        fi
+        ;;
+    helm:get:values)
+        if [ -f "${0%/*}/converged-helm-applied" ]; then
+            case " $* " in
+                *" --all "*)
+                    # The shared manifest below contains only the probe Deployment.
+                    printf '%s\n' '{"agentSandbox":{"deploy":false}}'
+                    exit 0
+                    ;;
+            esac
+        fi
+        ;;
     helm:status:*)
         if [ -f "${0%/*}/convergence-release-failed" ]; then
             printf '%s\n' '{"version":1,"info":{"status":"failed"},"hooks":[]}'

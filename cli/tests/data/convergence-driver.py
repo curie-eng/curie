@@ -125,10 +125,12 @@ def emit(value):
 
 if program == "helm":
     if args[0] == "history":
+        if (root / "helm-applied").exists():
+            emit([{"revision": 1, "status": "deployed"}])
         print("Error: release: not found", file=sys.stderr)
         sys.exit(1)
     if args[:2] == ["get", "values"]:
-        emit({"security": {"allowDevDefaults": True}})
+        emit({"security": {"allowDevDefaults": True}, "agentSandbox": {"deploy": False}})
     if args[:2] == ["get", "manifest"]:
         # JSON documents are YAML documents too; no optional YAML dependency.
         print("\n---\n".join(json.dumps(item) for item in expected))
@@ -220,6 +222,7 @@ if program == "helm":
         ]:
             print("Error: recorded install did not converge", file=sys.stderr)
             sys.exit(1)
+        (root / "helm-applied").touch()
         print("Release accepted")
         sys.exit(0)
     if args[:2] == ["show", "chart"]:

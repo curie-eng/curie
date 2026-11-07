@@ -34,6 +34,7 @@ from .test_http_receiver import (
     binding_body,
     native,
     receipt,
+    receiving,
 )
 from .test_http_receiver_dispatch import (
     DM_BINDING,
@@ -62,7 +63,7 @@ def dm_native(**changes: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     event = {key: value for key, value in event.items() if value is not _ABSENT}
     return {
         "type": "event_callback", "event_id": "EvNativeDirectSynthetic", "team_id": "T1",
-        "is_ext_shared_channel": False, "event": event,
+        "authorizations": receiving(), "is_ext_shared_channel": False, "event": event,
     }, event
 
 

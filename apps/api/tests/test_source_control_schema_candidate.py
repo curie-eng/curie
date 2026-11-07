@@ -44,9 +44,10 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
     # Workspace recovery reads require the 0141 outcome ledger.
     # The 0145 join requires both the stable deadline backport (0140) and 0144.
-    # The UI evidence reconciler reads the 0146 tables.
-    # The factory Slack progress loop reads the 0148 tables.
-    assert window == {"schema_min": "0148", "schema_head": "0148"}
+    # The UI evidence reconciler reads the 0146 tables, and the 0148 join
+    # also requires main's deleted issue cancellation (0147). The factory Slack
+    # progress loop reads the 0149 tables.
+    assert window == {"schema_min": "0149", "schema_head": "0149"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -77,7 +78,8 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.3") == {"schema_min": "0140", "schema_head": "0140"}
     assert data["windows"].get("0.14.4") == {"schema_min": "0140", "schema_head": "0140"}
-    assert data["revisions"][-30:] == [
+    assert data["revisions"][-33:] == [
+        "0095",
         "0096",
         "0097",
         "0098",
@@ -107,7 +109,9 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0144",
         "0145",
         "0146",
+        "0147",
         "0148",
+        "0149",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -134,7 +138,9 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0144"] == "expand"
     assert kinds["0145"] == "expand"
     assert kinds["0146"] == "expand"
+    assert kinds["0147"] == "expand"
     assert kinds["0148"] == "expand"
+    assert kinds["0149"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -145,6 +151,7 @@ def test_every_prior_registered_window_is_exactly_preserved() -> None:
         (Path(__file__).parent / "fixtures/source_schema_prior_windows.json").read_text()
     )
     actual = catalog()["windows"]
+    assert actual["0.15.3"] == {"schema_min": "0147", "schema_head": "0147"}
     assert {name: actual[name] for name in expected} == expected
     assert actual["0.12.1"] == {"schema_min": "0076", "schema_head": "0076"}
     # `curie dev bump-version` registers a window at the cut, so no window may
@@ -200,7 +207,9 @@ def test_released_0076_startup_refuses_without_migrating_then_0101_starts(
         get_settings.cache_clear()
 
 
-@pytest.mark.parametrize("source", ["0105", "0107", "0106", "0123", "0130", "0131", "0140", "0144"])
+@pytest.mark.parametrize(
+    "source", ["0105", "0107", "0106", "0123", "0130", "0131", "0140", "0144", "0146", "0147"]
+)
 def test_both_train_heads_upgrade_without_losing_existing_rows(
     source: str, isolated_migration_db: IsolatedMigrationDb
 ) -> None:
@@ -216,9 +225,21 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
             pass
     assert current_revision() == source
 
+    if source == "0147":
+        assert sql_rows("SELECT to_regclass('curie.publication_ui_evidence')") == [(None,)]
+    if source == "0146":
+        assert (
+            "issue_deleted"
+            not in sql_rows(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conrelid = 'curie.execution_requests'::regclass "
+                "AND conname = 'execution_requests_state_shape_ck'"
+            )[0][0]
+        )
+
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0148"
+    assert current_revision() == "0149"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]
@@ -238,6 +259,19 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
         ("publication_ui_evidence_images", "content"),
         ("publication_lineage_ui_evidence", "ref_commit_sha"),
     } <= columns
+    assert (
+        "issue_deleted"
+        in sql_rows(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conrelid = 'curie.execution_requests'::regclass "
+            "AND conname = 'execution_requests_state_shape_ck'"
+        )[0][0]
+    )
+    assert sql_rows(
+        "SELECT indexname FROM pg_indexes WHERE schemaname = 'curie' "
+        "AND indexname IN ('ix_publication_ui_evidence_status_lease', "
+        "'ix_publication_ui_evidence_lineage_id') ORDER BY indexname"
+    ) == [("ix_publication_ui_evidence_lineage_id",), ("ix_publication_ui_evidence_status_lease",)]
     assert {
         ("tenant_identity_providers", "http_selection"),
         ("tenant_identity_providers", "lifecycle_generation"),

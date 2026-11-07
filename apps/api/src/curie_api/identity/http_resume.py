@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api import identity_fence
 from curie_api.identity.http_approval import canonical_json, verified_capsule
-from curie_api.identity.http_approval_answer import check_http_approval_actor
+from curie_api.identity.http_approval_answer import approved_resume_authority
 from curie_api.identity.http_invocation import (
     HttpInvocationRuntime,
     check_http_turn_authority,
@@ -109,7 +109,10 @@ async def _check_resume(
     request: Request, check: TurnAuthorityRequestV1,
     grant: wire.ApprovalGrantExpectationV1 | None,
 ) -> TurnAuthorityResponseV1:
-    """One current boundary for a selected resume. @spec HTTP-APPROVAL-CONTINUITY-8/12."""
+    """One current boundary for a selected resume. @spec HTTP-APPROVAL-CONTINUITY-8/12.
+
+    Rejected and expired resumes check the original invoker only.
+    """
     runtime = getattr(request.app.state, "http_identity_runtime", None)
     client = getattr(request.app.state, "http_identity_client", None)
     if type(runtime) is not HttpInvocationRuntime or not isinstance(client, HttpIdentityClient):
@@ -138,22 +141,13 @@ async def _check_resume(
             row = await _read_row(session, resume.approval_id)
             if not _row_matches(runtime, row, resume, grant):
                 return turn_authority_response(check, "refuse", "invalid_context")
+            saved = None if row is None else verified_capsule(runtime, row)
     except (SQLAlchemyError, RedisError, identity_fence.IdentityWriterUnavailable):
         return turn_authority_response(check, "unavailable", "authority_unavailable")
     if resume.status == "approved":
-        # The preserved answering actor needs fresh approver authority of its own,
-        # independently of the original invoker checked below. @spec HTTP-APPROVAL-CONTINUITY-8/12.
-        try:
-            await check_http_approval_actor(
-                request, uuid.UUID(resume.approval_id),
-                approver_sets=request.app.state.approver_sets,
-            )
-        except HTTPException as error:
-            if error.status_code == 403 and error.detail == "caller_not_allowed":
-                return turn_authority_response(check, "refuse", "caller_not_allowed")
-            if error.status_code == 403:
-                return turn_authority_response(check, "refuse", "unsupported_resume")
-            return turn_authority_response(check, "unavailable", "authority_unavailable")
+        if saved is None:
+            return turn_authority_response(check, "refuse", "invalid_context")
+        return await _check_approved(request, check, runtime, resume, grant, saved)
     reason: Literal["current_authority", "invalid_context"] = "invalid_context"
     try:
         async with current_source_authority(
@@ -171,6 +165,39 @@ async def _check_resume(
             return turn_authority_response(check, "refuse", "caller_not_allowed")
         return turn_authority_response(check, "unavailable", "authority_unavailable")
     except (SQLAlchemyError, RedisError, identity_fence.IdentityWriterUnavailable):
+        return turn_authority_response(check, "unavailable", "authority_unavailable")
+    if reason == "current_authority":
+        return turn_authority_response(check, "continue", "current_authority")
+    return turn_authority_response(check, "refuse", "invalid_context")
+
+
+async def _check_approved(
+    request: Request, check: TurnAuthorityRequestV1, runtime: HttpInvocationRuntime,
+    resume: wire.ResumeContextV1, grant: wire.ApprovalGrantExpectationV1 | None,
+    saved: wire.ApprovalContextV1,
+) -> TurnAuthorityResponseV1:
+    """Both subjects of an approved resume inside one final boundary.
+
+    The composition approved-resume publication uses: a change to either
+    subject after capture is unavailable, never answered from an earlier
+    observation. @spec HTTP-APPROVAL-CONTINUITY-8/11/12.
+    """
+    reason: Literal["current_authority", "invalid_context"] = "invalid_context"
+    try:
+        async with approved_resume_authority(request.app.state)(saved) as current:
+            # The final reader still holds the unchanged protected row.
+            row = await _read_row(current.session, resume.approval_id)
+            if _row_matches(runtime, row, resume, grant):
+                reason = "current_authority"
+    except HTTPException as error:
+        if error.status_code == 403 and error.detail in {
+            "caller_not_allowed", "invalid_http_receiver",
+        }:
+            return turn_authority_response(check, "refuse", "caller_not_allowed")
+        if error.status_code == 403:
+            return turn_authority_response(check, "refuse", "unsupported_resume")
+        return turn_authority_response(check, "unavailable", "authority_unavailable")
+    except Exception:  # noqa: BLE001 - provider, credential and SQL details never cross.
         return turn_authority_response(check, "unavailable", "authority_unavailable")
     if reason == "current_authority":
         return turn_authority_response(check, "continue", "current_authority")

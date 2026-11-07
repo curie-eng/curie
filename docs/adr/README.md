@@ -275,7 +275,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0253 | [Factory base labels resolve at claim and follow relabels](0253-factory-base-labels-resolve-at-claim-and-follow-relabels.md) | Accepted |
 | 0254 | [HTTP identity applies to the channel identities an operator registers](0254-http-identity-applies-to-the-channel-identities-an-operator-registers.md) | Accepted |
 | 0255 | [Claim-backed sandbox scratch is bounded by its storage request](0255-claim-backed-sandbox-scratch-is-bounded-by-its-storage-request.md) | Draft |
-| 0256 | [Publication validates and pushes a Git object overlay](0256-publication-validates-and-pushes-a-git-object-overlay.md) | Draft |
+| 0256 | [Publication validates and pushes a Git object overlay](0256-publication-validates-and-pushes-a-git-object-overlay.md) | Accepted |
 | 0257 | [A release registers its schema window only at the cut](0257-a-release-registers-its-schema-window-only-at-the-cut.md) | Accepted |
 | 0258 | [A scheduled hook turn carries its deployment authority on HTTP identity bindings](0258-a-scheduled-hook-turn-carries-its-deployment-authority-on-http-identity-bindings.md) | Accepted |
 | 0259 | [A binding requires HTTP identity when its invocation or approver role needs HTTP facts](0259-a-binding-requires-http-identity-when-its-invocation-or-approver-role-needs-http-facts.md) | Accepted |
@@ -288,4 +288,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0266 | [Email receivers share a trusted sender domain under one namespace](0266-email-receivers-share-a-trusted-sender-domain-under-one-namespace.md) | Accepted |
 | 0267 | [An email reply answers an approval under the HTTP approver role](0267-an-email-reply-answers-an-approval-under-the-http-approver-role.md) | Accepted |
 | 0268 | [Personal subscription execution and its acceptance contract](0268-personal-subscription-execution-and-acceptance-contract.md) | Accepted |
+| 0269 | [Factory failure retries share a bounded fresh request allowance](0269-factory-failure-retries-share-a-bounded-fresh-request-allowance.md) | Accepted |
 <!-- END GENERATED: adr-index -->

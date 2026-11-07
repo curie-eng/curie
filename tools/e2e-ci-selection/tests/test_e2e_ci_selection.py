@@ -230,6 +230,15 @@ CHART_SETUP_FIXTURES = {
 
 
 CHART_SCENARIOS: dict[str, _ChartScenario] = {
+    "platform-runner-upgrade": {
+        "step": "Deployed platform runners survive both upgrade entry points",
+        "leg": "workload",
+        "inputs": [
+            "charts/curie/ci/runtime/platform-runner-upgrade-runtime.sh",
+            "cli/src/ops", "cli/src/connectors.rs", "apps/api", "apps/worker", "runner", "packages",
+            "pyproject.toml", "uv.lock",
+        ],
+    },
     "failed-first-install-retry": {
         "step": "Failed first install retry recreates data volumes",
         "inputs": [
@@ -319,15 +328,6 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
         ],
         "leg": "chart",
     },
-    "workspace-diagnostic": {
-        "step": "Workspace dependency failure reaches the terminal diagnostic",
-        "inputs": [
-            WORKLOAD_INSTALL,
-            "charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh",
-            *CHART_IMAGE_INPUTS,
-        ],
-        "leg": "workload",
-    },
     "quota-progress": {
         "step": "Quota progress regression",
         "inputs": [
@@ -358,12 +358,12 @@ CHART_IDS = tuple(sorted(CHART_SCENARIOS))
 CHART_LEGS = ("chart", "workload")
 WORKLOAD_SCENARIOS = frozenset(
     {
-        "workspace-diagnostic",
         "quota-progress",
         "connector-secret-rotation",
         "connector-apply-race",
         "failed-first-install-retry",
         "factory-resource-profile",
+        "platform-runner-upgrade",
     }
 )
 
@@ -2066,8 +2066,8 @@ def test_mixed_root_documentation_and_runtime_diff_selects_runtime_tiers(
             "connector-apply-race",
             "connector-secret-rotation",
             "factory-resource-profile",
+            "platform-runner-upgrade",
             "quota-progress",
-            "workspace-diagnostic",
         ),
         ci_policy_files=_expected_ci_policy_files("ARCHITECTURE.md", "apps/api/main.py"),
         paths=("ARCHITECTURE.md", "apps/api/main.py"),
@@ -3582,14 +3582,36 @@ def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
         step["name"]: step for step in negative_job["steps"] if isinstance(step.get("name"), str)
     }
     assert len(negative_steps) == sum("name" in step for step in negative_job["steps"])
+    disk_name = "Free disk for the disposable released upgrade cluster"
     for shared in (
         "Install Helm",
         "Install Calico so NetworkPolicy is enforced",
         "Download and verify the exact public v0.8.2 chart",
         "Write the legacy retained values fixture",
         "Write the managed attester verifier",
+        disk_name,
     ):
         assert negative_steps[shared] == named_steps[shared], shared
+    matrix_disk = next(
+        step["run"]
+        for step in jobs["e2e-cluster-upgrade-matrix"]["steps"]
+        if step.get("name") == "Free disk for the disposable upgrade matrix cluster"
+    )
+    assert named_steps[disk_name]["run"] == matrix_disk
+    assert "if" not in named_steps[disk_name]
+    for label, owner in (
+        ("e2e-released-upgrade", job),
+        ("e2e-released-upgrade-negative", negative_job),
+    ):
+        names = [step.get("name") for step in owner["steps"]]
+        disk_at = names.index(disk_name)
+        image_loads = [
+            index
+            for index, name in enumerate(names)
+            if isinstance(name, str) and name.startswith("Load ") and "image" in name
+        ]
+        assert image_loads, label
+        assert disk_at < min(image_loads), label
     negative_load = negative_steps["Load the worker image built by the ci-images job"]
     assert negative_load["uses"] == "./.github/actions/load-ci-images"
     assert negative_load["with"]["images"] == "worker"
@@ -4478,26 +4500,26 @@ def test_single_regression_proofs_run_outside_the_cluster_rung() -> None:
 
 WORKLOAD_STAGING_IF = (
     "${{ matrix.leg == 'workload' && "
-    "(contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') "
-    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') "
+    "(contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') "
-    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile')) }}"
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile') "
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade')) }}"
 )
 
 
-def test_workspace_diagnostic_reuses_the_chart_cluster_and_candidate_artifacts() -> None:
+def test_workload_leg_reuses_the_chart_cluster_and_candidate_artifacts() -> None:
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
     chart = jobs["e2e-cluster-chart-regressions"]
     assert chart["needs"] == ["rust-build", "changes", "ci-images"]
     steps = chart["steps"]
-    workspace = next(
+    quota = next(
         step
         for step in steps
-        if step.get("name") == "Workspace dependency failure reaches the terminal diagnostic"
+        if step.get("name") == CHART_SCENARIOS["quota-progress"]["step"]
     )
-    assert workspace["env"] == {
+    assert quota["env"] == {
         "CURIE_BIN": "${{ github.workspace }}/cli/target/release/curie",
         "CURIE_SCENARIO_CONTEXT": "kind-curie-e2e",
         "CURIE_SCENARIO_RUN_ID": "${{ github.run_id }}-${{ github.run_attempt }}",
@@ -4505,12 +4527,6 @@ def test_workspace_diagnostic_reuses_the_chart_cluster_and_candidate_artifacts()
         "CURIE_SCENARIO_WORKER_IMAGE": "curie-worker:wsdiag-${{ github.sha }}",
         "CURIE_SCENARIO_RUNNER_IMAGE": "curie-runner:wsdiag-${{ github.sha }}",
     }
-    commands = workspace["run"].replace("\\\n", " ")
-    assert [" ".join(line.split()) for line in commands.splitlines() if line.strip()] == [
-        "set -euo pipefail",
-        "bash tools/runtime-assertion-gate/run.sh "
-        "charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh",
-    ]
     staging_names = [
         "Download the workspace diagnostic CLI",
         "Load the workspace diagnostic candidate images",
@@ -4524,8 +4540,8 @@ def test_workspace_diagnostic_reuses_the_chart_cluster_and_candidate_artifacts()
         if step.get("name") == "Install Calico so NetworkPolicy is actually enforced"
     )
     assert calico_index < steps.index(staging[0]) < steps.index(staging[1])
-    assert steps.index(staging[1]) < steps.index(staging[2]) < steps.index(workspace)
-    assert workspace["if"] == _chart_step_if("workspace-diagnostic")
+    assert steps.index(staging[1]) < steps.index(staging[2]) < steps.index(quota)
+    assert quota["if"] == _chart_step_if("quota-progress")
     for step in staging:
         assert step["if"] == WORKLOAD_STAGING_IF, step
         assert "continue-on-error" not in step
@@ -4562,14 +4578,14 @@ def test_failed_first_install_retry_reuses_the_chart_cluster_and_candidate_artif
     ]
     assert len(matches) == 1
     retry = matches[0]
-    workspace = next(
-        step for step in steps if step.get("if") == _chart_step_if("workspace-diagnostic")
+    quota = next(
+        step for step in steps if step.get("if") == _chart_step_if("quota-progress")
     )
     # #5255 retains selection and candidate wiring while execution is disabled.
     assert retry["if"] == _chart_step_if("failed-first-install-retry")
     assert retry["if"].endswith(" && false }}")
     assert retry["timeout-minutes"] == 30
-    assert retry["env"] == workspace["env"]
+    assert retry["env"] == quota["env"]
     assert "continue-on-error" not in retry
     commands = retry["run"].replace("\\\n", " ")
     assert [" ".join(line.split()) for line in commands.splitlines() if line.strip()] == [
@@ -4592,13 +4608,13 @@ def test_factory_resource_profile_runs_on_the_workload_leg() -> None:
     matches = [step for step in steps if step.get("name") == name]
     assert len(matches) == 1
     profile = matches[0]
-    workspace = next(
-        step for step in steps if step.get("if") == _chart_step_if("workspace-diagnostic")
+    quota = next(
+        step for step in steps if step.get("if") == _chart_step_if("quota-progress")
     )
     assert profile["if"] == _chart_step_if("factory-resource-profile")
     assert profile["timeout-minutes"] == 30
     assert "continue-on-error" not in profile
-    assert profile["env"] == workspace["env"]
+    assert profile["env"] == quota["env"]
     commands = profile["run"].replace("\\\n", " ")
     assert [" ".join(line.split()) for line in commands.splitlines() if line.strip()] == [
         "set -euo pipefail",
@@ -5040,7 +5056,15 @@ def test_unrelated_changes_do_not_select_the_factory_runtime(tmp_path: Path, pat
 FRESH_INSTALL_TEST = "test_fresh_cluster_up_converges_without_rerun"
 SCRIPTED_FACTORY_LEGS = (
     ("scenario", lambda run: run == "python3 tools/factory-e2e/factory_e2e.py scripted"),
-    ("initial-binding", lambda run: INITIAL_BINDING_MODULE in run),
+    *(
+        (f"initial-binding-{index}",
+         lambda run, index=index: (
+             INITIAL_BINDING_MODULE in run
+             and f"--case-shard {index}/3" in run
+             and "--durations=0" in run
+         ))
+        for index in range(1, 4)
+    ),
     (
         "static-token-rotation",
         lambda run: run == f"uv run pytest -q -n 0 {STATIC_TOKEN_ROTATION_MODULE}",
@@ -5154,16 +5178,15 @@ def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required(tmp_p
 
     steps = job["steps"]
     registrations = [step for step in steps if INITIAL_BINDING_MODULE in step.get("run", "")]
-    assert len(registrations) == 1
-    registration = registrations[0]
+    assert len(registrations) == 3
     rotations = [step for step in steps if STATIC_TOKEN_ROTATION_MODULE in step.get("run", "")]
     assert len(rotations) == 1
     rotation = rotations[0]
     assert rotation["run"] == f"uv run pytest -q -n 0 {STATIC_TOKEN_ROTATION_MODULE}"
     assert not rotation.get("continue-on-error")
-    assert not registration.get("continue-on-error")
+    assert all(not registration.get("continue-on-error") for registration in registrations)
     pytest_steps = [step for step in steps if step.get("run", "").startswith("uv run pytest")]
-    assert len(pytest_steps) == 3
+    assert len(pytest_steps) == 5
     first_pytest = min(steps.index(step) for step in pytest_steps)
     assert any(
         step.get("uses", "").startswith("astral-sh/setup-uv@") for step in steps[:first_pytest]
@@ -5177,24 +5200,25 @@ def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required(tmp_p
         "Path(os.environ['REGISTRATION_ARGV']).write_text(json.dumps(sys.argv[1:]))\n"
     )
     uv.chmod(0o755)
-    executed = subprocess.run(
-        ["bash", "-e", "-o", "pipefail", "-c", registration["run"]],
-        cwd=tmp_path,
-        env={
-            **os.environ,
-            "PATH": f"{binaries}:{os.environ['PATH']}",
-            "REGISTRATION_ARGV": str(log),
-        },
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert executed.returncode == 0, executed.stdout + executed.stderr
-    argv = json.loads(log.read_text())
-    assert argv[:2] == ["run", "pytest"]
-    assert INITIAL_BINDING_MODULE in argv
-    assert not any(arg in argv for arg in ("-k", "-m", "--deselect"))
-    assert not any(arg.startswith(INITIAL_BINDING_MODULE + "::") for arg in argv)
+    for registration in registrations:
+        executed = subprocess.run(
+            ["bash", "-e", "-o", "pipefail", "-c", registration["run"]],
+            cwd=tmp_path,
+            env={
+                **os.environ,
+                "PATH": f"{binaries}:{os.environ['PATH']}",
+                "REGISTRATION_ARGV": str(log),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert executed.returncode == 0, executed.stdout + executed.stderr
+        argv = json.loads(log.read_text())
+        assert argv[:2] == ["run", "pytest"]
+        assert INITIAL_BINDING_MODULE in argv
+        assert not any(arg in argv for arg in ("-k", "-m", "--deselect"))
+        assert not any(arg.startswith(INITIAL_BINDING_MODULE + "::") for arg in argv)
 
 
 @pytest.mark.parametrize("exit_code", (0, 17))
@@ -5512,8 +5536,8 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
                 "connector-apply-race",
                 "connector-secret-rotation",
                 "factory-resource-profile",
+                "platform-runner-upgrade",
                 "quota-progress",
-                "workspace-diagnostic",
             ),
         ),
         (("charts/curie/templates/agent-sandbox.yaml",), False, False, CHART_IDS),
@@ -5538,8 +5562,8 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
                 "connector-readiness",
                 "connector-secret-rotation",
                 "factory-resource-profile",
+                "platform-runner-upgrade",
                 "quota-progress",
-                "workspace-diagnostic",
             ),
         ),
         (
@@ -5551,8 +5575,8 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
                 "connector-readiness",
                 "connector-secret-rotation",
                 "factory-resource-profile",
+                "platform-runner-upgrade",
                 "quota-progress",
-                "workspace-diagnostic",
             ),
         ),
         (("docs/adr/AGENTS.md",), False, False, ()),
@@ -5579,7 +5603,6 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
                 "factory-resource-profile",
                 "failed-first-install-retry",
                 "quota-progress",
-                "workspace-diagnostic",
             ),
         ),
         (("charts/curie/ci/scenarios/other-fixture.sh",), False, True, ()),
@@ -5645,8 +5668,8 @@ def test_chart_scenarios_follow_changed_inputs_and_final_tiers(
                 "connector-apply-race",
                 "connector-secret-rotation",
                 "factory-resource-profile",
+                "platform-runner-upgrade",
                 "quota-progress",
-                "workspace-diagnostic",
             ),
         ),
         (
@@ -5738,7 +5761,6 @@ def test_workload_install_change_selects_every_shared_consumer(tmp_path: Path) -
         "factory-resource-profile",
         "failed-first-install-retry",
         "quota-progress",
-        "workspace-diagnostic",
     ]
 
 
@@ -5758,8 +5780,8 @@ def test_chart_scenario_union_is_sorted_and_deduplicated(tmp_path: Path) -> None
         "connector-secret-rotation",
         "factory-resource-profile",
         "failed-first-install-retry",
+        "platform-runner-upgrade",
         "quota-progress",
-        "workspace-diagnostic",
     ]
 
 
@@ -6102,8 +6124,8 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
                 "connector-apply-race",
                 "connector-secret-rotation",
                 "factory-resource-profile",
+                "platform-runner-upgrade",
                 "quota-progress",
-                "workspace-diagnostic",
             )
     )
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == sorted((*expected, "unregistered"))
@@ -6263,7 +6285,10 @@ def test_chart_shared_workload_order_preserves_scenario_isolation() -> None:
     shared = [
         step for step in steps
         if step.get("name") in scenario_names
-        and step["name"] != CHART_SCENARIOS["failed-first-install-retry"]["step"]
+        and step["name"] not in {
+            CHART_SCENARIOS[item]["step"]
+            for item in ("failed-first-install-retry", "platform-runner-upgrade")
+        }
         and step.get("if", "").startswith("${{ matrix.leg == 'workload' && ")
     ]
     chart = [
@@ -6273,10 +6298,12 @@ def test_chart_shared_workload_order_preserves_scenario_isolation() -> None:
     ]
     assert {step["name"] for step in shared} == {
         CHART_SCENARIOS[scenario]["step"]
-        for scenario in WORKLOAD_SCENARIOS - {"failed-first-install-retry"}
+        for scenario in WORKLOAD_SCENARIOS - {
+            "failed-first-install-retry", "platform-runner-upgrade"
+        }
     }
     assert shared[0]["name"] == CHART_SCENARIOS["quota-progress"]["step"]
-    assert shared[-1]["name"] == CHART_SCENARIOS["workspace-diagnostic"]["step"]
+    assert shared[-1]["name"] == CHART_SCENARIOS["factory-resource-profile"]["step"]
     assert chart[-1]["name"] == CHART_SCENARIOS["controller-preflight"]["step"]
     install = positions["Install the shared workload platform"]
     remove = positions["Remove the shared workload platform"]
@@ -6306,3 +6333,24 @@ def test_chart_shared_workload_order_preserves_scenario_isolation() -> None:
     setup = steps[install]
     assert shlex.split(setup["run"]) == CHART_SETUP_FIXTURES[setup["name"]]
     assert "continue-on-error" not in setup and "continue-on-error" not in cleanup
+
+
+def test_platform_runner_upgrade_stages_candidate_artifacts_before_own_lifecycle() -> None:
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"][CHART_JOB]["steps"]
+    positions = {step.get("name"): index for index, step in enumerate(steps)}
+    name = CHART_SCENARIOS["platform-runner-upgrade"]["step"]
+    scenario = steps[positions[name]]
+    assert scenario["if"] == _chart_step_if("platform-runner-upgrade")
+    assert shlex.split(scenario["run"]) == [
+        "bash", "tools/runtime-assertion-gate/run.sh",
+        "charts/curie/ci/runtime/platform-runner-upgrade-runtime.sh",
+    ]
+    assert scenario["env"]["CURIE_SCENARIO_RUNNER_IMAGE"] == "curie-runner:wsdiag-${{ github.sha }}"
+    assert positions["Stage the workspace diagnostic images in kind"] < positions[name]
+    assert positions[name] < positions["Install the shared workload platform"]
+    for staging in (
+        "Download the workspace diagnostic CLI",
+        "Load the workspace diagnostic candidate images",
+        "Stage the workspace diagnostic images in kind",
+    ):
+        assert steps[positions[staging]]["if"] == WORKLOAD_STAGING_IF

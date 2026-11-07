@@ -192,6 +192,10 @@ fn matches(planned: &Value, recorded: &Value) -> bool {
     }
 }
 
+/// One Jira site has one binding. A second repository is added by hand,
+/// not by rerunning quickstart with flags that would rewrite `defaultRepo`.
+const HAND_WRITTEN_ALIAS_FIX: &str = "one Jira site has one binding; extend the existing binding by hand as docs/guides/dark-factory-quickstart.md#writing-the-values-by-hand describes, adding a repo alias and keeping `defaultRepo`; put a `repo:<alias>` label on the ticket; then bind the agent with `curie cluster surfaces <agent> --add jira=<binding> --label <label>`";
+
 /// The flags that set each compared field, for the refusal's fix.
 fn field_flags(field: &str) -> &'static str {
     match field {
@@ -253,15 +257,20 @@ pub(in crate::factory_quickstart) fn check_recorded(
             };
             let key = camel(field);
             let entry = list.trim_end_matches('s');
+            let fix = if list == "bindings" && (field == "default_repo" || field == "repos") {
+                HAND_WRITTEN_ALIAS_FIX.to_string()
+            } else {
+                format!(
+                    "rerun with {} matching factory.{list}[{name}].{key}, or change that entry on the release with helm for every Jira agent as docs/guides/dark-factory-quickstart.md shows, then rerun",
+                    field_flags(field)
+                )
+            };
             return Err(CliError::usage(format!(
                 "release {release} already has a Jira {entry} `{name}` that other agents serve, and its {key} is {} where this run would write {}; the conflicting {entry} was refused before any write",
                 shown(recorded.get(field)),
                 shown(planned.get(field)),
             ))
-            .with_fix(format!(
-                "rerun with {} matching factory.{list}[{name}].{key}, or change that entry on the release with helm for every Jira agent as docs/guides/dark-factory-quickstart.md shows, then rerun",
-                field_flags(field)
-            ))
+            .with_fix(fix)
             .into());
         }
     }
@@ -322,5 +331,43 @@ mod tests {
         assert_eq!(snake("pollIntervalSeconds"), "poll_interval_s");
         assert_eq!(camel("tracker_scope_id"), "trackerScopeId");
         assert_eq!(camel("poll_interval_s"), "pollIntervalS");
+    }
+
+    /// #4751: a second repository on an existing Jira binding is the hand
+    /// written alias route, not a flag rerun. A tracker field mismatch stays
+    /// on the flag matching fix.
+    #[test]
+    fn binding_default_repo_conflict_names_the_hand_route() {
+        let mut plan =
+            recorded_site_plan("https://acme.atlassian.net", "https://acme.atlassian.net");
+        plan.binding["defaultRepo"] = serde_json::json!("widgets");
+        plan.recorded_binding.as_mut().unwrap()["defaultRepo"] = serde_json::json!("gears");
+        let err = check_recorded(&plan, "acme").unwrap_err();
+        let cli = err.downcast_ref::<CliError>().expect("a usage error");
+        assert_eq!(cli.class.code(), 2, "{err:#}");
+        let fix = cli.fix.as_deref().unwrap_or("");
+        assert!(
+            fix.contains("docs/guides/dark-factory-quickstart.md#writing-the-values-by-hand"),
+            "{fix}"
+        );
+        assert!(fix.contains("repo:<alias>"), "{fix}");
+        assert!(fix.contains("curie cluster surfaces"), "{fix}");
+
+        let plan = recorded_site_plan(
+            "https://acme.atlassian.net/",
+            "https://acme.atlassian.net/ex/jira/cloud-1",
+        );
+        let err = check_recorded(&plan, "acme").unwrap_err();
+        let cli = err.downcast_ref::<CliError>().expect("a usage error");
+        assert_eq!(cli.class.code(), 2, "{err:#}");
+        let fix = cli.fix.as_deref().unwrap_or("");
+        assert!(
+            fix.contains("--forge-url"),
+            "a tracker conflict keeps the flag matching fix: {fix}"
+        );
+        assert!(
+            !fix.contains("writing-the-values-by-hand"),
+            "a tracker conflict does not name the hand route: {fix}"
+        );
     }
 }

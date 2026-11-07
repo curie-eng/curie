@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import math
 import sys
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from case_shards import assign_case_shards, load_durations
 
 
 @pytest.fixture(autouse=True)
@@ -23,14 +24,6 @@ def candidate_curie(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return binary
 
 
-# Contiguous collection-order shards for the serial kind regression modules.
-# Every case there provisions its own kind cluster, so a module can run as
-# parallel CI jobs. A shard is a contiguous block of ceil(total / count) cases,
-# so each case keeps the cases that precede it in the same process and the
-# shards partition the collection exactly. The split depends only on the
-# collected order, which every runner computes alike.
-
-
 def _parse_case_shard(value: str) -> tuple[int, int]:
     index_text, separator, count_text = value.partition("/")
     if not separator or not index_text.isdigit() or not count_text.isdigit():
@@ -41,18 +34,6 @@ def _parse_case_shard(value: str) -> tuple[int, int]:
     return index, count
 
 
-def case_shard_bounds(total: int, index: int, count: int) -> tuple[int, int]:
-    """The half-open collection range of shard ``index`` of ``count``."""
-
-    size = math.ceil(total / count)
-    start, end = (index - 1) * size, min(index * size, total)
-    if start >= end:
-        raise pytest.UsageError(
-            f"--case-shard {index}/{count} selects no case of {total}; lower the count"
-        )
-    return start, end
-
-
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--case-shard",
@@ -60,7 +41,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         type=_parse_case_shard,
         metavar="INDEX/COUNT",
-        help="Run one contiguous collection-order block of the selected cases.",
+        help="Run one duration-balanced shard, preserving collection order within it.",
     )
 
 
@@ -69,8 +50,17 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     shard = config.getoption("case_shard", default=None)
     if shard is None:
         return
-    start, end = case_shard_bounds(len(items), *shard)
-    deselected = items[:start] + items[end:]
+    index, count = shard
+    try:
+        assignments = assign_case_shards([item.nodeid for item in items], count, load_durations())
+    except (OSError, ValueError) as error:
+        raise pytest.UsageError(f"Cannot load case shard durations: {error}") from error
+    selected = set(assignments[index - 1])
+    if not selected:
+        raise pytest.UsageError(
+            f"--case-shard {index}/{count} selects no case of {len(items)}; lower the count"
+        )
+    deselected = [item for item in items if item.nodeid not in selected]
     if deselected:
         config.hook.pytest_deselected(items=deselected)
-    items[:] = items[start:end]
+    items[:] = [item for item in items if item.nodeid in selected]

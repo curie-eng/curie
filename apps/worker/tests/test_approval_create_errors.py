@@ -6,8 +6,13 @@ import asyncio
 
 import httpx
 import pytest
+
+# ruff: noqa: F811 (the shared harness fixture is imported and then requested)
 from curie_worker import api_retry
 from curie_worker.approvals import ApprovalBackendError, ApprovalClient, ApprovalRequest
+
+from apps.worker.tests.kernel import test_work_item_workspace as workspace
+from apps.worker.tests.kernel.conftest import make_harness  # noqa: F401
 
 
 @pytest.mark.parametrize("message", ["", "read timed out"])
@@ -53,3 +58,25 @@ def test_approval_create_timeout_retains_the_exception_type(monkeypatch, message
         assert all(attempt.content == seen[0].content for attempt in seen)
 
     asyncio.run(go())
+
+
+@pytest.mark.parametrize("code", ["publication.issue_deleted", "publication.work_item_cancelled"])
+def test_cancelled_publication_refusal_does_not_escalate(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, code: str
+) -> None:
+    monkeypatch.setattr(
+        workspace,
+        "_CANCELLED_PUBLICATION_BODY",
+        {"detail": {"code": code, "message": "the tracker issue no longer exists"}},
+    )
+    workspace.test_publication_refused_as_cancelled_settles_and_releases_the_claim(
+        make_harness, monkeypatch, caplog
+    )
+
+
+def test_unrelated_publication_error_still_escalates(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    workspace.test_publication_unprocessable_still_escalates_approval_create_failed(
+        make_harness, monkeypatch, caplog
+    )

@@ -542,7 +542,7 @@ def _patch_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _client_type(github: PollGitHub) -> type[httpx.AsyncClient]:
-    transport = httpx.MockTransport(github.handle)
+    transport = httpx.MockTransport(lambda request: github.handle(request))
 
     class _Client(httpx.AsyncClient):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -688,6 +688,55 @@ def _dispatch_state(request_id: uuid.UUID) -> dict[str, Any]:
         {"id": request_id},
     )
     return row
+
+
+@pytest.mark.parametrize("changed", [False, True], ids=["unchanged-base", "changed-base"])
+@pytest.mark.parametrize("intake", ["poll", "webhook"])
+def test_first_acquire_racing_initial_base_observation(
+    poll_factory: tuple[TestClient, PollGitHub],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    changed: bool,
+    intake: str,
+) -> None:
+    client, github = poll_factory
+    _reconfigure(
+        monkeypatch,
+        tmp_path,
+        bindings=[github_repository_binding(bases=["main", "next"], default_base="main")],
+    )
+    if intake == "poll":
+        number = github.plant_issue()
+        _run_once(github)
+        [row] = _requests(number)
+    else:
+        number, row = _admit_label(client, github)
+    original = github.handle
+    observed = False
+
+    async def observe_during_branch_read(request: httpx.Request) -> httpx.Response:
+        nonlocal observed
+        response = original(request)
+        if request.url.path == f"/repos/{REPO}/git/ref/heads/main" and not observed:
+            observed = True
+            if changed:
+                github.issues[number].base_labels = ("base:next",)
+            github._etags["issues"] = f'"observe-base-{number}"'
+            await _run_once_async(github)
+        return response
+
+    monkeypatch.setattr(github, "handle", observe_during_branch_read)
+    acquired = _acquire(client, row["id"])
+
+    assert observed
+    if changed:
+        assert acquired.status_code == 409, acquired.text
+        assert acquired.json()["detail"]["code"] == "not_dispatchable"
+        assert _requests(number)[0]["base_branch"] is None
+        assert _dispatch_state(row["id"])["acquire_owner"] is None
+    else:
+        assert acquired.status_code == 200, acquired.text
+        assert _requests(number)[0]["base_commit"] == _MAIN_SHA
 
 
 def test_poll_admits_a_young_labeled_issue_once(

@@ -1,9 +1,9 @@
-"""Migration 0148 adds factory Slack run threads and their owed posts (#5414).
+"""Migration 0149 adds factory Slack run threads and their owed posts (#5414).
 
-The downgrade to 0146 refuses, before any DDL, while progress state or a
+The downgrade to 0148 refuses, before any DDL, while progress state or a
 destination exists: dropping it would lose owed posts and the roots a
 re-upgrade needs to resume each thread. With none, it removes exactly the two
-tables and the two agent columns, and 0148 applies again.
+tables and the two agent columns, and 0149 applies again.
 """
 
 from __future__ import annotations
@@ -21,8 +21,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-REVISION = "0148"
-BELOW = "0146"
+REVISION = "0149"
+BELOW = "0148"
 TABLES = {"factory_slack_threads", "factory_slack_posts"}
 AGENT_COLUMNS = {"factory_slack_channel", "factory_slack_since"}
 CHANNEL = "C0EXAMPLE1"
@@ -61,7 +61,7 @@ def _agent(agent_id: uuid.UUID, channel: str | None = None) -> Statement:
         "INSERT INTO curie.agents (id, name, factory_slack_channel, factory_slack_since) "
         "VALUES (:id, :name, CAST(:channel AS text), "
         "CASE WHEN CAST(:channel AS text) IS NULL THEN NULL ELSE now() END)",
-        {"id": agent_id, "name": f"m0148-{agent_id.hex[:8]}", "channel": channel},
+        {"id": agent_id, "name": f"m0149-{agent_id.hex[:8]}", "channel": channel},
     )
 
 
@@ -186,7 +186,7 @@ def _catalog(*extra: Statement) -> tuple[Catalog, list[list[dict[str, Any]]]]:
 
 
 @pytest.mark.parametrize("seed", sorted(SEEDS))
-def test_0148_downgrade_refuses_while_progress_state_or_a_destination_exists(
+def test_0149_downgrade_refuses_while_progress_state_or_a_destination_exists(
     isolated_migration_db: IsolatedMigrationDb, seed: str
 ) -> None:
     config = alembic_config()
@@ -207,7 +207,7 @@ def test_0148_downgrade_refuses_while_progress_state_or_a_destination_exists(
     assert after == before
 
 
-def test_0148_downgrade_without_state_removes_the_tables_and_columns_and_reapplies(
+def test_0149_downgrade_without_state_removes_the_tables_and_columns_and_reapplies(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     config = alembic_config()

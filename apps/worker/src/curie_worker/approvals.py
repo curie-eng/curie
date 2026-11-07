@@ -770,9 +770,18 @@ class ApprovalClient:
         if refusal is not None:
             raise WorkspaceSelectionRefused(refusal)
         if response.status_code not in (200, 201):
+            refusal = _coded_refusal(response)
+            if (
+                response.status_code == 409
+                and refusal is not None
+                and refusal.startswith("publication.issue_deleted:")
+            ):
+                refusal = "publication.work_item_cancelled:" + refusal.removeprefix(
+                    "publication.issue_deleted:"
+                )
             raise ApprovalBackendError(
                 f"publication create failed: HTTP {response.status_code}: {response.text}",
-                refusal=_coded_refusal(response),
+                refusal=refusal,
             )
         try:
             body = response.json()

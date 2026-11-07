@@ -223,6 +223,22 @@ def _qualified(scope: HttpReceiverScopeV1, client: WebClient) -> None:
         raise ValueError("invalid_http_receiver_runtime")
 
 
+def _received_by(body: dict[str, Any], bot_user_id: str) -> bool:
+    """The envelope's own authorization names this receiver's bot user.
+
+    Bolt's bot context comes from the configured bot token, so it cannot reveal
+    an app token paired with another app's bot token; the authorization is set
+    by the app whose connection received the delivery. @spec HTTP-INVOCATION-EXECUTION-19.
+    """
+    authorizations = body.get("authorizations")
+    if type(authorizations) is not list or not authorizations:
+        return False
+    first = authorizations[0]
+    return (
+        type(first) is dict and first.get("is_bot") is True
+        and first.get("user_id") == bot_user_id
+    )
+
 def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """@spec HTTP-INVOCATION-EXECUTION-19."""
     result: dict[str, Any] = {}
@@ -411,6 +427,7 @@ class HttpReceiverRuntime:
                 or event.get("bot_id")
                 or event.get("subtype") in NON_CONTENT_SUBTYPES
                 or slack_identity != scope.channel_identity_name or bot_user_id != scope.bot_user_id
+                or not _received_by(body, scope.bot_user_id)
             ):
                 return None
             channel = event.get("channel")

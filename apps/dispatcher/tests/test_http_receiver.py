@@ -82,6 +82,14 @@ def binding_body(**changes: Any) -> dict[str, Any]:
     }
 
 
+def receiving(user_id: str = "U0BOT", **changes: Any) -> list[dict[str, Any]]:
+    """@spec HTTP-INVOCATION-EXECUTION-19: the measured authorization of the receiving app."""
+    return [{
+        "enterprise_id": None, "team_id": "T1", "user_id": user_id, "is_bot": True,
+        "is_enterprise_install": False, **changes,
+    }]
+
+
 def native() -> tuple[dict[str, Any], dict[str, Any]]:
     """@spec HTTP-INVOCATION-EXECUTION-19: native shape already exercised by dispatcher fixtures."""
     event = {
@@ -98,6 +106,7 @@ def native() -> tuple[dict[str, Any], dict[str, Any]]:
         "type": "event_callback",
         "event_id": "EvNativeSynthetic",
         "team_id": "T1",
+        "authorizations": receiving(),
         "is_ext_shared_channel": False,
         "event": event,
     }, event
@@ -358,6 +367,39 @@ def test_invalid_or_unsupported_delivery_refuses_before_http(damage: str) -> Non
         # A group DM is never a direct-message source. @spec HTTP-INVOCATION-EXECUTION-26.
         event.update(type="message", channel_type="mpim")
     result = runtime.submit(**kwargs)
+    assert result.status == "refused" and result.stream_id is None
+    assert rig.requests == []
+
+
+@pytest.mark.parametrize(
+    "authorizations",
+    [
+        None,
+        [],
+        receiving("U0EXAMPLEOTHERBOT"),
+        receiving(is_bot=False),
+        receiving(is_bot="true"),
+        [{"team_id": "T1", "is_bot": True}],
+        "U0BOT",
+    ],
+    ids=["absent", "empty", "other-bot", "not-bot", "bot-flag-text", "no-user", "not-list"],
+)
+def test_a_delivery_received_by_another_app_refuses_before_http(authorizations: Any) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-19: the envelope must name the registered bot user.
+
+    Bolt's bot context comes from the configured bot token, so it still says this
+    receiver's bot when the connection's app token belongs to another app. Only
+    the envelope's own authorization names the app that received the delivery.
+    """
+    module = api()
+    rig = HttpRig()
+    runtime = rig.runtime(module)
+    body, event = native()
+    if authorizations is None:
+        body.pop("authorizations")
+    else:
+        body["authorizations"] = authorizations
+    result = runtime.submit(body=body, event=event, slack_identity=NAME, bot_user_id=BOT)
     assert result.status == "refused" and result.stream_id is None
     assert rig.requests == []
 

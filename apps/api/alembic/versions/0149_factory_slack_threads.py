@@ -6,8 +6,8 @@ last set, so only runs live from then on are posted. ``factory_slack_threads``
 binds one WorkItem to one Slack root for its whole life, and
 ``factory_slack_posts`` is the durable outbox of messages owed to that root.
 
-Revision ID: 0148
-Revises: 0146
+Revision ID: 0149
+Revises: 0148
 """
 
 from collections.abc import Sequence
@@ -16,8 +16,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0148"
-down_revision: str = "0146"
+revision: str = "0149"
+down_revision: str = "0148"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 S = "curie"

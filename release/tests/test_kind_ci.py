@@ -46,12 +46,29 @@ REQUIRED = frozenset(
         *(f"E2E chart runtime regressions (kind, Calico, {leg})" for leg in ("chart", "workload")),
         *(
             f"E2E scripted factory (kind, scripted model, {suite})"
-            for suite in ("scenario", "initial-binding", "static-token-rotation", "fresh-install")
+            for suite in (
+                "scenario", "initial-binding-1", "initial-binding-2", "initial-binding-3",
+                "static-token-rotation", "fresh-install",
+            )
         ),
-        *(f"Admitted agent runtime regressions (kind, shard {n}/5)" for n in range(1, 6)),
+        *(f"Admitted agent runtime regressions (kind, shard {n}/7)" for n in range(1, 8)),
         *(f"E2E cluster upgrade matrix ({shard})" for shard in SHARDS),
     ]
 )
+
+# The recorded API shapes predate #5398. Model the new matrix names separately
+# so the historical capture retains its original identity and observations.
+CURRENT_JOBS = [
+    job for job in HISTORY["jobs"]
+    if not job["name"].startswith((
+        "E2E scripted factory (kind, scripted model, initial-binding)",
+        "Admitted agent runtime regressions (kind, shard ",
+    ))
+] + [
+    {"name": name, "status": "completed", "conclusion": "success"}
+    for name in sorted(REQUIRED)
+    if "initial-binding-" in name or name.startswith("Admitted agent runtime regressions")
+]
 
 GH = r'''#!/usr/bin/env python3
 import json, os, sqlite3, sys, time
@@ -118,7 +135,7 @@ class GitHub:
         for ref in (TAG, COMMIT):
             self.reply(f"{PREFIX}/commits/{ref}", HISTORY["commit"])
         self.history([HISTORY["run"]])
-        self.jobs(HISTORY["run"]["id"], HISTORY["jobs"])
+        self.jobs(HISTORY["run"]["id"], CURRENT_JOBS)
         # https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event
         self.reply(DISPATCH, {"workflow_run_id": RUN_ID, "html_url": RUN_URL}, method="POST")
         self.reply(STATUS, {"status": "completed", "conclusion": "success"})
@@ -193,7 +210,7 @@ def reasons(
     return cast(
         list[str],
         module.qualification_reasons(
-            HISTORY["run"] if run is None else run, HISTORY["jobs"] if jobs is None else jobs,
+            HISTORY["run"] if run is None else run, CURRENT_JOBS if jobs is None else jobs,
             candidate_tree=tree, target_tree=TREE, required_names=REQUIRED,
         ),
     )
@@ -220,9 +237,14 @@ def test_canonical_required_jobs_ignore_environment_override(
 ) -> None:
     monkeypatch.setenv("CURIE_E2E_SHARDS_OVERRIDE", "s01 nosetup fresh-n")
     assert kind_ci.required_job_names(ROOT, deadline=time.monotonic() + 8) == REQUIRED
-    assert len(REQUIRED) == 36
+    assert len(REQUIRED) == 40
     assert len(HISTORY["jobs"]) == 80
+    assert len(CURRENT_JOBS) == 84
     assert reasons(kind_ci) == []
+
+
+def test_pre_sharding_recording_does_not_prove_current_matrix(kind_ci: ModuleType) -> None:
+    assert reasons(kind_ci, jobs=HISTORY["jobs"])
 
 
 @pytest.mark.parametrize(
@@ -247,7 +269,7 @@ def test_invalid_or_unavailable_shard_listing_fails_closed(
 def test_each_required_job_must_supply_complete_success(
     kind_ci: ModuleType, name: str, state: str
 ) -> None:
-    jobs = deepcopy(HISTORY["jobs"])
+    jobs = deepcopy(CURRENT_JOBS)
     job = next(job for job in jobs if job["name"] == name)
     if state == "missing":
         jobs.remove(job)
@@ -279,7 +301,7 @@ def test_smoke_or_unresolved_upgrade_matrix_is_insufficient(
     kind_ci: ModuleType, smoke_only: bool
 ) -> None:
     jobs = [
-        job for job in HISTORY["jobs"]
+        job for job in CURRENT_JOBS
         if not job["name"].startswith("E2E cluster upgrade matrix (")
     ]
     jobs.append({
@@ -366,7 +388,7 @@ def test_select_follows_run_and_job_pagination(github: GitHub, late_success: boo
         [{**HISTORY["run"], "id": n, "conclusion": "failure"} for n in range(1, 101)], total=101
     )
     github.history([HISTORY["run"]], page=2, total=101)
-    jobs = deepcopy(HISTORY["jobs"])
+    jobs = deepcopy(CURRENT_JOBS)
     late = jobs.pop(next(i for i, job in enumerate(jobs) if job["name"] == "E2E required"))
     jobs += [
         {"name": f"unrelated {n}", "status": "completed", "conclusion": "skipped"}
@@ -386,7 +408,7 @@ def test_selector_does_not_combine_incomplete_runs(github: GitHub) -> None:
     runs = [{**HISTORY["run"], "id": n} for n in (1001, 1002)]
     github.history(runs)
     for run, missing in zip(runs, sorted(REQUIRED), strict=False):
-        github.jobs(run["id"], [job for job in HISTORY["jobs"] if job["name"] != missing])
+        github.jobs(run["id"], [job for job in CURRENT_JOBS if job["name"] != missing])
     result = github.cli("select")
     assert result.returncode == 3, result.stderr
     assert json.loads(result.stdout)["selected_run_id"] is None

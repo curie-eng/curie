@@ -4,6 +4,12 @@ Date: 2026-10-06
 
 Status: Accepted
 
+**Partially amended by [ADR 0269](0269-factory-failure-retries-share-a-bounded-fresh-request-allowance.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+the Decision and point 4 now spend a shared two-successor allowance per WorkItem
+instead of counting consecutive owner losses. The teardown-based owner-loss
+exception, fresh-request shape and all other guarantees stand.
+
 Amends [ADR 0157](0157-factory-work-dispatches-from-sql-over-the-runs-stream.md)
 D5 and builds on
 [ADR 0162](0162-work-items-own-durable-execution-identity.md).

@@ -1647,6 +1647,9 @@ class WorkerConfig(BaseSettings):
         """
         return f"{self.key_prefix}:delivery:{stream}:{group}:{entry_id}"
 
+    def capacity_thread_order_key(self, thread_key: str) -> str:
+        return f"{self.key_prefix}:capacity_wait:thread:{thread_key}"
+
     def completion_key(self, event_id: str) -> str:
         # The durable outbox record for this event's ``turn.completed``. NO TTL:
         # a payload that expires under a longer-lived set membership is a
