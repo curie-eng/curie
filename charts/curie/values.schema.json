@@ -401,10 +401,9 @@
           "description": "Overall wall-clock deadline for one delivery (ADR-0131). The shipped default is 10800 (a three hour run). Below 60s a budget cannot cover claim + one runner request + settle; at most 43200s (twelve hours, the factory maximum execution deadline, #5067). The rendered termination grace follows it: max(terminationGracePeriodSeconds, this + deliveryShutdownReserveSeconds). runnerTotalTimeoutSeconds must be no greater than deliveryBudgetSeconds."
         },
         "hookClaimLeaseSeconds": {
-          "type": ["integer", "null"],
-          "minimum": 1,
-          "maximum": 43200,
-          "description": "Optional cron claim lease in seconds, rendered as CURIE_HOOK_CLAIM_LEASE_S on the API and the worker only when set. Null leaves the variable unset so the process uses worker.deliveryBudgetSeconds. An integer from 1 through 43200. No cross-field check against the budget; the process refuses a shorter lease at boot."
+          "type": ["number", "null"],
+          "exclusiveMinimum": 0,
+          "description": "Optional cron claim lease in seconds, rendered as CURIE_HOOK_CLAIM_LEASE_S on the API and the worker only when set. Null leaves the variable unset so the process uses worker.deliveryBudgetSeconds. A positive number with no chart maximum, matching the released worker. The process refuses a lease shorter than the delivery budget at boot. There is no cross-field check in the schema."
         },
         "runnerTotalTimeoutSeconds": {
           "type": "number",

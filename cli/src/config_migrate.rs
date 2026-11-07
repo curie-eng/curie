@@ -81,7 +81,7 @@ const EXTRA_ENV_SUCCESSORS: &[(&str, &str, Coerce)] = &[
     (
         "CURIE_HOOK_CLAIM_LEASE_S",
         "worker.hookClaimLeaseSeconds",
-        Coerce::Integer,
+        Coerce::Number,
     ),
     (
         "CURIE_SLACK_TRUSTED_ORIGINS",
