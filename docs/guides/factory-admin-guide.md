@@ -41,12 +41,13 @@ Install the local skills in the repository checkout:
 curie factory skills install --help && curie factory skills install --agent codex
 ```
 
-If `skills` is unrecognized, use the
+Replace `codex` with `claude-code`, `copilot`, `gemini`, or `cursor`
+for your client. If `skills` is unrecognized, use the
 [source checkout instructions](factory-preparation.md#install-from-a-source-checkout).
 Then ask for a proposal:
 
 ```text
-$factory-environment-setup <repository binding>
+Use the factory-environment-setup skill to review <repository binding>.
 ```
 
 The skill compares repository checks and recent work with the runner image.
@@ -62,7 +63,8 @@ curie cluster work-items --agent dark-factory
 ```
 
 ```text
-$factory-environment-maintenance <factory> over the last 30 days
+Use the factory-environment-maintenance skill to review <factory>
+over the last 30 days.
 ```
 
 Review grouped failures and a proposed repair. Image tools belong in the

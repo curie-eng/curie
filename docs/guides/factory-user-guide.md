@@ -27,16 +27,17 @@ use their provider quickstart.
    curie factory skills install --help && curie factory skills install --agent codex
    ```
 
-   If `skills` is unrecognized, use the
+   Replace `codex` with `claude-code`, `copilot`, `gemini`, or `cursor`
+   for your client. If `skills` is unrecognized, use the
    [source checkout instructions](factory-preparation.md#install-from-a-source-checkout).
    Installation does not deploy the factory.
 
-2. **Prepare the issue** in Codex:
+2. **Prepare the issue** in your coding agent:
 
    ```text
-   $prepare-factory-ticket Add greeting.md with exactly
-   "# Hello, factory" and a final newline. Verify with:
-   printf '# Hello, factory\n' | cmp - greeting.md
+   Use the prepare-factory-ticket skill to add greeting.md with exactly
+   "# Hello, factory" and a final newline. Include this verification command:
+   `printf '# Hello, factory\n' | cmp - greeting.md`
    ```
 
    Review the full issue. For existing work, give the skill the issue URL.
@@ -56,7 +57,7 @@ use their provider quickstart.
 5. **Verify the PR.** Open its link and run:
 
    ```text
-   $review-pr <pr-url>
+   Use the review-pr skill to inspect <pr-url> and guide my local checks.
    ```
 
    Compare the diff with the issue, inspect CI, and run local checks. For
