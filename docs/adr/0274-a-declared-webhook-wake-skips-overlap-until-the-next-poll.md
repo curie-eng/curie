@@ -4,6 +4,9 @@ Date: 2026-11-05
 
 Status: Accepted
 
+Accepted on 2026-11-07 with explicit maintainer approval from Brian Conn,
+before implementation.
+
 This decision amends [ADR 0079](0079-inbound-triggers-as-a-new-event-kind.md),
 [ADR 0099](0099-hooks-are-bundle-declared-turns-the-system-starts.md), and
 [ADR 0258](0258-a-scheduled-hook-turn-carries-its-deployment-authority-on-http-identity-bindings.md)

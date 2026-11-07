@@ -4,7 +4,8 @@ Date: 2026-11-05
 
 Status: Accepted
 
-Accepted with explicit maintainer approval. Implementation follows
+Accepted on 2026-11-07 with explicit maintainer approval from Brian Conn,
+before implementation. Implementation follows
 [ADR 0085](0085-acceptance-not-implementation-authorizes-an-adr.md) and
 [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
 The realizing changes and required evidence below remain required.
