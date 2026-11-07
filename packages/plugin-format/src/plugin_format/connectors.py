@@ -51,6 +51,7 @@ from .reserved_env import SECRET_NAME_RE, is_reserved_boot_env_name
 # (the deploy validator, the approval-policy gate-name derivation, the API's
 # bundle reader) names one constant rather than its own copy of the string.
 CONNECTORS_FILE = "connectors.yaml"
+HOOK_WAKE_KEY_ENV: Final = "CURIE_HOOK_WAKE_KEY"
 
 # A connector name becomes a Kubernetes object name and a DNS label, so it is
 # held to the stricter of those: lowercase alphanumeric and dashes, starting and
@@ -875,6 +876,40 @@ def _validate_build(
             )
 
 
+def _validate_wake_key_role(where: str, spec: ConnectorSpec, errors: list[tuple[str, str]]) -> None:
+    if spec.bearer_secret == HOOK_WAKE_KEY_ENV:
+        errors.append(
+            ("connectors.wake_key_bearer", f"{where}: the wake key cannot be an MCP bearer")
+        )
+    invalid_secret = any(
+        (isinstance(secret, str) and secret == HOOK_WAKE_KEY_ENV)
+        or (
+            isinstance(secret, SecretRef)
+            and secret.name == HOOK_WAKE_KEY_ENV
+            and not spec.is_hosted
+        )
+        for secret in spec.secrets
+    )
+    expanded = [spec.url or "", spec.unhosted_url or "", *spec.headers.values()]
+    if spec.bearer_secret != HOOK_WAKE_KEY_ENV:
+        expanded.append(spec.bearer_secret or "")
+    if (
+        invalid_secret
+        or HOOK_WAKE_KEY_ENV in spec.secret_files
+        or HOOK_WAKE_KEY_ENV in spec.sealed_secrets
+        or HOOK_WAKE_KEY_ENV in spec.config
+        or HOOK_WAKE_KEY_ENV in spec.env
+        or any(HOOK_WAKE_KEY_ENV in text for text in expanded)
+    ):
+        errors.append(
+            (
+                "connectors.wake_key_delivery",
+                f"{where}: deliver the wake key only through a hosted secrets SecretRef; "
+                "it cannot enter client configuration or the per-agent secret store",
+            )
+        )
+
+
 def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[str, str]]]:
     """Validate parsed ``connectors.yaml`` content.
 
@@ -1281,9 +1316,16 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
         # credential resolved from their environment or vault and handed to the
         # bundle's own container, and at the skill tier that happens before this
         # validator ever runs.
-        declared_names = [s if isinstance(s, str) else s.name for s in spec.secrets]
-        declared_names += list(spec.secret_files)
-        for declared_name in declared_names:
+        _validate_wake_key_role(where, spec, errors)
+        declared_names = [
+            (
+                s if isinstance(s, str) else s.name,
+                isinstance(s, SecretRef) and s.name == HOOK_WAKE_KEY_ENV and spec.is_hosted,
+            )
+            for s in spec.secrets
+        ]
+        declared_names += [(name, False) for name in spec.secret_files]
+        for declared_name, connector_only_wake_key in declared_names:
             if not SECRET_NAME_RE.match(declared_name):
                 errors.append(
                     (
@@ -1294,7 +1336,7 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                         "outside that shape can never bind",
                     )
                 )
-            elif is_reserved_boot_env_name(declared_name):
+            elif is_reserved_boot_env_name(declared_name) and not connector_only_wake_key:
                 errors.append(
                     (
                         "connectors.secret_name_reserved",

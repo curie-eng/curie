@@ -128,6 +128,7 @@ mod github_app_input_validation;
 mod github_app_sandbox_reconciliation;
 mod guide;
 mod hook_fire;
+mod hook_wake;
 mod hooks_operator;
 mod installation_plan_parity;
 mod json_contract;

@@ -125,8 +125,8 @@ class TriggerDeclaration(BaseModel):
 
     ``type`` is ``cron`` or ``webhook``. ``name``, ``timezone``, ``target``, and
     ``prompt`` are optional. ``validate_bundle`` enforces the ADR-0099 cron shape
-    (non-empty name and prompt, five-field schedule) while a webhook stays
-    ``{type, path}``.
+    and the ADR-0274 explicit webhook wake shape. Other webhooks retain their
+    existing ``{type, path}`` contract.
     """
 
     model_config = _LENIENT
@@ -141,6 +141,7 @@ class TriggerDeclaration(BaseModel):
     target: str | None = None
     prompt: str | None = None
     path: str | None = None
+    wake: bool = Field(default=False, strict=True)
 
 
 class ApprovalGate(BaseModel):

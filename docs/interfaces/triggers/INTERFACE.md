@@ -328,6 +328,270 @@ not built (#3666), so a declared webhook validates its shape but does not yet wi
 only while its source has never been configured; the source-authentication fence above
 still applies.
 
+## Declared webhook wake contract (ADR 0274)
+
+This section freezes the wire contract for the dependent API, operator and
+worker slices. Declaration validation and the runtime declaration reader are
+implemented; the routes, generation storage, admission, deploy receipts and
+runtime credential-isolation proof described here still require those slices.
+It does not claim that a declared wake can execute yet. Ordinary and protected
+ingress retain their existing contracts.
+
+### Declaration and credential role
+
+Only a `webhook` with literal `wake: true` opts in. Its `name` is required,
+matches `[a-z0-9][a-z0-9._-]{0,62}` in full, and is used exactly as written.
+Its standing `prompt` must be nonblank and `target` must be absent, including
+no null or blank value. `path` remains required and nonblank under #3666; it
+may differ from `name` and does not select the wake route. Names remain unique
+across all named triggers, including cron, using the existing stripped,
+case-sensitive duplicate check. No new trigger type or generated prompt exists.
+
+Omitted `wake` and literal `wake: false` retain path-only and prompt-bearing
+webhook behavior. The optional model field defaults to false; null, strings
+and numbers are refused. Unknown extension fields remain allowed. Previously
+unmodeled, nonboolean `wake` values therefore become invalid. Cron selection
+remains cron-only; a wake declaration creates no timer.
+
+`plugin_format.validate.load_wake_triggers` shares the deploy trigger rules.
+`apps/api/src/curie_api/bundles.py::read_manifest_wake_triggers` requires a
+readable, well-formed manifest and returns only explicit wake declarations
+keyed by exact name. It refuses invalid trigger lists and duplicate names,
+including malformed sibling cron declarations, rather than silently returning
+no authority. An invalid stored bundle must be corrected by deployment.
+The existing raw cron reader is unchanged. The connector-build entrypoint
+also validates wake declarations when a manifest exists, even without
+`connectors.yaml`; malformed manifest JSON or trigger shapes now refuse that
+build. Connector-only build directories may still omit a manifest.
+
+The connector environment role is exactly `CURIE_HOOK_WAKE_KEY`. Deliver it
+only through a hosted connector's `secrets` `SecretRef.from_secret`:
+
+```yaml
+connectors:
+  queue-reader:
+    image: ghcr.io/acme-corp/queue-reader:1
+    env:
+      WAKE_URL: https://api.example.com/hooks/00000000-0000-4000-8000-000000000001/queue-ready/wake
+    secrets:
+      - name: CURIE_HOOK_WAKE_KEY
+        from_secret: acme-wake-credential
+        key: key
+```
+
+Each connector instance holds the key matching its configured wake URL;
+separate instances can hold
+different hooks' keys using the same environment name and different Secret
+references. Multiple wake declarations are permitted.
+
+Both deploy validators refuse that role as an explicit or inferred
+`bearer_secret`, including a same-named plain string secret. The role is also
+refused in plain secrets, `secret_files`, `sealed_secrets`, `config`, direct
+`env` assignment, remote connector secrets, or references in `url`,
+`unhosted_url`, headers and bearer configuration. A separately named client
+bearer and `no_client_auth` keep their meanings. The existing reserved
+`CURIE_` fences for manifest secrets, API secret maps, worker injection and
+Helm stay intact. No sealing path is introduced. Only authorized key retrieval
+and the connector's own Secret delivery may expose the clear key; sandbox
+environment, MCP headers/results, deploy receipts, logs and traces must not.
+Renderer and sandbox-boot verification remains part of the later integration
+slice, including the remaining half of ADR acceptance item 1.
+
+### Wake request and exact signing bytes
+
+The route is `POST /hooks/{agent_id}/{hook}/wake`. `agent_id` is a canonical
+lowercase, hyphenated UUID; `hook` is the exact declaration name. There are no
+query parameters. The body is exactly the two UTF-8 bytes `{}`. Whitespace,
+additional keys and every other JSON shape are refused. Content-Type does not
+select parsing or signing behavior. In particular the request never supplies
+a target, prompt, tools, tool policy, reply coordinates or human identity.
+
+Use the existing `apps/api/src/curie_api/hook_signing.py` header spellings:
+
+| Header | Required value |
+| --- | --- |
+| `X-Curie-Timestamp` | 1 to 12 ASCII decimal digits for Unix seconds. Leading zeroes are accepted and signed verbatim. |
+| `X-Curie-Delivery-Id` | 1 to 128 ASCII letters, digits, underscores or hyphens, freshly chosen per wake attempt. |
+| `X-Curie-Signature-256` | `sha256=` followed by 64 lowercase hexadecimal HMAC-SHA256 digits. |
+
+The server accepts a timestamp only when its absolute difference from server
+Unix time is at most `hook_signing.TOLERANCE_S`, exactly 300 seconds, including
+both boundaries. Missing or malformed headers have the same 401 as any invalid
+credential. Compare signature bytes in constant time.
+
+Let `C` be the ASCII encoding of compact JSON `[agent_id,hook]`, with no spaces
+and ASCII escaping, equivalent to Python
+`json.dumps([agent_id, hook], ensure_ascii=True, separators=(",", ":"))`.
+Let `L` be the canonical ASCII decimal byte length of `C`. The signed material
+is exactly this concatenation, with no final newline:
+
+```text
+ASCII("curie.hook.wake.v1") || 0x0a ||
+ASCII(timestamp) || ASCII(".") || ASCII(delivery_id) || ASCII(".") ||
+ASCII(L) || ASCII(":") || C || raw_body
+```
+
+`||` means byte concatenation. HMAC-SHA256 uses the UTF-8 bytes of the returned
+derived key string, without decoding it from base64url. The signature header
+is `sha256=` plus the lowercase hexadecimal digest. The exact body bytes,
+timestamp spelling, delivery id, agent and hook are all bound. The wake prefix
+is distinct from ordinary `curie.hook.delivery.v2` and protected support
+signing; neither route's material can authenticate a wake, or vice versa.
+There is no shared-agent-key or protected-source-key fallback.
+
+### Key derivation and administration
+
+The installation signing key is exactly `get_settings().api_key`, the same
+setting used by `get_hook_secret`. Let `G` be the stored generation integer
+for this agent and exact hook, initially 1 and bounded by `1 <= G <= 2^63-1`.
+Its encoding is canonical ASCII decimal, with no sign or leading zeroes.
+The derivation material is exactly:
+
+```text
+ASCII("curie.hook.wake.key.v1:") || ASCII(agent_id) || ASCII(":") ||
+ASCII(hook) || ASCII(":") || ASCII(G)
+```
+
+Compute HMAC-SHA256 keyed by UTF-8 installation-key bytes over these bytes;
+return the 32 digest bytes encoded as RFC 4648 base64url with all `=` padding
+removed. Store only the generation. Never store or return the installation key.
+The fixed vectors and independent test reference are in
+`tests/vectors/hook-wake-signing.json` and
+`packages/plugin-format/tests/test_hook_wake_signing.py`.
+
+Both administrative operations use the same platform-key or live-console
+authority as `apps/api/src/curie_api/routers/agents.py::get_hook_secret`,
+with `Cache-Control: no-store` on their responses. A wake signature does not
+authorize either operation. No query parameters or request body are accepted.
+
+| Operation | Success schema and exact fields |
+| --- | --- |
+| `GET /agents/{agent_id}/hooks/{hook}/wake-secret` | 200 `HookWakeSecretOut`: `{"agent_id":"<uuid>","hook":"<name>","generation":1,"secret":"<unpadded-base64url>"}` |
+| `POST /agents/{agent_id}/hooks/{hook}/wake-secret/rotate` | 200 `HookWakeRotationOut`: `{"agent_id":"<uuid>","hook":"<name>","generation":2}` |
+
+Every listed field is required; no extra fields are emitted. `agent_id` and
+`hook` are strings, `generation` is an integer, and `secret` is a string.
+Repeated reads reproduce the current key. Rotation increments generation under
+the same source/admission gate and invalidates the old key immediately, with
+no overlap. Its response carries no secret; use GET to retrieve the new key.
+At the maximum generation rotation returns 503
+`{"detail":"wake_generation_exhausted"}` without mutation. Rotation does not
+cancel an admitted run or undo its effects.
+
+Administration and admission require a current wake declaration and ordinary
+source authority. Refuse a source policy, unresolved source history,
+`remediation_policies` row, partition or source binding. Unavailable authority
+fails closed. Administrative errors use `HookWakeErrorOut` below: missing
+agent or wake declaration is 404 `wake_not_declared`; invalid stored bundle is
+503 `wake_declaration_unavailable`; nonordinary source is 409
+`wake_source_not_ordinary`; unavailable metadata/source authority is 503
+`authority_unavailable`. Check declaration before source classification.
+Administrative authentication failures retain the existing admin auth contract.
+
+### Admission responses and ordering
+
+These are the complete wake success schemas, with all fields required and no
+additional fields. `run_id` is a UUID string naming the admitted hook run.
+Coalescing exposes no run identifier, including when a replay's original run
+has already settled.
+
+| HTTP | Schema | Exact body |
+| --- | --- | --- |
+| 202 | `HookWakeQueuedOut` | `{"status":"queued","run_id":"<uuid>"}` |
+| 200 | `HookWakeCoalescedOut` | `{"status":"coalesced"}` |
+
+`HookWakeErrorOut` is exactly `{"detail":"<reason>"}`, with one required string
+field and no other fields. Evaluate refusals in this order:
+
+1. Before authentication, bound the streamed body using
+   `Settings.hook_max_body_bytes` (default 1048576 bytes). Oversize is 413
+   `{"detail":"hook body exceeds the maximum size"}` even without credentials.
+   Parse canonical path identity and required headers, load wake generation
+   metadata and verify the signature before reading the deployment bundle.
+   Unknown agent/key, malformed path identity/header, invalid signature and
+   stale timestamp all return 401 `{"detail":"invalid_wake_signature"}`.
+   Unavailable metadata authority returns 503 `authority_unavailable`.
+2. With valid authentication, a nonempty query string returns 400
+   `wake_query_forbidden`, including a parameter with an empty value. Then a
+   body other than exact `{}` returns 422 `wake_body_invalid`.
+3. Resolve the ranked active deployment and exact explicit wake declaration.
+   Absence returns 404 `wake_not_declared`; unreadable or malformed required
+   bundle returns 503 `wake_declaration_unavailable`.
+4. Recheck ordinary-source authority. Protected or configured source state
+   returns 409 `wake_source_not_ordinary`; unavailable authority returns 503
+   `authority_unavailable`. Neither ordinary ingress nor protected ingestion
+   is called as a fallback.
+5. Pause returns 409 `hook_paused`, then kill returns 409 `agent_killed`, then
+   existing configured-limit refusal returns 429 `budget_exhausted`. These
+   guards run before delivery reservation, including before a duplicate could
+   otherwise return `coalesced`.
+6. Reserve the signed delivery id in Valkey with `SET NX EX`. An existing
+   reservation returns 200 `coalesced`. Failed or uncertain reservation returns
+   503 `wake_dedupe_unavailable`, with no hook-run mutation or stream append.
+7. Under the per-agent/per-hook advisory lock, reclaim expired open claims and
+   coalesce into any remaining live open run, whether queued or started. Only
+   the dedupe reservation is written. Otherwise insert one open webhook run
+   with its explicit claim lease, commit and enqueue. Return 202 `queued` only
+   after enqueue succeeds. Known or uncertain enqueue failure returns 503
+   `wake_enqueue_unavailable`, retaining the reservation; a known failure may
+   close the row as `failed` / `enqueue_failed`. An uncertain append retains
+   the open claim until lease recovery. No terminal close admits a successor.
+
+Recheck current generation, source authority, pause, kill and limits under the
+gate before run mutation, using the same refusal vocabulary. Guard refusals
+create no run. Enqueue failure is the explicit exception because the open
+claim has already committed. Missing/invalid credentials are never separated
+into observable unknown-agent versus wrong-key responses.
+
+The dedupe key namespace is
+`curie:hook-wake:v1:{installation_scope}:{agent_id}:{hook}:{generation}:{delivery_id}`,
+where `installation_scope` is the lowercase hexadecimal HMAC-SHA256 digest
+keyed by UTF-8 installation-key bytes over exactly
+`ASCII("curie.hook.wake.scope.v1")`, without a trailing newline. Never use the
+installation key or its raw SHA256 digest as the scope: for keys longer than
+64 bytes that raw digest is an equivalent HMAC signing key. The scope label
+is distinct from every credential derivation label. The namespace is separate
+from ordinary ingress claims and scoped to current generation.
+Retain the reservation strictly beyond the signed
+timestamp plus 300 seconds. At receipt time `now`, its integer TTL in seconds
+is `max(1, floor(int(timestamp) + 300 - now) + 1)`. This includes accepted
+future timestamps and the inclusive acceptance boundary. No permanent receipt
+or follow-up state exists. A captured signed delivery remains coalesced after
+settlement while its reservation exists. Publication failure retains it too.
+
+### Deploy receipt and connector polling
+
+The dependent deploy slice adds `DeployOutput.wake_triggers`, an array of
+`HookWakeDeployReceipt` objects, with no credential:
+
+```json
+{"wake_triggers":[{"name":"queue-ready","url":"https://api.example.com/hooks/00000000-0000-4000-8000-000000000001/queue-ready/wake","mode":"targetless"}]}
+```
+
+Each entry has exactly `name` (string), `url` (string or null) and `mode`
+(literal `targetless`). Use the target's configured external API base with
+trailing slashes removed. When that base is unknown, emit `url: null`; never
+guess from internal service addresses. An empty declaration set emits `[]`.
+This array alone is not key-retrieval or runtime-isolation evidence.
+
+The connector owns queue polling. Configure a bounded cadence appropriate to
+the upstream service's rate limit, keep polling through run settlement, and
+use exponential backoff with jitter for transient failures. An empty queue
+poll sends no wake and creates no platform execution. Use durable item claims
+and idempotent result writes: neither admission nor stream delivery provides
+exactly-once external processing.
+
+Every wake attempt, including the next attempt after timeout or non-2xx,
+uses a fresh delivery id and current timestamp. Never reuse a signed delivery
+as a progress retry. `queued` acknowledges admission, not queue completion.
+`coalesced` means try again on the connector's next poll if work remains; it
+does not promise that the live run has seen that work. Work arriving after a
+run's final queue read waits for that next poll. Pause or kill requires
+operator intervention; rotation requires reprovisioning the current key.
+A lost publication can block until claim-lease expiry, followed by a fresh
+poll and wake. No privileged run-query access, successor enqueue, automatic
+channel reply or fabricated human is required.
+
 ## Implementations today
 
 Ten hardcoded trigger producers in two different processes, plus the declared per-agent cron

@@ -68,6 +68,7 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
         .plugin_dir
         .canonicalize()
         .with_context(|| format!("plugin dir not found: {}", opts.plugin_dir.display()))?;
+    cb::validate_wake_manifest(&plugin_dir)?;
     let decl = cb::load(&plugin_dir)?;
     let buildable: Vec<(&String, &cb::ConnectorSpecDecl)> = decl
         .connectors

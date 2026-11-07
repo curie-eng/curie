@@ -34,6 +34,7 @@ use sha2::{Digest, Sha256};
 /// The declaration this module reads, named once (its Python twin is
 /// `plugin_format.connectors.CONNECTORS_FILE`).
 pub const CONNECTORS_FILE: &str = "connectors.yaml";
+pub const HOOK_WAKE_KEY_ENV: &str = "CURIE_HOOK_WAKE_KEY";
 
 /// The lock `curie build` writes, named once (its Python twin is
 /// `plugin_format.connector_lock.CONNECTOR_LOCK_FILE`).
@@ -721,6 +722,7 @@ pub fn locked_runner_image(bundle_dir: &Path) -> Result<Option<String>> {
 }
 
 fn check_spec(name: &str, spec: &ConnectorSpecDecl) -> Result<()> {
+    check_wake_key_role(name, spec)?;
     let forms = [
         spec.image.is_some(),
         spec.build.is_some(),
@@ -770,6 +772,113 @@ fn check_spec(name: &str, spec: &ConnectorSpecDecl) -> Result<()> {
     }
     if let Some(build) = &spec.build {
         check_build(&format!("connectors.{name}"), build)?;
+    }
+    Ok(())
+}
+
+fn check_wake_key_role(name: &str, spec: &ConnectorSpecDecl) -> Result<()> {
+    if spec.bearer_secret.as_deref() == Some(HOOK_WAKE_KEY_ENV) {
+        bail!(
+            "connectors.wake_key_bearer: connectors.{name}: the wake key cannot be an MCP bearer"
+        );
+    }
+    let invalid_secret = spec.secrets.iter().any(|secret| match secret {
+        SecretDecl::Name(key) => key == HOOK_WAKE_KEY_ENV,
+        SecretDecl::Ref { name, .. } => name == HOOK_WAKE_KEY_ENV && spec.url.is_some(),
+    });
+    let expanded = spec.headers.values().map(String::as_str).chain([
+        spec.url.as_deref().unwrap_or_default(),
+        spec.unhosted_url.as_deref().unwrap_or_default(),
+        spec.bearer_secret.as_deref().unwrap_or_default(),
+    ]);
+    if invalid_secret
+        || spec.secret_files.contains_key(HOOK_WAKE_KEY_ENV)
+        || spec.sealed_secrets.contains_key(HOOK_WAKE_KEY_ENV)
+        || spec.config.iter().any(|key| key == HOOK_WAKE_KEY_ENV)
+        || spec.env.contains_key(HOOK_WAKE_KEY_ENV)
+        || expanded
+            .into_iter()
+            .any(|text| text.contains(HOOK_WAKE_KEY_ENV))
+    {
+        bail!(
+            "connectors.wake_key_delivery: connectors.{name}: deliver the wake key only \
+             through a hosted secrets SecretRef; it cannot enter client configuration \
+             or the per-agent secret store"
+        );
+    }
+    Ok(())
+}
+
+/// Wake-specific declaration checks for the existing connector-build entrypoint.
+pub fn validate_wake_manifest(bundle_dir: &Path) -> Result<()> {
+    if ![".claude-plugin/plugin.json", "plugin.json"]
+        .iter()
+        .any(|relative| bundle_dir.join(relative).is_file())
+    {
+        return Ok(());
+    }
+    let (_, manifest) = crate::scaffold::load_manifest_json(bundle_dir)?;
+    let Some(triggers) = manifest.get("triggers").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let triggers = triggers
+        .as_array()
+        .ok_or_else(|| anyhow!("triggers.invalid: triggers must be a list"))?;
+    let mut names = BTreeSet::new();
+    for trigger in triggers {
+        let trigger = trigger
+            .as_object()
+            .ok_or_else(|| anyhow!("triggers.invalid: each trigger must be an object"))?;
+        let wake = match trigger.get("wake") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| anyhow!("triggers.invalid: wake must be a boolean"))?,
+        };
+        let text = |key: &str| trigger.get(key).and_then(serde_json::Value::as_str);
+        let trim = |text: &str| {
+            text.trim_matches(|c: char| c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}'))
+                .to_string()
+        };
+        if let Some(name) = text("name").map(trim).filter(|name| !name.is_empty()) {
+            if !names.insert(name) {
+                bail!("triggers.duplicate_name: trigger names must be unique");
+            }
+        }
+        if trigger.contains_key("target")
+            && text("target").is_none_or(|value| trim(value).is_empty())
+        {
+            bail!("triggers.target_invalid: target must be a nonblank string");
+        }
+        if text("type") == Some("webhook")
+            && text("path").is_none_or(|value| trim(value).is_empty())
+        {
+            bail!("triggers.webhook_missing_path: webhook requires a path");
+        }
+        if !wake {
+            continue;
+        }
+        if text("type") != Some("webhook") {
+            bail!("triggers.wake_type_invalid: wake requires type webhook");
+        }
+        let valid_name = text("name").is_some_and(|name| {
+            let alnum = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+            !name.is_empty()
+                && name.len() <= 63
+                && alnum(name.as_bytes()[0])
+                && name
+                    .bytes()
+                    .all(|byte| alnum(byte) || b"._-".contains(&byte))
+        });
+        if !valid_name {
+            bail!("triggers.wake_invalid_name: invalid wake hook name");
+        }
+        if text("prompt").is_none_or(|value| trim(value).is_empty()) {
+            bail!("triggers.wake_missing_prompt: wake requires a standing prompt");
+        }
+        if trigger.contains_key("target") {
+            bail!("triggers.wake_target_forbidden: wake must not define target");
+        }
     }
     Ok(())
 }
