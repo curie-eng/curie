@@ -367,7 +367,7 @@ scheduler in the worker:
    `hook_runs`, and enqueues one CRON turn. `GET /schedules`
    (`apps/api/src/curie_api/routers/schedules.py::list_schedules`, #2933) lists
    those hooks with independent newest scheduled and manual histories, selected
-   by the persisted `hook_runs.source` (`schedule` or `manual`). Scheduled
+   by the persisted `hook_runs.source` (`schedule`, `manual`, or `webhook`). Scheduled
    `last_fire_at`, `last_outcome`, and `last_reason` exclude manual fires;
    `last_manual_fire_at`, `last_manual_outcome`, and `last_manual_reason` report
    the newest manual fire. `curie local schedules` and `curie cluster schedules`

@@ -604,6 +604,13 @@ spec:
             # cleanup.
             - name: CURIE_DELIVERY_BUDGET_S
               value: {{ .Values.worker.deliveryBudgetSeconds | quote }}
+            # Optional cron claim lease. Null or omitted leaves it unset, so
+            # the worker uses the delivery budget. The API renders the same
+            # value from worker.hookClaimLeaseSeconds.
+            {{- if .Values.worker.hookClaimLeaseSeconds }}
+            - name: CURIE_HOOK_CLAIM_LEASE_S
+              value: {{ .Values.worker.hookClaimLeaseSeconds | quote }}
+            {{- end }}
             # Per-request runner ceiling within the overall delivery budget.
             - name: CURIE_RUNNER_TOTAL_TIMEOUT_S
               value: {{ .Values.worker.runnerTotalTimeoutSeconds | quote }}

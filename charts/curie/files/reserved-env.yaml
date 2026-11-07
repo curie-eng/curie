@@ -41,6 +41,7 @@ worker:
   CURIE_E2E_REGISTRY_TOKEN_HOSTS: e2eConnector.registryTokenHosts
   CURIE_FAKE_MODEL: agentSandbox.runner.fakeModel
   CURIE_HEARTBEAT_FILE: the chart-managed heartbeat path (remove this override)
+  CURIE_HOOK_CLAIM_LEASE_S: worker.hookClaimLeaseSeconds
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
   CURIE_INSTALLATION_ID: the release-managed installation identity (remove this override)
   CURIE_NAMESPACE: the release namespace (Helm --namespace)
@@ -138,6 +139,7 @@ api:
   CURIE_CONNECTOR_PROXY_IMAGE: worker.image
   CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY: worker.image.pullPolicy
   CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS: worker.imagePullSecrets
+  CURIE_DELIVERY_BUDGET_S: worker.deliveryBudgetSeconds
   CURIE_E2E_BUILDER_IMAGE: e2eConnector.builderImage
   CURIE_E2E_BUILD_CACHE_REPO: e2eConnector.buildCacheRepo
   CURIE_E2E_BUILD_TIMEOUT_SECONDS: e2eConnector.buildTimeoutSeconds
@@ -159,6 +161,7 @@ api:
   CURIE_E2E_WORKER_CLUSTER_ROLE: e2eConnector.workerClusterRole
   CURIE_FACTORY_PUBLICATION_LABELS: api.factoryPublicationLabels
   CURIE_FORGES: factory.codeHosts / factory.trackers / factory.bindings
+  CURIE_HOOK_CLAIM_LEASE_S: worker.hookClaimLeaseSeconds
   CURIE_HTTP_IDENTITY_DIR: api.httpIdentity.existingSecret
   CURIE_INSTALLATION_ID: the release-managed installation identity (remove this override)
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken

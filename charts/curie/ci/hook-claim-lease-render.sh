@@ -245,12 +245,16 @@ render chart-defaults
 
 BUDGET_EXPECT=1800
 LEASE_EXPECT=absent
-render budget-override --set worker.deliveryBudgetSeconds=1800
+# The chart refuses a runner ceiling above the delivery budget. Lower both.
+render budget-override \
+  --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.runnerTotalTimeoutSeconds=1800
 
 BUDGET_EXPECT=1800
 LEASE_EXPECT=7200
 render budget-and-lease \
   --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.runnerTotalTimeoutSeconds=1800 \
   --set worker.hookClaimLeaseSeconds=7200
 
 cat > "$TMP/null-lease.yaml" <<'YAML'

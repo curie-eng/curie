@@ -23,7 +23,7 @@
         "name": { "type": "string" },
         "trigger": { "type": "string" },
         "slot_utc": { "type": "string" },
-        "source": { "type": "string", "enum": ["schedule", "manual"] },
+        "source": { "type": "string", "enum": ["schedule", "manual", "webhook"] },
         "outcome": { "type": ["string", "null"] },
         "reason": { "type": ["string", "null"] },
         "started_at": { "type": "string" },

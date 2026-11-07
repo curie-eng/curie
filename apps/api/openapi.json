@@ -7634,7 +7634,8 @@
           "source": {
             "enum": [
               "schedule",
-              "manual"
+              "manual",
+              "webhook"
             ],
             "title": "Source",
             "type": "string"

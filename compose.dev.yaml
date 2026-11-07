@@ -455,6 +455,11 @@ services:
       # reads the same interpolation. It requires the executor switch above; the
       # API and the worker refuse to boot with it on and the executor off.
       CURIE_REMEDIATION_ENABLED: ${CURIE_REMEDIATION_ENABLED:-false}
+      # Shared with curie-worker. The budget defaults to the process value.
+      # The lease passes the host value through: unset stays null, empty stays
+      # empty, and a set value is that value. An empty default would boot-fail.
+      CURIE_DELIVERY_BUDGET_S: ${CURIE_DELIVERY_BUDGET_S:-600}
+      CURIE_HOOK_CLAIM_LEASE_S:
       VALKEY_HOST: valkey
       VALKEY_PORT: "6379"
       VALKEY_PASSWORD: ${VALKEY_PASSWORD:-valkeypass}
@@ -739,6 +744,11 @@ services:
       # The automated remediation switch (AUTOMATED-REMEDIATION-1). curie-api
       # reads the same interpolation; the two must never differ.
       - CURIE_REMEDIATION_ENABLED=${CURIE_REMEDIATION_ENABLED:-false}
+      # Shared with curie-api. A bare lease name is the list form of a null
+      # mapping value: unset stays null, empty stays empty, and a set value is
+      # that value. Do not give it an empty default.
+      - CURIE_DELIVERY_BUDGET_S=${CURIE_DELIVERY_BUDGET_S:-600}
+      - CURIE_HOOK_CLAIM_LEASE_S
     restart: unless-stopped
 
   # Optional real Slack ingress for local development.

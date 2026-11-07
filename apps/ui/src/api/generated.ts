@@ -7440,7 +7440,7 @@ export interface components {
              * Source
              * @enum {string}
              */
-            source: "schedule" | "manual";
+            source: "schedule" | "manual" | "webhook";
             /**
              * Started At
              * Format: date-time
