@@ -14,12 +14,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import socket
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import anyio
+import httpx
 from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
@@ -324,24 +326,62 @@ def _connector_failure(exc: BaseException) -> str:
     return type(leaves[0] if leaves else exc).__name__
 
 
+CONNECTOR_CALL_ATTEMPTS = 3
+_CONNECTOR_CALL_BACKOFF_S = 0.2
+_TRANSPORT_FAILURES = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    ConnectionResetError,
+    socket.gaierror,
+)
+
+
+def _failed_before_answer(exc: BaseException) -> bool:
+    """True when every leaf is a transport failure and the proxy did not refuse."""
+
+    if _caller_refusal(exc) is not None:
+        return False
+    leaves = _probe_error_leaves(exc)
+    return bool(leaves) and all(isinstance(leaf, _TRANSPORT_FAILURES) for leaf in leaves)
+
+
+async def _dial_connector(config: Mapping[str, Any], timeout: float) -> int:
+    async with server_streams(config, plugin_dir=None, inherited_env={}) as (
+        read_stream,
+        write_stream,
+    ):
+        async with ClientSession(
+            read_stream, write_stream, read_timeout_seconds=timeout
+        ) as session:
+            await session.initialize()
+            listed = await session.list_tools()
+    return len(listed.tools)
+
+
 async def _call_connector(config: Mapping[str, Any]) -> str:
-    """One bounded dial: ``ok tools=<n>`` or ``failed <reason>``."""
+    """One bounded dial: ``ok tools=<n>`` or ``failed <reason>``.
+
+    A transport failure before the connector answers is retried, up to
+    ``CONNECTOR_CALL_ATTEMPTS`` inside the one per-server timeout. A proxy
+    refusal or any answered protocol error is reported at once.
+    """
 
     timeout = CONNECTOR_CALL_TIMEOUT_S
     try:
         with anyio.fail_after(timeout):
-            async with server_streams(config, plugin_dir=None, inherited_env={}) as (
-                read_stream,
-                write_stream,
-            ):
-                async with ClientSession(
-                    read_stream, write_stream, read_timeout_seconds=timeout
-                ) as session:
-                    await session.initialize()
-                    listed = await session.list_tools()
+            attempt = 1
+            while True:
+                try:
+                    tools = await _dial_connector(config, timeout)
+                    break
+                except Exception as exc:  # noqa: BLE001 - classified below
+                    if attempt >= CONNECTOR_CALL_ATTEMPTS or not _failed_before_answer(exc):
+                        raise
+                    await anyio.sleep(_CONNECTOR_CALL_BACKOFF_S * attempt)
+                    attempt += 1
     except Exception as exc:  # noqa: BLE001 - every failure is reported, none escapes
         return f"failed {_connector_failure(exc)}"
-    return f"ok tools={len(listed.tools)}"
+    return f"ok tools={tools}"
 
 
 async def call_connectors(servers: Mapping[str, Mapping[str, Any]]) -> str:
