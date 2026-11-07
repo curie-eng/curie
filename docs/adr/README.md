@@ -289,4 +289,9 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0267 | [An email reply answers an approval under the HTTP approver role](0267-an-email-reply-answers-an-approval-under-the-http-approver-role.md) | Accepted |
 | 0268 | [Personal subscription execution and its acceptance contract](0268-personal-subscription-execution-and-acceptance-contract.md) | Accepted |
 | 0269 | [Factory failure retries share a bounded fresh request allowance](0269-factory-failure-retries-share-a-bounded-fresh-request-allowance.md) | Accepted |
+| 0270 | [Hosted connectors receive the verified requester as a signed caller claim](0270-hosted-connectors-receive-the-verified-requester-as-a-signed-caller-claim.md) | Draft |
+| 0271 | [Per-request approver sets and separation of duties](0271-per-request-approver-sets-and-separation-of-duties.md) | Draft |
+| 0272 | [Approver DM delivery uses one selected recipient](0272-approver-dm-delivery-uses-one-selected-recipient.md) | Draft |
+| 0273 | [Approval routes own expiry and reminders](0273-approval-routes-own-expiry-and-reminders.md) | Draft |
+| 0274 | [A declared webhook wake skips overlap until the next poll](0274-a-declared-webhook-wake-skips-overlap-until-the-next-poll.md) | Draft |
 <!-- END GENERATED: adr-index -->
