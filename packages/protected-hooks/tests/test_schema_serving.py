@@ -103,6 +103,13 @@ def test_installed_candidate_decision_preserves_unknown_revision_policy(
     )
 
 
+def test_candidate_window_keeps_the_0148_floor() -> None:
+    """0149 stores webhook provenance and a wake-key generation and does not raise the floor."""
+    window = shared().load_metadata().window
+    assert window.schema_min == "0148"
+    assert window.schema_head == "0149"
+
+
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])
 def test_malformed_metadata_refuses_with_safe_category(mutation: str) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2."""

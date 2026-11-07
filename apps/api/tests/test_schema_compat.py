@@ -173,6 +173,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0146",
             "0147",
             "0148",
+            "0149",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -209,8 +210,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0146",
             "0147",
             "0148",
+            "0149",
         }
-    assert current_revision() == "0148"
+    assert current_revision() == "0149"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -309,7 +311,9 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # Factory base transition reads require the 0144 table, and the 0145 join
     # also requires the stable deadline backport (0140). The 0148 join
     # includes UI evidence and deleted-issue cancellation.
-    for revision in sorted(known - {"0148"}):
+    # 0149 stores webhook provenance and a wake-key generation. It does not
+    # raise the serving floor, so a database at 0148 can still serve.
+    for revision in sorted(known - {"0148", "0149"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
@@ -319,6 +323,7 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     assert can_serve("0146", window, known) is False
     assert can_serve("0147", window, known) is False
     assert can_serve("0148", window, known) is True
+    assert can_serve("0149", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:
