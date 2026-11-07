@@ -2,12 +2,12 @@
 
 Date: 2026-11-05
 
-Status: Draft
+Status: Accepted
 
-This draft does not authorize implementation. Acceptance follows
+Accepted with explicit maintainer approval. Implementation follows
 [ADR 0085](0085-acceptance-not-implementation-authorizes-an-adr.md) and
 [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
-The realizing changes and required evidence below are proposed.
+The realizing changes and required evidence below remain required.
 
 This ADR is independent of ADRs 0270, 0271 and 0272. It can be accepted and
 shipped first on existing fixed-channel and requesting-surface routes. It
@@ -175,17 +175,23 @@ ADR 0267's original answer surface and adds no reminder answer authority.
 `@spec APPROVAL-SCHEDULE-4`
 
 Use the existing single `ApprovalCardStore`. Card, notice and reply-placement
-references have no TTL while pending, including finite approvals that have
-not yet reached a terminal state. Migrate still-present pending entries by
-removing their TTL after checking the approval. Do not claim expired/lost
-references can be reconstructed.
+references have no TTL while pending, including finite approvals that have not
+yet reached a terminal state. Enable TTL-free pending writes only after every
+card writer and settlement consumer supports this retention contract. After the
+last old worker drains, reconcile still-present references against current
+approval state: remove TTLs for pending approvals and apply bounded terminal
+retention to settled approvals. Rollback must retain compatible reference owners
+until pending approvals settle. Do not claim expired/lost references can be
+reconstructed.
 
-At settlement apply the existing 14-day terminal TTL. Successful settlement
-can consume the exact ref immediately; failed card edits retain it within that
-bounded window. Preserve the late-registration terminal check. No new delivery
-collection or seal type is required. This retention primitive also serves
-ADR 0272, which depends on this decision. This ADR is its sole owner; the DM
-implementation reuses it without duplicating the contract or migration.
+At terminal settlement, start a new 14-day TTL on surviving references before
+attempting card delivery; the current store instead starts its 14-day TTL at
+registration. Successful settlement can consume the exact ref immediately;
+failed card edits retain it within that bounded window. Preserve the
+late-registration terminal check. No new delivery collection or seal type is
+required. This retention primitive also serves ADR 0272, which depends on this
+decision. This ADR is its sole owner; the DM implementation reuses it without
+duplicating the contract or migration.
 
 The reminder interval and `next_remind_at` are notification scheduling data,
 outside the authorization digest. Scheduling updates do not invalidate HTTP
@@ -272,7 +278,7 @@ At implementation record exact commands, candidate commit and outcomes:
    Run applicable external transport qualification; this independent change
    does not require ADR 0270's requester/live-model connector acceptance.
 
-No runtime acceptance evidence is claimed by this draft.
+No runtime acceptance evidence is claimed.
 
 ## Consequences
 

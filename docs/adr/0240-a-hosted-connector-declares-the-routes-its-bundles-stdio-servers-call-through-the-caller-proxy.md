@@ -4,6 +4,12 @@ Date: 2026-10-22
 
 Status: Accepted
 
+**Partially amended by [ADR 0270](0270-hosted-connectors-receive-the-verified-requester-as-a-signed-caller-claim.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0270 amends decision 2 only where it requires equal `ccr` and `cct`
+lifetimes. Adding requester authority to `ccr` would require a separate
+amendment.
+
 Accepted on 2026-10-22 with explicit maintainer approval from Junwon Jung,
 before implementation.
 

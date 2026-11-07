@@ -2,21 +2,25 @@
 
 Date: 2026-11-05
 
-Status: Draft
+Status: Accepted
 
-This draft does not authorize implementation. Acceptance follows
+Accepted with explicit maintainer approval. Implementation follows
 [ADR 0085](0085-acceptance-not-implementation-authorizes-an-adr.md) and
 [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
-The realizing changes and acceptance checks below are proposed.
+The realizing changes and acceptance checks below remain required.
 
-Partially supersedes [ADR 0178](0178-the-connector-caller-token-names-the-run-and-work-item.md)
+Partially supersedes
+[ADR 0178](0178-the-connector-caller-token-names-the-run-and-work-item.md)
 decision 2's byte-identical non-work-item token promise for opted-in human
 requests, decision 3's lifetime for requester-bearing tokens, decision 4's
 closed claim set, and decision 5's header set. Decision 1's agent and run
-semantics remain. Extends [ADR 0168](0168-one-installation-hosts-several-bot-identities.md)
-decision 7 with optional requester attribution after agent admission;
-`admits` continues to judge only the agent. These are partial amendments;
-no ADR is superseded in full.
+semantics remain. Extends
+[ADR 0168](0168-one-installation-hosts-several-bot-identities.md) decision 7
+with optional requester attribution after agent admission; `admits` continues to
+judge only the agent. Partially amends
+[ADR 0240](0240-a-hosted-connector-declares-the-routes-its-bundles-stdio-servers-call-through-the-caller-proxy.md)
+decision 2 only where it requires equal `ccr` and `cct` lifetimes. These are
+partial amendments; no ADR is superseded in full.
 
 Consistent with [ADR 0088](0088-per-user-delegated-oauth-for-mcp.md)'s one-human
 execution boundary. This decision transports identity and does not realize
@@ -110,11 +114,15 @@ principal-bearing and malformed cases to the existing shared caller-token
 and refusal corpora. The proxy accepts the new closed set before any worker
 mints it; unsupported consumers refuse unknown claims.
 
-`ccr` route tokens remain agent/run credentials without human authority,
-with their existing 24-hour/factory-deadline lifetime calculated separately
-from requester-bearing `cct`. Forged principal headers are stripped there too. Extending route authority
-would require a separate amendment to
-[ADR 0240](0240-a-hosted-connector-declares-the-routes-its-bundles-stdio-servers-call-through-the-caller-proxy.md).
+`ccr` route tokens remain agent/run credentials without human authority, with
+their existing 24-hour/factory-deadline lifetime calculated separately from
+requester-bearing `cct`. Forged principal headers are stripped there too. This
+partially amends
+[ADR 0240](0240-a-hosted-connector-declares-the-routes-its-bundles-stdio-servers-call-through-the-caller-proxy.md)
+decision 2 only where it requires equal `ccr` and `cct` lifetimes. On
+acceptance, keep ADR 0240 Accepted and its body unchanged, and add a back-link
+immediately after its status naming this lifetime amendment. Adding requester
+authority to `ccr` would require a separate amendment.
 
 ### 3. Replace on requester change and bound copied credentials to one hour
 
@@ -298,3 +306,6 @@ status, identifying the partial amendment:
    decision 5's identity-header projection, only for the opted-in capability.
 2. ADR 0168: ADR 0270 extends decision 7 with requester attribution after
    agent-only admission; the admission list itself is unchanged.
+3. ADR 0240: ADR 0270 amends decision 2 only where it requires equal `ccr` and
+   `cct` lifetimes. Keep ADR 0240 Accepted and its body unchanged, and add a
+   back-link immediately after its status naming this lifetime amendment.

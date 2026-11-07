@@ -2,12 +2,12 @@
 
 Date: 2026-11-05
 
-Status: Draft
+Status: Accepted
 
-This draft does not authorize implementation. Acceptance follows
+Accepted with explicit maintainer approval. Implementation follows
 [ADR 0085](0085-acceptance-not-implementation-authorizes-an-adr.md) and
 [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
-All realizing changes and required evidence below are proposed.
+All realizing changes and required evidence below remain required.
 
 Depends on [ADR 0270](0270-hosted-connectors-receive-the-verified-requester-as-a-signed-caller-claim.md)
 for connector requester attribution and its enforced live-turn requester
@@ -109,7 +109,7 @@ ceiling, original requester comparison or API-side separation policy. After
 an explicit exclusion opt-out, requester self-selection inside the ceiling is
 permitted; the signature alone supplies no separation guarantee.
 
-Keep signing keys outside sandbox/runner/model inputs. This draft does not
+Keep signing keys outside sandbox/runner/model inputs. This decision does not
 claim custody against other bundle-declared connector code. A renderer refusal
 to mount a registered key in another connector is optional hardening requiring
 its own behavioral proof; it is not assumed by the security argument or a
@@ -394,12 +394,15 @@ The named proposed owners are:
 
 At implementation record exact commands, candidate commit and outcomes:
 
-1. Through both real API creation boundaries with Postgres and Valkey, accept
-   a valid ticket; reject bad signatures, scope/requester/argument changes,
-   expired preparation, nonce replay and conflicting dedupe. Race identical
-   creation and prove one row plus one consumed nonce, or neither on rollback.
-   Refuse registration with requester transport off and disablement with a
-   registration, including concurrent updates and invalid stored state.
+1. Through the real HTTP approval creation boundary with Postgres and Valkey,
+   accept a valid ticket; reject bad signatures, scope/requester/argument
+   changes, expired preparation, nonce replay and conflicting dedupe. Through
+   the legacy creation boundary, refuse new-policy approval creation even with
+   an otherwise valid ticket, and verify ordinary legacy creation remains
+   unchanged. Race identical creation and prove one row plus one consumed nonce,
+   or neither on rollback. Refuse registration with requester transport off and
+   disablement with a registration, including concurrent updates and invalid
+   stored state.
 2. Register the pair on one route, then choose a looser bound route or omit
    the route; observe refusal and no grant-backed effect. Also reject a ticket
    on an unregistered route, a missing ticket on the owning route, and a direct

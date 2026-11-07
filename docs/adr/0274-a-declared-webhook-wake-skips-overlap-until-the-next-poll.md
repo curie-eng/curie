@@ -2,7 +2,7 @@
 
 Date: 2026-11-05
 
-Status: Draft
+Status: Accepted
 
 This decision amends [ADR 0079](0079-inbound-triggers-as-a-new-event-kind.md),
 [ADR 0099](0099-hooks-are-bundle-declared-turns-the-system-starts.md), and
@@ -13,8 +13,8 @@ only as specified below. It preserves the boundaries of
 [ADR 0259](0259-a-binding-requires-http-identity-when-its-invocation-or-approver-role-needs-http-facts.md).
 It supplies the opt-in targetless part of
 [#3666](https://github.com/curie-eng/curie/issues/3666), without closing that
-issue or changing its existing path-only declarations. Draft status does not
-authorize implementation or claim runtime support.
+issue or changing its existing path-only declarations. Acceptance authorizes
+implementation and does not claim runtime support.
 
 ## Context
 
@@ -196,77 +196,61 @@ approval resume. A gated tool fails before its effect with
 `approval_gate_targetless`. Ordinary deployed tools may still write; silence
 is not a read-only policy. Existing explicit channel-read rules remain.
 
-### 4. An overlapping wake writes nothing and relies on the next poll
+### 4. Suppress overlap and deduplicate signed deliveries
 
 <!-- @spec TARGETLESS-WEBHOOK-4 -->
-Reuse the existing per-agent, per-hook transaction advisory lock for wake
-admission and expired-lease reclamation. There is no follow-up flag,
-successor admission, delivery receipt store, SQL outbox, reconciler or
-failure counter. `HookRunRecorder.close` keeps its boolean result and only
-settles the current row; it performs no declaration read or fresh admission.
+Reuse the existing per-agent, per-hook transaction advisory lock for admission
+and expired-lease reclamation. There is no follow-up flag, successor admission,
+permanent delivery receipt store, SQL outbox, reconciler or failure counter.
+`HookRunRecorder.close` keeps its boolean result and only settles the current row.
 
-1. A valid wake reclaims expired open claims under that lock. If a live open
-   run exists, whether queued or executing, it returns `coalesced` without
-   inserting or updating a run, retaining a notification, or appending a
-   stream entry. Completion may race this read; the next poll supplies the
-   next opportunity to wake.
-2. Otherwise it inserts one open webhook run with a claim lease, commits,
-   enqueues the targetless turn, and returns `queued` after enqueue succeeds.
-3. Success or failure closes that run through the existing terminal guard.
-   Neither completion nor a duplicate or stale close starts another run.
-   Work arriving after the running turn's final queue read waits for a later
-   connector poll that finds unprocessed items and sends a fresh wake.
+After authentication, declaration resolution and all ordinary-source, pause,
+kill and configured-limit checks, reserve the authenticated delivery id with
+Valkey `SET NX EX` before any run mutation. Scope the key to installation,
+agent, exact hook, current generation and delivery id. Retain it until after
+the signed timestamp plus `hook_signing.TOLERANCE_S`, including the inclusive
+acceptance boundary and accepted future timestamps; a fixed 300 seconds from
+receipt is insufficient. Valkey failure or an uncertain reservation refuses
+admission without SQL mutation or stream publication. An existing reservation
+returns `coalesced`, even after the original run settles.
 
-The bound is one open run per hook, with no retained follow-up. Distinct
-hooks remain independent. Cron overlap keeps its existing recorded skip
-behavior. Coalesced wake requests create no additional run-history rows.
+For a newly reserved delivery id:
 
-The API must explicitly set `lease_expires_at` on the new row using the same
-effective claim lease as the worker:
-`apps/worker/src/curie_worker/config.py::WorkerConfig.effective_hook_claim_lease_s`,
-which uses `CURIE_HOOK_CLAIM_LEASE_S` when configured and otherwise
-`CURIE_DELIVERY_BUDGET_S`. Deployment configuration supplies those same
-values to API settings and worker settings, with the existing constraint
-that the lease covers the delivery budget. The current manual-fire insert
-in `apps/api/src/curie_api/routers/hook_fire.py` sets no lease and is not
-sufficient by itself. The wake API's settings and substrate wiring are part
-of this change, with no independent hardcoded API lease default.
+1. Reclaim expired open claims under the advisory lock. If a live open run
+   exists, return `coalesced` without changing that run, retaining a follow-up,
+   or appending a stream entry. Only the bounded dedupe reservation is written.
+2. Otherwise insert one open webhook run with an explicit claim lease, commit,
+   enqueue the targetless turn and return `queued` after enqueue succeeds.
+3. Success, failure and duplicate or stale closes never admit a successor.
+   Work arriving after the final queue read waits for another connector poll
+   and a fresh delivery id.
 
-A crash or lost stream append after SQL commit can leave an open run with no
-stream entry. Accept the hook claim-lease delay: once it expires, the next
-connector wake reclaims it and admits fresh work. A known enqueue error is
-reported as transient and may close the row as `enqueue_failed`; an uncertain
-append is never reported as proof that no work was admitted. There is no
-promise of autonomous dispatch recovery or recovery without another wake.
-The lease is the stall interval before reclamation becomes eligible; the next
-poll and its backoff add delay. Existing delivery ownership, lease renewal
-and terminal guards remain responsible for stale queue entries.
+The bound is one open run per hook. Distinct hooks remain independent.
+Cron overlap retains its existing recorded skip behavior.
 
-Delivery ids are authenticated but not deduplicated by this route. Replaying
-an in-window request coalesces while busy but can create another run after
-settlement. The 300-second tolerance limits a captured signature's usable
-time, not its lifetime number of runs. Accept that replay risk in this Draft;
-the maintainer must decide before acceptance whether to retain it or require
-the named mitigation: a small, roughly ten-line Valkey `SET NX EX` delivery-id
-dedupe, scoped to authenticated agent, hook and generation and retained
-through the signed timestamp's accepted window. That mitigation is proposed,
-not implemented or promised here, and is not permanent exactly-once queue
-processing.
+API settings and deployment wiring must use the same effective claim lease as
+`WorkerConfig.effective_hook_claim_lease_s`: `CURIE_HOOK_CLAIM_LEASE_S` when set,
+otherwise `CURIE_DELIVERY_BUDGET_S`, with the lease covering the delivery budget.
+The current manual-fire insert supplies no lease and is insufficient.
 
-Continuous valid wakes can sustain serialized model cost. Agent tools can
-also create queue items that the connector polls and uses to wake the same
-agent, forming a benign self-feeding loop. One open run limits concurrency,
-not run count or daily spending. Existing hook admission only refuses
-configured nonpositive limits and is not evidence of a daily spend ledger.
+A crash or uncertain stream append after SQL commit may leave an open run
+without dispatchable work. Retain the dedupe reservation. A later connector
+poll uses a fresh delivery id; after claim-lease expiry it can reclaim and admit
+fresh work. A known enqueue failure is transient and may close the row as
+`enqueue_failed`; an uncertain append never proves that nothing was admitted.
+There is no autonomous dispatch recovery or exactly-once external processing
+claim. Existing delivery ownership, renewal and terminal guards handle stale
+queue entries. Polling and backoff add delay beyond the claim lease.
 
-The platform guarantees overlap suppression and observable admitted-run
-provenance, not completion of the connector's queue. Run queries remain
-operator-only and expose webhook source and terminal reasons. Connector
-polling, durable item claims, idempotent writes and exponential backoff belong
-in interface and bundle documentation: wake on polls that find unprocessed
-work, backing off when wakes fail or the queue repeatedly makes no progress.
-This requires no privileged run-query access or knowledge of a run's terminal
-status. There is no platform failure counter or automatic retry policy.
+A current key holder can still sign fresh deliveries and sustain serialized
+model cost. One open run bounds concurrency, not spending or effects; existing
+configured-limit checks are not a daily spend ledger.
+
+Operator-only queries expose webhook provenance and terminal reasons.
+Connector polling, durable item claims, idempotent writes and backoff belong
+in interface and bundle documentation. Poll again when unprocessed work
+remains, using a fresh delivery id; no privileged run-query access or knowledge
+of settlement is required.
 
 ## Amendments and supersessions
 
@@ -295,9 +279,9 @@ status. There is no platform failure counter or automatic retry policy.
 The estimate is 4 to 5 engineer-days, with a 4.5-day working split. It assumes
 available test infrastructure, existing secret references and targetless
 execution. It excludes sealed secret implementation, a new queue source,
-dispatch services and protected worker qualification. All work remains
-proposed until acceptance; review or infrastructure waits are not engineering
-execution time.
+dispatch services and protected worker qualification. Acceptance authorizes the
+realizing work; review or infrastructure waits are not engineering execution
+time.
 
 1. **Declaration and secret-role contract, 0.75 day.**
    `packages/plugin-format/src/plugin_format/models.py`,
@@ -369,19 +353,19 @@ execution time.
    rendered lease-setting parity. Missing required runtime evidence remains
    a completion blocker.
 
-Package 1 precedes dependent contract adoption. Packages 2 and 3 agree on
-stored source and lease semantics, then can develop in parallel. Package 4
-uses that fixed contract; package 5 verifies the integrated result. Expose
-wake admission only after the migration, lease wiring and pause-aware worker
-pool are deployed. Use operator pause and settle admitted wake runs before
-rolling that worker pool back; rotating a key does not settle them. No
-follow-up state needs a rollout or rollback protocol. The replay decision in
-decision 4 remains explicit acceptance work for the maintainer.
+Package 1 precedes dependent contract adoption. Packages 2 and 3 agree on stored
+source and lease semantics, then can develop in parallel. Package 4 uses that
+fixed contract; package 5 verifies the integrated result. Expose wake admission
+only after the migration, lease wiring and pause-aware worker pool are deployed.
+Use operator pause and settle admitted wake runs before rolling that worker pool
+back; rotating a key does not settle them. No follow-up state needs a rollout or
+rollback protocol. Wake admission must remain disabled until decision 4's dedupe
+is available.
 
 ## Required acceptance evidence
 
-Each item records the candidate commit, exact command and observed outcome.
-No runtime evidence is claimed by this draft.
+Each item records the candidate commit, exact command and observed outcome. No
+runtime evidence is claimed.
 
 1. Production declaration validators and runtime loaders consume shared cases
    for explicit `wake: true`, unchanged path-only and prompt-bearing webhooks
@@ -396,16 +380,19 @@ No runtime evidence is claimed by this draft.
    source-binding controls refuse before run mutation. Race rotation, pause
    and source-policy mutation with admission. Pause refuses fresh admission
    and prevents queued starts; rotation leaves admitted execution intact.
-3. Concurrent wakes against a blocked real worker yield one open run.
-   Additional valid requests answer `coalesced` without database mutation or
-   another stream entry. Wakes before start, at the last queue read and during
-   close never retain a follow-up. Success, failure and duplicate/stale closes
-   create no successor. Leave an item after that last read, then show that a
-   fresh poll and wake after settlement processes it. Lose a stream append,
-   restart, expire the explicit claim lease and recover through the next
-   wake. Exercise stale queued entries and normal lease renewal. An in-window
-   replay coalesces while busy but can admit again after settlement; a stale
-   signature fails. Prove cron overlap still records its existing skip.
+3. Concurrent wakes against a blocked real worker yield one open run. Additional
+   fresh delivery ids answer `coalesced` without hook-run mutation or another
+   stream entry; only their bounded dedupe reservations are written. Wakes
+   before start, at the last queue read and during close never retain a
+   follow-up. Success, failure and duplicate/stale closes create no successor.
+   Leave an item after that last read, then show that a fresh poll and wake
+   after settlement processes it. Lose a stream append, restart, expire the
+   explicit claim lease and recover through the next wake. Exercise stale queued
+   entries and normal lease renewal. Replaying the same signed delivery admits
+   no second run, including after settlement. Exercise concurrent replay,
+   accepted future timestamps, dedupe expiry, Valkey failure and fresh-delivery
+   recovery; stale signatures fail. Prove cron overlap still records its
+   existing skip.
 4. Drive the hosted connector through API, worker, sandbox and MCP to read an
    item and record its result without a chat reply or fabricated human.
    Repeat with an agent whose chat binding requires HTTP identity. An empty
@@ -435,12 +422,12 @@ All cited paths, explicit symbols and relative ADR links resolve.
 1. Empty polls avoid sandbox and model work; accepted wakes use the existing
    silent targetless execution path. Overlapping wakes retain no follow-up;
    work missed by the current run waits for another connector poll.
-2. A compromised key, an in-window captured signature, or a benign loop where
-   agent writes create more queue items can sustain serialized model work on
-   one hook. One open run bounds concurrency, not daily spend or side effects.
-   Deployed tool policy and operator pause remain essential. Replay risk is
-   accepted in this Draft; the Valkey dedupe mitigation awaits a maintainer
-   decision before acceptance.
+2. A compromised key or a benign loop where agent writes create more queue items
+   can sustain serialized model work on one hook. One open run bounds
+   concurrency, not daily spend or side effects. Deployed tool policy and
+   operator pause remain essential. Decision 4 requires bounded delivery-id
+   dedupe against captured-signature replay; a current key holder can still
+   authorize fresh deliveries.
 3. Lost stream publication can stall until the lease expires and another wake
    arrives. This is an accepted recovery trade for a small implementation,
    with no exactly-once external processing or autonomous recovery claim.
@@ -459,11 +446,10 @@ All cited paths, explicit symbols and relative ADR links resolve.
    a frozen protocol and many consumers for behavior targetless cron already
    supplies. The stronger version contract is deferred explicitly.
 4. **Add sealed credentials, overlap rotation, permanent deduplication or an
-   outbox and reconciler.** These expand the implementation beyond the
-   required scope. Existing secret references, immediate rotation and
-   next-wake lease recovery meet this decision's contract. Short-lived Valkey
-   delivery-id dedupe remains the named replay mitigation for an acceptance
-   decision, separate from permanent deduplication.
+   outbox and reconciler.** These expand the implementation beyond the required
+   scope. Existing secret references, immediate rotation and next-wake lease
+   recovery meet this decision's contract. Decision 4 selects bounded Valkey
+   delivery-id dedupe; permanent deduplication remains outside scope.
 5. **Retain one follow-up or enqueue every notification.** A follow-up flag
    requires fresh admission from worker completion, expanding its authority
    and lifecycle contract; enqueueing each notification accumulates redundant

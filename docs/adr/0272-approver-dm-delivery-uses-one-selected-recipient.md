@@ -2,12 +2,12 @@
 
 Date: 2026-11-05
 
-Status: Draft
+Status: Accepted
 
-This draft does not authorize implementation. Acceptance follows
+Accepted with explicit maintainer approval. Implementation follows
 [ADR 0085](0085-acceptance-not-implementation-authorizes-an-adr.md) and
 [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
-The realizing changes and evidence below are proposed.
+The realizing changes and evidence below remain required.
 
 Depends on [ADR 0271](0271-per-request-approver-sets-and-separation-of-duties.md)
 for a verified per-request canonical selection and its authority checks, and
@@ -188,10 +188,19 @@ At implementation record exact commands, candidate commit and observed outcomes:
 2. With a real bot installation, create one request, receive its DM and verify
    the returned DM channel is the stored `card_channel`. Submit both a button
    and a note modal on separate requests, complete an actual approved effect,
-   and observe one-card settlement. Repeat with email origin, retaining its
-   original reply handle and refusing an email answer to the notice. Prove
-   the actual DM card read and outcome edit with `im:history`; a missing scope
-   must be reported as failed settlement qualification, not a passing send.
+   and observe one-card settlement. These are genuine Slack interactions: the
+   dispatcher receives them over Socket Mode and the modal needs Slack's
+   short-lived `trigger_id`, so no API call or scripted receiver proof
+   substitutes for them. Drive them with an unattended browser driver holding
+   authenticated Slack test-user sessions for the selected actor and an
+   ineligible actor, and reuse that driver for item 3's live interaction
+   controls. If no such session is available or a login challenge appears,
+   record this transport qualification as not run and complete it as one
+   human-driven check before the release that ships this ADR; every other item
+   stays unattended. Repeat with email origin, retaining its original reply
+   handle and refusing an email answer to the notice. Prove the actual DM card
+   read and outcome edit with `im:history`; a missing scope must be reported as
+   failed settlement qualification, not a passing send.
 3. Exercise wrong DM/actor/installation and copied-card controls through actual
    interaction authentication, plus concurrent answers. Observe no unauthorized
    effect and one decision. Refuse operator-principal resolution even on an
@@ -204,7 +213,7 @@ At implementation record exact commands, candidate commit and observed outcomes:
    After settlement verify bounded retention and successful exact deletion.
 5. Run the required live-provider and external-integration tiers for changed
    hosted-connector/DM paths. Keep shared approval-action and principal vectors
-   on both API/dispatcher readers. No runtime evidence is claimed by this draft.
+   on both API/dispatcher readers. No runtime evidence is claimed.
 
 ## Consequences
 

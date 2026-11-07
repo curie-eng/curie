@@ -3,6 +3,12 @@
 Date: 2026-07-10
 Status: Accepted
 
+**Partially amended by [ADR 0274](0274-a-declared-webhook-wake-skips-overlap-until-the-next-poll.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0274 amends decisions 1 and 2 with an opt-in wake class: a separate scoped
+credential and route, with no automatic channel output. Ordinary ingress and
+existing declaration work under #3666 are unchanged.
+
 Amended by [ADR 0190](0190-automated-hook-sources-cannot-widen-their-tool-access.md)
 for credentials used by operator-restricted hook sources.
 
