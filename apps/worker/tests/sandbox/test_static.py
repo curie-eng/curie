@@ -38,7 +38,7 @@ from curie_worker.sandbox import (
     shell_ssl_context,
 )
 from curie_worker.sandbox.quota import capacity_rejection_is_valid
-from curie_worker.sandbox.static import ShellUnreachable
+from curie_worker.sandbox.static import ShellRefused, ShellUnreachable
 from curie_worker.sandbox.types import (
     AdmissionRejection,
     AdmissionUnavailableError,
@@ -132,6 +132,7 @@ def _client(
         bundle_store=_NoBundles(),
         key_prefix=prefix,
         retire_timeout_seconds=20.0,
+        allow_unisolated_shells=True,
     )
 
 
@@ -341,6 +342,29 @@ def test_suspend_returns_the_slot_and_an_old_tombstone_never_releases_a_later_le
     slot = _slot(valkey, prefix, "s0")
     assert (slot["state"], slot["claim"]) == ("leased", "claim-b")
     assert shell.shell()["claim"]["name"] == "claim-b"
+
+
+def test_a_shell_without_isolation_is_never_leased(
+    valkey: redis.Redis, prefix: str, tls: ShellTls, shells: ShellFactory, records: Path
+) -> None:
+    shell = shells("s0")
+    client = StaticPoolSandboxClient(
+        slots=[StaticShellSlot(shell.slot, "localhost", shell.port, POOL)],
+        redis_client=valkey,
+        control_token=CONTROL_TOKEN,
+        ssl_context=shell_ssl_context(str(tls.ca)),
+        bundle_store=_NoBundles(),
+        key_prefix=prefix,
+    )
+    with pytest.raises(ShellRefused, match="without isolation"):
+        _create(client, "claim-a", _env(records))
+    slot = _slot(valkey, prefix, "s0")
+    assert (slot["state"], slot["reason"]) == ("quarantined", "unisolated-shell")
+    assert valkey.exists(f"{prefix}:static:claim:claim-a") == 0
+    assert shell.shell()["claim"] is None
+    # Reconciling never re-admits it while it still reports no isolation.
+    client.reap_claim_templates(keep=set(), created_before=_now())
+    assert _slot(valkey, prefix, "s0")["state"] == "quarantined"
 
 
 def test_unsupported_profiles_and_missing_inputs_are_refused(

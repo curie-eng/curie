@@ -385,6 +385,7 @@ class StaticPoolSandboxClient(ClaimInputStaging):
         workspace_limits: WorkspaceLimits | None = None,
         attachment_limits: AttachmentLimits | None = None,
         retire_timeout_seconds: float = 60.0,
+        allow_unisolated_shells: bool = False,
     ) -> None:
         if not slots:
             raise ValueError("a static pool needs at least one shell")
@@ -398,6 +399,9 @@ class StaticPoolSandboxClient(ClaimInputStaging):
         self._ssl = ssl_context
         self._prefix = f"{key_prefix}:static"
         self._retire_timeout_s = retire_timeout_seconds
+        # Only tests run shells without a separate child uid; a deployment's
+        # shell that reports no isolation is never leased.
+        self._allow_unisolated = allow_unisolated_shells
         self._reserve = redis_client.register_script(_RESERVE)
         self._acknowledge = redis_client.register_script(_ACKNOWLEDGE)
         self._release = redis_client.register_script(_RELEASE)
@@ -617,8 +621,32 @@ class StaticPoolSandboxClient(ClaimInputStaging):
         finally:
             archive.unlink(missing_ok=True)
 
+    def _accepts(self, shell: Mapping[str, Any]) -> bool:
+        return shell.get("isolated") is True or self._allow_unisolated
+
     def _start_on_shell(self, name: str, lease: _Lease, archive: Path, deadline: float) -> None:
         path = claim_path(name, lease.generation)
+        current = self.shell_status(
+            lease.slot, timeout=min(_CONTROL_READ_TIMEOUT_S, deadline - time.monotonic())
+        )
+        if not self._accepts(current):
+            # A shell whose child shares the supervisor's uid isolates nothing
+            # between claims: withhold the slot until a proper shell answers.
+            logger.error("static shell %s runs without isolation; quarantined", lease.slot.slot)
+            self._release(
+                keys=[self._slot_key(lease.slot.slot), self._claim_key(name), self._claims_key],
+                args=[
+                    name,
+                    lease.generation,
+                    "quarantined",
+                    "unisolated-shell",
+                    _now(),
+                    "delete",
+                    int(current.get("max_generation") or 0),
+                    str(current.get("incarnation") or ""),
+                ],
+            )
+            raise ShellRefused(f"shell {lease.slot.slot} runs without isolation")
         size = archive.stat().st_size
         for attempt in range(2):
             with archive.open("rb") as body:
@@ -940,8 +968,10 @@ class StaticPoolSandboxClient(ClaimInputStaging):
                 return
             shell = self.shell_status(slot, timeout=_CONTROL_READ_TIMEOUT_S)
         # A shell that quarantined itself stays quarantined until its task is
-        # replaced; only an idle shell with nothing running is clean.
+        # replaced; only an idle, isolated shell with nothing running is clean.
         if shell.get("state") != STATE_IDLE or shell.get("claim") is not None:
+            return
+        if not self._accepts(shell):
             return
         if self._readmit(
             keys=[self._slot_key(slot.slot)],

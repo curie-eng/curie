@@ -203,6 +203,7 @@ class _Worker:
             bundle_store=_Bundles(),
             key_prefix=prefix,
             retire_timeout_seconds=30.0,
+            allow_unisolated_shells=True,
         )
         self._pressure = AsyncRedis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW)
         self.substrate = SandboxSubstrate(

@@ -30,10 +30,17 @@ BASE_CHILD_ENV = (
     "PYTHONUNBUFFERED",
     "CURIE_PROC_DUMPABLE_PRELOAD",
 )
-# Only a root supervisor may scrub what the child left outside its claim
-# directory, because only then is everything the child uid owns the child's.
-ROOT_SCRUB_PATHS = ("/tmp", "/var/tmp", "/dev/shm", "/home/runner")
+# The only places outside its claim directory where an isolated runner child
+# may write. Each is emptied back to its startup contents at every
+# retirement; every other path must be read only to the child, which the
+# supervisor checks across the whole filesystem before it serves. POSIX
+# message queues live in /dev/mqueue, so it must be the mqueue mount.
+ROOT_SCRUB_PATHS = ("/tmp", "/var/tmp", "/dev/shm", "/run/lock", "/dev/mqueue")
 RUNNER_UID = 1000
+# Development and test only: run the child as the supervisor's own uid, with
+# no isolation between claims. A shell in this mode says so in its status,
+# and the worker refuses to lease it.
+UNISOLATED_ENV = "CURIE_SUPERVISOR_UNISOLATED_FOR_TESTS"
 
 
 class ConfigError(ValueError):
@@ -49,6 +56,7 @@ def check_private(path: Path, *, child_uid: int | None, child_gid: int | None) -
     """
 
     if child_uid is None:
+        # Only an unisolated (test) shell has no separate child uid.
         return
     info = path.stat()
     readable = (
@@ -104,6 +112,8 @@ class SupervisorConfig:
     child_port: int = 8080
     child_uid: int | None = None
     child_gid: int | None = None
+    # False only in the test-only unisolated mode (UNISOLATED_ENV).
+    isolated: bool = True
     workspace_path: Path = Path("/workspace")
     attachments_path: Path = Path("/attachments")
     # Supervisor env names the child receives. Secret names are withheld from
@@ -141,19 +151,33 @@ class SupervisorConfig:
                 "required: the shell serves HTTPS only"
             )
         root = os.geteuid() == 0
+        isolated = env.get(UNISOLATED_ENV) != "1"
         uid_raw = env.get("CURIE_SUPERVISOR_CHILD_UID")
         gid_raw = env.get("CURIE_SUPERVISOR_CHILD_GID")
-        child_uid = int(uid_raw) if uid_raw else (RUNNER_UID if root else None)
-        child_gid = int(gid_raw) if gid_raw else (child_uid if child_uid is not None else None)
-        if child_uid is not None and not root:
-            raise ConfigError("only a root supervisor can run the child as another uid")
-        if child_uid == 0:
-            raise ConfigError("the runner child never runs as root")
+        if isolated:
+            # The child must not share a uid or gid with the supervisor: a
+            # same-uid child could read the supervisor's initial environment
+            # through /proc and every file the supervisor can.
+            if not root:
+                raise ConfigError(
+                    "the supervisor must run as root to run the runner child as another uid"
+                )
+            child_uid: int | None = int(uid_raw) if uid_raw else RUNNER_UID
+            child_gid: int | None = int(gid_raw) if gid_raw else child_uid
+            if child_uid == 0 or child_gid == 0:
+                raise ConfigError("the runner child never runs as root or in the root group")
+        else:
+            if root or uid_raw or gid_raw:
+                raise ConfigError(
+                    f"{UNISOLATED_ENV} is for unprivileged tests only: never as root "
+                    "and never with a child uid"
+                )
+            child_uid = child_gid = None
         scrub_raw = env.get("CURIE_SUPERVISOR_SCRUB_PATHS")
         scrub = (
             tuple(Path(path) for path in _names(scrub_raw))
             if scrub_raw is not None
-            else (tuple(Path(path) for path in ROOT_SCRUB_PATHS) if child_uid is not None else ())
+            else (tuple(Path(path) for path in ROOT_SCRUB_PATHS) if isolated else ())
         )
         command = env.get("CURIE_SUPERVISOR_RUNNER_COMMAND", "python -m curie_runner")
         argv = tuple(shlex.split(command))
@@ -176,6 +200,7 @@ class SupervisorConfig:
             child_port=_int(env, "CURIE_SUPERVISOR_CHILD_PORT", 8080),
             child_uid=child_uid,
             child_gid=child_gid,
+            isolated=isolated,
             workspace_path=Path(env.get("CURIE_SUPERVISOR_WORKSPACE_PATH", "/workspace")),
             attachments_path=Path(env.get("CURIE_SUPERVISOR_ATTACHMENTS_PATH", "/attachments")),
             child_env_secret=secret,

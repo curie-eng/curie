@@ -299,7 +299,7 @@ def _writable(path: str) -> None:
 def wipe(path: Path) -> bool:
     """Remove ``path`` entirely, read-only trees included; True when gone."""
 
-    if path.is_symlink():
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
         path.unlink()
         return True
     if not path.exists():
@@ -310,7 +310,11 @@ def wipe(path: Path) -> bool:
     _writable(str(path))
 
     def retry(function: object, failed: str, _exc: BaseException) -> None:
-        _writable(os.path.dirname(failed))
+        parent = Path(failed).parent
+        # Only modes inside the tree being removed change: never its parent,
+        # which may be a shared scratch root such as /tmp.
+        if parent == path or path in parent.parents:
+            _writable(str(parent))
         with contextlib.suppress(FileNotFoundError):
             if os.path.isdir(failed) and not os.path.islink(failed):
                 shutil.rmtree(failed, ignore_errors=True)

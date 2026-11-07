@@ -33,7 +33,7 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
-from . import stage
+from . import isolation, stage
 from .child import RunnerChild, reap_orphans
 from .config import SupervisorConfig
 from .protocol import (
@@ -119,6 +119,10 @@ class Supervisor:
         self._quarantine: str | None = None
         self._last: dict[str, Any] | None = None
         self._http: aiohttp.ClientSession | None = None
+        self._baseline: isolation.Baseline | None = None
+        # Create and retire run as supervisor-owned tasks, so a control client
+        # that disconnects mid-call never abandons a half-done operation.
+        self._operations: set[asyncio.Task[Any]] = set()
 
     # -- status -----------------------------------------------------------------
 
@@ -140,6 +144,7 @@ class Supervisor:
         return {
             "slot": self._config.slot,
             "incarnation": self._config.incarnation,
+            "isolated": self._config.isolated,
             "state": self._state,
             "claim": claim,
             "max_generation": self._max_generation,
@@ -163,8 +168,23 @@ class Supervisor:
             for leftover in claims.iterdir():
                 if not stage.wipe(leftover):
                     self._quarantine_now("stale-claim-directory")
+        # A container restarted in place keeps its filesystem: what an earlier
+        # child left in the scratch roots goes before the baseline is taken.
         if not stage.scrub(self._config.scrub_paths, self._config.child_uid):
             self._quarantine_now("scrub-failed")
+        writer = (
+            None
+            if self._config.child_uid is None
+            else isolation.Writer(
+                uid=self._config.child_uid,
+                gids=frozenset({self._config.child_gid or self._config.child_uid}),
+            )
+        )
+        # Raises IsolationError when the shell cannot isolate claims; the
+        # supervisor then exits before serving.
+        self._baseline = await asyncio.to_thread(
+            isolation.Baseline.take, writer=writer, scratch_roots=self._config.scrub_paths
+        )
 
     async def close(self) -> None:
         lease = self._lease
@@ -226,6 +246,14 @@ class Supervisor:
     async def create(
         self, claim: str, generation: int, archive: Path, digest: str
     ) -> tuple[int, dict[str, Any]]:
+        try:
+            return await self._create(claim, generation, archive, digest)
+        finally:
+            archive.unlink(missing_ok=True)
+
+    async def _create(
+        self, claim: str, generation: int, archive: Path, digest: str
+    ) -> tuple[int, dict[str, Any]]:
         async with self._lock:
             lease = self._lease
             if lease is not None:
@@ -249,8 +277,11 @@ class Supervisor:
             except stage.StageError as exc:
                 self._state = STATE_IDLE
                 return 400, {"error": str(exc), "shell": self.status()}
-            except Exception as exc:  # noqa: BLE001 - a half staged shell is unknown
+            except BaseException as exc:
+                # A half staged shell is unknown, whatever stopped the staging.
                 self._quarantine_now(f"staging-failed:{type(exc).__name__}")
+                if not isinstance(exc, Exception):
+                    raise
                 return 503, {"error": "staging failed", "shell": self.status()}
             bearer = manifest.runner_token.encode("utf-8")
             if hmac.compare_digest(bearer, self._control):
@@ -270,9 +301,11 @@ class Supervisor:
                     uid=self._config.child_uid,
                     gid=self._config.child_gid,
                 )
-            except Exception as exc:  # noqa: BLE001 - nothing may run half staged
+            except BaseException as exc:
                 await asyncio.to_thread(self._clean_paths, staged)
                 self._quarantine_now(f"spawn-failed:{type(exc).__name__}")
+                if not isinstance(exc, Exception):
+                    raise
                 return 503, {"error": "runner did not start", "shell": self.status()}
             lease = Lease(
                 claim=claim,
@@ -317,15 +350,33 @@ class Supervisor:
             await asyncio.sleep(0.2)
         return False
 
-    def _clean_paths(self, staged: stage.StagedClaim) -> bool:
-        clean = True
+    def _clean_paths(self, staged: stage.StagedClaim | None) -> list[str]:
+        """Remove everything a claim could leave; return what is still there."""
+
+        problems: list[str] = []
         for path in (self._config.workspace_path, self._config.attachments_path):
             try:
                 stage.link(path, None)
             except (OSError, stage.StageError):
-                clean = False
-        clean = stage.wipe(staged.root) and clean
-        return stage.scrub(self._config.scrub_paths, self._config.child_uid) and clean
+                problems.append(f"could not remove the link {path}")
+        if staged is not None and not stage.wipe(staged.root):
+            problems.append("could not remove the claim directory")
+        if self._baseline is None:
+            problems.append("no isolation baseline")
+        else:
+            try:
+                problems += self._baseline.restore()
+            except OSError as exc:
+                problems.append(f"isolation check failed: {type(exc).__name__}")
+        return problems
+
+    async def _owned(self, operation: Any) -> tuple[int, dict[str, Any]]:
+        """Run ``operation`` to completion even if the caller goes away."""
+
+        task: asyncio.Task[tuple[int, dict[str, Any]]] = asyncio.create_task(operation)
+        self._operations.add(task)
+        task.add_done_callback(self._operations.discard)
+        return await asyncio.shield(task)
 
     async def retire(self, claim: str, generation: int, mode: str) -> tuple[int, dict[str, Any]]:
         async with self._lock:
@@ -349,12 +400,13 @@ class Supervisor:
             stopped = await lease.child.stop(self._config.stop_grace_s)
             for task in lease.tasks:
                 task.cancel()
-            cleaned = await asyncio.to_thread(self._clean_paths, lease.staged)
+            problems = await asyncio.to_thread(self._clean_paths, lease.staged)
             self._lease = None
             if not stopped:
                 self._quarantine_now("processes-survived")
-            elif not cleaned:
-                self._quarantine_now("cleanup-failed")
+            elif problems:
+                logger.error("claim %s left state behind: %s", claim, "; ".join(problems))
+                self._quarantine_now("cleanup-unverified")
             elif not settled:
                 self._quarantine_now("history-unsettled")
             else:
@@ -423,9 +475,12 @@ class Supervisor:
                     out.write(chunk)
             if received != length:
                 return web.json_response({"error": "truncated staging archive"}, status=400)
-            status, body = await self.create(*identity, archive, digest.hexdigest())
-        finally:
+        except BaseException:
             archive.unlink(missing_ok=True)
+            raise
+        # From here the create owns the archive and runs to its end even if
+        # this client disconnects; a retry of the same body then answers 200.
+        status, body = await self._owned(self.create(*identity, archive, digest.hexdigest()))
         return web.json_response(body, status=status)
 
     async def handle_retire(self, request: web.Request) -> web.Response:
@@ -435,7 +490,7 @@ class Supervisor:
         mode = request.query.get("mode", "retire")
         if identity is None or mode not in RETIRE_MODES:
             return web.json_response({"error": "invalid claim path or mode"}, status=400)
-        status, body = await self.retire(*identity, mode)
+        status, body = await self._owned(self.retire(*identity, mode))
         return web.json_response(body, status=status)
 
     async def handle_proxy(self, request: web.Request) -> web.StreamResponse:

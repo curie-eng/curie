@@ -232,6 +232,8 @@ class SupervisorProcess:
             "PATH": os.environ.get("PATH", os.defpath),
             "OTEL_SDK_DISABLED": "true",
             "CURIE_SUPERVISOR_SLOT": self.slot,
+            # These shells run unprivileged: no separate child uid.
+            "CURIE_SUPERVISOR_UNISOLATED_FOR_TESTS": "1",
             "CURIE_SUPERVISOR_CONTROL_TOKEN": self.control_token,
             "CURIE_SUPERVISOR_TLS_CERT_FILE": str(self.tls.cert),
             "CURIE_SUPERVISOR_TLS_KEY_FILE": str(self.tls.key),

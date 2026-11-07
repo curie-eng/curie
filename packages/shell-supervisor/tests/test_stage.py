@@ -19,6 +19,7 @@ BEARER = "bearer-" + "a" * 40
 def _config(tmp_path: Path, **overrides: object) -> SupervisorConfig:
     env = {
         "CURIE_SUPERVISOR_SLOT": "slot-a",
+        "CURIE_SUPERVISOR_UNISOLATED_FOR_TESTS": "1",
         "CURIE_SUPERVISOR_CONTROL_TOKEN": CONTROL_TOKEN,
         "CURIE_SUPERVISOR_TLS_CERT_FILE": "cert.pem",
         "CURIE_SUPERVISOR_TLS_KEY_FILE": "key.pem",
@@ -53,6 +54,7 @@ def _stage(tmp_path: Path, **manifest: object) -> tuple[stage.StagedClaim, stage
 def test_the_control_credential_leaves_the_supervisor_environment(tmp_path: Path) -> None:
     env = {
         "CURIE_SUPERVISOR_SLOT": "slot-a",
+        "CURIE_SUPERVISOR_UNISOLATED_FOR_TESTS": "1",
         "CURIE_SUPERVISOR_CONTROL_TOKEN": CONTROL_TOKEN,
         "CURIE_SUPERVISOR_TLS_CERT_FILE": "c",
         "CURIE_SUPERVISOR_TLS_KEY_FILE": "k",
@@ -68,7 +70,10 @@ def test_the_control_credential_leaves_the_supervisor_environment(tmp_path: Path
     [
         {"CURIE_SUPERVISOR_CONTROL_TOKEN": "short"},
         {"CURIE_SUPERVISOR_CHILD_ENV": "CURIE_SUPERVISOR_CONTROL_TOKEN"},
-        {"CURIE_SUPERVISOR_CHILD_UID": "0"},
+        {"CURIE_SUPERVISOR_CHILD_UID": "1000"},
+        # Without the explicit test-only switch, an unprivileged supervisor
+        # cannot isolate its child and refuses to start.
+        {"CURIE_SUPERVISOR_UNISOLATED_FOR_TESTS": "0"},
     ],
 )
 def test_unsafe_supervisor_settings_are_refused(tmp_path: Path, override: dict[str, str]) -> None:

@@ -14,6 +14,7 @@ from aiohttp import web
 
 from .child import become_subreaper
 from .config import ConfigError, SupervisorConfig, check_private
+from .isolation import IsolationError
 from .server import Supervisor
 
 logger = logging.getLogger("curie_shell_supervisor")
@@ -77,6 +78,9 @@ def main() -> None:
     become_subreaper()
     try:
         asyncio.run(serve(config))
+    except IsolationError as exc:
+        logger.critical("shell cannot isolate claims, refusing to serve: %s", exc)
+        sys.exit(78)
     except Exception:
         logger.exception("supervisor stopped on an unhandled fault")
         sys.exit(70)
