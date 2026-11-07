@@ -1948,6 +1948,13 @@ def test_the_static_client_needs_its_inventory_ca_and_lease_store(tmp_path: Path
     )
     with pytest.raises(ValueError, match="no static shell: sre"):
         _sandbox_client(WorkerConfig(), full, agents, redis_client=sync)
+    secrets = SubstrateConfig(
+        namespace="default",
+        warm_pool="curie-runner-pool",
+        connector_secret_pools=frozenset({"mail"}),
+    )
+    with pytest.raises(ValueError, match="no static shell: mail"):
+        _sandbox_client(WorkerConfig(), full, secrets, redis_client=sync)
     client = _sandbox_client(WorkerConfig(), full, generic, redis_client=sync)
     from curie_worker.sandbox import StaticPoolSandboxClient
 

@@ -404,7 +404,9 @@ class Supervisor:
         if identity is None:
             return web.json_response({"error": "invalid claim path"}, status=400)
         length = request.content_length
-        if length is None or length > self._config.max_stage_bytes:
+        if length is None:
+            return web.json_response({"error": "Content-Length is required"}, status=411)
+        if length > self._config.max_stage_bytes:
             return web.json_response({"error": "staging archive too large"}, status=413)
         self._config.state_root.mkdir(parents=True, exist_ok=True, mode=0o711)
         fd, name = tempfile.mkstemp(dir=self._config.state_root, prefix=".upload-")

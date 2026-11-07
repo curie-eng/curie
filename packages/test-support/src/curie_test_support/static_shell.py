@@ -25,7 +25,7 @@ import sys
 import tarfile
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -276,7 +276,7 @@ class SupervisorProcess:
         path: str,
         *,
         token: str | None,
-        body: bytes | None = None,
+        body: bytes | Iterable[bytes] | None = None,
         headers: dict[str, str] | None = None,
         timeout: float = 30.0,
     ) -> tuple[int, Any]:

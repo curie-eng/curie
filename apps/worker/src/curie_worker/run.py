@@ -423,12 +423,13 @@ def _static_pool_client(
     pools = {slot.pool for slot in slots}
     missing = sorted(
         agent
-        for agent in sub_config.agent_pools
+        for agent in sub_config.agent_pools | sub_config.connector_secret_pools
         if agent_warm_pool_name(sub_config.warm_pool, agent) not in pools
     )
     if missing:
         raise ValueError(
-            "CURIE_AGENT_SANDBOX_POOLS names agents with no static shell: " + ", ".join(missing)
+            "CURIE_AGENT_SANDBOX_POOLS or CURIE_AGENT_CONNECTOR_SECRET_POOLS names agents "
+            "with no static shell: " + ", ".join(missing)
         )
     if sub_config.warm_pool not in pools:
         logger.warning(

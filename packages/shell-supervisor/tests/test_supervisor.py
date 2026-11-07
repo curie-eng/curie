@@ -293,6 +293,11 @@ def test_staging_refusals_leave_the_shell_idle(
         status, answer = _create(supervisor, "claim-a", generation, body)
         assert status == 400, (generation, answer)
         assert supervisor.shell()["state"] == "idle"
+    # A streamed upload with no declared length cannot be bounded before reading.
+    chunked = supervisor.request(
+        "PUT", claim_path("claim-a", 9), token=CONTROL_TOKEN, body=iter([b"x" * 512])
+    )
+    assert chunked[0] == 411
     assert list((supervisor.state_root / "claims").iterdir()) == []
 
 
