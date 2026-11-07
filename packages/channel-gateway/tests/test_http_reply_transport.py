@@ -194,10 +194,70 @@ def test_gateway_http_routes_keep_each_slack_identity() -> None:
             )
             for route in routes:
                 await router.emit(event, route=route)
+            # Slack token headers: https://docs.slack.dev/authentication/tokens/
             assert tokens == ["Bearer xoxb-alpha", "Bearer xoxb-beta"]
         finally:
             if transport is not None:
                 await transport.aclose()
+            await server.close()
+            await provider_server.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("status", [410, 424])
+def test_gateway_preserves_explicit_provider_completion_refusals(status: int) -> None:
+    from curie_channel_gateway.reply_transport import (
+        DeletedReplyTargetError,
+        HttpReplyAdapter,
+        ProviderEgressRefusedError,
+    )
+
+    async def run() -> None:
+        error = DeletedReplyTargetError if status == 410 else ProviderEgressRefusedError
+        requests: list[bytes] = []
+
+        async def provider(request: web.Request) -> web.Response:
+            assert request.headers["X-Curie-Adapter-Secret"] == "test-provider"
+            requests.append(await request.read())
+            return web.json_response({"detail": error.reason}, status=status)
+
+        provider_app = web.Application()
+        provider_app.router.add_post("/reply", provider)
+        provider_server = TestServer(provider_app)
+        await provider_server.start_server()
+        inner = HttpReplyAdapter({"provider": "test-provider"})
+        server = TestServer(
+            reply_application(
+                inner,
+                secret="test-gateway",
+                route=TargetRoute(
+                    endpoint=str(provider_server.make_url("/reply")), adapter="provider"
+                ),
+            )
+        )
+        outer: HttpReplyTransport[TargetRoute] | None = None
+        try:
+            await server.start_server()
+            event = _EVENTS.validate_python(
+                next(
+                    case["body"]
+                    for case in _CORPUS["v1_0"]
+                    if case["body"]["event"] == "turn.completed"
+                )
+            )
+            route = TargetRoute(endpoint=str(server.make_url("/reply")), adapter="gateway")
+            outer = HttpReplyTransport(
+                {"gateway": "test-gateway"},
+                {(event.target.kind, route): ReplyCapabilities(False, None)},
+            )
+            with pytest.raises(error):
+                await outer.emit(event, route=route, best_effort_unreachable=True)
+            assert requests == [event.model_dump_json().encode()]
+        finally:
+            if outer is not None:
+                await outer.aclose()
+            await inner.aclose()
             await server.close()
             await provider_server.close()
 

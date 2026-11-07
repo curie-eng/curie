@@ -9,7 +9,12 @@ from pydantic import TypeAdapter, ValidationError
 
 from .ports.reply import DeclaredReplyTransport, ReplyCapabilities, ReplyEventTransport
 from .reply_route import ReplyRoute
-from .reply_transport import ADAPTER_SECRET_HEADER, HttpReplyAdapter
+from .reply_transport import (
+    ADAPTER_SECRET_HEADER,
+    DeletedReplyTargetError,
+    HttpReplyAdapter,
+    ProviderEgressRefusedError,
+)
 
 _EVENTS: TypeAdapter[ReplyEvent] = TypeAdapter(ReplyEvent)
 
@@ -52,7 +57,12 @@ def reply_application[Route](
             event = _EVENTS.validate_json(await request.read())
         except ValidationError:
             raise web.HTTPBadRequest(text="invalid reply event") from None
-        ack = await transport.emit(event, route=route, best_effort_unreachable=False)
+        try:
+            ack = await transport.emit(event, route=route, best_effort_unreachable=False)
+        except DeletedReplyTargetError as exc:
+            return web.json_response({"detail": exc.reason}, status=410)
+        except ProviderEgressRefusedError as exc:
+            return web.json_response({"detail": exc.reason}, status=424)
         return web.json_response(ack.model_dump(mode="json"))
 
     application = web.Application()
