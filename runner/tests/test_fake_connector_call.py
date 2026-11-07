@@ -46,9 +46,9 @@ import uvicorn
 from aci_protocol import Event
 from aiohttp import web
 from aiohttp.test_utils import TestServer
-from curie_runner.connectors import CALLER_HEADER
 from curie_runner import fake as fake_module
 from curie_runner import mcp_tool_capability as capability
+from curie_runner.connectors import CALLER_HEADER
 from curie_runner.fake import FakeModelSession, default_turn
 from curie_runner.otel import RunTracer
 from curie_runner.session import SessionRunner
@@ -184,9 +184,7 @@ def _mcp_connector(tools: str = "paired") -> Iterator[_Stub]:
 
 
 @asynccontextmanager
-async def _refusing_proxy(
-    status: int, body: bytes, content_type: str
-) -> AsyncIterator[_Stub]:
+async def _refusing_proxy(status: int, body: bytes, content_type: str) -> AsyncIterator[_Stub]:
     """A caller proxy that refuses every request, recording what each carried."""
 
     seen: list[dict[str, Any]] = []
@@ -499,9 +497,7 @@ def test_the_caller_value_never_appears_in_anything_the_session_emits(
 
     # The dial happened and was reported, so the absence below is not vacuous.
     expected = (
-        _ok("weather", _tool_count("paired"))
-        if outcome == "ok"
-        else _failed("weather", "invalid")
+        _ok("weather", _tool_count("paired")) if outcome == "ok" else _failed("weather", "invalid")
     )
     assert _call_lines(final["text"]) == [expected]
     assert any(expected in text for text in _texts_of(messages))
