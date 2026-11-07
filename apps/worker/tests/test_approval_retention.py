@@ -15,7 +15,8 @@ from redis.asyncio import Redis
 
 @asynccontextmanager
 async def store_for(sync_redis: Any, names: dict[str, str], *, enabled: bool = True):
-    redis = Redis(**sync_redis.connection_pool.connection_kwargs)
+    kwargs = sync_redis.connection_pool.connection_kwargs
+    redis = Redis(**{key: kwargs[key] for key in ("host", "port", "password", "db")})
     config = WorkerConfig(key_prefix=names["prefix"], approval_pending_retention_enabled=enabled)
     try:
         yield ApprovalCardStore(redis, config), redis, config
@@ -61,7 +62,12 @@ def test_pending_references_survive_restart_and_terminal_window_is_fresh(sync_re
                 )
             before = [await redis.pttl(key) for key in keys(config)]
             await restarted.settle("acme-approval")
-            assert all([await redis.pttl(key) <= ttl for key, ttl in zip(keys(config), before)])
+            assert all(
+                [
+                    await redis.pttl(key) <= ttl
+                    for key, ttl in zip(keys(config), before, strict=True)
+                ]
+            )
             await restarted.remember_notice_ref("acme-approval", "late-notice")
             assert 0 < await redis.pttl(keys(config)[1]) <= before[1]
 
@@ -164,5 +170,42 @@ def test_only_definitive_missing_approval_bounds_persistent_refs(
             assert await redis.scard(config.approval_references_pending_key()) == (
                 0 if deleted else 1
             )
+
+    asyncio.run(run())
+
+
+def test_publication_pop_restore_keeps_the_original_terminal_window(sync_redis, names):
+    async def run():
+        async with store_for(sync_redis, names) as (store, redis, config):
+            await remember(store)
+            ref = await store.pop("acme-approval")
+            assert ref is not None
+            end = await redis.get(config.approval_retention_key("acme-approval"))
+            assert end is not None
+            await store.restore("acme-approval", ref)
+            assert await store.read("acme-approval") is not None
+            assert await redis.get(config.approval_retention_key("acme-approval")) == end
+            assert 0 < await redis.pttl(keys(config)[0]) <= DEFAULT_CARD_TTL_S * 1000
+            await redis.delete(*keys(config), config.approval_retention_key("acme-approval"))
+            await store.restore("acme-approval", ref)
+            assert await store.read("acme-approval") is None
+
+    asyncio.run(run())
+
+
+def test_pending_snapshot_cannot_remove_a_concurrent_terminal_retention_window(sync_redis, names):
+    async def run():
+        async with store_for(sync_redis, names) as (store, redis, config):
+            await remember(store)
+
+            class RacingReader(Reader):
+                async def get(self, approval_id):
+                    pending = await super().get(approval_id)
+                    await store.settle(approval_id)
+                    return pending
+
+            await store.reconcile_pending(RacingReader())
+            assert all([0 < await redis.ttl(key) <= DEFAULT_CARD_TTL_S for key in keys(config)])
+            assert await redis.scard(config.approval_references_pending_key()) == 0
 
     asyncio.run(run())

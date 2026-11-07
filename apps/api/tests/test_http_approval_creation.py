@@ -669,3 +669,66 @@ def test_forged_stale_or_foreign_resume_cannot_suspend_again(
     assert rows(request["approval"]["dedupe_key"]) == []
     assert len(case.provider.requests) == calls
     assert rows(case.request["approval"]["dedupe_key"])[0]["id"] == first["id"]
+
+
+@pytest.mark.parametrize(
+    "override,producer,routed",
+    [
+        ({"expires_in_seconds": 3600}, 7, True),
+        ({"expires_in_seconds": None}, 7, True),
+        ({}, 23, True),
+        ({}, None, True),
+        ({}, 23, False),
+        ({}, None, False),
+    ],
+)
+def test_http_creation_freezes_explicit_route_schedule(creation_case, override, producer, routed):
+    case = creation_case
+    headers = {"X-API-Key": get_settings().api_key}
+    route = {"resolution": {"mode": "requesting_surface"}, **override}
+    changed = case.client.patch(
+        f"/agents/{case.scope['agent']}",
+        headers=headers,
+        json={"approval_routes": {"review": route}},
+    )
+    assert changed.status_code == 200, changed.text
+    case.request["approval"].update(route="review" if routed else None, expires_in_seconds=producer)
+    accepted(post(case), case.request)
+    row = rows(case.request["approval"]["dedupe_key"])[0]
+    duration = override.get("expires_in_seconds", producer) if routed else producer
+    if duration is None:
+        assert row["expires_at"] is None
+    else:
+        assert (row["expires_at"] - row["created_at"]).total_seconds() == duration
+    before = {key: row[key] for key in RECORD_FIELDS}
+    seal = row["identity_context"]
+    changed = case.client.patch(
+        f"/agents/{case.scope['agent']}",
+        headers=headers,
+        json={
+            "approval_routes": {
+                "review": {"resolution": {"mode": "requesting_surface"}, "expires_in_seconds": 99}
+            }
+        },
+    )
+    assert changed.status_code == 200, changed.text
+    accepted(post(case), case.request, duplicate=True)
+    again = rows(case.request["approval"]["dedupe_key"])[0]
+    assert {key: again[key] for key in RECORD_FIELDS} == before
+    assert again["identity_context"] == seal
+
+
+def test_pending_http_receipt_survives_schedule_schema_upgrade(creation_case):
+    from _migration_support import alembic_config
+    from alembic import command
+
+    case = creation_case
+    accepted(post(case), case.request)
+    before = rows(case.request["approval"]["dedupe_key"])[0]
+    try:
+        command.downgrade(alembic_config(), "0148")
+    finally:
+        command.upgrade(alembic_config(), "head")
+    accepted(post(case), case.request, duplicate=True)
+    after = rows(case.request["approval"]["dedupe_key"])[0]
+    assert after == before

@@ -452,6 +452,25 @@ pub struct ApprovalRouteBindingResponse {
     pub notification: Option<ApprovalNotificationTargetResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approvers: Option<ApprovalApprovers>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_route_deadline",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expires_in_seconds: Option<Option<u64>>,
+}
+
+fn deserialize_route_deadline<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)?;
+    if value == Some(0) {
+        return Err(serde::de::Error::custom(
+            "expires_in_seconds must be positive or null",
+        ));
+    }
+    Ok(Some(value))
 }
 
 /// Where a route's card goes, as the API returns it: a fixed channel, or the
@@ -540,6 +559,12 @@ pub struct ApprovalRouteBindingWrite {
     pub notification: Option<NotificationTargetWrite>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approvers: Option<ApprovalApprovers>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_route_deadline",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expires_in_seconds: Option<Option<u64>>,
 }
 
 /// Where a route's card goes, as an operator writes it: a fixed Slack channel,
@@ -619,6 +644,8 @@ pub struct RouteBindingInput {
     pub notification: Option<NotificationTargetWrite>,
     #[serde(default)]
     pub approvers: Option<ApproversInput>,
+    #[serde(default, deserialize_with = "deserialize_route_deadline")]
+    pub expires_in_seconds: Option<Option<u64>>,
 }
 
 /// An `approvers` block as written in a `--routes-from` file. Strict by design.
@@ -649,6 +676,7 @@ impl From<RouteBindingInput> for ApprovalRouteBindingWrite {
             resolution: input.resolution,
             notification: input.notification,
             approvers: input.approvers.map(Into::into),
+            expires_in_seconds: input.expires_in_seconds,
         }
     }
 }

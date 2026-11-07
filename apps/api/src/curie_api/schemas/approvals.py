@@ -1,17 +1,20 @@
 import uuid
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal, cast
 
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    GetJsonSchemaHandler,
     SerializerFunctionWrapHandler,
     field_validator,
     model_serializer,
     model_validator,
 )
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import CoreSchema
 
 from .. import adapter_principal
 from .channels import (
@@ -45,9 +48,15 @@ class _StoredWithoutNulls(BaseModel):
     dumped shape differ from the validated one.
     """
 
+    _explicit_null_fields: ClassVar[frozenset[str]] = frozenset()
+
     @model_serializer(mode="wrap")
     def _dump_without_nulls(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
-        return {k: v for k, v in handler(self).items() if v is not None}
+        return {
+            k: v
+            for k, v in handler(self).items()
+            if v is not None or k in self._explicit_null_fields & self.model_fields_set
+        }
 
 
 class ApprovalApprovers(_StoredWithoutNulls):
@@ -239,9 +248,12 @@ class ApprovalRouteBinding(_StoredWithoutNulls):
 
     model_config = ConfigDict(extra="forbid")
 
+    _explicit_null_fields = frozenset({"expires_in_seconds"})
+
     resolution: ApprovalResolutionTarget | ApprovalRequestingSurfaceTarget
     notification: ApprovalNotificationTarget | None = None
     approvers: ApprovalApprovers | None = None
+    expires_in_seconds: int | None = Field(default=None, strict=True, gt=0)
 
     @model_validator(mode="after")
     def _emails_need_the_requesting_surface(self) -> "ApprovalRouteBinding":
@@ -343,6 +355,25 @@ class ApprovalRouteBindingOut(BaseModel):
     resolution: ApprovalTargetOut | ApprovalRequestingSurfaceTargetOut
     notification: ApprovalTargetOut | None = None
     approvers: ApprovalApproversOut | None = None
+    expires_in_seconds: int | None = None
+
+    @model_serializer(mode="wrap")
+    def _preserve_deadline_presence(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        result: dict[str, Any] = handler(self)
+        if "expires_in_seconds" not in self.model_fields_set:
+            result.pop("expires_in_seconds", None)
+        return result
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls, core_schema: CoreSchema, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        return handler(
+            cast(
+                CoreSchema,
+                {key: value for key, value in core_schema.items() if key != "serialization"},
+            )
+        )
 
 
 class ApprovalResolve(BaseModel):

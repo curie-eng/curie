@@ -77,6 +77,10 @@ pub(super) async fn run(action: DevAction) -> Result<()> {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             commands::dev_script("cli/scripts/oidc-e2e.sh", &args).await
         }
+        DevAction::ApprovalScheduleE2e { args } => {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            commands::dev_script("cli/scripts/approval-schedule-e2e.sh", &args).await
+        }
         DevAction::IdentityE2e { args } => {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             commands::dev_script("cli/scripts/identity-e2e.sh", &args).await

@@ -592,6 +592,10 @@ class Approval(Base):
             name="approvals_identity_context_length_ck",
         ),
         CheckConstraint(
+            "remind_every_s IS NULL OR remind_every_s > 0",
+            name="approvals_remind_every_s_positive_ck",
+        ),
+        CheckConstraint(
             "(policy_identity IS NULL AND policy_version IS NULL) OR "
             "(policy_identity = 'publication:auto' AND policy_version >= 1)",
             name="approvals_policy_identity_ck",
@@ -657,6 +661,7 @@ class Approval(Base):
     # Optional SLA: past this instant the record can no longer be approved or
     # rejected; a resolve attempt flips it to expired instead.
     expires_at: Mapped[datetime | None] = mapped_column(default=None)
+    remind_every_s: Mapped[int | None] = mapped_column(default=None)
     resolved_by: Mapped[str | None] = mapped_column(default=None)
     resolution_note: Mapped[str | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())

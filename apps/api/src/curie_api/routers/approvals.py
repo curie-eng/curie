@@ -299,6 +299,12 @@ async def create_approval(
     traceparent = canonicalize_traceparent(
         request.headers.get(TRACEPARENT_STREAM_FIELD)
     )
+    existing = await crud_approvals.get_approval_by_dedupe_key(session, data.dedupe_key)
+    if existing is not None:
+        response.status_code = status.HTTP_200_OK
+        result = ApprovalCreateOut.model_validate(existing)
+        result.requested_by = await crud_approvals.approval_display_requester(session, existing)
+        return result
     rejected = await crud_approvals.find_rejected_reraise(session, data)
     # An existing row for this dedupe_key is a replay of a request this route
     # already accepted, so the idempotent 200 below still owns it.

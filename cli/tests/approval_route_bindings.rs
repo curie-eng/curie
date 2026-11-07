@@ -1371,15 +1371,27 @@ async fn route_deadlines_preserve_omitted_positive_and_explicit_null() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("routes.json");
     std::fs::write(&path, bound).unwrap();
-    let out = run(&server, ApprovalCmd { routes_from: Some(path), ..ApprovalCmd::default() })
-        .await.expect("all three deadline choices are valid");
+    let out = run(
+        &server,
+        ApprovalCmd {
+            routes_from: Some(path),
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    .expect("all three deadline choices are valid");
     let patch = patch_body(&server);
     let expected: serde_json::Value = serde_json::from_str(bound).unwrap();
     assert_eq!(patch["approval_routes"], expected);
-    let rendered = out.to_json().expect("structured routes");
+    let rendered = out.to_json();
     assert_eq!(rendered["routes"]["finite"]["expires_in_seconds"], 3600);
-    assert_eq!(rendered["routes"]["indefinite"]["expires_in_seconds"], serde_json::Value::Null);
-    assert!(rendered["routes"]["omitted"].get("expires_in_seconds").is_none());
+    assert_eq!(
+        rendered["routes"]["indefinite"]["expires_in_seconds"],
+        serde_json::Value::Null
+    );
+    assert!(rendered["routes"]["omitted"]
+        .get("expires_in_seconds")
+        .is_none());
 }
 
 #[tokio::test]
@@ -1389,7 +1401,15 @@ async fn invalid_deadline_values_never_write_routes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("routes.json");
         std::fs::write(&path, format!(r#"{{"review":{{"resolution":{{"kind":"slack","address":"C0EXAMPLE1"}},"expires_in_seconds":{value}}}}}"#)).unwrap();
-        assert!(run(&server, ApprovalCmd { routes_from: Some(path), ..ApprovalCmd::default() }).await.is_err());
+        assert!(run(
+            &server,
+            ApprovalCmd {
+                routes_from: Some(path),
+                ..ApprovalCmd::default()
+            }
+        )
+        .await
+        .is_err());
         assert_no_write(&server);
     }
 }

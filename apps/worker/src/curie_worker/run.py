@@ -154,6 +154,7 @@ class Runtime:
     # drive its one-shot legacy rekey at boot (#1751) without constructing a
     # second client-and-config pair that could drift from the kernel's.
     card_store: ApprovalCardStore
+    approval_reference_reader: ApprovalClient
     # None unless the connector reconciler is enabled (ADR-0090, #1184). Held
     # here so `_run` supervises it beside the consumers rather than letting it
     # run unsupervised.
@@ -937,6 +938,7 @@ def build(
             default_max_output_tokens_per_run=config.default_max_output_tokens_per_run,
         ),
         publication_loop=publication_loop,
+        approval_reference_reader=approval_client,
         remediation_cards=_build_remediation_cards(config, engine, sink, card_store),
         remediation_receipts=_build_remediation_receipts(config, engine, sink),
         stream_retention=build_stream_retention(config, async_redis),
@@ -1689,6 +1691,12 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
             lambda: run_heartbeat(config.heartbeat_file, config.heartbeat_interval_s, shutdown),
         ),
     ]
+    tasks.append(
+        launch(
+            "approval-reference-retention",
+            lambda: rt.card_store.run_retention(rt.approval_reference_reader, shutdown),
+        )
+    )
     if rt.deploy_notice_consumer is not None:
         tasks.append(launch("deploy-notices", rt.deploy_notice_consumer.run))
     if rt.connector_loop is not None:

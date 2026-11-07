@@ -2,7 +2,7 @@
 
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 from aci_protocol import ApprovalRequest
@@ -19,6 +19,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from ..approval_schedule import resolve_route_schedule
 from ..approvers import card_on_requesting_surface
 from ..models import (
     Agent,
@@ -59,13 +60,7 @@ async def insert_approval(
 ) -> Approval:
     """Borrowed insert/flush only. @spec HTTP-APPROVAL-CONTINUITY-5/9."""
 
-    expires_at = None
-    if data.expires_in_seconds is not None:
-        # Naive UTC, matching the DateTime columns (server_default func.now()
-        # stores naive timestamps in the session timezone, UTC in this stack).
-        expires_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(
-            seconds=data.expires_in_seconds
-        )
+    schedule = await resolve_route_schedule(session, data)
     approval = Approval(
         agent_id=data.agent_id,
         conversation_id=data.conversation_id,
@@ -90,7 +85,8 @@ async def insert_approval(
         gate_kind=data.gate_kind,
         granted_tool=data.granted_tool,
         granted_arguments=data.granted_arguments,
-        expires_at=expires_at,
+        created_at=schedule.created_at,
+        expires_at=schedule.expires_at,
     )
     if approval_id is not None:
         approval.id = approval_id

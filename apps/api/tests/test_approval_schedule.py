@@ -28,6 +28,16 @@ def test_omitted_deadline_stays_omitted_on_read_write() -> None:
     assert "expires_in_seconds" not in ApprovalRouteBindingOut.model_validate(written).model_dump()
 
 
+def test_readback_schema_rejects_a_route_without_a_resolution() -> None:
+    from jsonschema import ValidationError as JsonSchemaError
+    from jsonschema import validate
+
+    schema = ApprovalRouteBindingOut.model_json_schema(mode="serialization")
+    validate(binding(expires_in_seconds=None), schema)
+    with pytest.raises(JsonSchemaError):
+        validate({"expires_in_seconds": None}, schema)
+
+
 @pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, 5.0, "5"])
 def test_route_deadline_refuses_non_positive_or_non_integer_values(value: Any) -> None:
     with pytest.raises(ValidationError):
@@ -38,11 +48,11 @@ def test_route_deadline_refuses_non_positive_or_non_integer_values(value: Any) -
     "override", [{}, {"expires_in_seconds": 3600}, {"expires_in_seconds": None}]
 )
 def test_operator_deadline_round_trip(
-    client: Any, headers: dict[str, str], clean_db: None, override: dict[str, Any]
+    client: Any, auth_headers: dict[str, str], clean_db: None, override: dict[str, Any]
 ) -> None:
     created = client.post(
         "/agents",
-        headers=headers,
+        headers=auth_headers,
         json={
             "name": "acme-schedule",
             "channel": {"kind": "slack", "address": "C0EXAMPLE0"},
@@ -58,13 +68,15 @@ def test_operator_deadline_round_trip(
     } == override
     updated = client.patch(
         f"/agents/{agent_id}",
-        headers=headers,
+        headers=auth_headers,
         json={
             "approval_routes": {"review": binding(**override, notification=None, approvers=None)},
         },
     )
     assert updated.status_code == 200, updated.text
-    read = client.get(f"/agents/{agent_id}", headers=headers).json()["approval_routes"]["review"]
+    read = client.get(f"/agents/{agent_id}", headers=auth_headers).json()["approval_routes"][
+        "review"
+    ]
     assert {k: v for k, v in read.items() if k == "expires_in_seconds"} == override
 
 
@@ -74,14 +86,14 @@ def test_operator_deadline_round_trip(
 )
 def test_legacy_creation_freezes_route_deadline(
     client: Any,
-    headers: dict[str, str],
+    auth_headers: dict[str, str],
     clean_db: None,
     override: dict[str, Any],
     producer: int | None,
 ) -> None:
     created = client.post(
         "/agents",
-        headers=headers,
+        headers=auth_headers,
         json={
             "name": "acme-schedule",
             "channel": {"kind": "slack", "address": "C0EXAMPLE0"},
@@ -103,9 +115,9 @@ def test_legacy_creation_freezes_route_deadline(
         "card_channel": "C0EXAMPLE1",
         "expires_in_seconds": producer,
     }
-    response = client.post("/approvals", headers=headers, json=request)
+    response = client.post("/approvals", headers=auth_headers, json=request)
     assert response.status_code == 201, response.text
-    row = client.get(f"/approvals/{response.json()['id']}", headers=headers).json()
+    row = client.get(f"/approvals/{response.json()['id']}", headers=auth_headers).json()
     duration = override.get("expires_in_seconds", producer)
     if duration is None:
         assert row["expires_at"] is None
@@ -115,14 +127,14 @@ def test_legacy_creation_freezes_route_deadline(
         ).total_seconds() == duration
     changed = client.patch(
         f"/agents/{agent_id}",
-        headers=headers,
+        headers=auth_headers,
         json={"approval_routes": {"review": binding(expires_in_seconds=100)}},
     )
     assert changed.status_code == 200, changed.text
-    replay = client.post("/approvals", headers=headers, json=request)
+    replay = client.post("/approvals", headers=auth_headers, json=request)
     assert replay.status_code == 200, replay.text
     assert replay.json()["id"] == row["id"]
     assert (
-        client.get(f"/approvals/{row['id']}", headers=headers).json()["expires_at"]
+        client.get(f"/approvals/{row['id']}", headers=auth_headers).json()["expires_at"]
         == row["expires_at"]
     )

@@ -246,6 +246,22 @@ curie local approvals my-agent --routes-from approval-routes.json
 curie local approvals my-agent --list-routes
 ```
 
+A route's optional `expires_in_seconds` selects its decision deadline. A positive
+integer chooses that duration; explicit JSON null chooses no deadline. Omit the
+field to keep the producer's duration, including its existing null meaning.
+Session requests default to 24 hours when the route has no override. Booleans,
+zero, negative values and fractional numbers are refused. The API freezes the
+chosen deadline at creation, so retries and later route edits do not move it.
+Publication and remediation keep their independent deadline policies.
+
+Deploy compatible API readers and workers before writing deadline keys. Complete
+the [reference-retention rollout](../apps/worker/README.md#approval-deadline-and-reference-retention-rollout)
+so pending cards, notices and reply-placement references survive the whole pending
+lifetime. Terminal settlement starts a fresh 14-day retention window before card
+delivery; failed edits keep their references within that window. A no-deadline
+request still needs current answer authority. Removing its route can strand it
+until the binding is restored or an operator rejects it through recovery.
+
 The strict `--routes-from` JSON uses the complete binding shape shown above and is the only
 way to declare a notification, including the `endpoint` and `adapter` required for a
 non-Slack target. `--route-resolution` and `--route-approvers` can override resolution and
@@ -441,11 +457,16 @@ remediation write is refused `operator_principal_required`. Both are sent as
 A single operator does not need a second person to settle a card. An authenticated
 member of the approver set may approve their own request, including the person who
 asked. Terminal resolution still works only for an explicit `approvers.users`
-binding, because an operator principal carries no channel. If nobody resolves a
-worker-raised request, it expires after 24 hours and the paused session wakes on
-the timeout branch instead of staying pending.
+binding, because an operator principal carries no channel. A finite request that
+passes its stored deadline expires and wakes the paused session on its timeout
+branch. A request with no deadline stays pending until settlement.
 
 ## Operational guarantees
+
+Publication approvals retain their 24-hour deadline. The expiry sweeper wakes
+settled sessions, and the resume reconciler re-drives resolutions whose resume
+turn never landed. Historical approvals with a null `expires_at` remain pending
+until settlement.
 
 - **A paused turn holds nothing.** The queue entry is acknowledged when the turn
   suspends; the resolution arrives later as its own queued turn. No stream entry, thread
@@ -454,14 +475,6 @@ the timeout branch instead of staying pending.
   ([ADR-0003](adr/0003-stateless-first-rehydrate-on-resume.md)). Resume cold-creates a
   fresh one and rehydrates from history. Never design a feature that needs in-process
   state to survive a pause.
-- **Worker-raised approvals expire.** Session approvals the worker creates, and
-  publication approvals, carry a 24 hour deadline. The sweeper settles a lapsed
-  record and wakes the paused session down its timeout branch
-  (`apps/api/src/curie_api/sweeper.py`), and a reconciler re-drives resolutions
-  whose resume turn never landed (`apps/api/src/curie_api/resumereconciler.py`).
-  A direct API create that omits `expires_in_seconds` is still the wire's no-SLA
-  path and is not swept. Approvals created before this deadline existed keep a
-  null `expires_at` and are not swept; settle those by hand.
 - **Every attempt is audited.** `GET /approvals/{id}/audit` returns each resolution
   attempt with the authorizer, membership evidence, `principal_kind`, and
   `authenticated` proof state, including refusals. Historical rows remain

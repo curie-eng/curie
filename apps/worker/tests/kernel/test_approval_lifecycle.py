@@ -7097,3 +7097,36 @@ def test_approval_api_outage_retries_before_pausing_and_422_escalates(
                 assert await h.kernel._markers.is_terminal(event.event_id)
 
     asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "override,expected",
+    [({}, 86400), ({"expires_in_seconds": 7}, 7), ({"expires_in_seconds": None}, None)],
+)
+def test_session_route_deadline_preserves_default_and_explicit_null(
+    make_harness, override, expected
+):
+    async def go():
+        approvals = RecordingApprovals()
+        binding = RoutedBinding({"review": {**_resolution_route(), **override}})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Approve bounded work", "review")
+            await h.kernel.process_event(_qevent("please review"))
+            assert len(approvals.requests) == 1
+            assert approvals.requests[0].expires_in_seconds == expected
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "5"])
+def test_malformed_route_deadline_never_creates_approval(make_harness, value):
+    async def go():
+        approvals = RecordingApprovals()
+        binding = RoutedBinding({"review": {**_resolution_route(), "expires_in_seconds": value}})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Approve bounded work", "review")
+            await h.kernel.process_event(_qevent("please review"))
+            assert approvals.requests == []
+            assert h.sink.posts == []
+
+    asyncio.run(go())
