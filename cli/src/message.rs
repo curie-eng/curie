@@ -856,6 +856,7 @@ async fn await_cluster_relay(
 /// published host port, authenticated with the same password the compose worker
 /// uses. Pure so the construction is unit-tested without a live Valkey.
 pub fn local_valkey_url(password: &str, host: &str, port: u16) -> String {
+    let password = queue::percent_encode_unreserved(password);
     format!("redis://:{password}@{host}:{port}")
 }
 
@@ -3431,10 +3432,7 @@ async fn message_connected(
         }
     };
 
-    let valkey_url = format!(
-        "redis://:{}@127.0.0.1:{valkey_local_port}",
-        opts.valkey_password
-    );
+    let valkey_url = local_valkey_url(&opts.valkey_password, "127.0.0.1", valkey_local_port);
     let mut conn = connect(&valkey_url).await?;
     enqueue_over_connected_transport(&opts, &mut conn, TurnVerb::Cluster, &channel, &transport)
         .await
@@ -3533,10 +3531,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
 
     // Enqueue the exact Slack binding coordinates the dispatcher would produce,
     // with only the reserved adapter/ref selecting the built-in relay.
-    let valkey_url = format!(
-        "redis://:{}@127.0.0.1:{valkey_local_port}",
-        opts.valkey_password
-    );
+    let valkey_url = local_valkey_url(&opts.valkey_password, "127.0.0.1", valkey_local_port);
     let mut conn = connect(&valkey_url).await?;
     let (channel, thread_ts, _) = resolve_targets(Some(&channel), opts.thread.as_deref());
     let (event, reply_ref) = cluster_relay_turn(&channel, identity.as_deref(), &opts, &thread_ts);
@@ -5176,10 +5171,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     };
     ui.note(&format!("routing to channel {channel}"));
 
-    let valkey_url = format!(
-        "redis://:{}@127.0.0.1:{valkey_local_port}",
-        opts.valkey_password
-    );
+    let valkey_url = local_valkey_url(&opts.valkey_password, "127.0.0.1", valkey_local_port);
     let mut conn = connect(&valkey_url).await?;
 
     let results = match run_eval_turns(
@@ -7219,6 +7211,23 @@ mod tests {
             local_valkey_url("s3cr3t", "localhost", DEFAULT_LOCAL_VALKEY_PORT),
             "redis://:s3cr3t@localhost:26379"
         );
+    }
+
+    #[test]
+    fn local_valkey_url_preserves_reserved_password_characters() {
+        for password in [
+            "example#token",
+            "example+token",
+            "example%2Ftoken",
+            "example/?@token",
+        ] {
+            let client =
+                redis::Client::open(local_valkey_url(password, "localhost", 6379)).unwrap();
+            assert_eq!(
+                client.get_connection_info().redis_settings().password(),
+                Some(password)
+            );
+        }
     }
 
     #[test]

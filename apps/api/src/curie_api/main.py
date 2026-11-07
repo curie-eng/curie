@@ -14,6 +14,7 @@ from functools import partial
 
 import httpx
 import redis.asyncio as redis
+from curie_internal.valkey import AsyncRedis
 from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
@@ -167,7 +168,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # for a proxy most runs never touch.
     app.state.pod_log_reader = build_lazy_pod_log_reader(settings.kube_config_path)
     app.state.pod_lister = build_lazy_pod_lister(settings.kube_config_path)
-    valkey: redis.Redis = redis.from_url(settings.valkey_dsn())
+    valkey: redis.Redis = AsyncRedis.from_url(settings.valkey_dsn())
     app.state.valkey = valkey
     app.state.kill_switch = KillSwitch(valkey)
     app.state.thread_reset_requests = ThreadResetRequests(valkey)

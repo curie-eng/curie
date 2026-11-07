@@ -4,12 +4,15 @@
 > Valkey 8.1 with AOF fsync every second. This guide is the swap onto node-based
 > ElastiCache for Valkey with cluster mode disabled.
 
-Curie can run on that cache with no application change when the cache uses an
-auth token, TLS, and a custom parameter group that sets `maxmemory-policy` to
-`noeviction`. Clients stay on `redis.Redis` and `redis.asyncio.Redis`. Do not
-move them to a cluster client. Do not attach a Valkey RBAC user group: ElastiCache
-turns the default user off for that group, and the running services cannot send
-a username.
+The target is AWS ElastiCache for Valkey 8.1, cluster mode disabled, Multi-AZ
+with one replica and automatic failover, TLS, a replication-group auth token,
+`noeviction`, and daily snapshots. Ordinary API, worker and dispatcher clients
+use the shared primary-endpoint recovery policy in
+`packages/curie-internal/src/curie_internal/valkey.py`. They remain standalone
+clients, never cluster clients. This configuration does not provide durable
+acknowledged writes or support the protected commissioning and worker lanes.
+Do not attach an RBAC user group: this target uses the default user and an auth
+token, and the running services have no username setting.
 
 This guide lives beside the queue seam, the same way the Postgres swap guide
 lives beside the relational seam. `docs/operations.md` is a file, so this note
@@ -31,32 +34,48 @@ is not under a `docs/operations/` directory.
    snapshot does not close that window. The observable failures are listed
    below. Leave durability disabled. Turning it on would require cluster mode,
    which this swap does not take.
-2. **A demoted primary is not retried when it returns READONLY.** redis-py 8.1
-   retries connection and timeout errors. `ReadOnlyError` is a `ResponseError`,
-   so it is not in that set. `StreamConsumer._consume` catches the timeout and
-   the connection error around `XREADGROUP` and then retries. A READONLY error
-   leaves that loop. A dropped socket is retried, and a new connection resolves
-   DNS again. A live socket that keeps returning READONLY is not. Use the
-   primary endpoint, not the reader endpoint and not a node endpoint. Blocked
-   `XREADGROUP` and in-flight `EVAL` on the old primary fail with one of those
-   two errors. This is a reconnect improvement, not a boot blocker.
+2. **Reconnect recovery is implemented; write outcomes remain uncertain.**
+   On READONLY, connection errors and timeouts, ordinary shared clients
+   disconnect the pool, including in-use connections. The next command opens
+   a new socket and resolves the primary endpoint again. Observational commands
+   in the explicit read allowlist retry at most three times after 0.1, 0.2 and
+   0.4 seconds. Writes, Lua, transactions and stream delivery operations are
+   never automatically retried by this policy; redis-py's generic command
+   retry is disabled so a lost reply cannot silently replay an `INCR` or `EVAL`.
+   Existing callers receive those errors and retain their own recovery logic.
+   The shared stream read loop catches READONLY and backs off without exiting
+   or canceling its handlers. DNS convergence is still required, and a pool
+   reset may interrupt sibling commands, whose outcomes must be treated as
+   unknown. The bounded pressure probe opts out of read retries. Use the
+   primary endpoint, never the reader endpoint or a node endpoint.
 3. **A named RBAC user is not selectable.** The API builds
    `rediss://:<password>@<host>:<port>/0` unless `VALKEY_URL` is set. The
    worker and the dispatcher pass host, port, password, database, and `ssl`,
    and they have no username field. The connector proxy sends `AUTH` with the
    password only. The chart and Langfuse do the same. An auth token keeps the
-   default user on and matches every one of those clients. A Valkey user group
-   turns the default user off
+   default user on and matches every one of those clients. Named users need
+   RBAC user-group configuration, outside this target
    ([RBAC](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/Clusters.RBAC.html)).
    Username support across those clients is a later change. It is not required
    for the auth-token configuration, and Langfuse on this chart still would
    not send a username.
-4. **Protected-hook commissioning cannot create users on ElastiCache.**
-   `ACL SETUSER` is a restricted command. The worker ACL recipe also contains
-   `reset`, which an ElastiCache access string rejects. Steady-state protected
-   workers can use users that were created in the ElastiCache API. Commissioning
-   against this cache cannot. The main API, worker, and dispatcher do not call
-   `CONFIG` or `ACL SETUSER`.
+4. **Protected commissioning and protected-worker continuity are unsupported.**
+   Commissioning needs `ACL SETUSER`, a restricted ElastiCache command.
+   Protected workers require named users, which need RBAC and are excluded
+   from this auth-token target. They additionally pin TLS peer identity and
+   the server `run_id`, and their transport refuses reconnect. Even a separately
+   provisioned named user would not establish continuity across promotion to
+   a different server identity. The security fences in
+   `packages/protected-hooks/src/curie_protected_hooks/worker_transport.py`
+   remain unchanged; never route them through ordinary reconnecting clients.
+5. **Direct CLI Valkey transport needs a separate managed-cache change.**
+   Password construction is fixed, but the current Rust Redis dependency has
+   no TLS feature, and cluster message/eval enqueue through an in-chart Valkey
+   port-forward using plaintext URLs. Those direct paths are unsupported for
+   this TLS-only external cache. Add TLS and an explicit primary-endpoint
+   transport design before using them; the Python turn canary can already take
+   a `rediss://` URL. The feature inventory was checked with
+   `cargo tree --manifest-path cli/Cargo.toml -e features -i redis`.
 
 ## Required cache settings
 
@@ -81,31 +100,28 @@ Engine and shape, from the ElastiCache controls this swap depends on:
 | Snapshots | Daily automatic backups. Retain at least 1 day. 7 days is the practical retention so a bad day can be restored. Snapshots do not replace the missing AOF window. |
 | Node size | Do not copy the chart's 256Mi container limit. ElastiCache reserves memory for the process, replication, and snapshots, and `noeviction` refuses writes when the data memory is full. Size the node for the stream working set plus the Langfuse queues that share the cache, with headroom under `maxmemory`. A `cache.t4g.small` is only a floor for a small install. Move to a larger node in the m7g or r7g family when stream retention or those queues are large. |
 
-Access string for the default user that Curie and Langfuse share:
+The replication-group AUTH mode has no configurable user access string.
+It uses the default user with an auth token. Access strings belong to RBAC
+users, which this target excludes. The following string describes only the
+local stand-in's permissive user; it is not an ElastiCache AUTH-mode setting:
 
 ```
 on ~* &* +@all
 ```
 
-`+@all` is the least restrictive string ElastiCache documents. The engine still
-rejects the node-based restricted commands, so the string must not name them
-and must not contain `reset`. `&*` keeps pub/sub channels open. The kill path
-publishes and subscribes. A new user created with key and command grants but
-no channel grant cannot do that.
-
-A Curie-only cache, with Langfuse pointed elsewhere, can use a tighter string.
-The proof ran this one on Valkey 8.1.10:
+The **local test constraint only** was a tighter user on Valkey 8.1.10:
 
 ```
 on ~* &* +@all -@admin -@dangerous +info|server
 ```
 
-On that server the whole `INFO` command is in `@dangerous`, so `+info|server`
-is what puts `INFO server` back. Protected scripts read `run_id` from that
-section. `KEYS`, `ACL SETUSER`, `ACL GETUSER`, and `CLIENT KILL` are also in
-those categories and stay denied. Do not put `-@dangerous` on the shared
-Langfuse user until BullMQ's command set is checked. Do not paste the
-protected-hook worker ACL recipe into ElastiCache. It contains `reset`.
+That constraint keeps pub/sub channel access and permits `INFO server`, which
+protected scripts use for their run-id fence, while denying other `INFO`
+sections and admin/dangerous commands. It is neither an AWS AUTH-mode recipe
+nor a claim that Langfuse's BullMQ command set works with that constraint.
+ElastiCache restricts commands at the engine regardless of the local ACL.
+Do not paste the protected worker ACL recipe into an ElastiCache access string;
+it contains `reset`, which AWS rejects.
 
 Node-based restricted commands, which the main services do not call
 ([supported commands](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/SupportedCommands.html)):
@@ -143,13 +159,37 @@ the same boundary: `REDIS_HOST`, `REDIS_PORT`, `REDIS_AUTH`, and
 `REDIS_TLS_ENABLED`, with `REDIS_TLS_CA` left unset. A private CA or mutual TLS
 is outside this knob.
 
-`redis-py` 8.1 (the version pinned for the worker) sends `AUTH <password>` when
-the username is empty, `CLIENT SETINFO` on connect (a `ResponseError` is
-ignored), and `SELECT` only when the database is not 0. The protocol stays
-RESP2 unless a caller asks for RESP3. Maintenance notifications stay off unless
-RESP3 is selected. The worker's pressure client turns them off explicitly.
-`health_check_interval` stays 0. The worker sets the socket timeout to the
-blocking read plus 5 seconds so an idle `XREADGROUP` is not cut by the client.
+Passwords built into the API DSN are percent-encoded with an empty safe set,
+including `#`, `%`, `/`, `?`, `@` and `+`. Worker and dispatcher constructors
+pass the password as a separate argument and need no URL encoding.
+The CLI local and cluster direct queue builders also encode the password through
+one shared URL builder. The
+connector proxy receives the API-built DSN and percent-decodes its password;
+it does not build a second URL. When supplying `VALKEY_URL` directly, encode
+its password yourself.
+
+For auth-token rotation, use AWS `ROTATE` to accept the new token alongside
+the old one, update **every** consumer, including Langfuse, API, worker,
+dispatcher and any connector proxy grant-store configuration, then restart
+those consumers so all pooled connections and issued proxy configurations use
+the new token. Verify fresh connections before AWS `SET` removes the old token
+([AUTH rotation](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/auth.html)).
+
+The pinned redis-py 8.1.0 defaults to RESP3. With a password it sends
+`HELLO 3 AUTH default <password>`, then negotiates
+`CLIENT MAINT_NOTIFICATIONS ON moving-endpoint-type ...` in its default `auto`
+mode, followed by `CLIENT SETINFO LIB-NAME` and `LIB-VER`. Both sync and async
+connection implementations catch a `ResponseError` rejecting maintenance
+negotiation in `auto` mode, log at DEBUG and continue connecting. An explicit
+`enabled=True` instead propagates that rejection; non-`ResponseError` failures
+also propagate. `CLIENT SETINFO` response errors are ignored separately.
+This is grounded in redis-py 8.1.0's the sync and async connection modules, especially `on_connect_check_health` and
+`_enable_maintenance_notifications`
+([pinned source](https://github.com/redis/redis-py/tree/v8.1.0/redis)).
+The worker pressure client explicitly disables maintenance notifications.
+`SELECT` is sent only for a nonzero database; `health_check_interval` stays 0.
+The ordinary worker socket timeout stays above its blocking read by 5 seconds.
+
 
 ## Call paths
 
@@ -158,20 +198,20 @@ means an acknowledged write that the replica did not have at failover.
 
 | Path | Verdict | Lost write |
 | --- | --- | --- |
-| API, worker, and dispatcher connections (`Settings.valkey_dsn`, `WorkerConfig.valkey_client_kwargs`, `build_redis`) | Client config: `VALKEY_TLS=true`, primary host, auth token. No code change. | A connect error during failover retries. A READONLY response does not. |
+| API, worker, and dispatcher connections (`Settings.valkey_dsn`, `WorkerConfig.valkey_client_kwargs`, `build_redis`) | Client config: `VALKEY_TLS=true`, primary host, auth token; shared failover clients. | Pool invalidation on READONLY and transport errors; bounded observational retries. Writes and Lua surface errors. |
 | Connector proxy grant spend (`_set_nx_ex` in `apps/worker/src/curie_connector_proxy/server.py`) | Compatible. `rediss://` uses the system CA and TLS 1.2 or newer. `AUTH` is the password only. `SELECT` runs only when the URL path is not 0. Any reply other than `+OK`, including a connection error, is a failed spend. | An acknowledged `SET` that then disappears lets the same grant id be spent again. An error during failover fails closed. |
 | Streams and consumer groups (`XADD`, `XGROUP`, `XREADGROUP`, `XACK`, `XAUTOCLAIM`, `XCLAIM`, `XPENDING`, `XINFO`, `XRANGE`, `XREVRANGE`, `XLEN`, `XTRIM`) | Compatible. The broker port and the direct producers use these verbs. Multi-key scripts that also touch a stream are safe only because cluster mode stays disabled. | A lost `XADD` drops a turn the producer already treated as queued. A lost `XACK` leaves the entry pending and the group redelivers it, which is the existing at-least-once window. |
 | `SET NX EX` dedupe, locks, leases, and single-use grants | Compatible as commands. The parameter group must be `noeviction` or a full node evicts these TTL keys. | The key is gone, so a duplicate event is accepted, a second holder takes a lock or lease, or a grant is spent twice. |
-| Lua, including multi-key scripts and `TIME` | Compatible on this mode. Production scripts call the verbs listed below. No script calls `CONFIG`, `DEBUG`, `RANDOMKEY`, or `math.random`. `INFO server` is the protected run-id fence. Multi-key `EVAL` (resume, delivery, channel-read ledger, capacity wait, admission, commissioning, protected markers) hashes to more than one slot and is why cluster mode stays off. `EVAL` is sent directly at most sites. `register_script` uses `EVALSHA` and redis-py falls back to `EVAL` on `NOSCRIPT`, including after a new primary with an empty script cache. | A script the primary acknowledged and the replica did not apply is the same class of loss as the writes inside it. A script that errors mid-failover may have applied or not. Callers that retry a non-idempotent script can double the effect. |
+| Lua, including multi-key scripts and `TIME` | Compatible on this mode. Production scripts call the verbs listed below. No script calls `CONFIG`, `DEBUG`, `RANDOMKEY`, or `math.random`. `INFO server` is the protected run-id fence. Multi-key `EVAL` (resume, delivery, channel-read ledger, capacity wait, admission, commissioning, protected markers) hashes to more than one slot and is why cluster mode stays off. `EVAL` is sent directly at most sites. `register_script` uses `EVALSHA` and redis-py recovers `NOSCRIPT` with `SCRIPT LOAD` then `EVALSHA`, including after a new primary with an empty script cache. | A script the primary acknowledged and the replica did not apply is the same class of loss as the writes inside it. A script that errors mid-failover may have applied or not. Callers that retry a non-idempotent script can double the effect. |
 | `MULTI` / `EXEC` and pipelines | Compatible. One primary, so a transaction is not a cross-slot error. | A transaction the replica missed is lost as a group. |
 | `SCAN` | Compatible. Production iteration uses `scan_iter`. `KEYS` is not the production path. | None. `SCAN` does not create durable state. |
 | Pub/sub kill channel | Compatible. The API `PUBLISH`es and the worker `SUBSCRIBE`s. `EXISTS` on the kill flag still refuses a new run when the publish was missed. No other production pub/sub subscriber was found. Revocation of grants and channel reads is key state, not pub/sub. | A lost `SET` of the kill flag lets a killed agent accept new turns until the flag is written again. A lost `PUBLISH` with the flag still present does not interrupt a turn that is already running. |
-| Blocking `XREADGROUP` | Compatible to connect. The socket timeout sits above the block. | The blocked call fails. A connection error is caught and the loop continues. READONLY is not caught. |
+| Blocking `XREADGROUP` | Compatible to connect. The socket timeout sits above the block. | The blocked call can fail with READONLY or a transport error. Pool invalidation reconnects through DNS, and the shared consumer loop backs off and continues without a restart. A lost reply can leave an entry pending, recovered by the existing reclaim path. |
 | Database index | Compatible while every client stays on 0. The API DSN hardcodes `/0`. | None by itself. |
-| `CONFIG`, `DEBUG`, `SAVE`, `BGSAVE`, `FLUSHALL`, `MONITOR`, `REPLICAOF`, `SHUTDOWN`, `MIGRATE`, `SYNC` | The main services do not call them. ElastiCache removes the restricted set at the engine. | None. |
-| Protected-hook commissioning (`ACL SETUSER`, `ACL GETUSER`, `ACL WHOAMI`, `CLIENT KILL`) | Incompatible for creating users. See open item 4. A pre-created user can run the steady-state worker if its access string matches the worker rules without `reset`. | Same as the keys those scripts write. |
-| CLI queue commands and the turn canary | Compatible. Both take a URL, so `rediss://` and a username in the URL work for those operator tools. They are not the running service. | Same as the stream and set commands they issue. |
-| Langfuse on the same cache | Client config only: the chart's `REDIS_*` values. The shared user stays on `on ~* &* +@all` and `noeviction`. | Langfuse's own queue entries can be lost on failover. That is outside Curie's stream contract and still shares this recovery point. |
+| `CONFIG`, `DEBUG`, `SAVE`, `BGSAVE`, `FLUSHALL`, `MONITOR`, `REPLICAOF`, `SHUTDOWN`, `MIGRATE`, `SYNC` | The main services do not call them. `cli/scripts/restore-drill.sh` does issue `SAVE`; that Compose-specific restore procedure does not apply to ElastiCache. Use AWS snapshot and restore APIs instead. ElastiCache removes its restricted set at the engine. | None. |
+| Protected-hook commissioning (`ACL SETUSER`, `ACL GETUSER`, `ACL WHOAMI`, `CLIENT KILL`) | Unsupported for both commissioning and protected-worker continuity on this configuration. Named users require excluded RBAC, and TLS/run-id/no-reconnect fences reject a replacement server. See open item 4. | Same as the keys those scripts write. |
+| CLI direct queue commands and the turn canary | The Rust CLI direct Valkey paths are unsupported for this TLS-only target: the Redis crate enables `tokio-comp` and `streams`, without a TLS feature, and cluster message/eval builds plaintext URLs behind an in-chart Valkey port-forward. Encoding passwords does not add managed-cache routing or TLS. The Python turn canary takes a `rediss://` URL and can use TLS. These operator tools are separate from the ordinary service clients. | Same as the stream and set commands they issue; direct CLI transport needs a separate supported managed-cache design. |
+| Langfuse on the same cache | Client config only: the chart's `REDIS_*` values. The default user uses the replication-group auth token; no access string is configurable in AUTH mode. The parameter group uses `noeviction`. | Langfuse's own queue entries can be lost on failover. That is outside Curie's stream contract and still shares this recovery point. |
 
 Lua verbs found in production code under `apps/`, `packages/`, `runner/`,
 `cli/`, `examples/`, `tools/`, and `adapters/`, excluding tests: `DECR`, `DEL`,
@@ -185,18 +225,31 @@ Lua verbs found in production code under `apps/`, `packages/`, `runner/`,
 
 ## What a lost acknowledged write looks like
 
-1. A single-use grant or a dedupe key stored with `SET NX EX` is gone, so the
-   same grant or event is accepted again.
-2. A resume marker or its `XADD` is gone. The wake is dropped if the producer
-   does not retry, and duplicated if it does.
-3. A lease or a thread lock is gone, so a second holder can acquire it until
-   the TTL would have expired.
-4. An `XACK` is gone, so the entry stays in the pending list and is redelivered.
-5. An `XADD` of a turn is gone, so the producer observed success and the worker
-   never reads the turn.
-6. The kill flag `SET` is gone, so a killed agent keeps accepting turns until
-   the flag is written again. If only the `PUBLISH` is lost, `EXISTS` still
-   refuses new runs, and a turn already in progress is not interrupted.
+Replication loss can roll back deletions and replacements as well as new
+writes. Reconnecting restores transport, not the following guarantees:
+
+| Lost acknowledged mutation | Observable effect | Required recovery |
+| --- | --- | --- |
+| Dedupe, single-use grant or lease acquisition (`SET NX EX/PX`) | A duplicate is accepted, a grant is spent twice, or another holder acquires a live lock or lease. | Reconcile effects against durable identity and external state before replay. Stop or fence prior holders before reacquiring authority; reconnect alone is insufficient. |
+| Channel-read revocation `DEL` in `packages/curie-internal/src/curie_internal/channel_read_ledger.py` | A removed active-ledger capability can revive until its lease or token expires. | Treat affected capabilities as potentially live; wait for both validity bounds to expire or revoke through a durable authority before resuming sensitive access. |
+| Page-budget increment | The counter rolls back, restoring previously spent pages. | Reconstruct spending from durable evidence or refuse affected capabilities until expiration. The current counter cannot prove the original budget after failover. |
+| Affinity replacement, suspension update or route creation | An old route or suspension state reappears; a missing route causes fresh sandbox allocation in `apps/worker/src/curie_worker/sandbox/substrate.py`. Existing live sandboxes may still exist. | Reconcile routes against actual claims and pods, terminate or fence stale owners, then rebuild affinity before permitting duplicate execution. |
+| Completion, dedupe or side-effect marker | Replay protection weakens and an externally completed effect may be repeated. | Check durable completion and external effects before retrying; an absent Valkey marker is not evidence of no effect. |
+| Resume `XADD` or its marker | A wake disappears or later producer retries can duplicate it. If Postgres `resumed_at` committed first, the existing reconciler never selects that row again: `apps/api/src/curie_api/crud/approvals.py` filters NULL `resumed_at`, and `apps/api/src/curie_api/resumereconciler.py` marks after enqueue. | Identify durable approval obligations with no confirmed terminal execution and safely republish with the original identity. Current reconciliation does not repair this loss. |
+| `XACK` | The pending entry can be delivered again. | Use the existing bounded reclaim path, with durable/external verification when side-effect markers may also have rolled back. |
+| Ordinary turn `XADD` | The producer observed success but the worker never receives the turn. | Replay from a durable ingress obligation or report the lost turn; a stream alone cannot reconstruct it. |
+| Kill flag `SET`, deletion or kill/resume event `PUBLISH` | A lost kill lets new work run; a lost flag deletion restores a stale kill. A lost publish misses interruption of an active turn even if the flag survives. | Reconcile intended kill/resume state and active turns, rewrite the flag and reissue the event as appropriate. |
+
+**Resume repair recommendation, not implemented:** retain a durable outbox with
+publication identity and terminal-consumption evidence, and reconcile recently
+published obligations after failover. Merely scanning recent `resumed_at` rows
+and checking for an absent stream entry is unsafe: stream trimming and completed
+consumption can also remove that entry, and dedupe and side-effect markers can
+roll back together. A safe repair must preserve the selected HTTP identity and
+sealed approval publication rules, respect completed execution, and avoid
+reissuing side effects. This crosses more than a small, clearly safe reconciler
+patch. The stranded-resume case remains an explicit accepted recovery gap.
+
 
 ## Proof
 
@@ -232,8 +285,9 @@ Results:
    when used memory > 'maxmemory'`, and a TTL key written first was still
    present.
 9. The inspector saw `aof_enabled` 0 and `maxmemory_policy` `noeviction`.
-10. Failover was not simulated. The stand-in is one process, and `REPLICAOF`
-    was renamed away.
+10. That original command/ACL stand-in used one process with `REPLICAOF`
+    renamed away. It did not prove failover. The separate automated promotion
+    proof below uses two processes with replication administration enabled.
 
 Python 3.13 rejected a first CA that had no key-usage extension. The CA that
 passed had `keyUsage` of certificate sign and CRL sign. ElastiCache's public
@@ -251,10 +305,40 @@ Then repeat the TLS checks with redis-py against the TLS listener: password-only
 `rediss://` as the default user, and a named user only if you are proving the
 tighter string. Remove the process when you are done.
 
+## Automated promotion proof
+
+`apps/worker/tests/test_managed_valkey_failover.py` starts isolated Valkey
+8.1.10 primary and replica processes with auth, `noeviction`, and AOF disabled.
+A repointable TCP port keeps existing connections on their original server.
+The proof promotes the replica, demotes the old primary using `REPLICAOF`,
+leaves the endpoint stale through twelve READONLY responses, then repoints it.
+It asserts that the same stream read task handles and acknowledges a new entry,
+the same threadlock acquires and releases again, dispatcher writes recover,
+and an authenticated API reply append changes from 503 to 200 and reads back
+the expected events. No application client or consumer is restarted.
+It also drops replies after real writes and checks that `INCR`, Lua and a
+transaction are not repeated by either sync or async clients, while an
+observational `GET` retries at most three times and then surfaces failure.
+The reserved fixture token is passed through the API DSN into the actual connector grant
+spender. Fixture teardown verifies removal of its containers and network.
+
+Run with the caller's disposable Docker endpoint configured:
+
+```bash
+uv run pytest apps/worker/tests/test_managed_valkey_failover.py apps/api/tests/test_control_unit.py --reruns 0
+```
+
+This promotion proof is plaintext and local. The earlier TLS/auth stand-in
+proves a separate connection path, not AWS failover, TLS promotion or an AWS
+control-plane rehearsal. Live ElastiCache maintenance, DNS TTL behavior,
+AWS auth-token rotation and daily snapshot restore remain deployment checks.
+
 ## What this guide does not change
 
-No application code. The auth token is enough for the API, the worker, the
-dispatcher, the connector proxy, and Langfuse. Username plumbing, READONLY
-retry inside `StreamConsumer._consume`, and ElastiCache-native commissioning
-are recommendations. Cluster mode stays disabled, so multi-key Lua stays valid
-and durability stays unavailable.
+Protected transport security fences stay unchanged. Username plumbing,
+ElastiCache-native commissioning, direct CLI TLS/routing, durable publication
+reconciliation and
+recovery of rolled-back authorization or execution state remain recommendations.
+Cluster mode stays disabled, so multi-key Lua stays valid and durability stays
+unavailable. Ordinary connection recovery does not make acknowledged writes
+durable or authorize blind replay after failover.

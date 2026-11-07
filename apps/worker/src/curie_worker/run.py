@@ -22,14 +22,13 @@ from pathlib import Path
 from typing import Any, NoReturn, TypedDict
 
 import httpx
-import redis
 from aci_protocol.s3 import build_s3_client
 from aci_protocol.turn import DEFAULT_IDENTITY
 from aiohttp import web
+from curie_internal.valkey import AsyncRedis, Redis
 from curie_internal.workspace_objects import WorkspaceObjectPort
 from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import bootstrap_service_telemetry, record_metric
-from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
 from redis.maint_notifications import MaintNotificationsConfig
@@ -514,12 +513,13 @@ def build(
         socket_timeout=config.valkey_socket_timeout_s,
     )
     owner.register_close("runs-redis", async_redis.aclose, order=40)
-    sync_redis = redis.Redis(
+    sync_redis = Redis(
         **config.valkey_client_kwargs(),
         socket_timeout=config.valkey_socket_timeout_s,
     )
     owner.register_close("affinity-redis", lambda: _close_sync(sync_redis.close), order=43)
     pressure_async_redis: AsyncRedis = AsyncRedis(
+        retry_reads=False,
         **config.valkey_client_kwargs(),
         socket_timeout=1.0,
         socket_connect_timeout=1.0,

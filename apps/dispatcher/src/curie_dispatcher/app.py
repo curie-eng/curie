@@ -16,6 +16,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import redis
+from curie_internal.valkey import Redis
 from curie_telemetry import record_metric
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -59,7 +60,7 @@ _SLACK_API_TIMEOUT_SECONDS = 2
 
 def build_redis(config: DispatcherConfig) -> redis.Redis:
     """A decode_responses Valkey client (str in, str out) for stream + dedupe ops."""
-    return redis.Redis(
+    return Redis(
         host=config.valkey_host,
         port=config.valkey_port,
         password=config.valkey_password or None,
