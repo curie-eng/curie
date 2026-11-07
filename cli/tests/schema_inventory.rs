@@ -513,7 +513,7 @@ fn a_schema_may_not_change_shape_while_keeping_its_id() {
 }
 
 #[test]
-fn schedules_history_split_is_v3_and_hook_source_is_v1_2() {
+fn schedules_history_split_is_v3_and_hook_fire_is_v1_3() {
     let schedules: Value = serde_json::from_str(
         &std::fs::read_to_string(repo_path("cli/schema/schedules.schema.json"))
             .expect("read schedules schema"),
@@ -544,7 +544,7 @@ fn schedules_history_split_is_v3_and_hook_source_is_v1_2() {
     .expect("hook-fire schema is JSON");
     assert_eq!(
         fire["$id"],
-        "https://schemas.curietech.ai/cli/hook-fire/v1.2.json"
+        "https://schemas.curietech.ai/cli/hook-fire/v1.3.json"
     );
     assert!(fire["$defs"]["record"]["properties"]
         .get("source")
@@ -560,7 +560,7 @@ fn schedules_history_split_is_v3_and_hook_source_is_v1_2() {
         .expect("schema result inventory");
     for (schema, version) in [
         ("schedules.schema.json", "3.0"),
-        ("hook-fire.schema.json", "1.2"),
+        ("hook-fire.schema.json", "1.3"),
     ] {
         let entry = results
             .iter()

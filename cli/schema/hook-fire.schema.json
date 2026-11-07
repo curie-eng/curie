@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/hook-fire/v1.2.json",
+  "$id": "https://schemas.curietech.ai/cli/hook-fire/v1.3.json",
   "title": "curie <tier> hook fire or hook record --json",
   "description": "The agent-facing payload of `curie local hook fire`, `curie cluster hook fire`, and their `hook record` readers: the dry-run plan, or a durable run record. Fire waits for settlement; record also reads in-flight runs.",
   "$defs": {
