@@ -335,3 +335,24 @@ def test_control_agent_fails_with_principal_present() -> None:
     result = run_step(fake, None)
     assert result["steps"][0]["passed"] is False
     assert result["passed"] is False
+
+
+# --- the proxy's real log format ----------------------------------------------------
+
+REAL_PROXY_LINE = (
+    "INFO curie_connector_proxy caller=ie2e-on outcome=admitted method=POST "
+    "path='/mcp' principal=present"
+)
+
+
+@pytest.mark.parametrize(
+    "prefix", ["", "2026-11-07T12:34:56.123456789Z "], ids=["bare", "kubectl-timestamp"]
+)
+def test_parse_the_proxys_real_log_format(prefix: str) -> None:
+    assert harness.parse_proxy_decision(prefix + REAL_PROXY_LINE) == {
+        "caller": "ie2e-on",
+        "outcome": "admitted",
+        "method": "POST",
+        "path": "/mcp",
+        "principal": "present",
+    }

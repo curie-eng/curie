@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import inspect
 import json
 import os
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -53,6 +55,13 @@ ISSUER = "https://identity.example.test/directory"
 SUBJECT = "SyntheticRequesterSubject"
 RUN = "11111111-1111-4111-8111-111111111111"
 WORK_ITEM = "22222222-2222-4222-8222-222222222222"
+OTHER_TENANT = "44444444-4444-4444-8444-444444444444"
+# ADR 0270 decision 3: a requester-bearing cct lives at most one hour from mint.
+REQUESTER_TTL = 3600
+# The digest domain the route record's requester fact is computed under.
+DIGEST_DOMAIN = b"curie-cct-principal-v1\n"
+# A frozen wall clock, far from the real one so no assertion passes by accident.
+T = 1_900_000_000
 
 
 def _resolved() -> ResolvedDeployment:
@@ -123,7 +132,8 @@ def test_an_opted_in_boot_signs_the_principal_into_the_cct(subject: str) -> None
     claims = _verified_claims(seed, token, "cct")
     exp = claims["exp"]
     assert isinstance(exp, int)
-    assert before + SANDBOX_TOKEN_TTL_SECONDS <= exp <= after + SANDBOX_TOKEN_TTL_SECONDS
+    # ADR 0270 decision 3: a requester-bearing cct lives one hour from mint.
+    assert before + REQUESTER_TTL <= exp <= after + REQUESTER_TTL
     assert claims == {
         "agent": "test-agent", "exp": exp,
         "principal": {"issuer": ISSUER, "subject": subject, "tenant_id": TENANT},
@@ -205,6 +215,246 @@ def test_every_kernel_binding_accepts_the_principal_and_reads_the_flag(cls: type
     assert callable(reader) and inspect.iscoroutinefunction(reader), (
         f"{cls.__name__} has no async connector_requester_identity_for"
     )
+
+
+# -- ADR 0270 decision 3: the requester fact and the one-hour requester cct -------------
+
+
+def _principal_digest(value: Any) -> str:
+    """The route record's requester fact, computed independently of the worker.
+
+    ``sha256(domain + compact sorted-key ASCII JSON of the principal value)``.
+    @spec CONNECTOR-REQUESTER-3.
+    """
+    canonical = json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=True)
+    return "sha256:" + hashlib.sha256(DIGEST_DOMAIN + canonical.encode("ascii")).hexdigest()
+
+
+def _b64url(raw: bytes) -> str:
+    """@spec CONNECTOR-REQUESTER-3."""
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _signed_cct(seed: str, body: dict[str, Any], *, sort_keys: bool = True) -> str:
+    """A cct over any payload, signed with the test key: shapes the minter refuses.
+
+    @spec CONNECTOR-REQUESTER-3.
+    """
+    payload = json.dumps(body, separators=(",", ":"), sort_keys=sort_keys).encode("ascii")
+    head = f"cct.{_b64url(payload)}"
+    signature = SigningKey(base64.b64decode(seed)).sign(head.encode("ascii")).signature
+    return f"{head}.{_b64url(signature)}"
+
+
+def _unsigned_facts(token: str) -> tuple[str, int | None]:
+    """``caller_token.unsigned_facts``, resolved at call time. @spec CONNECTOR-REQUESTER-3."""
+    reader = getattr(caller_token, "unsigned_facts", None)
+    assert callable(reader), "caller_token has no unsigned_facts"
+    facts: tuple[str, int | None] = reader(token)
+    return facts
+
+
+_ALICE_FIELDS = {"issuer": ISSUER, "subject": SUBJECT, "tenant_id": TENANT}
+# Every principal value the proxy would refuse. Any principal key, whatever its
+# shape, is a requester fact (a digest), never principal-less.
+_MALFORMED_PRINCIPALS: dict[str, Any] = {
+    "partial": {"issuer": ISSUER, "subject": SUBJECT},
+    "unknown-key": {**_ALICE_FIELDS, "role": "admin"},
+    "uppercase-tenant": {**_ALICE_FIELDS, "tenant_id": TENANT.upper()},
+    "empty-subject": {**_ALICE_FIELDS, "subject": ""},
+    "typed-subject": {**_ALICE_FIELDS, "subject": 7},
+    "string": "SyntheticRequesterSubject",
+    "null": None,
+    "list": [],
+}
+
+
+def test_unsigned_facts_digest_tracks_each_principal_field() -> None:
+    """@spec CONNECTOR-REQUESTER-3: equality of the digest is equality of the principal."""
+    seed = _seed()
+    first = caller_token.mint(seed, agent="test-agent", exp=T + 3600, principal=_principal())
+    digest, exp = _unsigned_facts(first)
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", digest), digest
+    assert (digest, exp) == (_principal_digest(_ALICE_FIELDS), T + 3600)
+    # The same principal twice is equal, whatever else the token carries: a
+    # claim-time re-mint and a deadline re-sign keep the recorded fact.
+    again = caller_token.mint(
+        seed,
+        agent="test-agent",
+        exp=T + 1200,
+        run=RUN,
+        work_item=WORK_ITEM,
+        principal=_principal(),
+    )
+    assert _unsigned_facts(again) == (digest, T + 1200)
+    # The digest is over the canonical re-serialization, not the signed bytes.
+    reordered = _signed_cct(
+        seed,
+        {
+            "principal": {"tenant_id": TENANT, "subject": SUBJECT, "issuer": ISSUER},
+            "exp": T + 3600,
+            "agent": "test-agent",
+        },
+        sort_keys=False,
+    )
+    assert _unsigned_facts(reordered) == (digest, T + 3600)
+    # Each field alone changes it.
+    for field, value in (
+        ("tenant_id", OTHER_TENANT),
+        ("issuer", f"{ISSUER}/other"),
+        ("subject", f"{SUBJECT}2"),
+    ):
+        changed = caller_token.mint(
+            seed,
+            agent="test-agent",
+            exp=T + 3600,
+            principal=_principal(**{field: value}),
+        )
+        other, other_exp = _unsigned_facts(changed)
+        assert other_exp == T + 3600
+        assert other == _principal_digest({**_ALICE_FIELDS, field: value})
+        assert other != digest, field
+    # ASCII JSON: a non-ASCII subject is hashed escaped, never as raw UTF-8.
+    zoe = "Zoë.Requester@Example.Test"
+    escaped = _unsigned_facts(
+        caller_token.mint(seed, agent="test-agent", exp=T, principal=_principal(subject=zoe))
+    )[0]
+    assert escaped == _principal_digest({**_ALICE_FIELDS, "subject": zoe})
+    raw_utf8 = json.dumps(
+        {**_ALICE_FIELDS, "subject": zoe},
+        separators=(",", ":"),
+        sort_keys=True,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    assert escaped != "sha256:" + hashlib.sha256(DIGEST_DOMAIN + raw_utf8).hexdigest()
+    # No principal key, or a payload that cannot be read, is principal-less.
+    plain = caller_token.mint(seed, agent="test-agent", exp=T + 86400)
+    assert _unsigned_facts(plain) == ("none", T + 86400)
+    paired = caller_token.mint(seed, agent="test-agent", exp=T + 90, run=RUN, work_item=WORK_ITEM)
+    assert _unsigned_facts(paired) == ("none", T + 90)
+    for unreadable in (
+        "cct.payload.signature",
+        "cct.present",
+        "",
+        "cct." + _b64url(b"[1]") + ".sig",
+        "cct." + _b64url(b'{"principal":') + ".sig",
+    ):
+        assert _unsigned_facts(unreadable) == ("none", None), unreadable
+
+
+@pytest.mark.parametrize("shape", sorted(_MALFORMED_PRINCIPALS))
+def test_unsigned_facts_gives_any_principal_key_a_digest(shape: str) -> None:
+    """@spec CONNECTOR-REQUESTER-3: a malformed principal is a requester, never "none".
+
+    The proxy refuses it, so treating it as principal-less would let a
+    malformed requester adopt a principal-less sandbox.
+    """
+    seed = _seed()
+    value = _MALFORMED_PRINCIPALS[shape]
+    token = _signed_cct(seed, {"agent": "test-agent", "exp": T + 3600, "principal": value})
+    digest, exp = _unsigned_facts(token)
+    assert digest == _principal_digest(value)
+    assert digest not in {"none", "absent", _principal_digest(_ALICE_FIELDS)}
+    assert exp == T + 3600
+
+
+def test_unsigned_facts_reads_exp_as_the_route_expiry_read_does() -> None:
+    """@spec CONNECTOR-REQUESTER-3: a non-integer or missing exp is unknown, never coerced."""
+    seed = _seed()
+    for exp_value in ("1900000000", 1.5, True, None):
+        body: dict[str, Any] = {"agent": "test-agent", "principal": _ALICE_FIELDS}
+        if exp_value is not None:
+            body["exp"] = exp_value
+        assert _unsigned_facts(_signed_cct(seed, body)) == (
+            _principal_digest(_ALICE_FIELDS),
+            None,
+        ), exp_value
+
+
+def test_principal_of_reads_exactly_the_three_principal_fields() -> None:
+    """@spec CONNECTOR-REQUESTER-3: the re-sign and re-mint principal, or a refusal.
+
+    No principal key is None. Anything but exactly the three valid strings
+    raises ValueError, so no caller can fall back to a principal-less or
+    longer token, and the refusal never carries the values.
+    """
+    reader = getattr(caller_token, "principal_of", None)
+    assert callable(reader), "caller_token has no principal_of"
+    seed = _seed()
+    token = caller_token.mint(
+        seed,
+        agent="test-agent",
+        exp=T + 3600,
+        run=RUN,
+        work_item=WORK_ITEM,
+        principal=_principal(),
+    )
+    assert reader(token) == _principal()
+    assert reader(caller_token.mint(seed, agent="test-agent", exp=T + 3600)) is None
+    for shape, value in sorted(_MALFORMED_PRINCIPALS.items()):
+        malformed = _signed_cct(seed, {"agent": "test-agent", "exp": T + 3600, "principal": value})
+        with pytest.raises(ValueError) as caught:
+            reader(malformed)
+        assert SUBJECT not in str(caught.value), shape
+
+
+@pytest.mark.parametrize(
+    ("with_principal", "ceiling", "cct_exp", "ccr_exp"),
+    [
+        (True, None, T + 3600, T + 86400),
+        (False, None, T + 86400, T + 86400),
+        (True, T + 600, T + 600, T + 600),
+        (True, T + 7200, T + 3600, T + 7200),
+    ],
+    ids=["principal", "none", "principal-ceiling-600", "principal-ceiling-7200"],
+)
+def test_requester_cct_lifetimes(
+    monkeypatch: pytest.MonkeyPatch,
+    with_principal: bool,
+    ceiling: int | None,
+    cct_exp: int,
+    ccr_exp: int,
+) -> None:
+    """@spec CONNECTOR-REQUESTER-3: one hour for a requester cct; every ccr keeps its own.
+
+    A ccr is an agent/run credential (ADR 0270 decision 2), so it keeps the
+    24 hour or ceiling expiry; only the principal-bearing cct is capped at
+    mint time plus one hour, and never lengthened past the ceiling.
+    """
+    assert getattr(binding_module, "REQUESTER_CALLER_TOKEN_TTL_SECONDS", None) == REQUESTER_TTL
+    assert SANDBOX_TOKEN_TTL_SECONDS == 86400
+    # A fractional clock pins the integer truncation of "now".
+    monkeypatch.setattr(binding_module.time, "time", lambda: T + 0.75)
+    seed = _seed()
+    kwargs: dict[str, Any] = {"route_connectors": frozenset({"reviewer", "uploads"})}
+    if with_principal:
+        kwargs["caller_principal"] = _principal()
+    if ceiling is not None:
+        kwargs["caller_exp_ceiling"] = ceiling
+    env = _boot(seed, **kwargs)
+    claims = _verified_claims(seed, env[_CALLER_ENV], "cct")
+    assert claims["exp"] == cct_exp
+    assert ("principal" in claims) is with_principal
+    expected_cct = caller_token.mint(
+        seed,
+        agent="test-agent",
+        exp=cct_exp,
+        principal=_principal() if with_principal else None,
+    )
+    # Principal-less: byte for byte what is minted today.
+    assert env[_CALLER_ENV] == expected_cct
+    tokens = json.loads(env[_ROUTES_ENV])
+    assert sorted(tokens) == ["reviewer", "uploads"]
+    for connector, token in tokens.items():
+        route = _verified_claims(seed, token, "ccr")
+        assert route["exp"] == ccr_exp, connector
+        assert "principal" not in route
+        assert token == caller_token.mint_route(
+            seed,
+            agent="test-agent",
+            connector=connector,
+            exp=ccr_exp,
+        )
 
 
 # -- connector_requester_identity_for against real Postgres --------------------------------
