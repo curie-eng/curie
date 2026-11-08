@@ -384,7 +384,13 @@ async def _route_decision(
 
     A migrated approver role does not acquire the legacy card-channel default as
     an additional restriction; a nonmigrated role keeps it. @spec HTTP-APPROVAL-CONTINUITY-8.
+
+    A dynamic approval (ADR 0271) is denied first, before that early return
+    could skip the shared authorizer: no answer is accepted until decision 5
+    enforces its selected set. @spec REQUEST-APPROVAL-4.
     """
+    if row.selection_mode == "dynamic":
+        _deny()
     role = None if actor.capture.policy is None else actor.capture.policy.roles.approver
     if role is not None and role.legacy_state == "migrated" and not team_restriction(
         row, route_binding,

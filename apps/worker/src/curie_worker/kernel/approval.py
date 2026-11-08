@@ -148,7 +148,10 @@ def _parse_approval_targets(
     because JSONB may be written out of band: the retired ``channel`` key, a
     non-Slack resolver, an unknown target field, a half-configured transport,
     or duplicate targets must not produce a durable approval with ambiguous
-    authority.
+    authority. The operator-owned route keys ``approvers``,
+    ``approver_ticket`` and ``separation`` (ADR-0271 decision 1) are accepted
+    but never interpreted here: card targets come only from ``resolution`` and
+    ``notification``, and every other unknown route key is refused.
 
     ADR-0168 decision 3: a Slack notification names its identity in
     ``adapter``, or none for the default, and has no endpoint; any other kind
@@ -162,6 +165,8 @@ def _parse_approval_targets(
         "notification",
         "approvers",
         "expires_in_seconds",
+        "approver_ticket",
+        "separation",
     }:
         return None
 

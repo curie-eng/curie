@@ -3,7 +3,7 @@
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aci_protocol import ApprovalRequest
 from aci_protocol.turn import route_identity
@@ -36,6 +36,9 @@ from .channels import normalized_reply_identity
 from .errors import PublicationSettlementConflict
 from .publication_queries import get_publication_by_approval
 
+if TYPE_CHECKING:
+    from ..approver_tickets import ApprovalSelection
+
 # Purposes whose outcome no resumed model turn reports, so no wake is ever owed:
 # ``publication`` (the worker reports it) and ``remediation`` (the platform
 # executes the bound call, AUTOMATED-REMEDIATION-16). The resolution and expiry
@@ -57,8 +60,13 @@ async def insert_approval(
     *,
     traceparent: str | None = None,
     approval_id: uuid.UUID | None = None,
+    selection: "ApprovalSelection | None" = None,
 ) -> Approval:
-    """Borrowed insert/flush only. @spec HTTP-APPROVAL-CONTINUITY-5/9."""
+    """Borrowed insert/flush only. @spec HTTP-APPROVAL-CONTINUITY-5/9.
+
+    ``selection`` is the verified approver ticket snapshot of a dynamic
+    approval (ADR 0271 decision 4); None writes an ordinary row.
+    """
 
     schedule = await resolve_route_schedule(session, data)
     approval = Approval(
@@ -88,6 +96,15 @@ async def insert_approval(
         created_at=schedule.created_at,
         expires_at=schedule.expires_at,
     )
+    if selection is not None:
+        approval.selection_mode = "dynamic"
+        approval.selection_requester = selection.requester
+        approval.selection_connector = selection.connector
+        approval.selection_tool = selection.tool
+        approval.selection_key_id = selection.key_id
+        approval.selection_nonce = selection.nonce
+        approval.selection_arguments_sha256 = selection.arguments_sha256
+        approval.selected_approvers = selection.approvers
     if approval_id is not None:
         approval.id = approval_id
     session.add(approval)

@@ -9,7 +9,7 @@ from curie_api.crud import deployments as crud_deployments
 from curie_api.crud import versions as crud_versions
 from curie_api.schemas.deployments import DeploymentCreate, DeploymentOut
 
-from .. import deploy
+from .. import approver_tickets, deploy
 from ..auth import require_api_key
 from ..deps import SessionDep, StoreDep
 
@@ -57,10 +57,17 @@ async def create_deployment(
     # legacy bundle keeps reporting `bundle.too_large` rather than surfacing as
     # an extraction failure in here (ADR-0059 decision 3's error contract), and
     # in FRONT of the row creation, so a refusal leaves nothing behind.
+    #
+    # The same read judges ADR 0271 gate ownership: a version whose bundle would
+    # move or drop the gate of a registered approver_ticket pair never serves.
     try:
         await deploy.check_approval_route_bindings(store, version, agent.approval_routes)
     except deploy.ApprovalRoutesUnbound as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    except approver_tickets.BundleGateMismatch as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, {"code": exc.code, "message": str(exc)}
+        ) from exc
     deployment = await crud_deployments.create_deployment(session, data)
     return DeploymentOut.model_validate(deployment)
 

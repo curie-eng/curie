@@ -218,6 +218,89 @@ pod of the worker Deployment since the first send. For each JSON record they
 search the `message` and the last line of any logged `exception`. The
 deferral message has to reach the worker's log at its configured level.
 
+## What approver-ticket-creation proves
+
+ADR 0271 decisions 1, 2 and 4 on a live install: a selector registration is
+accepted only inside the operator ceiling, the route lock holds in both
+directions, and a ticket is verified once, when the approval is created. It
+also covers the selector and requester-flag race from ADR 0270. Every
+creation request goes through the real HTTP creation boundary,
+`POST /v1/internal/identity/approvals`, backed by the API's own Postgres and
+Valkey. Run it with:
+
+```bash
+curie dev identity-e2e -- prove $T --scenario approver-ticket-creation --evidence ticket.json
+```
+
+The scenario runs on `--flag-agent` (default: the first agent `up`
+registered). `--sender` is the requester and `--second-sender` the selected
+approver; they must differ and both must be active verified humans in the
+roster. `--control-agent` (default: the other agent) supplies a Slack binding
+for the ordinary legacy control. The agent needs the weather connector, so
+bring the install up with `--bundle examples/weather`. `--wait` bounds only
+the last step.
+
+Setup records the original requester flag, route map, active deployments and
+approver role, and refuses to start if the agent already stores a selector
+registration. It then makes four changes:
+
+1. It generates a per-run selector key pair, kept in the state directory.
+2. It binds two requesting-surface routes, builds a bundle from
+   `examples/weather` whose manifest gates the connector tool on the ticket
+   route with an `approvalPolicy`, deploys it, and ends the original active
+   deployments, because a registration needs every active version to gate the
+   pair.
+3. It writes the approver role of the agent's access policy, restricted to the
+   roster's active humans by issuer and subject.
+4. It sends real email turns from the approver and the requester. The approver
+   turn gives the approver a canonical human row in the `principals` table,
+   which the ticket's approver list needs. The creation steps then build their
+   requests in the API pod from each requester turn's ingress capsule.
+
+The scenario turns the requester flag off and on itself in the early steps.
+
+The steps run in this order, and each records its own evidence:
+
+1. `registration-refused-flag-off`: with the flag off, a registration is refused with 422 and changes nothing.
+2. `registration-bundle-gate-refused`: a registration whose serving bundle gates elsewhere, or not at all, is refused with 422.
+3. `registration-accepted`: with the flag on, a registration is stored, pinned to the approver role version and versioned by one.
+4. `flag-disable-refused-while-registered`: the flag cannot be turned off while a selector is registered.
+5. `concurrent-flag-and-registration`: in three rounds, a flag disable and a registration at one version race; exactly one commits.
+6. `deploy-breaking-gate-refused`: deploying a version whose bundle moves the registered gate is refused.
+7. `creation-valid`: a valid ticket creates one pending dynamic approval.
+8. `creation-bad-signature`: another key, a tampered signature or an unregistered key id is refused.
+9. `creation-scope-change`: a ticket for another tenant, agent, connector, tool or route is refused.
+10. `creation-requester-change`: a ticket naming a human other than the turn's verified requester is refused.
+11. `creation-argument-change`: arguments changed after signing are refused.
+12. `creation-expired`: an expired or not yet valid preparation is refused.
+13. `creation-nonce-replay`: the spent nonce is refused under a second dedupe key, and a fresh nonce then creates.
+14. `creation-conflicting-dedupe`: an identical retry returns the original receipt and a conflicting one is refused.
+15. `creation-identical-race`: four identical creations at once leave one row and one spent nonce.
+16. `legacy-new-policy-refused`: `POST /approvals` cannot create on the registered pair, even with a valid ticket.
+17. `legacy-ordinary-unchanged`: ordinary legacy creation is refused on an HTTP-selected binding and still created and idempotent on a legacy one.
+18. `route-bypass-refused`: the registered pair cannot be approved off its owning route or without its ticket; an unrelated tool still can.
+19. `cluster-message-negative-control`: `curie cluster message` to the agent is refused and creates no approval.
+
+The refusal steps also check that no approval row was stored and no nonce was
+spent.
+
+Carried: the ADR 0271 item 2 check of a direct execution call without the
+verified-grant header needs the connector proxy header from slice 0271c, so
+this scenario does not run it. The evidence lists it under `carried`.
+
+Restore runs in a `finally` block even after a failure, and a failed restore
+fails the run. It removes the registration with a versioned route write, puts
+the flag back, ends the run's deployments and recreates the original ones,
+writes the original route map back, and then checks all four. It restores the
+approver role last. A role that existed returns to its original filter. A role
+that was absent is removed directly in the API pod's database, under the role
+policy's lock order, with a version bump and an audit event, because the
+role-policy API cannot delete a role and a `filter: null` role would read as
+unrestricted instead of not configured. A configuration stored as SQL NULL goes
+back to NULL. The run's agent versions stay, undeployed, and approvals it
+created stay pending until they expire. The evidence keeps statuses, refusal
+codes, row counts and key ids, never tickets, keys, capsules or tokens.
+
 ## Add a scenario
 
 1. Write a function in `identity_scenarios.py` and register it with

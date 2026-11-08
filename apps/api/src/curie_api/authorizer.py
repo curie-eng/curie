@@ -109,9 +109,21 @@ async def authorize_approval(
     The order is the contract: the principal's kind must first be eligible for
     the selected set, then every principal (including the requester) is checked
     for membership.
+
+    A dynamic approval (ADR 0271 decision 4) is denied before either: its
+    selected set, ceiling and separation are judged only by the answer
+    authority of decision 5, which has not landed, so no route set may
+    approve or reject it until then.
     """
 
     name = approver_set.audit_name
+    if approval.selection_mode == "dynamic":
+        return name, AuthzDecision(
+            allowed=False,
+            reason="a dynamic approval cannot be answered until its selected approver "
+            "set is enforced at answer time",
+            evidence={"kind": "dynamic_selection_unavailable", "principal_kind": principal_kind},
+        )
 
     eligible = {
         "test_driver": approver_set.test_driver_eligible,

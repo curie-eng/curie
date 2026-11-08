@@ -8,6 +8,7 @@ per-version key.
 import hashlib
 import tempfile
 import uuid
+from collections import OrderedDict
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,7 @@ from starlette.concurrency import run_in_threadpool
 from curie_api.crud import versions as crud_versions
 from curie_api.schemas.versions import BundleOut
 
-from . import bundles
+from . import approver_tickets, bundles
 from .config import Settings, get_settings
 from .models import AgentVersion
 from .storage import ObjectStore
@@ -281,7 +282,7 @@ async def check_stored_sealing_key_custody(
         raise SealingKeyCustody("; ".join(reasons))
 
 
-def _declared_routes(data: bytes, settings: Settings) -> set[str] | None:
+def _declared_route_map(data: bytes, settings: Settings) -> dict[str, str] | None:
     """Blocking half of ``check_routes_from_bytes``; run in a threadpool."""
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -293,7 +294,7 @@ def _declared_routes(data: bytes, settings: Settings) -> set[str] | None:
             max_compression_ratio=settings.bundle_max_compression_ratio,
             max_members=settings.bundle_max_members,
         )
-        return bundles.declared_approval_routes(dest)
+        return bundles.declared_approval_route_map(dest)
 
 
 async def check_routes_from_bytes(
@@ -317,11 +318,53 @@ async def check_routes_from_bytes(
     ``validate_archive`` under these same caps a moment earlier, so only the
     stored-bytes wrapper below -- where the caps CAN have moved under the object
     -- maps it onto ``BundleTooLarge``.
+
+    The same read also judges gate ownership (ADR 0271 decision 2): every
+    ``approver_ticket`` registration in ``routes`` must be gated on its own
+    route by this bundle's last-declaration-wins map, or
+    ``approver_tickets.BundleGateMismatch`` refuses. The map is computed once,
+    so the declared set and the gate check read the same declaration.
     """
 
     settings = settings or get_settings()
-    declared = await run_in_threadpool(_declared_routes, data, settings)
+    route_map = await run_in_threadpool(_declared_route_map, data, settings)
+    declared = None if route_map is None else set(route_map.values())
     _raise_if_routes_unbound(declared, routes, version_id)
+    approver_tickets.check_bundle_gate(route_map, routes, version_id=version_id)
+
+
+# Effective route maps of stored bundles, keyed by their immutable object key
+# (write-once, ``store_bundle``), so the creation-time serving gate fetches and
+# extracts each serving bundle once per process. Bounded: least recently used
+# entries fall out.
+_STORED_ROUTE_MAPS: OrderedDict[str, dict[str, str] | None] = OrderedDict()
+_STORED_ROUTE_MAP_LIMIT = 128
+
+
+async def stored_route_map(
+    store: ObjectStore, bundle_ref: str, settings: Settings | None = None
+) -> dict[str, str] | None:
+    """A stored bundle's effective approval route map; ``None`` is poison.
+
+    For the creation-time serving gate (ADR 0271 decision 2, plan D9a). Stored
+    bytes the current caps refuse read as poison, never as an empty map. A
+    store failure propagates to the caller, which answers unavailable.
+    """
+
+    if bundle_ref in _STORED_ROUTE_MAPS:
+        _STORED_ROUTE_MAPS.move_to_end(bundle_ref)
+        cached = _STORED_ROUTE_MAPS[bundle_ref]
+        return None if cached is None else dict(cached)
+    settings = settings or get_settings()
+    data = await store.get(bundle_ref)
+    try:
+        route_map = await run_in_threadpool(_declared_route_map, data, settings)
+    except plugin_format.UnsupportedArchive:
+        route_map = None
+    _STORED_ROUTE_MAPS[bundle_ref] = None if route_map is None else dict(route_map)
+    while len(_STORED_ROUTE_MAPS) > _STORED_ROUTE_MAP_LIMIT:
+        _STORED_ROUTE_MAPS.popitem(last=False)
+    return route_map
 
 
 def _raise_if_routes_unbound(
@@ -361,6 +404,12 @@ async def check_approval_route_bindings(
     bundleless, then attach" would otherwise walk straight past this into the
     worker's active-deployment join (``curie_worker.binding``).
 
+    A bundleless version is still a no-op for the unbound-route check, but it
+    declares no approval gates and so cannot gate an ``approver_ticket`` pair:
+    it is judged as an empty route map for the ADR 0271 gate and refuses with
+    ``approver_tickets.BundleGateMismatch`` for an agent whose ``routes`` carry
+    a registration.
+
     ``routes`` is the map to judge: the agent's own ``approval_routes`` for the
     callers asking about the stored state, or the PROPOSED map the
     ``PATCH /agents/{id}`` preflight is about to write -- where an explicit
@@ -371,6 +420,7 @@ async def check_approval_route_bindings(
     """
 
     if version.bundle_ref is None:
+        approver_tickets.check_bundle_gate({}, routes, version_id=version.id)
         return
     settings = settings or get_settings()
     data = await store.get(version.bundle_ref)

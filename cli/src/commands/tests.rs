@@ -1935,6 +1935,8 @@ fn route_write_refusal_names_every_deployment_declaring_a_removed_route() {
                         notification: None,
                         approvers: None,
                         expires_in_seconds: None,
+                        approver_ticket: None,
+                        separation: None,
                     },
                 )
             })

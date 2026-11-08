@@ -570,6 +570,25 @@ class ThreadWorkspace(Base):
     )
 
 
+APPROVAL_SELECTION_MODE_CHECK = "selection_mode IN ('ordinary', 'dynamic')"
+_SELECTION_SNAPSHOT_COLUMNS = (
+    "selection_requester",
+    "selection_connector",
+    "selection_tool",
+    "selection_key_id",
+    "selection_nonce",
+    "selection_arguments_sha256",
+    "selected_approvers",
+)
+APPROVAL_SELECTION_SNAPSHOT_CHECK = (
+    "(selection_mode = 'dynamic' AND "
+    + " AND ".join(f"{column} IS NOT NULL" for column in _SELECTION_SNAPSHOT_COLUMNS)
+    + ") OR (selection_mode = 'ordinary' AND "
+    + " AND ".join(f"{column} IS NULL" for column in _SELECTION_SNAPSHOT_COLUMNS)
+    + ")"
+)
+
+
 class Approval(Base):
     """A durable approval request (#244, ADR-0010).
 
@@ -599,6 +618,22 @@ class Approval(Base):
             "(policy_identity IS NULL AND policy_version IS NULL) OR "
             "(policy_identity = 'publication:auto' AND policy_version >= 1)",
             name="approvals_policy_identity_ck",
+        ),
+        # ADR 0271 decision 4 (plan D10): the two selection modes stay explicit
+        # in storage. Migration 0153 carries a frozen copy of both checks.
+        CheckConstraint(
+            APPROVAL_SELECTION_MODE_CHECK, name="approvals_selection_mode_ck",
+        ),
+        CheckConstraint(
+            APPROVAL_SELECTION_SNAPSHOT_CHECK, name="approvals_selection_snapshot_ck",
+        ),
+        # A ticket nonce is single use per agent, only among rows that carry one.
+        Index(
+            "approvals_selection_nonce_key",
+            "agent_id",
+            "selection_nonce",
+            unique=True,
+            postgresql_where=text("selection_nonce IS NOT NULL"),
         ),
     )
 
@@ -697,6 +732,25 @@ class Approval(Base):
     # resolutions leave both NULL so they stay distinguishable in the audit.
     policy_identity: Mapped[str | None] = mapped_column(default=None)
     policy_version: Mapped[int | None] = mapped_column(default=None)
+    # ADR 0271 decision 4: ``dynamic`` rows were created from a verified approver
+    # ticket and carry the immutable selection below; ``ordinary`` rows carry
+    # none of it. Private: no public approval DTO exposes these columns, and the
+    # record digest covers them only on dynamic rows, so ordinary seals are
+    # unchanged (``identity.http_approval.approval_record_digest``).
+    selection_mode: Mapped[str] = mapped_column(
+        Text, default="ordinary", server_default="ordinary"
+    )
+    selection_requester: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), default=None
+    )
+    selection_connector: Mapped[str | None] = mapped_column(Text, default=None)
+    selection_tool: Mapped[str | None] = mapped_column(Text, default=None)
+    selection_key_id: Mapped[str | None] = mapped_column(Text, default=None)
+    selection_nonce: Mapped[str | None] = mapped_column(Text, default=None)
+    selection_arguments_sha256: Mapped[str | None] = mapped_column(Text, default=None)
+    selected_approvers: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSONB(none_as_null=True), default=None
+    )
 
     publication: Mapped[Publication | None] = relationship(back_populates="approval", uselist=False)
 

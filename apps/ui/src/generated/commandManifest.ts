@@ -3118,6 +3118,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "The connector requester identity version a route write compares against, as `--requester-identity show` reports it. Omit to use the version read from the agent in the same command. Only valid with --route-resolution, --route-approvers, --routes-from or --clear-routes",
+              "id": "routes_expected_version",
+              "long": "routes-expected-version",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Show or set whether this agent's hosted connector calls carry the verified human requester. `on` requires the tenant's HTTP identity selection and an operator receiver registration listing one of the agent's bindings. Experimental in this release: keep it off outside test installs. When on, the agent's hosted connector caller tokens carry the verified human requester and the connector proxy verifies it, but the proxy does not yet pass the requester to connectors (a later release adds that), so connectors cannot act on it yet. The worker replaces a sandbox before serving a different requester, and a different person's message that arrives during a live turn waits for that turn to end; if the turn outlasts the redelivery budget the message is settled visibly without running. A person's turn runs for at most the one-hour life of their connector credential, less the boot grace and the sandbox claim time; a turn still working then is stopped and reported as `requester-window`. Precondition: the api, the worker and the agent's connector proxies must all run this release (redeploy the agent if its connector proxies predate it); a partial rollout refuses the agent's HTTP turns or connector calls",
               "id": "requester_identity",
               "long": "requester-identity",
@@ -9493,6 +9501,14 @@ export const commandManifest = {
               "help": "The caller-chosen idempotency key for --recover. Retrying the identical command with the same key is absorbed by the server as one act; the CLI never generates or decorates it",
               "id": "recovery_key",
               "long": "recovery-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The connector requester identity version a route write compares against, as `--requester-identity show` reports it. Omit to use the version read from the agent in the same command. Only valid with --route-resolution, --route-approvers, --routes-from or --clear-routes",
+              "id": "routes_expected_version",
+              "long": "routes-expected-version",
               "positional": false,
               "required": false
             },

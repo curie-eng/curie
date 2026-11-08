@@ -592,6 +592,8 @@ pub(crate) enum LocalAction {
         #[command(flatten)]
         recovery: ApprovalRecoveryArgs,
         #[command(flatten)]
+        routes_version: ApprovalRoutesVersionArgs,
+        #[command(flatten)]
         requester: RequesterIdentityArgs,
     },
     /// Show the local observability surfaces (Curie Console + Langfuse traces/cost + API base).

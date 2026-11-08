@@ -278,6 +278,138 @@ declares the route and the preflight still refuses. The retired `--route` flag a
 `channel` JSON key are not accepted. Nothing is written unless every entry parses, so a
 typo cannot leave a half-written map behind.
 
+## Per-request approver selection (ADR 0271)
+
+Some approvals need a different set of approvers each time, chosen by the connector
+that raises them rather than fixed on the route. [ADR 0271](adr/0271-per-request-approver-sets-and-separation-of-duties.md)
+lets an operator register a signing key on one approval route for one connector tool.
+The connector then signs a short-lived ticket naming the approvers for that request.
+The platform checks the ticket when the approval is created. This section covers
+registering and reading back that selector. The wire format of the ticket is in the
+[connector host interface](interfaces/connector-host/INTERFACE.md#per-request-approval-tickets-adr-0271).
+
+Not everything is enforced yet. The platform verifies and stores a dynamic approval at
+creation, but the check that the person who answers is in the selected set, and
+separation of duties, arrive in a later slice. Until then a dynamic approval cannot be
+approved or rejected through any answer path; it expires on the usual 24 hour timeout.
+
+### Registering a selector
+
+Registration is part of the route binding. Add `approver_ticket` (and optionally
+`separation`) to the route in the JSON you pass to `--routes-from`:
+
+```json
+{
+  "approval_routes": {
+    "ledger_post": {
+      "resolution": { "kind": "slack", "address": "C0EXAMPLE1" },
+      "approver_ticket": {
+        "connector": "ledger",
+        "tool": "post_entry",
+        "key_id": "ledger-selector-1",
+        "public_key": "<unpadded base64url of a 32-byte Ed25519 public key>",
+        "ceiling": {
+          "approver_role_version": 4,
+          "users": [
+            { "issuer": "https://idp.example.test", "subject": "alice@example.test" }
+          ]
+        }
+      },
+      "separation": { "exclude_requester": true }
+    }
+  }
+}
+```
+
+```bash
+curie cluster approvals my-agent --routes-from routes.json
+curie cluster approvals my-agent --routes-from routes.json --routes-expected-version 5
+```
+
+`ceiling.users` is optional (1 to 128 unique entries) and narrows the pinned role to
+those exact people. `connector` is the declared hosted connector name, and `tool` is the
+exact upstream tool name. The key is the public half only; the private key stays with the
+connector.
+
+Prerequisites, all checked on write:
+
+1. The agent's requester identity flag (`connector_requester_identity`, ADR 0270) is on.
+   Without it the write is refused `approver_ticket_requires_requester_identity`.
+2. The agent has a restricted approver role in its access policy, and the write names that
+   policy's current version in `ceiling.approver_role_version`. The platform copies the role
+   as it stands at that version into the registration (`ceiling.approver_role`, returned on
+   readback). A later change to the agent's access policy never rewrites the copy, so a role
+   widened after registration does not widen the ceiling. To adopt the new role, write the
+   registration again naming the new version. A stale version is refused
+   `stale_role_policy_version`. An absent policy or approver role, an unrestricted role, or
+   one with no entries is refused `approver_ticket_ceiling_invalid`.
+3. At least one deployment is active, and every active deployment's bundle gates the exact
+   connector tool on this route, so the tool name resolves to this route under the bundle's
+   last-declaration-wins rule. Otherwise the write is refused `approver_ticket.bundle_gate_mismatch`
+   or, with no active deployment, `approver_ticket.no_serving_bundle`. The same check runs
+   when you deploy or upload a bundle, so a later deploy cannot move the gate off the route.
+4. A connector and tool pair is registered on at most one route (`approver_ticket_pair_conflict`).
+
+Once registered, the tool is locked to its route: an approval for it on any other route, or
+without a route, is refused `approval_route_locked`.
+
+### The shared configuration version
+
+Selector writes and the requester identity flag compare-and-set on the same agent value,
+`connector_requester_identity_version`. A route write that registers, replaces or removes a
+selector, or that edits a map already holding one, must carry the version you read. With
+`--routes-from`, the CLI reads the current version in the same command and sends it as
+`approval_routes_expected_version`, so ordinary use needs nothing extra. Pass
+`--routes-expected-version N` to pin the version you reviewed instead; if the agent has moved
+on, the API refuses `approval_routes.version_conflict` and writes nothing. A write that
+omits the version is refused `approval_routes.expected_version_required`. The flag can only
+be turned off after every selector is removed (`requester_identity_selector_registered`),
+and two writers holding the same version cannot both commit. Route writes that involve no
+selector are unchanged and do not bump the version. `--routes-expected-version` is accepted
+only alongside a route write flag.
+
+### Requester exclusion
+
+By default the person who asked cannot approve their own request. Omitting `separation`
+stores and returns `{"exclude_requester": true}`. Setting `"exclude_requester": false` is the
+audited opt-out for routes where one person may legitimately do both. Each change to the
+exclusion, and each registration, replacement and removal, writes an identity audit row with
+the route, key id, connector and tool, the old and new configuration version, and the old and
+new pinned role version. The public key bytes are never audited beyond the key id. Because
+enforcement lands with answer and resume authority, today the stored value is policy
+recorded and audited, not yet applied at answer time. `separation` without
+`approver_ticket`, and `exempt_group`, are refused.
+
+### Reading it back
+
+```bash
+curie cluster approvals my-agent --list-routes --json
+```
+
+The readback shows each registration with its key id, public key, ceiling (including the
+pinned `approver_role` and its version) and the effective `separation`. Edit that output and
+feed it back through `--routes-from` to change an unrelated route: a registration identical
+to the stored one, with its pinned role echoed back or omitted, keeps its existing pin and
+is not judged against the current policy version.
+
+### The creation-time ceiling rule
+
+When the connector raises a dynamic approval, the platform proves each selected approver is
+inside the pinned ceiling before storing anything. Each selected approver must be a known,
+active human in the platform's identity records and must be named by exact issuer and
+subject in the pinned role. When `ceiling.users` is set, the approver must also be listed
+there. `ceiling.users` only narrows the pinned role; it never admits someone the role does
+not name. Group entries and surface-account entries never match at creation, because the
+platform cannot establish group membership or an account association for someone who is not
+present in the request.
+
+The consequence: if the pinned role names approvers only by group, with no issuer and
+subject entry, every dynamic approval is refused `approval_ticket_outside_ceiling`, even
+when `ceiling.users` names the selected people. Name approvers by issuer and subject in the
+approver role, and optionally narrow them with `ceiling.users`, until a subject-keyed
+identity lookup exists. The answer-time check will use fresh identity facts, so this limit
+applies to creation only.
+
 ## Who may resolve
 
 One authorizer decides, and the swappable part behind it is the approver set
