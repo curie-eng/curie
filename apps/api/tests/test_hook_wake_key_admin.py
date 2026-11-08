@@ -175,7 +175,8 @@ def test_wake_secret_admin_requires_the_platform_key(wake_db: str, operation: st
             wake_signed = signed_headers(ctx.key(), ctx.agent_id, WAKE, b"")
             for headers in ({}, {"X-API-Key": "not-the-platform-key"}, wake_signed):
                 refused = await admin(ctx, operation, headers=headers)
-                assert_refused(refused, 401, ADMIN_UNAUTHORIZED)
+                # The router-level authentication refusal is no-store too.
+                assert_admin_refused(refused, 401, ADMIN_UNAUTHORIZED)
                 assert ctx.key() not in refused.text
             assert await wake_key_rows(ctx) == []
             accepted = await admin(ctx, operation)
@@ -200,8 +201,8 @@ def test_wake_secret_admin_refuses_query_and_body(wake_db: str, operation: str) 
             )
             for body in (b"{}", b"x", b" "):
                 assert_admin_refused(await admin(ctx, operation, body=body), 422, BODY_INVALID)
-            # Authentication still comes first.
-            assert_refused(
+            # Authentication still comes first, and its refusal is no-store too.
+            assert_admin_refused(
                 await admin(ctx, operation, query="?x=", body=b"{}", headers={}),
                 401,
                 ADMIN_UNAUTHORIZED,

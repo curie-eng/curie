@@ -30,7 +30,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import asyncpg
@@ -398,12 +398,26 @@ def _dedupe_pattern(agent_id: str) -> str:
     return f"curie:hook-wake:v1:*:{agent_id}:*"
 
 
+def missing_prerequisite(reason: str) -> NoReturn:
+    """Fail in CI and skip elsewhere, for a test prerequisite this environment lacks.
+
+    CI (``CI`` set to a true value, as GitHub Actions sets ``CI=true``) provides
+    every prerequisite, so a missing one there is a broken environment that must
+    not silently drop the proof. Outside CI the test is skipped with ``reason``.
+    """
+    if os.environ.get("CI", "").strip().lower() in ("1", "true", "yes", "on"):
+        pytest.fail(f"missing test prerequisite in CI: {reason}", pytrace=False)
+    pytest.skip(reason)
+
+
 @asynccontextmanager
 async def restricted_valkey(*denied: str) -> AsyncIterator[str]:
     """A fresh ACL user on the test Valkey with ``denied`` commands removed.
 
     Created with the suite's own connection and always deleted afterwards.
-    Yields the DSN that authenticates as that user.
+    Yields the DSN that authenticates as that user. When the test Valkey
+    refuses ACL SETUSER, ``missing_prerequisite`` fails the test in CI and
+    skips it with the reason elsewhere.
     """
     dsn = get_settings().valkey_dsn()
     admin = aioredis.from_url(dsn)
@@ -424,7 +438,7 @@ async def restricted_valkey(*denied: str) -> AsyncIterator[str]:
                 *(f"-{command}" for command in denied),
             )
         except RedisError as exc:
-            pytest.skip(f"the test Valkey refused ACL SETUSER: {type(exc).__name__}")
+            missing_prerequisite(f"the test Valkey refused ACL SETUSER: {type(exc).__name__}")
         created = True
         yield _dsn_with_user(dsn, user, ACL_PASSWORD)
     finally:
@@ -460,8 +474,13 @@ async def side_client(valkey_url: str) -> AsyncIterator[httpx.AsyncClient]:
 
     The variable is set before the app is created and stays set while the app
     serves, then is restored. The test reads Valkey state through the first
-    app's own client, never through settings. When the app cannot boot with that
-    URL the test is skipped with the reason.
+    app's own client, never through settings.
+
+    Startup never connects to Valkey (the client connects on first use), so
+    every caller, the unreachable URL included, expects the app to boot and the
+    request to meet the failure. No startup failure is an expected outcome:
+    any exception from startup propagates and fails the test instead of
+    skipping it.
     """
     saved = os.environ.get("VALKEY_URL")
     os.environ["VALKEY_URL"] = valkey_url
@@ -469,10 +488,7 @@ async def side_client(valkey_url: str) -> AsyncIterator[httpx.AsyncClient]:
     try:
         async with AsyncExitStack() as stack:
             app = create_app()
-            try:
-                await stack.enter_async_context(app.router.lifespan_context(app))
-            except Exception as exc:  # noqa: BLE001 - reported as the skip reason
-                pytest.skip(f"the app cannot boot with this VALKEY_URL: {type(exc).__name__}")
+            await stack.enter_async_context(app.router.lifespan_context(app))
             yield await stack.enter_async_context(
                 httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
             )

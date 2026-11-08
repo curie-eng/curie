@@ -966,6 +966,74 @@ def test_rotation_race_committed_after_authentication_refuses_the_wake(wake_db: 
     drive(scenario)
 
 
+def test_rotation_race_replayed_reservation_refuses_after_rotation(wake_db: str) -> None:
+    async def scenario() -> None:
+        async with wake_app() as ctx, observer() as probe:
+            # Delivery D is admitted, so reserved, under the generation 1 key, then settled
+            # so that a live open run is not what answers its replay.
+            reserved = signed_headers(ctx.key(generation=1), ctx.agent_id, WAKE)
+            await settle_run(ctx.app, assert_queued(await wake(ctx, headers=reserved)))
+            keys = [dedupe_key_for(ctx, reserved).encode()]
+            assert await dedupe_keys(ctx) == keys
+            # Before any rotation the replay meets its reservation and coalesces.
+            assert_coalesced(await wake(ctx, headers=reserved))
+            before = await snapshot(ctx)
+            tasks: list[asyncio.Task[Any]] = []
+            try:
+                async with holding_hook_lock(probe, ctx.agent_id):
+                    tasks.append(asyncio.create_task(_rotate(ctx)))
+                    # Rotation holds the source gate and waits on the admission lock.
+                    await wait_for_lock_waiters(probe, hook_lock_key(ctx.agent_id))
+                    tasks.append(asyncio.create_task(wake(ctx, headers=reserved)))
+                    # The replay has authenticated at generation 1 and waits on the gate.
+                    await wait_for_lock_waiters(probe, gate_lock_key(ctx.agent_id))
+                rotated, replayed = await asyncio.wait_for(asyncio.gather(*tasks), 10)
+            finally:
+                await finish(tasks)
+            assert rotated.status_code == 200, rotated.text
+            assert rotated.json() == _rotation_body(ctx, 2)
+            # A generation mismatch under the gate is the 401, even for a reserved delivery.
+            assert_refused(replayed, 401, INVALID_SIGNATURE)
+            await unchanged(ctx, before, keys=keys)
+            assert_queued(await wake(ctx, key=ctx.key(generation=2)))
+
+    drive(scenario)
+
+
+def test_rotation_race_with_a_live_open_run_refuses_the_old_key(wake_db: str) -> None:
+    async def scenario() -> None:
+        async with wake_app() as ctx, observer() as probe:
+            old = ctx.key(generation=1)
+            open_run = assert_queued(await wake(ctx, key=old))
+            # Before any rotation a fresh old-key delivery joins the live open run.
+            assert_coalesced(await wake(ctx, key=old))
+            before = await snapshot(ctx)
+            tasks: list[asyncio.Task[Any]] = []
+            try:
+                async with holding_hook_lock(probe, ctx.agent_id):
+                    tasks.append(asyncio.create_task(_rotate(ctx)))
+                    # Rotation holds the source gate and waits on the admission lock.
+                    await wait_for_lock_waiters(probe, hook_lock_key(ctx.agent_id))
+                    tasks.append(asyncio.create_task(wake(ctx, key=old)))
+                    # The fresh delivery has authenticated at generation 1 and waits on the gate.
+                    await wait_for_lock_waiters(probe, gate_lock_key(ctx.agent_id))
+                rotated, refused = await asyncio.wait_for(asyncio.gather(*tasks), 10)
+            finally:
+                await finish(tasks)
+            assert rotated.status_code == 200, rotated.text
+            assert rotated.json() == _rotation_body(ctx, 2)
+            # The live open run does not turn the stale key into a coalesced answer.
+            assert_refused(refused, 401, INVALID_SIGNATURE)
+            # The open run and the stream are exactly as they were.
+            assert await snapshot(ctx) == before
+            [run] = before[0]
+            assert str(run["id"]) == open_run and run["outcome"] is None
+            await settle_run(ctx.app, open_run)
+            assert_queued(await wake(ctx, key=ctx.key(generation=2)))
+
+    drive(scenario)
+
+
 def test_rotation_race_after_the_lock_leaves_the_admitted_run(wake_db: str) -> None:
     async def scenario() -> None:
         async with wake_app() as ctx, observer() as probe:
