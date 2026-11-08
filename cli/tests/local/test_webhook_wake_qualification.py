@@ -5,6 +5,9 @@ The sibling worker fixture owns a real kind install and verifies teardown.
 This suite moves admission to HTTP, using an independent contract signer.
 Hosted cases use a connector-only SecretRef. The live cases require
 ``WAKE_TEST_MODEL_CREDENTIAL`` and otherwise record an explicit acceptance gap.
+Local hosted sessions remain a gap because local/skill bring-up cannot deliver
+operator-managed SecretRefs. The two transport cases wait about 150 seconds
+per stack for real lease expiry on the database clock.
 """
 
 from __future__ import annotations
@@ -26,6 +29,14 @@ from test_webhook_wake_worker import FULLNAME, NAME, WakeStack, wait_until
 
 BODY = b"{}"
 HOOK = "queue-ready"
+LIVE_PROVIDER_GAP = (
+    "ADR 0274 live-provider connector/session gap: approved credential absent; "
+    "Brian waived the live run on 2026-11-08 pending a test credential"
+)
+LOCAL_CONNECTOR_GAP = (
+    "ADR 0274 local hosted connector gap: local/skill bring-up cannot deliver "
+    "operator-managed SecretRefs; connector wake-key custody runs on cluster only"
+)
 
 
 class PrivateInput(str):
@@ -43,6 +54,22 @@ def signed_headers(key, agent, hook, delivery, timestamp, body=BODY):
     context = json.dumps([agent, hook], ensure_ascii=True, separators=(",", ":")).encode()
     material = (
         b"curie.hook.wake.v1\n"
+        + f"{timestamp}.{delivery}.{len(context)}:".encode()
+        + context
+        + body
+    )
+    return {
+        "X-Curie-Timestamp": str(timestamp),
+        "X-Curie-Delivery-Id": delivery,
+        "X-Curie-Signature-256": "sha256="
+        + hmac.new(key.encode(), material, hashlib.sha256).hexdigest(),
+    }
+
+
+def ordinary_headers(key, hook, delivery, timestamp, body=BODY):
+    context = json.dumps([hook, None], separators=(",", ":")).encode()
+    material = (
+        b"curie.hook.delivery.v2\n"
         + f"{timestamp}.{delivery}.{len(context)}:".encode()
         + context
         + body
@@ -547,6 +574,18 @@ class Qualification(WakeStack):
             "stream": self.redis("XRANGE", "curie:runs", "-", "+"),
         }
 
+    def reservation_key(self, agent, delivery):
+        agent_id = self.agents[agent]
+        generation = self.http(f"/agents/{agent_id}/hooks/{HOOK}/wake-secret", admin=True)[0][
+            "body"
+        ]["generation"]
+        scope = self.api_python(
+            "import hashlib,hmac,json;from curie_api.config import get_settings;"
+            "print(json.dumps(hmac.new(get_settings().api_key.encode(),"
+            "b'curie.hook.wake.scope.v1',hashlib.sha256).hexdigest()))"
+        )
+        return f"curie:hook-wake:v1:{scope}:{agent_id}:{HOOK}:{generation}:{delivery}"
+
     def wake_batch(self, agent="acme-wake-idle", count=8):
         key, agent_id = self.key(agent), self.agents[agent]
         headers = [
@@ -764,6 +803,9 @@ def test_acceptance_1(qualification):
         ]
         assert_no_key(receipt, stack.key(agent))
     assert stack.redis("XLEN", "curie:runs") == 0
+    before = stack.snapshot()
+    stack.scheduler_tick()
+    assert stack.snapshot() == before == {"runs": [], "stream": []}
 
 
 def test_acceptance_2(qualification):
@@ -800,9 +842,18 @@ def test_acceptance_2(qualification):
     agent = stack.agents["acme-wake-idle"]
     for method, suffix in (("GET", ""), ("POST", "/rotate")):
         route = f"/agents/{agent}/hooks/{HOOK}/wake-secret{suffix}"
-        assert stack.http(route, method=method, admin=True, body="{}")[0]["status"] == 422
-        assert stack.http(route + "?override=", method=method, admin=True)[0]["status"] == 400
-        assert stack.http(route, method=method)[0]["status"] in (401, 403)
+        for path, body, status, detail in (
+            (route, "{}", 422, "wake_body_invalid"),
+            (route + "?override=", None, 400, "wake_query_forbidden"),
+        ):
+            answer = stack.http(path, method=method, admin=True, body=body)[0]
+            assert answer["status"] == status
+            assert answer["body"] == {"detail": detail}
+            assert answer["cache"] == "no-store"
+        answer = stack.http(route, method=method)[0]
+        assert answer["status"] == 401
+        assert answer["body"] == {"detail": "missing or invalid API key"}
+        assert answer["cache"] == "no-store"
     run = stack.queued()
     rotated = stack.http(
         f"/agents/{agent}/hooks/{HOOK}/wake-secret/rotate", method="POST", admin=True
@@ -895,6 +946,7 @@ def test_source_controls(qualification, guard):
         response = stack.http(path, method=method, admin=True)[0]
         assert response["status"] == 409
         assert response["body"] == {"detail": "wake_source_not_ordinary"}
+        assert response["cache"] == "no-store"
     assert stack.snapshot() == before
     assert (
         stack.sql(f"SELECT count(*) FROM curie.hook_wake_keys WHERE agent_id='{agent_id}'") == "0"
@@ -910,6 +962,8 @@ def test_acceptance_3(qualification):
     answers = stack.wake(delivery=delivery, timestamp=timestamp, copies=8)
     assert sorted(item["status"] for item in answers) == [200] * 7 + [202]
     run = next(item["body"]["run_id"] for item in answers if item["status"] == 202)
+    reservation = stack.reservation_key("acme-wake-idle", delivery)
+    assert stack.redis("PTTL", reservation) >= 421_000
     before = stack.snapshot()
     assert stack.wake()[0]["body"] == {"status": "coalesced"}
     assert stack.snapshot() == before
@@ -941,13 +995,8 @@ def test_signature_purposes_and_shared_key(qualification):
     headers["Content-Type"] = "application/json"
     crossed = stack.http(f"/hooks/{agent}/{HOOK}", method="POST", body="{}", headers=headers)[0]
     assert crossed["status"] == 401
-    context = json.dumps([HOOK, None], separators=(",", ":")).encode()
-    material = b"curie.hook.delivery.v2\n" + f"{timestamp}.{delivery}.{len(context)}:".encode()
-    material += context + BODY
     for signing_key in (ordinary_key, key):
-        headers["X-Curie-Signature-256"] = (
-            "sha256=" + hmac.new(signing_key.encode(), material, hashlib.sha256).hexdigest()
-        )
+        headers = ordinary_headers(signing_key, HOOK, delivery, timestamp)
         crossed = stack.http(
             f"/hooks/{agent}/{HOOK}/wake", method="POST", body="{}", headers=headers
         )[0]
@@ -972,18 +1021,8 @@ def test_fresh_overlap_and_dedupe_expiry(qualification):
     stack.settled(run, "ran")
     stack.worker(False)
     delivery, timestamp = uuid.uuid4().hex, int(time.time())
-    agent = stack.agents["acme-wake-idle"]
     run = stack.queued(delivery=delivery, timestamp=timestamp)
-    generation = stack.http(f"/agents/{agent}/hooks/{HOOK}/wake-secret", admin=True)[0]["body"][
-        "generation"
-    ]
-    reservation = stack.api_python(
-        "import json;from curie_api.config import get_settings;"
-        "from curie_api.hook_wake_signing import dedupe_key;"
-        f"print(json.dumps(dedupe_key(get_settings().api_key,agent_id='{agent}',hook='{HOOK}',"
-        f"generation={generation},"
-        f"delivery_id='{delivery}')))"
-    )
+    reservation = stack.reservation_key("acme-wake-idle", delivery)
     assert 300_000 <= stack.redis("PTTL", reservation) <= 601_000
     stack.worker(True)
     stack.settled(run, "ran")
@@ -1000,7 +1039,8 @@ def test_fresh_overlap_and_dedupe_expiry(qualification):
             interval=0.1,
         )
     )
-    fresh = stack.queued()
+    fresh = stack.queued(delivery=delivery, timestamp=timestamp)
+    assert fresh != run
     stack.worker(True)
     stack.settled(fresh, "ran")
 
@@ -1026,6 +1066,9 @@ def test_acceptance_4(qualification):
     attempted = stack.bash_requests
     gated = stack.queued("acme-wake-gated")
     stack.settled(gated, "failed", "approval_gate_targetless")
+    settled = stack.snapshot()
+    stack.scheduler_tick()
+    assert stack.snapshot() == settled
     assert stack.bash_requests > attempted
     assert stack.marker_value("acme-wake-gated") is None
     assert stack.sql("SELECT count(*) FROM curie.approvals") == "0"
@@ -1253,6 +1296,15 @@ def test_transport_failure_and_timed_recovery(qualification, budget, lease):
             assert answer["status"] == 503, answer
             assert answer["body"] == {"detail": "authority_unavailable"}
             assert stack.snapshot() == before
+            stack.fault_mode("refuse_set_nx")
+            try:
+                answer = stack.wake(key=key)[0]
+            finally:
+                reservation_fault = stack.fault_mode("forward")
+            assert reservation_fault["refused"] > observed["refused"], reservation_fault
+            assert answer["status"] == 503, answer
+            assert answer["body"] == {"detail": "wake_dedupe_unavailable"}
+            assert stack.snapshot() == before
             stack.fault_mode("drop_xadd")
             try:
                 answer = stack.wake()[0]
@@ -1299,20 +1351,16 @@ def test_transport_failure_and_timed_recovery(qualification, budget, lease):
             "live",
             marks=pytest.mark.skipif(
                 not os.environ.get("WAKE_TEST_MODEL_CREDENTIAL"),
-                reason="ADR 0274 live-provider connector/session gap: approved credential absent",
+                reason=LIVE_PROVIDER_GAP,
             ),
         ),
     ],
 )
-def test_hosted_connector_session(qualification, agent, provider_tier, record_property):
+def test_hosted_connector_session(qualification, agent, provider_tier):
     """Read and write through the real MCP path, with independent model tiers."""
     stack = qualification
     live = provider_tier == "live"
     credential = os.environ.get("WAKE_TEST_MODEL_CREDENTIAL", "") if live else "not-needed"
-    if not credential:
-        gap = "ADR 0274 live-provider connector/session proof missing: approved credential absent"
-        record_property("acceptance_gap", gap)
-        pytest.skip(gap)
     credential_name = os.environ.get("WAKE_TEST_MODEL_ENV_KEY", "ANTHROPIC_API_KEY")
     if credential_name not in {"CURIE_CREDENTIALS", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}:
         raise RuntimeError("approved test model credential uses an unsupported environment key")
@@ -1412,7 +1460,8 @@ def test_hosted_connector_session(qualification, agent, provider_tier, record_pr
                         "no_client_auth": "Caller identity is verified by the platform proxy.",
                         "scratch": {"path": "/tmp", "size_limit": "16Mi"},
                         "env": {
-                            "WAKE_URL": f"http://{FULLNAME}-api:8000/hooks/{agent_id}/{HOOK}/wake"
+                            "WAKE_URL": f"http://{FULLNAME}-api:8000/hooks/{agent_id}/{HOOK}/wake",
+                            "WAKE_QUEUE_DB": f"/tmp/wake-queue-{provider_tier}.sqlite3",
                         },
                         "secrets": [
                             {
@@ -1460,6 +1509,15 @@ def test_hosted_connector_session(qualification, agent, provider_tier, record_pr
     assert len(connectors) == 1
     connector = connectors[0]
     stack.kube("rollout", "status", f"deployment/{connector}", "--timeout=180s")
+    deployment = json.loads(stack.kube("get", "deployment", connector, "-o", "json"))
+    assert_no_key(deployment, key)
+    pod_spec = deployment["spec"]["template"]["spec"]
+    references = [
+        container["name"]
+        for container in pod_spec["containers"] + pod_spec.get("initContainers", [])
+        if wake_secret in json.dumps(container)
+    ]
+    assert references == ["server"]
 
     def control(path, value=None):
         return json.loads(
@@ -1496,7 +1554,8 @@ def test_hosted_connector_session(qualification, agent, provider_tier, record_pr
     if not live:
         stack.worker(False)
         control("/barriers", {"read": True, "complete": True})
-    control("/items", {"id": "item-1", "text": "Record the result receipt-ok."})
+    first_item, late_item = f"{provider_tier}-item-1", f"{provider_tier}-item-2"
+    control("/items", {"id": first_item, "text": "Record the result receipt-ok."})
     polled = control("/poll", {})
     assert polled["http_status"] == 202
     run = polled["receipt"]["run_id"]
@@ -1517,13 +1576,13 @@ def test_hosted_connector_session(qualification, agent, provider_tier, record_pr
                     interval=0.25,
                 )
             )
-            control("/items", {"id": "item-2", "text": "Arrived after the last queue read."})
+            control("/items", {"id": late_item, "text": "Arrived after the last queue read."})
             assert control("/poll", {})["receipt"] == {"status": "coalesced"}
             control("/barriers", {"read": False, "complete": True})
             asyncio.run(
                 wait_until(
                     lambda: control("/observation")["complete_waiting"],
-                    "connector completion",
+                    "connector's last tool call before settlement",
                     timeout=30,
                     interval=0.25,
                 )
@@ -1536,16 +1595,16 @@ def test_hosted_connector_session(qualification, agent, provider_tier, record_pr
         assert {row["id"] for row in after["runs"]} == {row["id"] for row in admitted["runs"]}
         assert after["stream"] == admitted["stream"]
         assert control("/observation")["items"] == [
-            {"id": "item-1", "result": "receipt-ok"},
-            {"id": "item-2", "result": None},
+            {"id": first_item, "result": "receipt-ok"},
+            {"id": late_item, "result": None},
         ]
         fresh = control("/poll", {})
         assert fresh["http_status"] == 202
         stack.settled(fresh["receipt"]["run_id"], "ran")
     observation = control("/observation")
-    expected = [{"id": "item-1", "result": "receipt-ok"}]
+    expected = [{"id": first_item, "result": "receipt-ok"}]
     if not live:
-        expected.append({"id": "item-2", "result": "receipt-ok"})
+        expected.append({"id": late_item, "result": "receipt-ok"})
     assert observation["items"] == expected
     assert {call["tool"] for call in observation["calls"]} == {"read", "complete"}
     assert all(call["agent"] == agent for call in observation["calls"])
@@ -1587,3 +1646,8 @@ def test_hosted_connector_session(qualification, agent, provider_tier, record_pr
         if key.encode() in exported:
             raise AssertionError("wake credential escaped into telemetry")
     assert stack.slack_calls == []
+
+
+@pytest.mark.skip(reason=LOCAL_CONNECTOR_GAP)
+def test_local_hosted_connector_gap():
+    pass

@@ -37,12 +37,10 @@ class Fault:
     forwarded = 0
 
 
-def main():
-    state = Fault()
-
+def proxy_server(state, upstream_host, upstream_port=6379, address=("0.0.0.0", 6379)):
     class Proxy(socketserver.StreamRequestHandler):
         def handle(self):
-            with socket.create_connection((os.environ["UPSTREAM_HOST"], 6379), timeout=5) as peer:
+            with socket.create_connection((upstream_host, upstream_port), timeout=5) as peer:
                 with peer.makefile("rb") as upstream:
                     try:
                         while True:
@@ -50,6 +48,15 @@ def main():
                             if state.mode == "down":
                                 state.refused += 1
                                 return
+                            if (
+                                state.mode == "refuse_set_nx"
+                                and command[0].upper() == b"SET"
+                                and b"NX" in [part.upper() for part in command[3:]]
+                            ):
+                                state.refused += 1
+                                self.wfile.write(b"-ERR qualification_reservation_unavailable\r\n")
+                                self.wfile.flush()
+                                continue
                             if state.mode == "drop_xadd" and command[0].upper() == b"XADD":
                                 state.dropped += 1
                                 return
@@ -60,6 +67,16 @@ def main():
                             self.wfile.flush()
                     except (EOFError, OSError):
                         return
+
+    class Server(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    return Server(address, Proxy)
+
+
+def main():
+    state = Fault()
 
     class Control(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -81,17 +98,13 @@ def main():
 
         def do_POST(self):
             value = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            if value.get("mode") not in {"forward", "down", "drop_xadd"}:
+            if value.get("mode") not in {"forward", "down", "refuse_set_nx", "drop_xadd"}:
                 self.send_error(400)
                 return
             state.mode = value["mode"]
             self.do_GET()
 
-    class Server(socketserver.ThreadingTCPServer):
-        allow_reuse_address = True
-        daemon_threads = True
-
-    with Server(("0.0.0.0", 6379), Proxy) as redis:
+    with proxy_server(state, os.environ["UPSTREAM_HOST"]) as redis:
         thread = threading.Thread(target=redis.serve_forever, daemon=True)
         thread.start()
         try:

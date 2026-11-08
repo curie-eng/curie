@@ -11,6 +11,9 @@ import os
 import sqlite3
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -124,8 +127,6 @@ class Queue:
     def poll(self, url, key):
         if not self.pending():
             return {"status": "empty"}
-        import urllib.parse
-
         path = urllib.parse.urlsplit(url).path.split("/")
         if len(path) != 5 or path[1] != "hooks" or path[4] != "wake":
             raise ValueError("invalid wake URL")

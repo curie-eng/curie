@@ -7,21 +7,103 @@ import hashlib
 import hmac
 import json
 import socket
+import socketserver
+import sys
 import threading
 import urllib.request
 import uuid
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import httpx2
 import pytest
 import uvicorn
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
-from webhook_wake_connector import Queue, build_mcp, control_server
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "cli/tests/local"))
+
+from webhook_wake_connector import Queue, build_mcp, control_server  # noqa: E402
+from webhook_wake_fault_proxy import Fault, frame, proxy_server  # noqa: E402
 
 KEY = "example-connector-wake-key"
 AGENT = "00000000-0000-4000-8000-000000000001"
+
+
+def test_cross_purpose_signatures_have_a_valid_ordinary_positive_control():
+    from curie_api.hook_signing import verify
+    from test_webhook_wake_qualification import ordinary_headers, signed_headers
+
+    timestamp, delivery = 1794000000, "example-delivery"
+    ordinary = ordinary_headers(KEY, "queue-ready", delivery, timestamp)
+    wake = signed_headers(KEY, AGENT, "queue-ready", delivery, timestamp)
+    arguments = {
+        "timestamp": str(timestamp),
+        "delivery_id": delivery,
+        "hook": "queue-ready",
+        "tool_access": None,
+        "body": b"{}",
+        "now": timestamp,
+    }
+    assert verify(KEY, header=ordinary["X-Curie-Signature-256"], **arguments)
+    assert not verify(KEY, header=wake["X-Curie-Signature-256"], **arguments)
+
+
+def test_reservation_fault_forwards_authority_reads_and_refuses_only_set_nx():
+    received = []
+
+    class Upstream(socketserver.StreamRequestHandler):
+        def handle(self):
+            try:
+                while True:
+                    _, command = frame(self.rfile)
+                    received.append(command)
+                    self.wfile.write(b"+OK\r\n")
+                    self.wfile.flush()
+            except EOFError:
+                return
+
+    class Server(socketserver.ThreadingTCPServer):
+        daemon_threads = True
+
+    with Server(("127.0.0.1", 0), Upstream) as upstream:
+        with serving(upstream):
+            state = Fault()
+            state.mode = "refuse_set_nx"
+            with proxy_server(state, *upstream.server_address, ("127.0.0.1", 0)) as proxy:
+                with serving(proxy):
+                    with socket.create_connection(proxy.server_address, timeout=5) as client:
+                        with client.makefile("rb") as stream:
+
+                            def send(*parts):
+                                encoded = [part.encode() for part in parts]
+                                client.sendall(
+                                    f"*{len(encoded)}\r\n".encode()
+                                    + b"".join(
+                                        f"${len(part)}\r\n".encode() + part + b"\r\n"
+                                        for part in encoded
+                                    )
+                                )
+                                return stream.readline()
+
+                            assert send("GET", "kill-switch") == b"+OK\r\n"
+                            assert send("SET", "ordinary", "value") == b"+OK\r\n"
+                            assert send("SET", "reservation", "1", "EX", "331", "NX") == (
+                                b"-ERR qualification_reservation_unavailable\r\n"
+                            )
+                            assert send("GET", "kill-switch") == b"+OK\r\n"
+                            state.mode = "forward"
+                            assert send("SET", "reservation", "1", "NX", "EX", "331") == (
+                                b"+OK\r\n"
+                            )
+    assert state.refused == 1 and state.forwarded == 4
+    assert received == [
+        [b"GET", b"kill-switch"],
+        [b"SET", b"ordinary", b"value"],
+        [b"GET", b"kill-switch"],
+        [b"SET", b"reservation", b"1", b"NX", b"EX", b"331"],
+    ]
 
 
 def test_private_inputs_are_redacted_by_the_real_failure_formatter(tmp_path):
@@ -47,7 +129,7 @@ def serving(server):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield f"http://127.0.0.1:{server.server_port}"
+        yield f"http://127.0.0.1:{server.server_address[1]}"
     finally:
         server.shutdown()
         server.server_close()
