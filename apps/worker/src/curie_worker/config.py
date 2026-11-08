@@ -981,6 +981,12 @@ class WorkerConfig(BaseSettings):
     delivery_lease_ttl_s: float = Field(
         default=45.0, gt=0, validation_alias="CURIE_DELIVERY_LEASE_TTL_S"
     )
+    abandoned_turn_grace_s: float = Field(
+        default=90.0,
+        gt=0,
+        allow_inf_nan=False,
+        validation_alias="CURIE_ABANDONED_TURN_GRACE_S",
+    )
     delivery_lease_heartbeat_s: float = Field(
         default=10.0, gt=0, validation_alias="CURIE_DELIVERY_LEASE_HEARTBEAT_S"
     )

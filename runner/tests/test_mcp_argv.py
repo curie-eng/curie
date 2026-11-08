@@ -9,6 +9,7 @@ import json
 import os
 import select
 import shlex
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -166,6 +167,42 @@ def test_spawned_process_cmdline_omits_hosted_bearer(
 
 def test_custom_header_absent_from_cli_argv() -> None:
     _assert_sentinel_off_argv({"X-Api-Key": "custom_sentinel_2635"}, "custom_sentinel_2635")
+
+
+def test_forced_stop_kills_the_cli_process_group(tmp_path: Path, monkeypatch) -> None:
+    from curie_runner.mcp_argv import CredentialSafeCLITransport
+    from curie_test_support.static_shell import wait_gone, wait_until
+
+    ready = tmp_path / "processes"
+    executable = tmp_path / "cli"
+    _write_closed_executable(
+        executable,
+        f"#!{sys.executable}\n"
+        "import os, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+        f"open({str(ready)!r}, 'w').write(str(child.pid))\n"
+        "time.sleep(600)\n",
+    )
+    monkeypatch.setenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
+    transport = CredentialSafeCLITransport("", ClaudeAgentOptions(cli_path=str(executable)))
+
+    async def go() -> None:
+        await transport.connect()
+        try:
+            await anyio.to_thread.run_sync(wait_until, ready.exists, 5, "CLI child started")
+            child_pid = int(ready.read_text())
+            assert transport._process is not None
+            leader_pid = transport._process.pid
+            assert os.getpgid(child_pid) == leader_pid
+            assert leader_pid != os.getpgrp()
+            with anyio.fail_after(6):
+                await transport.stop_process_group()
+            assert wait_gone(leader_pid, 1)
+            assert wait_gone(child_pid, 1)
+        finally:
+            await transport.close()
+
+    anyio.run(go)
 
 
 def test_basic_auth_absent_from_cli_argv() -> None:

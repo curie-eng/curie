@@ -645,6 +645,21 @@ heartbeat renews it; a renewal that Valkey cannot confirm fails **closed** —
 the owner is lease-lost, its runner is interrupted through the bounded control
 path, and it may no longer settle anything.
 
+A retained turn that has not reached a durable handoff boundary waits with
+exponential backoff inside its fenced delivery. These refusals consume the
+original delivery deadline, without consuming attempts or increasing the PEL
+delivery count. Reclaim preflight waits use the same rule. Deadline exhaustion
+still emits an operator-visible delivery failure.
+
+Before starting a turn, the worker records the claim and its delivery owner in
+Valkey. Maintenance observes missing ownership and allows
+`CURIE_ABANDONED_TURN_GRACE_S` (90 seconds by default) before checking the exact
+claim under the thread lock. A runner that remains active, unreadable or unable
+to confirm durable history is retired through its backend. Static shells stop
+the child and run cleanup before releasing the slot, or quarantine on failure.
+Healthy idle claims retain their routes. The bound and runner cleanup settings
+are described in [the static substrate reference](../../docs/static-pool-substrate.md).
+
 ### Capability audit: every owner verb and the fence that gates it
 
 One row per verb a delivery owner can perform that produces a durable or

@@ -51,6 +51,7 @@ from curie_worker.consumer_liveness import ConsumerLivenessStore, consumer_heart
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.kernel import attempt as kernel_attempt
 from curie_worker.kernel import log as kernel_log
+from curie_worker.kernel.routing import _thread_key_for
 
 from .conftest import _failing_process_event, _pending_rows, _ProcessEventSpy
 
@@ -78,6 +79,176 @@ _LEASE_KNOBS: dict[str, object] = {
     "delivery_lease_heartbeat_s": _HEARTBEAT_S,
     "runner_total_timeout_s": 30.0,
 }
+
+
+@pytest.mark.parametrize("settles", [True, False])
+@pytest.mark.parametrize("previous_watch", [True, False])
+def test_handoff_refusals_wait_without_spending_deliveries(
+    make_harness, settles: bool, previous_watch: bool
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS, max_delivery=2) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            await consumer.ensure_group()
+            event = _qevent("recover", thread="handoff-wait", event_id="handoff-wait")
+            handle = h.substrate.claim(
+                _thread_key_for(event),
+                env={
+                    "CURIE_RUNNER_TOKEN": "recovery-test-token",
+                    **({} if previous_watch else {"CURIE_MAX_TURNS": "1"}),
+                },
+            )
+            h.runner.history_durable = False
+            h.runner.session_status = DONE.value
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            entry_id, fields = await _read_one(h, h.config.consumer_name)
+            if previous_watch:
+                old = await store.acquire(
+                    h.config.stream,
+                    h.config.consumer_group,
+                    entry_id,
+                    consumer=h.config.consumer_name,
+                )
+                await h.kernel._markers.watch_turn(_thread_key_for(event), handle.claim_name, old)
+                await store.release(
+                    old.stream,
+                    old.group,
+                    old.entry_id,
+                    owner=old.owner,
+                    resume_event_id=None,
+                )
+            watched = await h.kernel._markers.watched_turn(handle.claim_name)
+            seconds, micros = await h.async_redis.time()
+            await h.async_redis.hset(
+                h.config.delivery_state_key(h.config.stream, h.config.consumer_group, entry_id),
+                "deadline_ms",
+                seconds * 1000 + micros // 1000 + 6000,
+            )
+            await consumer._dispatch(entry_id, fields)
+            try:
+                await _wait_until(lambda: len(h.runner.status_headers) >= 8)
+                assert (await _pending_rows(h))[entry_id] == 1
+                assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
+                assert h.runner.opened == []
+                assert await h.kernel._markers.watched_turn(handle.claim_name) == watched
+                if settles:
+                    h.runner.history_durable = True
+                    h.runner.default_script = [Final(text="recovered", status=DONE)]
+                await asyncio.wait_for(_settle(consumer), timeout=5)
+                assert await _pending_rows(h) == {}
+                assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
+                if settles:
+                    assert h.runner.opened == ["recover"]
+                    assert h.sink.last_text == "recovered"
+                else:
+                    assert h.runner.opened == []
+                    assert "delivery deadline" in h.sink.last_text
+            finally:
+                consumer.request_stop()
+                await _settle(consumer)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("durable", [True, False])
+def test_expired_worker_retires_a_wedged_static_claim(
+    make_harness, sync_redis, names, tmp_path: Path, durable: bool
+) -> None:
+    import json
+
+    from curie_test_support.static_shell import (
+        CONTROL_TOKEN,
+        FAKE_RUNNER_COMMAND,
+        SupervisorProcess,
+        make_shell_tls,
+        wait_gone,
+    )
+    from curie_worker.runner_client import RunnerClient
+    from curie_worker.sandbox import StaticPoolSandboxClient, StaticShellSlot, shell_ssl_context
+
+    class NoBundles:
+        def get(self, key: str) -> bytes:
+            raise AssertionError("this claim carries no bundle")
+
+    tls = make_shell_tls(tmp_path / "tls")
+    shell = SupervisorProcess(
+        slot="recovery",
+        tls=tls,
+        root=tmp_path / "shell",
+        runner_command=FAKE_RUNNER_COMMAND,
+        env={"CURIE_SUPERVISOR_SETTLE_TIMEOUT_SECONDS": "0.1"},
+    ).start()
+    client = StaticPoolSandboxClient(
+        slots=[StaticShellSlot("recovery", "localhost", shell.port, "test-pool")],
+        redis_client=sync_redis,
+        control_token=CONTROL_TOKEN,
+        ssl_context=shell_ssl_context(str(tls.ca)),
+        bundle_store=NoBundles(),
+        key_prefix=names["sandbox_prefix"],
+        allow_unisolated_shells=True,
+    )
+
+    async def go() -> None:
+        async with make_harness(
+            **_LEASE_KNOBS,
+            sandbox_client=client,
+            abandoned_turn_grace_s=0.05,
+        ) as h:
+            event = _qevent("wedged", event_id="wedged")
+            thread = _thread_key_for(event)
+            records = tmp_path / "records"
+            handle = await asyncio.to_thread(
+                h.substrate.claim,
+                thread,
+                env={
+                    "CURIE_RUNNER_TOKEN": "static-recovery-test-token",
+                    "FAKE_RECORD_DIR": str(records),
+                    "FAKE_DURABLE": "1" if durable else "0",
+                    "FAKE_STATUS_BODY": json.dumps(
+                        {"turn_active": True, "history_durable": durable}
+                    ),
+                },
+            )
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            await consumer.ensure_group()
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            entry, _fields = await _read_one(h, h.config.consumer_name)
+            lease = await store.acquire(
+                h.config.stream,
+                h.config.consumer_group,
+                entry,
+                consumer=h.config.consumer_name,
+            )
+            await h.kernel._markers.watch_turn(thread, handle.claim_name, lease)
+            async with RunnerClient(ssl_context=shell_ssl_context(str(tls.ca))) as runner:
+                h.kernel._runner = runner
+                assert await h.kernel.reap_orphans() == []
+                assert shell.shell()["claim"]["name"] == handle.claim_name
+                await store.release(
+                    lease.stream,
+                    lease.group,
+                    lease.entry_id,
+                    owner=lease.owner,
+                    resume_event_id=None,
+                )
+                assert await h.kernel.reap_orphans() == []
+                async with asyncio.timeout(10):
+                    while not await h.kernel.reap_orphans():
+                        pass
+                assert h.substrate.lookup(thread) is None
+                assert shell.shell()["state"] == "quarantined"
+                state = sync_redis.hget(f"{names['sandbox_prefix']}:static:slot:recovery", "state")
+                assert state == "quarantined"
+                assert wait_gone(int((records / "pid").read_text()), 5)
+                assert wait_gone(int((records / "grandchild").read_text()), 5)
+                assert await h.kernel._markers.watched_turns() == {}
+
+    try:
+        asyncio.run(go())
+    finally:
+        shell.stop()
 
 
 def test_twenty_nine_second_ownership_outage_preserves_the_whole_live_turn(

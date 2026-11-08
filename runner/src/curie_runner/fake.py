@@ -522,5 +522,8 @@ class FakeModelSession:
             return None
         return UserMessage(content=kept)
 
+    async def abort(self) -> None:
+        self._interrupted = True
+
     async def close(self) -> None:
         self.connected = False

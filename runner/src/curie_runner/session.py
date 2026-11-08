@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import hmac
 import logging
+import math
 import time
 import uuid
 from collections import OrderedDict
@@ -405,7 +406,11 @@ class SessionRunner:
         channel_kind: str | None = None,
         final_answer: FinalAnswerPolicy | None = None,
         initializer: Callable[[], Awaitable[None]] | None = None,
+        cleanup_timeout_s: float = _ABANDONED_TURN_DRAIN_TIMEOUT_S,
     ) -> None:
+        if not math.isfinite(cleanup_timeout_s) or cleanup_timeout_s <= 0:
+            raise ValueError("runner cleanup timeout must be finite and positive")
+        self._cleanup_timeout_s = cleanup_timeout_s
         self._final_answer = final_answer
         self._factory = session_factory
         # Boot work that must finish before the first session exists, such as
@@ -1071,6 +1076,33 @@ class SessionRunner:
 
         await asyncio.shield(self.begin_start())
 
+    async def _cleanup_turn_session(self) -> None:
+        session = self._session
+        if session is None:
+            return
+        stopped = not self._turn_open
+        pending_timeout = self._timeout_interrupt_settled
+        if pending_timeout is not None:
+            stopped = False
+        try:
+            with (
+                anyio.CancelScope(shield=True),
+                contextlib.suppress(Exception),
+                anyio.move_on_after(self._cleanup_timeout_s),
+            ):
+                if pending_timeout is not None:
+                    await pending_timeout.wait()
+                if self._turn_open and not self._timeout_interrupt_delivered:
+                    await session.interrupt()
+                stopped = True
+        finally:
+            if not stopped:
+                logger.error("turn interrupt did not settle; aborting session")
+                self._started = False
+                self._status = SessionStatus.CLASSIFIED_FAILURE
+                with anyio.fail_after(5.0, shield=True):
+                    await session.abort()
+
     async def close(self) -> None:
         if self._attachment_access is not None:
             self._attachment_access.end()
@@ -1706,19 +1738,6 @@ class SessionRunner:
                                 emit_completed_metrics()
                                 terminal_for_log = True
                         finally:
-                            # The SDK serializes this turn's stop and any later
-                            # query onto one locked stdin stream. Wait until the
-                            # timeout attempt settles before cleanup: a normally
-                            # returned stop is already ordered ahead of the next
-                            # query and the CLI cannot latch it for that later
-                            # turn. If the timeout call does not return normally,
-                            # the cleanup path below supplies the safety-net while
-                            # this turn still owns the lock; cancellation before
-                            # the write sends nothing for a later turn to observe.
-                            timeout_settled = self._timeout_interrupt_settled
-                            if timeout_settled is not None:
-                                with anyio.CancelScope(shield=True):
-                                    await timeout_settled.wait()
                             # Retire this turn's control token before cleanup can
                             # await the session-global interrupt. A timeout that
                             # arrives during that await is stale and must not
@@ -1731,19 +1750,8 @@ class SessionRunner:
                                 self._attachment_access.end(attachment_opener)
                             if self._turn_open and self._channel_read is not None:
                                 self._channel_read.end()
-                            # If the turn never reached a terminal final (_turn_open
-                            # still set), the consumer abandoned the stream mid-run
-                            # (client disconnect -> GeneratorExit, or cancellation).
-                            # Stop the SDK so it cannot keep executing tools past the
-                            # released turn lock and bleed into the next turn.
                             try:
-                                if (
-                                    self._turn_open
-                                    and not self._timeout_interrupt_delivered
-                                    and self._session is not None
-                                ):
-                                    with contextlib.suppress(Exception):
-                                        await self._session.interrupt()
+                                await self._cleanup_turn_session()
                             finally:
                                 self._turn_open = False
                                 self._turn_ready = False

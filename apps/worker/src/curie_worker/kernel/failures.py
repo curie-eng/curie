@@ -269,6 +269,10 @@ class ThreadBusyError(RuntimeError):
     """
 
 
+class HandoffPending(ThreadBusyError):
+    """A retained turn has not reached its durable handoff boundary."""
+
+
 class ToolAccessUnenforced(Exception):
     """The runner a restricted turn would go to does not enforce its access.
 

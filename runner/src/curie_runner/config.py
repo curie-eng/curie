@@ -14,6 +14,7 @@ their default. Each var keeps the behavior it has.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -175,6 +176,7 @@ class RunnerConfig:
     # provider default for the SDK's Opus alias (#4120).
     reviewer_model: str | None = None
     connector_endpoints: ConnectorEndpointBinding | None = None
+    cleanup_timeout_s: float = 30.0
 
     @property
     def memory_writes_on(self) -> bool:
@@ -231,6 +233,9 @@ class RunnerConfig:
         """
 
         boot = BootEnv.from_env(env)
+        cleanup_timeout_s = float(env.get("CURIE_RUNNER_CLEANUP_TIMEOUT_S", "30"))
+        if not math.isfinite(cleanup_timeout_s) or cleanup_timeout_s <= 0:
+            raise ValueError("CURIE_RUNNER_CLEANUP_TIMEOUT_S must be finite and positive")
         endpoints = (
             ConnectorEndpointBinding.model_validate(parse_endpoint_json(env[BINDING_ENV]))
             if BINDING_ENV in env
@@ -261,6 +266,7 @@ class RunnerConfig:
         # one way: only 1/true (any case, trimmed) opts out of authentication.
         allow_tokenless = env.get(ALLOW_TOKENLESS_ENV, "").strip().lower() in ("1", "true")
         return cls(
+            cleanup_timeout_s=cleanup_timeout_s,
             session=boot.session,
             attachment_access_enabled=boot.attachment_access_enabled is True,
             model=boot.model,
