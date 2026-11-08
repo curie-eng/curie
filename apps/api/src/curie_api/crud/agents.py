@@ -294,26 +294,21 @@ async def update_agent_connector_requester_identity(
     """Compare-and-set the flag on its version, bumping the version.
 
     Every accepted write bumps the version, even one that stores the value
-    already there, so a write names exactly the state it read. The UPDATE runs
-    first and holds the agent row while the invariant is judged; zero rows
-    means another writer moved the version, and nothing changes. The caller
+    already there, so a write names exactly the state it read. The agent row is
+    locked first and held while the invariant is judged; a stored version other
+    than the expected one means another writer moved it, and nothing changes.
+    The UPDATE follows the judgement, so storage's own selector check (ADR
+    0271, migration 0153) never meets a write this writer refuses. The caller
     sends nothing else in the same request, so this is its only write.
     @spec CONNECTOR-REQUESTER-1.
     """
 
-    updated = await session.scalar(
-        update(Agent)
-        .where(
-            Agent.id == agent.id,
-            Agent.connector_requester_identity_version == expected_version,
-        )
-        .values(
-            connector_requester_identity=enabled,
-            connector_requester_identity_version=expected_version + 1,
-        )
-        .returning(Agent.connector_requester_identity_version)
+    stored = await session.scalar(
+        select(Agent.connector_requester_identity_version)
+        .where(Agent.id == agent.id)
+        .with_for_update()
     )
-    if updated is None:
+    if stored != expected_version:
         await session.rollback()
         raise RequesterIdentityConflict(
             "connector requester identity version changed; retry the read"
@@ -323,6 +318,14 @@ async def update_agent_connector_requester_identity(
     except RequesterIdentityRefused:
         await session.rollback()
         raise
+    await session.execute(
+        update(Agent)
+        .where(Agent.id == agent.id)
+        .values(
+            connector_requester_identity=enabled,
+            connector_requester_identity_version=expected_version + 1,
+        )
+    )
     await session.commit()
     await session.refresh(agent)
     return agent

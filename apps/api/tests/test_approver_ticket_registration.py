@@ -575,7 +575,7 @@ def test_invalid_stored_selector_state_refuses_creation_and_disable(
     """@spec REQUEST-APPROVAL-1/2: hand-written invalid state fails closed (plan D7 rule 5).
 
     A registration with the flag off cannot be stored at all since migration
-    0154: storage refuses it for every writer and the row keeps its state.
+    0153: storage refuses it for every writer and the row keeps its state.
     """
     case = ticket_case
     agent = case.scope["agent"]

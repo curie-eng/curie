@@ -126,6 +126,15 @@ class ActionStatus(enum.StrEnum):
     failed = "failed"
 
 
+# ADR 0271 decision 1: a route map carrying an ``approver_ticket`` key (even a
+# malformed one, as ``approver_tickets.has_selector`` reads it) keeps the
+# requester flag on, for every writer. Migration 0153 carries a frozen copy.
+AGENT_SELECTOR_REQUIRES_REQUESTER_IDENTITY_CHECK = (
+    "connector_requester_identity OR NOT COALESCE(jsonb_path_exists(approval_routes, "
+    "'strict $.* ? (@.type() == \"object\" && exists(@.approver_ticket))', '{}', true), false)"
+)
+
+
 class Agent(Base):
     __tablename__ = "agents"
     __table_args__ = (
@@ -158,6 +167,10 @@ class Agent(Base):
         CheckConstraint(
             "connector_requester_identity_version >= 1",
             name="agents_connector_requester_identity_version_ck",
+        ),
+        CheckConstraint(
+            AGENT_SELECTOR_REQUIRES_REQUESTER_IDENTITY_CHECK,
+            name="agents_approver_ticket_requires_requester_identity_ck",
         ),
         # Carries tenant_id, so the owning team must be a team of the same tenant.
         ForeignKeyConstraint(
