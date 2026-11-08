@@ -2830,16 +2830,12 @@ def test_dead_lettered_wake_gets_one_terminal_reply_and_owed_completion(
             event = _qevent("hello", thread="dead-wake", event_id="dead-wake-turn")
             first = _capacity_consumer(h)
             await first.ensure_group()
-            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
-            first_task = asyncio.create_task(first.run())
-            try:
-                await _wait_capacity_state(first, event.event_id, "waiting")
-                await _wait_until(
-                    lambda: any("queued" in text.lower() for _, _, text in h.sink.updates)
-                )
-            finally:
-                first.request_stop()
-                await first_task
+            entry_id, fields = await _pending_local_entry(h, event)
+            await first._dispatch(entry_id, fields)
+            await asyncio.gather(*list(first._inflight))
+            parked = await first._waits.get(event.event_id)
+            assert parked is not None and parked.state == "waiting"
+            assert any("queued" in text.lower() for _, _, text in h.sink.updates)
 
             replacement = _capacity_consumer(h)
             await replacement.ensure_group()
