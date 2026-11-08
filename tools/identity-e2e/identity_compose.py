@@ -53,7 +53,7 @@ import sys
 import tarfile
 import time
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -657,6 +657,34 @@ def context_member(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
     return info
 
 
+def context_filter(
+    context: Path, state: Path
+) -> Callable[[tarfile.TarInfo], tarfile.TarInfo | None]:
+    """The archive filter for a directory build context that may hold the state directory.
+
+    The state directory holds the generated keys, the stack's credentials and
+    the archive being written, so nothing under it enters the context. A
+    context inside the state directory, or equal to it, is refused.
+    """
+
+    root = context.resolve()
+    private = state.resolve()
+    if root == private or private in root.parents:
+        raise HarnessError(f"--build-context {context} is inside the state directory {state}")
+    try:
+        skipped: str | None = private.relative_to(root).as_posix()
+    except ValueError:
+        skipped = None
+
+    def member(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        name = info.name[2:] if info.name.startswith("./") else info.name
+        if skipped is not None and (name == skipped or name.startswith(skipped + "/")):
+            return None
+        return context_member(info)
+
+    return member
+
+
 def parse_created(raw: str) -> float | None:
     """Unix seconds of a Docker RFC 3339 timestamp (nanoseconds allowed), or None."""
 
@@ -1093,7 +1121,11 @@ class ComposeHarness:
             log(f"archiving the build context {context}")
             # GNU format: docker build reads a PAX stream on stdin as a Dockerfile.
             with tarfile.open(temporary, "w", format=tarfile.GNU_FORMAT) as archive:
-                archive.add(context, arcname=".", filter=context_member)
+                archive.add(
+                    context,
+                    arcname=".",
+                    filter=context_filter(context, self.state.directory),
+                )
             tarball = temporary
         elif context.is_file():
             tarball = context

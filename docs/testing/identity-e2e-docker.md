@@ -48,8 +48,9 @@ T="--project ie2e --state-dir $PWD/.identity-e2e-docker"
 1. `$H build $T --image-repo-prefix example-cand --image-tag cand1 --build-context src.tar`
    builds `example-cand/curie-api:cand1`, `curie-worker` and `curie-runner`
    from a `git archive` tarball, or from a source directory, which is tarred
-   without `.git`, `cli/target`, environments, `.env` files and `*.key`
-   files. It refuses a `ghcr.io/curie-eng/` prefix so a candidate never shadows
+   without `.git`, `cli/target`, environments, `.env` files, `*.key` files
+   and the state directory (a context inside the state directory is
+   refused), so the generated keys and credentials never enter an image. It refuses a `ghcr.io/curie-eng/` prefix so a candidate never shadows
    a published tag. `up --build-context` does the same before bringing the
    stack up.
 2. `$H up $T --image-repo-prefix example-cand --image-tag cand1 --agent agent-a --agent agent-b`
