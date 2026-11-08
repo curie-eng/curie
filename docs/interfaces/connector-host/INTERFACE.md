@@ -590,7 +590,8 @@ The pure signer and verifier are available, and the API now enforces
 registration, the route lock and creation verification (see "What the API
 enforces today" below), and the connector proxy sets the verified-grant header
 (see "Verified spent-grant header" below). Answer and resume authority and
-separation enforcement are later slices and are not enforced yet.
+separation of duties are enforced (see
+[Per-request approver selection](../../approvals.md#per-request-approver-selection-adr-0271)).
 
 The connector helper is
 `packages/curie-internal/src/curie_internal/approver_ticket.py`.
@@ -664,13 +665,13 @@ A dynamic approval records the selected approver set, the signed requester, the
 key id, the nonce, and the arguments digest, all covered by the approval's
 integrity seal. Ordinary approvals and their existing seals are unchanged.
 
-What does not exist yet. Answer and resume authority (checking the person who
-answers or resumes against the selected set, the ceiling and fresh identity
-facts) and separation of duties enforcement land in a later slice. Until then a
-dynamic approval cannot be approved or rejected through any answer path; it can
-only expire or be recovered administratively. The proxy verified-grant header
-and the connector's refusal of a direct execution call without it also land in a
-later slice, as does rendering the stored arguments to the approver.
+What does not exist yet. The answer path now checks the answering human against the
+stored selected approvers, the registered ceiling and fresh identity facts, and enforces
+separation of duties, at answer and again at resume; the detail is in
+[Per-request approver selection](../../approvals.md#per-request-approver-selection-adr-0271).
+The proxy verified-grant header and the connector's refusal of a direct execution call
+without it still land in a later slice, as does rendering the stored arguments to the
+approver.
 
 Creation refusals. All are JSON error responses with the code in `detail`.
 

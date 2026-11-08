@@ -326,10 +326,43 @@ The platform checks the ticket when the approval is created. This section covers
 registering and reading back that selector. The wire format of the ticket is in the
 [connector host interface](interfaces/connector-host/INTERFACE.md#per-request-approval-tickets-adr-0271).
 
-Not everything is enforced yet. The platform verifies and stores a dynamic approval at
-creation, but the check that the person who answers is in the selected set, and
-separation of duties, arrive in a later slice. Until then a dynamic approval cannot be
-approved or rejected through any answer path; it expires on the usual 24 hour timeout.
+Answer and resume authority and separation of duties are enforced. A dynamic approval is
+answered only through the HTTP identity answer path: a verified HTTP identity, or a
+registered receiver's signed answer proof such as the email reply. Slack, CLI operator
+principals and other legacy paths are refused. At answer, and again at resume, the answering
+human must be one of the stored selected approvers, still inside the route's registered
+ceiling (the pinned approver role plus `ceiling.users`), with the registration still present
+for the same connector, tool and key id, and with a canonical active identity. Selection never
+changes after creation: widening the ceiling or changing the connector's source never admits
+someone who was not selected, and revoking a selected person, removing the registration or
+rotating the key refuses.
+
+Requester exclusion is on by default, and omitting `separation` on a selector route excludes.
+The requester is matched as the canonical human (issuer and subject), not a channel alias. A
+member of the route's `exempt_group` who is the requester may answer; removal from the group
+refuses, and a group that cannot be read refuses as 503 `authority_unavailable`. An explicit
+operator opt-out (`separation` with `exclude_requester` false, written through the versioned,
+audited route write) lets an eligible requester approve and records an
+`approval_separation.changed` audit row. An agent-owned write cannot opt out: the access
+policy (`PUT /agents/{id}/access-policy`) refuses a body carrying `separation` or
+`approval_routes`, and the stored separation is unchanged. Operator principals are refused on dynamic routes and on static routes
+whose binding enforces separation, before any approver-set shortcut, even when the route
+binds an explicit `approvers.users` list.
+
+Refusals answer 403 `caller_not_allowed` or 503 `authority_unavailable`. Each writes an audit
+row (action `denied` at answer, `resume_refused` at resume) whose evidence names a stable code
+from `apps/api/src/curie_api/approval_selection.py`:
+
+1. Route and registration: `selection_route_missing`, `selection_registration_invalid`,
+   `selection_registration_changed`, `selection_key_revoked`, `separation_policy_invalid`.
+2. Actor and selection: `selection_snapshot_invalid`, `selection_actor_not_canonical`,
+   `selection_actor_not_selected`, `selection_actor_outside_ceiling`, `selection_actor_changed`
+   (the person at resume is not the one sealed with the answer).
+3. Separation: `separation_requester_unknown`, `separation_actor_unknown`,
+   `separation_requester_excluded`, `separation_exemption_unavailable` (the 503 case).
+
+Decisions 7 and 8 of the ADR, the proxy verified-grant header and rendering the stored
+arguments to the approver, remain later work.
 
 A dynamic approval's card, the pending notice and the API's `display_summary` describe the
 tool and arguments the platform stored at creation, with the `approval_ticket` left out of
@@ -526,7 +559,10 @@ itself refuses what it could otherwise do:
    record another tool on the registered route, or record a ticket on a route that registers
    none.
 2. Turn the requester identity flag off while a selector is registered.
-3. Approve a dynamic approval. Until answer authority lands, no version can approve one.
+3. Approve a dynamic approval. From migration 0156, storage accepts that only from a
+   transaction the enforcing answer owner marked, in its final commit, after the selected
+   approvers, the ceiling and separation passed. An older API never marks it, so it cannot
+   approve one; rejection and expiry are unaffected.
 
 An older version sees these as failed writes, so the action fails closed. Removing a
 registration through an older API is not refused. It writes no selector audit, and the
