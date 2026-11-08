@@ -199,11 +199,12 @@ def _replica(directory: str, records: Any, entry: str, ready: Any, calls: Any) -
 
 
 def test_two_os_processes_racing_one_pending_claim_only_forward_once(
-    pworker_service: Any, campaign: Any, tmp_path: Path
+    pworker_service: Any, campaign: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import multiprocessing
     import queue
 
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3]))
     directory = campaign.write_directory(tmp_path / "runtime")
     context = multiprocessing.get_context("spawn")
     ready, calls = context.Barrier(2), context.Queue()
@@ -297,12 +298,13 @@ def _effect_replica(directory: str, records: Any, entry: str, effects: str, even
 
 
 def test_a_hard_killed_executor_is_not_replayed_by_a_fresh_os_process(
-    pworker_service: Any, campaign: Any, tmp_path: Path
+    pworker_service: Any, campaign: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """@spec PROTECTED-COMMISSIONING-4: consume-before-forward survives process death."""
     import multiprocessing
     import queue
 
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3]))
     directory = campaign.write_directory(tmp_path / "runtime")
     effects = tmp_path / "effects.txt"
     context = multiprocessing.get_context("spawn")

@@ -120,7 +120,7 @@ def primary_postgres(tmp_path_factory):
             cid = cidfile.read_text().strip()
             info = json.loads(docker("inspect", cid).stdout)[0]
             assert info["Id"] == cid and info["Config"]["Labels"]["curie.test.owner"] == owner
-            docker("rm", "-f", cid)
+            docker("rm", "-f", "-v", cid)
             assert cid not in docker("ps", "-aq", "--no-trunc").stdout.splitlines()
             cidfile.unlink()
 
