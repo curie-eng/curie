@@ -108,6 +108,61 @@ LEGACY_KEYS = {
 }
 
 
+V1_RECEIPT_KEYS = ["schema_version", "request_id", "id", "status", "duplicate", "requested_by"]
+STORED_RECEIPT_KEYS = ("granted_tool", "granted_arguments", "selected_approvers")
+
+
+def stored_text(arguments: Any) -> str:
+    """Independent oracle: the canonical JSON text of the stored arguments."""
+    return json.dumps(
+        arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+    )
+
+
+def receipt(response: Any, request: dict[str, Any], *, duplicate: bool = False) -> dict[str, Any]:
+    """ADR 0271 decisions 4 and 8: a dynamic creation answers V2 with the row's stored values.
+
+    The stored row is read independently, so the receipt must carry what was
+    persisted (the ticket included) and the selected people projected to their
+    canonical tenant, issuer and subject, never request echoes.
+    """
+    assert response.status_code == (200 if duplicate else 201), response.text
+    assert response.headers["cache-control"] == "no-store"
+    body = response.json()
+    assert set(body) == {*V1_RECEIPT_KEYS, *STORED_RECEIPT_KEYS}, body
+    assert body["schema_version"] == 2
+    assert body["request_id"] == request["request_id"]
+    assert body["duplicate"] is duplicate
+    assert body["status"] in {"pending", "approved", "rejected", "expired"}
+    assert body["requested_by"] is None or isinstance(body["requested_by"], str)
+    stored = rows(request["approval"]["dedupe_key"])
+    assert len(stored) == 1, stored
+    row = stored[0]
+    assert row["selection_mode"] == "dynamic"
+    assert body["id"] == str(row["id"])
+    assert body["granted_tool"] == row["granted_tool"]
+    assert body["granted_arguments"] == stored_text(row["granted_arguments"])
+    assert "approval_ticket" in json.loads(body["granted_arguments"])
+    assert body["selected_approvers"] == [
+        {key: person[key] for key in ("tenant_id", "issuer", "subject")}
+        for person in row["selected_approvers"]
+    ]
+    assert type(wire.creation_receipt(body)) is wire.ApprovalCreationResponseV2
+    return dict(body)
+
+
+def exact_v1(response: Any, request: dict[str, Any], *, duplicate: bool = False) -> dict[str, Any]:
+    """An ordinary creation keeps today's V1 receipt byte for byte."""
+    body = accepted(response, request, duplicate=duplicate)
+    assert list(body) == V1_RECEIPT_KEYS
+    assert response.content == (
+        wire.ApprovalCreationResponseV1.model_validate(body).model_dump_json().encode("utf-8")
+    )
+    assert not set(STORED_RECEIPT_KEYS) & set(body)
+    assert type(wire.creation_receipt(body)) is wire.ApprovalCreationResponseV1
+    return body
+
+
 def refused_creation(
     case: SimpleNamespace, request: dict[str, Any], status: int, code: str,
 ) -> None:
@@ -142,7 +197,7 @@ def test_valid_ticket_creates_one_sealed_dynamic_approval(ticket_case: SimpleNam
     payload = ticket_payload(case, ARGS)
     arguments = carried(case, ARGS, payload=payload)
     request = dynamic_request(case, arguments)
-    created = accepted(create(case.client, request), request)
+    created = receipt(create(case.client, request), request)
     assert created["status"] == "pending"
 
     stored = rows(request["approval"]["dedupe_key"])
@@ -226,7 +281,7 @@ def test_wire_key_scope_and_requester_refusals_consume_nothing(
         exactly(response, 422, f"approval_ticket_{code}")
     assert approval_rows(case.scope["agent"]) == []
     request = dynamic_request(case, carried(case, ARGS))
-    accepted(create(case.client, request), request)
+    receipt(create(case.client, request), request)
     assert len(approval_rows(case.scope["agent"])) == 1
 
 
@@ -265,7 +320,7 @@ def test_oversize_grant_and_duplicate_recipient_accounts_refuse(
     payload = ticket_payload(case, ARGS)
     payload["approvers"] = distinct
     request = dynamic_request(case, carried(case, ARGS, payload=payload))
-    accepted(create(case.client, request), request)
+    receipt(create(case.client, request), request)
     assert rows(request["approval"]["dedupe_key"])[0]["selected_approvers"] == distinct
 
 
@@ -307,7 +362,7 @@ def test_selected_people_must_be_active_humans_inside_the_pinned_role(
     request = dynamic_request(case, carried(case, ARGS, approvers=(OUTSIDER,)))
     refused_creation(case, request, 422, "approval_ticket_outside_ceiling")
     request = dynamic_request(case, carried(case, ARGS))
-    accepted(create(case.client, request), request)
+    receipt(create(case.client, request), request)
 
 
 def test_ceiling_users_narrow_the_selected_set(ticket_case: SimpleNamespace) -> None:
@@ -318,7 +373,7 @@ def test_ceiling_users_narrow_the_selected_set(ticket_case: SimpleNamespace) -> 
         request = dynamic_request(case, carried(case, ARGS, approvers=approvers))
         refused_creation(case, request, 422, "approval_ticket_outside_ceiling")
     request = dynamic_request(case, carried(case, ARGS, approvers=(APPROVER_A,)))
-    accepted(create(case.client, request), request)
+    receipt(create(case.client, request), request)
 
 
 def test_group_membership_never_proves_the_ceiling_at_creation(
@@ -351,7 +406,7 @@ def test_group_membership_never_proves_the_ceiling_at_creation(
     refused_creation(case, attempt(), 422, "approval_ticket_outside_ceiling")
     enroll(case)
     request = attempt()
-    accepted(create(case.client, request), request)
+    receipt(create(case.client, request), request)
 
 
 def test_surface_account_only_role_never_matches_at_creation(
@@ -367,7 +422,81 @@ def test_surface_account_only_role_never_matches_at_creation(
     set_approver_role(case.scope, CEILING_FILTER)
     enroll(case)
     request = dynamic_request(case, carried(case, ARGS, approvers=(APPROVER_A,)))
-    accepted(create(case.client, request), request)
+    receipt(create(case.client, request), request)
+
+
+# --- the versioned creation receipt (ADR 0271 decisions 4 and 8) -------------------
+
+
+def test_dynamic_receipt_carries_the_stored_grant_and_projected_selection(
+    ticket_case: SimpleNamespace,
+) -> None:
+    """@spec REQUEST-APPROVAL-4/8: V2 returns persisted values; an ordinary neighbour stays V1.
+
+    One selected person carries a recipient account, which the row keeps and
+    the receipt projects away; a multibyte value and nested keys out of order
+    show the arguments text is the stored canonical spelling. The identical
+    retry answers the same stored values, and an ordinary creation on the same
+    agent keeps the exact V1 receipt.
+    """
+    case = ticket_case
+    enroll(case)
+    scope, tenant = case.scope, case.scope["tenant"]
+    arguments = {**ARGS, "label": "é-synthetic", "change": {"scope": "all", "role": "reader"}}
+    payload = ticket_payload(case, arguments)
+    payload["approvers"] = [
+        {**principal_claims(tenant, APPROVER_A),
+         "recipient_accounts": [recipient(scope, "U0EXAMPLEA1")]},
+        principal_claims(tenant, APPROVER_B),
+    ]
+    carrying = carried(case, arguments, payload=payload)
+    request = dynamic_request(case, carrying)
+    response = create(case.client, request)
+    body = receipt(response, request)
+    assert body["granted_tool"] == LIVE
+    assert body["granted_arguments"] == stored_text(carrying)
+    assert json.loads(body["granted_arguments"]) == carrying
+    assert carrying["approval_ticket"] in body["granted_arguments"]
+    assert '"label":"é-synthetic"' in body["granted_arguments"]
+    assert body["selected_approvers"] == [
+        principal_claims(tenant, APPROVER_A), principal_claims(tenant, APPROVER_B),
+    ]
+    row = rows(request["approval"]["dedupe_key"])[0]
+    assert row["selected_approvers"][0]["recipient_accounts"] == [recipient(scope, "U0EXAMPLEA1")]
+    assert "recipient_accounts" not in response.text and "U0EXAMPLEA1" not in response.text
+
+    retry = copy.deepcopy(request)
+    retry["request_id"] = str(uuid.uuid4())
+    again = receipt(create(case.client, retry), retry, duplicate=True)
+    assert again["id"] == body["id"]
+    assert {key: again[key] for key in STORED_RECEIPT_KEYS} == {
+        key: body[key] for key in STORED_RECEIPT_KEYS
+    }
+
+    ordinary = request_for(ingress(case))
+    exact_v1(create(case.client, ordinary), ordinary)
+    assert rows(ordinary["approval"]["dedupe_key"])[0]["selection_mode"] == "ordinary"
+
+
+def test_ordinary_creation_and_its_retry_keep_the_exact_v1_receipt(
+    ticket_case: SimpleNamespace,
+) -> None:
+    """@spec REQUEST-APPROVAL-4 HTTP-APPROVAL-CONTINUITY-3: a registered selector changes nothing.
+
+    The agent has a registered selector, but this approval is ordinary, so its
+    fresh and historical receipts keep the V1 key set, schema version 1 and the
+    V1 model's own encoding byte for byte.
+    """
+    case = ticket_case
+    enroll(case)
+    request = request_for(case)
+    first = exact_v1(create(case.client, request), request)
+    retry = copy.deepcopy(request)
+    retry["request_id"] = str(uuid.uuid4())
+    again = exact_v1(create(case.client, retry), retry, duplicate=True)
+    assert again["id"] == first["id"]
+    stored = rows(request["approval"]["dedupe_key"])
+    assert len(stored) == 1 and stored[0]["selection_mode"] == "ordinary"
 
 
 # --- JSONB, nonce, retries, races and rollback -------------------------------------
@@ -424,7 +553,7 @@ def test_jsonb_unstable_arguments_refuse_without_a_row(ticket_case: SimpleNamesp
         headers={"X-Curie-Worker-Token": get_settings().internal_worker_token,
                  "Content-Type": "application/json"},
     )
-    accepted(response, request)
+    receipt(response, request)
     assert rows(request["approval"]["dedupe_key"])[0]["granted_arguments"] == {
         **stable, "approval_ticket": request["approval"]["granted_arguments"]["approval_ticket"],
     }
@@ -436,12 +565,12 @@ def test_nonce_replay_under_another_dedupe_key_refuses(ticket_case: SimpleNamesp
     enroll(case)
     arguments = carried(case, ARGS)
     first = dynamic_request(case, arguments)
-    accepted(create(case.client, first), first)
+    receipt(create(case.client, first), first)
     second = ingress(case)
     replay = dynamic_request(second, arguments)
     refused_creation(case, replay, 409, "approval_ticket_replayed")
     fresh = dynamic_request(second, carried(case, ARGS))
-    accepted(create(case.client, fresh), fresh)
+    receipt(create(case.client, fresh), fresh)
     assert len(approval_rows(case.scope["agent"])) == 2
 
 
@@ -452,7 +581,7 @@ def test_identical_retry_keeps_its_receipt_after_preparation_expiry(
     case = ticket_case
     enroll(case)
     request = dynamic_request(case, carried(case, ARGS))
-    first = accepted(create(case.client, request), request)
+    first = receipt(create(case.client, request), request)
     later = now() + 3600
     with pytest.raises(TicketError, match="preparation_expired"):
         verify_ticket(
@@ -463,8 +592,12 @@ def test_identical_retry_keeps_its_receipt_after_preparation_expiry(
     retry["request_id"] = str(uuid.uuid4())
     with monkeypatch.context() as patched:
         patched.setattr(time, "time", lambda: float(later))
-        historical = accepted(create(case.client, retry), retry, duplicate=True)
+        historical = receipt(create(case.client, retry), retry, duplicate=True)
     assert historical["id"] == first["id"]
+    # The historical receipt after preparation expiry carries the same stored values.
+    assert {key: historical[key] for key in STORED_RECEIPT_KEYS} == {
+        key: first[key] for key in STORED_RECEIPT_KEYS
+    }
     summary = copy.deepcopy(retry)
     summary["approval"]["summary"] += " changed"
     other_ticket = copy.deepcopy(retry)
@@ -502,15 +635,15 @@ def test_identical_creation_race_yields_one_row_and_one_nonce(
         responses = list(pool.map(post, copies))
     statuses = [response.status_code for response in responses]
     assert statuses.count(201) == 1, [(r.status_code, r.text) for r in responses]
-    winner = accepted(responses[statuses.index(201)], copies[statuses.index(201)])
+    winner = receipt(responses[statuses.index(201)], copies[statuses.index(201)])
     for item, response in zip(copies, responses, strict=True):
         if response.status_code == 200:
-            assert accepted(response, item, duplicate=True)["id"] == winner["id"]
+            assert receipt(response, item, duplicate=True)["id"] == winner["id"]
         else:
             assert response.status_code in {201, 503}, response.text
     replay = copy.deepcopy(request)
     replay["request_id"] = str(uuid.uuid4())
-    assert accepted(create(case.client, replay), replay, duplicate=True)["id"] == winner["id"]
+    assert receipt(create(case.client, replay), replay, duplicate=True)["id"] == winner["id"]
     stored = approval_rows(case.scope["agent"])
     assert len(stored) == 1
     assert [row["selection_nonce"] for row in stored] == [payload["nonce"]]
@@ -531,7 +664,7 @@ def test_failed_seal_rolls_back_the_row_and_the_nonce(
         patched.setattr(wire, "seal_approval_context", broken)
         refused_creation(case, request, 503, "authority_unavailable")
     assert approval_rows(case.scope["agent"]) == []
-    accepted(create(case.client, request), request)
+    receipt(create(case.client, request), request)
 
 
 # --- serving bundle and snapshot rechecks (plan D9, D9a) ---------------------------
@@ -555,7 +688,7 @@ def test_creation_refuses_when_registration_and_serving_bundle_disagree(
     refused_creation(case, request, 409, "approver_ticket.bundle_gate_mismatch")
     store_routes(agent, consistent)
     request = dynamic_request(case, carried(case, ARGS))
-    accepted(create(case.client, request), request)
+    receipt(create(case.client, request), request)
 
 
 def test_deployment_landing_between_phases_refuses_and_spends_nothing(
@@ -598,7 +731,7 @@ def test_deployment_landing_between_phases_refuses_and_spends_nothing(
         patched.setattr(HttpIdentityClient, "lookup", lookup)
         refused_creation(case, request, 503, "authority_unavailable")
     assert flips and flips[0] == "active"
-    accepted(create(case.client, request), request)
+    receipt(create(case.client, request), request)
 
 
 # --- legacy boundary and existing ordinary approvals -------------------------------
@@ -690,7 +823,7 @@ def test_dynamic_approval_cannot_be_answered_before_answer_authority_lands(
 
     second = ingress(case)
     request = dynamic_request(second, carried(case, ARGS))
-    accepted(create(case.client, request), request)
+    receipt(create(case.client, request), request)
     row = rows(request["approval"]["dedupe_key"])[0]
     target = SimpleNamespace(client=case.client, scope=case.scope, row=row)
     for decision in ("approved", "rejected"):

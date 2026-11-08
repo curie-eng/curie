@@ -214,3 +214,62 @@ def test_api_display_summary_omits_the_ticket_while_the_grant_keeps_it() -> None
     assert "granted_arguments" not in out
     assert _TICKET not in json.dumps({k: v for k, v in out.items() if k != "summary"})
     assert row.granted_arguments == {"note": "synthetic", "approval_ticket": _TICKET}
+
+
+# --- ADR 0271 decision 8: a dynamic row describes its stored values ---------------
+
+_DYNAMIC_TOOL = "mcp__access__execute"
+_TEAM_SUMMARY = "Approve the synthetic access change for the whole team"
+
+
+def _selected(summary: str, arguments: dict, *, mode: str) -> Approval:
+    row = approval(summary, _DYNAMIC_TOOL, arguments)
+    row.gate_kind = "policy"
+    row.selection_mode = mode
+    return row
+
+
+def test_dynamic_display_summary_describes_stored_values_and_ordinary_keeps_summary() -> None:
+    """@spec REQUEST-APPROVAL-8: the stored grant, not the summary text, is what is shown."""
+    from curie_api.approval_wording import describe_approval
+
+    stored = {"account": "acct-example-1", "approval_ticket": _TICKET, "note": "stored"}
+    expected = "Approve execute. Account: acct-example-1; Note: stored"
+    assert describe_approval(_DYNAMIC_TOOL, stored) == expected
+    row = _selected(_TEAM_SUMMARY, stored, mode="dynamic")
+    assert row.display_summary == expected
+    out = ApprovalOut.model_validate(row).model_dump(mode="json")
+    assert out["display_summary"] == expected
+    assert out["summary"] == _TEAM_SUMMARY
+    assert _TICKET not in json.dumps(out)
+    assert row.granted_arguments == stored
+    # Neighbour: the same stored values on an ordinary row keep today's display.
+    ordinary = _selected(_TEAM_SUMMARY, stored, mode="ordinary")
+    assert ordinary.display_summary == _TEAM_SUMMARY
+    assert ApprovalOut.model_validate(ordinary).model_dump()["display_summary"] == _TEAM_SUMMARY
+
+
+def test_dynamic_display_ignores_a_summary_naming_other_arguments() -> None:
+    """@spec REQUEST-APPROVAL-8: neither model prose nor a machine summary replaces storage."""
+    stored = {"approval_ticket": _TICKET, "note": "stored"}
+    machine = (
+        "Tool call awaiting approval: " + _DYNAMIC_TOOL + " " + json.dumps({"note": "model"})
+    )
+    for summary in (machine, "Approve note model via mcp__access__execute", "Approve it"):
+        row = _selected(summary, stored, mode="dynamic")
+        assert row.display_summary == "Approve execute. Note: stored", summary
+    # Neighbour: an ordinary row with prose keeps that prose, normalized as today.
+    ordinary = _selected("Approve note model via mcp__access__execute", stored, mode="ordinary")
+    assert ordinary.display_summary == "Approve note model via execute"
+
+
+def test_dynamic_display_keeps_the_bounded_preview_notice() -> None:
+    """@spec REQUEST-APPROVAL-8: no claim to display arbitrarily large arguments in full."""
+    notice = "Details exceed this preview; review the original request before approving."
+    stored = {"approval_ticket": _TICKET, "note": "n" * 3000}
+    display = _selected(_TEAM_SUMMARY, stored, mode="dynamic").display_summary
+    assert display.startswith("Approve execute. Note: nnn")
+    assert display.endswith("… " + notice)
+    assert len(display) == 2400 + len("… " + notice)
+    assert _TICKET not in display
+    assert _selected(_TEAM_SUMMARY, stored, mode="ordinary").display_summary == _TEAM_SUMMARY
