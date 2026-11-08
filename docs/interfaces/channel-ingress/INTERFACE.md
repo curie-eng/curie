@@ -131,7 +131,7 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   events (`turn.status`, `reply.update`, `reply.post`, `turn.completed`) over a
   worker-local `TargetRoute`. Beside the verb, the kernel asks two optional capability
   questions that are not on the Protocol: `undeliverable_reason(kind, route)`, which drops a
-  turn addressed to a Slack identity this worker holds no token for before any model call,
+  turn addressed to an undeclared Slack identity before any model call,
   and `edits_in_place(kind, route)`, which decides whether a sibling-limit notice can edit
   the placeholder. `ReplySinkRouter`
   (`apps/worker/src/curie_worker/reply_sink.py::ReplySinkRouter`) finds them with `getattr`
