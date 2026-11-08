@@ -879,6 +879,14 @@ async def _route_and_start(
             # fallback as a 409; never send a null-authority steer to a live turn.
             steered = False
         else:
+            lease = constants._DELIVERY_LEASE.get()
+            if (
+                _is_fenced(lease)
+                and lease is not None
+                and lease.generation > 1
+                and await self._markers.saw_side_effect(queued_event_id)
+            ):
+                raise failures.PriorSideEffectObserved()
             steered = await self._runner.steer(
                 handle.base_url, steer_event, token=handle.token or None, remaining_s=remaining_s
             )

@@ -2298,3 +2298,61 @@ def test_a_channel_port_turn_hands_the_lane_the_binding_it_arrived_on(make_harne
             ]
 
     asyncio.run(go())
+
+
+@pytest.mark.parametrize("side_effect", [False, True])
+def test_attachment_handoff_preserves_predecessor_action_marker(make_harness, side_effect) -> None:
+    from curie_dispatcher.queue import to_stream_fields
+    from curie_worker.consumer import Consumer
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+    from curie_worker.kernel.routing import _thread_key_for
+
+    async def go() -> None:
+        async with make_harness() as h:
+            first = _qevent("action A", event_id="crashed-before-file")
+            thread = _thread_key_for(first)
+            handle = h.substrate.claim(
+                thread,
+                env={
+                    "CURIE_RUNNER_TOKEN": "recovery-test-token",
+                    "CURIE_SESSION_ID": f"session:{thread}",
+                    "CURIE_HISTORY_REF": f"history:{thread}",
+                },
+            )
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            await consumer.ensure_group()
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(first))
+            rows = await h.async_redis.xreadgroup(
+                h.config.consumer_group, h.config.consumer_name, {h.config.stream: ">"}, count=1
+            )
+            entry, fields = rows[0][1][0]
+            old = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
+            )
+            await h.kernel._markers.watch_turn(thread, handle.claim_name, old, first.event_id)
+            h.runner.side_effect_emitted = side_effect
+            h.kernel._attachments = _FakeAttachmentLane()
+            file_event = _qevent(
+                "file B", event_id="file-followup", attachments=[Attachment(id="F1", name="a.txt")]
+            )
+            await h.kernel.process_event(file_event)
+            replacement = h.substrate.lookup(thread)
+            assert replacement is not None and replacement.claim_name != handle.claim_name
+            assert await h.kernel._markers.saw_side_effect(first.event_id) is side_effect
+            h.runner.side_effect_emitted = False
+            await store.release(
+                old.stream, old.group, old.entry_id, owner=old.owner, resume_event_id=None
+            )
+            h.kernel._attachments = None
+            await consumer._dispatch(entry, fields)
+            await asyncio.gather(*list(consumer._inflight))
+            assert h.runner.opened == (["file B"] if side_effect else ["file B", "action A"])
+            assert [c.outcome for c in h.sink.completions if c.event_id == first.event_id] == [
+                "escalated" if side_effect else "delivered"
+            ]
+            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                "pending"
+            ] == 0
+
+    asyncio.run(go())

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from typing import TYPE_CHECKING, Any
 
@@ -78,6 +79,17 @@ async def _route_attachment_and_start(
             min(constants._ATTACHMENT_HANDOFF_PROBE_TIMEOUT_S, probe_remaining_s - elapsed),
         )
 
+    async def handoff_readiness(handle: SandboxHandle, budget: float) -> str:
+        watched = await self._markers.watched_turn(handle.claim_name)
+        predecessor_event_id = None
+        if watched is not None:
+            event_id = json.loads(watched)["event_id"]
+            if not await self._markers.is_terminal(event_id):
+                predecessor_event_id = event_id
+        return await self._cold_handoff_readiness(
+            handle, remaining_s=budget, predecessor_event_id=predecessor_event_id
+        )
+
     async def settle_shielded(task: asyncio.Task[Any]) -> None:
         while not task.done():
             try:
@@ -145,10 +157,7 @@ async def _route_attachment_and_start(
             probe_budget = current_probe_budget()
             if probe_budget <= 0:
                 raise TimeoutError("attachment handoff probe budget is exhausted")
-            readiness = await self._cold_handoff_readiness(
-                expected_handle,
-                remaining_s=probe_budget,
-            )
+            readiness = await handoff_readiness(expected_handle, probe_budget)
             if readiness != "ready":
                 logger.info(
                     "retained attachment handoff refused for agent=%s "
@@ -208,10 +217,7 @@ async def _route_attachment_and_start(
                     probe_budget = current_probe_budget()
                     if probe_budget <= 0:
                         raise TimeoutError("attachment handoff probe budget is exhausted")
-                    readiness = await self._cold_handoff_readiness(
-                        current_handle,
-                        remaining_s=probe_budget,
-                    )
+                    readiness = await handoff_readiness(current_handle, probe_budget)
                     if readiness != "ready":
                         logger.info(
                             "retained attachment handoff refused for agent=%s "

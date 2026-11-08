@@ -530,6 +530,32 @@ class Markers:
             expected,
         )
 
+    async def note_terminal_status_failure(
+        self, claim_name: str, expected: str, *, limit: int
+    ) -> None:
+        await self._redis.eval(
+            """
+            local value = redis.call('HGET', KEYS[1], ARGV[1])
+            if value ~= ARGV[2] then return 0 end
+            local record = cjson.decode(value)
+            local failures = (record.status_read_failures or 0) + 1
+            if failures >= tonumber(ARGV[3]) then
+              redis.call('HDEL', KEYS[1], ARGV[1])
+              redis.call('HDEL', KEYS[2], ARGV[1])
+            else
+              record.status_read_failures = failures
+              redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(record))
+            end
+            return failures
+            """,
+            2,
+            self._turn_recovery_key(),
+            self._turn_recovery_key() + ":absent",
+            claim_name,
+            expected,
+            limit,
+        )
+
     def _completion_storage_key(self, event_id: str, *, answer: CompletionNamespace = False) -> str:
         key = self._config.completion_key(event_id)
         if answer == "verbatim":

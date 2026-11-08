@@ -497,11 +497,13 @@ def _path_needs_images(path: str) -> bool:
         "packages/shell-supervisor/",
         "runner/src/curie_runner/",
         "apps/worker/src/curie_worker/kernel/",
+        "apps/worker/src/curie_worker/sandbox/",
     )) or path in {
         "apps/worker/src/curie_worker/markers.py",
         "apps/worker/src/curie_worker/delivery_lease.py",
         "apps/worker/src/curie_worker/stream_consumer.py",
         "apps/worker/src/curie_worker/runner_client.py",
+        "apps/worker/src/curie_worker/threadlock.py",
     }:
         return True
     return "Dockerfile" in name or name.endswith(".dockerfile")
@@ -6404,6 +6406,9 @@ def test_platform_runner_upgrade_stages_candidate_artifacts_before_own_lifecycle
         "apps/worker/src/curie_worker/kernel/completion.py",
         "apps/worker/src/curie_worker/kernel/work_items.py",
         "apps/worker/src/curie_worker/kernel/recovery/check.py",
+        "apps/worker/src/curie_worker/sandbox/static.py",
+        "apps/worker/src/curie_worker/sandbox/substrate.py",
+        "apps/worker/src/curie_worker/threadlock.py",
         "apps/worker/src/curie_worker/markers.py",
         "apps/worker/src/curie_worker/delivery_lease.py",
         "apps/worker/src/curie_worker/stream_consumer.py",

@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 from . import clock, constants, failures, memory, routing
 from .log import logger
 
+_TERMINAL_WATCH_STATUS_READ_LIMIT = 3
+
 
 async def _settle_sleep(delay: float) -> None:
     await asyncio.sleep(delay)
@@ -438,11 +440,15 @@ async def reap_orphans(self: Kernel) -> list[str]:
                     if status.get("side_effect_emitted") is True:
                         await self._markers.mark_side_effect(record["event_id"])
                     if (
-                        terminal
-                        and status.get("turn_active") is not True
+                        status.get("turn_active") is not True
                         and status.get("turn_active") is not False
                     ):
-                        continue
+                        if terminal:
+                            await self._markers.note_terminal_status_failure(
+                                claim_name, expected, limit=_TERMINAL_WATCH_STATUS_READ_LIMIT
+                            )
+                            continue
+                        await self._markers.mark_side_effect(record["event_id"])
                     retire = status.get("turn_active") is True if terminal else not (
                         status.get("turn_active") is False
                         and status.get("history_durable") is True
