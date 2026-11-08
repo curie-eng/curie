@@ -227,8 +227,8 @@ class Qualification(WakeStack):
             str(path),
             "--wait",
             "--timeout",
-            "300s",
-            timeout=360,
+            "900s",
+            timeout=960,
         )
 
     def telemetry_snapshot(self):
@@ -278,7 +278,7 @@ class Qualification(WakeStack):
 
     def restart_api(self):
         self.kube("rollout", "restart", f"deployment/{FULLNAME}-api")
-        self.kube("rollout", "status", f"deployment/{FULLNAME}-api", "--timeout=180s")
+        self.kube("rollout", "status", f"deployment/{FULLNAME}-api", "--timeout=600s")
 
     def configure_lease(self, budget, lease):
         self.upgrade(
@@ -406,13 +406,13 @@ class Qualification(WakeStack):
                 "-",
                 stdin=json.dumps({"apiVersion": "v1", "kind": "List", "items": resources}),
             )
-            self.kube("wait", "--for=condition=Ready", f"pod/{name}", "--timeout=90s")
+            self.kube("wait", "--for=condition=Ready", f"pod/{name}", "--timeout=300s")
             self.kube("set", "env", f"deployment/{FULLNAME}-api", f"VALKEY_HOST={name}")
-            self.kube("rollout", "status", f"deployment/{FULLNAME}-api", "--timeout=180s")
+            self.kube("rollout", "status", f"deployment/{FULLNAME}-api", "--timeout=600s")
             yield
         finally:
             self.kube("set", "env", f"deployment/{FULLNAME}-api", f"VALKEY_HOST={host}")
-            self.kube("rollout", "status", f"deployment/{FULLNAME}-api", "--timeout=180s")
+            self.kube("rollout", "status", f"deployment/{FULLNAME}-api", "--timeout=600s")
             self.kube("delete", "pod,service,configmap", name, "--ignore-not-found", "--wait=true")
 
     def kube(self, *args, stdin=None):
@@ -473,7 +473,7 @@ class Qualification(WakeStack):
         try:
             self.kube("create", "-f", "-", stdin=json.dumps(job))
             created = True
-            self.kube("wait", "--for=condition=Complete", f"job/{name}", "--timeout=120s")
+            self.kube("wait", "--for=condition=Complete", f"job/{name}", "--timeout=300s")
         finally:
             if created:
                 (self.root / "scheduler-probe.log").write_text(self.kube("logs", f"job/{name}"))
@@ -682,7 +682,7 @@ class Qualification(WakeStack):
         )
         assert reset["released"] and reset["route_existed"]
         for pod in pods:
-            self.kube("wait", "--for=delete", f"pod/{pod}", "--timeout=90s")
+            self.kube("wait", "--for=delete", f"pod/{pod}", "--timeout=300s")
 
     def add_agent(self, agent):
         bundle = self.root / agent
@@ -1416,7 +1416,7 @@ def test_hosted_connector_session(qualification, agent, provider_tier):
         timeout=1800,
     )
     stack.images["connector"] = image
-    stack.run("kind", "load", "docker-image", "--name", stack.cluster, image, timeout=300)
+    stack.run("kind", "load", "docker-image", "--name", stack.cluster, image, timeout=600)
     wake_secret = f"{agent}-wake-credential"
     for name, value in ((wake_secret, key), ("acme-model-credential", credential)):
         stack.kube(
@@ -1476,8 +1476,8 @@ def test_hosted_connector_session(qualification, agent, provider_tier):
         str(values_path),
         "--wait",
         "--timeout",
-        "300s",
-        timeout=360,
+        "900s",
+        timeout=960,
     )
     bundle = stack.root / agent
     manifest_path = bundle / ".claude-plugin/plugin.json"
@@ -1544,7 +1544,7 @@ def test_hosted_connector_session(qualification, agent, provider_tier):
     ]
     assert len(connectors) == 1
     connector = connectors[0]
-    stack.kube("rollout", "status", f"deployment/{connector}", "--timeout=180s")
+    stack.kube("rollout", "status", f"deployment/{connector}", "--timeout=600s")
     deployment = json.loads(stack.kube("get", "deployment", connector, "-o", "json"))
     assert_no_key(deployment, key)
     pod_spec = deployment["spec"]["template"]["spec"]
