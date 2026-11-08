@@ -175,6 +175,12 @@ _TrustedOrigin = tuple[str, str, int | None]
 # Slack names a thread by its parent message's timestamp: `<seconds>.<micros>`.
 _SLACK_TS = re.compile(r"^\d+\.\d+$")
 
+# A Slack user id (``U...``, or ``W...`` on Enterprise Grid). Posting a card to
+# one opens the user's App Home DM, which is how the worker delivers an approver
+# DM card (ADR 0272 decision 2); it is the only top-level approval card whose
+# address is a user id.
+_SLACK_USER_ID = re.compile(r"^[UW][A-Z0-9]{8,}$")
+
 
 def _thread_ts(conversation_id: str | None) -> str | None:
     """The Slack thread this conversation id names, or None when it names none.
@@ -1018,6 +1024,17 @@ class SlackReplyAdapter:
         # A rejected Block Kit payload falls back to text-only, mirroring
         # ``update``: the card is the resolve UI, but a plain-text notice still
         # beats losing the message (the API resolve path works regardless).
+        # Not for an approver DM card (ADR 0272 decision 2): a top-level approval
+        # card addressed to a user id. Its buttons are the only way the selected
+        # approver answers, and the worker registers the DM a post answers with,
+        # so a buttonless DM would bind the approval to a card nobody can click.
+        # The error propagates instead and the worker records a DM delivery
+        # failure, including for an ambiguous ``internal_error``.
+        dm_card = (
+            isinstance(intent, ConfirmIntent)
+            and thread_ts is None
+            and _SLACK_USER_ID.fullmatch(channel) is not None
+        )
         response = await self._with_transport_fallback(
             endpoint,
             lambda client: _post_with_block_fallback(
@@ -1027,6 +1044,7 @@ class SlackReplyAdapter:
                 blocks=blocks,
                 thread_ts=thread_ts,
                 client_msg_id=client_msg_id,
+                allow_block_fallback=not dm_card,
             ),
             describe="chat_postMessage",
             operation="post",
