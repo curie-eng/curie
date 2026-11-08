@@ -262,8 +262,7 @@ def _attachment_objects(store: RetainingObjectStore) -> set[str]:
 class _Transport:
     """A channel adapter's HTTP answer per URL: ``(status, body)`` or an exception."""
 
-    def __init__(self, attachments: Any, answers: dict[str, Any]) -> None:
-        self._attachments = attachments
+    def __init__(self, answers: dict[str, Any]) -> None:
         self.answers = answers
         self.calls: list[dict[str, Any]] = []
 
@@ -280,7 +279,7 @@ class _Transport:
         if isinstance(answer, BaseException):
             raise answer
         status, body = answer
-        return self._slack_files.FileResponse(status=status, headers={}, chunks=iter([body]))
+        return slack_files.FileResponse(status=status, headers={}, chunks=iter([body]))
 
 
 def _channel_files(
@@ -511,9 +510,7 @@ def test_append_refs_record_the_current_files_route_digest_and_order(
 def test_a_channel_port_files_ref_records_its_kind_and_adapter_never_its_endpoint(
     attachments: Any, ledger: Any
 ) -> None:
-    transport = _Transport(
-        attachments, {f"{ADAPTER_ENDPOINT}/attachments/M1": (200, b"mail-bytes")}
-    )
+    transport = _Transport({f"{ADAPTER_ENDPOINT}/attachments/M1": (200, b"mail-bytes")})
     coordinator, _store, _clock = _coordinator(
         attachments, channel_files=_channel_files(attachments, transport)
     )
@@ -705,7 +702,7 @@ def test_a_lapsed_channel_port_file_is_fetched_from_the_routes_current_endpoint(
     attachments: Any, ledger: Any
 ) -> None:
     moved = "http://moved-adapter.example:9090/curie"
-    transport = _Transport(attachments, {f"{moved}/attachments/M1": (200, b"mail")})
+    transport = _Transport({f"{moved}/attachments/M1": (200, b"mail")})
     coordinator, _store, _clock = _coordinator(
         attachments, channel_files=_channel_files(attachments, transport)
     )
@@ -722,7 +719,7 @@ def test_a_lapsed_channel_port_file_is_fetched_from_the_routes_current_endpoint(
 
 
 def test_bind_route_refuses_before_any_request(attachments: Any) -> None:
-    transport = _Transport(attachments, {})
+    transport = _Transport({})
     client = _channel_files(attachments, transport)
 
     with pytest.raises(attachments.AttachmentResolutionError) as no_endpoint:
@@ -752,7 +749,7 @@ def _case_slack_identity_token_removed(attachments: Any, ledger: Any) -> dict[st
 
 
 def _case_channel_port_route_gone(attachments: Any, ledger: Any) -> dict[str, Any]:
-    transport = _Transport(attachments, {})
+    transport = _Transport({})
     return {
         "ref": _earlier(ledger, "BAD", b"x", kind="email", adapter=ADAPTER),
         "channel_files": _channel_files(attachments, transport),
@@ -761,7 +758,7 @@ def _case_channel_port_route_gone(attachments: Any, ledger: Any) -> dict[str, An
 
 
 def _case_channel_port_secret_removed(attachments: Any, ledger: Any) -> dict[str, Any]:
-    transport = _Transport(attachments, {})
+    transport = _Transport({})
     return {
         "ref": _earlier(ledger, "BAD", b"x", kind="email", adapter=ADAPTER),
         "routes": [_email_route(attachments)],
@@ -771,7 +768,7 @@ def _case_channel_port_secret_removed(attachments: Any, ledger: Any) -> dict[str
 
 
 def _adapter_case(attachments: Any, ledger: Any, answer: Any, reason: str) -> dict[str, Any]:
-    transport = _Transport(attachments, {f"{ADAPTER_ENDPOINT}/attachments/BAD": answer})
+    transport = _Transport({f"{ADAPTER_ENDPOINT}/attachments/BAD": answer})
     return {
         "ref": _earlier(ledger, "BAD", b"x", kind="email", adapter=ADAPTER),
         "routes": [_email_route(attachments)],

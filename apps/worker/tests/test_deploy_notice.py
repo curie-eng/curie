@@ -228,10 +228,16 @@ def test_reenqueued_notice_keeps_one_slack_delivery_identity(
                 for _ in range(2)
             ]
             for _ in range(100):
-                if len(capture.requests) == 2:
+                groups = await valkey.xinfo_groups(names["stream"])
+                if any(
+                    group["name"] == names["group"]
+                    and group["last-delivered-id"] == entries[-1]
+                    and group["pending"] == 0
+                    for group in groups
+                ):
                     break
                 await asyncio.sleep(0.05)
-            assert len(capture.requests) == 2
+            assert len(capture.requests) == 1
             # https://docs.slack.dev/reference/methods/chat.postMessage/
             # documents client_msg_id; test_live.py pins the ambiguous-retry
             # behavior against a real Slack test workspace.
@@ -245,6 +251,7 @@ def test_reenqueued_notice_keeps_one_slack_delivery_identity(
                 assert await valkey.xpending_range(
                     names["stream"], names["group"], min=entry, max=entry, count=1
                 ) == []
+            assert await valkey.xlen(f"{names['stream']}:dead") == 0
         finally:
             consumer.request_stop()
             await asyncio.wait_for(task, timeout=5)

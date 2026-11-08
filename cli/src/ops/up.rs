@@ -620,14 +620,13 @@ pub(crate) fn retained_runner_key_survives(
         .any(|(path, is_list)| removed_by_overrides(path, is_list, overridden))
 }
 
-/// The recorded value families [`resolve_retained_runner_values`] carries.
-/// Three environment lists and the per-agent connector binding map
-/// `curie cluster secrets` writes.
+/// Runtime value families retained with their types and private file delivery.
 const RETAINED_RUNNER_FAMILIES: &[&str] = &[
     "agentSandbox.runner.extraEnv",
     "agentSandbox.connectorSecrets",
     "api.extraEnv",
     "dispatcher.extraEnv",
+    "channelGateway",
 ];
 
 pub(crate) fn is_retained_runner_key(key: &str) -> bool {
@@ -636,8 +635,8 @@ pub(crate) fn is_retained_runner_key(key: &str) -> bool {
         .any(|family| key_is_or_descends_from(key, family))
 }
 
-/// Preserve the recorded runner, api and dispatcher environment lists and
-/// every agent's connector bindings as typed values (#3848).
+/// Preserve runtime environment lists, connector bindings and gateway configuration
+/// as typed values.
 ///
 /// `up` is a full upgrade, so these reset to the chart's empty default unless
 /// re-supplied, which silently unbound every agent's connector credentials and
@@ -5856,7 +5855,7 @@ async fn run_prepared_up(
     }
     if let Some(values) = &opts.retained_runner_values {
         ui.note(&format!(
-            "preserving {} runner value family(s) recorded by the release",
+            "preserving {} runtime value family(s) recorded by the release",
             values.keys().len()
         ));
     }
