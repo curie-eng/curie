@@ -145,9 +145,13 @@ SET outcome = 'failed', reason = 'enqueue_failed', ended_at = now()
 WHERE id = :id AND outcome IS NULL
 """
 
+# One statement reads whether the agent exists and its stored generation, so an
+# unknown agent (no row) is told apart from a hook with no key row (NULL).
 _GENERATION_SQL = """
-SELECT generation FROM {schema}.hook_wake_keys
-WHERE agent_id = :agent_id AND hook = :hook
+SELECT k.generation
+FROM {schema}.agents a
+LEFT JOIN {schema}.hook_wake_keys k ON k.agent_id = a.id AND k.hook = :hook
+WHERE a.id = :agent_id
 """
 
 _PAUSED_SQL = """
@@ -270,13 +274,22 @@ def _coalesced() -> JSONResponse:
     return _answer(status.HTTP_200_OK, HookWakeCoalescedOut(status="coalesced"))
 
 
-async def _generation(session: AsyncSession, agent_id: uuid.UUID, hook: str) -> int:
-    """The stored wake generation, 1 when absent; unreadable metadata fails closed."""
+async def _generation(session: AsyncSession, agent_id: uuid.UUID, hook: str) -> int | None:
+    """The stored wake generation, 1 when no key row exists, None for an unknown agent.
+
+    Unreadable metadata fails closed, including a raw driver connection error
+    (an ``OSError``) that SQLAlchemy leaves unwrapped.
+    """
 
     try:
-        stored = await session.scalar(_sql(_GENERATION_SQL), {"agent_id": agent_id, "hook": hook})
-    except SQLAlchemyError:
+        row = (
+            await session.execute(_sql(_GENERATION_SQL), {"agent_id": agent_id, "hook": hook})
+        ).first()
+    except (SQLAlchemyError, OSError):
         raise _Refusal(status.HTTP_503_SERVICE_UNAVAILABLE, _AUTHORITY) from None
+    if row is None:
+        return None
+    stored = row[0]
     if stored is None:
         return 1
     if type(stored) is not int or not 1 <= stored <= hook_wake_signing.MAX_GENERATION:
@@ -290,9 +303,10 @@ async def _gated_agent(
 ) -> AsyncIterator[tuple[Agent, SourceGateContext]]:
     """Hold the agent's source gate, as ``hook_fire._source_locked_agent`` does.
 
-    A missing, invalid or unavailable gate, and any database failure inside it
-    that no step mapped itself, is 503 ``authority_unavailable``: authority that
-    cannot be read refuses closed. A missing agent is ``wake_not_declared``.
+    A missing, invalid or unavailable gate, and any database or raw driver
+    connection failure inside it that no step mapped itself, is 503
+    ``authority_unavailable``: authority that cannot be read refuses closed. A
+    missing agent is ``wake_not_declared``.
     """
 
     try:
@@ -307,7 +321,13 @@ async def _gated_agent(
             if agent is None:
                 raise _Refusal(status.HTTP_404_NOT_FOUND, _NOT_DECLARED)
             yield agent, held
-    except (SourceAgentNotFound, SourceGateInvalid, SourceSnapshotUnavailable, SQLAlchemyError):
+    except (
+        SourceAgentNotFound,
+        SourceGateInvalid,
+        SourceSnapshotUnavailable,
+        SQLAlchemyError,
+        OSError,
+    ):
         raise _Refusal(status.HTTP_503_SERVICE_UNAVAILABLE, _AUTHORITY) from None
 
 
@@ -353,7 +373,7 @@ async def _require_ordinary(
         snapshot = await read_source_snapshot(held, await session.connection(), hook)
     except SourceAgentNotFound:
         raise _Refusal(status.HTTP_404_NOT_FOUND, _NOT_DECLARED) from None
-    except (SourceGateInvalid, SourceSnapshotUnavailable, SQLAlchemyError):
+    except (SourceGateInvalid, SourceSnapshotUnavailable, SQLAlchemyError, OSError):
         raise _Refusal(status.HTTP_503_SERVICE_UNAVAILABLE, _AUTHORITY) from None
     if not snapshot.never_configured:
         raise _Refusal(status.HTTP_409_CONFLICT, _NOT_ORDINARY)
@@ -467,7 +487,10 @@ async def _wake(
     ):
         raise _Refusal(status.HTTP_401_UNAUTHORIZED, _INVALID)
     agent_uuid = uuid.UUID(agent_id)
-    generation = await _generation(session, agent_uuid, hook)
+    stored = await _generation(session, agent_uuid, hook)
+    # An unknown agent does the same derivation and verification as generation 1,
+    # then refuses whatever the result, so it answers like any wrong key.
+    generation = 1 if stored is None else stored
     authentic = hook_wake_signing.verify(
         hook_wake_signing.derive_key(
             settings.api_key, agent_id=agent_id, hook=hook, generation=generation
@@ -480,7 +503,7 @@ async def _wake(
         header=presented,
         now=time.time(),
     )
-    if not authentic:
+    if stored is None or not authentic:
         raise _Refusal(status.HTTP_401_UNAUTHORIZED, _INVALID)
 
     # Step 2: request shape, only after authentication.
@@ -520,6 +543,7 @@ async def _wake(
         admitted: Any = None
         async with session.begin():
             await session.execute(_sql(_LOCK_SQL), {"agent_id": agent_id, "name": hook})
+            # A rotated key or a deleted agent (None) no longer matches the authenticated one.
             if await _generation(session, agent_uuid, hook) != generation:
                 raise _Refusal(status.HTTP_401_UNAUTHORIZED, _INVALID)
             controls = await _require_ordinary(session, held, agent_uuid, hook)
@@ -621,6 +645,9 @@ async def get_wake_secret(
             await _declaration(session, store, agent_uuid, hook)
             await _require_ordinary(session, held, agent_uuid, hook)
             generation = await _generation(session, agent_uuid, hook)
+            if generation is None:
+                # The agent vanished after the gated read: answer as a missing agent.
+                raise _Refusal(status.HTTP_404_NOT_FOUND, _NOT_DECLARED)
             secret = hook_wake_signing.derive_key(
                 get_settings().api_key, agent_id=canonical, hook=hook, generation=generation
             )
