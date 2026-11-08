@@ -311,7 +311,9 @@ class StubAuthority:
                 self.wfile.write(body)
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(
+            target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        ).start()
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
 
     def close(self) -> None:
@@ -347,7 +349,9 @@ def connectors() -> Iterator[Callable[..., ThreadingHTTPServer]]:
             timeout_s=timeout_s,
         )
         assert isinstance(server, ThreadingHTTPServer)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        ).start()
         started.append(server)
         return server
 

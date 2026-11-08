@@ -485,7 +485,10 @@ def serve(
     lookup_server.socket = tls.wrap_socket(lookup_server.socket, server_side=True)
     sink_server = ThreadingHTTPServer((host, sink_port), _handler(provider, lookup=False))
     for server in (lookup_server, sink_server):
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        # A short poll keeps shutdown() quick for the harness tests.
+        threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        ).start()
     return lookup_server, sink_server
 
 
