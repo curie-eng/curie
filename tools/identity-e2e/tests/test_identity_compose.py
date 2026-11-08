@@ -393,6 +393,56 @@ def test_context_member_drops_the_local_owner() -> None:
     assert compose.context_member(tarfile.TarInfo("./.env")) is None
 
 
+def archived(context: Path, state: Path) -> list[str]:
+    """The member names a directory build context gets, as the build archives it."""
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.GNU_FORMAT) as archive:
+        archive.add(context, arcname=".", filter=compose.context_filter(context, state))
+    buffer.seek(0)
+    with tarfile.open(fileobj=buffer) as archive:
+        return archive.getnames()
+
+
+def test_a_state_directory_inside_the_build_context_stays_out_of_it(tmp_path: Path) -> None:
+    """The documented state directory sits in the checkout; its keys never enter a build."""
+
+    context = tmp_path / "checkout"
+    (context / "apps").mkdir(parents=True)
+    (context / "apps" / "app.py").write_text("print('app')\n")
+    state = context / ".identity-e2e-docker"
+    (state / "cli-config").mkdir(parents=True)
+    (state / "state.json").write_text('{"caller_signing_key": "synthetic"}\n')
+    (state / "cli-config" / "credentials.json").write_text("{}\n")
+    (state / compose.CONTEXT_TAR).write_bytes(b"partial")
+    (context / ".identity-e2e-docker-notes").write_text("kept\n")
+
+    names = archived(context, state)
+
+    assert "./apps/app.py" in names
+    assert "./.identity-e2e-docker-notes" in names, "a sibling with the same prefix was dropped"
+    leaked = [name for name in names if name.startswith("./.identity-e2e-docker/")]
+    assert leaked == [] and "./.identity-e2e-docker" not in names
+
+
+def test_a_state_directory_outside_the_build_context_changes_nothing(tmp_path: Path) -> None:
+    context = tmp_path / "checkout"
+    context.mkdir()
+    (context / "app.py").write_text("print('app')\n")
+    state = tmp_path / "state"
+    state.mkdir()
+
+    assert sorted(archived(context, state)) == [".", "./app.py"]
+
+
+def test_a_build_context_inside_or_equal_to_the_state_directory_is_refused(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    (state / "src").mkdir(parents=True)
+    for context in (state, state / "src"):
+        with pytest.raises(HarnessError, match="state directory"):
+            compose.context_filter(context, state)
+
+
 def test_child_env_strips_credentials_and_stack_steering_names() -> None:
     base = {
         "PATH": "/usr/bin",
