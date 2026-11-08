@@ -100,6 +100,7 @@ class CredentialSafeCLITransport(_SDKSubprocessCLITransport):
         self._mcp_config_tmps = offloaded
         return [
             sys.executable,
+            "-I",
             "-c",
             "import os,sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])",
             *rewritten,
