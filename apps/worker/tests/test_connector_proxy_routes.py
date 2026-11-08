@@ -10,6 +10,7 @@ the two real halves.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from collections.abc import AsyncIterator, Callable, Coroutine
@@ -23,6 +24,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from curie_connector_proxy import caller, server
 from curie_worker import caller_token
+from nacl.signing import SigningKey
 from yarl import URL
 
 _ROOT = Path(__file__).resolve().parents[3]
@@ -212,6 +214,101 @@ def test_a_route_admits_only_a_live_route_token_for_this_connector(
             assert status == server.REFUSAL_STATUS
             assert json.loads(answer) == server.refusal_body(refusal)
             assert upstream.seen == []
+
+    _run(go)
+
+
+_FORGED = _TOKENS["forged_principal_headers"]
+_FORGED_CCR = [case for case in _FORGED["cases"] if case["token_kind"] == "ccr"]
+
+
+def _no_principal_header(headers: Any) -> bool:
+    """No copy of the principal header, in any letter case."""
+
+    wanted = str(_FORGED["header"]).lower()
+    return all(name.lower() != wanted for name in headers)
+
+
+def test_the_forged_principal_cases_cover_the_route_path() -> None:
+    # @spec CONNECTOR-REQUESTER-4
+    assert _FORGED["header"] == caller.PRINCIPAL_HEADER
+    assert _FORGED_CCR
+    assert any(len(case["inbound"]) > 1 for case in _FORGED_CCR)
+    for case in _FORGED_CCR:
+        assert set(case) == {"name", "why", "token_kind", "inbound"}
+
+
+@pytest.mark.parametrize("case", _FORGED_CCR, ids=lambda c: c["name"])
+def test_a_forged_principal_header_is_stripped_on_a_route(case: dict[str, Any]) -> None:
+    # @spec CONNECTOR-REQUESTER-4: a ccr carries no human authority, so any
+    # principal header beside one is forged and stripped, every copy in any
+    # letter case, while the route token itself is still admitted.
+    inbound = [(str(name), str(value)) for name, value in case["inbound"]]
+
+    async def go() -> None:
+        async with _serving() as (upstream, proxy):
+            status, _, _ = await _post_pairs(
+                proxy,
+                "/v1/review",
+                b"{}",
+                [(caller.HEADER, _route_token(run=_RUN, work_item=_WORK_ITEM)), *inbound],
+            )
+            assert status == 201
+            [seen] = upstream.seen
+            assert _no_principal_header(seen["headers"])
+            assert seen["headers"].getall(caller.PRINCIPAL_HEADER, []) == []
+            for _name, value in inbound:
+                assert value not in seen["headers"].values()
+            assert seen["headers"][caller.AGENT_HEADER] == "acme-dev"
+            assert seen["headers"][caller.RUN_HEADER] == _RUN
+            assert caller.HEADER not in seen["headers"]
+
+    _run(go)
+
+
+async def _post_pairs(
+    proxy: TestServer, path: str, data: object, headers: list[tuple[str, str]]
+) -> tuple[int, bytes, Any]:
+    # A header list, not a dict, so a name can repeat in different cases.
+    url = URL(f"http://{proxy.host}:{proxy.port}{path}", encoded=True)
+    async with aiohttp.ClientSession() as client:
+        async with client.post(url, data=data, headers=headers) as a:
+            return a.status, await a.read(), a.headers
+
+
+def _signed_route(claims: dict[str, object]) -> str:
+    seed = base64.b64decode(_SEED)
+    payload = json.dumps(claims, separators=(",", ":"), sort_keys=True).encode("ascii")
+    head = f"ccr.{_b64url(payload)}"
+    return f"{head}.{_b64url(SigningKey(seed).sign(head.encode('ascii')).signature)}"
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def test_a_route_token_carrying_a_principal_never_reaches_the_route() -> None:
+    # @spec CONNECTOR-REQUESTER-2: ccr keeps its closed claims. The same claims
+    # without the principal are admitted, so the principal is what refuses.
+    human = next(v for v in _TOKENS["vectors"] if v["name"] == "a_human_requester")
+    base: dict[str, object] = {"agent": "acme-dev", "connector": _CONNECTOR, "exp": _EXP}
+
+    async def go() -> None:
+        async with _serving() as (upstream, proxy):
+            status, answer, _ = await _post(
+                proxy,
+                "/v1/review",
+                b"{}",
+                {caller.HEADER: _signed_route({**base, "principal": human["principal"]})},
+            )
+            assert status == server.REFUSAL_STATUS
+            assert json.loads(answer) == server.refusal_body(caller.INVALID)
+            assert upstream.seen == []
+            status, _, _ = await _post(
+                proxy, "/v1/review", b"{}", {caller.HEADER: _signed_route(base)}
+            )
+            assert status == 201
+            assert len(upstream.seen) == 1
 
     _run(go)
 

@@ -155,6 +155,10 @@ class Agent(Base):
             "status IN ('active', 'paused', 'draining', 'retired')",
             name="agents_status_ck",
         ),
+        CheckConstraint(
+            "connector_requester_identity_version >= 1",
+            name="agents_connector_requester_identity_version_ck",
+        ),
         # Carries tenant_id, so the owning team must be a team of the same tenant.
         ForeignKeyConstraint(
             ["tenant_id", "owning_team_id"],
@@ -323,6 +327,15 @@ class Agent(Base):
     # agent (#1461, ADR-0167). Operator-owned; off by default. When on, the
     # worker hands the runner the binding-scoped channel memory URL.
     memory_writes: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # Whether this agent's connector calls carry the verified human requester
+    # (ADR 0270 decision 1, @spec CONNECTOR-REQUESTER-1). Operator-owned and
+    # off by default. Written only by the `PATCH /agents/{id}` compare-and-set
+    # on the version below, which every accepted write bumps
+    # (`crud.agents.update_agent_connector_requester_identity`).
+    connector_requester_identity: Mapped[bool] = mapped_column(
+        default=False, server_default="false"
+    )
+    connector_requester_identity_version: Mapped[int] = mapped_column(default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     versions: Mapped[list[AgentVersion]] = relationship(

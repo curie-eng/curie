@@ -1,4 +1,9 @@
-"""Current core checks. @spec HTTP-INVOCATION-EXECUTION-8/16."""
+"""Current core checks. @spec HTTP-INVOCATION-EXECUTION-8/16.
+
+The current check answers version 1, or version 2 with the verified requester
+for an opted-in agent; the body's explicit schema_version selects the model.
+@spec CONNECTOR-REQUESTER-1.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +24,7 @@ from curie_internal.identity_authority import (
     BindingClassificationResponseV1,
     TurnAuthorityRequestV1,
     TurnAuthorityResponseV1,
+    TurnAuthorityResponseV2,
 )
 
 
@@ -42,6 +48,21 @@ def _pairs(entries: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _constant(value: str) -> Never:
     """@spec HTTP-INVOCATION-EXECUTION-16."""
+    raise ValueError
+
+
+def turn_authority_answer(value: object) -> TurnAuthorityResponseV1 | TurnAuthorityResponseV2:
+    """One model per explicit schema_version; anything else is invalid.
+
+    @spec CONNECTOR-REQUESTER-1 HTTP-INVOCATION-EXECUTION-16.
+    """
+    if type(value) is not dict:
+        raise ValueError
+    version = value.get("schema_version")
+    if type(version) is int and version == 1:
+        return TurnAuthorityResponseV1.model_validate(value)
+    if type(version) is int and version == 2:
+        return TurnAuthorityResponseV2.model_validate(value)
     raise ValueError
 
 
@@ -110,8 +131,10 @@ class HttpTurnAuthorityClient:
         self._token = worker_token
         self._client = client
 
-    async def check(self, request: TurnAuthorityRequestV1) -> TurnAuthorityResponseV1:
-        """@spec HTTP-INVOCATION-EXECUTION-16."""
+    async def check(
+        self, request: TurnAuthorityRequestV1,
+    ) -> TurnAuthorityResponseV1 | TurnAuthorityResponseV2:
+        """@spec HTTP-INVOCATION-EXECUTION-16 CONNECTOR-REQUESTER-1."""
         try:
             if type(request) is not TurnAuthorityRequestV1:
                 raise ValueError
@@ -142,7 +165,7 @@ class HttpTurnAuthorityClient:
                         bytes(raw).decode("utf-8"), object_pairs_hook=_pairs,
                         parse_constant=_constant,
                     )
-                    result = TurnAuthorityResponseV1.model_validate(value)
+                    result = turn_authority_answer(value)
                     if (
                         result.request_id != captured.request_id or result.stage != captured.stage
                         or result.event_id != captured.event_id or result.scope != captured.scope

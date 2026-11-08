@@ -316,6 +316,9 @@ class TurnStream:
         self._response = response
         self.turn_epoch = turn_epoch
         self.verbatim_answer = verbatim_answer
+        # ADR 0270 decision 3: set by the kernel when the requester token
+        # window, not the configured bound, set this stream's deadline.
+        self.requester_window_bound = False
         self._saw_final = False
         # The streaming budget this stream is running under, carried from the
         # client so the stream can NAME the budget it blew (#2011).

@@ -14,6 +14,7 @@ from sqlalchemy.orm import selectinload
 
 from curie_api.schemas.agents import AgentCreate, HookPartitionConfig, SourceBindingConfig
 
+from ..identity.http_invocation import registered_binding_ids, tenant_selects_http_identity
 from ..models import (
     DEFAULT_TENANT_ID,
     Agent,
@@ -24,6 +25,10 @@ from ..models import (
     WorkspaceRecoveryGroup,
 )
 from ..publication_policy import PublicationPolicyConflict
+
+# ADR 0270 decision 1 refusal codes. @spec CONNECTOR-REQUESTER-1.
+REQUESTER_IDENTITY_VERSION_CONFLICT = "agent.requester_identity_version_conflict"
+REQUESTER_IDENTITY_REQUIRES_HTTP_IDENTITY = "requester_identity_requires_http_identity"
 
 
 async def refresh_with_channels(session: AsyncSession, agent: Agent) -> Agent:
@@ -209,6 +214,105 @@ async def update_agent_publication_policy(
     if updated_version is None:
         await session.rollback()
         raise PublicationPolicyConflict("publication policy version changed; retry the read")
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+class RequesterIdentityConflict(Exception):
+    """The expected connector requester identity version is no longer stored."""
+
+
+class RequesterIdentityRefused(Exception):
+    """A flag write the stored state does not admit. ``code`` names the reason."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+async def check_requester_identity_invariant(
+    session: AsyncSession, agent: Agent, *, enabled: bool, runtime: object
+) -> None:
+    """The one invariant every operator writer of the flag enforces.
+
+    ADR 0270 decision 1: enabling requires the tenant's HTTP identity
+    selection and at least one of the agent's bindings listed in an operator
+    receiver registration of the live runtime. Disabling needs neither, so an
+    operator can always turn requester transport off. Raises
+    ``RequesterIdentityRefused``; callers run it inside the transaction that
+    holds the agent row's compare-and-set, before committing.
+
+    ADR 0271 adds its selector checks HERE, not beside its own writers: refuse
+    disabling while any ``approver_ticket`` selector registration of this agent
+    exists, and refuse registering such a selector while the flag is off. Its
+    selector and route writes compare-and-set on
+    ``connector_requester_identity_version`` (bumping it), so a flag write and a
+    selector write that read the same version cannot both commit.
+    @spec CONNECTOR-REQUESTER-1.
+    """
+
+    if not enabled:
+        return
+    if not await tenant_selects_http_identity(session, agent.tenant_id):
+        raise RequesterIdentityRefused(
+            REQUESTER_IDENTITY_REQUIRES_HTTP_IDENTITY,
+            "enabling connector requester identity requires the tenant's HTTP identity selection",
+        )
+    registered = registered_binding_ids(runtime, agent.tenant_id)
+    bindings = await session.scalars(
+        select(AgentChannel.id).where(
+            AgentChannel.agent_id == agent.id, AgentChannel.tenant_id == agent.tenant_id
+        )
+    )
+    if not any(str(binding) in registered for binding in bindings):
+        raise RequesterIdentityRefused(
+            REQUESTER_IDENTITY_REQUIRES_HTTP_IDENTITY,
+            "enabling connector requester identity requires an operator receiver "
+            "registration that lists one of this agent's bindings",
+        )
+
+
+async def update_agent_connector_requester_identity(
+    session: AsyncSession,
+    agent: Agent,
+    *,
+    enabled: bool,
+    expected_version: int,
+    runtime: object,
+) -> Agent:
+    """Compare-and-set the flag on its version, bumping the version.
+
+    Every accepted write bumps the version, even one that stores the value
+    already there, so a write names exactly the state it read. The UPDATE runs
+    first and holds the agent row while the invariant is judged; zero rows
+    means another writer moved the version, and nothing changes. The caller
+    sends nothing else in the same request, so this is its only write.
+    @spec CONNECTOR-REQUESTER-1.
+    """
+
+    updated = await session.scalar(
+        update(Agent)
+        .where(
+            Agent.id == agent.id,
+            Agent.connector_requester_identity_version == expected_version,
+        )
+        .values(
+            connector_requester_identity=enabled,
+            connector_requester_identity_version=expected_version + 1,
+        )
+        .returning(Agent.connector_requester_identity_version)
+    )
+    if updated is None:
+        await session.rollback()
+        raise RequesterIdentityConflict(
+            "connector requester identity version changed; retry the read"
+        )
+    try:
+        await check_requester_identity_invariant(session, agent, enabled=enabled, runtime=runtime)
+    except RequesterIdentityRefused:
+        await session.rollback()
+        raise
     await session.commit()
     await session.refresh(agent)
     return agent

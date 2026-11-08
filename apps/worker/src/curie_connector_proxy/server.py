@@ -83,6 +83,10 @@ _NOT_FORWARDED = frozenset(
         caller.AGENT_HEADER.lower(),
         caller.RUN_HEADER.lower(),
         caller.WORK_ITEM_HEADER.lower(),
+        # Inbound copies are forged, on cct and ccr paths alike. ADR 0270
+        # decision 4 sets it from the verified claim in a later change; until
+        # then the connector never sees one.
+        caller.PRINCIPAL_HEADER.lower(),
     }
 )
 
@@ -660,15 +664,21 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
     # The path is decoded, so it is quoted: an encoded newline in it stays
     # `\n` inside this line rather than starting a line of its own.
     # ``grant=`` names which grant check refused, from a fixed set, and is
-    # absent otherwise; it is never a claim value.
+    # absent otherwise; it is never a claim value. ``principal=`` says only
+    # whether an admitted ``cct`` named a requester (ADR 0270 decision 2); a
+    # refusal and a ``ccr`` carry none, and no principal value is ever logged.
+    principal = ""
+    if refusal is None and route is None:
+        principal = " principal=" + ("present" if decision.principal is not None else "absent")
     logger.info(
-        "caller=%s outcome=%s method=%s path=%r%s%s",
+        "caller=%s outcome=%s method=%s path=%r%s%s%s",
         decision.agent or "-",
         refusal or "admitted",
         request.method,
         request.path,
         f" route={route.path!r}" if route is not None else "",
         f" grant={grant_reason}" if grant_reason is not None else "",
+        principal,
     )
     if refusal is not None:
         return web.json_response(refusal_body(refusal), status=REFUSAL_STATUS)

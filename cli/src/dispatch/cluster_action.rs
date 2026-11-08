@@ -1817,6 +1817,11 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     reason,
                     recovery_key,
                 },
+            requester:
+                RequesterIdentityArgs {
+                    requester_identity,
+                    expected_version,
+                },
         } => {
             let ClusterAgentTarget {
                 agent,
@@ -1831,6 +1836,23 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 dry_run,
             )
             .await?;
+            // ADR 0270 decision 1: its own object, so clap has already refused
+            // every gate, route, pending-record and recovery flag beside it.
+            if let Some(mode) = requester_identity {
+                return emit_boxed(
+                    commands::approvals_requester_identity(
+                        AgentActionOpts {
+                            api_url,
+                            api_key,
+                            agent,
+                            dry_run,
+                        },
+                        mode,
+                        expected_version,
+                    )
+                    .await?,
+                );
+            }
             emit(
                 commands::approvals(
                     AgentActionOpts {

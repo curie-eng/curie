@@ -236,6 +236,13 @@ class SandboxHandle:
     # this runner was not booted for a work item. Missing on a route written
     # before the field existed, which reads as no run.
     caller_run: str | None = None
+    # ADR 0270 decision 3: the requester the runner's caller token booted
+    # with, and that token's expiry. ``"absent"`` when the boot env carried no
+    # cct, ``"none"`` for a cct naming no principal, else ``"sha256:<hex>"``
+    # over the principal (never the plaintext). None only on a route written
+    # before the fields existed, which cannot prove a requester match.
+    caller_requester: str | None = None
+    caller_token_exp: int | None = None
     # #3823: the boot state token's credential id, the agent it names, and its
     # absolute expiry. Missing on a route written before the field existed.
     # Release reports the id; a later turn replaces a route whose token has

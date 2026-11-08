@@ -306,7 +306,11 @@ async def get_hook_secret(
 
 @router.patch("/{agent_id}", response_model=AgentOut)
 async def update_agent(
-    agent_id: uuid.UUID, data: AgentUpdate, session: SessionDep, store: StoreDep
+    agent_id: uuid.UUID,
+    data: AgentUpdate,
+    session: SessionDep,
+    store: StoreDep,
+    request: Request,
 ) -> AgentOut:
     # No binding key here since ADR-0118: an agent may hold several bindings, so
     # "move the agent's channel" has no referent and the write surface is the
@@ -315,6 +319,31 @@ async def update_agent(
     agent = await crud_agents.get_agent(session, agent_id)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+    # ADR 0270 decision 1 (@spec CONNECTOR-REQUESTER-1). The schema has already
+    # refused a flag write sharing the request with any other field, so this
+    # compare-and-set is the request's only write and returns before any other
+    # field block runs.
+    if "connector_requester_identity" in data.model_fields_set:
+        assert data.connector_requester_identity is not None
+        assert data.connector_requester_identity_expected_version is not None
+        try:
+            agent = await crud_agents.update_agent_connector_requester_identity(
+                session,
+                agent,
+                enabled=data.connector_requester_identity,
+                expected_version=data.connector_requester_identity_expected_version,
+                runtime=getattr(request.app.state, "http_identity_runtime", None),
+            )
+        except crud_agents.RequesterIdentityRefused as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, {"code": exc.code, "message": str(exc)}
+            ) from exc
+        except crud_agents.RequesterIdentityConflict as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {"code": crud_agents.REQUESTER_IDENTITY_VERSION_CONFLICT, "message": str(exc)},
+            ) from exc
+        return AgentOut.model_validate(agent)
     # The declared/bound approval-route join, judged BEFORE the first mutation
     # (#2436). A write to `approval_routes` is a full replacement (`--route`,
     # `--routes-from` and `--clear-routes` all replace the whole map), so

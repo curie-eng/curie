@@ -200,6 +200,7 @@ def test_the_refusal_vector_carries_only_known_keys() -> None:
         "content_type",
         "unpaired",
         "vectors",
+        "principal_refusals",
     }
     unpaired = _REFUSAL["unpaired"]
     assert set(unpaired) == {"why", "token", "refusal"}
@@ -211,6 +212,14 @@ def test_the_refusal_vector_carries_only_known_keys() -> None:
         assert set(vector) == {"refusal", "body"}
     assert _REFUSAL["header"] == caller.HEADER
     assert _REFUSAL["status"] == server.REFUSAL_STATUS
+    principal_refusals = _REFUSAL["principal_refusals"]
+    for entry in principal_refusals:
+        assert set(entry) == {"name", "why", "token", "refusal"}, entry.get("name")
+        # Each names a refusal whose body the corpus already freezes.
+        assert entry["refusal"] in caller.REFUSALS, entry["name"]
+    refused_as = {entry["refusal"] for entry in principal_refusals}
+    assert {caller.INVALID, caller.NOT_ADMITTED} <= refused_as
+    assert len({entry["name"] for entry in principal_refusals}) == len(principal_refusals)
 
 
 # @spec ADR-0168 d7
@@ -315,6 +324,114 @@ def test_a_run_token_sets_identity_headers_and_drops_forged_ones() -> None:
             assert seen["headers"][caller.WORK_ITEM_HEADER] == run_vector["work_item"]
             assert caller.HEADER not in seen["headers"]
             assert "forged-run" not in seen["headers"].values()
+
+    _run(go)
+
+
+def _body_for(refusal: str) -> dict[str, Any]:
+    return next(v["body"] for v in _REFUSAL["vectors"] if v["refusal"] == refusal)
+
+
+# @spec CONNECTOR-REQUESTER-2
+@pytest.mark.parametrize("entry", _REFUSAL["principal_refusals"], ids=lambda e: e["name"])
+def test_a_principal_refusal_answers_the_frozen_body_and_never_reaches_the_server(
+    entry: dict[str, Any],
+) -> None:
+    # A requester never changes a refusal or its body: the same 403 and the
+    # same JSON-RPC error as an agent-only token refused for the same reason.
+    async def go() -> None:
+        async with _serving() as (upstream, proxy):
+            async with aiohttp.ClientSession() as client:
+                async with client.post(
+                    proxy.make_url("/mcp"),
+                    json={"x": 1},
+                    headers={caller.HEADER: str(entry["token"])},
+                ) as answer:
+                    assert answer.status == _REFUSAL["status"]
+                    assert answer.content_type == _REFUSAL["content_type"]
+                    assert "WWW-Authenticate" not in answer.headers
+                    assert await answer.json() == _body_for(entry["refusal"])
+            assert upstream.seen == []
+
+    _run(go)
+
+
+_FORGED = _TOKENS["forged_principal_headers"]
+_FORGED_CCT = [case for case in _FORGED["cases"] if case["token_kind"] == "cct"]
+
+
+def _no_principal_header(headers: Any) -> bool:
+    """No copy of the principal header, in any letter case."""
+
+    wanted = str(_FORGED["header"]).lower()
+    return all(name.lower() != wanted for name in headers)
+
+
+# @spec CONNECTOR-REQUESTER-4
+def test_the_forged_principal_cases_cover_the_caller_path() -> None:
+    assert _FORGED["header"] == caller.PRINCIPAL_HEADER
+    assert _FORGED_CCT
+    assert any(len(case["inbound"]) > 1 for case in _FORGED_CCT)
+    for case in _FORGED_CCT:
+        assert set(case) == {"name", "why", "token_kind", "inbound"}
+
+
+# @spec CONNECTOR-REQUESTER-4
+@pytest.mark.parametrize("case", _FORGED_CCT, ids=lambda c: c["name"])
+def test_a_forged_principal_header_is_stripped_and_the_caller_still_admitted(
+    case: dict[str, Any],
+) -> None:
+    inbound = [(str(name), str(value)) for name, value in case["inbound"]]
+
+    async def go() -> None:
+        async with _serving() as (upstream, proxy):
+            async with aiohttp.ClientSession() as client:
+                async with client.post(
+                    proxy.make_url("/mcp"),
+                    data=b"{}",
+                    headers=[(caller.HEADER, _TOKEN), *inbound],
+                ) as answer:
+                    # Liveness: a forged header is dropped, not a refusal.
+                    assert answer.status == 201
+            [seen] = upstream.seen
+            assert _no_principal_header(seen["headers"])
+            assert seen["headers"].getall(caller.PRINCIPAL_HEADER, []) == []
+            for _name, value in inbound:
+                assert value not in seen["headers"].values()
+            assert seen["headers"][caller.AGENT_HEADER] == "acme-dev"
+            assert caller.HEADER not in seen["headers"]
+
+    _run(go)
+
+
+# @spec CONNECTOR-REQUESTER-2
+@pytest.mark.parametrize("name", ["a_human_requester", "the_same_requester_on_a_work_item_run"])
+def test_a_principal_bearing_token_is_admitted_with_its_agent_headers(name: str) -> None:
+    vector = next(v for v in _TOKENS["vectors"] if v["name"] == name)
+    assert vector["public"] == _VECTOR["public"]
+
+    async def go() -> None:
+        async with _serving() as (upstream, proxy):
+            async with aiohttp.ClientSession() as client:
+                async with client.post(
+                    proxy.make_url("/mcp"),
+                    data=b"{}",
+                    headers={caller.HEADER: str(vector["minted"])},
+                ) as answer:
+                    assert answer.status == 201
+            [seen] = upstream.seen
+            assert seen["headers"][caller.AGENT_HEADER] == "acme-dev"
+            if "run" in vector:
+                assert seen["headers"][caller.RUN_HEADER] == vector["run"]
+                assert seen["headers"][caller.WORK_ITEM_HEADER] == vector["work_item"]
+            assert caller.HEADER not in seen["headers"]
+            # The bearer never reaches the connector, so neither does any
+            # spelling of the signed principal it carries.
+            forwarded = "\n".join(seen["headers"].values())
+            assert str(vector["minted"]).split(".")[1] not in forwarded
+            # ADR 0270 decision 4's projection is not set yet: until it is, the
+            # proxy verifies a principal and supplies no principal header.
+            assert _no_principal_header(seen["headers"])
 
     _run(go)
 
@@ -989,5 +1106,5 @@ def test_a_replayed_grant_logs_not_spent(caplog: pytest.LogCaptureFixture) -> No
     with caplog.at_level(logging.INFO, logger="curie_connector_proxy"):
         _run(go)
     lines = [r.getMessage() for r in caplog.records if "outcome=" in r.getMessage()]
-    assert lines[0].endswith("outcome=admitted method=POST path='/mcp'")
+    assert lines[0].endswith("outcome=admitted method=POST path='/mcp' principal=absent")
     assert lines[1].endswith(f"grant={server.GRANT_NOT_SPENT}")

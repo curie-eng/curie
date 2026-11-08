@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -10,7 +11,7 @@ from aci_protocol import (
     QueuedTurn,
 )
 
-from ..binding import FactoryWake
+from ..binding import FactoryWake, caller_requester_facts
 from ..delivery_lease import DeliveryLease
 from ..killswitch import KillSwitch
 from ..threadlock import LockLeaseLost
@@ -23,9 +24,10 @@ from ..workitem_dispatch import (
 )
 
 if TYPE_CHECKING:
+    from ..sandbox.types import SandboxHandle
     from .core import Kernel
 
-from . import clock, constants, failures, memory, routing
+from . import claim, clock, constants, failures, memory, routing
 from .log import logger
 
 
@@ -464,7 +466,13 @@ async def reap_orphans(self: Kernel) -> list[str]:
 
 
 async def _preflight_reclaimed_delivery(
-    self: Kernel, thread_key: str, lease: DeliveryLease
+    self: Kernel,
+    thread_key: str,
+    lease: DeliveryLease,
+    *,
+    event_id: str,
+    boot_env: Mapping[str, str] | None,
+    requester_enforced: bool,
 ) -> None:
     """Prove a TRANSFERRED delivery is safe to re-execute, or refuse it.
 
@@ -497,6 +505,13 @@ async def _preflight_reclaimed_delivery(
     retained live turn: this is the same event being retried, not a follow-up.
     The choice is driven by the lease generation, an explicit distributed
     state fact, so kernel rule 3 ("never keyword-guess intent") is untouched.
+
+    ADR 0270 decision 3: rule 2 interrupts only a live turn of this
+    delivery's own requester. A live route that booted for a different
+    requester is never interrupted: the delivery defers with
+    ``RequesterHandoffPending`` and is redelivered after that turn ends. The
+    interrupt is fenced to the exact route checked (``expected``), and when
+    that route changed in between, the check runs again on the new route.
     """
     # ONE deadline for the WHOLE preflight, established before the first
     # probe -- not merely the gap between polls. Every liveness probe below
@@ -520,28 +535,41 @@ async def _preflight_reclaimed_delivery(
     def _left() -> float:
         return max(0.0, deadline - clock.time.monotonic())
 
-    handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
-    if handle is None:
-        # No retained sandbox: the previous owner's runner is gone, which is
-        # the "or disappear" half of rule 2.
-        return
-    if not await self._turn_active(handle, remaining_s=_left()):
-        return
-    logger.warning(
-        "reclaimed delivery for thread %s (generation %d) found a live turn "
-        "from a previous owner; interrupting before retry",
-        thread_key,
-        lease.generation,
-    )
-    # The interrupt is deliberately NOT given this window: it keeps its own
-    # independent control-plane timeout, because a fence derived from a
-    # budget that may already be spent could not stop the runner it fenced.
-    await self.interrupt_thread(thread_key, "fenced transfer of a reclaimed delivery")
-    while clock.time.monotonic() < deadline:
-        await asyncio.sleep(min(constants._RECLAIM_PREFLIGHT_POLL_S, _left()))
+    desired_requester, _desired_exp = caller_requester_facts(boot_env)
+    interrupted: SandboxHandle | None = None
+    while True:
         handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
-        if handle is None or not await self._turn_active(handle, remaining_s=_left()):
+        if handle is None:
+            # No retained sandbox: the previous owner's runner is gone, which
+            # is the "or disappear" half of rule 2.
             return
+        if not await self._turn_active(handle, remaining_s=_left()):
+            return
+        if claim._requester_change(
+            handle.caller_requester, desired_requester, enforced=requester_enforced
+        ):
+            raise claim._requester_handoff_pending(thread_key, event_id)
+        if handle != interrupted:
+            logger.warning(
+                "reclaimed delivery for thread %s (generation %d) found a live turn "
+                "from a previous owner; interrupting before retry",
+                thread_key,
+                lease.generation,
+            )
+            # The interrupt is deliberately NOT given this window: it keeps
+            # its own independent control-plane timeout, because a fence
+            # derived from a budget that may already be spent could not stop
+            # the runner it fenced. It reaches only the route just checked.
+            if await self.interrupt_thread(
+                thread_key, "fenced transfer of a reclaimed delivery", expected=handle
+            ):
+                interrupted = handle
+            elif clock.time.monotonic() < deadline:
+                # The route changed after the check: check the new one now.
+                continue
+        if clock.time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(min(constants._RECLAIM_PREFLIGHT_POLL_S, _left()))
     raise memory.ReclaimPreflightUnsafe(
         f"thread {thread_key} still reports (or cannot deny) a live turn after "
         "the reclaim interrupt; refusing to run a replacement beside it"

@@ -906,6 +906,12 @@
       "path": "/agents/{agent_id}"
     },
     {
+      "function": "set_connector_requester_identity",
+      "struct": "AgentUpdate",
+      "method": "patch",
+      "path": "/agents/{agent_id}"
+    },
+    {
       "function": "trigger_eval",
       "struct": "EvalTriggerRequest",
       "method": "post",
@@ -998,7 +1004,9 @@
         {"field": "publication_policy", "why": "Publication policy has its own operator command."},
         {"field": "publication_policy_version", "why": "Publication policy has its own operator command."},
         {"field": "publication_draft", "why": "Publication policy has its own operator command."},
-        {"field": "publication_branch_prefix", "why": "Publication policy has its own operator command."}
+        {"field": "publication_branch_prefix", "why": "Publication policy has its own operator command."},
+        {"field": "connector_requester_identity", "why": "The connector requester identity flag belongs to approvals --requester-identity."},
+        {"field": "connector_requester_identity_version", "why": "The connector requester identity flag belongs to approvals --requester-identity."}
       ]
     },
     {
@@ -1110,6 +1118,14 @@
         {
           "field": "source_bindings",
           "why": "Hook configuration has its own operator command. The overrides command changes model behavior only."
+        },
+        {
+          "field": "connector_requester_identity",
+          "why": "The connector requester identity flag has its own verb, approvals --requester-identity (ADR 0270 decision 1). Emitting it from overrides would imply that verb can change it."
+        },
+        {
+          "field": "connector_requester_identity_version",
+          "why": "The connector requester identity flag has its own verb, approvals --requester-identity (ADR 0270 decision 1). Emitting it from overrides would imply that verb can change it."
         }
       ]
     },

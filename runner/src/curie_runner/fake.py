@@ -4,18 +4,24 @@ The fake is the mock at the adapter seam: it constructs real claude-agent-sdk
 message dataclasses with canned content, so everything above it (translation,
 budget, side-effect flagging, status, NDJSON, the HTTP layer) runs unmodified and
 un-mocked while the model (the only external dependency) is replaced. It never
-spawns the CLI or touches the network. ``aci-protocol`` is never mocked.
+spawns the CLI or touches the network, with one explicit exception: a prompt
+carrying ``[fake:connector-call]`` dials the hosted connectors the session was
+handed (ADR 0270). ``aci-protocol`` is never mocked.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable
+import socket
+from collections import deque
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import anyio
+import httpx2
 from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
@@ -29,6 +35,7 @@ from claude_agent_sdk.types import (
     PermissionResultDeny,
     ToolPermissionContext,
 )
+from mcp import ClientSession
 
 from .adapter import PartialMessageBoundary
 from .approval import (
@@ -37,7 +44,9 @@ from .approval import (
     ApprovalGate,
     process_approval_request,
 )
+from .connectors import CALLER_HEADER
 from .history import ConversationMessage
+from .mcp_tool_capability import _caller_refusal, _probe_error_leaves, server_streams
 from .tool_access import TurnToolAccess
 from .turn_progress import NOT_SHOWN_TEXT, TurnProgress
 
@@ -251,6 +260,146 @@ def progress_demo_turn() -> list[Any]:
     return script
 
 
+# Explicit test-only marker for ADR 0270 evidence: the turn dials every hosted
+# connector the session was handed, in sorted name order, through the same
+# standalone MCP client the boot probe uses (one ``initialize``, one
+# ``tools/list``), and answers one line per connector:
+#
+#     connector-call <name>: ok tools=<n> caller=<fp>
+#     connector-call <name>: failed <reason> caller=<fp>
+#
+# ``<fp>`` is the first 16 hex characters of the sha256 of the X-Curie-Caller
+# value that connector was dialled with, or ``-`` without one, so a run can tie
+# a dial to its token without the token being printed. ``<reason>`` is the
+# caller proxy's refusal code when it refused, else the failure's exception
+# class name; neither ever carries exception text. With no connectors the
+# answer is ``connector-call: none``. This is the fake's only network call.
+CONNECTOR_CALL_MARKER = "[fake:connector-call]"
+# Per connector, read at call time. One dial bounds a connector that accepts
+# and then hangs, so the turn always completes.
+CONNECTOR_CALL_TIMEOUT_S = 15.0
+_CONNECTOR_CALL_USAGE = {"input_tokens": 20, "output_tokens": 8}
+
+
+@dataclass(frozen=True)
+class _ConnectorCalls:
+    """A scripted dial of every connector, answered as the turn's closing text."""
+
+
+def connector_call_turn() -> list[Any]:
+    """A turn that dials the session's connectors, then answers one line each."""
+
+    return [_assistant(TextBlock(text="Calling the connectors")), _ConnectorCalls()]
+
+
+def _connector_call_answer(text: str) -> list[Any]:
+    return [
+        _assistant(TextBlock(text=text), usage=dict(_CONNECTOR_CALL_USAGE)),
+        _result(text=text, usage=dict(_CONNECTOR_CALL_USAGE)),
+    ]
+
+
+def _caller_fingerprint(config: Mapping[str, Any]) -> str:
+    """The sent X-Curie-Caller value's sha256, first 16 hex characters, or ``-``.
+
+    ``server_streams`` expands ``${NAME}`` against the empty env this dial
+    passes, which leaves the value as written, so this is what was sent.
+    """
+
+    headers = config.get("headers")
+    value = headers.get(CALLER_HEADER) if isinstance(headers, Mapping) else None
+    if value is None:
+        return "-"
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+
+
+def _connector_failure(exc: BaseException) -> str:
+    """The proxy's refusal code, or the innermost failure's class name.
+
+    Never the exception text: it can carry a header value.
+    """
+
+    refusal = _caller_refusal(exc)
+    if refusal is not None:
+        return refusal
+    leaves = _probe_error_leaves(exc)
+    return type(leaves[0] if leaves else exc).__name__
+
+
+CONNECTOR_CALL_ATTEMPTS = 3
+_CONNECTOR_CALL_BACKOFF_S = 0.2
+# mcp's HTTP transport is httpx2 (installed with mcp; the runner image has no
+# httpx): a dial that never reached the server arrives as an exception group
+# whose leaf is one of these.
+_TRANSPORT_FAILURES = (
+    httpx2.ConnectError,
+    httpx2.ConnectTimeout,
+    ConnectionResetError,
+    socket.gaierror,
+)
+
+
+def _failed_before_answer(exc: BaseException) -> bool:
+    """True when every leaf is a transport failure and the proxy did not refuse."""
+
+    if _caller_refusal(exc) is not None:
+        return False
+    leaves = _probe_error_leaves(exc)
+    return bool(leaves) and all(isinstance(leaf, _TRANSPORT_FAILURES) for leaf in leaves)
+
+
+async def _dial_connector(config: Mapping[str, Any], timeout: float) -> int:
+    async with server_streams(config, plugin_dir=None, inherited_env={}) as (
+        read_stream,
+        write_stream,
+    ):
+        async with ClientSession(
+            read_stream, write_stream, read_timeout_seconds=timeout
+        ) as session:
+            await session.initialize()
+            listed = await session.list_tools()
+    return len(listed.tools)
+
+
+async def _call_connector(config: Mapping[str, Any]) -> str:
+    """One bounded dial: ``ok tools=<n>`` or ``failed <reason>``.
+
+    A transport failure before the connector answers is retried, up to
+    ``CONNECTOR_CALL_ATTEMPTS`` inside the one per-server timeout. A proxy
+    refusal or any answered protocol error is reported at once.
+    """
+
+    timeout = CONNECTOR_CALL_TIMEOUT_S
+    try:
+        with anyio.fail_after(timeout):
+            attempt = 1
+            while True:
+                try:
+                    tools = await _dial_connector(config, timeout)
+                    break
+                except Exception as exc:  # noqa: BLE001 - classified below
+                    if attempt >= CONNECTOR_CALL_ATTEMPTS or not _failed_before_answer(exc):
+                        raise
+                    await anyio.sleep(_CONNECTOR_CALL_BACKOFF_S * attempt)
+                    attempt += 1
+    except Exception as exc:  # noqa: BLE001 - every failure is reported, none escapes
+        return f"failed {_connector_failure(exc)}"
+    return f"ok tools={tools}"
+
+
+async def call_connectors(servers: Mapping[str, Mapping[str, Any]]) -> str:
+    """The ``[fake:connector-call]`` answer: one line per connector, by name."""
+
+    if not servers:
+        return "connector-call: none"
+    lines = []
+    for name in sorted(servers):
+        config = servers[name]
+        outcome = await _call_connector(config)
+        lines.append(f"connector-call {name}: {outcome} caller={_caller_fingerprint(config)}")
+    return "\n".join(lines)
+
+
 class FakeModelSession:
     """A ModelSession that replays a fixed script of SDK messages per turn.
 
@@ -285,6 +434,10 @@ class FakeModelSession:
     emulated tool (the approval request) runs, and is answered the way the real
     CLI answers a PreToolUse deny: an error result carrying the refusal, in
     place of whatever result the script had for that call. The turn continues.
+
+    ``connector_servers`` are the derived hosted connector entries the caller
+    proxy fronts, headers already materialized. Only a prompt carrying
+    ``CONNECTOR_CALL_MARKER`` reads them; without it nothing is dialled.
     """
 
     def __init__(
@@ -303,8 +456,10 @@ class FakeModelSession:
         disallowed_tools: list[str] | tuple[str, ...] | None = None,
         turn_progress: TurnProgress | None = None,
         tool_access: TurnToolAccess | None = None,
+        connector_servers: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         self._script_factory = script_factory or self._default_script
+        self._connector_servers: Mapping[str, Mapping[str, Any]] = connector_servers or {}
         # The session's progress holder (ADR 0130); None when the tool is not
         # mounted, which the demo answers as "not shown", like no capability.
         self._turn_progress = turn_progress
@@ -352,6 +507,8 @@ class FakeModelSession:
             return reversible_turn()
         if PROGRESS_DEMO_MARKER in last:
             return progress_demo_turn()
+        if CONNECTOR_CALL_MARKER in last:
+            return connector_call_turn()
         return default_turn()
 
     async def connect(self) -> None:
@@ -369,11 +526,20 @@ class FakeModelSession:
         self._interrupted = True
 
     async def receive_turn(self) -> AsyncIterator[Any]:
-        for scripted in self._script_factory():
+        script = deque(self._script_factory())
+        while script:
+            scripted = script.popleft()
             if self._interrupted and self._truncate_on_interrupt:
                 return
             message = self._without_refused_results(scripted)
             if message is None:
+                continue
+            if isinstance(message, _ConnectorCalls):
+                # The answer exists only once every connector has answered, so
+                # the dial expands in place into the turn's closing messages,
+                # which then take the same path as any scripted message.
+                answer = await call_connectors(self._connector_servers)
+                script.extendleft(reversed(_connector_call_answer(answer)))
                 continue
             if isinstance(message, _Pause):
                 # Read at call time, so a test can shorten the demo's waits.

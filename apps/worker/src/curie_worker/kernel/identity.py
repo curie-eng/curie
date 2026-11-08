@@ -1,4 +1,8 @@
-"""Per-delivery current authority. @spec HTTP-INVOCATION-EXECUTION-18."""
+"""Per-delivery current authority. @spec HTTP-INVOCATION-EXECUTION-18.
+
+A delivery also retains the verified requester its version 2 answers project,
+and keeps exactly one for its lifetime. @spec CONNECTOR-REQUESTER-1.
+"""
 
 from __future__ import annotations
 
@@ -22,10 +26,18 @@ from curie_internal.identity_authority import (
     Stage,
     TurnAuthorityRequestV1,
     TurnAuthorityResponseV1,
+    TurnAuthorityResponseV2,
     TurnAuthorityScopeV1,
+    TurnRequesterV1,
 )
 
-from ..binding import AmbiguousRoute, HttpIdentityBinding, binding_adapter_for_handle
+from ..binding import (
+    AmbiguousRoute,
+    HttpIdentityBinding,
+    RequesterIdentityStateInvalid,
+    binding_adapter_for_handle,
+)
+from ..caller_token import CallerPrincipal
 from ..hook_runs import HookRunRecorderError
 from ..identity_authority import TurnAuthorityUnavailable
 from .approval import _approval_id_from_resume_event
@@ -58,6 +70,16 @@ class HttpTurnCarry:
     # The binding a context-free cron turn's deployment authority was
     # verified against at prepare. @spec HTTP-INVOCATION-EXECUTION-23.
     scheduled: HttpIdentityBinding | None = None
+    # The verified requester a version 2 continue projected, or None for no
+    # verified human. Once any version 2 answer arrived (requester_checked),
+    # every later check of this delivery must be version 2 with this same
+    # requester. Never logged. @spec CONNECTOR-REQUESTER-1.
+    requester: TurnRequesterV1 | None = field(default=None, repr=False)
+    requester_checked: bool = False
+    # The validated operator flag read ``requester_principal`` made for this
+    # delivery's boot, False until then. True makes the route comparison
+    # refuse a route that recorded no requester. @spec CONNECTOR-REQUESTER-3.
+    requester_enabled: bool = False
 
 
 CURRENT: ContextVar[HttpTurnCarry | None] = ContextVar("http_turn_authority", default=None)
@@ -213,6 +235,110 @@ def selected() -> bool:
     return carry is not None and carry.context is not None
 
 
+def requester() -> TurnRequesterV1 | None:
+    """The live delivery's retained verified requester, or None.
+
+    None outside a live HTTP-context delivery, for a delivery whose answers
+    were version 1, and for a version 2 answer without a verified human.
+    @spec CONNECTOR-REQUESTER-1.
+    """
+    carry = CURRENT.get()
+    if carry is None or carry.context is None or not carry.requester_checked:
+        return None
+    if not is_live(carry):
+        return None
+    return carry.requester
+
+
+def requester_enforced() -> bool:
+    """Whether this delivery is an opted-in requester turn (ADR 0270 decision 3).
+
+    True only for a live HTTP-context delivery whose operator flag read, made
+    immediately before boot, returned True. Such a turn cannot adopt a route
+    that recorded no requester. Every other delivery (flag off, an ended or
+    context-free carry, no carry) adopts a legacy route as before; the digest
+    rule applies to all of them regardless. @spec CONNECTOR-REQUESTER-3.
+    """
+    carry = CURRENT.get()
+    if carry is None or carry.context is None or not carry.requester_enabled:
+        return False
+    return is_live(carry)
+
+
+def _retain_requester(
+    carry: HttpTurnCarry, result: TurnAuthorityResponseV1 | TurnAuthorityResponseV2,
+) -> None:
+    """One requester per delivery, bound to its checked scope.
+
+    A version 1 continue after any version 2 answer (a mixed-version API
+    replica), or a version 2 requester that differs from the retained one,
+    including null against non-null, refuses. @spec CONNECTOR-REQUESTER-1.
+    """
+    if not isinstance(result, TurnAuthorityResponseV2):
+        if carry.requester_checked:
+            raise HttpIdentityRefused()
+        return
+    projected = result.requester
+    if projected is not None and (
+        carry.scope is None or projected.tenant_id != carry.scope.tenant_id
+    ):
+        raise HttpIdentityRefused()
+    if carry.requester_checked:
+        if projected != carry.requester:
+            raise HttpIdentityRefused()
+        return
+    carry.requester = projected
+    carry.requester_checked = True
+
+
+async def requester_principal(self: Kernel, agent_id: uuid.UUID) -> CallerPrincipal | None:
+    """The principal an HTTP-context boot signs into its ``cct``, or None.
+
+    Called immediately before the targeted ``boot_env`` of a selected turn. The
+    operator flag is read for every such turn, with or without a retained
+    requester. An unreadable or malformed flag refuses before boot, and so
+    does a retained requester on an agent that has not opted in (an
+    inconsistent answer). Only an opted-in agent with a retained requester
+    for this checked agent gets a principal; everything else boots
+    principal-less. A schedule, hook, eval or legacy turn has no HTTP context
+    and never reaches here. @spec CONNECTOR-REQUESTER-1 CONNECTOR-REQUESTER-2.
+    """
+    carry = CURRENT.get()
+    if carry is None or carry.context is None:
+        return None
+    if not is_live(carry):
+        raise TurnAuthorityUnavailable()
+    retained = carry.requester if carry.requester_checked else None
+    reader = getattr(self._binding, "connector_requester_identity_for", None)
+    if not callable(reader):
+        # A binding that cannot say whether the agent opted in never mints one.
+        if retained is not None:
+            raise HttpIdentityRefused()
+        return None
+    try:
+        enabled = await reader(agent_id)
+    except RequesterIdentityStateInvalid:
+        raise HttpIdentityRefused() from None
+    if type(enabled) is not bool:
+        raise HttpIdentityRefused()
+    if not is_live(carry):
+        raise TurnAuthorityUnavailable()
+    carry.requester_enabled = enabled
+    if retained is None:
+        return None
+    if (
+        not enabled or carry.scope is None or retained.tenant_id != carry.scope.tenant_id
+        or str(agent_id) != carry.scope.agent_id
+    ):
+        raise HttpIdentityRefused()
+    try:
+        return CallerPrincipal(
+            tenant_id=retained.tenant_id, issuer=retained.issuer, subject=retained.subject,
+        )
+    except ValueError:
+        raise HttpIdentityRefused() from None
+
+
 def creation_identity() -> ApprovalCreationIdentityV1:
     """The live owner's exact creation carry. @spec HTTP-APPROVAL-CONTINUITY-4."""
     carry = CURRENT.get()
@@ -255,11 +381,15 @@ async def check(self: Kernel, stage: Stage) -> None:
         )
     except (ValueError, TypeError):
         raise HttpIdentityRefused() from None
+    result: TurnAuthorityResponseV1 | TurnAuthorityResponseV2
     try:
-        result = await self._identity_authority.check(request)
-        if type(result) is not TurnAuthorityResponseV1:
+        answer = await self._identity_authority.check(request)
+        if type(answer) is TurnAuthorityResponseV1:
+            result = TurnAuthorityResponseV1.model_validate(answer)
+        elif type(answer) is TurnAuthorityResponseV2:
+            result = TurnAuthorityResponseV2.model_validate(answer)
+        else:
             raise ValueError
-        result = TurnAuthorityResponseV1.model_validate(result)
         if (
             result.request_id != request.request_id or result.stage != request.stage
             or result.event_id != request.event_id or result.scope != request.scope
@@ -274,6 +404,7 @@ async def check(self: Kernel, stage: Stage) -> None:
         raise HttpIdentityRefused()
     if result.decision != "continue":
         raise TurnAuthorityUnavailable()
+    _retain_requester(carry, result)
 
 
 async def approval_grant(self: Kernel, agent_id: uuid.UUID) -> ApprovalGrantExpectationV1 | None:

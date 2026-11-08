@@ -370,6 +370,14 @@ pub struct Agent {
     pub publication_draft: bool,
     #[serde(default)]
     pub publication_branch_prefix: Option<String>,
+    /// Whether this agent's connector calls carry the verified requester (ADR
+    /// 0270 decision 1). `None` means a platform older than the flag, which
+    /// `approvals --requester-identity` reports instead of reading it as off.
+    #[serde(default)]
+    pub connector_requester_identity: Option<bool>,
+    /// The version the flag's next compare-and-set write must name.
+    #[serde(default)]
+    pub connector_requester_identity_version: Option<u64>,
 }
 
 /// An operator authored hook configuration file. Absent maps are omitted from
@@ -5037,6 +5045,88 @@ impl ApiClient {
             .json()
             .await
             .context("decoding updated agent")
+    }
+
+    /// Compare-and-set the agent's connector requester identity flag (ADR 0270
+    /// decision 1): `PATCH /agents/{id}` carrying ONLY the flag and the version
+    /// it expects, which the API requires. Sent once; a 409 is a recovery for
+    /// the operator, never retried here with a freshly read version.
+    pub async fn set_connector_requester_identity(
+        &self,
+        agent_id: &str,
+        enabled: bool,
+        expected_version: u64,
+    ) -> Result<Agent> {
+        use crate::exit::CliError;
+        use reqwest::StatusCode;
+        let what = "setting connector requester identity";
+        let resp = self
+            .send_request(
+                self.http
+                    .patch(format!("{}/agents/{agent_id}", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<AgentUpdate>(&AgentUpdate {
+                        connector_requester_identity: Some(enabled),
+                        connector_requester_identity_expected_version: Some(expected_version),
+                        ..AgentUpdate::default()
+                    }),
+                "PATCH /agents/{id} (connector requester identity)",
+            )
+            .await?;
+        let status = resp.status();
+        if status.is_success() || status.is_redirection() {
+            return Self::expect_ok(resp, what)
+                .await?
+                .json()
+                .await
+                .context("decoding updated agent");
+        }
+        let body = resp.text().await.unwrap_or_default();
+        let detail = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .map(|value| value["detail"].clone());
+        let code = detail
+            .as_ref()
+            .and_then(|detail| detail["code"].as_str())
+            .map(str::to_string);
+        let reason = match (&code, &detail) {
+            (Some(code), Some(detail)) => match detail["message"].as_str() {
+                Some(message) => format!("{code}: {message}"),
+                None => code.clone(),
+            },
+            _ => api_detail_reason(&body).unwrap_or_else(|| status.to_string()),
+        };
+        let message = format!("{what} failed with {status}: {reason}");
+        let error = match (status, code.as_deref()) {
+            (StatusCode::CONFLICT, _) => CliError::failure(message).with_fix(
+                "another write moved the agent's connector requester identity version since \
+                 it was read. Run `curie <local|cluster> approvals <AGENT> --requester-identity \
+                 show`, confirm the current state, then retry with --expected-version set to \
+                 the version it reports",
+            ),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("requester_identity_requires_http_identity"),
+            ) => CliError::usage(message).with_fix(
+                "enabling needs the tenant's HTTP identity selection and an operator \
+                 receiver registration (Slack or email) that lists one of this agent's \
+                 bindings. Configure both, complete the rollout of the api, worker and the \
+                 agent's connector proxies, then retry",
+            ),
+            (StatusCode::UNPROCESSABLE_ENTITY | StatusCode::BAD_REQUEST, _) => {
+                CliError::usage(message)
+            }
+            (StatusCode::NOT_FOUND, _) if is_unrouted(status, &body) => CliError::failure(format!(
+                "{what} failed: this platform release does not have that endpoint, so it is \
+                 older than this CLI"
+            ))
+            .with_fix("upgrade the release, or use a CLI matching it"),
+            (StatusCode::UNAUTHORIZED, _) => CliError::failure(message)
+                .with_fix("verify --api-key or CURIE_API_KEY matches the selected platform API"),
+            (s, _) if s.is_server_error() => CliError::transient(message),
+            _ => CliError::failure(message),
+        };
+        Err(anyhow::Error::from(error))
     }
 
     /// Enqueue an on-demand platform eval run: `POST /evals/trigger`. With no

@@ -983,6 +983,25 @@ fn dev_subcommands_parse() {
             _ => panic!("dev oidc-e2e parsed as another command"),
         }
     }
+    let cli = try_parse_from([
+        "curie",
+        "dev",
+        "identity-e2e",
+        "--",
+        "observe",
+        "--context",
+        "kind-x",
+        "--agent",
+        "a",
+    ])
+    .expect("dev identity-e2e should pass its action and flags through");
+    match cli.command {
+        Some(Command::Dev {
+            action: DevAction::IdentityE2e { args },
+        }) => assert_eq!(args, ["observe", "--context", "kind-x", "--agent", "a"]),
+        _ => panic!("dev identity-e2e parsed as another command"),
+    }
+    assert!(try_parse_from(["curie", "dev", "identity-e2e"]).is_err());
     let cli = try_parse_from(["curie", "dev", "chart-runtime-e2e"])
         .expect("dev chart-runtime-e2e should parse");
     assert!(matches!(

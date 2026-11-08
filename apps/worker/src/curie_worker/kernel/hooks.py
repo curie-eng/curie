@@ -22,6 +22,7 @@ from ..sandbox.types import (
     SandboxHandle,
 )
 from ..turn_progress import (
+    TurnProgressPlan,
     activate_turn_progress,
     deactivate_turn_progress,
 )
@@ -188,6 +189,24 @@ async def _post_notice_after_error(self: Kernel, qevent: QueuedTurn, carry: _Hoo
         await self._post_coverage_notice(qevent, routing._route_from_handle(qevent), text)
 
 
+async def _own_opened_turn(
+    self: Kernel, handle: SandboxHandle, turn: TurnStream, plan: TurnProgressPlan | None
+) -> None:
+    """Record the turn this delivery just opened (ADR 0270 decision 3 [D2]).
+
+    A lost lease then stops it at its own sandbox. The record stops the turn
+    at once when the lease was lost while the start was in flight; if that
+    stop is cancelled the turn is closed here, since the caller never gets it.
+    """
+    try:
+        await self._own_execution(handle, turn.turn_epoch)
+    except BaseException:  # noqa: BLE001 - the unreturned turn is closed, then re-raised
+        turn.close()
+        if plan is not None and self._progress is not None:
+            await deactivate_turn_progress(self._progress, plan)
+        raise
+
+
 async def _start_turn_under_hook_control(
     self: Kernel,
     handle: SandboxHandle,
@@ -201,6 +220,10 @@ async def _start_turn_under_hook_control(
     from .identity import check
 
     await check(self, "start")
+    # ADR 0270 decision 3: a turn on a principal-bearing route runs for at most
+    # the requester window. Every credential below, and the runner's stream
+    # deadline, is bound from this capped budget.
+    remaining_s, window_bound = self._bound_requester_turn(handle, remaining_s)
     if event.tool_access is not None:
         # @spec WORKER-TOOL-ACCESS-2: every path that opens a turn comes
         # through here, the attachment handoff included.
@@ -237,6 +260,10 @@ async def _start_turn_under_hook_control(
             if not allowed:
                 raise failures.HookPaused("cron hook paused before runner start")
             try:
+                # ADR 0270 decision 3: immediately before the runner start, the
+                # window the token has left caps (or refuses) the turn once more.
+                remaining_s, rebound = self._bound_requester_turn(handle, remaining_s)
+                window_bound = window_bound or rebound
                 turn = await self._runner.start_turn(
                     handle.base_url,
                     event,
@@ -248,11 +275,18 @@ async def _start_turn_under_hook_control(
                 if plan is not None and self._progress is not None:
                     await deactivate_turn_progress(self._progress, plan)
                 raise
+            await _own_opened_turn(self, handle, turn, plan)
+            if window_bound:
+                turn.requester_window_bound = True
             if mint is not None:
                 self._record_turn_deadline(mint.grant, remaining_s)
             memory._note_live_memory_turn(turn)
             return turn
     try:
+        # ADR 0270 decision 3: immediately before the runner start, the
+        # window the token has left caps (or refuses) the turn once more.
+        remaining_s, rebound = self._bound_requester_turn(handle, remaining_s)
+        window_bound = window_bound or rebound
         turn = await self._runner.start_turn(
             handle.base_url,
             event,
@@ -264,6 +298,9 @@ async def _start_turn_under_hook_control(
         if plan is not None and self._progress is not None:
             await deactivate_turn_progress(self._progress, plan)
         raise
+    await _own_opened_turn(self, handle, turn, plan)
+    if window_bound:
+        turn.requester_window_bound = True
     if mint is not None:
         self._record_turn_deadline(mint.grant, remaining_s)
     # This attempt owns the turn, so it closes the steers that join it.

@@ -112,6 +112,12 @@ pub struct AgentUpdate {
     pub approval_required_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_routes: Option<BTreeMap<String, ApprovalRouteBindingWrite>>,
+    /// ADR 0270 decision 1. Sent only with the expected version below and
+    /// nothing else: the API refuses a flag write sharing its PATCH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_requester_identity: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_requester_identity_expected_version: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_deadline_seconds: Option<Option<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

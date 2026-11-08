@@ -1020,7 +1020,13 @@ class Consumer(StreamConsumer):
 
         A capacity wake may have started no turn, or a later message may now
         own the thread. Its recorded epoch is the only runner turn this callback
-        may stop. Other deliveries keep the existing thread interrupt path.
+        may stop.
+
+        Every other delivery stops only what this lease acquisition opened or
+        steered into, at the sandbox it recorded (ADR 0270 decision 3). One
+        that opened or steered nothing (it lost its lease waiting on the order
+        lock, the authority answer or a liveness probe) stops nothing, so it
+        never ends another delivery's turn, another person's included.
 
         Every failure is logged and swallowed. Failing to interrupt must not mask
         the lease loss itself, which ``lease.lost`` has already recorded and which
@@ -1028,15 +1034,19 @@ class Consumer(StreamConsumer):
         the second, independent guard against a turn that keeps running here.
         """
         try:
-            qevent = from_stream_fields(fields)
+            # Read before any await: the loss task drops ``_notice_lease``.
+            lease = self._held_leases.get(entry_id) or self._notice_lease.get(entry_id)
             if WAIT_GENERATION_FIELD in fields:
+                qevent = from_stream_fields(fields)
                 generation = int(fields[WAIT_GENERATION_FIELD])
                 record = await self._waits.get(qevent.event_id)
                 if record is None or record.generation != generation or record.grant_epoch is None:
                     return
                 await self._kernel.resolve_capacity_grant(qevent, record.grant_epoch)
                 return
-            await self._kernel.interrupt_thread(_thread_key_for(qevent), "delivery lease lost")
+            if lease is None:
+                return
+            await self._kernel.stop_owned_execution(lease.owner, "delivery lease lost")
         except Exception:
             logger.exception(
                 "could not interrupt the runner for entry %s after its delivery "

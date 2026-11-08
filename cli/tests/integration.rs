@@ -16,6 +16,7 @@ mod approval_pending_approvers;
 mod approval_presentation;
 mod approval_principal;
 mod approval_recovery_cli;
+mod approval_requester_identity;
 mod approval_route_bindings;
 mod approval_route_precheck;
 mod approvals_list_truncation;

@@ -13,8 +13,8 @@ import hashlib
 import hmac
 import logging
 import uuid
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -50,6 +50,7 @@ from .http_invocation import (
     capture_source,
     lookup_request,
     registered_sender,
+    resolved_identity,
     source_facts,
     source_permission,
     turn_invocation_source,
@@ -901,7 +902,43 @@ async def check_http_approval_actor(
         _unavailable()
 
 
+@dataclass(frozen=True)
+class ApprovedResumeCurrent:
+    """An approved resume's final reader plus its freshly verified original invoker.
+
+    ``invoker`` is the invocation role's canonical identity from this same
+    composition, or None when its fresh outcome is not resolved;
+    ``invoker_human`` says whether that application carried a human
+    principal. Never the approver's. @spec CONNECTOR-REQUESTER-1 HTTP-APPROVAL-CONTINUITY-8.
+    """
+
+    authority: CurrentResumeAuthority
+    invoker: codec.ContextCanonicalV1 | None = field(repr=False)
+    invoker_human: bool = field(repr=False)
+
+
+ApprovedResumeInvokerAuthority = Callable[
+    [wire.ApprovalContextV1], AbstractAsyncContextManager[ApprovedResumeCurrent]
+]
+
+
 def approved_resume_authority(state: Any) -> ApprovedResumeAuthority:
+    """The current check publication uses: only the final reader and its windows.
+
+    @spec HTTP-APPROVAL-CONTINUITY-8/9/11.
+    """
+    observe = approved_resume_current(state)
+
+    @asynccontextmanager
+    async def authority(saved: wire.ApprovalContextV1) -> AsyncIterator[CurrentResumeAuthority]:
+        """@spec HTTP-APPROVAL-CONTINUITY-8/9/11."""
+        async with observe(saved) as current:
+            yield current.authority
+
+    return authority
+
+
+def approved_resume_current(state: Any) -> ApprovedResumeInvokerAuthority:
     """The two-subject current check an approved selected resume publishes under.
 
     Fresh original-invoker (purpose=invocation) and preserved answering-actor
@@ -911,11 +948,14 @@ def approved_resume_authority(state: Any) -> ApprovedResumeAuthority:
     finishes before the final read-only reader opens; that reader is yielded
     with the stable fence read under it and one T1 window per role, and it
     writes nothing. Phase 5 is absent. @spec HTTP-APPROVAL-CONTINUITY-8/9/11.
+
+    It also yields the invocation role's freshly verified identity, which the
+    turn current check projects for an opted-in agent. @spec CONNECTOR-REQUESTER-1.
     """
 
     @asynccontextmanager
-    async def authority(saved: wire.ApprovalContextV1) -> AsyncIterator[CurrentResumeAuthority]:
-        """@spec HTTP-APPROVAL-CONTINUITY-8/9/11."""
+    async def authority(saved: wire.ApprovalContextV1) -> AsyncIterator[ApprovedResumeCurrent]:
+        """@spec HTTP-APPROVAL-CONTINUITY-8/9/11 CONNECTOR-REQUESTER-1."""
         runtime = getattr(state, "http_identity_runtime", None)
         client = getattr(state, "http_identity_client", None)
         if type(runtime) is not HttpInvocationRuntime or not isinstance(
@@ -974,7 +1014,11 @@ def approved_resume_authority(state: Any) -> ApprovedResumeAuthority:
                     validity.lower_seconds * 1_000_000 + validity.lower_microseconds,
                     validity.upper_seconds * 1_000_000 + validity.upper_microseconds,
                 )
-            yield CurrentResumeAuthority(session=session, stable_fence=stable, windows=windows)
+            yield ApprovedResumeCurrent(
+                CurrentResumeAuthority(session=session, stable_fence=stable, windows=windows),
+                invoker=resolved_identity(facts["invocation"]),
+                invoker_human=composition.applications["invocation"].principal_id is not None,
+            )
 
     return authority
 

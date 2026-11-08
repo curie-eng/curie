@@ -287,6 +287,60 @@ an install its key this covers every runner from before it and any runner a
 worker pod the roll has not replaced yet boots; `charts/curie/README.md` says
 how long that window lasts.
 
+A `cct` may also carry `principal`, the verified human who made the request
+([ADR 0270](../../adr/0270-hosted-connectors-receive-the-verified-requester-as-a-signed-caller-claim.md)
+decision 2). It is an object with exactly `tenant_id`, a lowercase hyphenated
+UUID, `issuer`, 1 to 2048 characters, and `subject`, 1 to 256 characters. Each
+is a string that encodes to UTF-8 (a lone surrogate is refused), compared
+exactly. The `cct` key sets are closed: `agent` and `exp`, optionally the `run` and `work_item` pair, and
+optionally `principal`. A principal is complete or absent, so a null, empty,
+partial, extra-key or wrongly typed one, and a duplicate key at any depth of
+the payload, is `invalid`
+(`apps/worker/src/curie_connector_proxy/caller.py::claims`). The worker
+refuses before boot to build a principal that breaks these rules or to mint a
+token past the verifier's 4096 characters
+(`apps/worker/src/curie_worker/caller_token.py::CallerPrincipal`,
+`apps/worker/src/curie_worker/caller_token.py::MAX_TOKEN_CHARS`). The proxy
+returns the principal only on an admitted decision
+(`apps/worker/src/curie_connector_proxy/caller.py::Principal`), never on an
+`expired` or `not_admitted` refusal, and never logs it. Its decision log line
+ends `principal=present` or `principal=absent` on an admitted `cct` and has no
+principal field on a refusal or a `ccr`. A requester adds no
+admission: `admits` still judges only the agent. A `ccr` never carries a
+principal, and one that does is `invalid`
+(`apps/worker/src/curie_connector_proxy/caller.py::decide_route`), so a route
+holds no human authority.
+
+The worker mints a principal only for an agent whose operator flag
+`connector_requester_identity` is on. It is off by default, and every other
+agent's token keeps its exact bytes. The proxy drops every inbound
+`X-Curie-Principal` header
+(`apps/worker/src/curie_connector_proxy/caller.py::PRINCIPAL_HEADER`), in any
+letter case and however often it repeats, on `cct` and `ccr` paths alike,
+before the forward
+(`apps/worker/src/curie_connector_proxy/server.py::_NOT_FORWARDED`). This
+release does not yet set that header from the verified claim, so a connector
+sees no principal header at all; decision 4's projection is a later change.
+
+`connector_requester_identity` is experimental in this release and should stay
+off outside test installs. When it is on, an opted-in agent's hosted-connector
+caller tokens carry the verified human requester and the connector proxy
+verifies it, but the proxy does not yet pass the requester to connectors (a
+later release adds that), so connectors cannot act on it yet. The worker
+replaces a sandbox before serving a different requester and never runs one
+person's message under another person's token. A different person's message
+that arrives during a live turn waits for that turn to end, and if the turn
+outlasts the existing redelivery budget the message is settled visibly without
+running.
+
+As a precondition, the api, the worker and the agent's connector proxies must
+all run this release, and the agent must be redeployed first if its connector
+proxies predate it. A mixed state fails closed rather than leaking or widening
+authority: an older worker cannot read the turn authority answer that carries
+the requester and refuses the turn, and an older proxy refuses a
+principal-bearing `cct` as `invalid`, so the agent's connector calls are
+refused until the rollout completes.
+
 ## Implementations today
 
 One production host plus a fake:

@@ -459,6 +459,45 @@ def _reject_null_publication_switches(data: Any) -> Any:
     return data
 
 
+REQUESTER_IDENTITY_WRITE = frozenset(
+    {"connector_requester_identity", "connector_requester_identity_expected_version"}
+)
+# The flag column is INTEGER and every accepted write stores expected + 1.
+MAX_REQUESTER_IDENTITY_EXPECTED_VERSION = 2_147_483_646
+
+
+def _requester_identity_write_shape(update: "AgentUpdate") -> "AgentUpdate":
+    """One complete, solitary flag write (ADR 0270 decision 1).
+
+    The flag and the version it expects travel together, both non-null, and
+    nothing else rides in the same PATCH: every other field block in
+    ``update_agent`` commits on its own, so a flag write beside one could leave
+    that field persisted from a request answered with a refusal, or a losing
+    compare-and-set beside a winning sibling write. Refused here, before the
+    handler runs. @spec CONNECTOR-REQUESTER-1.
+    """
+
+    sent = update.model_fields_set
+    named = sent & REQUESTER_IDENTITY_WRITE
+    if not named:
+        return update
+    if (
+        named != REQUESTER_IDENTITY_WRITE
+        or update.connector_requester_identity is None
+        or update.connector_requester_identity_expected_version is None
+    ):
+        raise ValueError(
+            "connector_requester_identity and connector_requester_identity_expected_version "
+            "are written together and neither may be null"
+        )
+    if sent - REQUESTER_IDENTITY_WRITE:
+        raise ValueError(
+            "requester_identity_write_must_be_alone: send connector_requester_identity and "
+            "its expected version in a PATCH of their own"
+        )
+    return update
+
+
 def _validate_publication_policy_value(value: str | None) -> str | None:
     if value is None:
         return None
@@ -617,6 +656,14 @@ class AgentUpdate(BaseModel):
     publication_policy: Literal["approve", "auto"] | None = None
     publication_draft: bool | None = None
     publication_branch_prefix: str | None = None
+    # Whether this agent's connector calls carry the verified requester (ADR
+    # 0270 decision 1). Written only with the version last read, alone in its
+    # PATCH; explicit null is refused. Enabling also needs HTTP identity and a
+    # registered receiver, judged by the handler.
+    connector_requester_identity: Annotated[bool, Field(strict=True)] | None = None
+    connector_requester_identity_expected_version: (
+        Annotated[int, Field(strict=True, ge=1, le=MAX_REQUESTER_IDENTITY_EXPECTED_VERSION)] | None
+    ) = None
 
     _check_reviewer_model = field_validator("reviewer_model")(
         nullable_override_validator("reviewer_model", "a reviewer model id like 'claude-opus-5-5'")
@@ -640,6 +687,7 @@ class AgentUpdate(BaseModel):
     # same key stays required on `AgentCreate`.
     _reject_retired_channel_key = model_validator(mode="before")(_reject_retired_update_binding_key)
     _reject_null_publication = model_validator(mode="before")(_reject_null_publication_switches)
+    _requester_identity_alone = model_validator(mode="after")(_requester_identity_write_shape)
 
 
 class AgentOut(BaseModel):
@@ -683,6 +731,10 @@ class AgentOut(BaseModel):
     publication_policy_version: int = 1
     publication_draft: bool = False
     publication_branch_prefix: str | None = None
+    # ADR 0270 decision 1: the operator's requester identity flag and the
+    # version its next write must name.
+    connector_requester_identity: bool = False
+    connector_requester_identity_version: int = 1
     created_at: datetime
 
     @field_validator("secrets", mode="before")

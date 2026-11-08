@@ -3237,7 +3237,7 @@ export interface paths {
         put?: never;
         /**
          * Check Turn Authority
-         * @description @spec HTTP-INVOCATION-EXECUTION-8/16.
+         * @description @spec HTTP-INVOCATION-EXECUTION-8/16 CONNECTOR-REQUESTER-1.
          */
         post: operations["check_turn_authority_v1_internal_identity_turn_authority_check_post"];
         delete?: never;
@@ -4742,6 +4742,16 @@ export interface components {
             /** Channels */
             channels: components["schemas"]["ChannelBindingOut"][];
             /**
+             * Connector Requester Identity
+             * @default false
+             */
+            connector_requester_identity?: boolean;
+            /**
+             * Connector Requester Identity Version
+             * @default 1
+             */
+            connector_requester_identity_version?: number;
+            /**
              * Created At
              * Format: date-time
              */
@@ -4843,6 +4853,10 @@ export interface components {
             approval_routes?: {
                 [key: string]: components["schemas"]["ApprovalRouteBinding"];
             } | null;
+            /** Connector Requester Identity */
+            connector_requester_identity?: boolean | null;
+            /** Connector Requester Identity Expected Version */
+            connector_requester_identity_expected_version?: number | null;
             /** Deploy Notifications */
             deploy_notifications?: boolean | null;
             /** Execution Deadline Seconds */
@@ -10572,6 +10586,45 @@ export interface components {
             stage: "prepare" | "claim_or_resume" | "start" | "steer";
         };
         /**
+         * TurnAuthorityResponseV2
+         * @description Every version 1 field plus the required-nullable requester projection.
+         *
+         *     The API answers version 2 only for a continue on an agent that opted in to
+         *     connector requester identity; a null requester means no verified human. A
+         *     requester is bound to this answer's own checked scope and never rides a
+         *     refused or unavailable answer. @spec CONNECTOR-REQUESTER-1.
+         */
+        TurnAuthorityResponseV2: {
+            /** Context Sha256 */
+            context_sha256: string;
+            /**
+             * Decision
+             * @enum {string}
+             */
+            decision: "continue" | "refuse" | "unavailable";
+            /** Event Id */
+            event_id: string;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "current_authority" | "caller_not_allowed" | "invalid_context" | "unsupported_resume" | "authority_unavailable";
+            /** Request Id */
+            request_id: string;
+            requester: components["schemas"]["TurnRequesterV1"] | null;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 2;
+            scope: components["schemas"]["TurnAuthorityScopeV1"];
+            /**
+             * Stage
+             * @enum {string}
+             */
+            stage: "prepare" | "claim_or_resume" | "start" | "steer";
+        };
+        /**
          * TurnAuthorityScopeV1
          * @description @spec HTTP-INVOCATION-EXECUTION-16.
          */
@@ -10612,6 +10665,20 @@ export interface components {
              * @constant
              */
             version: "1.0";
+        };
+        /**
+         * TurnRequesterV1
+         * @description The verified original requester: tenant and canonical issuer and subject only.
+         *
+         *     Compared exactly; never normalized. @spec CONNECTOR-REQUESTER-1.
+         */
+        TurnRequesterV1: {
+            /** Issuer */
+            issuer: string;
+            /** Subject */
+            subject: string;
+            /** Tenant Id */
+            tenant_id: string;
         };
         /**
          * TurnSource
@@ -17973,7 +18040,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TurnAuthorityResponseV1"];
+                    "application/json": components["schemas"]["TurnAuthorityResponseV1"] | components["schemas"]["TurnAuthorityResponseV2"];
                 };
             };
             /** @description Validation Error */
