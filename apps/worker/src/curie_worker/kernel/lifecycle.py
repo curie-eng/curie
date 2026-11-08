@@ -1325,6 +1325,23 @@ async def _process_event(
                         )
                         await asyncio.sleep(backoff_s)
                         continue
+                carry = constants._HOOK_RUN_CARRY.get()
+                if (
+                    isinstance(busy, failures.HookPaused)
+                    and carry is not None
+                    and carry.state is not None
+                    and carry.state.source == "webhook"
+                ):
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                        hook_outcome="blocked",
+                        hook_reason="hook_paused",
+                    )
+                    return
                 if qevent.source is TurnSource.CRON and (
                     isinstance(busy, failures.HookPaused)
                     or (
@@ -1336,7 +1353,7 @@ async def _process_event(
                     # under the per-thread lock. Record the fire deferred and
                     # settle this delivery; the scheduler reopens the slot on
                     # a later tick or ages it out, so stream reclaim never
-                    # holds a cron turn. A targetless hook is never deferred.
+                    # holds a cron turn.
                     # A retry past its catch-up bound, busy or not, is
                     # skipped rather than deferred again.
                     expiry = retry_expiry(event_id)

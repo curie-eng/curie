@@ -363,12 +363,14 @@ RETURNING id
 _DEFERRED_SQL = """
 SELECT slot_utc FROM {schema}.hook_runs
 WHERE agent_id = :agent_id AND name = :name AND outcome = 'deferred'
+  AND source IN ('schedule', 'manual')
 ORDER BY slot_utc
 """
 
 _SETTLE_DEFERRED_SQL = """
 UPDATE {schema}.hook_runs SET outcome = CAST(:outcome AS text), reason = :reason, ended_at = now()
 WHERE agent_id = :agent_id AND name = :name AND slot_utc = :slot AND outcome = 'deferred'
+  AND source IN ('schedule', 'manual')
 RETURNING outcome
 """
 
@@ -378,6 +380,7 @@ _REOPEN_SQL = """
 UPDATE {schema}.hook_runs SET outcome = NULL, reason = NULL, ended_at = NULL, started_at = now(),
        lease_expires_at = now() + make_interval(secs => :lease_s)
 WHERE agent_id = :agent_id AND name = :name AND slot_utc = :slot AND outcome = 'deferred'
+  AND source IN ('schedule', 'manual')
 RETURNING id
 """
 

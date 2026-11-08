@@ -1,4 +1,4 @@
-"""Persist terminal outcomes for scheduled hook turns."""
+"""Persist provenance and terminal outcomes for hook turns."""
 
 from __future__ import annotations
 
@@ -87,6 +87,7 @@ class HookRunState:
     name: str
     slot_utc: datetime
     outcome: str | None
+    source: str
     # The row's own clock: a sweep checkpoint stated before it is not this
     # run's (ADR-0160, #2878).
     started_at: datetime
@@ -181,7 +182,7 @@ class HookRunRecorder:
                 row = (
                     await connection.execute(
                         text(
-                            "SELECT outcome, started_at, version_id "
+                            "SELECT outcome, source, started_at, version_id "
                             f"FROM {self._schema}.hook_runs "
                             "WHERE agent_id = :agent_id "
                             "AND name = :name AND slot_utc = :slot_utc"
@@ -205,6 +206,7 @@ class HookRunRecorder:
             name=key.name,
             slot_utc=key.slot_utc,
             outcome=row.outcome,
+            source=row.source,
             started_at=row.started_at,
             version_id=row.version_id,
         )
@@ -312,7 +314,7 @@ class HookRunRecorder:
                             "SET outcome = :outcome, reason = :reason, ended_at = now() "
                             "WHERE agent_id = :agent_id "
                             "AND name = :name AND slot_utc = :slot_utc "
-                            "AND outcome IS NULL RETURNING outcome"
+                            "AND outcome IS NULL RETURNING outcome, source"
                         ),
                         {
                             "agent_id": key.agent_id,
@@ -352,13 +354,13 @@ class HookRunRecorder:
                 "hook run outcome could not be stored",
                 code="backend",
             ) from exc
-        if closed:
+        if updated is not None:
             try:
                 record_metric(
                     "curie.schedule.fire",
                     attributes={
                         "service.name": "curie-worker",
-                        "trigger": "cron",
+                        "trigger": "webhook" if updated.source == "webhook" else "cron",
                         "outcome": outcome,
                     },
                 )
