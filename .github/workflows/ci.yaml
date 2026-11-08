@@ -2064,6 +2064,18 @@ jobs:
     if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.ci-images.result == 'success' || needs.ci-images.result == 'skipped') }}
     env:
       CURIE_REPO_TOOLCHAIN_PROOF: required
+      CI_REQUIRE_VALKEY_TESTS: "1"
+      TEST_VALKEY_PW: ""
+    services:
+      valkey:
+        image: valkey/valkey:8.1.10-alpine
+        ports:
+          - 26379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       # The per-run Docker daemon image (ADR 0217 decision 4): the curie-authz
       # plugin crate's fmt, clippy and tests, a build for both release arches (the

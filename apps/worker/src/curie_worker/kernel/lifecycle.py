@@ -528,24 +528,7 @@ async def _process_event(
 
         # Crash-safety: prior observed or unconfirmed execution latched the
         # retry fence but never reached done. Do not auto-retry the action.
-        if await self._markers.saw_side_effect(event_id):
-            # This path is NOT silent: it is the one message a human most
-            # needs to see. It runs before binding resolution, so it emits
-            # over the server-minted handle's route, verbatim -- never a
-            # lookup it cannot reach and never a default standing in for a
-            # missing adapter.
-            #
-            # And it is a DURABLE TERMINAL OUTCOME, so it completes through
-            # the same ordering every other terminal path uses (driver
-            # adjudication, superseding the earlier "suppress the completion
-            # here" wording). Marking done without a completion is only
-            # survivable on an edit-in-place channel: a BUFFERED adapter
-            # accumulates the reply and flushes on ``turn.completed``, so a
-            # suppressed completion writes the escalation, marks the turn
-            # done, and never delivers it -- silently, on exactly the channel
-            # with nobody watching a thread. The handle-derived route is what
-            # the record stores, so a sweeper re-emits over the same
-            # transport the escalation text went to.
+        async def halt_prior_side_effect() -> None:
             escalation_update = await self._escalate(
                 qevent,
                 route,
@@ -563,7 +546,22 @@ async def _process_event(
                 hook_outcome="failed",
                 hook_reason="prior_side_effect",
             )
-            return
+
+        if await self._markers.saw_side_effect(event_id):
+            predecessor = await asyncio.to_thread(self._substrate.lookup, thread_key)
+            predecessor_watch = (
+                await self._markers.watched_turn(predecessor.claim_name)
+                if predecessor is not None
+                else None
+            )
+            if not (
+                lease is not None
+                and lease.generation > 1
+                and predecessor_watch is not None
+                and json.loads(predecessor_watch)["event_id"] == event_id
+            ):
+                await halt_prior_side_effect()
+                return
 
         # ADR-0168 decision 6: a turn one of this installation's own
         # identities wrote counts against the sibling limit, and past it
@@ -1092,10 +1090,8 @@ async def _process_event(
         # message text, so kernel rule 3 stands -- may not simply route: the
         # ordinary path would STEER into a retained live turn, which is right
         # for a follow-up and wrong for a retry of the same event. Placed
-        # deliberately AFTER the side-effect check above (rule 1 of the
-        # preflight is that check, and a marker must forbid replay before any
-        # interrupt-and-rehydrate is contemplated) and BEFORE the first
-        # attempt.
+        # before the first attempt. A watched predecessor must quiesce before
+        # its side-effect escalation can settle and remove the recovery watch.
         reclaim_preflight_pending = (
             claim._is_fenced(lease) and lease is not None and lease.generation > 1
         )
@@ -1234,6 +1230,9 @@ async def _process_event(
                     )
                     continue
                 reclaim_preflight_pending = False
+            if await self._markers.saw_side_effect(event_id):
+                await halt_prior_side_effect()
+                return
             try:
                 outcome = await self._attempt(
                     qevent,

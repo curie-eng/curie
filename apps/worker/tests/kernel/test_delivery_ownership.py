@@ -2253,3 +2253,197 @@ def test_the_running_consumer_redelivers_a_failed_turn_without_a_manual_reclaim(
             )
 
     asyncio.run(go())
+
+
+def test_settled_non_durable_runner_keeps_its_route(make_harness) -> None:
+    import json
+
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS, abandoned_turn_grace_s=0.001) as h:
+            event = _qevent("complete", event_id="settled-deferred-history")
+            thread = _thread_key_for(event)
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            await consumer.ensure_group()
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.hold = asyncio.Event()
+            h.runner.tail = [Final(text="done", status=DONE)]
+            h.runner.history_durable = False
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            entry, fields = await _read_one(h, h.config.consumer_name)
+            await consumer._dispatch(entry, fields)
+            await _wait_until(lambda: bool(h.runner.queried))
+            handle = h.substrate.lookup(thread)
+            assert handle is not None
+            expected = await h.kernel._markers.watched_turn(handle.claim_name)
+            assert expected is not None
+            assert json.loads(expected)["event_id"] == event.event_id
+            h.runner.hold.set()
+            await _settle(consumer)
+            assert await h.kernel._markers.is_terminal(event.event_id)
+            assert await h.kernel._markers.watched_turns() == {}
+            await h.async_redis.hset(
+                h.kernel._markers._turn_recovery_key(), handle.claim_name, expected
+            )
+            assert await h.kernel.reap_orphans() == []
+            assert await h.kernel._markers.watched_turns() == {}
+            assert h.substrate.lookup(thread) == handle
+            assert h.runner.history_durable is False
+            assert not await h.kernel._workspace_handoff_ready(handle, remaining_s=1)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("side_effect", [False, True])
+def test_reaper_persists_unacknowledged_side_effect_before_retirement(
+    make_harness, monkeypatch, sync_redis, side_effect: bool
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS, abandoned_turn_grace_s=0.001) as h:
+            event = _qevent("recover", event_id="unacknowledged-action")
+            thread = _thread_key_for(event)
+            handle = h.substrate.claim(thread)
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            await consumer.ensure_group()
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            entry, fields = await _read_one(h, h.config.consumer_name)
+            lease = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
+            )
+            await h.kernel._markers.watch_turn(thread, handle.claim_name, lease, event.event_id)
+            h.runner.turn_active = True
+            h.runner.side_effect_emitted = side_effect
+            original = h.substrate.release_if_claim
+
+            def retire(*args):
+                assert (
+                    bool(sync_redis.exists(h.config.side_effect_key(event.event_id))) is side_effect
+                )
+                return original(*args)
+
+            monkeypatch.setattr(h.substrate, "release_if_claim", retire)
+            await store.release(
+                lease.stream, lease.group, lease.entry_id, owner=lease.owner, resume_event_id=None
+            )
+            async with asyncio.timeout(5):
+                while not await h.kernel.reap_orphans():
+                    pass
+            assert await h.kernel._markers.saw_side_effect(event.event_id) is side_effect
+            h.runner.turn_active = False
+            await consumer._dispatch(entry, fields)
+            await _settle(consumer)
+            if side_effect:
+                assert h.runner.opened == []
+                assert "A prior attempt may already have executed an action" in h.sink.last_text
+            else:
+                assert h.runner.opened == ["recover"]
+            assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
+
+    asyncio.run(go())
+
+
+def test_failed_watch_retirement_does_not_starve_other_reaps(make_harness, monkeypatch) -> None:
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS, abandoned_turn_grace_s=0.001) as h:
+            markers = h.kernel._markers
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            await consumer.ensure_group()
+            claims = []
+            for name in ("unreachable", "reachable"):
+                event = _qevent(name, thread=name, event_id=name)
+                thread = _thread_key_for(event)
+                handle = h.substrate.claim(thread)
+                await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+                entry, _fields = await _read_one(h, h.config.consumer_name)
+                lease = await store.acquire(
+                    h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
+                )
+                await markers.watch_turn(thread, handle.claim_name, lease, event.event_id)
+                await store.release(
+                    lease.stream,
+                    lease.group,
+                    lease.entry_id,
+                    owner=lease.owner,
+                    resume_event_id=None,
+                )
+                claims.append((thread, handle.claim_name))
+            h.runner.turn_active = True
+            original = h.substrate.release_if_claim
+
+            def retire(thread, name):
+                if name == claims[0][1]:
+                    raise RuntimeError("control endpoint unavailable")
+                return original(thread, name)
+
+            monkeypatch.setattr(h.substrate, "release_if_claim", retire)
+            orphan_reaps = []
+            original_reap = h.substrate.reap_orphans
+
+            def reap():
+                orphan_reaps.append(True)
+                return original_reap()
+
+            monkeypatch.setattr(h.substrate, "reap_orphans", reap)
+            async with asyncio.timeout(5):
+                while claims[1][1] not in await h.kernel.reap_orphans():
+                    pass
+            assert orphan_reaps
+            assert set(await markers.watched_turns()) == {claims[0][1]}
+            assert h.substrate.lookup(claims[0][0]) is not None
+            monkeypatch.setattr(h.substrate, "release_if_claim", original)
+            assert claims[0][1] in await h.kernel.reap_orphans()
+            assert await markers.watched_turns() == {}
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("persisted", [False, True])
+def test_reclaim_waits_for_side_effecting_predecessor_retirement(
+    make_harness, persisted: bool
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS, abandoned_turn_grace_s=0.001) as h:
+            event = _qevent("do not replay", event_id="side-effect-before-preflight")
+            thread = _thread_key_for(event)
+            handle = h.substrate.claim(thread)
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            await consumer.ensure_group()
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            entry, fields = await _read_one(h, h.config.consumer_name)
+            lease = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
+            )
+            await h.kernel._markers.watch_turn(thread, handle.claim_name, lease, event.event_id)
+            await store.release(
+                lease.stream, lease.group, lease.entry_id, owner=lease.owner, resume_event_id=None
+            )
+            h.runner.turn_active = True
+            h.runner.history_durable = False
+            h.runner.side_effect_emitted = True
+            if persisted:
+                await h.kernel._markers.mark_side_effect(event.event_id)
+            await consumer._dispatch(entry, fields)
+            try:
+                await _wait_until(lambda: bool(h.runner.interrupts))
+                assert h.sink.completions == []
+                assert await h.kernel._markers.watched_turn(handle.claim_name) is not None
+                async with asyncio.timeout(5):
+                    while not await h.kernel.reap_orphans():
+                        pass
+                await _settle(consumer)
+                assert h.runner.opened == []
+                assert h.substrate.lookup(thread) is None
+                assert h.sink.last_text == (
+                    "curie-turn-failure: prior-side-effect\n\n"
+                    "A prior attempt may already have executed an action; "
+                    "not retrying automatically. Flagging for a human."
+                )
+                assert [c.outcome for c in h.sink.completions] == ["escalated"]
+            finally:
+                consumer.request_stop()
+                await _settle(consumer)
+
+    asyncio.run(go())

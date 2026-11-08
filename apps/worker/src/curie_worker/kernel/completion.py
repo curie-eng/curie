@@ -384,6 +384,10 @@ async def _complete(
             # successor drops at the terminal-row preamble.
             await self._markers.publish_successor(self._config.stream, successor.model_dump_json())
         await self._markers.mark_done(event_id, marker_value=marker_value, generation=generation)
+    try:
+        await self._markers.forget_settled_turn(event_id)
+    except Exception:  # noqa: BLE001 - terminal settlement already committed
+        logger.warning("could not clear settled turn watch for %s", event_id, exc_info=True)
     constants._LIFECYCLE_OUTCOME.set(telemetry_outcome)
     if notice is not None and hook_carry is not None:
         hook_carry.notice_pending = None
@@ -509,6 +513,10 @@ async def _settle_targetless(
             return
     else:
         await self._markers.mark_done_without_completion(event_id)
+    try:
+        await self._markers.forget_settled_turn(event_id)
+    except Exception:  # noqa: BLE001 - terminal settlement already committed
+        logger.warning("could not clear settled turn watch for %s", event_id, exc_info=True)
     constants._LIFECYCLE_OUTCOME.set(telemetry_outcome)
     log.record_metric(
         "curie.turn.completed",

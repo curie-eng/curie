@@ -44,7 +44,10 @@ async def main() -> None:
     engine = create_async_engine(config.database_url, pool_size=4, max_overflow=0)
     async with Redis(**connection) as store:
         client = StaticPoolSandboxClient(
-            slots=[StaticShellSlot("proof-0", "localhost", spec["port"], "crash-pool")],
+            slots=[
+                StaticShellSlot(f"proof-{index}", "localhost", port, "crash-pool")
+                for index, port in enumerate(spec["ports"])
+            ],
             redis_client=sync,
             control_token=spec["control"],
             ssl_context=shell_ssl_context(spec["ca"]),
