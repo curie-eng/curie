@@ -1,10 +1,12 @@
 """File-driven source boot against owned backends, not installation qualification."""
 
 import asyncio
+import contextlib
 import dataclasses
 import time
 
 import pytest
+from curie_test_support.channel_gateway import reply_gateway
 from sqlalchemy import text
 
 from .protected_configuration_vectors import canonical
@@ -29,34 +31,47 @@ def test_actual_file_driven_boot_and_owned_runtime_shutdown(
         ):
             engine, schema = await database(primary_postgres, client)
             try:
-                async with external_reply() as (reply, calls):
+                async with external_reply() as (reply, calls), contextlib.AsyncExitStack() as owner:
+                    gateway = owner.enter_context(
+                        reply_gateway(
+                            {"adapter/example": "synthetic-slack-token"},
+                            reply._adapters["slack"]._default_base_url,
+                        )
+                    )
                     credential = owned_worker.credential()
                     for name, raw in {
                         "manifest.json": client._manifest.canonical_bytes,
                         "execution_config.json": client._execution.canonical_bytes,
-                        "worker.json": canonical({
-                            "schema_version": 1,
-                            "credential_ref": (
-                                client._manifest.as_dict()["credential_refs"]["worker"]
-                            ),
-                            "worker": {
-                                "username": credential.username, "password": credential.password,
-                            },
-                        }),
+                        "worker.json": canonical(
+                            {
+                                "schema_version": 1,
+                                "credential_ref": (
+                                    client._manifest.as_dict()["credential_refs"]["worker"]
+                                ),
+                                "worker": {
+                                    "username": credential.username,
+                                    "password": credential.password,
+                                },
+                            }
+                        ),
                         "ca.pem": owned_worker.broker.ca_pem.encode("ascii"),
-                        "process.json": canonical({
-                            "schema_version": 1, "database_url": primary_postgres,
-                            "db_schema": schema, "api_base_url": "https://api.example.com",
-                            "internal_worker_token": "synthetic-worker-token",
-                            "adapter_credentials": {},
-                            "slack": {
-                                "token": "synthetic-slack-token",
-                                "base_url": reply._adapters["slack"]._default_base_url,
-                                "identity_tokens": {"adapter/example": "synthetic-slack-token"},
-                                "trusted_origins": [],
-                            },
-                            "launch_tls": dataclasses.asdict(client._tls),
-                        }),
+                        "process.json": canonical(
+                            {
+                                "schema_version": 2,
+                                "database_url": primary_postgres,
+                                "db_schema": schema,
+                                "api_base_url": "https://api.example.com",
+                                "internal_worker_token": "synthetic-worker-token",
+                                "adapter_credentials": {},
+                                "channel_gateway": {
+                                    "url": gateway["channel_gateway_url"],
+                                    "token": gateway["channel_gateway_token"],
+                                    "allow_insecure_http": True,
+                                    "identities": ["adapter/example"],
+                                },
+                                "launch_tls": dataclasses.asdict(client._tls),
+                            }
+                        ),
                     }.items():
                         (tmp_path / name).write_bytes(raw)
                     if mode == "cancel-serve":

@@ -643,6 +643,7 @@ services:
       - CURIE_CHANNEL_GATEWAY_URL=http://localhost:${CURIE_LOCAL_GATEWAY_PORT:-8081}
       - CURIE_CHANNEL_GATEWAY_TOKEN=${CURIE_CHANNEL_GATEWAY_WORKER_TOKEN:-curie-dev-gateway-worker}
       - CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE=true
+      - CURIE_SLACK_TRUSTED_ORIGINS=${CURIE_SLACK_TRUSTED_ORIGINS-http://localhost,http://127.0.0.1,http://host.docker.internal}
       - CURIE_ATTACHMENT_MAX_FILE_BYTES=${CURIE_ATTACHMENT_MAX_FILE_BYTES:-33554432}
       # Per-adapter egress credentials (ADR-0096 D4.2): a JSON object mapping an
       # adapter slug (the binding row's `adapter`) to the secret the worker

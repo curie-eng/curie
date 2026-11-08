@@ -3626,7 +3626,7 @@ mod tests {
         &rest[..end]
     }
 
-    /// Assert the shared core(8)/full(6) profile binding in a compose file:
+    /// Assert the shared core/full profile binding in a compose file:
     /// the anchors are declared, the counts hold, AND each service block carries
     /// the anchor it should (so swapping a service's profile fails the test).
     fn assert_core_full_bindings(compose: &str, file: &str) {
@@ -3640,12 +3640,12 @@ mod tests {
         );
         assert_eq!(
             compose.matches("profiles: *core_profiles").count(),
-            8,
+            CORE_SERVICES.len(),
             "{file} core-profile count"
         );
         assert_eq!(
             compose.matches("profiles: *full_profiles").count(),
-            6,
+            FULL_SERVICES.len(),
             "{file} full-profile count"
         );
         for service in CORE_SERVICES {

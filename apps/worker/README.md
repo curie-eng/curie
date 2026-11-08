@@ -587,6 +587,7 @@ export CLAUDE_CODE_OAUTH_TOKEN=...        # or ANTHROPIC_API_KEY=... / CURIE_CRE
 env CURIE_SANDBOX_SUBSTRATE=docker \
     VALKEY_HOST=localhost VALKEY_PORT=26379 VALKEY_PASSWORD=valkeypass \
     CURIE_CHANNEL_GATEWAY_URL=http://localhost:8081 CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE=true \
+    CURIE_CHANNEL_GATEWAY_TOKEN=curie-dev-gateway-worker \
     CURIE_DOCKER_NETWORK=curie_default \
     OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
     uv run python -m curie_worker &
@@ -608,8 +609,14 @@ env CURIE_SANDBOX_SUBSTRATE=docker \
   `curie-runner`).
 - `VALKEY_HOST`/`VALKEY_PORT`/`VALKEY_PASSWORD` point at the compose stores.
   The worker uses a gateway caller credential for provider operations;
-  `SLACK_API_BASE_URL` points at the stack's Slack stub instead of real
-  slack.com.
+  configure `SLACK_API_BASE_URL` on the gateway to select the stack's Slack stub.
+
+The protected worker's `process.json` uses schema version 2 and a
+`channel_gateway` object with `url`, `token`, `allow_insecure_http` and
+`identities`. Its token authenticates this worker to the gateway. TLS is required
+unless `allow_insecure_http` is explicitly true. Empty URL, token and identities
+disable Slack delivery. Both worker entry points refuse ambient Slack tokens,
+and the protected worker rejects the former provider-credential configuration.
 
 Drive a turn the normal way once it's up (`curie local deploy` / `curie
 local message`, pinned at whichever API port you brought up) -- the hand-run
