@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 
 import pytest
@@ -10,6 +11,7 @@ from aci_protocol import EvalJob
 from curie_internal.connector_endpoints import BINDING_ENV
 from curie_runner import RunnerConfig
 from curie_worker.binding import BindingResolver, ResolvedDeployment
+from curie_worker.binding import apply_connector_endpoints
 from curie_worker.config import WorkerConfig
 from curie_worker.eval.stream import EvalStreamConsumer
 
@@ -26,6 +28,37 @@ _MAP = {
 def _config(monkeypatch: pytest.MonkeyPatch) -> WorkerConfig:
     monkeypatch.setenv("CURIE_CONNECTOR_ENDPOINTS", json.dumps(_MAP))
     return WorkerConfig(connector_caller_signing_key=_SEED)
+
+
+@pytest.mark.parametrize("substrate", ["kubernetes", "docker", "static"])
+@pytest.mark.parametrize("uploads", [False, True])
+def test_binding_warns_once_for_unsupported_upload_token_delivery(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    substrate: str, uploads: bool,
+) -> None:
+    monkeypatch.setenv("CURIE_SANDBOX_SUBSTRATE", substrate)
+    endpoints = {
+        "version": 1, "agents": {"acme-dev": {
+            name: {"base_url": "https://connectors.example.com/" + name,
+                   **({"upload_url": "https://uploads.example.com/" + name} if uploads else {})}
+            for name in ("reviewer", "uploads")
+        }},
+    }
+    monkeypatch.setenv("CURIE_CONNECTOR_ENDPOINTS", json.dumps(endpoints))
+    config = WorkerConfig(connector_caller_signing_key=_SEED)
+    env: dict[str, str] = {}
+    with caplog.at_level(logging.WARNING, logger="curie_worker.binding"):
+        apply_connector_endpoints(env, config, agent_name="acme-dev", caller_token="cct.test.sig")
+    records = [r for r in caplog.records if r.name == "curie_worker.binding"]
+    if uploads and substrate != "static":
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert substrate in message and "upload token" in message
+        assert "not supported" in message
+        assert "static" in message
+    else:
+        assert records == []
+    assert json.loads(env[BINDING_ENV])["agent"] == "acme-dev"
 
 
 def test_worker_projects_only_authenticated_agent_and_keeps_route_tokens(
