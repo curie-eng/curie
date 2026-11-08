@@ -503,6 +503,35 @@ def require_reference_connector(harness: Harness, agents: Sequence[str]) -> dict
     return seen
 
 
+def require_direct_refused(
+    direct: Mapping[str, Any], effects: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """A call around the caller proxy with a human's header established no requester.
+
+    ``direct`` is :meth:`Harness.connector_direct_effect`'s answer, ``effects``
+    the reference connector's outcome lines since it started. The call left a
+    non-loopback address, its tool result is ``refused missing_requester``, and
+    the connector logged exactly that outcome with no requester and applied no
+    effect.
+    """
+
+    check(
+        direct.get("source_loopback") is False,
+        "the direct call left from loopback, so it did not go around the caller proxy",
+    )
+    answer = (direct.get("status"), direct.get("is_error"), direct.get("text"))
+    check(
+        answer == (200, True, f"refused {MISSING_REQUESTER}"),
+        f"the direct call answered {answer}, expected (200, True, 'refused {MISSING_REQUESTER}')",
+    )
+    logged = [(str(e.get("outcome")), str(e.get("requester"))) for e in effects]
+    check(
+        logged == [(MISSING_REQUESTER, "-")],
+        f"the connector logged {logged}, expected one ({MISSING_REQUESTER}, -) line",
+    )
+    return {"answer": list(answer), "logged": logged}
+
+
 def await_effects(harness: Harness, agent: str, since: float) -> list[dict[str, Any]]:
     """The connector's outcome lines since ``since``, waiting briefly for a trailing line."""
 
@@ -816,6 +845,21 @@ def requester_effect(harness: Harness, args: Any, evidence: Evidence) -> None:
             principal=None,
             wait=wait,
         )
+
+    with evidence.step(
+        "E8",
+        f"a caller around the caller proxy presenting {sender}'s X-Curie-Principal is refused "
+        f"{MISSING_REQUESTER}",
+    ) as seen:
+        seen["header_fingerprint"] = principal_fingerprint(principal_a)
+        direct = harness.connector_direct_effect(
+            flag_agent, principal_header_value(principal_a), nonce("E8")
+        )
+        seen["direct"] = {
+            key: direct.get(key) for key in ("status", "is_error", "text", "source_loopback", "pod")
+        }
+        effects = await_effects(harness, flag_agent, float(direct["started"]) - CLOCK_SKEW_S)
+        seen["result"] = require_direct_refused(direct, effects)
 
 
 # --- requester-expiry ---------------------------------------------------------------

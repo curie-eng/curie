@@ -178,3 +178,55 @@ except Exception as exc:
     result = {"error": type(exc).__name__}
 print(json.dumps(result))
 """
+
+# Runs in a hosted connector pod's server container (never the caller proxy),
+# with a principal header on stdin. It dials the server on the pod's own
+# address, as a caller on the connector's -direct Service reaches it, so the
+# request does not arrive on the caller proxy's loopback forward. It sends one
+# MCP tools/call record_effect carrying the header and answers the HTTP status,
+# the tool result's error flag and text, and whether its own source address
+# was loopback. The header is never printed.
+DIRECT_EFFECT_SCRIPT = """
+import http.client, ipaddress, json, os, socket, sys
+
+P = json.load(sys.stdin)
+
+
+def main():
+    address = socket.gethostbyname(socket.gethostname())
+    if ipaddress.ip_address(address).is_loopback:
+        return {"error": "no pod address"}
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "record_effect", "arguments": {"note": P["note"]}},
+    }).encode()
+    port = int(os.environ.get("PORT", "8000"))
+    connection = http.client.HTTPConnection(address, port, timeout=20)
+    try:
+        connection.connect()
+        source = connection.sock.getsockname()[0]
+        connection.request("POST", "/mcp", body, {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "X-Curie-Principal": P["header"],
+        })
+        response = connection.getresponse()
+        raw = response.read()
+    finally:
+        connection.close()
+    result = json.loads(raw).get("result") or {}
+    content = result.get("content") or [{}]
+    return {
+        "status": response.status,
+        "is_error": bool(result.get("isError")),
+        "text": content[0].get("text"),
+        "source_loopback": ipaddress.ip_address(source).is_loopback,
+    }
+
+
+try:
+    result = main()
+except Exception as exc:
+    result = {"error": type(exc).__name__}
+print(json.dumps(result))
+"""

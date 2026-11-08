@@ -79,7 +79,7 @@ from identity_assets import (
     secret_manifest,
     set_path,
 )
-from identity_pod_scripts import PROXY_REPLAY_SCRIPT, ROUTE_DOCTOR_SCRIPT
+from identity_pod_scripts import DIRECT_EFFECT_SCRIPT, PROXY_REPLAY_SCRIPT, ROUTE_DOCTOR_SCRIPT
 from identity_target import (
     ADAPTER,
     ADOPT_SCRIPT,
@@ -1260,6 +1260,35 @@ class Harness:
         if not isinstance(result, dict) or "error" in result:
             failure = result.get("error") if isinstance(result, dict) else result
             raise HarnessError(f"the replay in {pod} failed: {failure}")
+        result.update(connector=connector, pod=pod, started=started, finished=finished)
+        return result
+
+    def connector_direct_effect(
+        self, name: str, header: str, note: str, connector: str = REFERENCE_CONNECTOR
+    ) -> dict[str, Any]:
+        """One ``record_effect`` to ``name``'s reference connector around its caller proxy.
+
+        Execs into the connector server container of a ready pod and dials the
+        server on the pod's own address, which is how a caller on the
+        connector's ``-direct`` Service reaches it, with ``header`` as its
+        ``X-Curie-Principal`` (passed on stdin). Returns ``status``,
+        ``is_error``, ``text`` and ``source_loopback``, plus the pod and the
+        host time window.
+        """
+
+        deployment = self.connector_deployment(name, connector)
+        container = connector_server_container(deployment)
+        pod = ready_pod(self._pods(deployment))
+        if pod is None:
+            raise HarnessError(f"no ready pod serves connector {connector} of {name}")
+        started = time.time()
+        result = self.target.exec_python(
+            pod, container, DIRECT_EFFECT_SCRIPT, {"header": header, "note": note}, timeout=60
+        )
+        finished = time.time()
+        if not isinstance(result, dict) or "error" in result:
+            failure = result.get("error") if isinstance(result, dict) else result
+            raise HarnessError(f"the direct call in {pod} failed: {failure}")
         result.update(connector=connector, pod=pod, started=started, finished=finished)
         return result
 
