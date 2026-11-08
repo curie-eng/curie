@@ -436,9 +436,13 @@ def dynamic(
     @spec REQUEST-APPROVAL-5.
     """
     request = dynamic_request(_turn(case), carried(case, ARGS, approvers=approvers))
-    accepted(create(case.client, request), request)
+    response = create(case.client, request)
+    assert response.status_code == 201, response.text
     found = rows(request["approval"]["dedupe_key"])
     assert len(found) == 1 and found[0]["selection_mode"] == "dynamic", found
+    # A dynamic creation answers the V2 receipt carrying the stored row's id.
+    assert response.json()["schema_version"] == 2, response.text
+    assert response.json()["id"] == str(found[0]["id"])
     return found[0]
 
 

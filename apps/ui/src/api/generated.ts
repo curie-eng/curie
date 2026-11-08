@@ -1607,7 +1607,10 @@ export interface paths {
          *     The authorizer runs first, server-side (#246): the route's approvers decide
          *     whether the authenticated principal belongs -- an explicit user list, a
          *     Slack user group, or (declaring none) the card channel's members (#420).
-         *     Requester equality neither grants nor vetoes membership. Then exactly one
+         *     Requester equality neither grants nor vetoes membership, except on a
+         *     canonical route (ADR 0271: dynamic selection or requester exclusion), which
+         *     only the HTTP answer composition may answer; every other principal there is
+         *     refused and audited, an operator first. Then exactly one
          *     authorized resolver wins
          *     the conditional UPDATE; a loser gets 409 naming who resolved it, and a
          *     past-SLA record flips to expired and returns 410 while still enqueuing the
@@ -5208,6 +5211,29 @@ export interface components {
             status: "pending" | "approved" | "rejected" | "expired";
         };
         /**
+         * ApprovalExemptGroup
+         * @description The one identity provider group exempt from requester exclusion (ADR 0271).
+         *
+         *     Named by canonical issuer and stable group id, compared byte for byte with
+         *     the requester's current directory groups at answer time.
+         */
+        ApprovalExemptGroup: {
+            /** Id */
+            id: string;
+            /** Issuer */
+            issuer: string;
+        };
+        /**
+         * ApprovalExemptGroupOut
+         * @description Read projection of a stored exempt group; tolerant for repair.
+         */
+        ApprovalExemptGroupOut: {
+            /** Id */
+            id?: string | null;
+            /** Issuer */
+            issuer?: string | null;
+        };
+        /**
          * ApprovalGrantAuthorityRequestV1
          * @description @spec HTTP-APPROVAL-CONTINUITY-12.
          */
@@ -5613,7 +5639,8 @@ export interface components {
          *     message carries no interaction. ``approvers`` continues to narrow WHO may
          *     act through the resolution card path and is never inferred from notification
          *     recipients. ``approver_ticket`` registers a per-request approver selector and
-         *     ``separation`` its requester exclusion (ADR 0271).
+         *     ``separation`` the route's requester exclusion, with or without a selector
+         *     (ADR 0271).
          */
         ApprovalRouteBinding: {
             approver_ticket?: components["schemas"]["ApproverTicketRegistration"] | null;
@@ -5648,23 +5675,30 @@ export interface components {
         };
         /**
          * ApprovalSeparation
-         * @description Requester exclusion for a registered selector route (ADR 0271).
+         * @description Requester exclusion on an approval route (ADR 0271 decision 6).
          *
-         *     Omitted on write stores ``{"exclude_requester": true}``; ``false`` is the
-         *     audited opt-out. ``exempt_group`` lands with its enforcement (0271b), so it
-         *     is refused here rather than stored unenforced.
+         *     On a route that registers an ``approver_ticket`` selector, omitting it
+         *     stores ``{"exclude_requester": true}`` and ``false`` is the audited opt-out.
+         *     On any other route it is stored as written: ``true`` enables static
+         *     exclusion, and omitting it keeps ordinary ADR 0106 self-confirmation.
+         *     ``exempt_group`` is valid only beside ``exclude_requester: true``.
          */
         ApprovalSeparation: {
             /** Exclude Requester */
             exclude_requester: boolean;
+            exempt_group?: components["schemas"]["ApprovalExemptGroup"] | null;
         };
         /**
          * ApprovalSeparationOut
          * @description Read projection of the stored, effective requester exclusion.
+         *
+         *     ``exempt_group`` is omitted, not null, when the route stores none, so a
+         *     route without one reads back exactly as before.
          */
         ApprovalSeparationOut: {
             /** Exclude Requester */
             exclude_requester?: boolean | null;
+            exempt_group?: components["schemas"]["ApprovalExemptGroupOut"] | null;
         };
         /**
          * ApprovalTargetOut
