@@ -914,31 +914,57 @@ async def _answer(
     factory: Any, valkey: Any, approval_id: uuid.UUID, *,
     principal: AuthenticatedApprovalPrincipal, answer: ApprovalAnswer, approver_sets: Any,
 ) -> Approval:
-    """@spec HTTP-APPROVAL-CONTINUITY-9."""
+    """Phases 1 to 5 of one answer. @spec HTTP-APPROVAL-CONTINUITY-9.
+
+    On a canonical route every refusal raised once the actor has authenticated
+    is audited once, at the phase 1 capture as at every later stage; an actor
+    that never authenticated is refused unaudited. @spec REQUEST-APPROVAL-5/6.
+    """
     # Phase 1: short reader capture of every required source.
-    async with factory() as session, session.begin():
-        await identity_fence.lock_identity_reader(session)
-        row = _pending(await session.get(Approval, approval_id, populate_existing=True))
-        saved = verified_capsule(runtime, row)
-        if saved is None or saved.status != "pending" or row.purpose != "session":
-            _refuse(403, "unsupported_approval")
-        actor_scope = (
-            _authenticate_email_actor(runtime, row, saved, principal, answer)
-            if principal.kind == "adapter"
-            else _authenticate_actor(runtime, row, saved, principal, answer)
+    audited: Approval | None = None
+    try:
+        async with factory() as session, session.begin():
+            await identity_fence.lock_identity_reader(session)
+            row = _pending(await session.get(Approval, approval_id, populate_existing=True))
+            saved = verified_capsule(runtime, row)
+            if saved is None or saved.status != "pending" or row.purpose != "session":
+                _refuse(403, "unsupported_approval")
+            route_binding = await approvals_crud.get_approval_route_binding(session, row)
+            # Detached while fully loaded, so a rollback of this reader cannot
+            # expire it: the capture refusal audit below reads it exactly as the
+            # phases after a committed capture do. @spec REQUEST-APPROVAL-5/6.
+            session.expunge(row)
+            actor_scope = (
+                _authenticate_email_actor(runtime, row, saved, principal, answer)
+                if principal.kind == "adapter"
+                else _authenticate_actor(runtime, row, saved, principal, answer)
+            )
+            if approval_selection.canonical_route(row, route_binding):
+                audited = row
+            try:
+                caller_registration, caller_source = turn_invocation_source(runtime, saved)
+            except HTTPException:
+                _deny()
+            caller = await _prepare(
+                session, runtime, "invocation", caller_registration, caller_source,
+            )
+            actor = await _prepare(
+                session, runtime, "approver", actor_scope.registration, actor_scope.source,
+            )
+            snapshot = approval_record_digest(row)
+    except ApprovalSettled:
+        raise
+    except (Exception, BaseExceptionGroup) as error:  # noqa: BLE001 - normalized below.
+        # @spec REQUEST-APPROVAL-5/6: a capture refusal after authentication on
+        # a canonical route is audited once, after this reader has rolled back
+        # and closed; every other failure propagates unchanged. The normalized
+        # refusal is never bound to a local (see below).
+        if audited is None:
+            raise
+        await _audit_answer_refusal(
+            factory, audited, principal, answer, _boundary_refusal(error), "capture",
         )
-        try:
-            caller_registration, caller_source = turn_invocation_source(runtime, saved)
-        except HTTPException:
-            _deny()
-        caller = await _prepare(
-            session, runtime, "invocation", caller_registration, caller_source,
-        )
-        actor = await _prepare(
-            session, runtime, "approver", actor_scope.registration, actor_scope.source,
-        )
-        route_binding = await approvals_crud.get_approval_route_binding(session, row)
-        snapshot = approval_record_digest(row)
+        raise _boundary_refusal(error) from None
     composition = _Composition(
         request, runtime, client, factory, valkey, approval_id, snapshot, row, route_binding,
         approver_sets, principal.subject, actor_scope.channel, [caller, actor],
@@ -946,10 +972,11 @@ async def _answer(
     )
     if not approval_selection.canonical_route(row, route_binding):
         return await _decide(composition, principal, answer, actor_scope)
-    # @spec REQUEST-APPROVAL-5/6: every refusal on a canonical route is audited
-    # once, after the phase that raised it has closed its reader, writer and
-    # fence; a grouped or unexpected failure reads as unavailable unless a
-    # definitive denial is inside it.
+    # @spec REQUEST-APPROVAL-5/6: every refusal on a canonical route after the
+    # actor authenticated is audited once, after the phase that raised it has
+    # closed its reader, writer and fence: the capture refusals above, and here
+    # those of the later phases. A grouped or unexpected failure reads as
+    # unavailable unless a definitive denial is inside it.
     try:
         return await _decide(composition, principal, answer, actor_scope)
     except ApprovalSettled:
@@ -1034,6 +1061,10 @@ async def _decide(
                 evidence={
                     "kind": "administrative_recovery", "recovery_key": answer.recovery_key,
                     "facts": list(answer.recovery_facts), "authenticated_actor": authenticated,
+                    # @spec REQUEST-APPROVAL-5/6: a recovery on a canonical route
+                    # records the same judgment as an ordinary answer.
+                    **({} if composition.selection_evidence is None
+                       else {"selection": composition.selection_evidence}),
                 } if recovery else {
                     "kind": "http_approval_answer", "authenticated_actor": authenticated,
                     "route": composition.route_evidence,
@@ -1085,6 +1116,9 @@ async def check_http_approval_actor(
             ):
                 _refuse(403, "unsupported_approval")
             route_binding = await approvals_crud.get_approval_route_binding(session, row)
+            # Detached while fully loaded, so a rollback of this reader cannot
+            # expire it: the capture refusal audit reads it as after a commit.
+            session.expunge(row)
             if approval_selection.canonical_route(row, route_binding):
                 audited = (row, saved)
             actor, association = _preserved_actor(runtime, row, saved)
@@ -1215,6 +1249,9 @@ def approved_resume_current(state: Any) -> ApprovedResumeInvokerAuthority:
                 ):
                     _refuse(403, "unsupported_approval")
                 route_binding = await approvals_crud.get_approval_route_binding(session, row)
+                # Detached while fully loaded, so a rollback of this reader cannot
+                # expire it: the capture refusal audit reads it as after a commit.
+                session.expunge(row)
                 if approval_selection.canonical_route(row, route_binding):
                     audited = row
                 actor, association = _preserved_actor(runtime, row, saved)
