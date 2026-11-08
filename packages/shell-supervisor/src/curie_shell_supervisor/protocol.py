@@ -54,6 +54,9 @@ STATE_STOPPING = "stopping"
 STATE_QUARANTINED = "quarantined"
 
 RUNNER_TOKEN_ENV = "CURIE_RUNNER_TOKEN"
+UPLOAD_TOKENS_ENV = "CURIE_CONNECTOR_UPLOAD_TOKENS_FILE"
+UPLOAD_TOKENS_FIELD = "connector_upload_tokens"
+UPLOAD_TOKENS_FILE = "connector-upload-tokens.json"
 
 # The claim names the worker mints (``curie-thread-<hash>-<nonce>``) are DNS
 # labels; anything else never reaches a path or a directory name.

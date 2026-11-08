@@ -455,6 +455,7 @@ def _static_pool_client(
         bundle_max_members=config.bundle_max_members,
         workspace_limits=_workspace_limits(config),
         attachment_limits=_attachment_limits(config),
+        connector_upload_signing_key=config.connector_caller_signing_key,
     )
 
 

@@ -194,7 +194,29 @@ an ingress must not route it to the MCP listener. Upload clients send a signed
 capability using its private key, agent, connector, and absolute expiry. Its
 signed claims are exactly `agent`, `connector`, and `exp`. Keep expiry short and
 deliver the capability only to the authorized upload client. Endpoint projection
-contains URLs only; it does not distribute upload credentials automatically.
+contains URLs only.
+
+On the static-pool substrate, the worker mints upload credentials while staging
+each claim. It uses the authenticated agent's endpoint projection, the staged
+bundle's hosted connector declarations and its `deploy.yaml` connector allowlist.
+Only connectors with an operator-configured `upload_url` receive a token. The
+worker's existing caller signing key stays on the worker; the authenticated
+staging archive carries only the minted tokens. The supervisor writes a JSON
+object mapping connector names to tokens in a fresh claim directory, mode `0400`,
+owned by the runner's UID (1000 in the standard image), and sets
+`CURIE_CONNECTOR_UPLOAD_TOKENS_FILE` to its absolute path. Bundle upload clients
+read this file and the URL map in `CURIE_CONNECTOR_UPLOAD_ENDPOINTS`. With no
+upload listener configured, no upload token is minted and no file is created.
+
+Tokens expire 3600 seconds after minting. There is no automatic renewal: an
+upload after expiry receives HTTP 403 with `error.data.curie_caller` equal to
+`expired` and an explicit expiry message. Start a fresh claim for new credentials.
+This keeps the shell free of a minting key and avoids a second credential-update
+protocol. The claim-end wipe removes the file. A copied token remains valid for
+its agent and connector until expiry, including after its claim ends; this is
+the accepted bound of the existing `ccu` wire. Kubernetes and Docker substrates
+do not currently deliver upload-token files automatically; this capability
+requires the static-pool substrate.
 
 The upload listener verifies the signature, expiry, admitted agent, and connector
 before streaming the bounded upload to task loopback. It rejects `/mcp`, other

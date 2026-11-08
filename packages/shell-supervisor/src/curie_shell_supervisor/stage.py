@@ -26,7 +26,7 @@ import shutil
 import stat
 import tarfile
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import BASE_CHILD_ENV, SupervisorConfig
@@ -38,6 +38,9 @@ from .protocol import (
     MANIFEST_NAME,
     MANIFEST_VERSION,
     RUNNER_TOKEN_ENV,
+    UPLOAD_TOKENS_ENV,
+    UPLOAD_TOKENS_FIELD,
+    UPLOAD_TOKENS_FILE,
     WORKSPACE_DIR,
 )
 
@@ -55,6 +58,7 @@ _OWNED_ENV = frozenset(
         PLUGIN_DIR_ENV,
         SANDBOX_ID_ENV,
         RUNNER_PORT_ENV,
+        UPLOAD_TOKENS_ENV,
         "LD_PRELOAD",
         "LD_LIBRARY_PATH",
         "PYTHONPATH",
@@ -77,6 +81,7 @@ class Manifest:
     withheld_env: frozenset[str]
     attachments: str
     workspace: bool
+    connector_upload_tokens: Mapping[str, str] = field(repr=False)
 
     @property
     def runner_token(self) -> str:
@@ -91,6 +96,7 @@ class StagedClaim:
     attachments: Path | None
     home: Path
     tmp: Path
+    upload_tokens: Path | None
 
 
 def _parse_manifest(raw: bytes, claim: str, generation: int) -> Manifest:
@@ -123,6 +129,12 @@ def _parse_manifest(raw: bytes, claim: str, generation: int) -> Manifest:
     attachments = value.get("attachments", "none")
     if attachments not in ATTACHMENT_MODES or not isinstance(value.get("workspace", False), bool):
         raise StageError("invalid attachment or workspace mode")
+    upload_tokens = value.get(UPLOAD_TOKENS_FIELD, {})
+    if not isinstance(upload_tokens, dict) or not all(
+        isinstance(name, str) and name and isinstance(token, str) and token
+        for name, token in upload_tokens.items()
+    ):
+        raise StageError("connector upload tokens must map connector names to credentials")
     return Manifest(
         claim=claim,
         generation=generation,
@@ -131,6 +143,7 @@ def _parse_manifest(raw: bytes, claim: str, generation: int) -> Manifest:
         withheld_env=frozenset(withheld),
         attachments=attachments,
         workspace=bool(value.get("workspace", False)),
+        connector_upload_tokens=upload_tokens,
     )
 
 
@@ -238,10 +251,18 @@ def prepare(
         for private in (home, tmp):
             private.mkdir()
             _own(private, uid, gid, dir_mode=0o700, file_mode=0o600)
+        upload_tokens: Path | None = None
+        if manifest.connector_upload_tokens:
+            upload_tokens = root / UPLOAD_TOKENS_FILE
+            fd = os.open(upload_tokens, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(dict(manifest.connector_upload_tokens), stream, sort_keys=True)
+                if uid is not None:
+                    os.fchown(stream.fileno(), uid, gid if gid is not None else -1)
     except BaseException:
         wipe(root)
         raise
-    return StagedClaim(root, bundle, workspace, attachments, home, tmp), manifest
+    return StagedClaim(root, bundle, workspace, attachments, home, tmp, upload_tokens), manifest
 
 
 def child_environment(
@@ -261,6 +282,9 @@ def child_environment(
     secret_names -= manifest.withheld_env
     env.update({name: environ[name] for name in secret_names if name in environ})
     env.update({k: v for k, v in manifest.env.items() if k not in _OWNED_ENV})
+    env.pop(UPLOAD_TOKENS_ENV, None)
+    if staged.upload_tokens is not None:
+        env[UPLOAD_TOKENS_ENV] = str(staged.upload_tokens)
     env.update(
         {
             "HOME": str(staged.home),

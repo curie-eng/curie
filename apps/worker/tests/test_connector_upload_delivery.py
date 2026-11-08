@@ -53,8 +53,7 @@ def test_only_this_agents_declared_upload_gets_a_one_hour_token(tmp_path: Path) 
     token = tokens["reviewer"]
     payload = json.loads(base64.urlsafe_b64decode(token.split(".")[1] + "=="))
     assert set(payload) == {"agent", "connector", "exp"}
-    assert before < payload["exp"] <= after + 3600
-    assert payload["exp"] - before <= 3600
+    assert before + 3600 <= payload["exp"] <= after + 3600
     assert caller.decide_upload(
         KEYS, token, connector="reviewer", admits=frozenset({"acme-dev"}), now=after
     ).admitted
@@ -63,9 +62,12 @@ def test_only_this_agents_declared_upload_gets_a_one_hour_token(tmp_path: Path) 
         ("reviewer", "acme-prod", after, caller.NOT_ADMITTED),
         ("reviewer", "acme-dev", payload["exp"], caller.EXPIRED),
     ):
-        assert caller.decide_upload(
-            KEYS, token, connector=connector, admits=frozenset({agent}), now=now
-        ).refusal == refusal
+        assert (
+            caller.decide_upload(
+                KEYS, token, connector=connector, admits=frozenset({agent}), now=now
+            ).refusal
+            == refusal
+        )
 
 
 def test_no_upload_listener_needs_no_key_or_bundle(tmp_path: Path) -> None:
@@ -102,5 +104,20 @@ def test_absent_deploy_file_allows_declared_hosted_connectors(tmp_path: Path) ->
     bundle = _bundle(tmp_path)
     (bundle / "deploy.yaml").unlink()
     assert set(mint_claim_upload_tokens(SEED, bundle=bundle, endpoints=_binding())) == {
-        "reviewer", "private"
+        "reviewer",
+        "private",
     }
+
+
+def test_other_authenticated_agent_receives_its_own_allowed_connector(tmp_path: Path) -> None:
+    tokens = mint_claim_upload_tokens(
+        SEED, bundle=_bundle(tmp_path), endpoints=_binding(agent="acme-prod")
+    )
+    assert set(tokens) == {"private"}
+    assert caller.decide_upload(
+        KEYS,
+        tokens["private"],
+        connector="private",
+        admits=frozenset({"acme-prod"}),
+        now=int(time.time()),
+    ).admitted

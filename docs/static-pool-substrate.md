@@ -212,6 +212,26 @@ certificate key or other claims' directories. The runner bearer is per claim
 and must differ from the control credential. Each claim gets a new directory,
 `HOME` and `TMPDIR`, and its bundle is read only.
 
+When the bound agent has configured upload listeners, the worker mints `ccu`
+tokens only for its declared and allowed hosted connectors with an `upload_url`.
+The staging manifest carries the token map separately from the child environment.
+The supervisor writes `connector-upload-tokens.json` inside the new claim
+directory, owned by UID 1000 in the standard image with mode `0400`, and sets
+`CURIE_CONNECTOR_UPLOAD_TOKENS_FILE` for the runner. It owns this environment
+variable, so a supplied path cannot override it. With no upload tokens, it
+creates no file and omits the variable. Retirement and suspension wipe the file
+with the rest of the claim directory.
+
+Upload credentials expire 3600 seconds after minting and are not renewed on a
+retained claim. Later uploads fail explicitly with HTTP 403 and the `expired`
+caller reason; a fresh claim receives new credentials. This uses the existing
+listener's expiry enforcement without adding a renewal API or giving signing
+authority to the shell. A copied token remains valid for its agent and connector
+until expiry, even after the claim-end wipe. This is the accepted authorization
+bound; the existing token wire has no claim identifier or revocation mechanism.
+Automatic upload-token file delivery is unsupported on the Kubernetes and Docker
+substrates.
+
 Before it serves, the supervisor walks the whole filesystem (virtual
 filesystems excepted) and refuses to start, with exit code 78, when the child
 could write any path outside the scratch roots, when a setuid or setgid file
