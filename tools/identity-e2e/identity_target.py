@@ -261,7 +261,12 @@ async def body(session):
     async with session.begin():
         current = await agent_role_policy.read_role_policy(
             session, tenant_id=tenant, agent_id=agent)
-    version = 0 if current is None else current.version
+        # The snapshot is None while the access policy row stores no roles, but
+        # the row (created by the teamless access-policy PUT) already has a
+        # version, which is what the change must name.
+        _agent, row, _null = await agent_role_policy.lock_policy_rows(
+            session, tenant_id=tenant, agent_id=agent, require_active=False)
+    version = 0 if row is None else row.version
     role = None if current is None else getattr(current.roles, name)
     previous = None if role is None or role.filter is None else role.filter.model_dump(mode="json")
     state = None if role is None else role.legacy_state
