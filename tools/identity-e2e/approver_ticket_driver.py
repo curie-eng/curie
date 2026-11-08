@@ -1215,7 +1215,7 @@ def _approval_for(
     now: int,
     registered_key: Any,
 ) -> tuple[dict[str, Any], _Turn | None, int | None]:
-    from aci_protocol import ApprovalRequest
+    from aci_protocol import READER_CONTEXT, ApprovalRequest
     from curie_internal.approver_ticket import (
         TicketError,
         execution_arguments_sha256,
@@ -1264,7 +1264,9 @@ def _approval_for(
             item, turn=turn.turn, agent_id=context.scope.agent_id, granted_arguments=arguments
         )
     try:
-        approval = ApprovalRequest.model_validate(fields).model_dump(mode="json")
+        approval = ApprovalRequest.model_validate(fields, context=READER_CONTEXT).model_dump(
+            mode="json"
+        )
     except ValueError:
         raise DriverRefusal(f"case {name}: the approval request does not validate") from None
     return approval, turn, issued_at
