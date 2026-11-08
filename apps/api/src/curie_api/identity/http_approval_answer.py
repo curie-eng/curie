@@ -30,7 +30,7 @@ from typing import Any, Literal, NoReturn, cast
 from curie_internal import identity_approval as wire
 from curie_internal import identity_context as codec
 from fastapi import HTTPException, Request
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api import approval_selection, identity_fence, principal_authority
@@ -79,6 +79,12 @@ _RECOVERY_AUDIT_ACTION = approvals_crud.RECOVERY_AUDIT_ACTION
 _RECOVERY_AUTHORIZER = "approval_recovery"
 _AUTHORIZER = "HttpApprovalAnswer"
 _RESUME_REFUSED: Literal["resume_refused"] = "resume_refused"
+# The transaction-local setting and value that let a dynamic approval become
+# ``approved`` in storage. Only this owner's final commit sets it, after the
+# canonical-route judgment. Migration 0156 (``0156_dynamic_approval_answer_gate``,
+# ``GATE_SETTING``/``GATE_VALUE``) holds the frozen copy its trigger compares.
+# @spec REQUEST-APPROVAL-5.
+SELECTION_ENFORCED = ("curie.approval_selection_enforced", "v1")
 
 
 def _error(status: int, code: str) -> HTTPException:
@@ -988,6 +994,17 @@ async def _decide(
     async with identity_fence.mutation(factory, valkey) as writer:
         async with writer.begin():
             current_facts = await composition.verify(writer, writer=True)
+            if (
+                answer.decision == ApprovalStatus.approved
+                and composition.row.selection_mode == "dynamic"
+                and composition.selection_evidence is not None
+            ):
+                # @spec REQUEST-APPROVAL-5: the selection was judged in this same
+                # transaction just above, so open the 0156 storage gate for it alone.
+                await writer.execute(
+                    text("SELECT set_config(:name, :value, true)"),
+                    {"name": SELECTION_ENFORCED[0], "value": SELECTION_ENFORCED[1]},
+                )
             locked = (await writer.execute(
                 select(Approval).where(Approval.id == approval_id).with_for_update()
                 .execution_options(populate_existing=True)
