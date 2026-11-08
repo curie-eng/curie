@@ -541,4 +541,16 @@ networks:
                         raise RuntimeError("qualification Compose resources survived teardown")
         finally:
             self.local_started = False
+            image_listing = [
+                "docker",
+                "image",
+                "ls",
+                "--format",
+                "{{.Repository}}:{{.Tag}}",
+                "--filter",
+                f"reference=*:{self.tag}",
+            ]
+            for index, reference in enumerate(self.run(*image_listing).splitlines()):
+                self.images[f"local-{index}"] = reference
             super().close()
+            assert not self.run(*image_listing).strip()
