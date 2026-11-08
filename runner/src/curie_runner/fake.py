@@ -444,7 +444,7 @@ def connector_tool_turn(last: str) -> list[Any]:
 # ``[fake:gated-connector-tool <connector> <tool> <json-object>]`` (ADR 0271)
 # emits one ToolUseBlock named ``mcp__<connector>__<tool>`` carrying exactly the
 # parsed object, so the permission gate runs over it like any scripted call.
-# It dials nothing; the approved call is made later with ``[fake:connector-tool]``.
+# The directive only raises the permission gate; it dials nothing.
 # A directive that does not parse falls back to the default turn.
 GATED_CONNECTOR_TOOL_MARKER = "[fake:gated-connector-tool"
 _GATED_CONNECTOR_TOOL_RE = re.compile(r"\[fake:gated-connector-tool (\S+) (\S+) (\{.*\})\]")

@@ -510,13 +510,13 @@ ADR 0271 decision 7, acceptance item 5 and the carried part of item 2: through
 the real worker, caller proxy and reference connector, with the two protected
 execution tools held for approval by the runner but absent from the proxy's
 gated list, a grant-less call has no effect; the grant the worker mints for an
-approved resume rides unspent on unrelated calls, is spent once by the
-approved call and is attested to the connector; and replay, forged attestation
-headers, changed arguments, batches and tampered tickets refuse, with an
-uncertain execution never resent. It needs `up --reference-connector`, two
-verified humans in `identity-e2e-members` (`--sender` writes, `--second-sender`
-approves) and the worker's connector reconciler off, which is the chart
-default:
+approved resume, sent with the resumed sandbox's own boot credentials, rides
+unspent on unrelated calls, is spent once by the approved call and is attested
+to the connector; and replay, forged attestation headers, changed arguments,
+batches and tampered tickets refuse, with an uncertain execution never resent.
+It needs `up --reference-connector`, two verified humans in
+`identity-e2e-members` (`--sender` writes, `--second-sender` approves) and the
+worker's connector reconciler off, which is the chart default:
 
 ```bash
 curie dev identity-e2e -- prove $T --scenario grant-attestation --evidence attestation.json
@@ -524,12 +524,13 @@ curie dev identity-e2e -- prove $T --scenario grant-attestation --evidence attes
 
 The caller proxy exists only on Kubernetes, so there is no Docker variant, and
 the scenario refuses to start on the Docker harness. Every email turn's text
-carries `grant-attestation <step> <nonce>` with a nonce for the run, and each
-step reads the proxy's and the connector's logs only from its own send (2 s of
-clock skew allowed). Spends are read from Valkey before and after each step,
-from inside the worker container with the worker's own client, as the first 16
-hex characters of the sha256 of each `connector-grant:<jti>` key's `jti`: the
-same fingerprint the connector logs as `grant=`.
+carries `grant-attestation <step> <nonce>` with a nonce for the run. Each
+email step reads the proxy's and the connector's logs only from its own send
+(2 s of clock skew allowed), and each probe only from its own pod-clock window.
+Spends are read from Valkey before and after each step, from inside the worker
+container with the worker's own client, as the first 16 hex characters of the
+sha256 of each `connector-grant:<jti>` key's `jti`: the same fingerprint the
+connector logs as `grant=`.
 
 1. G0: the worker Deployment does not set `CURIE_CONNECTOR_RECONCILE` true, so
    nothing renders the connector again during the run; the release's caller key
@@ -563,20 +564,26 @@ same fingerprint the connector logs as `grant=`.
    fingerprint. The harness looks in the claim's token Secret first, the way
    it reads the caller token, then in the claim's `spec.env`: the worker does
    not count the grant among the claim's scoped tokens, so it arrives there.
-   Nothing is spent yet. The resume claim's caller token is held in memory for
-   G9.
-5. G4 to G8 are email turns from `--sender` on C. Each must create no claim
-   and its dial must send the resume claim's caller token, so it ran in the
-   resumed sandbox whose boot env carries the grant as a static header; only
-   then is it judged. G4: an unrelated `record_effect` succeeds, the proxy
-   attests and refuses nothing, the connector logs `grant=-`, and the grant is
-   still unspent. G5: `execute_attested` with the approved arguments; the proxy
-   logs `attested=present` once, exactly one spend appears and it is the G3
-   fingerprint, and the connector applies the effect under the requester's
-   fingerprint with that grant. G6: another unrelated `record_effect` succeeds
-   with no spend. G7: the approved call again is refused `grant_required`
-   (`not_spent`) with no connector line. G8: `execute_attested` with other
-   arguments forwards unattested, spends nothing and is refused
+   Nothing is spent yet. The harness keeps the grant and the resume claim's
+   caller token in memory, both held private, for G4 to G9.
+5. G4 to G8 are one probe each, sent with the G9 probe script from inside the
+   connector pod's caller-proxy container to the live proxy on loopback. Each
+   carries the resumed sandbox's boot credentials: the resume claim's caller
+   token as `X-Curie-Caller` and the G3 grant as `X-Curie-Connector-Grant`. No
+   probe mints a grant. Each is judged in its own pod-clock window against the
+   proxy's decisions, the connector's lines and the spends Valkey shows across
+   its step; the probe must report the G3 fingerprint, and in every step but
+   G7 the proxy must admit it with `principal=present`. G4: an unrelated
+   `record_effect` is forwarded unattested and applied; the proxy attests and
+   refuses nothing, the connector logs `ok` under the requester's fingerprint
+   with `grant=-`, and nothing is spent. G5: `execute_attested` with the
+   approved arguments; the proxy logs `attested=present` once, the step's one
+   spend is the G3 fingerprint, and the connector applies the effect under the
+   requester's fingerprint with that grant. G6: another unrelated
+   `record_effect` after the spend, judged as G4. G7: G5's exact call and
+   grant, sent again, are refused `grant_required` (`not_spent`), with no
+   connector line and no spend. G8: `execute_attested` with other arguments
+   and the grant forwards unattested, spends nothing and is refused
    `attestation_missing`.
 6. G9: from inside the connector pod's caller-proxy container, one script
    posts to the live proxy on loopback with the captured caller token, grants
@@ -603,6 +610,16 @@ same fingerprint the connector logs as `grant=`.
    requires the serving pod's gated list to equal G0's. As in
    `requester-approval`, an approver role that had no entry stays with no
    filter.
+
+G4 to G8 are probes, not email turns, because no follow-up turn runs in the
+sandbox that holds the grant. Every follow-up turn boots a new sandbox:
+`kernel/claim.py::_boots_differently` replaces a warm route whose state-token
+expiry is earlier than the new boot token's (#3823), and the new token's
+expiry, now plus the turn deadline plus the grace, is always the later. So the
+probes send that sandbox's own boot credentials, the caller token and the
+grant, which are the two headers its runner sends on every hosted connector
+call. The runner's handling of those headers did not change when these steps
+became probes, so the proxy and the connector see what the runner would send.
 
 No evidence carries a grant, ticket, key, token or principal value. Grants
 appear as the fingerprint of their `jti`, humans as the fingerprint of their

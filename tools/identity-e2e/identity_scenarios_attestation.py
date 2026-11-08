@@ -3,10 +3,11 @@
 ``grant-attestation`` (acceptance items 5 and the carried part of 2, decision
 7): through the real worker, caller proxy and reference connector, with the two
 protected execution tools absent from the proxy's gated list, a grant-less
-call has no effect; the grant the worker mints for an approved resume rides
-unspent on unrelated calls, is spent once by the approved call and emits its
-id; and replay, forged attestation headers, changed arguments, batches and
-tampered tickets refuse, with an uncertain execution never resent. Needs
+call has no effect; the grant the worker mints for an approved resume, sent
+with the resumed sandbox's own boot credentials, rides unspent on unrelated
+calls, is spent once by the approved call and emits its id; and replay, forged
+attestation headers, changed arguments, batches and tampered tickets refuse,
+with an uncertain execution never resent. Needs
 ``up --reference-connector``. The caller proxy exists only on Kubernetes, so
 there is no Docker variant.
 
@@ -50,7 +51,6 @@ from identity_scenarios import (
     CLOCK_SKEW_S,
     Evidence,
     StepFailed,
-    accepted_event_id,
     await_turns,
     check,
     principal_for,
@@ -163,9 +163,12 @@ OTHER_TICKET_ROUTE = "identity-e2e-elsewhere"
 SELECTOR_KEY_DIR = "selector-key"
 # A permission gate's approval row (curie_api ApprovalOut.gate_kind).
 PERMISSION_GATE = "permission"
-# G9: the pause between two probes, and how far a log stamp may sit outside the
-# probe's own pod-clock window. The pause is wider than twice the slack, so no
-# line can fall into two windows.
+# G4 to G8: the name the worker-minted grant goes by in the probe script's
+# ``supplied_grants``.
+WORKER_GRANT = "worker"
+# G4 to G9: the pause after each probe, and how far a log stamp may sit outside
+# the probe's own pod-clock window. The pause is wider than twice the slack, so
+# no line can fall into two windows, within one script run or across two.
 PROBE_GAP_S = 1.0
 PROBE_SLACK_S = 0.3
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -710,7 +713,60 @@ def private_values(*values: Any) -> list[str]:
     return found
 
 
-# --- G9 probes ----------------------------------------------------------------------
+# --- G4 to G9 probes ---------------------------------------------------------------
+
+
+def worker_grant_cases(
+    nonce: str, approved: Mapping[str, Any], other: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """G4 to G8, in order: one probe each, with the resumed sandbox's boot credentials.
+
+    Every case but the replay names ``supplied_grant``, the worker-minted grant
+    G3 read from the resume claim, which the probe script sends as
+    ``X-Curie-Connector-Grant`` beside the resume claim's caller token; no case
+    mints a grant. G4 and G6 are unrelated ``record_effect`` calls, forwarded
+    unattested and applied (``forwarded``); G5 is ``execute_attested`` with
+    exactly ``approved``, attested and spent once; G7 replays G5 and is refused
+    ``not_spent``; G8 is ``execute_attested`` with ``other``, forwarded
+    unattested and refused ``attestation_missing``.
+    """
+
+    if dict(other) == dict(approved):
+        raise HarnessError("G8 needs arguments other than the approved ones")
+
+    def unrelated(step: str) -> dict[str, Any]:
+        return {
+            "id": step,
+            "tool": EFFECT_TOOL,
+            "arguments": {"note": f"grant-attestation {step} {nonce}"},
+            "supplied_grant": WORKER_GRANT,
+            "expect": {"kind": "forwarded", "outcome": OK},
+        }
+
+    return [
+        unrelated("G4"),
+        {
+            "id": "G5",
+            "tool": ATTESTED_TOOL,
+            "arguments": dict(approved),
+            "supplied_grant": WORKER_GRANT,
+            "expect": {"kind": "attested", "outcome": OK},
+        },
+        unrelated("G6"),
+        {
+            "id": "G7",
+            "tool": ATTESTED_TOOL,
+            "replay_of": "G5",
+            "expect": {"kind": "refused", "reason": GRANT_NOT_SPENT},
+        },
+        {
+            "id": "G8",
+            "tool": ATTESTED_TOOL,
+            "arguments": dict(other),
+            "supplied_grant": WORKER_GRANT,
+            "expect": {"kind": "unattested", "outcome": ATTESTATION_MISSING},
+        },
+    ]
 
 
 def probe_cases(nonce: str) -> list[dict[str, Any]]:
@@ -837,12 +893,16 @@ def judge_probe(
     new_spent: Sequence[str],
     requester: str,
 ) -> dict[str, Any]:
-    """One G9 probe against its expectation, from its answer, its log window and Valkey.
+    """One probe against its expectation, from its answer, its log window and Valkey.
 
     ``decisions`` and ``effects`` are the reference connector's proxy
     decisions and outcome lines inside this probe's window; ``new_spent`` every
-    grant fingerprint spent during G9; ``requester`` the fingerprint of the
-    principal the captured token names.
+    grant fingerprint spent during the probe's step; ``requester`` the
+    fingerprint of the principal the captured token names. The grant is the one
+    the probe reports (``grant_fingerprint``), minted or supplied alike.
+    ``forwarded`` is an unrelated call that carries a grant: forwarded
+    unattested, applied for ``requester`` with ``grant=-``, and the grant
+    unspent.
     """
 
     expect = case["expect"]
@@ -860,6 +920,24 @@ def judge_probe(
         judged = require_unattested(
             decisions, effects, tool=tool, outcome=outcome, since=float("-inf")
         )
+        check(
+            held is None or held not in new_spent,
+            f"the grant {held} was spent although the call forwarded unattested",
+        )
+    elif kind == "forwarded":
+        text = answer.get("text")
+        check(
+            answer.get("status") == 200
+            and answer.get("is_error") is False
+            and isinstance(text, str)
+            and text.startswith("effect="),
+            f"the probe answered {shown}, expected 200 with the tool result effect=<n>",
+        )
+        judged = require_unattested(
+            decisions, effects, tool=tool, outcome=expect.get("outcome", OK), since=float("-inf")
+        )
+        logged = judged["logged"]["requester"]
+        check(logged == requester, f"the connector logged requester={logged}, expected {requester}")
         check(
             held is None or held not in new_spent,
             f"the grant {held} was spent although the call forwarded unattested",
@@ -907,7 +985,7 @@ def judge_probe(
 def expected_spends(
     cases: Sequence[Mapping[str, Any]], answers: Mapping[str, Mapping[str, Any]]
 ) -> list[str]:
-    """The grant fingerprints G9 must have spent: one per attested or dropped probe."""
+    """The grant fingerprints a probe run must have spent: one per attested or dropped probe."""
 
     held = [
         answers.get(str(case["id"]), {}).get("grant_fingerprint")
@@ -972,56 +1050,6 @@ def await_gated_approval(
         time.sleep(3)
 
 
-def warm_call(
-    harness: Harness,
-    seen: dict[str, Any],
-    *,
-    agent: str,
-    sender: str,
-    conversation: str,
-    resume: Mapping[str, Any],
-    text: str,
-    tool: str,
-    wait: float,
-) -> dict[str, Any]:
-    """One email turn on the resumed conversation, run on the warm resume claim.
-
-    The turn must create no claim and its dial must send the resume claim's
-    caller token (by fingerprint), so it ran in the resumed sandbox, whose
-    boot env carries the worker-minted grant as a static header; only then is
-    it judged. Returns the dial, the reference connector's decisions and
-    outcome lines since the send (less the clock skew), and that ``since``.
-    """
-
-    sent = harness.send(agent, sender, text, conversation=conversation)
-    seen["send"] = send_summary(sent)
-    check(sent.get("http_status") == 200, f"the email turn answered {sent.get('http_status')}")
-    event_id = accepted_event_id(sent)
-    since = float(sent["sent_at"]) - CLOCK_SKEW_S
-    turns, _ = await_turns(harness, agent, conversation, since, [event_id], wait)
-    turn = turns[event_id]
-    seen["turn"] = turn
-    fresh = harness.claims(agent, since)
-    seen["claims_since_send"] = [claim["name"] for claim in fresh]
-    check(
-        not fresh,
-        f"the turn ran on new claim(s) {seen['claims_since_send']}, not the warm resume claim "
-        f"{resume['claim']}",
-    )
-    require_delivered(turn)
-    dial = fake_dial(turn.get("texts") or [], REFERENCE_CONNECTOR, tool)
-    seen["dial"] = dial
-    check(
-        dial.get("caller") == resume["caller_fingerprint"],
-        f"the dial sent caller {dial.get('caller')}, not the resume claim's token "
-        f"({resume['caller_fingerprint']}), so it did not run in the resumed sandbox",
-    )
-    effects = req_helpers.await_effects(harness, agent, since)
-    decisions = connector_decisions(harness, agent, since)
-    seen.update(effects=effects, decisions=decisions)
-    return {"dial": dial, "decisions": decisions, "effects": effects, "since": since}
-
-
 # --- grant-attestation --------------------------------------------------------------
 
 
@@ -1033,11 +1061,13 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
     held by the runner but absent from the proxy's gated list, the connector's
     ticket settings); G1 a grant-less direct call is refused; G2 the requester
     trips the gate; G3 the approver answers by email and the resume boots
-    with the worker-minted grant; G4 an unrelated call leaves it unspent; G5
-    the approved call spends it once and is attested; G6 an unrelated call
-    after the spend; G7 the replay is refused; G8 changed arguments forward
-    unattested; G9 loopback probes of forged headers, batches, tickets,
-    uncertain execution and replays; G10 restores everything G0 changed.
+    with the worker-minted grant; G4 to G8 probe the live proxy with the
+    resumed sandbox's boot credentials (its caller token and that grant): G4
+    an unrelated call leaves the grant unspent, G5 the approved call spends it
+    once and is attested, G6 an unrelated call after the spend, G7 the replay
+    is refused, G8 changed arguments forward unattested; G9 loopback probes of
+    forged headers, batches, tickets, uncertain execution and replays; G10
+    restores everything G0 changed.
     """
 
     if not isinstance(harness, Harness):
@@ -1210,7 +1240,8 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
         with evidence.step(
             "G3",
             f"{approver} approves by a signed email answer; the resume boots a fresh sandbox "
-            f"whose boot env carries the worker-minted grant for exactly the approved call",
+            "whose boot env carries the worker-minted grant for exactly the approved call, "
+            "and the harness keeps that grant and the sandbox's caller token for the probes",
         ) as seen:
             before = harness.grant_spends()
             answer: dict[str, Any] = {}
@@ -1244,8 +1275,10 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
             seen["grant"] = {"present": grant is not None, "where": where}
             check(grant is not None, f"the resume claim {resume_claim} carries no connector grant")
             assert grant is not None
-            # Held until G10's guard, which searches the evidence for it.
+            # Held until G10's guard, which searches the evidence for it; G4 to
+            # G8 send it as the resumed sandbox's grant header.
             captured.setdefault("grants", []).append(grant)
+            captured["worker_grant"] = grant
             evidence.hold_private([grant])
             facts = grant_facts(grant, agent=agent, tool=ATTESTED_TOOL, arguments=approved)
             del grant
@@ -1282,167 +1315,40 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
                 facts["jti_fingerprint"] not in after,
                 "the worker-minted grant is already spent before any call presented it",
             )
-            state.update(
-                grant_fp=facts["jti_fingerprint"],
-                resume={
-                    "claim": resume_claim,
-                    "caller_fingerprint": resumed.get("caller_fingerprint"),
-                },
-            )
+            state["grant_fp"] = facts["jti_fingerprint"]
         require_passed(evidence)
 
-        warm = {
-            "agent": agent,
-            "sender": requester,
-            "conversation": state["conversation"],
-            "resume": state["resume"],
-            "wait": wait,
-        }
         grant_fp = str(state["grant_fp"])
-
-        with evidence.step(
-            "G4",
-            f"warm reuse with the grant unspent: an unrelated {EFFECT_TOOL} call succeeds "
-            "unattested and spends nothing",
-        ) as seen:
-            before = harness.grant_spends()
-            arguments = {"note": f"grant-attestation G4 {nonce}"}
-            call = warm_call(
-                harness,
-                seen,
-                text=text_for("G4", tool_directive(EFFECT_TOOL, arguments)),
-                tool=EFFECT_TOOL,
-                **warm,
-            )
-            unrelated_call_after(
-                harness,
-                seen,
-                call,
-                before=before,
-                grant_fp=grant_fp,
-                agent=agent,
-                requester=requester_fp,
-            )
-
-        with evidence.step(
-            "G5",
-            f"the approved {ATTESTED_TOOL} call spends the worker-minted grant once, is attested, "
-            "and applies the effect for the requester",
-        ) as seen:
-            before = harness.grant_spends()
-            call = warm_call(
-                harness,
-                seen,
-                text=text_for("G5", tool_directive(ATTESTED_TOOL, approved)),
-                tool=ATTESTED_TOOL,
-                **warm,
-            )
-            dial = call["dial"]
-            check(
-                dial["outcome"] == OK,
-                f"the approved call answered {dial['outcome']} {dial['code']}",
-            )
-            spent = spent_since(before, harness.grant_spends())
-            seen["spent"] = spent
-            seen["attested"] = require_attested_effect(
-                call["decisions"],
-                call["effects"],
-                tool=ATTESTED_TOOL,
-                requester=requester_fp,
-                spent=spent,
-            )
-            check(
-                spent == [grant_fp],
-                f"the spent grant {spent} is not the worker-minted grant ({grant_fp})",
-            )
-            check(
-                (dial.get("requester"), dial.get("grant")) == (requester_fp, grant_fp),
-                f"the tool result names requester={dial.get('requester')} grant="
-                f"{dial.get('grant')}, expected {requester_fp} and {grant_fp}",
-            )
-            seen["proxy"] = req_helpers.require_proxy_principal(
-                call["decisions"], agent=agent, connector=REFERENCE_CONNECTOR, principal=True
-            )
-
-        with evidence.step(
-            "G6",
-            f"after the spend, an unrelated {EFFECT_TOOL} call still succeeds unattested and "
-            "spends nothing",
-        ) as seen:
-            before = harness.grant_spends()
-            arguments = {"note": f"grant-attestation G6 {nonce}"}
-            call = warm_call(
-                harness,
-                seen,
-                text=text_for("G6", tool_directive(EFFECT_TOOL, arguments)),
-                tool=EFFECT_TOOL,
-                **warm,
-            )
-            unrelated_call_after(
-                harness,
-                seen,
-                call,
-                before=before,
-                grant_fp=None,
-                agent=agent,
-                requester=requester_fp,
-            )
-
-        with evidence.step(
-            "G7",
-            f"replaying the approved call is refused {GRANT_REQUIRED} ({GRANT_NOT_SPENT}) with no "
-            "effect",
-        ) as seen:
-            before = harness.grant_spends()
-            call = warm_call(
-                harness,
-                seen,
-                text=text_for("G7", tool_directive(ATTESTED_TOOL, approved)),
-                tool=ATTESTED_TOOL,
-                **warm,
-            )
-            dial = call["dial"]
-            check(
-                (dial["outcome"], dial["code"]) == ("failed", GRANT_REQUIRED),
-                f"the replay answered {dial['outcome']} {dial['code']}, expected the proxy's "
-                f"{GRANT_REQUIRED}",
-            )
-            seen["refused"] = require_proxy_refused(
-                call["decisions"], call["effects"], reason=GRANT_NOT_SPENT
-            )
-            require_no_spend(before, harness.grant_spends())
-
-        with evidence.step(
-            "G8",
-            f"{ATTESTED_TOOL} with changed arguments forwards unattested, spends nothing and is "
-            f"refused {ATTESTATION_MISSING}",
-        ) as seen:
-            before = harness.grant_spends()
-            arguments = {"note": f"grant-attestation G8 other {nonce}"}
-            call = warm_call(
-                harness,
-                seen,
-                text=text_for("G8", tool_directive(ATTESTED_TOOL, arguments)),
-                tool=ATTESTED_TOOL,
-                **warm,
-            )
-            dial = call["dial"]
-            check(
-                (dial["outcome"], dial["code"]) == ("refused", ATTESTATION_MISSING),
-                f"the call answered {dial['outcome']} {dial['code']}, expected refused "
-                f"{ATTESTATION_MISSING}",
-            )
-            seen["unattested"] = require_unattested(
-                call["decisions"],
-                call["effects"],
-                tool=ATTESTED_TOOL,
-                outcome=ATTESTATION_MISSING,
-                since=call["since"],
-            )
-            seen["proxy"] = req_helpers.require_proxy_principal(
-                call["decisions"], agent=agent, connector=REFERENCE_CONNECTOR, principal=True
-            )
-            require_no_spend(before, harness.grant_spends())
+        worker_cases = worker_grant_cases(
+            nonce, approved, {"note": f"grant-attestation G8 other {nonce}"}
+        )
+        titles = {
+            "G4": f"an unrelated {EFFECT_TOOL} call carrying the unspent worker-minted grant is "
+            "forwarded unattested, applies for the requester and spends nothing",
+            "G5": f"the approved {ATTESTED_TOOL} call spends the worker-minted grant once, is "
+            "attested, and applies the effect for the requester",
+            "G6": f"after the spend, an unrelated {EFFECT_TOOL} call carrying the grant still "
+            "forwards unattested and spends nothing",
+            "G7": f"replaying the approved call is refused {GRANT_REQUIRED} ({GRANT_NOT_SPENT}) "
+            "with no effect",
+            "G8": f"{ATTESTED_TOOL} with changed arguments and the worker-minted grant forwards "
+            f"unattested, spends nothing and is refused {ATTESTATION_MISSING}",
+        }
+        for case in worker_cases:
+            step = str(case["id"])
+            with evidence.step(
+                step, f"probed with the resumed sandbox's boot credentials: {titles[step]}"
+            ) as seen:
+                worker_probe(
+                    harness,
+                    seen,
+                    case,
+                    agent=agent,
+                    requester=requester_fp,
+                    captured=captured,
+                    grant_fp=grant_fp,
+                    cases=worker_cases,
+                )
 
         with evidence.step(
             "G9",
@@ -1610,89 +1516,46 @@ def setup(
     seen["spend_keys"] = len(harness.grant_spends())
 
 
-def unrelated_call_after(
-    harness: Harness,
-    seen: dict[str, Any],
-    call: Mapping[str, Any],
-    *,
-    before: Sequence[str],
-    grant_fp: str | None,
-    agent: str,
-    requester: str,
-) -> None:
-    """G4 and G6: an unrelated ``record_effect`` with the static grant header rides along.
+def _probe_input(case: Mapping[str, Any]) -> dict[str, Any]:
+    """A case as the probe script reads it: everything but the harness's expectation."""
 
-    It succeeds for the requester, the proxy neither attests nor refuses a
-    grant, the connector saw no attestation, and nothing is spent; with
-    ``grant_fp`` (G4, before the approved call), that grant is still unspent.
-    """
-
-    dial = call["dial"]
-    check(dial["outcome"] == OK, f"the unrelated call answered {dial['outcome']} {dial['code']}")
-    seen["unattested"] = require_unattested(
-        call["decisions"], call["effects"], tool=EFFECT_TOOL, outcome=OK, since=call["since"]
-    )
-    logged = seen["unattested"]["logged"]["requester"]
-    check(logged == requester, f"the effect names requester {logged}, expected {requester}")
-    seen["proxy"] = req_helpers.require_proxy_principal(
-        call["decisions"], agent=agent, connector=REFERENCE_CONNECTOR, principal=True
-    )
-    after = harness.grant_spends()
-    require_no_spend(before, after)
-    if grant_fp is not None:
-        check(grant_fp not in after, "the worker-minted grant was spent by an unrelated call")
+    return {key: value for key, value in case.items() if key != "expect"}
 
 
-def probe_step(
-    harness: Harness,
-    seen: dict[str, Any],
-    *,
-    agent: str,
-    agent_id: str,
-    principal: Mapping[str, Any],
-    other: Mapping[str, Any],
-    requester: str,
-    captured: Mapping[str, Any],
-    gated: Sequence[str],
-    nonce: str,
-) -> None:
-    """G9: the loopback probes, each judged in its own pod-clock window."""
+def require_probe_token(captured: Mapping[str, Any]) -> None:
+    """The captured caller token outlives a probe run by two minutes at least."""
 
-    now_gated = serving_gated_tools(harness, agent)
-    seen["gated_tools"] = now_gated
-    require_ungated(now_gated["patterns"], REFERENCE_CONNECTOR, PROTECTED_TOOLS)
-    check(
-        now_gated["patterns"] == list(gated),
-        f"the proxy's gated list changed since G0: {now_gated['patterns']}",
-    )
     exp = captured.get("exp")
     check(
         isinstance(exp, int) and exp > time.time() + 120,
         f"the captured caller token expires at {exp}, too soon for the probes",
     )
-    keys = harness.data["keys"]
-    cases = probe_cases(nonce)
-    params = {
-        "token": captured["token"],
-        "caller_seed": keys["caller_signing"],
-        "selector_seed": keys["selector_signing"],
-        "agent": agent,
-        "agent_id": agent_id,
-        "tenant_id": harness.data["tenant_id"],
-        "connector": REFERENCE_CONNECTOR,
-        "ticket_tool": APPROVED_TOOL,
-        "key_id": SELECTOR_KEY_ID,
-        "route": TICKET_ROUTE,
-        "other_route": OTHER_TICKET_ROUTE,
-        "requester": dict(principal),
-        "other_requester": dict(other),
-        "approver": dict(other),
-        "gap_s": PROBE_GAP_S,
-        "cases": [{key: value for key, value in case.items() if key != "expect"} for case in cases],
-    }
+
+
+def run_probes(
+    harness: Harness,
+    seen: dict[str, Any],
+    *,
+    agent: str,
+    requester: str,
+    cases: Sequence[Mapping[str, Any]],
+    params: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Send ``cases`` in one probe script run and judge each in its own pod-clock window.
+
+    ``params`` are the script's other stdin values: the caller token and what
+    the cases need of signing seeds, supplied grants and earlier cases. Each
+    case is judged by :func:`judge_probe` against the reference connector's
+    proxy decisions and outcome lines stamped in its window and the spends
+    Valkey shows across the run, which must be exactly one per attested or
+    dropped probe. Records ``pod``, ``probes`` and ``spends`` in ``seen`` and
+    returns the answers by case id.
+    """
+
+    stdin = {**params, "gap_s": PROBE_GAP_S, "cases": [_probe_input(case) for case in cases]}
     before = harness.grant_spends()
-    probed = harness.grant_probes(agent, params)
-    del params
+    probed = harness.grant_probes(agent, stdin)
+    del stdin
     after = harness.grant_spends()
     answers = {str(answer["id"]): answer for answer in probed.get("answers") or []}
     seen["pod"] = probed.get("pod")
@@ -1741,9 +1604,111 @@ def probe_step(
     seen["spends"] = {"new": new_spent, "expected": expected}
     check(
         new_spent == expected,
-        f"G9 spent grants {new_spent}, expected exactly one per attested probe {expected}",
+        f"the probes spent grants {new_spent}, expected exactly one per attested probe {expected}",
     )
     check(not failures, f"{len(failures)} probe(s) failed: {failures}")
+    return answers
+
+
+def worker_probe(
+    harness: Harness,
+    seen: dict[str, Any],
+    case: Mapping[str, Any],
+    *,
+    agent: str,
+    requester: str,
+    captured: Mapping[str, Any],
+    grant_fp: str,
+    cases: Sequence[Mapping[str, Any]],
+) -> None:
+    """One of G4 to G8: ``case`` probed with the resumed sandbox's boot credentials.
+
+    Every follow-up turn boots a new sandbox, so no turn after the resume runs
+    where the grant is. The probe sends what that sandbox's runner sends on
+    every hosted connector call: the resume claim's caller token and the
+    worker-minted grant G3 read. A replay names its case among ``cases``,
+    which the script rebuilds without sending it again. The probe must report
+    the G3 grant's fingerprint, the step's spends are exactly what its kind
+    spends (:func:`run_probes`), and a call the proxy forwards must carry the
+    requester's principal.
+    """
+
+    require_probe_token(captured)
+    replayed = case.get("replay_of")
+    answers = run_probes(
+        harness,
+        seen,
+        agent=agent,
+        requester=requester,
+        cases=[case],
+        params={
+            "token": captured["token"],
+            "supplied_grants": {WORKER_GRANT: captured["worker_grant"]},
+            "earlier": [_probe_input(c) for c in cases if c["id"] == replayed],
+        },
+    )
+    held = answers[str(case["id"])].get("grant_fingerprint")
+    seen["grant"] = {"fingerprint": held, "worker_minted": held == grant_fp}
+    check(
+        held == grant_fp,
+        f"the probe sent grant {held}, not the worker-minted grant G3 read ({grant_fp})",
+    )
+    if case["expect"]["kind"] != "refused":
+        seen["proxy"] = req_helpers.require_proxy_principal(
+            seen["probes"][str(case["id"])]["decisions"],
+            agent=agent,
+            connector=REFERENCE_CONNECTOR,
+            principal=True,
+        )
+
+
+def probe_step(
+    harness: Harness,
+    seen: dict[str, Any],
+    *,
+    agent: str,
+    agent_id: str,
+    principal: Mapping[str, Any],
+    other: Mapping[str, Any],
+    requester: str,
+    captured: Mapping[str, Any],
+    gated: Sequence[str],
+    nonce: str,
+) -> None:
+    """G9: the loopback probes, each judged in its own pod-clock window."""
+
+    now_gated = serving_gated_tools(harness, agent)
+    seen["gated_tools"] = now_gated
+    require_ungated(now_gated["patterns"], REFERENCE_CONNECTOR, PROTECTED_TOOLS)
+    check(
+        now_gated["patterns"] == list(gated),
+        f"the proxy's gated list changed since G0: {now_gated['patterns']}",
+    )
+    require_probe_token(captured)
+    keys = harness.data["keys"]
+    run_probes(
+        harness,
+        seen,
+        agent=agent,
+        requester=requester,
+        cases=probe_cases(nonce),
+        params={
+            "token": captured["token"],
+            "caller_seed": keys["caller_signing"],
+            "selector_seed": keys["selector_signing"],
+            "agent": agent,
+            "agent_id": agent_id,
+            "tenant_id": harness.data["tenant_id"],
+            "connector": REFERENCE_CONNECTOR,
+            "ticket_tool": APPROVED_TOOL,
+            "key_id": SELECTOR_KEY_ID,
+            "route": TICKET_ROUTE,
+            "other_route": OTHER_TICKET_ROUTE,
+            "requester": dict(principal),
+            "other_requester": dict(other),
+            "approver": dict(other),
+        },
+    )
 
 
 def answer_summary(answer: Mapping[str, Any]) -> dict[str, Any]:

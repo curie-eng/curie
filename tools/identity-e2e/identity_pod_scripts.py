@@ -263,20 +263,24 @@ print(json.dumps(result))
 """
 
 # Runs in a hosted connector pod's caller-proxy container (the worker image),
-# with the caller token, the install's caller signing seed and the run's
-# selector seed on stdin. For each case in order it builds one JSON-RPC
-# tools/call (or a two-element batch with a ping), adds the approval ticket the
-# case asks for (signed with curie_internal.approver_ticket.sign_ticket, fresh
-# 32-byte nonce, issued now, five minutes to expire, digest by
-# execution_arguments_sha256, with the case's tampering), mints the case's
-# grant with curie_worker.connector_grant.mint over the canonical arguments
-# (fresh uuid4 jti, ten minutes to expire), or replays an earlier case's exact
-# call and grant, and POSTs it to the live proxy on loopback with the case's
-# forged headers. It answers per case only the HTTP status, the tool result's
-# error flag and first text line, the proxy's refusal code and whether its body
-# is the frozen one, whether the connection was dropped (the proxy's 502), the
-# grant's jti fingerprint and the pod-clock window of the request. No token,
-# grant, ticket, key or jti is printed.
+# with the caller token on stdin and, as the cases need them, the install's
+# caller signing seed, the run's selector seed and P["supplied_grants"] (name to
+# grant token). For each case in order it builds one JSON-RPC tools/call (or a
+# two-element batch with a ping), adds the approval ticket the case asks for
+# (signed with curie_internal.approver_ticket.sign_ticket, fresh 32-byte nonce,
+# issued now, five minutes to expire, digest by execution_arguments_sha256, with
+# the case's tampering), sends the grant its supplied_grant names, mints the
+# case's grant with curie_worker.connector_grant.mint over the canonical
+# arguments (fresh uuid4 jti, ten minutes to expire), or replays an earlier
+# case's exact call and grant, and POSTs it to the live proxy on loopback with
+# the case's forged headers. A replay may name a case of P["earlier"], which an
+# earlier run sent: it is rebuilt, never sent, so it must carry a supplied grant
+# and no minted grant or ticket. It answers per case only the HTTP status, the
+# tool result's error flag and first text line, the proxy's refusal code and
+# whether its body is the frozen one, whether the connection was dropped (the
+# proxy's 502), the grant's jti fingerprint (read from a supplied grant's
+# payload) and the pod-clock window of the request. No token, grant, ticket, key
+# or jti is printed.
 GRANT_PROBE_SCRIPT = """
 import base64, hashlib, http.client, json, os, sys, time, uuid
 
@@ -334,6 +338,29 @@ def grant(tool, arguments):
     return token, fingerprint(jti)
 
 
+def supplied(name):
+    token = P["supplied_grants"][name]
+    segment = token.split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+    return token, fingerprint(claims["jti"])
+
+
+def built(case, sent):
+    if case.get("replay_of"):
+        return sent[case["replay_of"]]
+    tool = case["tool"]
+    arguments = dict(case["arguments"])
+    if case.get("ticket") is not None:
+        arguments["approval_ticket"] = ticket(arguments, case["ticket"].get("tamper"))
+    token, held = None, None
+    if case.get("supplied_grant"):
+        token, held = supplied(case["supplied_grant"])
+    elif case.get("grant"):
+        granted = case.get("grant_arguments")
+        token, held = grant(tool, arguments if granted is None else dict(granted))
+    return tool, arguments, token, held
+
+
 def post(port, body, headers):
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
     try:
@@ -376,17 +403,7 @@ def judged(status, raw):
 
 
 def call(port, case, sent):
-    if case.get("replay_of"):
-        tool, arguments, token, held = sent[case["replay_of"]]
-    else:
-        tool = case["tool"]
-        arguments = dict(case["arguments"])
-        if case.get("ticket") is not None:
-            arguments["approval_ticket"] = ticket(arguments, case["ticket"].get("tamper"))
-        token, held = None, None
-        if case.get("grant"):
-            granted = case.get("grant_arguments")
-            token, held = grant(tool, arguments if granted is None else dict(granted))
+    tool, arguments, token, held = built(case, sent)
     sent[case["id"]] = (tool, arguments, token, held)
     message = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                "params": {"name": tool, "arguments": arguments}}
@@ -411,6 +428,10 @@ def call(port, case, sent):
 def main():
     port = int(os.environ["CURIE_CALLER_PROXY_PORT"])
     sent = {}
+    for case in P.get("earlier") or ():
+        if case.get("grant") or case.get("ticket") is not None:
+            raise ValueError("only a supplied-grant case is rebuilt exactly")
+        sent[case["id"]] = built(case, sent)
     answers = []
     for case in P["cases"]:
         try:

@@ -1464,10 +1464,11 @@ class Harness:
 
         Execs into the caller-proxy container of a ready pod and posts each
         case of ``params["cases"]`` to the live proxy on loopback (see
-        ``GRANT_PROBE_SCRIPT``). ``params`` carry the caller token and the two
-        signing seeds on stdin only. Returns the per-case ``answers`` (status,
-        error flag, first text line, refusal, drop, grant fingerprint and the
-        pod-clock window), plus the pod and the host time window.
+        ``GRANT_PROBE_SCRIPT``). ``params`` carry the caller token and whatever
+        signing seeds or supplied grants the cases need, on stdin only. Returns
+        the per-case ``answers`` (status, error flag, first text line, refusal,
+        drop, grant fingerprint and the pod-clock window), plus the pod and the
+        host time window.
         """
 
         deployment = self.connector_deployment(name, connector)
