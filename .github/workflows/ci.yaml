@@ -2580,11 +2580,11 @@ jobs:
             exit 1
           fi
           printf '%s\n' "$output" | grep -F "may not skip"
-      - name: "Toolchain: Load the runner image built by the ci-images job"
+      - name: "Toolchain: Load the runner and API images built by the ci-images job"
         if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         uses: ./.github/actions/load-ci-images
         with:
-          images: runner
+          images: "{runner,api}"
       - name: "Toolchain: Tag the runner image as the harness default (curie-runner)"
         if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         run: docker tag curie-ci/runner:candidate curie-runner
