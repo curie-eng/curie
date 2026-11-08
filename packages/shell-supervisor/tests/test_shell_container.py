@@ -70,9 +70,14 @@ if not IMAGE:
     pytest.skip("CURIE_SHELL_IMAGE names no shell image", allow_module_level=True)
 
 
-def _docker(*args: str, stdin: bytes | None = None, check: bool = True) -> str:
+def _docker(
+    *args: str,
+    stdin: bytes | None = None,
+    check: bool = True,
+    client_env: dict[str, str] | None = None,
+) -> str:
     result = subprocess.run(  # noqa: S603 - fixed docker argv
-        ["docker", *args], input=stdin, capture_output=True, check=False
+        ["docker", *args], input=stdin, capture_output=True, check=False, env=client_env
     )
     if check and result.returncode != 0:
         raise AssertionError(f"docker {args[0]} failed: {result.stderr.decode()[-1500:]}")
@@ -135,11 +140,12 @@ class Shell:
             "CURIE_SUPERVISOR_SETTLE_TIMEOUT_SECONDS=5",
             *(
                 argument
-                for key, value in (env or {}).items()
-                for argument in ("-e", f"{key}={value}")
+                for key in (env or {})
+                for argument in ("-e", key)
             ),
             IMAGE,
             *(command or []),
+            client_env={**os.environ, **(env or {})},
         )
         archive = _root_owned({"tls.crt": tls.cert.read_bytes(), "tls.key": tls.key.read_bytes()})
         _docker("cp", "-", f"{self.name}:/etc/", stdin=archive)
@@ -782,6 +788,13 @@ def _assert_worker_kill_recovers(case, phase: str) -> None:
         if any(reply["event"] == "turn.completed" for reply in observed["replies"]):
             pytest.fail(
                 "turn ended before the kill point: "
+                + json.dumps(
+                    {
+                        name: observed.get(name)
+                        for name in ("requests", "tool_starts", "upstream_statuses", "upstream_errors")
+                    }
+                )
+                + " "
                 + (case["logs"] / "worker-0.log").read_text()[-4000:]
             )
         return observed[phase]

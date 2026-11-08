@@ -18,6 +18,8 @@ STATE = {
     "replies": [],
     "tool_starts": 0,
     "requests": 0,
+    "upstream_statuses": [],
+    "upstream_errors": [],
 }
 
 
@@ -40,8 +42,11 @@ async def upstream_response(request: web.Request) -> web.StreamResponse:
                 allow_redirects=False,
             ) as upstream,
         ):
+            STATE["upstream_statuses"].append(upstream.status)
             if upstream.status != 200:
-                raise web.HTTPBadGateway(text=f"model provider returned HTTP {upstream.status}")
+                return web.Response(
+                    status=upstream.status, text=f"model provider returned HTTP {upstream.status}"
+                )
             response = web.StreamResponse(
                 headers={"Content-Type": upstream.headers.get("Content-Type", "application/json")}
             )
@@ -50,7 +55,8 @@ async def upstream_response(request: web.Request) -> web.StreamResponse:
                 await response.write(chunk)
             await response.write_eof()
             return response
-    except (ClientError, TimeoutError):
+    except (ClientError, TimeoutError) as error:
+        STATE["upstream_errors"].append(type(error).__name__)
         raise web.HTTPBadGateway(text="model provider request failed") from None
 
 
