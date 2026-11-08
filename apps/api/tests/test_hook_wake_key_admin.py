@@ -32,6 +32,7 @@ from _hook_wake_support import (
     assert_no_store,
     assert_queued,
     assert_refused,
+    connection_limited_database,
     drive,
     get_bundle_object,
     hook_runs,
@@ -332,5 +333,28 @@ def test_wake_secret_routes_answer_authority_unavailable_when_the_database_is_un
             assert current.json()["secret"] == ctx.key(generation=2)
             rotated = await admin(ctx, "rotate")
             assert rotated.status_code == 200 and rotated.json()["generation"] == 3
+
+    drive(scenario)
+
+
+def test_wake_secret_routes_answer_authority_unavailable_when_database_connections_are_exhausted(
+    wake_db: str,
+) -> None:
+    async def scenario() -> None:
+        async with wake_app() as ctx:
+            assert (await admin(ctx, "rotate")).status_code == 200
+            before = await wake_key_rows(ctx)
+            assert [row["generation"] for row in before] == [2]
+            # Postgres refuses every request session connection with 53300, which
+            # asyncpg raises from connect as neither SQLAlchemyError nor OSError.
+            async with connection_limited_database(ctx.app):
+                for operation in OPERATIONS:
+                    refused = await admin(ctx, operation)
+                    assert_admin_refused(refused, 503, AUTHORITY_UNAVAILABLE)
+                    assert ctx.key(generation=2) not in refused.text, operation
+            assert await wake_key_rows(ctx) == before
+            current = await admin(ctx, "read")
+            assert current.status_code == 200, current.text
+            assert current.json()["generation"] == 2
 
     drive(scenario)

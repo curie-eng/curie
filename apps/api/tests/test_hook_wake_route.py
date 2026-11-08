@@ -48,6 +48,7 @@ from _hook_wake_support import (
     WakeApp,
     assert_queued,
     assert_refused,
+    connection_limited_database,
     control,
     dedupe_key_for,
     dedupe_keys,
@@ -797,6 +798,23 @@ def test_unreachable_source_gate_database_answers_authority_unavailable(wake_db:
                 unauthenticated = await wake(ctx, key=ctx.key(OTHER_WAKE))
             assert_refused(refused, 503, AUTHORITY_UNAVAILABLE)
             assert_refused(unauthenticated, 401, INVALID_SIGNATURE)
+            await unchanged(ctx, before)
+            assert_queued(await wake(ctx, headers=headers))
+
+    drive(scenario)
+
+
+def test_exhausted_database_connections_answer_authority_unavailable(wake_db: str) -> None:
+    async def scenario() -> None:
+        async with wake_app() as ctx:
+            headers = signed_headers(ctx.key(), ctx.agent_id, WAKE)
+            before = await snapshot(ctx)
+            # Postgres refuses every request session connection with 53300, which
+            # asyncpg raises from connect as neither SQLAlchemyError nor OSError.
+            async with connection_limited_database(ctx.app):
+                refused = await wake(ctx, headers=headers)
+            assert_refused(refused, 503, AUTHORITY_UNAVAILABLE)
+            # No run, no stream entry and no reservation for this delivery.
             await unchanged(ctx, before)
             assert_queued(await wake(ctx, headers=headers))
 

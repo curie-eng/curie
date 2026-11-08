@@ -21,6 +21,7 @@ import io
 import json
 import math
 import os
+import secrets
 import socket
 import tarfile
 import time
@@ -32,6 +33,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
+import asyncpg
 import httpx
 import pytest
 import redis.asyncio as aioredis
@@ -45,6 +47,7 @@ from curie_protected_hooks.source_policy_records import target_intent_sha256
 from curie_protected_hooks.source_policy_sql import SourceGate
 from redis.exceptions import RedisError
 from sqlalchemy import URL, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -514,6 +517,59 @@ async def unreachable_database(app: Any, *, sessions: bool, gate: bool) -> Async
         app.state.sessionmaker = saved_sessions
         app.state.source_gate = saved_gate
         await dead.dispose()
+
+
+@asynccontextmanager
+async def connection_limited_database(app: Any) -> AsyncIterator[None]:
+    """Serve request sessions as a fresh role whose every connection Postgres refuses.
+
+    The role is created ``LOGIN ... CONNECTION LIMIT 0`` through the app's own
+    engine, so the server answers each connection with "too many connections
+    for role" (SQLSTATE 53300), which asyncpg raises from ``connect`` as a
+    ``PostgresError``. A probe proves that before the swap. Only
+    ``app.state.sessionmaker`` changes, to a NullPool engine on the app's
+    database URL with only the credentials replaced; the source gate stays
+    live. The original sessionmaker always comes back, the engine is disposed
+    and the role is dropped.
+    """
+    role = "wake_limited_" + secrets.token_hex(8)
+    password = secrets.token_hex(16)
+    quoted_role = '"' + role.replace('"', '""') + '"'
+    quoted_password = "'" + password.replace("'", "''") + "'"
+    url = make_url(get_settings().database_url)
+    limited = create_async_engine(url.set(username=role, password=password), poolclass=NullPool)
+    engine: AsyncEngine = app.state.engine
+    saved_sessions = app.state.sessionmaker
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    f"CREATE ROLE {quoted_role} LOGIN PASSWORD {quoted_password} CONNECTION LIMIT 0"
+                )
+            )
+        await _assert_role_connections_refused(url, role, password)
+        app.state.sessionmaker = create_sessionmaker(limited)
+        yield
+    finally:
+        app.state.sessionmaker = saved_sessions
+        try:
+            await limited.dispose()
+        finally:
+            async with engine.begin() as conn:
+                await conn.execute(text(f"DROP ROLE IF EXISTS {quoted_role}"))
+
+
+async def _assert_role_connections_refused(url: URL, role: str, password: str) -> None:
+    """The server itself refuses ``role``: asyncpg raises 53300 while connecting."""
+    try:
+        probe = await asyncpg.connect(
+            user=role, password=password, host=url.host, port=url.port, database=url.database
+        )
+    except asyncpg.exceptions.TooManyConnectionsError as exc:
+        assert exc.sqlstate == "53300", exc.sqlstate
+        return
+    await probe.close()
+    raise AssertionError("a CONNECTION LIMIT 0 role was allowed to connect")
 
 
 # --- requests ----------------------------------------------------------------
