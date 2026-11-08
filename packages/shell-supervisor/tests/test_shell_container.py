@@ -13,6 +13,7 @@ and the second looks for any of it.
 
 from __future__ import annotations
 
+import gzip
 import http.client
 import io
 import json
@@ -20,6 +21,7 @@ import os
 import socket
 import ssl
 import subprocess
+import sys
 import tarfile
 import uuid
 from collections.abc import Iterator
@@ -95,6 +97,8 @@ class Shell:
         *,
         command: list[str] | None = None,
         runner_command: str | None = RUNNER_COMMAND,
+        env: dict[str, str] | None = None,
+        network: str | None = None,
     ) -> None:
         self.tls = tls
         self.name = f"curie-shell-proof-{uuid.uuid4().hex[:8]}"
@@ -107,6 +111,7 @@ class Shell:
             "keep=false",
             "--label",
             f"curie.test.owner={self.name}",
+            *(["--network", network] if network else []),
             "-p",
             f"127.0.0.1:{self.port}:8443",
             "-e",
@@ -124,6 +129,11 @@ class Shell:
             ),
             "-e",
             "CURIE_SUPERVISOR_SETTLE_TIMEOUT_SECONDS=5",
+            *(
+                argument
+                for key, value in (env or {}).items()
+                for argument in ("-e", f"{key}={value}")
+            ),
             IMAGE,
             *(command or []),
         )
@@ -245,6 +255,548 @@ def test_built_image_imports_the_runner(image: str) -> None:
         "-c",
         "import curie_runner",
     )
+
+
+@pytest.fixture(scope="module")
+def crash_platform():
+    import asyncio
+
+    import asyncpg
+
+    token = uuid.uuid4().hex[:8]
+    network = f"curie-crash-platform-{token}"
+    names = {role: f"curie-crash-{role}-{token}" for role in ("postgres", "store", "valkey", "api")}
+    api_port, database_port, store_port = free_port(), free_port(), free_port()
+    api_image = os.environ.get("CURIE_CRASH_API_IMAGE", "curie-ci/api:candidate")
+    database_url = f"postgresql://postgres:postgres@localhost:{database_port}/postgres"
+
+    def run(role: str, image: str, *, env=None, ports=(), command=(), entrypoint=None):
+        _docker(
+            "run",
+            "-d",
+            "--name",
+            names[role],
+            "--network",
+            network,
+            "--network-alias",
+            "crash-" + role,
+            "--label",
+            f"curie.test.owner={network}",
+            *(argument for pair in ports for argument in ("-p", pair)),
+            *(
+                argument
+                for key, value in (env or {}).items()
+                for argument in ("-e", f"{key}={value}")
+            ),
+            *(["--entrypoint", entrypoint] if entrypoint else []),
+            image,
+            *command,
+        )
+
+    try:
+        _docker("network", "create", "--label", f"curie.test.owner={network}", network)
+        run(
+            "postgres",
+            "postgres:17.7-alpine",
+            env={"POSTGRES_PASSWORD": "postgres"},
+            ports=[f"127.0.0.1:{database_port}:5432"],
+            command=["-c", "max_connections=600"],
+        )
+        run(
+            "store",
+            "rustfs/rustfs:1.0.0-beta.12",
+            env={"RUSTFS_ACCESS_KEY": "rustfs", "RUSTFS_SECRET_KEY": "rustfssecret"},
+            ports=[f"127.0.0.1:{store_port}:9000"],
+            command=["/data"],
+        )
+        run(
+            "valkey",
+            "valkey/valkey:8.1.10-alpine",
+            command=["valkey-server", "--requirepass", "valkeypass"],
+        )
+
+        def database_ready() -> bool:
+            async def connect() -> bool:
+                try:
+                    connection = await asyncpg.connect(database_url, timeout=2)
+                except OSError:
+                    return False
+                await connection.close()
+                return True
+
+            return asyncio.run(connect())
+
+        wait_until(database_ready, 30, "crash proof database ready")
+        run(
+            "api",
+            api_image,
+            entrypoint="sh",
+            ports=[f"127.0.0.1:{api_port}:8000"],
+            env={
+                "DATABASE_URL": "postgresql+asyncpg://postgres:postgres@crash-postgres:5432/postgres",
+                "VALKEY_HOST": "crash-valkey",
+                "VALKEY_PORT": "6379",
+                "VALKEY_PASSWORD": "valkeypass",
+                "S3_ENDPOINT_URL": "http://crash-store:9000",
+                "S3_ACCESS_KEY": "rustfs",
+                "S3_SECRET_KEY": "rustfssecret",
+                "API_KEY": "crash-proof-platform-key",
+                "OTEL_SDK_DISABLED": "true",
+                "CURIE_WORK_ITEM_RECONCILER_ENABLED": "false",
+                "CURIE_DEPLOY_NOTICE_RECONCILER_ENABLED": "false",
+            },
+            command=["-c", "alembic upgrade head && exec python -m curie_api"],
+        )
+
+        def api_ready() -> bool:
+            connection = http.client.HTTPConnection("localhost", api_port, timeout=2)
+            try:
+                connection.request("GET", "/ready")
+                response = connection.getresponse()
+                response.read()
+                return response.status == 200
+            except OSError:
+                return False
+            finally:
+                connection.close()
+
+        wait_until(api_ready, 90, "crash proof API ready")
+        yield {
+            "network": network,
+            "database_url": database_url,
+            "api_url": f"http://localhost:{api_port}",
+            "store_url": f"http://localhost:{store_port}",
+        }
+    finally:
+        for name in reversed(list(names.values())):
+            _docker("rm", "-fv", name, check=False)
+        _docker("network", "rm", network, check=False)
+        assert not _docker("ps", "-aq", "--filter", f"label=curie.test.owner={network}").strip()
+
+
+@pytest.fixture
+def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
+    from aci_protocol import QueuedTurn, ReplyHandle
+    from aci_protocol.s3 import build_s3_client
+    from curie_dispatcher.queue import to_stream_fields
+    from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW, connect_or_skip
+    from curie_worker.bundle_store import BundleStore
+    from curie_worker.config import WorkerConfig
+    from curie_worker.kernel.routing import _thread_key_for
+    from curie_worker.sandbox import (
+        AffinityStore,
+        SandboxSubstrate,
+        StaticPoolSandboxClient,
+        StaticShellSlot,
+        SubstrateConfig,
+        shell_ssl_context,
+    )
+    from redis.asyncio import Redis
+
+    identity = uuid.uuid4().hex
+    prefix = f"test:crash:{identity}"
+    provider = f"curie-crash-provider-{identity[:8]}"
+    network = crash_platform["network"]
+    port = free_port()
+    shell = None
+    bucket_created = False
+    workers = []
+    valkey = connect_or_skip(decode_responses=True)
+    config = WorkerConfig(
+        valkey_host=VALKEY_HOST,
+        valkey_port=VALKEY_PORT,
+        valkey_password=VALKEY_PW,
+        stream=prefix + ":runs",
+        consumer_group=prefix + ":group",
+        consumer_name="crash-worker",
+        key_prefix=prefix + ":worker",
+        delivery_budget_s=60,
+        runner_total_timeout_s=15,
+        delivery_lease_ttl_s=1.5,
+        delivery_lease_heartbeat_s=0.3,
+        lease_expired_idle_ms=1500,
+        reclaim_min_idle_ms=30000,
+        reclaim_interval_s=0.1,
+        consumer_heartbeat_ttl_ms=1500,
+        consumer_capability_ttl_ms=60000,
+        dead_consumer_idle_ms=50,
+        read_block_ms=50,
+        lock_ttl_ms=1000,
+        abandoned_turn_grace_s=0.5,
+        capacity_wait_budget_s=2,
+        retry_backoff_base_s=0.02,
+        retry_backoff_max_s=0.1,
+        s3_endpoint_url=crash_platform["store_url"],
+        s3_access_key="rustfs",
+        s3_secret_key="rustfssecret",
+        bundle_bucket="crash-" + identity,
+        database_url=crash_platform["database_url"].replace(
+            "postgresql://", "postgresql+asyncpg://"
+        ),
+        api_base_url=crash_platform["api_url"],
+        runner_api_base_url="http://crash-api:8000",
+        api_key="crash-proof-platform-key",
+        workspace_enabled=False,
+    )
+    storage = build_s3_client(
+        endpoint_url=config.s3_endpoint_url,
+        access_key=config.s3_access_key,
+        secret_key=config.s3_secret_key,
+        region=config.s3_region,
+    )
+    pressure = Redis(
+        host=config.valkey_host, port=config.valkey_port, password=config.valkey_password
+    )
+
+    def provider_request(path: str, method: str = "GET"):
+        connection = http.client.HTTPConnection("localhost", port, timeout=5)
+        try:
+            connection.request(method, path)
+            response = connection.getresponse()
+            assert response.status == 200
+            return json.loads(response.read())
+        finally:
+            connection.close()
+
+    def start_worker():
+        log = (tmp_path / f"worker-{len(workers)}.log").open("wb")
+        process = subprocess.Popen(
+            [sys.executable, str(Path(__file__).with_name("crash_worker.py"))],
+            env={
+                "PATH": os.environ["PATH"],
+                "OTEL_SDK_DISABLED": "true",
+                "CURIE_CRASH_PROOF": json.dumps(spec),
+            },
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        log.close()
+        workers.append(process)
+        return process
+
+    try:
+        _docker(
+            "create",
+            "--name",
+            provider,
+            "--network",
+            network,
+            "--network-alias",
+            "crash-provider",
+            "--label",
+            f"curie.test.owner={provider}",
+            "-p",
+            f"127.0.0.1:{port}:8089",
+            "-e",
+            f"CRASH_PHASE={phase}",
+            "--entrypoint",
+            "python",
+            RUNNER_IMAGE,
+            "/tmp/crash_provider.py",
+        )
+        _docker(
+            "cp",
+            str(Path(__file__).with_name("crash_provider.py")),
+            f"{provider}:/tmp/crash_provider.py",
+        )
+        _docker("start", provider)
+
+        def provider_ready() -> bool:
+            try:
+                return isinstance(provider_request("/state"), dict)
+            except OSError:
+                return False
+
+        wait_until(provider_ready, 20, "model provider ready")
+        shell = Shell.__new__(Shell)
+        Shell.__init__(
+            shell,
+            tls,
+            runner_command=None,
+            network=network,
+            env={
+                "CURIE_SUPERVISOR_CHILD_ENV": "ANTHROPIC_API_KEY",
+                "ANTHROPIC_API_KEY": "sk-ant-PLACEHOLDER",
+                "CURIE_SUPERVISOR_CHILD_ENV_PUBLIC": (
+                    "ANTHROPIC_BASE_URL,CURIE_MODEL,CURIE_RUNNER_CLEANUP_TIMEOUT_S,"
+                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,DISABLE_TELEMETRY,OTEL_SDK_DISABLED"
+                ),
+                "ANTHROPIC_BASE_URL": "http://crash-provider:8089",
+                "CURIE_MODEL": "claude-sonnet-5",
+                "CURIE_RUNNER_CLEANUP_TIMEOUT_S": "1",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                "DISABLE_TELEMETRY": "1",
+                "OTEL_SDK_DISABLED": "true",
+                "CURIE_SUPERVISOR_SETTLE_TIMEOUT_SECONDS": "1",
+            },
+        )
+        wait_until(shell.answers, 20, "shell ready")
+        storage.create_bucket(Bucket=config.bundle_bucket)
+        bucket_created = True
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w") as archive:
+            manifest = b'{"name":"crash-proof","version":"1.0.0"}'
+            info = tarfile.TarInfo(".claude-plugin/plugin.json")
+            info.size = len(manifest)
+            archive.addfile(info, io.BytesIO(manifest))
+        storage.put_object(
+            Bucket=config.bundle_bucket, Key="bundle.tar.gz", Body=gzip.compress(raw.getvalue())
+        )
+        client = StaticPoolSandboxClient(
+            slots=[StaticShellSlot("proof-0", "localhost", shell.port, "crash-pool")],
+            redis_client=valkey,
+            control_token=CONTROL_TOKEN,
+            ssl_context=shell_ssl_context(str(tls.ca)),
+            bundle_store=BundleStore(config),
+            key_prefix=prefix + ":sandbox",
+        )
+        substrate = SandboxSubstrate(
+            client,
+            AffinityStore(valkey, pressure_client=pressure, key_prefix=prefix + ":sandbox"),
+            SubstrateConfig(
+                namespace="default",
+                warm_pool="crash-pool",
+                key_prefix=prefix + ":sandbox",
+                claim_timeout_seconds=30,
+            ),
+        )
+        event = QueuedTurn(
+            event_id=identity,
+            conversation_id=identity,
+            author="U0EXAMPLE1",
+            text="run the probe",
+            received_at="2026-11-08T00:00:00Z",
+            reply_handle=ReplyHandle(
+                kind="crash-proof",
+                channel="proof",
+                placeholder="reply",
+                endpoint=f"http://localhost:{port}/reply",
+                adapter="crash-proof",
+            ),
+        )
+        import asyncio
+
+        import asyncpg
+        from curie_worker.binding import BindingResolver
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        async def seed():
+            agent, version, deployment = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+            connection = await asyncpg.connect(crash_platform["database_url"])
+            try:
+                await connection.execute(
+                    "INSERT INTO curie.agents (id,name,max_usd_per_day,max_output_tokens_per_run) "
+                    "VALUES ($1,$2,5,1000)",
+                    agent,
+                    "acme-crash-" + identity,
+                )
+                await connection.execute(
+                    "INSERT INTO curie.agent_channels (id,agent_id,kind,address,endpoint,adapter) "
+                    "VALUES ($1,$2,'crash-proof',$3,$4,'crash-proof')",
+                    uuid.uuid4(),
+                    agent,
+                    identity,
+                    f"http://localhost:{port}/reply",
+                )
+                await connection.execute(
+                    "INSERT INTO curie.agent_versions "
+                    "(id,agent_id,version_label,bundle_ref,created_by) "
+                    "VALUES ($1,$2,'v1','bundle.tar.gz','fixture')",
+                    version,
+                    agent,
+                )
+                await connection.execute(
+                    "INSERT INTO curie.deployments (id,agent_id,version_id,environment,status) "
+                    "VALUES ($1,$2,$3,'prod','active')",
+                    deployment,
+                    agent,
+                    version,
+                )
+            finally:
+                await connection.close()
+            engine = create_async_engine(config.database_url)
+            try:
+                binding = BindingResolver(engine, config)
+                resolved = await binding.resolve("crash-proof", "crash-proof", identity)
+                assert resolved is not None
+                return binding.boot_env(
+                    resolved, _thread_key_for(event), kind="crash-proof", address=identity
+                ), binding
+            finally:
+                await engine.dispose()
+
+        event = event.model_copy(
+            update={"reply_handle": event.reply_handle.model_copy(update={"channel": identity})}
+        )
+        boot, binding = asyncio.run(seed())
+        substrate.set_boot_credential_minter(binding.fresh_boot_credential)
+        substrate.set_boot_credential_revoker(binding.release_boot_credential_sync)
+        handle = substrate.claim(_thread_key_for(event), env=boot)
+        spec = {
+            "config": config.model_dump(mode="json"),
+            "port": shell.port,
+            "ca": str(tls.ca),
+            "control": CONTROL_TOKEN,
+            "sandbox_prefix": prefix + ":sandbox",
+        }
+        valkey.xgroup_create(config.stream, config.consumer_group, id="0", mkstream=True)
+        worker = start_worker()
+        valkey.xadd(config.stream, to_stream_fields(event))
+        yield {
+            "worker": worker,
+            "restart": start_worker,
+            "provider": provider_request,
+            "valkey": valkey,
+            "config": config,
+            "shell": shell,
+            "prefix": prefix,
+            "event_id": identity,
+            "claim": handle.claim_name,
+            "handle": handle,
+            "boot": boot,
+            "logs": tmp_path,
+        }
+    finally:
+        for process in workers:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(5)
+        if shell is not None:
+            shell.remove()
+        _docker("rm", "-f", provider, check=False)
+        assert not _docker("ps", "-aq", "--filter", f"name=^/{provider}$").strip()
+        for key in valkey.scan_iter(match=prefix + ":*"):
+            valkey.delete(key)
+        valkey.close()
+        import asyncio
+
+        asyncio.run(pressure.aclose())
+        if bucket_created:
+            storage.delete_object(Bucket=config.bundle_bucket, Key="bundle.tar.gz")
+            storage.delete_bucket(Bucket=config.bundle_bucket)
+
+
+@pytest.mark.parametrize("phase", ["healthy"])
+def test_crash_proof_control_completes_a_tool_and_persists_history(crash_case) -> None:
+    from urllib.parse import urlsplit
+
+    case = crash_case
+    state = case["provider"]
+    wait_until(
+        lambda: any(r["event"] == "turn.completed" for r in state("/state")["replies"]),
+        60,
+        "healthy tool turn completed",
+    )
+    completed = [r for r in state("/state")["replies"] if r["event"] == "turn.completed"]
+    assert len(completed) == 1
+    assert completed[0]["outcome"] == "delivered"
+    assert state("/state")["tool_starts"] == 1
+    assert any(r.get("text") == "recovered" for r in state("/state")["replies"])
+    status, body = case["shell"].request(
+        "GET",
+        proxy_base_path(case["claim"], 1) + "/v1/status",
+        token=case["handle"].token,
+    )
+    assert status == 200 and body["turn_active"] is False and body["history_durable"] is True
+    endpoint = urlsplit(case["config"].api_base_url)
+    connection = http.client.HTTPConnection(endpoint.hostname, endpoint.port, timeout=5)
+    try:
+        connection.request(
+            "GET",
+            urlsplit(case["boot"]["CURIE_HISTORY_REF"]).path,
+            headers={"X-API-Key": case["config"].api_key},
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        assert len(json.loads(response.read())["value"]) == 1
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("phase", ["before", "during", "after"])
+@pytest.mark.parametrize("repeat", range(3))
+def test_worker_kill_recovers_one_reply_and_retires_the_shell(crash_case, phase, repeat) -> None:
+    case = crash_case
+    state = case["provider"]
+    worker = case["worker"]
+
+    def reached() -> bool:
+        if worker.poll() is not None:
+            pytest.fail(
+                "worker exited before the kill point: "
+                + (case["logs"] / "worker-0.log").read_text()[-4000:]
+            )
+        observed = state("/state")
+        if any(reply["event"] == "turn.completed" for reply in observed["replies"]):
+            pytest.fail(
+                "turn ended before the kill point: "
+                + (case["logs"] / "worker-0.log").read_text()[-4000:]
+            )
+        return observed[phase]
+
+    wait_until(reached, 60, f"real tool reached {phase} kill point")
+    observed = state("/state")
+    assert observed["tool_starts"] == (0 if phase == "before" else 1)
+    if phase == "during":
+        assert not observed["after"]
+    assert not [r for r in observed["replies"] if r["event"] == "turn.completed"]
+    worker.kill()
+    worker.wait(5)
+    assert worker.returncode == -9
+    state("/release", "POST")
+    replacement = case["restart"]()
+
+    def recovered() -> bool:
+        if replacement.poll() is not None:
+            pytest.fail(
+                "replacement worker exited: " + (case["logs"] / "worker-1.log").read_text()[-4000:]
+            )
+        replies = state("/state")["replies"]
+        slot = case["valkey"].hget(case["prefix"] + ":sandbox:static:slot:proof-0", "state")
+        return any(r["event"] == "turn.completed" for r in replies) and slot in {
+            "free",
+            "quarantined",
+        }
+
+    wait_until(recovered, 75, "one final reply and a reusable or quarantined shell slot")
+    replies = state("/state")["replies"]
+    finals = [r for r in replies if r["event"] == "turn.completed"]
+    assert len(finals) == 1
+    assert finals[0]["event_id"] == case["event_id"]
+    answers = [r for r in replies if r["event"] in {"reply.update", "reply.post"} and r.get("text")]
+    assert answers
+    assert sum(r["text"] == answers[-1]["text"] for r in answers) == 1
+    assert case["valkey"].xlen(case["config"].dead_letter_stream_name()) == 0
+    assert (
+        case["valkey"].xpending(case["config"].stream, case["config"].consumer_group)["pending"]
+        == 0
+    )
+    assert (
+        case["shell"].request("GET", "/_curie/supervisor/v1/shell", token=CONTROL_TOKEN)[1]["claim"]
+        is None
+    )
+    children = _docker(
+        "exec",
+        "--user",
+        "0:0",
+        case["shell"].name,
+        "python",
+        "-c",
+        "import json,pathlib; live=[]\n"
+        "for path in pathlib.Path('/proc').glob('[0-9]*/status'):\n"
+        " try:\n"
+        "  lines=path.read_text().splitlines()\n"
+        "  fields=dict(line.split(':',1) for line in lines if ':' in line)\n"
+        "  if fields['Uid'].split()[0]=='1000' and fields['State'].split()[0]!='Z':\n"
+        "   live.append(path.parent.name)\n"
+        " except FileNotFoundError: pass\n"
+        "print(json.dumps(live))",
+    )
+    assert json.loads(children) == []
 
 
 def test_runner_default_entrypoint_serves_authenticated_status(

@@ -2617,6 +2617,8 @@ jobs:
         if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         env:
           CURIE_SHELL_IMAGE: curie-ci/shell:candidate
+          CURIE_RUNNER_IMAGE: curie-ci/runner:candidate
+          CURIE_CRASH_API_IMAGE: curie-ci/api:candidate
           CURIE_SHELL_CONTAINER_PROOF: required
         run: uv run pytest packages/shell-supervisor/tests/test_shell_container.py -q
 
