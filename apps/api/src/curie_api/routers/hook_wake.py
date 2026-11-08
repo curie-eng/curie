@@ -50,7 +50,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
@@ -67,8 +67,10 @@ from curie_protected_hooks.source_policy_sql import (
     ensure_source_gate_live,
     read_source_snapshot,
 )
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel
 from redis.exceptions import ResponseError
 from sqlalchemy import TextClause, select, text
@@ -94,8 +96,34 @@ from ..storage import ObjectStore
 from ..wirebody import read_bounded_body
 from .schedules import read_wake_triggers
 
+
+class NoStoreRoute(APIRoute):
+    """Marks every wake-key answer ``no-store``, including the router's authentication refusal.
+
+    An ``HTTPException`` renders through FastAPI's own handler, so its body and headers stay.
+    """
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+
+        async def no_store(request: Request) -> Response:
+            try:
+                response = await handler(request)
+            except HTTPException as exc:
+                response = await http_exception_handler(request, exc)
+            response.headers.setdefault("Cache-Control", "no-store")
+            return response
+
+        return no_store
+
+
 router = APIRouter(prefix="/hooks", tags=["hooks"])
-admin_router = APIRouter(prefix="/agents", tags=["hooks"], dependencies=[Depends(require_api_key)])
+admin_router = APIRouter(
+    prefix="/agents",
+    tags=["hooks"],
+    dependencies=[Depends(require_api_key)],
+    route_class=NoStoreRoute,
+)
 logger = logging.getLogger(__name__)
 
 _INVALID = "invalid_wake_signature"
@@ -517,6 +545,10 @@ async def _wake(
         raise _Refusal(status.HTTP_422_UNPROCESSABLE_CONTENT, _BODY)
 
     async with _gated_agent(request, session, agent_uuid) as (agent, held):
+        # Rotation holds this gate, so this recheck covers every later answer, coalesce included.
+        if await _generation(session, agent_uuid, hook) != generation:
+            raise _Refusal(status.HTTP_401_UNAUTHORIZED, _INVALID)
+
         # Steps 3 to 5: declaration, ordinary source, pause, kill, limits.
         version_id, prompt = await _declaration(session, store, agent_uuid, hook)
         controls = await _require_ordinary(session, held, agent_uuid, hook)
