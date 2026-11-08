@@ -186,6 +186,9 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/render-assertions.sh
 
+      - name: Unchanged Slack gateway upgrade scenario
+        run: bash charts/curie/ci/channel-gateway-upgrade-assertions.sh
+
       - name: Release name length assertions
         run: bash charts/curie/ci/release-name-length-assertions.sh
 

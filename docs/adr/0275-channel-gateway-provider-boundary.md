@@ -19,7 +19,8 @@ rendering, clicks, replies and provider reads. Its `curie_channel_gateway.ports`
 package depends on neutral channel contracts and the standard library. The
 import-linter contract in `pyproject.toml` forbids provider SDK, API and worker
 imports from these ports. It is exercised with violating imports as well as the
-valid package. No production composition uses the new ports in this slice.
+valid package. Provider composition lives in
+`curie_channel_gateway.slack.read_server.application`.
 
 The gateway authenticates Slack via signature verification or Socket Mode. It
 mints the chat-attester principal and signs receiver answer proofs over exact
@@ -50,7 +51,9 @@ connect URL is single-use and must never be cached or shared.
 
 ## Consequences and extraction sequence
 
-This is a behavior-neutral extraction. U2 moves Slack intake and mail while
+The source extraction preserves provider-visible operations, but moving token
+custody into the gateway changes runtime configuration and credential access.
+U2 moves Slack intake and mail while
 retaining the standalone mail entrypoint and stock Slack admission, dedupe claim,
 placeholder, enqueue ordering. U3 moves replies, cards and clicks after promoting
 the general `Reply` value to `channel-protocol` and migrating all callers. U4
@@ -64,6 +67,21 @@ alias. Shared neutral value records belong in `channel-protocol` when needed.
 The executable regression selection is `packages/channel-gateway/behavior.pytest`.
 It includes the selected-click acknowledgement and exactly-once submission check.
 Extraction must retain all assertions and controls.
+
+Existing Helm Slack installations keep their values and Secret objects. The
+chart automatically deploys the gateway, preserves bot-token Secret references,
+removes raw tokens from API and worker environments, and gives those callers
+separate gateway credentials. Chart-managed TLS certificates persist through
+Helm lookup; operator-managed certificates remain available. Explicit gateway
+disable without an external URL refuses rendering. Optional new capabilities
+remain off until configured. `charts/curie/templates/_channel-gateway.tpl` and
+`charts/curie/templates/channel-gateway-tls.yaml` in the chart realize that upgrade wiring.
+
+Protected-worker process files require the offline
+`curie migrate-protected-process` migration from v1 to v2. Runtime accepts
+only v2 and names the migration when rejecting v1. Custom launchers must move
+provider credentials into the gateway and configure their caller credentials.
+This is not a behavior-neutral runtime upgrade for those launchers.
 
 This Draft records the proposed durable boundary for review. It does not accept
 the decision or authorize subsequent runtime rewiring by itself.
