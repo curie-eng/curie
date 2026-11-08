@@ -376,7 +376,9 @@ _GRANT_FP = "1111222233334444"
 @pytest.mark.parametrize("tool", ["execute_attested", "execute_approved"])
 @pytest.mark.parametrize("prefix", ["", _STAMP], ids=["bare", "kubectl-timestamp"])
 def test_parse_effect_line_reads_the_protected_tools(tool: str, prefix: str) -> None:
-    parsed = harness.parse_effect_line(f"{prefix}{tool} outcome=ok requester={_FP} grant={_GRANT_FP}")
+    parsed = harness.parse_effect_line(
+        f"{prefix}{tool} outcome=ok requester={_FP} grant={_GRANT_FP}"
+    )
     assert parsed is not None
     assert parsed["tool"] == tool
     assert parsed["outcome"] == "ok"
@@ -406,7 +408,7 @@ def test_parse_effect_line_grant_is_none_on_a_pre_change_line() -> None:
 
 def test_parse_effect_line_record_effect_keeps_outcome_and_requester() -> None:
     parsed = harness.parse_effect_line(
-        f"record_effect outcome=requester_missing requester=- grant=-"
+        "record_effect outcome=requester_missing requester=- grant=-"
     )
     assert parsed is not None
     assert parsed["outcome"] == "requester_missing"
@@ -426,7 +428,9 @@ def test_parse_effect_line_rejects_malformed_or_other_tools(line: str) -> None:
     assert harness.parse_effect_line(line) is None
 
 
-_DECISION = "INFO:curie_connector_proxy.server:caller=ie2e-on outcome=admitted method=POST path='/mcp'"
+_DECISION = (
+    "INFO:curie_connector_proxy.server:caller=ie2e-on outcome=admitted method=POST path='/mcp'"
+)
 
 
 def test_parse_proxy_decision_attested_present() -> None:

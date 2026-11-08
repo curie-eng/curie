@@ -321,9 +321,7 @@ def refused(**overrides: Any) -> dict[str, Any]:
 
 
 def test_proxy_refused_passes_on_the_recorded_shape() -> None:
-    att.require_proxy_refused(
-        [decision("grant_required", grant="not_spent")], [], **refused()
-    )
+    att.require_proxy_refused([decision("grant_required", grant="not_spent")], [], **refused())
 
 
 def test_proxy_refused_ignores_admitted_decisions_beside_it() -> None:
@@ -414,7 +412,10 @@ CALLER = "9988776655443322"
 
 
 def test_fake_dial_parses_an_ok_line() -> None:
-    texts = [f"working on it", f"connector-tool {CONNECTOR}/{ATTESTED}: ok applied note caller={CALLER}"]
+    texts = [
+        "working on it",
+        f"connector-tool {CONNECTOR}/{ATTESTED}: ok applied note caller={CALLER}",
+    ]
     dial = att.fake_dial(texts, CONNECTOR, ATTESTED)
     assert dial["outcome"] == "ok"
     assert dial["text"] == "applied note"
