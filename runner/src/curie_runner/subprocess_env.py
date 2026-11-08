@@ -24,6 +24,8 @@ import tempfile
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 
+from curie_internal.connector_endpoints import UPLOAD_TOKENS_FILE_ENV
+
 from .sdk_auth import (
     API_KEY_ENV,
     AUTH_TOKEN_ENV,
@@ -95,13 +97,18 @@ def platform_credential_names(source: Mapping[str, str]) -> frozenset[str]:
     """Env names a shell or hook must not receive.
 
     ``CURIE_*TOKEN*`` covers runner, state, memory, history, progress, and
-    caller tokens, including indexed names. Model credential variables and
+    caller tokens, including indexed names. The upload credential file path
+    stays available to bundle clients. Model credential variables and
     any name ``CURIE_MODEL_ENV_KEY`` points at are included too.
     """
 
     names: set[str] = set(CLI_PARENT_MODEL_KEYS)
     names.add(CREDENTIALS_ENV)
-    names.update(key for key in source if key.startswith("CURIE_") and "TOKEN" in key)
+    names.update(
+        key
+        for key in source
+        if key.startswith("CURIE_") and "TOKEN" in key and key != UPLOAD_TOKENS_FILE_ENV
+    )
     try:
         names.update(resolve_credential_env_keys(dict(source)))
     except (InvalidEnvKeyError, ValueError):

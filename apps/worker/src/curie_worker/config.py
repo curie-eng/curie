@@ -324,6 +324,7 @@ class WorkerConfig(BaseSettings):
     connector_endpoints: Annotated[
         StaticConnectorEndpoints | None, NoDecode, BeforeValidator(parse_endpoint_json)
     ] = Field(default=None, validation_alias="CURIE_CONNECTOR_ENDPOINTS")
+    sandbox_substrate: str = Field(default="kubernetes", validation_alias="CURIE_SANDBOX_SUBSTRATE")
 
     # The Ed25519 seed that signs each sandbox's connector caller token
     # (ADR-0168 decision 7), standard base64. Empty mints no token. The chart
