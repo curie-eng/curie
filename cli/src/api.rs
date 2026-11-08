@@ -563,6 +563,7 @@ where
 #[serde(untagged)]
 pub enum ApprovalResolutionResponse {
     Fixed(ApprovalResolutionTargetResponse),
+    ApproverDm(ApproverDmTargetResponse),
     RequestingSurface(RequestingSurfaceTargetResponse),
 }
 
@@ -572,6 +573,7 @@ impl ApprovalResolutionResponse {
         match self {
             Self::Fixed(target) => format!("{}:{}", target.kind, target.address),
             Self::RequestingSurface(target) => target.mode.clone(),
+            Self::ApproverDm(target) => format!("{} (identity {})", target.mode, target.identity),
         }
     }
 }
@@ -586,8 +588,18 @@ pub struct ApprovalResolutionTargetResponse {
 
 /// The `{"mode": "requesting_surface"}` resolution as the API returns it.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RequestingSurfaceTargetResponse {
     pub mode: String,
+}
+
+/// The `{"mode": "approver_dm", "identity": "<slug>"}` resolution as the API
+/// returns it (ADR 0272).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApproverDmTargetResponse {
+    pub mode: String,
+    pub identity: String,
 }
 
 /// Text-only notification target returned by the API. Endpoint and adapter are
@@ -733,6 +745,7 @@ pub struct ExemptGroupWrite {
 pub enum ApprovalResolutionWrite {
     Fixed(ApprovalResolutionTargetWrite),
     RequestingSurface(RequestingSurfaceTargetWrite),
+    ApproverDm(ApproverDmTargetWrite),
 }
 
 impl ApprovalResolutionWrite {
@@ -757,6 +770,12 @@ impl From<ApprovalResolutionResponse> for ApprovalResolutionWrite {
             ApprovalResolutionResponse::RequestingSurface(target) => {
                 Self::RequestingSurface(RequestingSurfaceTargetWrite { mode: target.mode })
             }
+            ApprovalResolutionResponse::ApproverDm(target) => {
+                Self::ApproverDm(ApproverDmTargetWrite {
+                    mode: target.mode,
+                    identity: target.identity,
+                })
+            }
         }
     }
 }
@@ -777,6 +796,16 @@ pub struct ApprovalResolutionTargetWrite {
 #[serde(deny_unknown_fields)]
 pub struct RequestingSurfaceTargetWrite {
     pub mode: String,
+}
+
+/// `{"mode": "approver_dm", "identity": "<slug>"}`: DM the one approver the
+/// route's approver_ticket selector picks, through the named Slack identity
+/// (ADR 0272). Command validation refuses any other mode value.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApproverDmTargetWrite {
+    pub mode: String,
+    pub identity: String,
 }
 
 /// Optional notification target with write-only transport routing.

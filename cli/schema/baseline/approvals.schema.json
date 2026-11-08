@@ -125,18 +125,52 @@
       "properties": {
         "resolution": {
           "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "type": "string"
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "type": "string"
+                },
+                "address": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "address"
+              ]
             },
-            "address": {
-              "type": "string"
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "mode": {
+                  "const": "requesting_surface"
+                }
+              },
+              "required": [
+                "mode"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "ADR 0272: the card is a DM to the one approver the approver_ticket selector picks, through the named Slack identity.",
+              "properties": {
+                "mode": {
+                  "const": "approver_dm"
+                },
+                "identity": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mode",
+                "identity"
+              ]
             }
-          },
-          "required": [
-            "kind",
-            "address"
           ]
         },
         "notification": {
@@ -283,6 +317,20 @@
           "required": [
             "exclude_requester"
           ]
+        },
+        "expires_in_seconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Route deadline in seconds, or null for none (ADR 0273). Absent when the route does not set one."
+        },
+        "remind_every_s": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Reminder interval in seconds, or null for none. Absent when the route does not set one."
         }
       },
       "required": [

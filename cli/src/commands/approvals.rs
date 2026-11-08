@@ -281,6 +281,15 @@ pub(super) fn build_route_bindings(
     for (name, binding) in &bindings {
         validate_resolution_target(name, &binding.resolution)?;
         if let Some(notification) = &binding.notification {
+            if matches!(
+                binding.resolution,
+                crate::api::ApprovalResolutionWrite::ApproverDm(_)
+            ) {
+                return Err(crate::exit::usage(format!(
+                    "route {name:?}: an approver_dm resolution cannot carry a notification; \
+                     the card is a DM to the approver the selector picks"
+                )));
+            }
             let crate::api::ApprovalResolutionWrite::Fixed(resolution) = &binding.resolution else {
                 // ADR-0177 decision 1, mirroring the API: the card already
                 // joins the conversation that asked, so there is nobody further
@@ -292,6 +301,18 @@ pub(super) fn build_route_bindings(
             };
             validate_notification_target(name, notification)?;
             reject_identical_targets(name, resolution, notification)?;
+        }
+        if matches!(
+            binding.resolution,
+            crate::api::ApprovalResolutionWrite::ApproverDm(_)
+        ) && binding.approver_ticket.is_none()
+        {
+            return Err(crate::exit::CliError::usage(format!(
+                "route {name:?}: an approver_dm resolution needs an approver_ticket on the same \
+                 route; the ticket's selector picks the one approver the card is sent to"
+            ))
+            .with_fix("add an approver_ticket block to the route in --routes-from")
+            .into());
         }
         if let Some(approvers) = &binding.approvers {
             validate_parsed_approvers(name, approvers)?;
@@ -450,9 +471,24 @@ pub(super) fn validate_resolution_target(
         crate::api::ApprovalResolutionWrite::RequestingSurface(target) => {
             if target.mode != "requesting_surface" {
                 return Err(crate::exit::usage(format!(
-                    "route {route:?}: resolution mode {:?} is unsupported; the only mode is \
-                     \"requesting_surface\"",
+                    "route {route:?}: resolution mode {:?} is unsupported; the modes are \
+                     \"requesting_surface\" and \"approver_dm\"",
                     target.mode
+                )));
+            }
+            return Ok(());
+        }
+        crate::api::ApprovalResolutionWrite::ApproverDm(target) => {
+            if target.mode != "approver_dm" {
+                return Err(crate::exit::usage(format!(
+                    "route {route:?}: resolution mode {:?} is unsupported; the modes are \
+                     \"requesting_surface\" and \"approver_dm\"",
+                    target.mode
+                )));
+            }
+            if target.identity.trim().is_empty() {
+                return Err(crate::exit::usage(format!(
+                    "route {route:?}: an approver_dm resolution needs a non-empty identity"
                 )));
             }
             return Ok(());
@@ -1002,6 +1038,13 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                                  conversation that asked)"
                                     .to_string()
                             }
+                            crate::api::ApprovalResolutionResponse::ApproverDm(target) => {
+                                format!(
+                                    "resolution approver_dm (identity {}; the card is a DM to \
+                                     the approver the selector picks)",
+                                    target.identity
+                                )
+                            }
                         };
                         ui.kv(name, &resolution);
                         let notification = binding
@@ -1029,6 +1072,11 @@ pub(super) fn describe_approvers(binding: &crate::api::ApprovalRouteBindingRespo
             crate::api::ApprovalResolutionResponse::RequestingSurface(_) => {
                 "the asking channel's members in Slack, and nobody on any other channel \
                  (the default: no approvers block declared)"
+                    .to_string()
+            }
+            crate::api::ApprovalResolutionResponse::ApproverDm(_) => {
+                "the one approver the selector picks (the default: no approvers block \
+                 declared)"
                     .to_string()
             }
         },
