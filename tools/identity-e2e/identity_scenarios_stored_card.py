@@ -20,12 +20,14 @@ no placeholders.
    model carries neither ``selection_mode`` nor ``granted_arguments``).
 3. S2: the card and the pending notice as the worker delivered them to the
    email thread, and ``GET /approvals/<id>``'s ``display_summary``.
-4. S3, always: the ``TicketScenario`` restore and its verification, and the
-   selector seed out of the state.
+4. S3, always: the ``TicketScenario`` restore and its verification, the
+   selector seed out of the state, and then
+   ``identity_scenarios_attestation.require_private_run`` over the whole evidence.
 
 Registered by ``identity_scenarios`` on import. The ticket stays in memory: it
 crosses the API pod's exec pipe and the requester's turn, and the evidence
-carries only lengths, fingerprints and booleans, never a ticket, key or token.
+carries only lengths, fingerprints, counts and booleans, never a ticket, key,
+token or principal value.
 """
 
 from __future__ import annotations
@@ -37,16 +39,18 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import approver_ticket_driver as tickets
-from identity_e2e import Harness, caller_fingerprint, turn_summary
+from identity_e2e import Harness, caller_fingerprint, principal_header_value, turn_summary
 from identity_scenarios import (
     CLOCK_SKEW_S,
     Evidence,
     TicketScenario,
     check,
+    principal_rows_summary,
     require_passed,
     scenario,
     send_summary,
 )
+from identity_scenarios_attestation import private_values, require_private_run
 from identity_scenarios_requester import approval_card
 
 SCENARIO = "stored-arguments-card"
@@ -355,7 +359,7 @@ def stored_arguments_card(harness: Harness, args: Any, evidence: Evidence) -> No
                 issuer=run.requester["issuer"],
                 subject=run.requester["subject"],
             )["rows"]
-            seen["requester_principal"] = rows
+            seen["requester_principal"] = principal_rows_summary(rows)
             check(
                 any(row.get("type") == "human" and row.get("status") == "active" for row in rows),
                 f"{run.senders['requester']} has no active human principals row after their turn",
@@ -487,33 +491,65 @@ def stored_arguments_card(harness: Harness, args: Any, evidence: Evidence) -> No
             }
             seen["card_text_equals_display_summary"] = text == display
     finally:
+        humans = [{**human, "tenant_id": run.tenant_id} for human in (run.requester, run.approver)]
+        private = private_values(
+            [human["subject"] for human in humans],
+            [principal_header_value(human) for human in humans],
+            secret.get("ticket"),
+            run.key.get("seed_hex"),
+        )
         secret.clear()
-        with evidence.step(
-            "S3",
-            "restore: the registration, flag, deployments, routes and approver role put back "
-            "and verified as approver-ticket-creation does, and the selector seed removed",
-        ) as seen:
-            run.restore()
-            report = evidence.data.get("restore") or {}
-            done = list(report.get("done") or [])
-            seen["done"] = [item.get("action") for item in done]
-            seen["verified"] = next(
-                (item.get("result") for item in done if item.get("action") == "verify"), None
+        try:
+            restore_step(harness, evidence, run, state, private)
+        finally:
+            private.clear()
+
+
+def restore_step(
+    harness: Harness,
+    evidence: Evidence,
+    run: TicketScenario,
+    state: Mapping[str, Any],
+    secrets: Sequence[str],
+) -> None:
+    """S3: the ``TicketScenario`` restore, the selector seed removed, then the privacy guard.
+
+    ``secrets`` are every private value the run held: the humans' subjects and
+    principal header values, the ticket and the selector seed. The whole
+    evidence, this step's included, must carry none of them and no
+    principal-shaped object or token envelope.
+    """
+
+    with evidence.step(
+        "S3",
+        "restore: the registration, flag, deployments, routes and approver role put back "
+        "and verified as approver-ticket-creation does, and the selector seed removed; the "
+        "evidence carries no ticket, key, token or principal value",
+    ) as seen:
+        run.restore()
+        report = evidence.data.get("restore") or {}
+        done = list(report.get("done") or [])
+        seen["done"] = [item.get("action") for item in done]
+        seen["verified"] = next(
+            (item.get("result") for item in done if item.get("action") == "verify"), None
+        )
+        seen["failed"] = list(report.get("failed") or [])
+        seed = harness.state.directory / SELECTOR_FILE
+        seed.unlink(missing_ok=True)
+        seen["selector_seed_removed"] = not seed.exists()
+        if state.get("approval_id"):
+            seen["left"] = (
+                f"approval {state['approval_id']} stays pending until it expires at "
+                f"{state.get('expires_at')}; its expiry resumes the paused conversation on "
+                "the restored deployment"
             )
-            seen["failed"] = list(report.get("failed") or [])
-            seed = harness.state.directory / SELECTOR_FILE
-            seed.unlink(missing_ok=True)
-            seen["selector_seed_removed"] = not seed.exists()
-            if state.get("approval_id"):
-                seen["left"] = (
-                    f"approval {state['approval_id']} stays pending until it expires at "
-                    f"{state.get('expires_at')}; its expiry resumes the paused conversation on "
-                    "the restored deployment"
-                )
-            check(
-                not seen["failed"],
-                "restore incomplete: "
-                + "; ".join(
-                    f"{item.get('action')}: {item.get('error')}" for item in seen["failed"]
-                ),
-            )
+        failed = seen["failed"]
+        require_private_run(
+            evidence,
+            seen,
+            secrets=secrets,
+            failure="restore incomplete: "
+            + "; ".join(f"{item.get('action')}: {item.get('error')}" for item in failed)
+            if failed
+            else None,
+        )

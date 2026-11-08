@@ -31,7 +31,7 @@ from typing import Any
 
 import approver_ticket_driver as tickets
 from identity_assets import ed25519_pair
-from identity_e2e import Api, Harness, HarnessError, epoch, turn_summary
+from identity_e2e import Api, Harness, HarnessError, caller_fingerprint, epoch, turn_summary
 from identity_target import REPO, http, write_private
 
 # The fake model's test-only directive: the turn dials every hosted connector
@@ -1554,6 +1554,52 @@ TICKET_TURNS = (
 )
 
 
+def redacted_turns(turns: Mapping[str, Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """What evidence keeps of :attr:`TicketScenario.turns`: ids, the sender and a fingerprint.
+
+    Per label, the event and stream ids, the sender's address, and of the
+    ingress capsule only whether it carries a principal, the first 16 hex of
+    the sha256 of its canonical principal as compact sorted JSON, and the
+    scope's agent id. Never the canonical principal, the rest of the scope or
+    any other capsule field.
+    """
+
+    redacted = {}
+    for label, turn in turns.items():
+        raw = turn.get("capsule_facts")
+        facts: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
+        scope = facts.get("scope") if isinstance(facts.get("scope"), Mapping) else {}
+        canonical = facts.get("canonical")
+        fingerprint = None
+        if canonical is not None:
+            fingerprint = caller_fingerprint(
+                json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+            )
+        redacted[label] = {
+            "event_id": turn.get("event_id"),
+            "stream_id": turn.get("stream_id"),
+            "sender": turn.get("sender"),
+            "capsule": {
+                "principal_present": bool(facts.get("principal_present")),
+                "canonical_fingerprint": fingerprint,
+                "scope_agent_id": scope.get("agent_id"),
+            },
+        }
+    return redacted
+
+
+def principal_rows_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """What evidence keeps of principals rows: the count, an active human, the distinct types."""
+
+    return {
+        "rows": len(rows),
+        "active_human": any(
+            row.get("type") == "human" and row.get("status") == "active" for row in rows
+        ),
+        "types": sorted({str(row["type"]) for row in rows if row.get("type") is not None}),
+    }
+
+
 def refused_with(status: int, body: Any, wanted: int, code: str) -> bool:
     """A refusal with this status whose body names ``code`` (as a detail or a code field)."""
 
@@ -1929,7 +1975,7 @@ class TicketScenario:
         role = self.original["approver_role"]
         setup.update(
             key_id=key["key_id"],
-            ceiling_subjects=self.ceiling,
+            ceiling_humans=len(self.ceiling),
             original={
                 "flag": flag,
                 "version": version,
@@ -2440,14 +2486,20 @@ class TicketScenario:
         for label, who in turns:
             facts = captured[label]
             wanted = self.requester if who == "requester" else self.approver
-            if (
-                facts.get("canonical") != wanted
-                or not facts.get("principal_present")
-                or (facts.get("scope") or {}).get("agent_id") != self.agent_id
-            ):
+            # The facts hold the canonical principal: the message names checks only.
+            failed = [
+                name
+                for name, held in (
+                    ("canonical principal", facts.get("canonical") == wanted),
+                    ("principal present", bool(facts.get("principal_present"))),
+                    ("scope agent", (facts.get("scope") or {}).get("agent_id") == self.agent_id),
+                )
+                if not held
+            ]
+            if failed:
                 raise HarnessError(
                     f"the {label} turn's capsule does not name {self.senders[who]} as a "
-                    f"verified human on {self.agent}: {facts}"
+                    f"verified human on {self.agent}: its {', '.join(failed)} check failed"
                 )
             self.turns[label]["capsule_facts"] = facts
         rows = self.drive(
@@ -2456,8 +2508,8 @@ class TicketScenario:
             issuer=self.issuer,
             subject=self.approver["subject"],
         )["rows"]
-        self.evidence.data["turns"] = self.turns
-        self.evidence.data["approver_principal"] = rows
+        self.evidence.data["turns"] = redacted_turns(self.turns)
+        self.evidence.data["approver_principal"] = principal_rows_summary(rows)
         if not any(row.get("type") == "human" and row.get("status") == "active" for row in rows):
             raise HarnessError(
                 f"{self.senders['approver']} has no active human principals row after their turn"

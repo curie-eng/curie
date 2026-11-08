@@ -497,7 +497,12 @@ role-policy API cannot delete a role and a `filter: null` role would read as
 unrestricted instead of not configured. A configuration stored as SQL NULL goes
 back to NULL. The run's agent versions stay, undeployed, and approvals it
 created stay pending until they expire. The evidence keeps statuses, refusal
-codes, row counts and key ids, never tickets, keys, capsules or tokens.
+codes, row counts and key ids, never tickets, keys, capsules or tokens. Each
+email turn appears as its event and stream ids, its sender's address and, of
+its capsule, whether it carries a principal, the scope's agent id and the
+first 16 hex characters of the sha256 of its canonical principal. The
+approver's `principals` rows appear as a count, whether one is an active
+human, and their types, and the roster's active humans as a count.
 
 ## What grant-attestation proves
 
@@ -603,7 +608,13 @@ No evidence carries a grant, ticket, key, token or principal value. Grants
 appear as the fingerprint of their `jti`, humans as the fingerprint of their
 `X-Curie-Principal` value, and the probe script prints only statuses, the
 first line of each tool result, the proxy's refusal code, the grant
-fingerprint and the pod-clock window of each request.
+fingerprint and the pod-clock window of each request. G10 checks the whole
+evidence last, after its restores and including its own step, and fails on
+any object with both an `issuer` and a `subject` key, any `cct.`, `ccg.`,
+`ccr.` or `cat1.` envelope, and any private value the run held in memory: both
+humans' subjects and `X-Curie-Principal` values, the captured caller token,
+every grant it read, the selector seed and the caller signing seed. The
+failure names only the JSON path of what it found.
 
 ## What stored-arguments-card proves
 
@@ -674,12 +685,16 @@ pending until it expires, after the 24-hour session default because the ticket
 route binds no expiry, and its expiry resumes the paused conversation on the
 restored deployment. The run's agent version stays, undeployed.
 
-No evidence carries a ticket, key or token. The ticket stays in memory: it
-crosses the API pod's exec pipe and the requester's turn, and the evidence
-keeps lengths, booleans and fingerprints (the first 16 hex characters of a
-sha256) of the ticket and of each judged text. The approval's `summary`
-field, the runner's machine string of the raw call, is never read into the
-evidence.
+No evidence carries a ticket, key, token or principal value. The ticket stays
+in memory: it crosses the API pod's exec pipe and the requester's turn, and the
+evidence keeps lengths, booleans and fingerprints (the first 16 hex characters
+of a sha256) of the ticket and of each judged text. The S0 turns and
+`principals` rows appear as `approver-ticket-creation` records them. The
+approval's `summary` field, the runner's machine string of the raw call, is
+never read into the evidence. S3 checks the whole evidence last, after its
+restore and including its own step, as `grant-attestation` G10 does, with the
+two humans' subjects and `X-Curie-Principal` values, the ticket and the
+selector seed as the run's private values.
 
 ## Add a scenario
 
