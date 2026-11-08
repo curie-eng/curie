@@ -400,6 +400,41 @@ class NoVerifiableApprovers:
         )
 
 
+class SelectedApprovers:
+    """A dynamic approval's stored selected set, narrowing a route with no ``approvers``.
+
+    ADR 0271 decision 5: the selection a dynamic row stores is the explicit
+    narrowing even when the route declares no legacy ``approvers`` block, so
+    such a route does not fall back to card-channel membership. The selected
+    canonical people are judged only from fresh HTTP identity facts, by
+    ``approval_selection.check_answer`` inside the HTTP answer composition;
+    ``authorizer.authorize_approval`` refuses every other caller on a dynamic
+    row before it reaches a set. ``contains`` therefore admits, and its evidence
+    names the narrowing that decides instead.
+
+    Only a verified chat click or an adapter-carried reply reaches the HTTP
+    composition, so those are the eligible kinds; an operator, console session
+    or test driver cannot establish a selected canonical person.
+    """
+
+    # NEW vocabulary added by ADR 0271; see the audit-vocabulary note above.
+    audit_name = "SelectedApproverSet"
+    operator_eligible = False
+    console_eligible = False
+    adapter_eligible = True
+    test_driver_eligible = False
+    chat_eligible = True
+    ineligible_reason = (
+        "a dynamic approval is answered only by one of its selected people, through "
+        "their own verified chat click or adapter reply"
+    )
+
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
+        return MembershipVerdict(
+            member=True, evidence={"kind": "approval_selection", "narrowing": "selected_set"},
+        )
+
+
 class ApproverSetSelector(Protocol):
     """Pick the approver set an approval's route binding calls for.
 

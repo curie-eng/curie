@@ -199,6 +199,13 @@ async def _check_approved(
 
     An opted-in agent projects the freshly verified original invoker, never
     the approver. @spec CONNECTOR-REQUESTER-1.
+
+    It serves both the turn-authority and the approval-grant check, so on a
+    canonical route (ADR 0271) both refuse ``caller_not_allowed`` whenever the
+    preserved answering actor is no longer a selected person inside the
+    current ceiling, is no longer the same canonical person, or is now an
+    excluded requester; the shared composition audits each refusal as
+    ``resume_refused``. @spec REQUEST-APPROVAL-5/6.
     """
     answer: TurnAuthorityResponseV1 | TurnAuthorityResponseV2 | None = None
     try:

@@ -4,6 +4,13 @@ The answering actor is authenticated from the existing chat attestation plus a
 receiver-signed proof over the exact submitted bytes, then the original invoker
 and the actor are checked independently and the operation commits through one
 explicit owner. @spec HTTP-APPROVAL-CONTINUITY-7/8/9/10.
+
+On a canonical route (a dynamic approval, or a route enforcing requester
+exclusion) the approver subject is also judged by ``approval_selection`` from
+the same fresh facts, at the answer, the final commit, approved-resume
+publication and the resume and grant current checks. Every refusal there is
+audited once, in its own short transaction after every reader, writer and
+identity fence of the refused operation has closed. @spec REQUEST-APPROVAL-5/6.
 """
 
 from __future__ import annotations
@@ -26,12 +33,13 @@ from fastapi import HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from curie_api import identity_fence, principal_authority
+from curie_api import approval_selection, identity_fence, principal_authority
 from curie_api.approval_auth import AuthenticatedApprovalPrincipal
+from curie_api.approval_selection import SelectionRefused
 from curie_api.approval_teams import authenticated_actor_evidence, team_restriction
 from curie_api.authorizer import authorize_approval
 from curie_api.crud import approvals as approvals_crud
-from curie_api.models import Approval, ApprovalAuditEntry, ApprovalStatus, Principal
+from curie_api.models import Agent, Approval, ApprovalAuditEntry, ApprovalStatus, Principal
 from curie_api.resumequeue import ApprovalResumeRefused, approval_trace_context
 from curie_api.schemas.http_authority import HttpSelectionV1
 from curie_api.schemas.http_identity import LookupRequestV1, NamespaceV1, SenderV1, ValidatedFacts
@@ -70,11 +78,17 @@ _INVALID_PRINCIPAL = "missing or invalid approval principal"
 _RECOVERY_AUDIT_ACTION = approvals_crud.RECOVERY_AUDIT_ACTION
 _RECOVERY_AUTHORIZER = "approval_recovery"
 _AUTHORIZER = "HttpApprovalAnswer"
+_RESUME_REFUSED: Literal["resume_refused"] = "resume_refused"
+
+
+def _error(status: int, code: str) -> HTTPException:
+    """@spec HTTP-APPROVAL-CONTINUITY-7/10."""
+    return HTTPException(status, code, headers={"Cache-Control": "no-store"})
 
 
 def _refuse(status: int, code: str) -> NoReturn:
     """Fixed details only; no submitted value is echoed. @spec HTTP-APPROVAL-CONTINUITY-7/10."""
-    raise HTTPException(status, code, headers={"Cache-Control": "no-store"})
+    raise _error(status, code)
 
 
 def _invalid() -> NoReturn:
@@ -107,6 +121,77 @@ def _definitive_refusal(group: BaseExceptionGroup[Any]) -> HTTPException | None:
         elif isinstance(error, HTTPException) and error.status_code < 500:
             return error
     return None
+
+
+def _boundary_refusal(error: BaseException) -> HTTPException:
+    """What a failure of the shared phases reads as at a boundary, fixed details only.
+
+    A definitive refusal keeps its precedence inside a TaskGroup; a receiver
+    that no longer matches is a denial; any other failure, grouped or not, is
+    unavailable. A ``SelectionRefused`` keeps its code and evidence.
+    @spec HTTP-APPROVAL-CONTINUITY-8/9 REQUEST-APPROVAL-5.
+    """
+    if isinstance(error, BaseExceptionGroup):
+        found = _definitive_refusal(error)
+        if found is None:
+            return _error(503, "authority_unavailable")
+        error = found
+    if isinstance(error, SelectionRefused):
+        return error
+    if isinstance(error, HTTPException):
+        if error.detail == "invalid_http_receiver":
+            return _error(403, "caller_not_allowed")
+        if error.status_code == 503:
+            return _error(503, "authority_unavailable")
+        return error
+    return _error(503, "authority_unavailable")
+
+
+@dataclass(frozen=True)
+class _RefusalAudit:
+    """Who a refused canonical-route operation names in its audit row.
+
+    @spec REQUEST-APPROVAL-5/6.
+    """
+
+    action: Literal["denied", "resume_refused"]
+    actor: str
+    actor_channel: str | None
+    principal_kind: str | None
+    authenticated: bool
+    decision: str
+
+
+async def _audit_refusal(
+    factory: Any, row: Approval, who: _RefusalAudit, refusal: HTTPException, stage: str,
+) -> None:
+    """One audit row for a refusal on a canonical route, in its own short transaction.
+
+    Called only after every reader, writer and identity fence of the refused
+    operation has closed, never under one. The evidence names the public
+    status and detail, the stage and, when the selection policy refused, its
+    code and selection evidence. A failure to write it is logged and never
+    changes the refusal. @spec REQUEST-APPROVAL-5/6.
+    """
+    evidence: dict[str, Any] = {
+        "kind": approval_selection.EVIDENCE_KIND, "mode": row.selection_mode,
+        "route": row.route, "key_id": row.selection_key_id, "decision": who.decision,
+        "code": None,
+    }
+    if isinstance(refusal, SelectionRefused):
+        evidence.update(refusal.evidence)
+    evidence.update(status=refusal.status_code, detail=refusal.detail, stage=stage)
+    try:
+        async with factory() as session, session.begin():
+            session.add(ApprovalAuditEntry(
+                approval_id=row.id, action=who.action, actor=who.actor,
+                actor_channel=who.actor_channel, principal_kind=who.principal_kind,
+                authenticated=who.authenticated, principal_subject=None, decision=who.decision,
+                authorizer=_AUTHORIZER, authorized=False, reason=str(refusal.detail),
+                evidence=evidence,
+            ))
+    except Exception:  # noqa: BLE001 - the refusal stands without its audit row.
+        logger.warning("approval %s refusal audit row could not be written", row.id)
 
 
 def _sha256(data: bytes) -> str:
@@ -385,12 +470,12 @@ async def _route_decision(
     A migrated approver role does not acquire the legacy card-channel default as
     an additional restriction; a nonmigrated role keeps it. @spec HTTP-APPROVAL-CONTINUITY-8.
 
-    A dynamic approval (ADR 0271) is denied first, before that early return
-    could skip the shared authorizer: no answer is accepted until decision 5
-    enforces its selected set. @spec REQUEST-APPROVAL-4.
+    This composition is the canonical owner the shared authorizer admits on a
+    canonical route (ADR 0271). The selected set, ceiling and separation are
+    judged in ``_Composition.verify`` from fresh facts, so the migrated-role
+    early return here skips only the retained route restrictions, never them.
+    @spec REQUEST-APPROVAL-5/6.
     """
-    if row.selection_mode == "dynamic":
-        _deny()
     role = None if actor.capture.policy is None else actor.capture.policy.roles.approver
     if role is not None and role.legacy_state == "migrated" and not team_restriction(
         row, route_binding,
@@ -406,6 +491,7 @@ async def _route_decision(
     )
     _, decision = await authorize_approval(
         row, subject, channel, approver_set=approver_set, principal_kind=kind,
+        route_binding=route_binding, canonical_owner=True,
     )
     if not decision.allowed:
         if isinstance(decision.evidence, dict) and decision.evidence.get("lookup_failed"):
@@ -510,6 +596,12 @@ class _Composition:
 
     Route restrictions are evaluated for the approver subject only.
     @spec HTTP-APPROVAL-CONTINUITY-8/9.
+
+    ``saved`` is the row's sealed capsule, ``decision`` the answer judged (an
+    approved resume judges ``approved``) and ``preserved`` whether the approver
+    subject is the answering actor sealed with the row rather than a new
+    answer. ``selection_evidence`` holds the last canonical-route judgment.
+    @spec REQUEST-APPROVAL-5/6.
     """
 
     request: Request
@@ -526,11 +618,16 @@ class _Composition:
     actor_channel: str
     subjects: list[_Subject]
     associations: dict[str, Any]
+    saved: wire.ApprovalContextV1
+    decision: str = "approved"
+    preserved: bool = False
     applications: dict[str, principal_authority.PrincipalApplication] = field(
         default_factory=dict,
     )
     final: int = 0
     route_evidence: dict[str, Any] | None = None
+    selection_evidence: dict[str, Any] | None = None
+    stage: str = "capture"
 
     async def _observe(self, subject: _Subject) -> _Subject:
         """Phase 2 for one subject. @spec HTTP-APPROVAL-CONTINUITY-9."""
@@ -550,6 +647,7 @@ class _Composition:
 
         @spec HTTP-APPROVAL-CONTINUITY-8/9.
         """
+        self.stage = "observe"
         if len({subject.capture.authority for subject in self.subjects}) != 1:
             _unavailable()
         actor = next((item for item in self.subjects if item.role == "approver"), None)
@@ -606,6 +704,11 @@ class _Composition:
         Requester equality neither grants nor vetoes: each subject is judged by
         its own role against its own preserved association, if any.
         @spec HTTP-APPROVAL-CONTINUITY-8/9.
+
+        On a canonical route the approver subject is then judged by
+        ``approval_selection.check_answer`` from the same fresh facts, after
+        its own permission, with the configuration version read in this same
+        session. @spec REQUEST-APPROVAL-5/6.
         """
         current_facts: dict[str, ValidatedFacts] = {}
         state = self.request.app.state
@@ -627,10 +730,36 @@ class _Composition:
             current_facts[subject.role] = observed
         if await approvals_crud.get_approval_route_binding(session, self.row) != self.route_binding:
             _unavailable()
+        await self._judge_selection(session, current_facts)
         return current_facts
+
+    async def _judge_selection(
+        self, session: AsyncSession, facts: dict[str, ValidatedFacts],
+    ) -> None:
+        """The canonical-route check of the approver subject, if any.
+
+        Pure apart from the configuration version this session reads.
+        @spec REQUEST-APPROVAL-5/6.
+        """
+        self.selection_evidence = None
+        if "approver" not in facts or not approval_selection.canonical_route(
+            self.row, self.route_binding,
+        ):
+            return
+        version = await session.scalar(
+            select(Agent.connector_requester_identity_version).where(
+                Agent.id == self.row.agent_id,
+            )
+        )
+        self.selection_evidence = approval_selection.check_answer(
+            self.row, self.route_binding, saved=self.saved, facts=facts["approver"],
+            principal_applied=self.applications["approver"].principal_id is not None,
+            decision=self.decision, configuration_version=version, preserved=self.preserved,
+        )
 
     async def recheck(self) -> None:
         """Phase 4: a clean read-only reader. @spec HTTP-APPROVAL-CONTINUITY-9."""
+        self.stage = "recheck"
         async with self.factory() as session, session.begin():
             await identity_fence.lock_identity_reader(session)
             await self.verify(session, writer=False)
@@ -807,13 +936,55 @@ async def _answer(
     composition = _Composition(
         request, runtime, client, factory, valkey, approval_id, snapshot, row, route_binding,
         approver_sets, principal.subject, actor_scope.channel, [caller, actor],
-        {"invocation": saved, "approver": None},
+        {"invocation": saved, "approver": None}, saved, decision=answer.decision,
     )
+    if not approval_selection.canonical_route(row, route_binding):
+        return await _decide(composition, principal, answer, actor_scope)
+    # @spec REQUEST-APPROVAL-5/6: every refusal on a canonical route is audited
+    # once, after the phase that raised it has closed its reader, writer and
+    # fence; a grouped or unexpected failure reads as unavailable unless a
+    # definitive denial is inside it.
+    try:
+        return await _decide(composition, principal, answer, actor_scope)
+    except ApprovalSettled:
+        raise
+    except (Exception, BaseExceptionGroup) as error:  # noqa: BLE001 - normalized below.
+        # The normalized refusal is never bound to a local: a frame holding the
+        # exception that holds the frame would keep both alive until a GC pass.
+        await _audit_answer_refusal(
+            factory, row, principal, answer, _boundary_refusal(error), composition.stage,
+        )
+        raise _boundary_refusal(error) from None
+
+
+async def _audit_answer_refusal(
+    factory: Any, row: Approval, principal: AuthenticatedApprovalPrincipal,
+    answer: ApprovalAnswer, refusal: HTTPException, stage: str,
+) -> None:
+    """One ``denied`` row naming the authenticated actor, for a 403 or 503 refusal.
+
+    @spec REQUEST-APPROVAL-5/6.
+    """
+    if refusal.status_code in (403, 503):
+        await _audit_refusal(factory, row, _RefusalAudit(
+            "denied", principal.subject, principal.actor_channel, principal.kind, True,
+            answer.decision,
+        ), refusal, stage)
+
+
+async def _decide(
+    composition: _Composition, principal: AuthenticatedApprovalPrincipal,
+    answer: ApprovalAnswer, actor_scope: _Actor,
+) -> Approval:
+    """Phases 2 to 5 of one answer. @spec HTTP-APPROVAL-CONTINUITY-9 REQUEST-APPROVAL-5."""
+    runtime, factory, valkey = composition.runtime, composition.factory, composition.valkey
+    approval_id, snapshot, saved = composition.approval_id, composition.snapshot, composition.saved
     await composition.observe_and_apply()
     await composition.recheck()
     actor = composition.subjects[1]
 
     # Phase 5: the one mutation; no external call here.
+    composition.stage = "commit"
     async with identity_fence.mutation(factory, valkey) as writer:
         async with writer.begin():
             current_facts = await composition.verify(writer, writer=True)
@@ -849,6 +1020,9 @@ async def _answer(
                 } if recovery else {
                     "kind": "http_approval_answer", "authenticated_actor": authenticated,
                     "route": composition.route_evidence,
+                    # @spec REQUEST-APPROVAL-5/6: the canonical-route judgment.
+                    **({} if composition.selection_evidence is None
+                       else {"selection": composition.selection_evidence}),
                 },
             ))
             await writer.flush()
@@ -870,12 +1044,19 @@ async def check_http_approval_actor(
     ``unsupported_approval`` when the row is not a sealed approved selected
     session approval, 503 ``authority_unavailable`` otherwise.
     @spec HTTP-APPROVAL-CONTINUITY-8/9.
+
+    On a canonical route the preserved actor must also still be the same
+    canonical person and pass ``approval_selection``; each refusal there
+    writes one ``resume_refused`` audit row once its readers have closed.
+    @spec REQUEST-APPROVAL-5/6.
     """
     runtime = getattr(request.app.state, "http_identity_runtime", None)
     client = getattr(request.app.state, "http_identity_client", None)
     if type(runtime) is not HttpInvocationRuntime or not isinstance(client, HttpIdentityClient):
         _unavailable()
     factory, valkey = request.app.state.sessionmaker, request.app.state.valkey
+    audited: tuple[Approval, wire.ApprovalContextV1] | None = None
+    composition: _Composition | None = None
     try:
         async with factory() as session, session.begin():
             await identity_fence.lock_identity_reader(session)
@@ -886,27 +1067,49 @@ async def check_http_approval_actor(
                 or saved.status != "approved" or row.purpose != "session"
             ):
                 _refuse(403, "unsupported_approval")
+            route_binding = await approvals_crud.get_approval_route_binding(session, row)
+            if approval_selection.canonical_route(row, route_binding):
+                audited = (row, saved)
             actor, association = _preserved_actor(runtime, row, saved)
             subject = await _prepare(
                 session, runtime, "approver", actor.registration, actor.source,
             )
-            route_binding = await approvals_crud.get_approval_route_binding(session, row)
             snapshot = approval_record_digest(row)
         composition = _Composition(
             request, runtime, client, factory, valkey, approval_id, snapshot, row,
             route_binding, approver_sets, actor.source.sender.native_id, actor.channel,
-            [subject], {"approver": association},
+            [subject], {"approver": association}, saved, preserved=True,
         )
         await composition.observe_and_apply()
         await composition.recheck()
-    except HTTPException as error:
-        if error.detail == "invalid_http_receiver":
-            _deny()
-        if error.status_code == 503:
-            _unavailable()
-        raise
-    except Exception:  # noqa: BLE001 - provider, credential and SQL details never cross.
-        _unavailable()
+    except (Exception, BaseExceptionGroup) as error:  # noqa: BLE001 - normalized below.
+        # Provider, credential and SQL details never cross. The refusal is never
+        # bound to a local, so no frame-exception cycle outlives the check.
+        if audited is not None:
+            await _audit_resume_refusal(
+                factory, *audited, _boundary_refusal(error),
+                "capture" if composition is None else composition.stage,
+            )
+        raise _boundary_refusal(error) from None
+
+
+async def _audit_resume_refusal(
+    factory: Any, row: Approval, saved: wire.ApprovalContextV1, refusal: HTTPException,
+    stage: str,
+) -> None:
+    """One ``resume_refused`` row naming the preserved answering actor, no principal kind.
+
+    Only for a canonical route and a 403 or 503 refusal, after every reader of
+    the refused check has closed. A retried check adds a row per refusal.
+    @spec REQUEST-APPROVAL-5/6.
+    """
+    if refusal.status_code not in (403, 503):
+        return
+    scope = saved.actor_scope
+    await _audit_refusal(factory, row, _RefusalAudit(
+        _RESUME_REFUSED, scope.native_id if scope is not None else (row.resolved_by or ""),
+        None if scope is None else scope.actor_channel, None, False, saved.status,
+    ), refusal, stage)
 
 
 @dataclass(frozen=True)
@@ -958,6 +1161,14 @@ def approved_resume_current(state: Any) -> ApprovedResumeInvokerAuthority:
 
     It also yields the invocation role's freshly verified identity, which the
     turn current check projects for an opted-in agent. @spec CONNECTOR-REQUESTER-1.
+
+    It serves approved-resume publication, ``turn-authority/check`` and
+    ``approval-grant/check``. On a canonical route the preserved answering
+    actor must still be the same canonical person and pass
+    ``approval_selection``; each refusal before the yield writes one
+    ``resume_refused`` audit row, in its own transaction once this check's
+    readers have closed, and the refusal then propagates unchanged.
+    @spec REQUEST-APPROVAL-5/6.
     """
 
     @asynccontextmanager
@@ -972,60 +1183,83 @@ def approved_resume_current(state: Any) -> ApprovedResumeInvokerAuthority:
         request = cast(Request, SimpleNamespace(app=SimpleNamespace(state=state)))
         factory, valkey = state.sessionmaker, state.valkey
         approval_id = uuid.UUID(saved.approval_id)
-        # Phase 1: a short reader capture of both subjects; released before lookups.
-        async with factory() as session, session.begin():
-            await identity_fence.lock_identity_reader(session)
-            row = await session.get(Approval, approval_id, populate_existing=True)
-            if (
-                row is None or row.status != ApprovalStatus.approved or row.purpose != "session"
-                or verified_capsule(runtime, row) != saved or saved.status != "approved"
-            ):
-                _refuse(403, "unsupported_approval")
-            actor, association = _preserved_actor(runtime, row, saved)
-            try:
-                caller_registration, caller_source = turn_invocation_source(runtime, saved)
-            except HTTPException:
-                _deny()
-            caller = await _prepare(
-                session, runtime, "invocation", caller_registration, caller_source,
-            )
-            approver = await _prepare(
-                session, runtime, "approver", actor.registration, actor.source,
-            )
-            route_binding = await approvals_crud.get_approval_route_binding(session, row)
-            snapshot = approval_record_digest(row)
-        composition = _Composition(
-            request, runtime, client, factory, valkey, approval_id, snapshot, row,
-            route_binding, state.approver_sets, actor.source.sender.native_id, actor.channel,
-            [caller, approver], {"invocation": saved, "approver": association},
-        )
-        # Phases 2 and 3: lookups and route membership outside SQL, then lifecycle.
-        await composition.observe_and_apply()
-        # Phase 4: the final clean reader, held open across the guarded append.
-        async with factory() as session, session.begin():
-            await identity_fence.lock_identity_reader(session)
-            facts = await composition.verify(session, writer=False)
-            _pending(
-                await session.get(Approval, approval_id, populate_existing=True),
-                snapshot, status=row.status,
-            )
-            stable = await valkey.get(identity_fence.FENCE_KEY)
-            if isinstance(stable, bytes):
-                stable = stable.decode("ascii")
-            if type(stable) is not str or not stable.startswith("stable:"):
-                _unavailable()
-            windows: dict[Literal["invocation", "approver"], ResumeWindow] = {}
-            for subject in composition.subjects:
-                validity = identity_delivery_window(facts[subject.role], subject.credential.limits)
-                windows[subject.role] = ResumeWindow(
-                    validity.lower_seconds * 1_000_000 + validity.lower_microseconds,
-                    validity.upper_seconds * 1_000_000 + validity.upper_microseconds,
+        audited: Approval | None = None
+        composition: _Composition | None = None
+        entered = False
+        try:
+            # Phase 1: a short reader capture of both subjects; released before lookups.
+            async with factory() as session, session.begin():
+                await identity_fence.lock_identity_reader(session)
+                row = await session.get(Approval, approval_id, populate_existing=True)
+                if (
+                    row is None or row.status != ApprovalStatus.approved
+                    or row.purpose != "session"
+                    or verified_capsule(runtime, row) != saved or saved.status != "approved"
+                ):
+                    _refuse(403, "unsupported_approval")
+                route_binding = await approvals_crud.get_approval_route_binding(session, row)
+                if approval_selection.canonical_route(row, route_binding):
+                    audited = row
+                actor, association = _preserved_actor(runtime, row, saved)
+                try:
+                    caller_registration, caller_source = turn_invocation_source(runtime, saved)
+                except HTTPException:
+                    _deny()
+                caller = await _prepare(
+                    session, runtime, "invocation", caller_registration, caller_source,
                 )
-            yield ApprovedResumeCurrent(
-                CurrentResumeAuthority(session=session, stable_fence=stable, windows=windows),
-                invoker=resolved_identity(facts["invocation"]),
-                invoker_human=composition.applications["invocation"].principal_id is not None,
+                approver = await _prepare(
+                    session, runtime, "approver", actor.registration, actor.source,
+                )
+                snapshot = approval_record_digest(row)
+            composition = _Composition(
+                request, runtime, client, factory, valkey, approval_id, snapshot, row,
+                route_binding, state.approver_sets, actor.source.sender.native_id,
+                actor.channel, [caller, approver], {"invocation": saved, "approver": association},
+                saved, preserved=True,
             )
+            # Phases 2 and 3: lookups and route membership outside SQL, then lifecycle.
+            await composition.observe_and_apply()
+            # Phase 4: the final clean reader, held open across the guarded append.
+            composition.stage = "recheck"
+            async with factory() as session, session.begin():
+                await identity_fence.lock_identity_reader(session)
+                facts = await composition.verify(session, writer=False)
+                _pending(
+                    await session.get(Approval, approval_id, populate_existing=True),
+                    snapshot, status=row.status,
+                )
+                stable = await valkey.get(identity_fence.FENCE_KEY)
+                if isinstance(stable, bytes):
+                    stable = stable.decode("ascii")
+                if type(stable) is not str or not stable.startswith("stable:"):
+                    _unavailable()
+                windows: dict[Literal["invocation", "approver"], ResumeWindow] = {}
+                for subject in composition.subjects:
+                    validity = identity_delivery_window(
+                        facts[subject.role], subject.credential.limits,
+                    )
+                    windows[subject.role] = ResumeWindow(
+                        validity.lower_seconds * 1_000_000 + validity.lower_microseconds,
+                        validity.upper_seconds * 1_000_000 + validity.upper_microseconds,
+                    )
+                current = ApprovedResumeCurrent(
+                    CurrentResumeAuthority(session=session, stable_fence=stable, windows=windows),
+                    invoker=resolved_identity(facts["invocation"]),
+                    invoker_human=composition.applications["invocation"].principal_id is not None,
+                )
+                entered = True
+                yield current
+        except (Exception, BaseExceptionGroup) as error:  # noqa: BLE001 - audited, re-raised.
+            # The caller's body and every non-canonical route keep their own
+            # failure; each boundary maps it exactly as before.
+            if entered or audited is None:
+                raise
+            await _audit_resume_refusal(
+                factory, audited, saved, _boundary_refusal(error),
+                "capture" if composition is None else composition.stage,
+            )
+            raise
 
     return authority
 

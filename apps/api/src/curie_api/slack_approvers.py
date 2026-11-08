@@ -46,6 +46,7 @@ from .approvers import (
     InvalidApprovers,
     MembershipVerdict,
     NoVerifiableApprovers,
+    SelectedApprovers,
     UnboundRoute,
     shown_off_slack,
 )
@@ -250,6 +251,10 @@ class SlackApproverSetSelector:
     a route in ``requesting_surface`` mode) takes a provider-neutral set, since
     no Slack set can be proven there (ADR-0177): the route's approver
     ``emails`` on an email card, and nobody otherwise (ADR-0177 amendment).
+
+    A dynamic approval (ADR 0271) whose bound route declares no ``approvers``
+    takes ``SelectedApprovers`` ahead of that: its stored selected set is the
+    narrowing, judged by the HTTP answer composition.
     """
 
     def __init__(
@@ -280,6 +285,13 @@ class SlackApproverSetSelector:
             # approver set to everyone in the card's channel -- the opposite of
             # what the binding was trying to say.
             return InvalidApprovers(spec_error)
+        if approval.selection_mode == "dynamic" and approvers is None and binding is not None:
+            # ADR 0271 decision 5: a dynamic row's stored selection is the
+            # explicit narrowing even with no legacy ``approvers`` block, on any
+            # card surface, so it never widens to channel membership. A missing
+            # binding still falls through to ``UnboundRoute`` below, and a
+            # declared block stays an additional constraint.
+            return SelectedApprovers()
         if shown_off_slack(approval, binding):
             # ADR-0177: the card is in a non-Slack conversation, so none of
             # Slack's sets below can be proven there. ADR-0177 amendment: an email card is

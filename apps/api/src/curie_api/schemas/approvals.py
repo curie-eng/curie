@@ -347,17 +347,42 @@ class ApproverTicketRegistration(_StoredWithoutNulls):
         return base64.urlsafe_b64decode(self.public_key + "=" * (-len(self.public_key) % 4))
 
 
-class ApprovalSeparation(_StoredWithoutNulls):
-    """Requester exclusion for a registered selector route (ADR 0271).
+class ApprovalExemptGroup(_StoredWithoutNulls):
+    """The one identity provider group exempt from requester exclusion (ADR 0271).
 
-    Omitted on write stores ``{"exclude_requester": true}``; ``false`` is the
-    audited opt-out. ``exempt_group`` lands with its enforcement (0271b), so it
-    is refused here rather than stored unenforced.
+    Named by canonical issuer and stable group id, compared byte for byte with
+    the requester's current directory groups at answer time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    issuer: Annotated[str, AfterValidator(_issuer_text)]
+    id: TicketText
+
+
+class ApprovalSeparation(_StoredWithoutNulls):
+    """Requester exclusion on an approval route (ADR 0271 decision 6).
+
+    On a route that registers an ``approver_ticket`` selector, omitting it
+    stores ``{"exclude_requester": true}`` and ``false`` is the audited opt-out.
+    On any other route it is stored as written: ``true`` enables static
+    exclusion, and omitting it keeps ordinary ADR 0106 self-confirmation.
+    ``exempt_group`` is valid only beside ``exclude_requester: true``.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     exclude_requester: Annotated[bool, Field(strict=True)]
+    exempt_group: ApprovalExemptGroup | None = None
+
+    @model_validator(mode="after")
+    def _exemption_needs_exclusion(self) -> "ApprovalSeparation":
+        if self.exempt_group is not None and not self.exclude_requester:
+            raise ValueError(
+                "exempt_group applies only with exclude_requester true: an exemption "
+                "without requester exclusion is invalid (ADR 0271 decision 6)"
+            )
+        return self
 
 
 class ApprovalRouteBinding(_StoredWithoutNulls):
@@ -369,7 +394,8 @@ class ApprovalRouteBinding(_StoredWithoutNulls):
     message carries no interaction. ``approvers`` continues to narrow WHO may
     act through the resolution card path and is never inferred from notification
     recipients. ``approver_ticket`` registers a per-request approver selector and
-    ``separation`` its requester exclusion (ADR 0271).
+    ``separation`` the route's requester exclusion, with or without a selector
+    (ADR 0271).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -383,15 +409,6 @@ class ApprovalRouteBinding(_StoredWithoutNulls):
     remind_every_s: int | None = Field(default=None, strict=True, gt=0, le=2**31 - 1)
     approver_ticket: ApproverTicketRegistration | None = None
     separation: ApprovalSeparation | None = None
-
-    @model_validator(mode="after")
-    def _separation_needs_a_selector(self) -> "ApprovalRouteBinding":
-        if self.separation is not None and self.approver_ticket is None:
-            raise ValueError(
-                "separation applies only to a route that registers an approver_ticket "
-                "selector (ADR 0271): add the registration or remove separation"
-            )
-        return self
 
     @model_validator(mode="after")
     def _emails_need_the_requesting_surface(self) -> "ApprovalRouteBinding":
@@ -517,12 +534,28 @@ class ApproverTicketOut(BaseModel):
     ceiling: ApproverTicketCeilingOut | None = None
 
 
+class ApprovalExemptGroupOut(BaseModel):
+    """Read projection of a stored exempt group; tolerant for repair."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    issuer: str | None = None
+    id: str | None = None
+
+
 class ApprovalSeparationOut(BaseModel):
-    """Read projection of the stored, effective requester exclusion."""
+    """Read projection of the stored, effective requester exclusion.
+
+    ``exempt_group`` is omitted, not null, when the route stores none, so a
+    route without one reads back exactly as before.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
     exclude_requester: bool | None = None
+    exempt_group: ApprovalExemptGroupOut | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class ApprovalRouteBindingOut(BaseModel):

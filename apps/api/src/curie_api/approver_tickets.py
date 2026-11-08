@@ -3,10 +3,11 @@
 ``verify_ticket`` is the frozen pure preparation check (INTERFACE.md). Everything
 else here is the platform's creation-side wiring of decisions 1, 2 and 4:
 
-1. Registration (decision 1): the closed registration shape lives on
-   ``schemas.approvals.ApprovalRouteBinding``; ``prepare_selector_write`` pins
-   the operator-approved approver role and builds the audit rows for one route
-   map replacement, inside the caller's row-locked transaction.
+1. Registration (decisions 1 and 6): the closed registration and separation
+   shapes live on ``schemas.approvals.ApprovalRouteBinding``;
+   ``prepare_selector_write`` pins the operator-approved approver role, stores
+   each route's requester exclusion and builds the audit rows for one versioned
+   route map replacement, inside the caller's row-locked transaction.
 2. Serving bundle gate (decision 2): ``check_bundle_gate`` refuses a bundle
    route map that does not send a registered connector tool to its route.
 3. Route lock (decision 2): ``check_tool_route`` reads the lock key only from
@@ -61,6 +62,9 @@ PAIR_CONFLICT = "approver_ticket_pair_conflict"
 NO_SERVING_BUNDLE = "approver_ticket.no_serving_bundle"
 SELECTOR_REGISTERED = "requester_identity_selector_registered"
 BUNDLE_GATE_MISMATCH = "approver_ticket.bundle_gate_mismatch"
+# Separation (decision 6): enabling exclusion or an exemption on any route.
+SEPARATION_REQUIRES_HTTP_IDENTITY = "approval_separation_requires_http_identity"
+SEPARATION_CHANGED = "approval_separation.changed"
 
 # Creation (both creation owners).
 ROUTE_LOCKED = "approval_route_locked"
@@ -157,6 +161,24 @@ def has_selector(routes: Any) -> bool:
     """Whether any route of a raw map carries an ``approver_ticket`` key, even malformed."""
 
     return next(_selector_bindings(routes), None) is not None
+
+
+def has_separation(routes: Any) -> bool:
+    """Whether any route of a raw map carries a ``separation`` key, even malformed."""
+
+    return isinstance(routes, dict) and any(
+        isinstance(binding, dict) and "separation" in binding for binding in routes.values()
+    )
+
+
+def needs_configuration_version(routes: Any) -> bool:
+    """Whether a raw map's replacement is versioned (ADR 0271 decisions 1 and 6).
+
+    Any ``approver_ticket`` or ``separation`` key, even malformed, puts the write
+    on the compare-and-set of ``connector_requester_identity_version``.
+    """
+
+    return has_selector(routes) or has_separation(routes)
 
 
 def live_pair(granted_tool: object) -> tuple[str, str] | None:
@@ -347,6 +369,93 @@ def _role_version(ticket: dict[str, Any] | None) -> Any:
     return ceiling.get("approver_role_version") if isinstance(ceiling, dict) else None
 
 
+def separation_needs_http_identity(routes: Any) -> bool:
+    """Whether a raw map holds a separation choice that needs verified requester identity.
+
+    Static exclusion (``exclude_requester`` true on a route without a
+    selector) and any ``exempt_group`` do. A selector route's own exclusion
+    does not: it rides on the registration, whose prerequisite is the
+    requester identity flag (decision 1), and its approvals are created only
+    on the HTTP path. Judged on the whole map, so a kept choice is judged like
+    a new one. A ``separation`` that cannot be read counts, failing closed.
+    """
+
+    if not isinstance(routes, dict):
+        return False
+    for binding in routes.values():
+        if not isinstance(binding, dict) or "separation" not in binding:
+            continue
+        separation = binding["separation"]
+        if not isinstance(separation, dict) or separation.get("exempt_group") is not None:
+            return True
+        if "approver_ticket" not in binding and separation.get("exclude_requester") is not False:
+            return True
+    return False
+
+
+def _separation_choice(routes: Any, name: str, *, selector: bool) -> tuple[Any, Any]:
+    """A route's effective ``(exclude_requester, exempt_group)``, read tolerantly.
+
+    A stored ``separation`` is reported as stored, malformed values included,
+    so the write that repairs it is audited. Without one, a route is excluding
+    when ``selector`` (the selector default, never an operator choice) and
+    ordinary self-confirmation otherwise.
+    """
+
+    binding = routes.get(name) if isinstance(routes, dict) else None
+    if isinstance(binding, dict) and "separation" in binding:
+        separation = binding["separation"]
+        if not isinstance(separation, dict):
+            return separation, None
+        return separation.get("exclude_requester"), separation.get("exempt_group")
+    return (True, None) if selector else (False, None)
+
+
+def _route_names(*maps: Any) -> list[str]:
+    return sorted({str(name) for routes in maps if isinstance(routes, dict) for name in routes})
+
+
+def _separation_audit(
+    stored: Any,
+    written: dict[str, Any],
+    name: str,
+    named: dict[str, Any] | None,
+    *,
+    selector: bool,
+    old_version: int,
+    new_version: int,
+) -> SelectorAudit | None:
+    """The ``approval_separation.changed`` row for one route, when its choice changed.
+
+    Compared on the effective ``(exclude_requester, exempt_group)`` before and
+    after, on selector and static routes alike. A route that holds a selector
+    before or after is compared against the selector default, so registering
+    with exclusion omitted records nothing and an opt-out or exemption at
+    registration does. ``named`` is the route's registration, if any.
+    """
+
+    old = _separation_choice(stored, name, selector=selector)
+    new = _separation_choice(written, name, selector=False)
+    if old == new:
+        return None
+    named = named or {}
+    return SelectorAudit(
+        SEPARATION_CHANGED,
+        {
+            "route": name,
+            "key_id": named.get("key_id"),
+            "connector": named.get("connector"),
+            "tool": named.get("tool"),
+            "old_exclude_requester": old[0],
+            "new_exclude_requester": new[0],
+            "old_exempt_group": old[1],
+            "new_exempt_group": new[1],
+            "old_configuration_version": old_version,
+            "new_configuration_version": new_version,
+        },
+    )
+
+
 async def prepare_selector_write(
     session: AsyncSession,
     agent: Agent,
@@ -354,13 +463,17 @@ async def prepare_selector_write(
     *,
     new_version: int,
 ) -> tuple[dict[str, Any], list[SelectorAudit]]:
-    """The stored map and audit rows for one selector route map replacement.
+    """The stored map and audit rows for one versioned route map replacement.
 
     Runs inside the caller's transaction, after the agent row is locked and its
     expected version compared. Judges each registration (decision 1), pins its
-    ceiling, and stores the effective requester exclusion. A registration
+    ceiling, and stores the effective requester exclusion: omitted on a
+    selector route it stores ``exclude_requester: true``, and on any other
+    route ``separation`` is stored as written (decision 6). A registration
     identical to the stored one on the same route keeps its pin and is not
-    judged against the current policy version.
+    judged against the current policy version. The receiver prerequisite for
+    static exclusion and exemptions is the caller's (``crud.agents``), judged
+    on the map returned here.
     """
 
     bindings = {name: ApprovalRouteBinding.model_validate(raw) for name, raw in proposed.items()}
@@ -394,45 +507,65 @@ async def prepare_selector_write(
                     "value back unchanged",
                 )
             raw["approver_ticket"]["ceiling"]["approver_role"] = pin
-            exclude = True if binding.separation is None else binding.separation.exclude_requester
-            raw["separation"] = {"exclude_requester": exclude}
+            if binding.separation is None:
+                raw["separation"] = {"exclude_requester": True}
         written[name] = raw
     held = set(_registered_names(stored))
     old_version = agent.connector_requester_identity_version
     audits: list[SelectorAudit] = []
-    for name in sorted(held | set(_registered_names(written))):
+    for name in _route_names(stored, written):
         before, after = _stored_ticket(stored, name), _stored_ticket(written, name)
         if before is None and name in held:
             before = {}  # A stored registration too malformed to read is still replaced.
-        old_exclude = _stored_exclusion(stored, name) if before is not None else None
-        new_exclude = _stored_exclusion(written, name) if after is not None else None
-        named = after if after is not None else before
-        assert named is not None
-        details = {
-            "route": name,
-            "key_id": named.get("key_id"),
-            "connector": named.get("connector"),
-            "tool": named.get("tool"),
-            "old_key_id": None if before is None else before.get("key_id"),
-            "old_configuration_version": old_version,
-            "new_configuration_version": new_version,
-            "old_exclude_requester": old_exclude,
-            "new_exclude_requester": new_exclude,
-            "old_approver_role_version": _role_version(before),
-            "new_approver_role_version": _role_version(after),
-        }
-        if before is None:
-            audits.append(SelectorAudit("approver_ticket.registered", details))
-        elif after is None:
-            audits.append(SelectorAudit("approver_ticket.removed", details))
-        elif before != after:
-            audits.append(SelectorAudit("approver_ticket.replaced", details))
-        if after is not None and (
-            (before is None and new_exclude is False)
-            or (before is not None and old_exclude != new_exclude)
-        ):
-            audits.append(SelectorAudit("approval_separation.changed", details))
+        selector = _selector_audit(
+            stored, written, name, before, after, old_version=old_version, new_version=new_version
+        )
+        separation = _separation_audit(
+            stored,
+            written,
+            name,
+            after if after is not None else before,
+            selector=before is not None or after is not None,
+            old_version=old_version,
+            new_version=new_version,
+        )
+        audits.extend(audit for audit in (selector, separation) if audit is not None)
     return written, audits
+
+
+def _selector_audit(
+    stored: Any,
+    written: dict[str, Any],
+    name: str,
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+    *,
+    old_version: int,
+    new_version: int,
+) -> SelectorAudit | None:
+    """The registration row for one route: registered, replaced or removed, if any."""
+
+    named = after if after is not None else before
+    if named is None or before == after:
+        return None
+    details = {
+        "route": name,
+        "key_id": named.get("key_id"),
+        "connector": named.get("connector"),
+        "tool": named.get("tool"),
+        "old_key_id": None if before is None else before.get("key_id"),
+        "old_configuration_version": old_version,
+        "new_configuration_version": new_version,
+        "old_exclude_requester": _stored_exclusion(stored, name) if before is not None else None,
+        "new_exclude_requester": _stored_exclusion(written, name) if after is not None else None,
+        "old_approver_role_version": _role_version(before),
+        "new_approver_role_version": _role_version(after),
+    }
+    if before is None:
+        return SelectorAudit("approver_ticket.registered", details)
+    if after is None:
+        return SelectorAudit("approver_ticket.removed", details)
+    return SelectorAudit("approver_ticket.replaced", details)
 
 
 def _registered_names(routes: Any) -> Iterable[str]:

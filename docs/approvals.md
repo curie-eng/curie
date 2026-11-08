@@ -403,30 +403,77 @@ approval is being created is therefore judged by that creation, or waits for it 
 
 ### The shared configuration version
 
-Selector writes and the requester identity flag compare-and-set on the same agent value,
-`connector_requester_identity_version`. A route write that registers, replaces or removes a
-selector, or that edits a map already holding one, must carry the version you read. With
+Selector and separation writes and the requester identity flag compare-and-set on the same
+agent value, `connector_requester_identity_version`. A route write that registers, replaces or
+removes a selector, that writes or removes a `separation` on any route, or that edits a map
+already holding either, must carry the version you read. With
 `--routes-from`, the CLI reads the current version in the same command and sends it as
 `approval_routes_expected_version`, so ordinary use needs nothing extra. Pass
 `--routes-expected-version N` to pin the version you reviewed instead; if the agent has moved
 on, the API refuses `approval_routes.version_conflict` and writes nothing. A write that
 omits the version is refused `approval_routes.expected_version_required`. The flag can only
 be turned off after every selector is removed (`requester_identity_selector_registered`),
-and two writers holding the same version cannot both commit. Route writes that involve no
-selector are unchanged and do not bump the version. `--routes-expected-version` is accepted
-only alongside a route write flag.
+and two writers holding the same version cannot both commit. Route writes that involve
+neither a selector nor a separation are unchanged and do not bump the version.
+`--routes-expected-version` is accepted only alongside a route write flag.
 
 ### Requester exclusion
 
-By default the person who asked cannot approve their own request. Omitting `separation`
-stores and returns `{"exclude_requester": true}`. Setting `"exclude_requester": false` is the
-audited opt-out for routes where one person may legitimately do both. Each change to the
-exclusion, and each registration, replacement and removal, writes an identity audit row with
-the route, key id, connector and tool, the old and new configuration version, and the old and
-new pinned role version. The public key bytes are never audited beyond the key id. Because
-enforcement lands with answer and resume authority, today the stored value is policy
-recorded and audited, not yet applied at answer time. `separation` without
-`approver_ticket`, and `exempt_group`, are refused.
+`separation` decides whether the person who asked may approve their own request. It can sit
+on any route, with or without a selector.
+
+On a route that registers a selector, exclusion is the default: omitting `separation` stores
+and returns `{"exclude_requester": true}`. Setting `"exclude_requester": false` is the audited
+opt-out for routes where one person may legitimately do both. Only that explicit operator
+write opts out; omission never does.
+
+On a route without a selector, `separation` is stored as written. `{"exclude_requester": true}`
+turns on static exclusion, so the person whose turn raised the approval cannot approve it.
+Omitting `separation` keeps ordinary self-confirmation (ADR 0106).
+
+`exempt_group` names one identity provider group, by its canonical `issuer` and stable group
+`id`, whose members are exempt from the exclusion:
+
+```json
+"separation": {
+  "exclude_requester": true,
+  "exempt_group": { "issuer": "https://idp.example.test", "id": "finance-leads" }
+}
+```
+
+It is valid only beside `"exclude_requester": true`. An exemption without exclusion is refused
+422, and so is `exempt_group` anywhere other than inside `separation`. The issuer is 1 to 2048
+UTF-8 bytes and the id 1 to 256, with no surrounding whitespace or control characters.
+
+Rules, all checked on write:
+
+1. A route map that carries a `separation` on the stored or the proposed side is a versioned
+   write. It must send `approval_routes_expected_version`, and every accepted one bumps it.
+2. Static exclusion and any `exempt_group` need verified requester identity: the tenant's HTTP
+   identity selection, and at least one of the agent's bindings listed in an operator receiver
+   registration of the running API. This is the same prerequisite as the requester identity
+   flag. Without it the write is refused `approval_separation_requires_http_identity` and
+   nothing is stored. The whole map being written is judged, so a write that only keeps an
+   existing static exclusion or exemption is judged again. A selector route's default
+   exclusion needs nothing more, because the registration already needs the requester identity
+   flag.
+3. `separation` cannot be set when an agent is created; `POST /agents` refuses it 422. Create
+   the agent, then write it.
+4. Only this operator route write changes `separation`. The agent-owned access policy writer
+   has no separation field and refuses a body that carries one (422), so an agent can never
+   opt out of exclusion itself.
+
+Each route whose effective `exclude_requester` or `exempt_group` changes writes one
+`approval_separation.changed` identity audit row with actor `operator`. It names the route,
+the old and new `exclude_requester`, the old and new `exempt_group`, the old and new
+configuration version, and on a selector route the selector's key id, connector and tool. A
+selector registered with `separation` omitted records no change, because exclusion is its
+default; an opt-out or an exemption at registration does. Removing a selector or a static
+exclusion records the change back to self-confirmation. Each registration, replacement and
+removal of a selector also writes its own `approver_ticket.registered`,
+`approver_ticket.replaced` or `approver_ticket.removed` row with the route, key id, connector
+and tool, the old and new configuration version, and the old and new pinned role version. The
+public key bytes are never audited beyond the key id.
 
 ### Reading it back
 
@@ -435,7 +482,8 @@ curie cluster approvals my-agent --list-routes --json
 ```
 
 The readback shows each registration with its key id, public key, ceiling (including the
-pinned `approver_role` and its version) and the effective `separation`. Edit that output and
+pinned `approver_role` and its version) and the effective `separation`, with its
+`exempt_group` when one is set. Edit that output and
 feed it back through `--routes-from` to change an unrelated route: a registration identical
 to the stored one, with its pinned role echoed back or omitted, keeps its existing pin and
 is not judged against the current policy version.

@@ -14,7 +14,10 @@ swappable part is the set behind it (ADR-0034).
 
 Requester equality has no special meaning here. ADR-0106 makes the selected set
 the authorization boundary, so an authenticated requester who belongs to it may
-confirm their own action and an unlisted requester remains denied.
+confirm their own action and an unlisted requester remains denied. A route that
+explicitly excludes the requester, or a dynamic approval (ADR 0271), is a
+canonical route: only the HTTP answer composition may reach its set, and
+``approval_selection`` judges equality and the selected people there.
 
 Principals other than a dispatcher-attested ``chat`` click have one
 additional eligibility rule: the selected set must say it can judge that kind.
@@ -44,6 +47,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from .approval_selection import canonical_route
 from .approvers import ApproverSet
 from .models import Approval
 
@@ -90,6 +94,17 @@ _INELIGIBLE_DEFAULTS: dict[PrincipalKind, tuple[str, str]] = {
 }
 
 
+_OPERATOR_REFUSED = (
+    "operator approval principals cannot answer an approval whose route selects its "
+    "approvers per request or excludes the requester: only a selected person's own "
+    "verified identity can answer it"
+)
+_REQUIRES_HTTP_ANSWER = (
+    "this approval's route selects its approvers per request or excludes the requester, "
+    "so it is answered only through a verified identity answer"
+)
+
+
 async def authorize_approval(
     approval: Approval,
     actor: str,
@@ -97,6 +112,8 @@ async def authorize_approval(
     *,
     approver_set: ApproverSet,
     principal_kind: PrincipalKind,
+    route_binding: Any,
+    canonical_owner: bool = False,
 ) -> tuple[str | None, AuthzDecision]:
     """Decide whether ``actor`` may resolve ``approval``, and name what decided
     (for the audit row).
@@ -104,26 +121,40 @@ async def authorize_approval(
     ``approver_set`` is the set this approval's route binding calls for, already
     chosen by an ``approvers.ApproverSetSelector``. Every binding maps to some
     set, including one the platform could not read, so there is no second path
-    through here.
+    through here. ``route_binding`` is that same raw binding (None when there
+    is none to read).
 
     The order is the contract: the principal's kind must first be eligible for
     the selected set, then every principal (including the requester) is checked
     for membership.
 
-    A dynamic approval (ADR 0271 decision 4) is denied before either: its
-    selected set, ceiling and separation are judged only by the answer
-    authority of decision 5, which has not landed, so no route set may
-    approve or reject it until then.
+    A canonical route (ADR 0271 decisions 5 and 6: a dynamic approval, or a
+    binding whose ``separation`` enables or cannot read requester exclusion) is
+    judged before either. An ``operator`` principal is refused first, whatever
+    the set's ``operator_eligible`` says, because an operator token cannot
+    establish a selected canonical person or an inequality. Then every caller
+    but the HTTP answer composition (``canonical_owner``) is refused: only it
+    holds the fresh canonical facts ``approval_selection.check_answer`` judges.
+    @spec REQUEST-APPROVAL-5 REQUEST-APPROVAL-6.
     """
 
     name = approver_set.audit_name
-    if approval.selection_mode == "dynamic":
-        return name, AuthzDecision(
-            allowed=False,
-            reason="a dynamic approval cannot be answered until its selected approver "
-            "set is enforced at answer time",
-            evidence={"kind": "dynamic_selection_unavailable", "principal_kind": principal_kind},
-        )
+    if canonical_route(approval, route_binding):
+        if principal_kind == "operator":
+            return name, AuthzDecision(
+                allowed=False,
+                reason=_OPERATOR_REFUSED,
+                evidence={"kind": "canonical_route_operator_refused", "principal_kind": "operator"},
+            )
+        if not canonical_owner:
+            return name, AuthzDecision(
+                allowed=False,
+                reason=_REQUIRES_HTTP_ANSWER,
+                evidence={
+                    "kind": "canonical_route_requires_http_answer",
+                    "principal_kind": principal_kind,
+                },
+            )
 
     eligible = {
         "test_driver": approver_set.test_driver_eligible,
