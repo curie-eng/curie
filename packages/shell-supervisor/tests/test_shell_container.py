@@ -9,6 +9,10 @@ supervisor port is published on loopback.
 Recycling proofs additionally run ``hostile_child.py`` as the runner's uid:
 the first claim writes into every writable directory and creates IPC objects,
 and the second looks for any of it.
+
+The live crash case requires ``CURIE_E2E_LIVE=1`` and ``ANTHROPIC_API_KEY``.
+``CURIE_CRASH_PROVIDER_BASE_URL`` selects its provider endpoint and
+``CURIE_CRASH_LIVE_MODEL`` optionally selects its model.
 """
 
 from __future__ import annotations
@@ -375,7 +379,18 @@ def crash_platform():
 
 
 @pytest.fixture
-def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
+def live_provider(request: pytest.FixtureRequest) -> bool:
+    enabled = bool(getattr(request, "param", False))
+    if enabled:
+        if os.environ.get("CURIE_E2E_LIVE") != "1":
+            pytest.skip("set CURIE_E2E_LIVE=1 for the live provider crash proof")
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            pytest.fail("the live provider crash proof requires ANTHROPIC_API_KEY")
+    return enabled
+
+
+@pytest.fixture
+def crash_case(tls: ShellTls, tmp_path: Path, phase: str, live_provider: bool, crash_platform):
     from aci_protocol import QueuedTurn, ReplyHandle
     from aci_protocol.s3 import build_s3_client
     from curie_dispatcher.queue import to_stream_fields
@@ -489,6 +504,15 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
             f"127.0.0.1:{port}:8089",
             "-e",
             f"CRASH_PHASE={phase}",
+            *(
+                [
+                    "-e",
+                    "CURIE_CRASH_UPSTREAM_URL="
+                    + os.environ.get("CURIE_CRASH_PROVIDER_BASE_URL", "https://api.anthropic.com"),
+                ]
+                if live_provider
+                else []
+            ),
             "--entrypoint",
             "python",
             RUNNER_IMAGE,
@@ -516,13 +540,19 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
             network=network,
             env={
                 "CURIE_SUPERVISOR_CHILD_ENV": "ANTHROPIC_API_KEY",
-                "ANTHROPIC_API_KEY": "sk-ant-PLACEHOLDER",
+                "ANTHROPIC_API_KEY": (
+                    os.environ["ANTHROPIC_API_KEY"] if live_provider else "sk-ant-PLACEHOLDER"
+                ),
                 "CURIE_SUPERVISOR_CHILD_ENV_PUBLIC": (
                     "ANTHROPIC_BASE_URL,CURIE_MODEL,CURIE_RUNNER_CLEANUP_TIMEOUT_S,"
                     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,DISABLE_TELEMETRY,OTEL_SDK_DISABLED"
                 ),
                 "ANTHROPIC_BASE_URL": "http://crash-provider:8089",
-                "CURIE_MODEL": "claude-sonnet-5",
+                **(
+                    {"CURIE_MODEL": os.environ["CURIE_CRASH_LIVE_MODEL"]}
+                    if live_provider and os.environ.get("CURIE_CRASH_LIVE_MODEL")
+                    else ({} if live_provider else {"CURIE_MODEL": "claude-sonnet-5"})
+                ),
                 "CURIE_RUNNER_CLEANUP_TIMEOUT_S": "1",
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
                 "DISABLE_TELEMETRY": "1",
@@ -564,7 +594,15 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
             event_id=identity,
             conversation_id=identity,
             author="U0EXAMPLE1",
-            text="run the probe",
+            text=(
+                "Run this exact command in one Bash call: `"
+                "curl -fsS http://crash-provider:8089/tool/start && "
+                "curl -fsS http://crash-provider:8089/tool/hold && "
+                "curl -fsS http://crash-provider:8089/tool/end`. "
+                "Then reply with the command result."
+                if live_provider
+                else "run the probe"
+            ),
             received_at="2026-11-08T00:00:00Z",
             reply_handle=ReplyHandle(
                 kind="crash-proof",
@@ -720,7 +758,16 @@ def test_crash_proof_control_completes_a_tool_and_persists_history(crash_case) -
 @pytest.mark.parametrize("phase", ["before", "during", "after"])
 @pytest.mark.parametrize("repeat", range(3))
 def test_worker_kill_recovers_one_reply_and_retires_the_shell(crash_case, phase, repeat) -> None:
-    case = crash_case
+    _assert_worker_kill_recovers(crash_case, phase)
+
+
+@pytest.mark.parametrize("phase", ["during"])
+@pytest.mark.parametrize("live_provider", [True], indirect=True)
+def test_live_worker_kill_recovers_one_reply_and_retires_the_shell(crash_case, phase) -> None:
+    _assert_worker_kill_recovers(crash_case, phase)
+
+
+def _assert_worker_kill_recovers(case, phase: str) -> None:
     state = case["provider"]
     worker = case["worker"]
 

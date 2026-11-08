@@ -6,9 +6,10 @@ import asyncio
 import json
 import os
 
-from aiohttp import web
+from aiohttp import ClientError, ClientSession, ClientTimeout, web
 
 PHASE = os.environ["CRASH_PHASE"]
+UPSTREAM = os.environ.get("CURIE_CRASH_UPSTREAM_URL")
 GATE = asyncio.Event()
 STATE = {
     "before": False,
@@ -18,6 +19,39 @@ STATE = {
     "tool_starts": 0,
     "requests": 0,
 }
+
+
+async def upstream_response(request: web.Request) -> web.StreamResponse:
+    assert UPSTREAM is not None
+    headers = {
+        name: value
+        for name, value in request.headers.items()
+        if name.lower()
+        not in {"host", "connection", "content-length", "transfer-encoding", "accept-encoding"}
+    }
+    try:
+        async with (
+            ClientSession(timeout=ClientTimeout(total=90)) as client,
+            client.request(
+                request.method,
+                UPSTREAM.rstrip("/") + request.path_qs,
+                data=await request.read(),
+                headers=headers,
+                allow_redirects=False,
+            ) as upstream,
+        ):
+            if upstream.status != 200:
+                raise web.HTTPBadGateway(text=f"model provider returned HTTP {upstream.status}")
+            response = web.StreamResponse(
+                headers={"Content-Type": upstream.headers.get("Content-Type", "application/json")}
+            )
+            await response.prepare(request)
+            async for chunk in upstream.content.iter_any():
+                await response.write(chunk)
+            await response.write_eof()
+            return response
+    except (ClientError, TimeoutError):
+        raise web.HTTPBadGateway(text="model provider request failed") from None
 
 
 async def messages(request: web.Request) -> web.StreamResponse:
@@ -33,6 +67,8 @@ async def messages(request: web.Request) -> web.StreamResponse:
     STATE[stage] = True
     if PHASE == stage:
         await GATE.wait()
+    if UPSTREAM:
+        return await upstream_response(request)
     response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
     await response.prepare(request)
     # https://platform.claude.com/docs/en/build-with-claude/streaming
@@ -124,7 +160,9 @@ async def reply(request: web.Request) -> web.Response:
     return web.json_response({"ref": "reply-PLACEHOLDER"})
 
 
-async def other(_request: web.Request) -> web.Response:
+async def other(request: web.Request) -> web.StreamResponse:
+    if UPSTREAM:
+        return await upstream_response(request)
     return web.json_response({"input_tokens": 1})
 
 
