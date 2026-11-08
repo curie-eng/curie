@@ -137,9 +137,15 @@ def _segment(text: str) -> bytes | None:
         return None
     # One spelling per byte string: a segment with stray trailing bits decodes
     # to the same bytes as the canonical one, and is refused.
-    if base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii") != text:
+    if _b64url(raw) != text:
         return None
     return raw
+
+
+def _b64url(raw: bytes) -> str:
+    """Unpadded base64url: the one spelling of a segment and of the principal header."""
+
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
 def _signed_by(keys: Sequence[VerifyKey], message: bytes, signature: bytes) -> bool:
@@ -240,7 +246,7 @@ def principal_header_value(principal: Principal) -> str:
         sort_keys=True,
         ensure_ascii=False,
     )
-    return base64.urlsafe_b64encode(text.encode("utf-8")).rstrip(b"=").decode("ascii")
+    return _b64url(text.encode("utf-8"))
 
 
 def _no_constant(name: str) -> object:

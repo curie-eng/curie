@@ -887,8 +887,9 @@ class Consumer(StreamConsumer):
                             # released first, and the record's sticky reason
                             # keeps every wake and re-park out of the order.
                             handoff = isinstance(requested, RequesterHandoffWaitRequested)
+                            parkable = self._kernel._can_park(qevent)
                             try:
-                                if handoff and self._kernel._can_park(qevent):
+                                if handoff and parkable:
                                     await self._waits.finish_order(
                                         _thread_key_for(qevent),
                                         qevent.event_id,
@@ -902,7 +903,7 @@ class Consumer(StreamConsumer):
                                     lease,
                                     thread_key=(
                                         _thread_key_for(qevent)
-                                        if self._kernel._can_park(qevent) and not handoff
+                                        if parkable and not handoff
                                         else None
                                     ),
                                     reason=REQUESTER_HANDOFF_REASON if handoff else "",

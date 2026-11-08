@@ -11,7 +11,6 @@ handed (ADR 0270). ``aci-protocol`` is never mocked.
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import re
@@ -478,13 +477,14 @@ async def call_connector_tool(
         return f"connector-tool {call.connector}: failed unknown_connector"
     config: Mapping[str, Any] = base
     if call.forged_principal is not None:
-        forged = copy.deepcopy(dict(base))
-        headers = forged.get("headers")
-        forged["headers"] = {
-            **(dict(headers) if isinstance(headers, Mapping) else {}),
-            _FORGED_PRINCIPAL_HEADER: call.forged_principal,
+        headers = base.get("headers")
+        config = {
+            **base,
+            "headers": {
+                **(dict(headers) if isinstance(headers, Mapping) else {}),
+                _FORGED_PRINCIPAL_HEADER: call.forged_principal,
+            },
         }
-        config = forged
     label = f"connector-tool {call.connector}/{call.tool}"
     caller = _caller_fingerprint(config)
     args = call.args
@@ -561,7 +561,9 @@ class FakeModelSession:
         *,
         truncate_on_interrupt: bool = True,
         can_use_tool: CanUseTool | None = None,
-        pre_tool_use_hook: Callable[[Any, str | None, Any], Awaitable[dict[str, Any]]]
+        pre_tool_use_hook: Callable[
+            [Any, str | None, Any], Awaitable[dict[str, Any]]
+        ]
         | None = None,
         approval_gate: ApprovalGate | None = None,
         replay_messages: tuple[ConversationMessage, ...] = (),
