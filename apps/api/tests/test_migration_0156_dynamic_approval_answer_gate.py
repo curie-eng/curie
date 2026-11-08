@@ -43,7 +43,7 @@ from alembic.script import ScriptDirectory
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
-BELOW = "0153"
+BELOW = "0154"
 REVISION = "0156"
 MIGRATION_FILE = "0156_dynamic_approval_answer_gate.py"
 KINDS = Path(__file__).resolve().parents[1] / "src/curie_api/revision_kinds.json"
