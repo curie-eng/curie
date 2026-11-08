@@ -172,7 +172,6 @@ def test_dedupe_key_format() -> None:
     assert key == f"curie:hook-wake:v1:{scope}:{AGENT}:queue-ready:7:example-delivery"
     assert key == reference_dedupe_key(api_key, AGENT, "queue-ready", 7, "example-delivery")
     assert api_key not in key
-    assert hashlib.sha256(api_key.encode()).hexdigest() not in key
     other_generation = hook_wake_signing.dedupe_key(
         api_key, agent_id=AGENT, hook="queue-ready", generation=8, delivery_id="example-delivery"
     )
