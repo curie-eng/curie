@@ -2,7 +2,9 @@
 
 Everything here reaches the install only through ``kubectl``, ``helm``, a
 loopback port-forward or the ``curie`` CLI. The in-pod scripts run inside the
-release's API container so signing and adoption use the deployed product code.
+release's own containers (the API for signing and adoption, the worker for its
+route store, a connector pod's caller proxy for replays) so they use the
+deployed product code.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import base64
 import contextlib
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -46,6 +49,16 @@ def b64url(raw: bytes) -> str:
 
 def b64url_decode(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+# A credential-shaped run: a Curie token by its prefix, or any long base64 run.
+_SECRET_TEXT = re.compile(r"\b(?:cct|ccr|ccg|adp|chn|apr)\.[A-Za-z0-9_.-]*|[A-Za-z0-9_+/=-]{32,}")
+
+
+def redact(text: str) -> str:
+    """``text`` with anything shaped like a token or key replaced by ``<redacted>``."""
+
+    return _SECRET_TEXT.sub("<redacted>", text)
 
 
 def summarize_event(event: Any, limit: int = 200) -> Any:
@@ -244,27 +257,30 @@ from curie_api.schemas.agent_access import SetRoleFilterV1
 
 async def body(session):
     tenant, agent = uuid.UUID(P["tenant_id"]), uuid.UUID(P["agent_id"])
+    name = P.get("role", "invocation")
     async with session.begin():
         current = await agent_role_policy.read_role_policy(
             session, tenant_id=tenant, agent_id=agent)
     version = 0 if current is None else current.version
-    role = None if current is None else current.roles.invocation
+    role = None if current is None else getattr(current.roles, name)
     previous = None if role is None or role.filter is None else role.filter.model_dump(mode="json")
+    state = None if role is None else role.legacy_state
     if previous == P["filter"] and role is not None:
-        return {"action": "unchanged", "previous": previous, "version": version}
+        return {"action": "unchanged", "previous": previous, "previous_present": True,
+                "legacy_state": state, "version": version}
     change = SetRoleFilterV1.model_validate({
         "schema_version": 1, "tenant_id": str(tenant), "agent_id": str(agent),
-        "expected_version": version, "role": "invocation", "operation": "set_filter",
+        "expected_version": version, "role": name, "operation": "set_filter",
         "filter": P["filter"],
     })
     async with session.begin():
         result = await agent_role_policy.apply_role_change(session, change=change)
-    return {"action": "set", "previous": previous, "version": result.version}
+    return {"action": "set", "previous": previous, "previous_present": role is not None,
+            "legacy_state": getattr(result.roles, name).legacy_state, "version": result.version}
 
 emit(asyncio.run(_with_session(body)))
 """
 )
-
 
 # --- the target install ------------------------------------------------------------
 
@@ -360,7 +376,22 @@ class Target:
 
     # in-pod product calls -----------------------------------------------------------
 
-    def pod_python(self, script: str, params: Mapping[str, Any]) -> Any:
+    def exec_python(
+        self,
+        workload: str,
+        container: str,
+        script: str,
+        params: Mapping[str, Any],
+        *,
+        timeout: float = 120,
+    ) -> Any:
+        """Run ``script`` with ``python -c`` in ``container`` of ``workload``.
+
+        ``workload`` is a pod name or ``deployment/<name>``. ``params`` travel
+        as JSON on stdin, never on argv; the script's last stdout line is its
+        JSON answer. A failure reports the exit code and a redacted stderr tail.
+        """
+
         result = run(
             [
                 "kubectl",
@@ -370,21 +401,37 @@ class Target:
                 self.namespace,
                 "exec",
                 "-i",
-                f"deployment/{self.component('api')}",
+                workload,
                 "-c",
-                "api",
+                container,
                 "--",
                 "python",
                 "-c",
                 script,
             ],
             input_text=json.dumps(params),
-            timeout=120,
+            timeout=timeout,
+            check=False,
         )
+        if result.returncode != 0:
+            tail = redact(result.stderr or result.stdout).strip().splitlines()[-6:]
+            raise HarnessError(
+                f"python in {workload}/{container} exited {result.returncode}: " + " | ".join(tail)
+            )
         lines = [line for line in result.stdout.splitlines() if line.strip()]
         if not lines:
-            raise HarnessError("the in-pod product call printed nothing")
+            raise HarnessError(f"the in-pod call in {workload}/{container} printed nothing")
         return json.loads(lines[-1])
+
+    def pod_python(self, script: str, params: Mapping[str, Any]) -> Any:
+        """``script`` in the release's API container, against the deployed product code."""
+
+        return self.exec_python(f"deployment/{self.component('api')}", "api", script, params)
+
+    def worker_python(self, script: str, params: Mapping[str, Any]) -> Any:
+        """``script`` in the release's worker container (its Valkey client and config)."""
+
+        return self.exec_python(f"deployment/{self.component('worker')}", "worker", script, params)
 
     def sql(self, *statements: tuple[str, Mapping[str, Any]]) -> list[Any]:
         """Run statements in one transaction inside the API pod."""

@@ -12,9 +12,10 @@ exits nonzero unless every recorded step passed.
 Each step drives the install through the same boundaries an operator or a
 mail adapter uses (``Harness.send``, ``Harness.observe``, the platform API and
 the ``curie`` CLI), and reads what the product logged (the caller proxy's
-decisions through ``Harness.proxy_decisions``). Direct SQL is reserved for
-deliberately corrupting stored state that no product surface can write, and
-every such change is restored in a ``finally`` block.
+decisions through ``Harness.proxy_decisions``). Direct SQL and the worker
+route record rewrite (``Harness.route_doctor``) are reserved for deliberately
+corrupting stored state that no product surface can write, and every such
+change is restored in a ``finally`` block.
 """
 
 from __future__ import annotations
@@ -39,12 +40,17 @@ PROGRESS_DEMO_ANSWER = "all done"
 # a turn is live, and the reclaim preflight interrupting a live turn.
 PENDING_MESSAGE = "requester handoff pending"
 INTERRUPT_MESSAGE = "interrupting before retry"
+# The consumer's durable wait for a deferred different-human delivery
+# (capacity_wait): `capacity wait parked event_id=<id> cause=requester_handoff`.
+HANDOFF_PARK_CAUSE = "requester_handoff"
+_PARKED = re.compile(r"\bcapacity wait parked event_id=(?P<event_id>\S+) cause=(?P<cause>\S+)")
 DEFERRAL_NOT_EXERCISED = "deferral not exercised"
 STEERING_NOT_EXERCISED = "steering not exercised"
 # Between the host, the API server's claim stamps and the reply sink's clock.
 CLOCK_SKEW_S = 2.0
-# A deferred delivery is redelivered about one lease TTL (45 s) later; leave
-# room for a second deferral before the delivery caps settle it.
+# A deferred delivery parks in a durable wait whose due wake (about 5 s) runs
+# it once the other human's turn ends, so it no longer waits for a 45 s
+# redelivery. The bound stays generous: it only caps a failing run.
 HANDOFF_WAIT_S = 360.0
 SECOND_SEND_DELAY_S = 1.0
 LOG_MESSAGE_LIMIT = 300
@@ -128,12 +134,30 @@ def run(name: str, harness: Harness, args: Any) -> dict[str, Any]:
 # --- shared helpers -----------------------------------------------------------------
 
 
+def default_agents(
+    data: Mapping[str, Any], flag: str | None, control: str | None
+) -> tuple[str | None, str | None]:
+    """``--flag-agent`` and ``--control-agent``, defaulting to the first two `up` registered.
+
+    The state file sorts its keys, so the registration order comes from its
+    ``agent_order`` list, not from the order of ``agents``.
+    """
+
+    order = [name for name in data.get("agent_order") or () if name in data.get("agents", {})]
+    if flag is None and order:
+        flag = order[0]
+    if control is None:
+        control = next((name for name in order if name != flag), None)
+    return flag, control
+
+
 def two_agents(harness: Harness, args: Any) -> tuple[str, str]:
-    names = list(harness.data.get("agents", {}))
-    flag = args.flag_agent or (names[0] if names else None)
-    control = args.control_agent or next((n for n in names if n != flag), None)
+    flag, control = default_agents(harness.data, args.flag_agent, args.control_agent)
     if flag is None or control is None or flag == control:
-        raise HarnessError("this scenario needs two distinct agents; run `up --agent A --agent B`")
+        raise HarnessError(
+            "this scenario needs two distinct agents; run `up --agent A --agent B` (which "
+            "records their order) or pass --flag-agent and --control-agent"
+        )
     for name in (flag, control):
         harness.agent_entry(name)
     return flag, control
@@ -886,6 +910,39 @@ def require_deferred(
     }
 
 
+def parked_events(messages: Iterable[Any]) -> list[dict[str, str]]:
+    """Every ``capacity wait parked event_id=<id> cause=<cause>`` in worker messages."""
+
+    found = []
+    for message in messages:
+        for match in _PARKED.finditer(str(message)):
+            found.append({"event_id": match["event_id"], "cause": match["cause"]})
+    return found
+
+
+def require_parked(messages: Sequence[Any], event_id: str) -> dict[str, Any]:
+    """The worker parked ``event_id`` in a durable requester-handoff wait.
+
+    ``messages`` are the worker's log messages since the first human's send.
+    Requires a ``capacity wait parked`` line naming exactly ``event_id`` with
+    ``cause=requester_handoff``: the deferred delivery waits in the durable
+    record rather than for a redelivery. Returns what was seen, no token.
+    """
+
+    parked = parked_events(messages)
+    mine = [
+        entry
+        for entry in parked
+        if entry["event_id"] == event_id and entry["cause"] == HANDOFF_PARK_CAUSE
+    ]
+    check(
+        bool(mine),
+        f"the worker never logged `capacity wait parked event_id={event_id} "
+        f"cause={HANDOFF_PARK_CAUSE}`; parked lines since the first send: {parked[:5]}",
+    )
+    return {"event_id": event_id, "parked_count": len(mine), "parked_lines_seen": len(parked)}
+
+
 def event_turn(replies: Sequence[Mapping[str, Any]], event_id: str) -> dict[str, Any]:
     """One inbound event's turn, from the reply events of a conversation turns share.
 
@@ -1046,19 +1103,27 @@ def send_while_live(
     conversation: str,
     step_id: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """The first human starts a progress-demo turn; the second writes a second later."""
+    """The first human starts a progress-demo turn; the second writes a second later.
 
-    first_sent = harness.send(
+    Both proofs are signed before either post, and both posts share one
+    port-forward, so neither signing nor a forward stretches the gap.
+    """
+
+    first_turn = harness.prepare(
         agent, first, f"requester-handoff: {step_id} {PROGRESS_DEMO}", conversation=conversation
     )
+    second_turn = harness.prepare(
+        agent, second, f"requester-handoff: {step_id} {CONNECTOR_CALL}", conversation=conversation
+    )
+    with harness.api() as api:
+        first_sent = harness.post(first_turn, api)
+        if first_sent.get("http_status") == 200:
+            time.sleep(SECOND_SEND_DELAY_S)
+            second_sent = harness.post(second_turn, api)
     seen["first_send"] = send_summary(first_sent)
     check(
         first_sent.get("http_status") == 200,
         f"{first}'s turn answered {first_sent.get('http_status')}",
-    )
-    time.sleep(SECOND_SEND_DELAY_S)
-    second_sent = harness.send(
-        agent, second, f"requester-handoff: {step_id} {CONNECTOR_CALL}", conversation=conversation
     )
     seen["second_send"] = send_summary(second_sent)
     check(
@@ -1091,8 +1156,10 @@ def deferral_step(
     """H4: the second human writes during the first's live turn on the flag agent.
 
     The first turn finishes uninterrupted; the worker logged the second
-    delivery's deferral and no interrupt; and the second turn ran afterwards
-    on a new claim whose token names the second human, as its reply proves.
+    delivery's deferral, parked it in a durable requester-handoff wait under
+    its own event id, and interrupted nothing; and the second turn ran
+    afterwards on a new claim whose token names the second human, as its reply
+    proves.
     """
 
     with evidence.step(
@@ -1138,6 +1205,7 @@ def deferral_step(
             a_reply_at=float(first_turn["completed_at"]),
             b_claim_created=float(observed["claim_created_epoch"]),
         )
+        seen["parked"] = require_parked(messages, second_event)
         seen["replaced"] = require_replaced(
             previous, observed, sent_at=float(second_sent["sent_at"])
         )
@@ -1298,8 +1366,9 @@ def requester_handoff(harness: Harness, args: Any, evidence: Evidence) -> None:
     agent, each with ``[fake:connector-call]``, so every reply carries the
     fingerprint of the caller token its dial sent. H1 the first human (A); H2
     the second (B) while idle replaces the claim; H3 A again replaces it back
-    and warms A's sandbox; H4 B writes during A's live progress-demo turn and
-    is deferred until it ends, then served as B; H5 the control on the flag-off
+    and warms A's sandbox; H4 B writes during A's live progress-demo turn, is
+    deferred and parked in a durable wait until it ends, then served as B; H5
+    the control on the flag-off
     agent steers B into A's live turn on one claim. Each step needs the one
     before it, so a failed step stops the run. H4 runs again once from H3 on a
     new conversation when it fails only because B never met A's live turn,
@@ -1451,3 +1520,9 @@ def requester_handoff(harness: Harness, args: Any, evidence: Evidence) -> None:
             wait=wait,
         ),
     )
+
+
+# The ADR 0270 slice 2 requester scenarios (requester-effect, requester-expiry,
+# requester-approval) live in their own module and register here, last, so
+# every name they import from this one already exists.
+import identity_scenarios_requester  # noqa: E402,F401

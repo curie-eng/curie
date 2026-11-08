@@ -11,7 +11,10 @@ The driver is [`tools/identity-e2e/identity_e2e.py`](../../tools/identity-e2e/id
 It is standard library Python on the host. Product calls that need signing keys
 or the database run inside the release's own API pod, so they use the deployed
 build. The provider is [`tools/identity-e2e/fake_idp.py`](../../tools/identity-e2e/fake_idp.py)
-and the scenarios are in [`tools/identity-e2e/identity_scenarios.py`](../../tools/identity-e2e/identity_scenarios.py).
+and the scenarios are in [`tools/identity-e2e/identity_scenarios.py`](../../tools/identity-e2e/identity_scenarios.py)
+and [`tools/identity-e2e/identity_scenarios_requester.py`](../../tools/identity-e2e/identity_scenarios_requester.py).
+The same scenarios on the Docker substrate, against an isolated `curie local up`
+stack, are in [Identity E2E on Docker](identity-e2e-docker.md).
 
 ## What you need
 
@@ -79,6 +82,10 @@ T="--context kind-identity-e2e --namespace identity-e2e --release identity-e2e -
    hosted connector, `netpol-probe`, is what the scenarios' turns call. `--bundle` only deploys
    agents that do not exist yet, so an agent deployed earlier from a bundle
    with no hosted connector fails the scenario's preconditions.
+   `up --reference-connector` is what `requester-effect` needs, and works for
+   every scenario; see [The reference connector](#the-reference-connector).
+   With no `--flag-agent` or `--control-agent`, `prove` picks the first and
+   second agents in the order `up` registered them.
 2. `curie dev identity-e2e -- send $T --agent agent-a --sender alice@example.test --text hello`
    signs the proof over the exact body and posts the turn, as the mail adapter
    does. It prints the delivery id, conversation id and the API's answer.
@@ -97,14 +104,50 @@ T="--context kind-identity-e2e --namespace identity-e2e --release identity-e2e -
    passed. The flag agent is `--flag-agent` (default: the first agent `up`
    registered) and the control agent `--control-agent` (default: the second).
    `--sender` (default `alice@example.test`) is the human who writes, and
-   `requester-handoff` also takes `--second-sender` (default
-   `bob@example.test`), a different verified human from the roster. `--wait`
-   (default 240) bounds each wait for a claim or a reply.
+   `requester-handoff`, `requester-expiry` and `requester-approval` also take
+   `--second-sender` (default `bob@example.test`), a different verified human
+   from the roster. `requester-effect` takes `--outsider` (default
+   `dana@example.test`), a verified human outside the authority group.
+   `--wait` (default 240) bounds each wait for a claim or a reply.
 5. `curie dev identity-e2e -- down $T` deletes the agents and bindings `up`
    created, restores the helm values it changed, deletes the provider and
    runtime objects, removes the tenant HTTP selection row when `up` created it,
-   rolls the API and worker, and verifies that nothing it labelled remains.
-   Delete the cluster or namespace afterwards as usual.
+   rolls the API and worker, deletes the rendered reference bundle, and
+   verifies that nothing it labelled remains. Delete the cluster or namespace
+   afterwards as usual.
+
+## The reference connector
+
+`up --reference-connector --bundle examples/weather` renders the bundle into
+`reference-bundle/` under the state directory with one more hosted connector,
+`human-restricted` ([`human_restricted_connector.py`](../../tools/identity-e2e/human_restricted_connector.py)),
+and deploys every missing agent from that rendered copy. The connector has one
+tool, `record_effect`. Before each effect it reads the `X-Curie-Principal` its
+caller proxy set and asks the provider whether that exact tenant, issuer and
+subject may act now (ADR 0270 decisions 4 and 5). It answers `effect=<n>
+requester=<fp>` or `refused <code>`, and logs one line per call,
+`record_effect outcome=<ok|code> requester=<fp or ->`, where `<fp>` is the
+first 16 hex characters of the sha256 of the header value. It never logs the
+principal.
+
+The provider then also serves that current authority on its sink listener at
+`http://<release>-identity-e2e-idp.<namespace>.svc:8080/authority`. `up`
+generates the authority bearer and keeps it in the private state file; the
+rendered bundle carries it in the connector's environment, so the rendered
+tree is mode 0700 and 0600 as well. The authority allows a verified, active
+human of the agents' tenant and the roster issuer who is in the group
+`identity-e2e-members`, and denies anyone else. The tenant is known only once
+the agents exist, so a first `up` restarts the provider with it after
+deploying them. The scenarios change the authority through the provider's
+admin endpoints (`/admin/membership`, `/admin/authority`, guarded by the
+adapter secret). A membership change also changes what the provider's lookup
+answers for that sender, so run `requester-effect` on an `up` without
+`--role-filter`.
+
+`--bundle` deploys only missing agents. An agent deployed earlier without the
+reference connector fails `requester-effect`'s preconditions; delete it or
+choose new agent names. The flag is remembered in the state, so a later `up`
+keeps serving the authority.
 
 ## The scripted directory
 
@@ -184,16 +227,19 @@ step stops the run (the evidence records it under `aborted`):
 4. H3: A writes on C again. The claim is replaced back the same way and names
    A. This also leaves A's sandbox warm for H4.
 5. H4: A sends `[fake:progress-demo]`, a turn that stays live for about 8 s.
-   One second after A's send returns, B sends `[fake:connector-call]`. A's
-   reply must be delivered and end with `all done`, so A's turn was not
-   interrupted. The worker log since A's send must contain `requester handoff
-   pending` (the kernel's deferral of B's delivery) and must not contain
+   B sends `[fake:connector-call]` one second after A's send. Both proofs are
+   signed first and both posts share one port-forward, so the gap stays near
+   one second. A's reply must be delivered and end with `all done`, so A's
+   turn was not interrupted. The worker log since A's send must contain
+   `requester handoff pending` (the kernel's deferral of B's delivery) and
+   `capacity wait parked event_id=<B's event id> cause=requester_handoff` (the
+   consumer parked B's delivery in a durable wait), and must not contain
    `interrupting before retry`. B's turn must then run on a new claim created
    no earlier than A's reply (2 s of skew allowed), whose token names B, and
-   B's reply must carry that token's fingerprint. B is redelivered about one
-   delivery lease TTL (45 s) after A's turn ends, so B's reply usually
-   arrives about a minute after B's send. The step waits up to 6 minutes, or
-   `--wait` when that is longer.
+   B's reply must carry that token's fingerprint. The parked wait's due wake
+   runs B a few seconds after A's turn ends, with no delivery lease
+   redelivery in between. The step waits up to 6 minutes, or `--wait` when
+   that is longer.
 6. H5 is the control, on the flag-off agent and a new conversation. A first
    sends a warm `[fake:connector-call]` turn, whose token carries no
    principal, so the conversation's sandbox is booted. Then A sends
@@ -218,6 +264,146 @@ pod of the worker Deployment since the first send. For each JSON record they
 search the `message` and the last line of any logged `exception`. The
 deferral message has to reach the worker's log at its configured level.
 
+## What requester-effect proves
+
+ADR 0270 acceptance item 5, decisions 4 and 5: a human-restricted effect
+happens only for the human the caller proxy attests, and only while the
+connector's current downstream authority allows it. It needs
+`up --reference-connector`, and no `--role-filter`:
+
+```bash
+curie dev identity-e2e -- prove $T --scenario requester-effect --evidence effect.json
+```
+
+Every step sends one email turn whose text carries
+`[fake:connector-tool human-restricted record_effect {"note":"..."}]`. The fake
+model calls that one tool through the runner's real caller header path and
+replies `connector-tool human-restricted/record_effect: ok effect=<n>
+requester=<fp> caller=<fp>` or `... refused <code> caller=<fp>`. Each step
+requires that the claim's token names the expected human (or no one), that the
+turn was delivered, that the reply has exactly one such line with the expected
+outcome and the claim's token fingerprint, that the connector logged exactly
+one outcome line for the call with the same outcome and the fingerprint of the
+expected human's `X-Curie-Principal`, and that the caller proxy admitted the
+agent with `principal=present` (or `absent`). A refusal therefore applied no
+effect. Effects are counted from the connector's own log, read with `kubectl
+logs` from its server container, never the proxy's.
+
+1. E0: preconditions. Both agents have the HTTP selection, a registered
+   binding and the `human-restricted` connector behind a caller proxy; the
+   flag is on for the flag agent and off for the control; `--sender` is in
+   `identity-e2e-members` and `--outsider` is not; the provider's authority is
+   reset to available with `--sender` a member.
+2. E1: `--sender` (alice) gets `ok`, and the effect names alice's fingerprint.
+3. E2: `--outsider` (dana, a verified human in no group) is refused
+   `not_authorized`.
+4. E3: dana's tool arguments name alice's subject, issuer and tenant; still
+   `not_authorized`, and the connector logged dana's fingerprint.
+5. E4: dana's message also carries `[fake:forge-principal <alice's header>]`,
+   so the runner sends a forged `X-Curie-Principal` on that dial. The proxy
+   drops it and sets dana's; refused `not_authorized` with dana's fingerprint.
+6. E5: the provider revokes alice's membership; alice is refused
+   `not_authorized`. The membership is restored in a `finally`, and alice's
+   next call is `ok` again.
+7. E6: the provider's authority is made unavailable; alice is refused
+   `authority_unavailable`. It is restored in a `finally` and checked to allow
+   alice again.
+8. E7: alice on the flag-off control agent: the token names no one, the proxy
+   sets no header, and the connector refuses `missing_requester`.
+
+## What requester-expiry proves
+
+ADR 0270 decision 3 and acceptance items 3 and 4 on the flag agent: a copied
+requester token stays usable until its signed expiry, even after a handoff, and
+is refused after it; a warm sandbox whose caller token is too short for the
+next turn is replaced; and a thread idle past the hour gets a fresh token.
+
+```bash
+curie dev identity-e2e -- prove $T --scenario requester-expiry --evidence expiry.json
+```
+
+This scenario waits for real time. X6 waits until the C1 token's expiry plus 5
+seconds, at most an hour after X1, and prints the time left on stderr every
+few minutes. Plan on about 70 minutes. The captured token stays in the
+harness's memory only; the evidence keeps fingerprints and `exp` values.
+
+1. X1: A (`--sender`) writes on a new conversation C3, then on a new
+   conversation C1, each with `[fake:connector-call]`; each claim's token names
+   A. C3 comes first so its token expires no later than C1's. C1's token is
+   read from its claim's token Secret and held in memory.
+2. X0: the worker logged `requester turn on thread ... bounded to <n>s by the
+   requester token window (configured bound <m>s)` for those turns, with every
+   `<n>` under 3600 and under `<m>`: no opted-in turn may run past its token.
+   It runs after X1 and does not stop the scenario.
+3. X2: B (`--second-sender`) writes on C1; the claim is replaced and names B.
+4. X3: from inside a `human-restricted` (or the first) connector pod's
+   caller-proxy container, the harness posts an MCP `initialize` with A's old
+   C1 token to the live proxy on loopback. It is admitted, and the proxy logged
+   `outcome=admitted principal=present` for it: the accepted residual window
+   after a handoff.
+5. X4: in the same container the harness builds the deployed proxy from that
+   container's own environment (`ProxyConfig.from_env`, `make_app` with a
+   frozen clock) on a free loopback port and sends the same request at the
+   token's `exp - 1` (admitted) and at `exp` (403 with the frozen `expired`
+   refusal body).
+6. X5: A writes on a new conversation C2; then the harness rewrites the C2
+   route record's `caller_token_exp` to two minutes from now (see the route
+   doctoring exception below) and A writes on C2 again. The turn runs on a new
+   claim, created after the send, whose token names A with a later `exp` than
+   the warm one. The original value is put back in a `finally` only while the
+   record still holds the doctored one, so a route the worker replaced is
+   never touched.
+7. X6: once C1's token expired, the same replay to the live proxy is refused
+   `expired` (403, frozen body) and the proxy logged `outcome=expired`. Then A
+   writes on C3 again, idle since X1: a new claim whose token names A and
+   expires after the send and after C3's first token.
+
+The token is passed to the in-pod script on stdin, never on argv, and the
+script prints only the status, the refusal reason and whether the body is the
+frozen one.
+
+## What requester-approval proves
+
+ADR 0270 decision 3's approval resume: an approval one human requested and
+another answered resumes on a fresh claim whose token still names the
+requester, never the approver.
+
+```bash
+curie dev identity-e2e -- prove $T --scenario requester-approval --evidence approval.json
+```
+
+1. P0: the flag agent is opted in. The harness binds the approval route
+   `identity-e2e-approve` through `PATCH /agents/<id>` with
+   `{"resolution": {"mode": "requesting_surface"}, "approvers": {"emails":
+   ["<second sender>"]}}`, so the card stays in the asking email thread and
+   only that address may answer it (ADR 0177 amendment). It also sets the
+   agent's approver role filter to the issuer group `identity-e2e-members`
+   through the API's role policy owner in the API pod, so the HTTP approver
+   role (ADR 0267) evaluates the answering human on fresh provider facts. It
+   reads the stored routes first so it can put them back exactly.
+2. P1: A sends `[fake:request-approval:identity-e2e-approve] ...
+   [fake:connector-call]`. The paused turn's token names A; the API lists a
+   pending approval on that route and conversation whose card channel is the
+   reply channel; and the provider's reply sink recorded the card, a
+   `reply.post` carrying a `confirm` interaction for that approval id.
+3. P2: the harness mints an adapter credential for the flag agent's email
+   binding (`POST /approvals/principals/adapter`), signs an email approval
+   answer proof for B's `{"decision":"approved"}` inside the API pod with the
+   receiver key (as `send` signs a receiver proof), and posts it to
+   `/approvals/<id>/resolve` as the mail adapter does. The answer must be 200
+   with the approval approved by B, and the audit trail must record B's
+   authorized answer by `HttpApprovalAnswer`.
+4. P3: the resume runs on a claim created after the answer, different from the
+   paused turn's, whose token fingerprint differs and whose principal is A,
+   never B. The resume text quotes the approval summary, which carries
+   `[fake:connector-call]`, so the resumed turn also dials every connector:
+   each `ok` line carries the resumed token's fingerprint and every proxy
+   admitted it with `principal=present`.
+5. P4: restores the routes and the approver role filter. The role policy has
+   no removal, so on an agent that had no approver role before, the role stays
+   with no filter, which the answer path reads as unrestricted. Run it on
+   agents `up` created, which `down` deletes.
+
 ## Add a scenario
 
 1. Write a function in `identity_scenarios.py` and register it with
@@ -227,16 +413,30 @@ deferral message has to reach the worker's log at its configured level.
    block. Record what you observed in `seen` and assert with `check(...)`. A
    failed step is recorded and the next step still runs. When later steps
    build on a step, call `require_passed(evidence)` after it to stop the run.
-3. Drive the install only through `harness.send`, `harness.observe`,
-   `harness.api()`, `harness.target.curie(...)` and `harness.records()`, and
-   read connector evidence with `harness.connectors(...)` and
-   `harness.proxy_decisions(...)` and worker messages with
-   `harness.worker_log(...)`. Use
-   `harness.target.sql(...)` only to corrupt state that no product surface can
-   write, and restore it in a `finally` block.
-4. If the scenario needs other humans, add them to the default roster or ship a
+3. Drive the install only through `harness.send` (or `harness.prepare` and
+   `harness.post` for sends that must go out close together),
+   `harness.observe`, `harness.api()`, `harness.target.curie(...)`,
+   `harness.records()` and the provider's admin endpoints
+   (`harness.provider_admin(...)`). Read connector evidence with
+   `harness.connectors(...)`, `harness.proxy_decisions(...)` and
+   `harness.connector_effects(...)`, and worker messages with
+   `harness.worker_log(...)`. `harness.capture_caller_token(claim)` returns a
+   claim's raw token for `harness.proxy_replay(...)`; keep it in memory and
+   record only its fingerprint and `exp`.
+4. Use `harness.target.sql(...)` or `harness.route_doctor(...)` only to
+   corrupt state that no product surface can write, and restore it in a
+   `finally` block. `route_doctor` is the route doctoring exception:
+   `requester-expiry` X5 needs a warm route whose caller token is too short
+   for the next turn, which no product path writes. It finds the worker's
+   sandbox route record in Valkey by its claim name (keys
+   `curie:sandbox:route:<thread key>`), from inside the worker container with
+   the worker's own Valkey client, and rewrites only `caller_token_exp`, with
+   the record's own serialization and TTL. Its restore is conditional on the
+   field still holding the doctored value. The record also carries the
+   runner's bearer, which nothing prints.
+5. If the scenario needs other humans, add them to the default roster or ship a
    roster file, and add any new agent with `up --agent`.
-5. Add a unit test in `tools/identity-e2e/tests` for any new helper, judged by
+6. Add a unit test in `tools/identity-e2e/tests` for any new helper, judged by
    the product code that consumes its output.
 
 ## Known limits
@@ -253,3 +453,8 @@ deferral message has to reach the worker's log at its configured level.
    given the dev default key over a loopback port-forward. The harness runs
    `curie` with a private `CURIE_CONFIG_DIR` under the state directory to
    avoid that.
+5. The reference connector runs a digest-pinned `python:3.12-slim` image. The
+   cluster must be able to pull it, or have it loaded (`kind load
+   docker-image`), before `up --reference-connector` deploys the agents.
+6. `requester-expiry` cannot shorten its one-hour wait: X6 proves the live
+   proxy's own clock refuses the token, which a controlled clock cannot.

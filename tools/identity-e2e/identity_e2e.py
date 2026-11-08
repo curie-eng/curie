@@ -15,7 +15,9 @@ Actions:
    upgrade with ``--reuse-values`` that mounts it and supplies the connector
    caller signing key and the email adapter's reply secret, the tenant's HTTP
    selection, an invocation role filter and one email binding plus channel
-   token per ``--agent``.
+   token per ``--agent``. ``--reference-connector`` deploys missing agents
+   from ``--bundle`` plus the reference human-restricted connector and has the
+   provider serve that connector's current authority.
 2. ``send`` signs an email receiver proof for exactly the submitted body, as
    the mail adapter does, and posts ``/channels/turns``.
 3. ``observe`` reads the newest sandbox claim's connector caller token for an
@@ -62,18 +64,22 @@ from identity_assets import (
     INBOX_DOMAIN,
     ISSUER,
     LOOKUP_PORT,
+    MEMBER_GROUP,
     OWNER_LABEL,
+    REFERENCE_CONNECTOR,
     SINK_PORT,
     ed25519_pair,
     get_path,
     make_certificates,
     provider_manifests,
+    reference_bundle,
     restored_values,
     role_filter,
     runtime_document,
     secret_manifest,
     set_path,
 )
+from identity_pod_scripts import PROXY_REPLAY_SCRIPT, ROUTE_DOCTOR_SCRIPT
 from identity_target import (
     ADAPTER,
     ADOPT_SCRIPT,
@@ -114,6 +120,15 @@ CALLER_PROXY_CONNECTOR_ENV = "CURIE_CALLER_PROXY_CONNECTOR"
 WORKER_CONTAINER = "worker"
 FINGERPRINT_HEX = 16
 REPLY_TEXT_LIMIT = 2000
+# The group the provider's current authority requires for the reference
+# human-restricted connector `up --reference-connector` adds to the bundle
+# (identity_assets.reference_bundle), and where the rendered bundle lives.
+AUTHORITY_GROUP = MEMBER_GROUP
+REFERENCE_BUNDLE_DIR = "reference-bundle"
+# The provider's sink-listener admin paths (fake_idp), guarded by the adapter secret.
+ADMIN_MEMBERSHIP = "/admin/membership"
+ADMIN_AUTHORITY = "/admin/authority"
+ADAPTER_SECRET_HEADER = "X-Curie-Adapter-Secret"
 
 # `kubectl logs --timestamps` puts an RFC 3339 stamp with nanoseconds first.
 _LOG_STAMP = re.compile(
@@ -129,6 +144,11 @@ _PROXY_DECISION = re.compile(
     rf"path=(?P<path>{_QUOTED})(?P<rest>.*)"
 )
 _PROXY_SUFFIX = re.compile(rf"\s+(?P<key>[a-z_]+)=(?P<value>{_QUOTED}|\S+)")
+# The reference connector's one line per tool call (human_restricted_connector):
+# the outcome, and the fingerprint of the X-Curie-Principal it read or `-`.
+_EFFECT_LINE = re.compile(
+    r"\brecord_effect outcome=(?P<outcome>[a-z_]+) requester=(?P<requester>[0-9a-f]{16}|-)(?=\s|$)"
+)
 
 
 def slug(name: str) -> str:
@@ -178,6 +198,90 @@ def caller_fingerprint(token: str) -> str:
     """The first 16 hex of the token's sha256, as the fake model prints for a sent header."""
 
     return hashlib.sha256(token.encode("utf-8")).hexdigest()[:FINGERPRINT_HEX]
+
+
+def principal_header_value(principal: Mapping[str, Any]) -> str:
+    """The one ``X-Curie-Principal`` spelling the caller proxy sets for ``principal``.
+
+    ADR 0270 decision 4, restated from
+    ``curie_connector_proxy.caller.principal_header_value`` because the harness
+    does not import the worker package: unpadded base64url of compact,
+    sorted-key JSON of exactly ``issuer``, ``subject`` and ``tenant_id``, with
+    non-ASCII text as raw UTF-8.
+    """
+
+    text = json.dumps(
+        {
+            "issuer": principal["issuer"],
+            "subject": principal["subject"],
+            "tenant_id": principal["tenant_id"],
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return b64url(text.encode("utf-8"))
+
+
+def principal_fingerprint(principal: Mapping[str, Any]) -> str:
+    """The fingerprint the reference connector logs for ``principal``'s header."""
+
+    return caller_fingerprint(principal_header_value(principal))
+
+
+def parse_effect_line(line: str) -> dict[str, Any] | None:
+    """One reference connector outcome line, or None for any other line.
+
+    The line is ``record_effect outcome=<ok|code> requester=<fp|->``, after an
+    optional ``kubectl logs --timestamps`` stamp and any logging prefix.
+    Returns ``{"at_epoch", "outcome", "requester"}``; ``at_epoch`` is None
+    without a stamp.
+    """
+
+    at, rest = split_log_stamp(line.strip())
+    match = _EFFECT_LINE.search(rest)
+    if match is None:
+        return None
+    return {"at_epoch": at, "outcome": match["outcome"], "requester": match["requester"]}
+
+
+def connector_server_container(deployment: Mapping[str, Any]) -> str:
+    """The name of a hosted connector Deployment's server container (not the proxy)."""
+
+    containers = deployment.get("spec", {}).get("template", {}).get("spec", {}).get("containers")
+    names = [
+        str(container.get("name"))
+        for container in containers or []
+        if container.get("name") != CALLER_PROXY_CONTAINER
+    ]
+    if len(names) != 1:
+        raise HarnessError(f"expected one connector server container beside the proxy: {names}")
+    return names[0]
+
+
+def ready_pod(pods: Sequence[Mapping[str, Any]]) -> str | None:
+    """The newest running, ready pod not being deleted, by name, or None."""
+
+    candidates = []
+    for pod in pods:
+        metadata, status = pod.get("metadata", {}), pod.get("status", {})
+        statuses = status.get("containerStatuses") or []
+        if (
+            status.get("phase") == "Running"
+            and not metadata.get("deletionTimestamp")
+            and statuses
+            and all(item.get("ready") for item in statuses)
+        ):
+            candidates.append((epoch(str(metadata.get("creationTimestamp", ""))), metadata["name"]))
+    return str(max(candidates)[1]) if candidates else None
+
+
+def make_private_tree(root: Path) -> None:
+    """Mode 0700 on every directory and 0600 on every file under ``root``."""
+
+    os.chmod(root, 0o700)
+    for path in root.rglob("*"):
+        os.chmod(path, 0o700 if path.is_dir() else 0o600)
 
 
 def split_log_stamp(line: str) -> tuple[float | None, str]:
@@ -346,6 +450,12 @@ class Harness:
     def provider_host(self) -> str:
         return f"{self.prefix}-idp.{self.target.namespace}.svc"
 
+    @property
+    def authority_url(self) -> str:
+        """The provider's sink listener, where the reference connector asks ``/authority``."""
+
+        return f"http://{self.provider_host}:{SINK_PORT}"
+
     def _check_target(self) -> None:
         recorded = self.data.get("target")
         current = {
@@ -379,6 +489,7 @@ class Harness:
         roster: Mapping[str, Any],
         *,
         with_role_filter: bool = False,
+        reference_connector: bool = False,
     ) -> dict[str, Any]:
         if not agents:
             raise HarnessError("up needs at least one --agent")
@@ -394,6 +505,12 @@ class Harness:
         keys.setdefault("context", b64url(secrets.token_bytes(32)))
         keys.setdefault("bearer", secrets.token_urlsafe(32))
         keys.setdefault("adapter_secret", secrets.token_urlsafe(32))
+        # Sticky: a later `up` without the flag keeps the provider's authority.
+        if reference_connector:
+            self.data["reference_connector"] = True
+        reference = bool(self.data.get("reference_connector"))
+        if reference:
+            keys.setdefault("authority_bearer", secrets.token_urlsafe(32))
         self.data["roster"] = copy.deepcopy(dict(roster))
         self.data.update(
             fullname=target.fullname,
@@ -412,34 +529,24 @@ class Harness:
             log("creating the private CA and provider certificate")
             make_certificates(self.state.directory, hosts)
 
-        log("applying the test identity provider")
-        manifests = provider_manifests(
-            prefix=self.prefix,
-            release=target.release,
-            image=target.api_image(),
-            roster=roster,
-            certificate=(self.state.directory / "server.pem").read_bytes(),
-            private_key=(self.state.directory / "server.key").read_bytes(),
-            bearer=keys["bearer"],
-            adapter_secret=keys["adapter_secret"],
-        )
-        target.kubectl(
-            "apply",
-            "-f",
-            "-",
-            input_text=json.dumps({"apiVersion": "v1", "kind": "List", "items": manifests}),
-        )
-        target.rollout(f"{self.prefix}-idp", timeout="300s")
+        provider_tenant = self._apply_provider(roster)
 
         # Hosted connectors render their proxy's verify key when an agent is
         # deployed, so the release must carry the caller key pair, and the API
         # must have rolled to it, before any agent is deployed.
         self._ensure_caller_pair()
 
+        if reference and bundle is not None:
+            bundle = self._render_reference_bundle(bundle)
         with self.api() as api:
             self._agents(api, agents, bundle)
             tenant_id = self._tenant()
             self._bindings(api, tenant_id)
+        # The provider's authority judges one tenant, the agents', which is
+        # known only once they exist; a first `up` applied it without one.
+        if reference and provider_tenant != tenant_id:
+            log("restarting the provider with the agents' tenant for its authority")
+            self._apply_provider(roster, restart=True)
         selection = {
             "mode": "http",
             "issuer": ISSUER,
@@ -527,7 +634,7 @@ class Harness:
                 agent.update(api.mint_channel_token(agent["address"]))
                 log(f"minted the channel token for {name}")
         self.state.save()
-        return {
+        result: dict[str, Any] = {
             "action": "up",
             "release": target.release,
             "namespace": target.namespace,
@@ -542,6 +649,79 @@ class Harness:
             "roster": sorted(roster.get("senders", {})),
             "state_dir": str(self.state.directory),
         }
+        if reference:
+            result["reference_connector"] = {
+                "connector": REFERENCE_CONNECTOR,
+                "authority_url": self.authority_url,
+                "authority_group": AUTHORITY_GROUP,
+                "bundle": self.data.get("reference_bundle"),
+            }
+        return result
+
+    def _apply_provider(self, roster: Mapping[str, Any], *, restart: bool = False) -> str | None:
+        """Apply the test provider and wait for it; the tenant its authority judges.
+
+        With the reference connector, the provider also serves the current
+        authority: its bearer, the agents' tenant (None until they exist) and
+        the group it requires. ``restart`` rolls the pod even when the objects
+        are unchanged, so a new tenant always takes effect.
+        """
+
+        target = self.target
+        keys = self.data["keys"]
+        tenant = self.data.get("tenant_id")
+        authority: dict[str, Any] = {}
+        if self.data.get("reference_connector"):
+            authority = {
+                "authority_bearer": keys["authority_bearer"],
+                "tenant": tenant,
+                "authority_group": AUTHORITY_GROUP,
+            }
+        log("applying the test identity provider")
+        manifests = provider_manifests(
+            prefix=self.prefix,
+            release=target.release,
+            image=target.api_image(),
+            roster=roster,
+            certificate=(self.state.directory / "server.pem").read_bytes(),
+            private_key=(self.state.directory / "server.key").read_bytes(),
+            bearer=keys["bearer"],
+            adapter_secret=keys["adapter_secret"],
+            **authority,
+        )
+        target.kubectl(
+            "apply",
+            "-f",
+            "-",
+            input_text=json.dumps({"apiVersion": "v1", "kind": "List", "items": manifests}),
+        )
+        target.rollout(f"{self.prefix}-idp", restart=restart, timeout="300s")
+        return None if tenant is None else str(tenant)
+
+    def _render_reference_bundle(self, source: Path) -> Path:
+        """``source`` plus the reference connector, rendered privately into the state dir.
+
+        The rendered ``connectors.yaml`` carries the authority bearer in the
+        connector's env, so the tree is mode 0700/0600 like the rest of the state.
+        """
+
+        dest = self.state.directory / REFERENCE_BUNDLE_DIR
+        shutil.rmtree(dest, ignore_errors=True)
+        log(f"rendering {source} with the {REFERENCE_CONNECTOR} connector")
+        old = os.umask(0o077)
+        try:
+            produced = reference_bundle(
+                source,
+                dest,
+                authority_url=self.authority_url,
+                authority_bearer=self.data["keys"]["authority_bearer"],
+            )
+        finally:
+            os.umask(old)
+        make_private_tree(produced)
+        self.data["reference_bundle"] = {"source": str(source), "path": str(produced)}
+        self.state.save()
+        return produced
 
     def _access_policy(self, api: Api, name: str, agent: dict[str, Any]) -> None:
         """An HTTP turn needs a stored access policy: its version is provenance.
@@ -592,6 +772,10 @@ class Harness:
             entry = agents.setdefault(name, {})
             entry.setdefault("created", False)
             entry["agent_id"] = str(existing[name]["id"])
+            # The state file sorts its keys, so the registration order is kept apart.
+            order = self.data.setdefault("agent_order", [])
+            if name not in order:
+                order.append(name)
         self.state.save()
 
     def _tenant(self) -> str:
@@ -730,6 +914,23 @@ class Harness:
         conversation: str | None = None,
         delivery: str | None = None,
     ) -> dict[str, Any]:
+        return self.post(self.prepare(name, sender, text, conversation, delivery))
+
+    def prepare(
+        self,
+        name: str,
+        sender: str,
+        text: str,
+        conversation: str | None = None,
+        delivery: str | None = None,
+    ) -> dict[str, Any]:
+        """One signed turn, ready to :meth:`post`.
+
+        Signing runs in the API container and takes a second or two, so a
+        scenario that needs two sends one second apart prepares both first. The
+        result holds the receiver proof: keep it in memory, never in evidence.
+        """
+
         agent = self.agent_entry(name)
         delivery_id = delivery or f"<{uuid.uuid4().hex}@identity-e2e.example.test>"
         conversation_id = conversation or f"<{uuid.uuid4().hex}@identity-e2e.example.test>"
@@ -762,20 +963,42 @@ class Harness:
                 },
             },
         )
-        sent_at = time.time()
-        with self.api() as api:
-            token = self.ensure_token(api, name)
-            status, payload = http(
-                "POST",
-                api.base + "/channels/turns",
-                raw=body,
-                headers={"X-API-Key": token, "X-Curie-Receiver-Proof": signed["proof"]},
-            )
-        record = {
+        if not agent.get("token") or agent.get("expires_at", 0) < time.time() + 300:
+            with self.api() as api:
+                self.ensure_token(api, name)
+        return {
             "agent": name,
             "sender": sender.lower(),
             "delivery_id": delivery_id,
             "conversation_id": conversation_id,
+            "body": body,
+            "proof": signed["proof"],
+        }
+
+    def post(self, prepared: Mapping[str, Any], api: Api | None = None) -> dict[str, Any]:
+        """Post a prepared turn to ``/channels/turns``; the send record, without the proof.
+
+        ``api`` reuses an open port-forward, so two posts can go out about a
+        second apart.
+        """
+
+        if api is None:
+            with self.api() as opened:
+                return self.post(prepared, opened)
+        name = str(prepared["agent"])
+        token = self.ensure_token(api, name)
+        sent_at = time.time()
+        status, payload = http(
+            "POST",
+            api.base + "/channels/turns",
+            raw=prepared["body"],
+            headers={"X-API-Key": token, "X-Curie-Receiver-Proof": prepared["proof"]},
+        )
+        record = {
+            "agent": name,
+            "sender": prepared["sender"],
+            "delivery_id": prepared["delivery_id"],
+            "conversation_id": prepared["conversation_id"],
             "sent_at": sent_at,
             "http_status": status,
             "response": payload,
@@ -941,11 +1164,159 @@ class Harness:
 
         return sorted(self._connector_deployments(name))
 
+    def connector_deployment(self, name: str, connector: str) -> dict[str, Any]:
+        """``name``'s Deployment for hosted ``connector``."""
+
+        deployments = self._connector_deployments(name)
+        if connector not in deployments:
+            raise HarnessError(
+                f"{name} has no hosted connector {connector} (it has {sorted(deployments)}); "
+                "deploy the agents with `up --reference-connector --bundle examples/weather`"
+            )
+        return deployments[connector]
+
+    def _pods(self, deployment: Mapping[str, Any]) -> list[dict[str, Any]]:
+        labels = deployment["spec"]["selector"]["matchLabels"]
+        selector = ",".join(f"{key}={value}" for key, value in sorted(labels.items()))
+        return list(self.target.kubectl_json("get", "pod", "-l", selector)["items"])
+
+    def connector_effects(
+        self, name: str, since: float, connector: str = REFERENCE_CONNECTOR
+    ) -> list[dict[str, Any]]:
+        """The reference connector's outcome lines for ``name`` at or after ``since``, oldest first.
+
+        Read from the connector server container (never the caller proxy) of
+        every pod of ``name``'s ``connector`` Deployment. Each is a
+        :func:`parse_effect_line` entry plus ``connector`` and ``pod``. They
+        carry outcomes and requester fingerprints only, never a principal.
+        """
+
+        deployment = self.connector_deployment(name, connector)
+        container = connector_server_container(deployment)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))
+        effects: list[dict[str, Any]] = []
+        for pod in self._pods(deployment):
+            pod_name = str(pod["metadata"]["name"])
+            result = self.target.kubectl(
+                "logs",
+                pod_name,
+                "-c",
+                container,
+                "--timestamps",
+                f"--since-time={stamp}",
+                check=False,
+            )
+            if result.returncode != 0:
+                log(f"no {connector} log from {pod_name}: exit {result.returncode}")
+                continue
+            for line in result.stdout.splitlines():
+                parsed = parse_effect_line(line)
+                if parsed is None:
+                    continue
+                if parsed["at_epoch"] is not None and parsed["at_epoch"] < since:
+                    continue
+                parsed.update(connector=connector, pod=pod_name)
+                effects.append(parsed)
+        return sorted(
+            effects, key=lambda entry: since if entry["at_epoch"] is None else entry["at_epoch"]
+        )
+
+    def capture_caller_token(self, claim: str) -> str | None:
+        """The raw ``cct`` in ``claim``'s token Secret, for a replay.
+
+        The caller holds it in memory only. It is never logged, printed or
+        written to evidence or state; record :func:`caller_fingerprint` and its
+        decoded ``exp`` instead.
+        """
+
+        return self.caller_token(claim)
+
+    def proxy_replay(
+        self, name: str, connector: str, token: str, *, clock: float | None = None
+    ) -> dict[str, Any]:
+        """Present ``token`` to ``name``'s ``connector`` caller proxy from inside its pod.
+
+        Execs into the caller-proxy container of a ready connector pod and sends
+        an MCP ``initialize`` with ``X-Curie-Caller: token`` (passed on stdin).
+        Without ``clock`` it goes to the live proxy on loopback; with ``clock``
+        (unix seconds) to the deployed proxy app built from that container's own
+        env with the clock frozen there. Returns ``status``, ``admitted``,
+        ``reason`` (the refusal code of a proxy refusal, else None) and
+        ``frozen_refusal_body``, plus the pod and the host time window.
+        """
+
+        deployment = self.connector_deployment(name, connector)
+        if proxied_connector(deployment) is None:
+            raise HarnessError(f"connector {connector} of {name} has no caller proxy")
+        pod = ready_pod(self._pods(deployment))
+        if pod is None:
+            raise HarnessError(f"no ready pod serves connector {connector} of {name}")
+        params = {"token": token, "clock": None if clock is None else int(clock)}
+        started = time.time()
+        result = self.target.exec_python(
+            pod, CALLER_PROXY_CONTAINER, PROXY_REPLAY_SCRIPT, params, timeout=90
+        )
+        finished = time.time()
+        if not isinstance(result, dict) or "error" in result:
+            failure = result.get("error") if isinstance(result, dict) else result
+            raise HarnessError(f"the replay in {pod} failed: {failure}")
+        result.update(connector=connector, pod=pod, started=started, finished=finished)
+        return result
+
+    def route_doctor(
+        self, claim: str, caller_token_exp: int, *, only_if: int | None = None
+    ) -> dict[str, Any]:
+        """Rewrite the ``caller_token_exp`` of the live route record serving ``claim``.
+
+        Stored state no product surface can write: the worker's sandbox route
+        record in Valkey, found by its claim name and changed in that field only
+        (same serialization, same TTL), from inside the worker container. With
+        ``only_if``, it changes only while the field still holds that value, so
+        restoring never clobbers a route the product has since replaced. The
+        answer summarizes the record before and after and never carries its
+        runner bearer.
+        """
+
+        params: dict[str, Any] = {"claim": claim, "caller_token_exp": int(caller_token_exp)}
+        if only_if is not None:
+            params["only_if"] = int(only_if)
+        result = self.target.worker_python(ROUTE_DOCTOR_SCRIPT, params)
+        if not isinstance(result, dict) or "error" in result:
+            failure = result.get("error") if isinstance(result, dict) else result
+            raise HarnessError(f"the route record of {claim} could not be read: {failure}")
+        return dict(result)
+
+    def provider_admin(self, path: str, body: Mapping[str, Any]) -> int:
+        """POST one admin change (membership, authority) to the provider; its status."""
+
+        if path not in (ADMIN_MEMBERSHIP, ADMIN_AUTHORITY):
+            raise HarnessError(f"{path} is not a provider admin path")
+        headers = {ADAPTER_SECRET_HEADER: self.data["keys"]["adapter_secret"]}
+        with self.target.forward(f"{self.prefix}-idp", SINK_PORT, "/healthz") as base:
+            status, _ = http("POST", base + path, body=dict(body), headers=headers)
+        return status
+
+    def authority_decision(self, principal: Mapping[str, Any]) -> tuple[int, Any]:
+        """The provider's current-authority answer for ``principal``, as the connector asks it."""
+
+        bearer = self.data.get("keys", {}).get("authority_bearer")
+        if not bearer:
+            raise HarnessError("the state has no authority bearer; run `up --reference-connector`")
+        body = {key: principal[key] for key in ("tenant_id", "issuer", "subject")}
+        with self.target.forward(f"{self.prefix}-idp", SINK_PORT, "/healthz") as base:
+            return http(
+                "POST",
+                base + "/authority",
+                body=body,
+                headers={"Authorization": "Bearer " + bearer},
+            )
+
     def proxy_decisions(self, name: str, since: float) -> list[dict[str, Any]]:
         """Caller proxy decisions logged by ``name``'s connector pods at or after ``since``.
 
         Each is a :func:`parse_proxy_decision` entry plus the ``connector`` whose
-        pod logged it and the log stamp ``at``. Kept: every decision whose
+        pod logged it, the log stamp ``at`` and its unix seconds ``at_epoch``
+        (None without a stamp). Kept: every decision whose
         caller is ``name``, and every refusal whatever its caller, so a step
         sees a refusal it did not expect.
         """
@@ -984,7 +1355,9 @@ class Harness:
                         continue
                     if parsed["caller"] != name and parsed["outcome"] == "admitted":
                         continue
-                    parsed.update(connector=connector, at=line[: len(line) - len(rest)].strip())
+                    parsed.update(
+                        connector=connector, at=line[: len(line) - len(rest)].strip(), at_epoch=at
+                    )
                     decisions.append((since if at is None else at, parsed))
         return [entry for _, entry in sorted(decisions, key=lambda pair: pair[0])]
 
@@ -1112,6 +1485,10 @@ class Harness:
         for name in (STATE_FILE, "ca.pem", "ca.key", "server.pem", "server.key"):
             (self.state.directory / name).unlink(missing_ok=True)
         shutil.rmtree(self.state.directory / "curie-config", ignore_errors=True)
+        if (self.state.directory / REFERENCE_BUNDLE_DIR).exists():
+            # It holds the authority bearer in the connector's env.
+            shutil.rmtree(self.state.directory / REFERENCE_BUNDLE_DIR, ignore_errors=True)
+            report["removed"].append("the rendered reference bundle")
         with contextlib.suppress(OSError):
             self.state.directory.rmdir()
         return report
@@ -1178,6 +1555,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="also set an issuer-group invocation filter on every agent (its bindings then "
         "require HTTP identity, and non-HTTP turns to it are refused)",
     )
+    up.add_argument(
+        "--reference-connector",
+        action="store_true",
+        help=f"deploy missing agents from --bundle plus the {REFERENCE_CONNECTOR} reference "
+        "connector, and serve its current authority from the provider",
+    )
 
     send = actions.add_parser("send", parents=[common], help="post one signed email turn")
     send.add_argument("--agent", required=True)
@@ -1206,7 +1589,14 @@ def build_parser() -> argparse.ArgumentParser:
     prove.add_argument(
         "--second-sender",
         default="bob@example.test",
-        help="the other verified human for requester-handoff (default: bob@example.test)",
+        help="the other verified human for requester-handoff, requester-expiry and the "
+        "approver of requester-approval (default: bob@example.test)",
+    )
+    prove.add_argument(
+        "--outsider",
+        default="dana@example.test",
+        help="for requester-effect: a verified human outside the authority group "
+        "(default: dana@example.test)",
     )
     prove.add_argument("--wait", type=float, default=240)
 
@@ -1222,7 +1612,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.action == "up":
             roster = DEFAULT_ROSTER if args.roster is None else json.loads(args.roster.read_text())
             bundle = None if args.bundle is None else args.bundle.resolve()
-            result: Any = harness.up(args.agents, bundle, roster, with_role_filter=args.role_filter)
+            result: Any = harness.up(
+                args.agents,
+                bundle,
+                roster,
+                with_role_filter=args.role_filter,
+                reference_connector=args.reference_connector,
+            )
         elif args.action == "send":
             harness.state.load()
             result = harness.send(
