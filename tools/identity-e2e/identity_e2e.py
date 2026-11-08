@@ -30,8 +30,9 @@ Actions:
    changed, then verifies the removal.
 
 State (generated keys, ids, channel tokens) lives in ``--state-dir`` with
-mode 0700 and 0600 files. No action prints a key, bearer, proof or token.
-See docs/testing/identity-e2e.md.
+mode 0700 and 0600 files. No action prints a key, bearer, proof or token. A
+failed command's error names the command and exit code only; its raw output
+goes to ``last-exec-error.txt`` there. See docs/testing/identity-e2e.md.
 """
 
 from __future__ import annotations
@@ -91,6 +92,7 @@ from identity_target import (
     ADOPT_SCRIPT,
     API_PORT,
     HERE,
+    LAST_EXEC_ERROR,
     REPO,
     ROLE_FILTER_SCRIPT,
     SIGN_SCRIPT,
@@ -100,7 +102,9 @@ from identity_target import (
     b64url,
     b64url_decode,
     http,
+    last_exec_error,
     log,
+    set_private_log_dir,
     summarize_event,
     write_private,
 )
@@ -1704,6 +1708,9 @@ class Harness:
         report["verified"] = self._verify_removed(previous)
         for name in (STATE_FILE, "ca.pem", "ca.key", "server.pem", "server.key"):
             (self.state.directory / name).unlink(missing_ok=True)
+        if last_exec_error() is None:
+            # An earlier action's raw command output; one this down wrote stays to read.
+            (self.state.directory / LAST_EXEC_ERROR).unlink(missing_ok=True)
         shutil.rmtree(self.state.directory / "curie-config", ignore_errors=True)
         if (self.state.directory / REFERENCE_BUNDLE_DIR).exists():
             # It holds the authority bearer in the connector's env.
@@ -1827,7 +1834,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     target = _target(args)
-    harness = Harness(target, State(args.state_dir.resolve()))
+    state_dir = args.state_dir.resolve()
+    harness = Harness(target, State(state_dir))
+    # A failed command's error names the command and exit code only; its raw
+    # output goes to the private state directory.
+    set_private_log_dir(state_dir)
     try:
         if args.action == "up":
             roster = DEFAULT_ROSTER if args.roster is None else json.loads(args.roster.read_text())
@@ -1861,14 +1872,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.evidence is not None:
                 args.evidence.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
             print(json.dumps(evidence, indent=2, sort_keys=True))
-            return 0 if evidence.get("passed") else 1
+            if evidence.get("passed"):
+                return 0
+            _point_at_raw_output()
+            return 1
         else:
             result = harness.down()
     except HarnessError as exc:
         print(json.dumps({"action": args.action, "error": str(exc)}), file=sys.stderr)
+        _point_at_raw_output()
         return 1
+    finally:
+        set_private_log_dir(None)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
+
+
+def _point_at_raw_output() -> None:
+    """Name the private file holding the raw output of this run's failed command, if any."""
+
+    path = last_exec_error()
+    if path is not None:
+        log(f"the failed command's raw output is in {path} (mode 0600; it may hold private values)")
 
 
 if __name__ == "__main__":

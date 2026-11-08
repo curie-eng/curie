@@ -89,6 +89,23 @@ def check(condition: bool, message: str) -> None:
         raise StepFailed(message)
 
 
+def refusal(status: int, body: Any) -> str:
+    """A failed API answer as its status and refusal code, never the rest of its body.
+
+    The code is the body's ``detail`` when it is a string, else ``detail.code``
+    or a top-level ``code``; an error body can echo the request's input.
+    """
+
+    detail = body.get("detail") if isinstance(body, Mapping) else None
+    if isinstance(detail, str):
+        code: Any = detail
+    elif isinstance(detail, Mapping) and detail.get("code") is not None:
+        code = detail["code"]
+    else:
+        code = body.get("code") if isinstance(body, Mapping) else None
+    return f"{status}" if code is None else f"{status} {str(code)[:200]}"
+
+
 class Evidence:
     """The JSON evidence one ``prove`` run writes.
 
@@ -114,11 +131,22 @@ class Evidence:
     def hold_private(self, values: Iterable[Any]) -> None:
         """Hold ``values`` as private values of this run. Cumulative.
 
-        Strings shorter than ``identity_privacy.MIN_SECRET`` characters and
-        non-strings are ignored, but any call puts the run under the privacy
-        rules at :meth:`finish`.
+        Non-strings and empty strings are ignored, but any call puts the run
+        under the privacy rules at :meth:`finish`. A non-empty string shorter
+        than ``identity_privacy.MIN_SECRET`` characters is refused, since the
+        evidence could not be searched for it: use longer roster subjects.
         """
 
+        values = list(values)
+        if any(
+            isinstance(value, str) and 0 < len(value) < identity_privacy.MIN_SECRET
+            for value in values
+        ):
+            raise HarnessError(
+                f"a private value of this run is shorter than {identity_privacy.MIN_SECRET} "
+                "characters, so the evidence cannot be searched for it; use longer roster "
+                "subjects"
+            )
         held = [] if self._private is None else self._private
         held += [value for value in identity_privacy.searchable(values) if value not in held]
         self._private = held
@@ -134,11 +162,6 @@ class Evidence:
         count = sum(identity_privacy.scrub(tree, wanted) for tree in (self.data, *trees))
         self._redactions += count
         return count
-
-    def scrub_text(self, text: str) -> str:
-        """``text`` with each held private value and each token or ticket envelope redacted."""
-
-        return identity_privacy.scrub_text(text, self._private or ())
 
     @contextlib.contextmanager
     def step(self, step_id: str, title: str) -> Iterator[dict[str, Any]]:
@@ -174,7 +197,11 @@ class Evidence:
 
 
 def run(name: str, harness: Harness, args: Any) -> dict[str, Any]:
-    """Run one registered scenario and return its finished evidence."""
+    """Run one registered scenario and return its finished evidence.
+
+    Any other exception the scenario raises aborts it by its type name only,
+    since its text can carry a private value, and the evidence still finishes.
+    """
 
     if name not in SCENARIOS:
         raise HarnessError(f"unknown scenario {name}; known: {', '.join(sorted(SCENARIOS))}")
@@ -183,6 +210,8 @@ def run(name: str, harness: Harness, args: Any) -> dict[str, Any]:
         SCENARIOS[name](harness, args, evidence)
     except (StepFailed, HarnessError) as exc:
         evidence.data["aborted"] = str(exc)
+    except Exception as exc:  # noqa: BLE001 - recorded by type; its text may be private
+        evidence.data["aborted"] = type(exc).__name__
     return evidence.finish()
 
 
@@ -264,7 +293,7 @@ def set_requester_flag(api: Api, agent_id: str, wanted: bool, *, what: str) -> t
                 "connector_requester_identity_expected_version": version,
             },
         )
-        check(status == 200, f"{what} answered {status}: {body}")
+        check(status == 200, f"{what} answered {refusal(status, body)}")
         flag, version = requester_flag(api, agent_id)
     return flag, version
 
@@ -2086,7 +2115,11 @@ class TicketScenario:
         setup["approver_role"] = {key: role.get(key) for key in ("action", "version")}
 
     def restore(self) -> None:
-        """Put back what ``changes`` records; a failure fails the run, naming what is left."""
+        """Put back what ``changes`` records; a failure fails the run, naming what is left.
+
+        A failed action records its exception type name only: its text can
+        carry a private value.
+        """
 
         report: dict[str, Any] = {"done": [], "failed": []}
         self.evidence.data["restore"] = report
@@ -2095,7 +2128,7 @@ class TicketScenario:
             try:
                 report["done"].append({"action": name, "result": action()})
             except (HarnessError, StepFailed, KeyError, TypeError, ValueError) as exc:
-                report["failed"].append({"action": name, "error": str(exc)[:400]})
+                report["failed"].append({"action": name, "error": type(exc).__name__})
 
         changes = self.changes
         if changes["routes"] or changes["flag"] or changes["deployments"] or changes["ended"]:
@@ -2110,7 +2143,7 @@ class TicketScenario:
                         attempt("approval routes", lambda: self._restore_routes(api))
                     attempt("verify", lambda: self._verify_restored(api))
             except HarnessError as exc:
-                report["failed"].append({"action": "port-forward", "error": str(exc)[:400]})
+                report["failed"].append({"action": "port-forward", "error": type(exc).__name__})
         if changes["approver_role"]:
             attempt("approver role", self._restore_role)
         report["left"] = (

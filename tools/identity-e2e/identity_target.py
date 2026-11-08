@@ -13,7 +13,6 @@ import base64
 import contextlib
 import json
 import os
-import re
 import signal
 import socket
 import subprocess
@@ -51,16 +50,6 @@ def b64url_decode(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
-# A credential-shaped run: a Curie token by its prefix, or any long base64 run.
-_SECRET_TEXT = re.compile(r"\b(?:cct|ccr|ccg|adp|chn|apr)\.[A-Za-z0-9_.-]*|[A-Za-z0-9_+/=-]{32,}")
-
-
-def redact(text: str) -> str:
-    """``text`` with anything shaped like a token or key replaced by ``<redacted>``."""
-
-    return _SECRET_TEXT.sub("<redacted>", text)
-
-
 def summarize_event(event: Any, limit: int = 200) -> Any:
     """A reply event with long strings truncated, for evidence."""
 
@@ -90,6 +79,45 @@ def write_private(path: Path, data: bytes) -> None:
 
 # --- process helpers -------------------------------------------------------------
 
+# A failed command's error names only its command words and exit code: its
+# output can carry a subject, token or bound query parameter. The raw output
+# tail goes to this file in the private log directory instead, replacing the
+# previous failure's, and is dropped when no directory is set.
+LAST_EXEC_ERROR = "last-exec-error.txt"
+_OUTPUT_TAIL_LINES = 40
+_private_log_dir: Path | None = None
+_last_exec_error: Path | None = None
+
+
+def set_private_log_dir(path: Path | None) -> None:
+    """Keep each failed command's raw output tail in ``path`` (mode 0600), or drop it."""
+
+    global _private_log_dir, _last_exec_error
+    _private_log_dir, _last_exec_error = path, None
+
+
+def last_exec_error() -> Path | None:
+    """The file holding a failed command's raw output, when one was written since set."""
+
+    return _last_exec_error
+
+
+def _keep_output(what: str, result: subprocess.CompletedProcess[str]) -> None:
+    global _last_exec_error
+    if _private_log_dir is None:
+        return
+    lines = [f"{what} exited {result.returncode}"]
+    for name, stream in (("stderr", result.stderr), ("stdout", result.stdout)):
+        tail = (stream or "").rstrip().splitlines()[-_OUTPUT_TAIL_LINES:]
+        lines += [f"--- {name}, last {len(tail)} lines", *tail]
+    path = _private_log_dir / LAST_EXEC_ERROR
+    try:
+        write_private(path, ("\n".join(lines) + "\n").encode())
+    except OSError:
+        # Keeping the output is best effort; the command's own error still raises.
+        return
+    _last_exec_error = path
+
 
 def run(
     argv: Sequence[str],
@@ -100,7 +128,11 @@ def run(
     env: Mapping[str, str] | None = None,
     cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a command, capturing output. A failure names the command, not its input."""
+    """Run a command, capturing output.
+
+    A failure names the first four command words and the exit code only; the
+    raw output tail goes to the private log directory, when one is set.
+    """
 
     try:
         result = subprocess.run(  # noqa: S603 - argv lists only
@@ -118,8 +150,9 @@ def run(
     except subprocess.TimeoutExpired:
         raise HarnessError(f"{' '.join(argv[:3])} timed out after {timeout:.0f}s") from None
     if check and result.returncode != 0:
-        tail = (result.stderr or result.stdout).strip().splitlines()[-8:]
-        raise HarnessError(f"{' '.join(argv[:4])} exited {result.returncode}: " + " | ".join(tail))
+        command = " ".join(argv[:4])
+        _keep_output(command, result)
+        raise HarnessError(f"{command} exited {result.returncode}")
     return result
 
 
@@ -394,7 +427,8 @@ class Target:
 
         ``workload`` is a pod name or ``deployment/<name>``. ``params`` travel
         as JSON on stdin, never on argv; the script's last stdout line is its
-        JSON answer. A failure reports the exit code and a redacted stderr tail.
+        JSON answer. A failure names the workload, container and exit code
+        only; the raw output tail goes to the private log directory, when set.
         """
 
         result = run(
@@ -419,10 +453,9 @@ class Target:
             check=False,
         )
         if result.returncode != 0:
-            tail = redact(result.stderr or result.stdout).strip().splitlines()[-6:]
-            raise HarnessError(
-                f"python in {workload}/{container} exited {result.returncode}: " + " | ".join(tail)
-            )
+            where = f"python in {workload}/{container}"
+            _keep_output(where, result)
+            raise HarnessError(f"{where} exited {result.returncode}")
         lines = [line for line in result.stdout.splitlines() if line.strip()]
         if not lines:
             raise HarnessError(f"the in-pod call in {workload}/{container} printed nothing")

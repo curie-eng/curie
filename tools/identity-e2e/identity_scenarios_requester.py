@@ -600,14 +600,14 @@ def effect_call(
 def _quietly(evidence: Evidence, call: Callable[[], Any]) -> Any:
     """``call()``, or None when it fails; for restores in a ``finally``.
 
-    A failure is logged by type and with the text scrubbed of the run's private
-    values, since a failed query can carry its bound parameters.
+    A failure is logged by its exception type only: its text can carry a
+    private value, such as a failed query's bound parameters.
     """
 
     try:
         return call()
     except HarnessError as exc:
-        log(f"restore failed: {type(exc).__name__}: {evidence.scrub_text(str(exc))}")
+        log(f"restore failed: {type(exc).__name__}")
         return None
 
 

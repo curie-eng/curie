@@ -54,6 +54,7 @@ from identity_scenarios import (
     await_turns,
     check,
     principal_for,
+    refusal,
     requester_flag,
     require_delivered,
     require_install_ready,
@@ -1481,7 +1482,7 @@ def setup(
     seen["approval_required_tools"] = {"status": status, "before": stored, "after": readback}
     check(
         status == 200,
-        f"adding the protected tools to approval_required_tools answered {status}: {body}",
+        f"adding the protected tools to approval_required_tools answered {refusal(status, body)}",
     )
     check(
         all(name in (readback or []) for name in PROTECTED_LIVE_NAMES),
@@ -1788,7 +1789,7 @@ def restore_grant_setup(
         with contextlib.suppress(OSError):
             (harness.state.directory / SELECTOR_KEY_DIR).rmdir()
         if failures:
-            log(evidence.scrub_text(f"grant-attestation restore incomplete: {failures}"))
+            log(f"grant-attestation restore incomplete: {failures}")
         require_private_run(
             evidence,
             seen,

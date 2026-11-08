@@ -767,3 +767,13 @@ written or printed, and the run fails, also when the run stops before S3.
    `approval_required_tools`, so the proxy would gate the protected tools
    itself and the run would no longer show that they hold without the gated
    list.
+8. A harness error names only the failed command (or the workload and
+   container of an in-pod call) and its exit code, since the output can carry
+   a subject, token or query parameter. The raw output tail of the last failed
+   command goes to `last-exec-error.txt` in the state directory, mode 0600,
+   and the printed error says so when that file was written. A failed restore
+   logs only its exception type.
+9. `grant-attestation` and `stored-arguments-card` refuse a roster subject (or
+   any other private value) shorter than 8 characters, because the evidence
+   could not be searched for it reliably. Use longer subjects in a custom
+   roster.
