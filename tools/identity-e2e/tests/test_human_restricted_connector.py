@@ -483,6 +483,56 @@ def test_an_allowed_human_applies_one_effect_each_call_attributed_to_the_header(
     assert ledger(server) == [(1, fingerprint(ALICE)), (2, fingerprint(BOB))]
 
 
+@pytest.mark.parametrize("host", ["127.0.0.1", "127.0.0.53", "::1", "::ffff:127.0.0.1"])
+def test_a_loopback_peer_is_the_caller_proxys_forward(host: str) -> None:
+    assert hrc.from_caller_proxy(host)
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["10.0.0.7", "192.168.1.20", "::ffff:10.0.0.7", "2001:db8::7", "fe80::1%eth0", "", "pod"],
+)
+def test_any_other_peer_is_not_the_caller_proxy(host: str) -> None:
+    assert not hrc.from_caller_proxy(host)
+
+
+def report_peer_as(server: ThreadingHTTPServer, host: str) -> None:
+    """Every accepted connection reports ``host`` as its peer, as a pod-network caller would.
+
+    The connector's ``-direct`` Service reaches it on the pod address, not on
+    the caller proxy's loopback forward.
+    """
+
+    accept = server.get_request
+
+    def get_request() -> tuple[Any, Any]:
+        connection, address = accept()
+        return connection, (host, address[1])
+
+    server.get_request = get_request  # type: ignore[method-assign]
+
+
+def test_a_direct_caller_cannot_establish_a_human_with_the_header(
+    stub: StubAuthority, connectors: Callable[..., ThreadingHTTPServer]
+) -> None:
+    """INTERFACE.md: only the caller proxy's loopback forward attests a requester.
+
+    A caller on the pod network presents an allowed human's valid header. It
+    refuses ``missing_requester`` before any authority request, and records no
+    effect. Liveness: the same header on the loopback forward applies one.
+    """
+
+    direct = connectors(stub.url)
+    report_peer_as(direct, "10.0.0.7")
+    assert record_effect(direct, ALICE) == refused("missing_requester")
+    assert ledger(direct) == []
+    assert stub.requests == []
+
+    forwarded = connectors(stub.url)
+    assert record_effect(forwarded, ALICE) == ok(1, ALICE)
+    assert ledger(forwarded) == [(1, fingerprint(ALICE))]
+
+
 def test_a_call_without_a_principal_header_refuses_missing_requester(
     connectors: Callable[..., ThreadingHTTPServer], idp: SimpleNamespace
 ) -> None:
