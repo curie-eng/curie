@@ -36,7 +36,7 @@ from aci_protocol import Final, SessionStatus
 from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyTarget, TurnCompleted
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker.consumer import Consumer
-from curie_worker.delivery_lease import DeliveryLeaseStore
+from curie_worker.delivery_lease import DeliveryLeaseStore, LeaseLostError
 from curie_worker.markers import CompletionRecord, Markers
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerClient
@@ -687,7 +687,9 @@ def test_a_stale_generation_owner_writes_no_marker_clears_nothing_and_emits_noth
             )
             assert await h.async_redis.smembers(h.config.completions_pending_key()) == {"r6-stale"}
 
-            await h.kernel.process_event(qe, lease=stale)
+            with pytest.raises(LeaseLostError):
+                await h.kernel.process_event(qe, lease=stale)
+            assert h.runner.opened == [], "a fenced-out owner started a model turn"
 
             assert h.sink.completions == [], "a fenced-out owner emitted a terminal result"
             assert await h.async_redis.exists(h.config.done_key("r6-stale")) == 0, (
