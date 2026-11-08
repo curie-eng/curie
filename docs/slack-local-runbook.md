@@ -112,7 +112,7 @@ Export the tokens into your shell and start the profile:
 ```bash
 export SLACK_APP_TOKEN=xapp-...
 export SLACK_BOT_TOKEN=xoxb-...
-export SLACK_API_BASE_URL=          # empty: un-wire the worker's Slack stub -> real slack.com
+export SLACK_API_BASE_URL=          # empty: un-wire the gateway's Slack stub -> real slack.com
 curie local up --slack
 
 # Raw Docker alternative (the dispatcher depends on valkey, a core service, so
@@ -127,15 +127,15 @@ profile, it does not set `SLACK_API_BASE_URL`.
 
 What each export does:
 
-- `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` are read by the `curie-dispatcher`
+1. `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` are read by the `curie-dispatcher`
   service (its `VALKEY_*` connection is already wired to the compose `valkey`
   service). A token-less dispatcher just backoff-reconnects forever, so the
   profile is meaningless without real tokens.
-- Setting `SLACK_API_BASE_URL` to an EMPTY string un-wires the worker's Slack
-  stub and points its outbound posts at real slack.com. The worker's default is
+2. Setting `SLACK_API_BASE_URL` to an EMPTY string un-wires the gateway's Slack
+  stub and points its outbound posts at real slack.com. The gateway's default is
   `${SLACK_API_BASE_URL-http://localhost:8155/api/}` with a single `-`, so
   leaving the variable UNSET keeps the stub, and setting it empty overrides it.
-- The gateway reads `SLACK_BOT_TOKEN`; the dispatcher uses it for inbound Slack
+3. The gateway reads `SLACK_BOT_TOKEN`; the dispatcher uses it for inbound Slack
   operations. API and worker use separate gateway caller credentials and reject
   Slack token environment variables at startup.
 
