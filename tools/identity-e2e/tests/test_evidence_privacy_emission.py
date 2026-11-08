@@ -88,7 +88,7 @@ def test_scrubbed_tree_passes_the_guard() -> None:
 
 def test_finish_without_anything_private_changes_only_passed_and_finished_at() -> None:
     evidence = Evidence(NAME)
-    evidence.hold_private([SECRET, 7, "short"])
+    evidence.hold_private([SECRET, 7, None])
     with evidence.step("a", "clean") as seen:
         seen["count"] = 2
     before = json.loads(json.dumps(evidence.data))
