@@ -330,11 +330,15 @@ Answer and resume authority and separation of duties are enforced. A dynamic app
 a static route that enforces separation, is answered only through the HTTP identity answer
 path, which accepts a Slack answer or an email reply carrying its registered receiver's
 signed answer proof. The legacy approver-set resolution without that proof, and operator
-principals (including the CLI's operator-principal resolution), are refused. At answer, and again at resume, the answering
-human must be one of the stored selected approvers, still inside the route's registered
+principals (including the CLI's operator-principal resolution), are refused. On every such
+route the answering human must have a canonical active identity at answer and again at
+resume, and resume requires that same person. For a dynamic approval the answering human
+must also be one of the stored selected approvers, still inside the route's registered
 ceiling (the pinned approver role plus `ceiling.users`), with the registration still present
-for the same connector, tool and key id, and with a canonical active identity. Selection never
-changes after creation: widening the ceiling or changing the connector's source never admits
+for the same connector, tool and key id. A static route that enforces separation has no
+selector: any approver its existing route and role rules admit may answer, subject to the
+separation rules below. A dynamic approval's selection never changes after creation:
+widening the ceiling or changing the connector's source never admits
 someone who was not selected, and revoking a selected person, removing the registration or
 rotating the key refuses.
 
@@ -346,7 +350,8 @@ operator opt-out (`separation` with `exclude_requester` false, written through t
 audited route write) lets an eligible requester approve and records an
 `approval_separation.changed` audit row. An agent-owned write cannot opt out: the access
 policy (`PUT /agents/{id}/access-policy`) refuses a body carrying `separation` or
-`approval_routes`, and the stored separation is unchanged. Operator principals are refused on dynamic routes and on static routes
+`approval_routes`, and the stored separation is unchanged. Operator principals are refused on
+dynamic routes and on static routes
 whose binding enforces separation, before any approver-set shortcut, even when the route
 binds an explicit `approvers.users` list.
 
