@@ -78,7 +78,13 @@ an idle runner with durable history keeps its route. For a terminal delivery,
 maintenance retires only a runner observed to be active. An idle runner keeps
 its route even if history is deferred or a previous history loss still makes
 it report non-durable. Maintenance removes that idle runner's watch and keeps
-an unreadable terminal runner's watch for a later status read. It also removes
+an unreadable terminal runner's watch for a later status read. After three
+failed reads, maintenance forgets that terminal watch without retiring the
+runner. This permits two transient failures while bounding status probes to
+15 seconds per terminal watch across maintenance ticks and worker restarts.
+For an unfinished delivery, an unreadable runner latches the action marker
+before retirement, so recovery escalates rather than risking a replay.
+Maintenance also removes
 the watch when the claim is gone or retirement succeeds.
 Retirement stops the child and verifies cleanup. If the runner
 settles before the supervisor checks it, the cleaned shell can be reused;
@@ -113,6 +119,9 @@ status. Recovery persists that marker before retiring the claim or replacing
 an unfinished predecessor's watch for a follow-up. It checks the marker again
 after interrupt completion and again under the thread lock after the handoff
 check, so an unacknowledged side effect escalates instead of replaying.
+Reclaimed deliveries check their marker before steering as well as before
+starting a turn. An attachment cold handoff preserves an unfinished
+predecessor's marker before retiring its runner.
 The status flag identifies the runner's latest turn, not an event. If delivery
 ownership changed before recovery reads it, recovery can conservatively attribute
 the flag to a watched delivery and escalate even when that delivery performed no

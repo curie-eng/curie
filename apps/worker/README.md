@@ -659,7 +659,10 @@ active, unreadable or unable to confirm durable history is retired through its
 backend. A terminal delivery's runner is retired only when status reports an
 active turn. An idle terminal runner keeps its route even if its history is
 non-durable; its watch is removed. An unreadable terminal runner keeps its watch
-for a later status read. Static shells stop
+for a later status read. Three unreadable status probes remove that terminal
+watch without retiring the runner, bounding probes to 15 seconds across ticks
+and worker restarts while allowing two transient failures. An unreadable
+unfinished runner latches the action marker before retirement. Static shells stop
 the child and verify cleanup. If the runner settled before the supervisor's
 check, the cleaned shell can be reused; otherwise it is quarantined and its 503
 health response asks the platform to replace it. Settlement retains the recovery

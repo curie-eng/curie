@@ -423,11 +423,13 @@ def _needs_images(paths: list[str]) -> bool:
             "packages/shell-supervisor/",
             "runner/src/curie_runner/",
             "apps/worker/src/curie_worker/kernel/",
+            "apps/worker/src/curie_worker/sandbox/",
         )) or path in {
             "apps/worker/src/curie_worker/markers.py",
             "apps/worker/src/curie_worker/delivery_lease.py",
             "apps/worker/src/curie_worker/stream_consumer.py",
             "apps/worker/src/curie_worker/runner_client.py",
+            "apps/worker/src/curie_worker/threadlock.py",
         }:
             return True
     return False
