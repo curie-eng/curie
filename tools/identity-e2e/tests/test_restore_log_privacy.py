@@ -1,7 +1,8 @@
 """A failed restore must not log a private value, and every scenario module imports first.
 
 Covers the ``Evidence.hold_private`` short-value refusal,
-``identity_scenarios_requester._quietly`` and the import order of the scenario modules. Synthetic values only.
+``identity_scenarios_requester._quietly`` and the import order of the scenario modules.
+Synthetic values only.
 """
 
 from __future__ import annotations
