@@ -55,6 +55,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
+import asyncpg  # type: ignore[import-untyped]
 from aci_protocol import HookRunRef, QueuedTurn, TurnSource
 from channel_protocol import hook_conversation_id
 from curie_protected_hooks.source_policy_sql import (
@@ -112,6 +113,10 @@ _ENQUEUE = "wake_enqueue_unavailable"
 _EXHAUSTED = "wake_generation_exhausted"
 
 _NO_STORE = {"Cache-Control": "no-store"}
+
+# SQLAlchemy leaves errors raised while opening an asyncpg connection untranslated: a raw
+# OSError, a PostgresError such as too many connections, or an InterfaceError.
+_DATABASE_UNAVAILABLE = (SQLAlchemyError, OSError, asyncpg.PostgresError, asyncpg.InterfaceError)
 
 # The statements below repeat ``hook_fire``'s, which this module may not import
 # (``scripts/check-private-imports.py``). The in-force rule is the platform's
@@ -277,15 +282,15 @@ def _coalesced() -> JSONResponse:
 async def _generation(session: AsyncSession, agent_id: uuid.UUID, hook: str) -> int | None:
     """The stored wake generation, 1 when no key row exists, None for an unknown agent.
 
-    Unreadable metadata fails closed, including a raw driver connection error
-    (an ``OSError``) that SQLAlchemy leaves unwrapped.
+    Unreadable metadata fails closed, including a driver error raised while
+    connecting that SQLAlchemy leaves unwrapped.
     """
 
     try:
         row = (
             await session.execute(_sql(_GENERATION_SQL), {"agent_id": agent_id, "hook": hook})
         ).first()
-    except (SQLAlchemyError, OSError):
+    except _DATABASE_UNAVAILABLE:
         raise _Refusal(status.HTTP_503_SERVICE_UNAVAILABLE, _AUTHORITY) from None
     if row is None:
         return None
@@ -303,8 +308,8 @@ async def _gated_agent(
 ) -> AsyncIterator[tuple[Agent, SourceGateContext]]:
     """Hold the agent's source gate, as ``hook_fire._source_locked_agent`` does.
 
-    A missing, invalid or unavailable gate, and any database or raw driver
-    connection failure inside it that no step mapped itself, is 503
+    A missing, invalid or unavailable gate, and any database or driver error
+    raised while connecting inside it that no step mapped itself, is 503
     ``authority_unavailable``: authority that cannot be read refuses closed. A
     missing agent is ``wake_not_declared``.
     """
@@ -325,8 +330,7 @@ async def _gated_agent(
         SourceAgentNotFound,
         SourceGateInvalid,
         SourceSnapshotUnavailable,
-        SQLAlchemyError,
-        OSError,
+        *_DATABASE_UNAVAILABLE,
     ):
         raise _Refusal(status.HTTP_503_SERVICE_UNAVAILABLE, _AUTHORITY) from None
 
@@ -373,7 +377,7 @@ async def _require_ordinary(
         snapshot = await read_source_snapshot(held, await session.connection(), hook)
     except SourceAgentNotFound:
         raise _Refusal(status.HTTP_404_NOT_FOUND, _NOT_DECLARED) from None
-    except (SourceGateInvalid, SourceSnapshotUnavailable, SQLAlchemyError, OSError):
+    except (SourceGateInvalid, SourceSnapshotUnavailable, *_DATABASE_UNAVAILABLE):
         raise _Refusal(status.HTTP_503_SERVICE_UNAVAILABLE, _AUTHORITY) from None
     if not snapshot.never_configured:
         raise _Refusal(status.HTTP_409_CONFLICT, _NOT_ORDINARY)
