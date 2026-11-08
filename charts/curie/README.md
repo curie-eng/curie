@@ -2355,7 +2355,9 @@ An existing Slack install upgrades with the same values file and Secret objects.
 `channelGateway.deploy: null` automatically deploys the gateway when Slack is
 configured and `channelGateway.url` is empty. Setting `deploy: false` explicitly
 requires an external URL; the render refuses otherwise and names both fixes.
-Installs without Slack do not deploy a gateway automatically.
+Installs without Slack do not deploy a gateway automatically. The gateway adds
+one Deployment and a 1Gi replay PVC by default; its storage class follows
+`global.storageClass` unless `channelGateway.replayStorageClass` is configured.
 
 The chart moves Slack bot-token references from the API and worker into the
 gateway, preserving their Secret names and keys. The dispatcher retains its

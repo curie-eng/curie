@@ -128,8 +128,8 @@ metadata:
   name: {{ include "curie.fullname" . }}-channel-gateway-replay
 spec:
   accessModes: [ReadWriteOnce]
-  {{- if $gateway.replayStorageClass }}
-  storageClassName: {{ $gateway.replayStorageClass | quote }}
+  {{- with ($gateway.replayStorageClass | default .Values.global.storageClass) }}
+  storageClassName: {{ . | quote }}
   {{- end }}
   resources:
     requests:

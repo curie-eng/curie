@@ -195,3 +195,19 @@ def test_unchanged_slack_secret_references_move_to_gateway():
                 volume.get("secret", {}).get("secretName") == "acme-curie-channel-gateway-tls"
                 for volume in pod["volumes"]
             )
+
+
+@pytest.mark.parametrize("specific", ["", "acme-gateway-storage"])
+def test_gateway_replay_storage_uses_the_chart_storage_class(specific):
+    result = render(
+        "dispatcher.slack.botTokenExistingSecret=acme-slack",
+        "global.storageClass=acme-platform-storage",
+        f"channelGateway.replayStorageClass={specific}",
+    )
+    assert result.returncode == 0, result.stderr
+    claim = next(
+        item for item in yaml.safe_load_all(result.stdout)
+        if item and item["kind"] == "PersistentVolumeClaim"
+        and item["metadata"]["name"] == "acme-curie-channel-gateway-replay"
+    )
+    assert claim["spec"]["storageClassName"] == (specific or "acme-platform-storage")
