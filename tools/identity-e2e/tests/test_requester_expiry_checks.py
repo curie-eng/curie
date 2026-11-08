@@ -1,4 +1,4 @@
-"""The requester-expiry step checks, judged on shapes a live run recorded.
+"""The requester-expiry and requester-effect step checks, judged on recorded shapes.
 
 The worker lines and proxy decisions below are copied from a live
 ``requester-expiry`` run on a throwaway kind cluster (thread keys shortened).
@@ -146,3 +146,52 @@ def test_a_real_refusal_after_the_replay_still_fails() -> None:
             expected_principal=PRINCIPAL,
             after=REPLAY["at_epoch"],
         )
+
+
+# --- require_direct_refused (requester-effect E8) ----------------------------------------
+
+DIRECT_REFUSED = {
+    "status": 200,
+    "is_error": True,
+    "text": "refused missing_requester",
+    "source_loopback": False,
+}
+
+
+def test_a_direct_call_refused_missing_requester_with_no_effect_passes() -> None:
+    seen = identity_scenarios_requester.require_direct_refused(
+        DIRECT_REFUSED, [{"outcome": "missing_requester", "requester": "-"}]
+    )
+    assert seen["logged"] == [("missing_requester", "-")]
+
+
+@pytest.mark.parametrize(
+    ("direct", "effects", "message"),
+    [
+        (
+            dict(DIRECT_REFUSED, source_loopback=True),
+            [{"outcome": "missing_requester", "requester": "-"}],
+            "left from loopback",
+        ),
+        (
+            dict(DIRECT_REFUSED, is_error=False, text="effect=1 requester=0123456789abcdef"),
+            [{"outcome": "ok", "requester": "0123456789abcdef"}],
+            "the direct call answered",
+        ),
+        (
+            DIRECT_REFUSED,
+            [
+                {"outcome": "missing_requester", "requester": "-"},
+                {"outcome": "ok", "requester": "0123456789abcdef"},
+            ],
+            "the connector logged",
+        ),
+        (DIRECT_REFUSED, [], "the connector logged"),
+    ],
+    ids=["loopback-source", "effect-applied", "extra-effect-line", "no-log-line"],
+)
+def test_a_direct_call_that_was_not_refused_cleanly_fails(
+    direct: dict[str, Any], effects: list[dict[str, Any]], message: str
+) -> None:
+    with pytest.raises(identity_scenarios.StepFailed, match=message):
+        identity_scenarios_requester.require_direct_refused(direct, effects)
