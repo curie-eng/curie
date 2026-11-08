@@ -421,24 +421,25 @@ def test_operator_principal_is_refused_on_canonical_routes_of_the_selected_path(
     make it eligible on an ordinary route. The operator is refused and
     audited; a selected canonical human on the same routes is admitted, and an
     ordinary selected approval keeps today's bare refusal.
+
+    Each row is answered before the next turn is accepted: accepting a turn
+    mints a channel token, which moves the binding generation and would void
+    the earlier row's invocation capture.
     """
     case = selection_case
     listed = {"users": [OPERATOR, NATIVE_A]}
     configured(case, approvers=listed, static=EXCLUDE, static_approvers=listed)
-    selected = dynamic(case, (APPROVER_A,))
-    excluded = ordinary(case, OTHER_ROUTE)
-    for row in (selected, excluded):
+    for create in (lambda: dynamic(case, (APPROVER_A,)), lambda: ordinary(case, OTHER_ROUTE)):
+        row = create()
         _operator_refused(case.client, row["id"])
         still_pending(row["id"])
+        answered(case, row, NATIVE_A)
 
     plain = ordinary(case, None)
     response = _operator_resolves(case.client, plain["id"])
     assert response.status_code == 403, response.text
     assert response.json() == {"detail": "unsupported_approval"}
     assert audit_rows(plain["id"]) == []
-
-    answered(case, selected, NATIVE_A)
-    answered(case, excluded, NATIVE_A)
 
 
 LEGACY_ROUTE = "synthetic-legacy-review"
