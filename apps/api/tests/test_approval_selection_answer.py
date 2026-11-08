@@ -597,7 +597,7 @@ def test_a_provider_outage_at_resume_leaves_resume_refused_rows(
 def test_a_resume_check_refused_at_capture_on_a_canonical_route_is_audited(
     selection_case: SimpleNamespace, cause: str,
 ) -> None:
-    """@spec REQUEST-APPROVAL-5/6: a phase 1 refusal of a resume check keeps its status and is audited.
+    """@spec REQUEST-APPROVAL-5/6: a phase 1 resume refusal keeps its status and is audited.
 
     After the selected approver's answer, with the provider credential not
     registered (503, reported ``unavailable``/``authority_unavailable``) or
