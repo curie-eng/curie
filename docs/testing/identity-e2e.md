@@ -310,6 +310,12 @@ logs` from its server container, never the proxy's.
    alice again.
 8. E7: alice on the flag-off control agent: the token names no one, the proxy
    sets no header, and the connector refuses `missing_requester`.
+9. E8: a caller around the caller proxy. From inside the flag agent's
+   connector server container, the harness dials the server on the pod's own
+   address, as a caller on the connector's `-direct` Service reaches it, with
+   alice's valid `X-Curie-Principal` (sent on stdin, never logged). The request
+   does not arrive on the proxy's loopback forward, so the connector refuses
+   `missing_requester` and logs no requester and no effect.
 
 ## What requester-expiry proves
 
