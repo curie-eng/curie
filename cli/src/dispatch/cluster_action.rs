@@ -1817,6 +1817,10 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     reason,
                     recovery_key,
                 },
+            routes_version:
+                ApprovalRoutesVersionArgs {
+                    routes_expected_version,
+                },
             requester:
                 RequesterIdentityArgs {
                     requester_identity,
@@ -1876,6 +1880,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                         routes_from,
                         list_routes,
                         clear_routes,
+                        routes_expected_version,
                         report_identity,
                         recover,
                         reason,

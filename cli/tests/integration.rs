@@ -19,6 +19,7 @@ mod approval_recovery_cli;
 mod approval_requester_identity;
 mod approval_route_bindings;
 mod approval_route_precheck;
+mod approval_route_selector;
 mod approvals_list_truncation;
 mod approvals_manifest_unreadable;
 mod artifacts_fetch;

@@ -83,7 +83,10 @@ def graph_payload() -> dict[str, Any]:
         ("0148", False),
         # @spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 columns.
         ("0149", False),
-        ("0151", True),
+        ("0151", False),
+        ("0152", False),
+        # Approval ORM reads require the 0153 selection columns.
+        ("0153", True),
         ("0000", True),
         ("future-expand", True),
     ],
@@ -106,11 +109,14 @@ def test_installed_candidate_decision_preserves_unknown_revision_policy(
     )
 
 
-def test_candidate_window_raises_the_floor_to_0151() -> None:
-    """@spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 requester columns."""
+def test_candidate_window_raises_the_floor_to_0153() -> None:
+    """@spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 requester columns.
+
+    Approval ORM reads require the 0153 selection columns, so 0153 is the floor.
+    """
     window = shared().load_metadata().window
-    assert window.schema_min == "0151"
-    assert window.schema_head == "0151"
+    assert window.schema_min == "0153"
+    assert window.schema_head == "0153"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])

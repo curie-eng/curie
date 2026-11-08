@@ -135,11 +135,12 @@ fn approval_route_split_is_a_v2_schema_contract() {
     )
     .expect("approvals schema is JSON");
     assert_eq!(
-        schema["$id"], "https://schemas.curietech.ai/cli/approvals/v2.5.json",
+        schema["$id"], "https://schemas.curietech.ai/cli/approvals/v2.6.json",
         "removing the fused channel field and requiring resolution is a major schema break; \
          v2.3 adds the read-time route approver view to pending results (#2940); v2.4 adds \
          the remediation_principal mint result (#4228); v2.5 adds the connector requester \
-         identity readback (ADR 0270)"
+         identity readback (ADR 0270); v2.6 adds the route approver_ticket and separation \
+         readback (ADR 0271)"
     );
 
     let binding = &schema["$defs"]["approvalRouteBinding"];
@@ -166,7 +167,7 @@ fn approval_route_split_is_a_v2_schema_contract() {
         .iter()
         .find(|entry| entry["result"] == "ApprovalsOutput")
         .expect("ApprovalsOutput inventory entry");
-    assert_eq!(approvals["version"], "2.5");
+    assert_eq!(approvals["version"], "2.6");
 }
 
 #[test]

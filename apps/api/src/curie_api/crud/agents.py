@@ -14,6 +14,7 @@ from sqlalchemy.orm import selectinload
 
 from curie_api.schemas.agents import AgentCreate, HookPartitionConfig, SourceBindingConfig
 
+from .. import approver_tickets, identity_audit
 from ..identity.http_invocation import registered_binding_ids, tenant_selects_http_identity
 from ..models import (
     DEFAULT_TENANT_ID,
@@ -253,6 +254,15 @@ async def check_requester_identity_invariant(
     """
 
     if not enabled:
+        # Re-read under the caller's row lock, never from the loaded object: a
+        # selector registered since the read must still refuse the disable.
+        stored = await session.scalar(select(Agent.approval_routes).where(Agent.id == agent.id))
+        if approver_tickets.has_selector(stored):
+            raise RequesterIdentityRefused(
+                approver_tickets.SELECTOR_REGISTERED,
+                "connector requester identity cannot be turned off while an approver_ticket "
+                "selector is registered on this agent; remove every registration first",
+            )
         return
     if not await tenant_selects_http_identity(session, agent.tenant_id):
         raise RequesterIdentityRefused(
@@ -284,26 +294,21 @@ async def update_agent_connector_requester_identity(
     """Compare-and-set the flag on its version, bumping the version.
 
     Every accepted write bumps the version, even one that stores the value
-    already there, so a write names exactly the state it read. The UPDATE runs
-    first and holds the agent row while the invariant is judged; zero rows
-    means another writer moved the version, and nothing changes. The caller
+    already there, so a write names exactly the state it read. The agent row is
+    locked first and held while the invariant is judged; a stored version other
+    than the expected one means another writer moved it, and nothing changes.
+    The UPDATE follows the judgement, so storage's own selector check (ADR
+    0271, migration 0153) never meets a write this writer refuses. The caller
     sends nothing else in the same request, so this is its only write.
     @spec CONNECTOR-REQUESTER-1.
     """
 
-    updated = await session.scalar(
-        update(Agent)
-        .where(
-            Agent.id == agent.id,
-            Agent.connector_requester_identity_version == expected_version,
-        )
-        .values(
-            connector_requester_identity=enabled,
-            connector_requester_identity_version=expected_version + 1,
-        )
-        .returning(Agent.connector_requester_identity_version)
+    stored = await session.scalar(
+        select(Agent.connector_requester_identity_version)
+        .where(Agent.id == agent.id)
+        .with_for_update()
     )
-    if updated is None:
+    if stored != expected_version:
         await session.rollback()
         raise RequesterIdentityConflict(
             "connector requester identity version changed; retry the read"
@@ -313,6 +318,14 @@ async def update_agent_connector_requester_identity(
     except RequesterIdentityRefused:
         await session.rollback()
         raise
+    await session.execute(
+        update(Agent)
+        .where(Agent.id == agent.id)
+        .values(
+            connector_requester_identity=enabled,
+            connector_requester_identity_version=expected_version + 1,
+        )
+    )
     await session.commit()
     await session.refresh(agent)
     return agent
@@ -355,17 +368,91 @@ async def update_agent_approval_tools(
     return agent
 
 
+class ApprovalRoutesRefused(Exception):
+    """A route map write the stored state does not admit (ADR 0271 decision 1)."""
+
+    def __init__(self, status: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+
 async def update_agent_approval_routes(
-    session: AsyncSession, agent: Agent, routes: dict[str, Any]
+    session: AsyncSession,
+    agent: Agent,
+    routes: dict[str, Any],
+    *,
+    expected_version: int | None = None,
 ) -> Agent:
     """Set the agent's approval route bindings (#247). An empty dict clears
     them (stored as NULL: unbound routes escalate rather than inventing a
-    resolution surface)."""
+    resolution surface).
 
-    agent.approval_routes = routes or None
+    ADR 0271 decision 1 (plan D1, D2): the agent row is locked and re-read
+    first. ``expected_version``, when sent, must equal the stored
+    ``connector_requester_identity_version``. A write whose stored or proposed
+    map carries any ``approver_ticket`` key must send it, pins every
+    registration's ceiling, bumps the version and writes one identity audit row
+    per changed registration or exclusion, all in this one commit. The flag
+    writer takes the same row lock, so two writers that read one version cannot
+    both commit. Selector-free writes keep the unversioned behavior and do not
+    bump. Raises ``ApprovalRoutesRefused``.
+    """
+
+    locked = await session.scalar(
+        select(Agent)
+        .where(Agent.id == agent.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    assert locked is not None
+    current = locked.connector_requester_identity_version
+    try:
+        if expected_version is not None and expected_version != current:
+            raise ApprovalRoutesRefused(
+                409,
+                approver_tickets.VERSION_CONFLICT,
+                f"approval_routes_expected_version {expected_version} is not the stored "
+                f"configuration version {current}; read the agent again",
+            )
+        if not (
+            approver_tickets.has_selector(locked.approval_routes)
+            or approver_tickets.has_selector(routes)
+        ):
+            locked.approval_routes = routes or None
+        else:
+            if expected_version is None:
+                raise ApprovalRoutesRefused(
+                    409,
+                    approver_tickets.EXPECTED_VERSION_REQUIRED,
+                    "this route map write registers, replaces, removes or keeps an "
+                    "approver_ticket selector: send approval_routes_expected_version",
+                )
+            try:
+                written, audits = await approver_tickets.prepare_selector_write(
+                    session,
+                    locked,
+                    routes,
+                    new_version=current + 1,
+                )
+            except approver_tickets.ApproverTicketRefusal as exc:
+                raise ApprovalRoutesRefused(exc.status, exc.code, str(exc)) from None
+            locked.approval_routes = written or None
+            locked.connector_requester_identity_version = current + 1
+            for audit in audits:
+                identity_audit.record(
+                    session,
+                    tenant_id=locked.tenant_id,
+                    event_type=audit.event_type,
+                    actor="operator",
+                    details=audit.details,
+                )
+    except ApprovalRoutesRefused:
+        await session.rollback()
+        raise
     await session.commit()
-    await session.refresh(agent)
-    return agent
+    await session.refresh(locked)
+    return locked
 
 
 def _stored_hook_partitions(

@@ -160,6 +160,46 @@
       "omissions": []
     },
     {
+      "struct": "ApproverTicketResponse",
+      "schema": "ApproverTicketOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverCeilingResponse",
+      "schema": "ApproverTicketCeilingOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverUserResponse",
+      "schema": "ApproverTicketCeilingUserOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalSeparationResponse",
+      "schema": "ApprovalSeparationOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverTicketWrite",
+      "schema": "ApproverTicketRegistration",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverCeilingWrite",
+      "schema": "ApproverTicketCeiling",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverUserWrite",
+      "schema": "ApproverTicketCeilingUser",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalSeparationWrite",
+      "schema": "ApprovalSeparation",
+      "omissions": []
+    },
+    {
       "struct": "ApprovalResolutionTargetResponse",
       "schema": "ApprovalTargetOut",
       "omissions": []

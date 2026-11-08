@@ -31,6 +31,7 @@ from opentelemetry.trace import SpanKind
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from curie_api.crud import agents as crud_agents
 from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import channels as crud_channels
 from curie_api.schemas.approvals import (
@@ -45,7 +46,7 @@ from curie_api.schemas.approvals import (
     ApprovalResolve,
 )
 
-from .. import adapter_principal, approval_principal
+from .. import adapter_principal, approval_principal, approver_tickets
 from ..action_forward import ForwardRefused
 from ..admission import admit
 from ..approval_auth import (
@@ -293,12 +294,31 @@ async def create_approval(
     runner, so a sandbox cannot talk its way past it.
     """
 
+    # ADR 0271 decision 2 (@spec REQUEST-APPROVAL-2): the same route lock as the
+    # HTTP owner, before anything else. Only the HTTP owner verifies a selection,
+    # so a dynamic request or any carried ticket never creates here.
+    try:
+        agent = None if data.agent_id is None else await crud_agents.get_agent(
+            session, data.agent_id
+        )
+        if approver_tickets.check_tool_route(agent, data) is not None:
+            raise approver_tickets.ApproverTicketRefusal(
+                status.HTTP_409_CONFLICT, approver_tickets.REQUIRES_HTTP_CREATION,
+            )
+    except approver_tickets.ApproverTicketRefusal as exc:
+        raise HTTPException(exc.status, exc.code) from None
     await require_legacy_approval_creation(
         session, data, runtime=identity_runtime(request.app.state),
     )
     traceparent = canonicalize_traceparent(
         request.headers.get(TRACEPARENT_STREAM_FIELD)
     )
+    existing = await crud_approvals.get_approval_by_dedupe_key(session, data.dedupe_key)
+    if existing is not None:
+        response.status_code = status.HTTP_200_OK
+        result = ApprovalCreateOut.model_validate(existing)
+        result.requested_by = await crud_approvals.approval_display_requester(session, existing)
+        return result
     rejected = await crud_approvals.find_rejected_reraise(session, data)
     # An existing row for this dedupe_key is a replay of a request this route
     # already accepted, so the idempotent 200 below still owns it.
@@ -306,6 +326,15 @@ async def create_approval(
         session, data.dedupe_key
     ) is None:
         raise await _refuse_rejected_reraise(session, data, rejected)
+    try:
+        # The route lock again, on the agent row locked until create_approval
+        # commits, so a registration landing since the first check is judged.
+        if await approver_tickets.locked_tool_route(session, data) is not None:
+            raise approver_tickets.ApproverTicketRefusal(
+                status.HTTP_409_CONFLICT, approver_tickets.REQUIRES_HTTP_CREATION,
+            )
+    except approver_tickets.ApproverTicketRefusal as exc:
+        raise HTTPException(exc.status, exc.code) from None
     try:
         approval = await crud_approvals.create_approval(session, data, traceparent=traceparent)
     except IntegrityError as exc:

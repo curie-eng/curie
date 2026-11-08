@@ -1601,6 +1601,19 @@
             ],
             "title": "Approval Routes"
           },
+          "approval_routes_expected_version": {
+            "anyOf": [
+              {
+                "maximum": 2147483646.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval Routes Expected Version"
+          },
           "connector_requester_identity": {
             "anyOf": [
               {
@@ -3335,8 +3348,18 @@
       },
       "ApprovalRouteBinding": {
         "additionalProperties": false,
-        "description": "One strict workspace binding for a declared approval route (#1460).\n\n``resolution`` is the single verified-identity action surface: a fixed\nSlack channel, or the conversation that asked (ADR-0177).\n``notification`` may make the pending request visible elsewhere, but its\nmessage carries no interaction. ``approvers`` continues to narrow WHO may\nact through the resolution card path and is never inferred from notification\nrecipients.",
+        "description": "One strict workspace binding for a declared approval route (#1460).\n\n``resolution`` is the single verified-identity action surface: a fixed\nSlack channel, or the conversation that asked (ADR-0177).\n``notification`` may make the pending request visible elsewhere, but its\nmessage carries no interaction. ``approvers`` continues to narrow WHO may\nact through the resolution card path and is never inferred from notification\nrecipients. ``approver_ticket`` registers a per-request approver selector and\n``separation`` its requester exclusion (ADR 0271).",
         "properties": {
+          "approver_ticket": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApproverTicketRegistration"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "approvers": {
             "anyOf": [
               {
@@ -3346,6 +3369,19 @@
                 "type": "null"
               }
             ]
+          },
+          "expires_in_seconds": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 315360000.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires In Seconds"
           },
           "notification": {
             "anyOf": [
@@ -3367,6 +3403,16 @@
               }
             ],
             "title": "Resolution"
+          },
+          "separation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalSeparation"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -3376,8 +3422,18 @@
         "type": "object"
       },
       "ApprovalRouteBindingOut": {
-        "description": "The required resolution plus optional, redacted visibility policy.",
+        "description": "The required resolution plus optional, redacted visibility policy.\n\n``approver_ticket`` and ``separation`` are omitted, not null, on a route\nwithout a selector, so every existing route reads back exactly as before.",
         "properties": {
+          "approver_ticket": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApproverTicketOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "approvers": {
             "anyOf": [
               {
@@ -3387,6 +3443,17 @@
                 "type": "null"
               }
             ]
+          },
+          "expires_in_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires In Seconds"
           },
           "notification": {
             "anyOf": [
@@ -3408,12 +3475,55 @@
               }
             ],
             "title": "Resolution"
+          },
+          "separation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalSeparationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
           "resolution"
         ],
         "title": "ApprovalRouteBindingOut",
+        "type": "object"
+      },
+      "ApprovalSeparation": {
+        "additionalProperties": false,
+        "description": "Requester exclusion for a registered selector route (ADR 0271).\n\nOmitted on write stores ``{\"exclude_requester\": true}``; ``false`` is the\naudited opt-out. ``exempt_group`` lands with its enforcement (0271b), so it\nis refused here rather than stored unenforced.",
+        "properties": {
+          "exclude_requester": {
+            "title": "Exclude Requester",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "exclude_requester"
+        ],
+        "title": "ApprovalSeparation",
+        "type": "object"
+      },
+      "ApprovalSeparationOut": {
+        "description": "Read projection of the stored, effective requester exclusion.",
+        "properties": {
+          "exclude_requester": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exclude Requester"
+          }
+        },
+        "title": "ApprovalSeparationOut",
         "type": "object"
       },
       "ApprovalTargetOut": {
@@ -3433,6 +3543,238 @@
           "address"
         ],
         "title": "ApprovalTargetOut",
+        "type": "object"
+      },
+      "ApproverTicketCeiling": {
+        "additionalProperties": false,
+        "description": "The operator ceiling a selector chooses inside (ADR 0271 decision 1).\n\n``approver_role_version`` names the agent access-policy version whose\napprover role the operator approves. ``approver_role`` is server-owned: the\nplatform pins that role's canonical JSON on write and returns it on\nreadback, and a write may echo it back unchanged or omit it.",
+        "properties": {
+          "approver_role": {
+            "anyOf": [
+              {
+                "minLength": 2,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approver Role"
+          },
+          "approver_role_version": {
+            "maximum": 2147483647.0,
+            "minimum": 1.0,
+            "title": "Approver Role Version",
+            "type": "integer"
+          },
+          "users": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ApproverTicketCeilingUser"
+                },
+                "maxItems": 128,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Users"
+          }
+        },
+        "required": [
+          "approver_role_version"
+        ],
+        "title": "ApproverTicketCeiling",
+        "type": "object"
+      },
+      "ApproverTicketCeilingOut": {
+        "description": "Read projection of a registration ceiling, including the server-owned pin.",
+        "properties": {
+          "approver_role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approver Role"
+          },
+          "approver_role_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approver Role Version"
+          },
+          "users": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ApproverTicketCeilingUserOut"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Users"
+          }
+        },
+        "title": "ApproverTicketCeilingOut",
+        "type": "object"
+      },
+      "ApproverTicketCeilingUser": {
+        "additionalProperties": false,
+        "description": "One exact canonical person the operator allows inside the pinned role.",
+        "properties": {
+          "issuer": {
+            "title": "Issuer",
+            "type": "string"
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "issuer",
+          "subject"
+        ],
+        "title": "ApproverTicketCeilingUser",
+        "type": "object"
+      },
+      "ApproverTicketCeilingUserOut": {
+        "description": "Read projection of one ceiling user; tolerant for repair.",
+        "properties": {
+          "issuer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issuer"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject"
+          }
+        },
+        "title": "ApproverTicketCeilingUserOut",
+        "type": "object"
+      },
+      "ApproverTicketOut": {
+        "description": "Read projection of a selector registration (ADR 0271). The public key is\npublic material and reads back so a readback can be written back.",
+        "properties": {
+          "ceiling": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApproverTicketCeilingOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "connector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connector"
+          },
+          "key_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key Id"
+          },
+          "public_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Public Key"
+          },
+          "tool": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool"
+          }
+        },
+        "title": "ApproverTicketOut",
+        "type": "object"
+      },
+      "ApproverTicketRegistration": {
+        "additionalProperties": false,
+        "description": "A selector registered on one approval route (ADR 0271 decision 1).\n\nOne hosted connector and one exact upstream tool, the Ed25519 public key\n(unpadded base64url of 32 bytes) and key id its tickets are verified with,\nand the mandatory ceiling. The private key never reaches the platform.",
+        "properties": {
+          "ceiling": {
+            "$ref": "#/components/schemas/ApproverTicketCeiling"
+          },
+          "connector": {
+            "title": "Connector",
+            "type": "string"
+          },
+          "key_id": {
+            "title": "Key Id",
+            "type": "string"
+          },
+          "public_key": {
+            "title": "Public Key",
+            "type": "string"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          }
+        },
+        "required": [
+          "connector",
+          "tool",
+          "key_id",
+          "public_key",
+          "ceiling"
+        ],
+        "title": "ApproverTicketRegistration",
         "type": "object"
       },
       "Attachment": {
@@ -8101,6 +8443,114 @@
           "reason"
         ],
         "title": "HookSupportOut",
+        "type": "object"
+      },
+      "HookWakeCoalescedOut": {
+        "additionalProperties": false,
+        "description": "200: the wake joined a live open run, or its delivery id was already reserved.",
+        "properties": {
+          "status": {
+            "const": "coalesced",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "HookWakeCoalescedOut",
+        "type": "object"
+      },
+      "HookWakeErrorOut": {
+        "additionalProperties": false,
+        "description": "Every wake and wake-key refusal: exactly one reason string.",
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "HookWakeErrorOut",
+        "type": "object"
+      },
+      "HookWakeQueuedOut": {
+        "additionalProperties": false,
+        "description": "202: one webhook run was admitted and its turn enqueued.",
+        "properties": {
+          "run_id": {
+            "format": "uuid",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "const": "queued",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "run_id"
+        ],
+        "title": "HookWakeQueuedOut",
+        "type": "object"
+      },
+      "HookWakeRotationOut": {
+        "additionalProperties": false,
+        "description": "The generation a rotation committed. Carries no key.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "hook": {
+            "title": "Hook",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "hook",
+          "generation"
+        ],
+        "title": "HookWakeRotationOut",
+        "type": "object"
+      },
+      "HookWakeSecretOut": {
+        "additionalProperties": false,
+        "description": "The current wake key of one agent hook. Served with ``Cache-Control: no-store``.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "hook": {
+            "title": "Hook",
+            "type": "string"
+          },
+          "secret": {
+            "title": "Secret",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "hook",
+          "generation",
+          "secret"
+        ],
+        "title": "HookWakeSecretOut",
         "type": "object"
       },
       "IssueReadContext": {
@@ -20102,6 +20552,222 @@
         ]
       }
     },
+    "/agents/{agent_id}/hooks/{hook}/wake-secret": {
+      "get": {
+        "description": "Read the current wake key of one declared webhook wake hook.\n\nRepeated reads return the same key until rotation. Provision it into the\nconnector's operator-managed secret as ``CURIE_HOOK_WAKE_KEY``.",
+        "operationId": "get_wake_secret_agents__agent_id__hooks__hook__wake_secret_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeSecretOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_query_forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_not_declared"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_source_not_ordinary"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_body_invalid"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "authority_unavailable or wake_declaration_unavailable"
+          }
+        },
+        "summary": "Get Wake Secret",
+        "tags": [
+          "hooks"
+        ]
+      }
+    },
+    "/agents/{agent_id}/hooks/{hook}/wake-secret/rotate": {
+      "post": {
+        "description": "Rotate one hook's wake key; the previous key stops working at once.\n\nThe answer carries the new generation and no key; read the key back with\nthe GET. Rotation does not cancel an admitted run.",
+        "operationId": "rotate_wake_secret_agents__agent_id__hooks__hook__wake_secret_rotate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeRotationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_query_forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_not_declared"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_source_not_ordinary"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_body_invalid"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "authority_unavailable, wake_declaration_unavailable or wake_generation_exhausted"
+          }
+        },
+        "summary": "Rotate Wake Secret",
+        "tags": [
+          "hooks"
+        ]
+      }
+    },
     "/agents/{agent_id}/hooks/{name}/fire": {
       "post": {
         "description": "Run one named cron hook now and return its run record.",
@@ -27040,6 +27706,138 @@
         ]
       }
     },
+    "/hooks/{agent_id}/{hook}/wake": {
+      "post": {
+        "description": "Admit one targetless run of a declared webhook wake hook.\n\nThe body is exactly ``{}``, signed with the hook's wake key; there are no\nquery parameters. 202 ``queued`` names the admitted run; 200 ``coalesced``\nmeans a run was already open or this delivery id was already reserved, so\npoll again later with a fresh delivery id if work remains.",
+        "operationId": "wake_hook_hooks__agent_id___hook__wake_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeCoalescedOut"
+                }
+              }
+            },
+            "description": "Joined a live open run, or the delivery id is already reserved"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeQueuedOut"
+                }
+              }
+            },
+            "description": "One webhook run admitted and enqueued"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_query_forbidden"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "invalid_wake_signature"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_not_declared"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_source_not_ordinary, hook_paused or agent_killed"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "hook body exceeds the maximum size"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_body_invalid"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "budget_exhausted"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "authority_unavailable, wake_declaration_unavailable, wake_dedupe_unavailable or wake_enqueue_unavailable"
+          }
+        },
+        "summary": "Wake Hook",
+        "tags": [
+          "hooks"
+        ]
+      }
+    },
     "/identity/admin/{tenant_id}/{resource}": {
       "get": {
         "operationId": "identity_view_identity_admin__tenant_id___resource__get",
@@ -28753,7 +29551,7 @@
     },
     "/schedules/{agent}/{name}/pause": {
       "post": {
-        "description": "Pause a named cron hook without changing its in force bundle.",
+        "description": "Pause a named cron or webhook wake hook without changing its in force bundle.",
         "operationId": "pause_schedule_schedules__agent___name__pause_post",
         "parameters": [
           {
@@ -28821,7 +29619,7 @@
     },
     "/schedules/{agent}/{name}/resume": {
       "post": {
-        "description": "Resume a named cron hook with one bounded catch up opportunity.",
+        "description": "Resume a named hook: a cron hook gets one bounded catch up, a wake none.",
         "operationId": "resume_schedule_schedules__agent___name__resume_post",
         "parameters": [
           {

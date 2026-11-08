@@ -2,8 +2,8 @@
 
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, timedelta
-from typing import Any
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 from aci_protocol import ApprovalRequest
 from aci_protocol.turn import route_identity
@@ -19,6 +19,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from ..approval_schedule import resolve_route_schedule
 from ..approvers import card_on_requesting_surface
 from ..models import (
     Agent,
@@ -34,6 +35,9 @@ from .agents import get_agent
 from .channels import normalized_reply_identity
 from .errors import PublicationSettlementConflict
 from .publication_queries import get_publication_by_approval
+
+if TYPE_CHECKING:
+    from ..approver_tickets import ApprovalSelection
 
 # Purposes whose outcome no resumed model turn reports, so no wake is ever owed:
 # ``publication`` (the worker reports it) and ``remediation`` (the platform
@@ -56,16 +60,15 @@ async def insert_approval(
     *,
     traceparent: str | None = None,
     approval_id: uuid.UUID | None = None,
+    selection: "ApprovalSelection | None" = None,
 ) -> Approval:
-    """Borrowed insert/flush only. @spec HTTP-APPROVAL-CONTINUITY-5/9."""
+    """Borrowed insert/flush only. @spec HTTP-APPROVAL-CONTINUITY-5/9.
 
-    expires_at = None
-    if data.expires_in_seconds is not None:
-        # Naive UTC, matching the DateTime columns (server_default func.now()
-        # stores naive timestamps in the session timezone, UTC in this stack).
-        expires_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(
-            seconds=data.expires_in_seconds
-        )
+    ``selection`` is the verified approver ticket snapshot of a dynamic
+    approval (ADR 0271 decision 4); None writes an ordinary row.
+    """
+
+    schedule = await resolve_route_schedule(session, data)
     approval = Approval(
         agent_id=data.agent_id,
         conversation_id=data.conversation_id,
@@ -90,8 +93,18 @@ async def insert_approval(
         gate_kind=data.gate_kind,
         granted_tool=data.granted_tool,
         granted_arguments=data.granted_arguments,
-        expires_at=expires_at,
+        created_at=schedule.created_at,
+        expires_at=schedule.expires_at,
     )
+    if selection is not None:
+        approval.selection_mode = "dynamic"
+        approval.selection_requester = selection.requester
+        approval.selection_connector = selection.connector
+        approval.selection_tool = selection.tool
+        approval.selection_key_id = selection.key_id
+        approval.selection_nonce = selection.nonce
+        approval.selection_arguments_sha256 = selection.arguments_sha256
+        approval.selected_approvers = selection.approvers
     if approval_id is not None:
         approval.id = approval_id
     session.add(approval)

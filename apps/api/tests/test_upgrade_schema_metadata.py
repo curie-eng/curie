@@ -26,7 +26,7 @@ def test_packaged_schema_metadata_matches_api_authority() -> None:
     api = REPO / "apps/api/src/curie_api"
     window = json.loads((api / "schema_compat.json").read_text())
     kinds = json.loads((api / "revision_kinds.json").read_text())
-    assert window == {"schema_min": "0151", "schema_head": "0151"}
+    assert window == {"schema_min": "0153", "schema_head": "0153"}
     assert metadata["schema_min"] == window["schema_min"]
     assert metadata["schema_head"] == window["schema_head"]
     graph = ScriptDirectory(str(REPO / "apps/api/alembic"))

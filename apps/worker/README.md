@@ -1433,3 +1433,49 @@ The Docker substrate uses a claim-owned named tmpfs volume, bounded by
 effective memory resources in addition to the model process; a file under the
 volume capacity is not guaranteed to fit the runner's remaining memory. This is
 a resource capacity limit, not a catalog selection or per-file policy ceiling.
+
+
+## Approval deadline and reference-retention rollout
+
+An approval route may set `expires_in_seconds` to a positive integer, or to
+explicit JSON null for no deadline. Omitting it keeps the producer duration;
+session approvals keep their 24-hour default. The API freezes the actual
+deadline at creation. Route edits do not reschedule pending approvals.
+Publication and remediation retain their independent deadline policies.
+
+The reference-retention rollout has an explicit compatibility gate:
+
+1. Keep the new route key absent and
+   `CURIE_APPROVAL_PENDING_RETENTION_ENABLED=false` while deploying compatible
+   API readers, every worker card writer and every settlement consumer.
+2. Drain all old versions before writing deadline keys. Old workers refuse
+   those keys, and old HTTP API readers refuse their route bindings.
+3. Enable `CURIE_APPROVAL_PENDING_RETENTION_ENABLED=true` on every worker.
+   Pending card, notice and reply-placement references then have no TTL.
+   Compatible flag-off writers preserve references already made persistent.
+4. After the final old and flag-off writer drains, run the one-time migration
+   in a compatible worker with its ordinary API and Valkey configuration:
+   `python3 -m curie_worker.approval_cards --writers-drained`.
+   Require a successful JSON `references_reconciled` result. The command visits
+   only still-present references and cannot reconstruct expired references.
+   This in-process maintenance command reuses the worker's credentials and
+   exact store configuration; it exposes no new administrative API.
+   An unreadable approval id stops the pass. Restore API access or repair the
+   invalid legacy reference, then rerun to completion.
+5. Keep compatible reference owners running during rollback until pending
+   approvals settle. Remove `expires_in_seconds` from stored route bindings
+   through the compatible API before rolling any reader back to an old version.
+   Removing the key leaves existing approval deadlines unchanged. Disabling
+   pending retention alone is not a safe rollback of persistent references.
+
+All compatible writers index approval ids, even with the flag off. The worker
+always runs bounded cleanup over that owned index. It checks current API state;
+a definitive missing-approval reply also bounds references after agent deletion.
+An outage or generic proxy 404 preserves them for another pass. The only
+keyspace scan is the explicit one-time post-drain migration.
+
+Terminal settlement starts a fresh 14-day reference window before delivery.
+Retries and late registrations share that window. Successful card delivery may
+consume the exact card reference immediately; failed delivery keeps it within
+the window. Reconciliation also bounds terminal approvals that never resume a
+model turn, including remediation approvals.

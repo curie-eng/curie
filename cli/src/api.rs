@@ -452,6 +452,77 @@ pub struct ApprovalRouteBindingResponse {
     pub notification: Option<ApprovalNotificationTargetResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approvers: Option<ApprovalApprovers>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_route_deadline",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expires_in_seconds: Option<Option<u64>>,
+    /// ADR 0271: the approver-ticket selector registered on this route, with
+    /// the server-owned pinned `ceiling.approver_role`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver_ticket: Option<ApproverTicketResponse>,
+    /// ADR 0271: the stored effective separation policy for the selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub separation: Option<ApprovalSeparationResponse>,
+}
+
+/// A route's approver-ticket registration as the API returns it. Tolerant of
+/// fields a newer server adds.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApproverTicketResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling: Option<ApproverCeilingResponse>,
+}
+
+/// The operator-approved ceiling of a registration. `approver_role` is the
+/// server-owned pinned copy of the agent's approver role configuration, kept
+/// opaque: the CLI shows and echoes it, and never interprets it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApproverCeilingResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver_role_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub users: Option<Vec<ApproverUserResponse>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver_role: Option<serde_json::Value>,
+}
+
+/// One identity-provider user named in a ceiling.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApproverUserResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+/// The stored separation policy of a registration.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApprovalSeparationResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_requester: Option<bool>,
+}
+
+fn deserialize_route_deadline<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)?;
+    if value.is_some_and(|duration| !(1..=315_360_000).contains(&duration)) {
+        return Err(serde::de::Error::custom(
+            "expires_in_seconds must be between 1 and 315360000, or null",
+        ));
+    }
+    Ok(Some(value))
 }
 
 /// Where a route's card goes, as the API returns it: a fixed channel, or the
@@ -540,6 +611,56 @@ pub struct ApprovalRouteBindingWrite {
     pub notification: Option<NotificationTargetWrite>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approvers: Option<ApprovalApprovers>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_route_deadline",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expires_in_seconds: Option<Option<u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver_ticket: Option<ApproverTicketWrite>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub separation: Option<ApprovalSeparationWrite>,
+}
+
+/// An approver-ticket registration as an operator writes it (ADR 0271).
+/// Strict: an unknown key is refused locally, never dropped.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApproverTicketWrite {
+    pub connector: String,
+    pub tool: String,
+    pub key_id: String,
+    pub public_key: String,
+    pub ceiling: ApproverCeilingWrite,
+}
+
+/// The ceiling of a registration. `approver_role` is server-owned: it may be
+/// echoed back from a readback, and is otherwise omitted.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApproverCeilingWrite {
+    pub approver_role_version: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub users: Option<Vec<ApproverUserWrite>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver_role: Option<serde_json::Value>,
+}
+
+/// One identity-provider user named in a ceiling.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApproverUserWrite {
+    pub issuer: String,
+    pub subject: String,
+}
+
+/// The separation policy of a registration. `exempt_group` lands with a later
+/// ADR 0271 slice and is refused until the API accepts it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalSeparationWrite {
+    pub exclude_requester: bool,
 }
 
 /// Where a route's card goes, as an operator writes it: a fixed Slack channel,
@@ -619,6 +740,12 @@ pub struct RouteBindingInput {
     pub notification: Option<NotificationTargetWrite>,
     #[serde(default)]
     pub approvers: Option<ApproversInput>,
+    #[serde(default, deserialize_with = "deserialize_route_deadline")]
+    pub expires_in_seconds: Option<Option<u64>>,
+    #[serde(default)]
+    pub approver_ticket: Option<ApproverTicketWrite>,
+    #[serde(default)]
+    pub separation: Option<ApprovalSeparationWrite>,
 }
 
 /// An `approvers` block as written in a `--routes-from` file. Strict by design.
@@ -649,6 +776,9 @@ impl From<RouteBindingInput> for ApprovalRouteBindingWrite {
             resolution: input.resolution,
             notification: input.notification,
             approvers: input.approvers.map(Into::into),
+            expires_in_seconds: input.expires_in_seconds,
+            approver_ticket: input.approver_ticket,
+            separation: input.separation,
         }
     }
 }
@@ -5027,7 +5157,11 @@ impl ApiClient {
         &self,
         agent_id: &str,
         routes: &std::collections::BTreeMap<String, ApprovalRouteBindingWrite>,
+        expected_version: Option<u64>,
     ) -> Result<Agent> {
+        use crate::exit::CliError;
+        use reqwest::StatusCode;
+        let what = "updating approval routes";
         let resp = self
             .send_request(
                 self.http
@@ -5035,12 +5169,51 @@ impl ApiClient {
                     .header("X-API-Key", &self.api_key)
                     .json::<AgentUpdate>(&AgentUpdate {
                         approval_routes: Some(routes.clone()),
+                        approval_routes_expected_version: expected_version,
                         ..AgentUpdate::default()
                     }),
                 "PATCH /agents/{id} (approval routes)",
             )
             .await?;
-        Self::expect_ok(resp, "updating approval routes")
+        if resp.status() == StatusCode::CONFLICT {
+            let body = resp.text().await.unwrap_or_default();
+            let detail = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .map(|value| value["detail"].clone());
+            let code = detail
+                .as_ref()
+                .and_then(|detail| detail["code"].as_str())
+                .filter(|code| {
+                    matches!(
+                        *code,
+                        "approval_routes.version_conflict"
+                            | "approval_routes.expected_version_required"
+                    )
+                });
+            if let Some(code) = code {
+                let reason = detail
+                    .as_ref()
+                    .and_then(|detail| detail["message"].as_str())
+                    .map_or_else(|| code.to_string(), |message| format!("{code}: {message}"));
+                return Err(anyhow::Error::from(
+                    CliError::failure(format!("{what} failed with 409 Conflict: {reason}"))
+                        .with_fix(
+                            "another write moved the agent's selector configuration version \
+                             since it was read, or the write named none. Re-read the routes \
+                             with `curie <local|cluster> approvals <AGENT> --list-routes`, \
+                             confirm the current state, then retry (pass \
+                             --routes-expected-version with the version it was read at to \
+                             pin it)",
+                        ),
+                ));
+            }
+            bail!(
+                "{what} failed with {}: {}",
+                StatusCode::CONFLICT,
+                body.trim()
+            );
+        }
+        Self::expect_ok(resp, what)
             .await?
             .json()
             .await

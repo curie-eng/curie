@@ -338,6 +338,11 @@ class SettledApproval:
     resolution_note: str | None
     # When the decision was recorded, aware UTC; None when the record omits it.
     resolved_at: datetime | None = None
+    expires_at: datetime | None = None
+
+
+class ApprovalMissing(Exception):
+    """The API definitively reports that this approval no longer exists."""
 
 
 # The settle message's decision time (ADR-0179). ``SettledOutcome`` is decoded
@@ -702,10 +707,8 @@ class ApprovalClient:
     async def get(self, approval_id: str) -> SettledApproval | None:
         """The record's settled outcome, or None when it cannot be read (#1084).
 
-        Never raises. Its only caller is best-effort card teardown on a resume
-        turn: the resolution already happened and the session is already waking,
-        so a failed read costs a stamped card and nothing else. Raising here
-        would turn a cosmetic gap into a dead-lettered resume.
+        Raises ApprovalMissing only for the API's definitive missing-row reply.
+        Unavailable or unusable reads return None and preserve references.
         """
 
         headers = dict(self._headers)
@@ -719,6 +722,12 @@ class ApprovalClient:
         except httpx.HTTPError as exc:
             logger.warning("approval read failed for %s: %s", approval_id, exc)
             return None
+        if response.status_code == 404:
+            try:
+                if response.json() == {"detail": "approval not found"}:
+                    raise ApprovalMissing(approval_id)
+            except ValueError:
+                pass
         if response.status_code != 200:
             logger.warning(
                 "approval read failed for %s: HTTP %s", approval_id, response.status_code
@@ -731,6 +740,7 @@ class ApprovalClient:
                 resolved_by=body.get("resolved_by"),
                 resolution_note=body.get("resolution_note"),
                 resolved_at=parse_decision_time(body.get("resolved_at")),
+                expires_at=parse_decision_time(body.get("expires_at")),
             )
         except (ValueError, KeyError) as exc:
             logger.warning("approval read returned an unusable body for %s: %s", approval_id, exc)

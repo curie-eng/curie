@@ -4421,6 +4421,94 @@ def test_malformed_route_target_escalates_without_creating_an_approval(
     asyncio.run(go())
 
 
+_OPERATOR_OWNED_ROUTE_KEYS = {
+    "approver_ticket": {
+        "connector": "example-ticket",
+        "tool": "approve",
+        "key_id": "key-1",
+        "public_key": "AAAA-example-public-key",
+        "ceiling": {
+            "approver_role_version": 1,
+            "approver_role": '{"role":"example-approver"}',
+            "users": ["U0EXAMPLE1"],
+        },
+    },
+    "separation": {"exclude_requester": True},
+}
+
+
+@pytest.mark.parametrize(
+    ("route_binding", "expected_card_channel", "expected_conversation"),
+    [
+        pytest.param(
+            {"resolution": {"kind": "slack", "address": "C0EXAMPLE3"}},
+            "C0EXAMPLE3",
+            None,
+            id="fixed-slack-resolution",
+        ),
+        pytest.param(
+            {"resolution": {"mode": "requesting_surface"}},
+            "C1",
+            "th-operator-keys",
+            id="requesting-surface",
+        ),
+    ],
+)
+def test_operator_owned_route_keys_do_not_change_card_targets(
+    make_harness,
+    route_binding: dict,
+    expected_card_channel: str,
+    expected_conversation: str | None,
+) -> None:
+    """ADR 0271 decision 1: ``approver_ticket`` and ``separation`` ride on a
+    route binding but are not card targets. The parser accepts them without
+    interpreting them, so the card lands exactly where it would without them."""
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        binding = RoutedBinding({"managers": {**route_binding, **_OPERATOR_OWNED_ROUTE_KEYS}})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Anything", "managers")
+            await h.kernel.process_event(_qevent("gate", thread="th-operator-keys"))
+
+            assert len(approvals.requests) == 1
+            assert approvals.requests[0].card_channel == expected_card_channel
+            assert len(h.sink.posts) == 1
+            address, _message, _by, conversation_id, _endpoint = h.sink.posts[0]
+            assert address == expected_card_channel
+            if expected_conversation is not None:
+                assert conversation_id == expected_conversation
+
+    asyncio.run(go())
+
+
+def test_an_unrelated_unknown_route_key_is_still_refused_beside_operator_keys(
+    make_harness,
+) -> None:
+    """Liveness of the refusal: only the two operator-owned keys are new."""
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        route_binding = {
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE3"},
+            **_OPERATOR_OWNED_ROUTE_KEYS,
+            "surprise": {"x": 1},
+        }
+        binding = RoutedBinding({"managers": route_binding})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Anything", "managers")
+            ev = _qevent("gate", thread="th-unknown-key")
+            await h.kernel.process_event(ev)
+
+            assert approvals.requests == []
+            assert h.sink.posts == []
+            assert h.sink.last_text is not None
+            assert "managers" in h.sink.last_text
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
 def test_routeless_approval_keeps_prior_behavior(make_harness) -> None:
     async def go() -> None:
         approvals = RecordingApprovals()
@@ -7095,5 +7183,47 @@ def test_approval_api_outage_retries_before_pausing_and_422_escalates(
                     )
                 assert h.runner.opened == ["please deploy"]
                 assert await h.kernel._markers.is_terminal(event.event_id)
+
+    asyncio.run(go())
+
+
+_DEADLINE_VECTORS = json.loads(
+    (Path(__file__).resolve().parents[4] / "tests/vectors/approval-route-deadlines.json")
+    .read_text()
+)
+
+
+@pytest.mark.parametrize(
+    "override,expected",
+    [
+        ({}, 86400),
+        *[({"expires_in_seconds": value}, value) for value in _DEADLINE_VECTORS["valid"]],
+    ],
+)
+def test_session_route_deadline_preserves_default_and_explicit_null(
+    make_harness, override, expected
+):
+    async def go():
+        approvals = RecordingApprovals()
+        binding = RoutedBinding({"review": {**_resolution_route(), **override}})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Approve bounded work", "review")
+            await h.kernel.process_event(_qevent("please review"))
+            assert len(approvals.requests) == 1
+            assert approvals.requests[0].expires_in_seconds == expected
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("value", _DEADLINE_VECTORS["invalid"])
+def test_malformed_route_deadline_never_creates_approval(make_harness, value):
+    async def go():
+        approvals = RecordingApprovals()
+        binding = RoutedBinding({"review": {**_resolution_route(), "expires_in_seconds": value}})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Approve bounded work", "review")
+            await h.kernel.process_event(_qevent("please review"))
+            assert approvals.requests == []
+            assert h.sink.posts == []
 
     asyncio.run(go())

@@ -35,7 +35,7 @@ from curie_api.crud import deployments as crud_deployments
 from curie_api.crud import versions as crud_versions
 from curie_api.schemas.deployments import WebhookResult
 
-from . import bundles, deploy
+from . import approver_tickets, bundles, deploy
 from .config import Settings
 from .evalqueue import EvalQueue, now_iso
 from .github_app import credentials_for
@@ -407,7 +407,12 @@ def log_push_outcome(result: WebhookResult, payload: dict[str, object], *, sourc
 
 
 def _rejected(
-    exc: deploy.ApprovalRoutesUnbound | deploy.BundleTooLarge | deploy.SealingKeyCustody,
+    exc: (
+        deploy.ApprovalRoutesUnbound
+        | deploy.BundleTooLarge
+        | deploy.SealingKeyCustody
+        | approver_tickets.BundleGateMismatch
+    ),
     agent_id: uuid.UUID | None = None,
 ) -> WebhookResult:
     """The rejection envelope for the two refusals `process_push` shares with the API.
@@ -420,7 +425,8 @@ def _rejected(
     them, reading the code and the message off the exception itself, so what an
     operator greps for cannot come out different depending on which check got
     there first. The message is the exception's own, identical to the one the
-    API returns as a 422 detail.
+    API returns as a 422 detail. `approver_ticket.bundle_gate_mismatch` (ADR
+    0271 decision 2) rides on the same three route gates.
     """
 
     return WebhookResult(
@@ -727,6 +733,7 @@ async def process_push(
             except (
                 deploy.BundleTooLarge,
                 deploy.ApprovalRoutesUnbound,
+                approver_tickets.BundleGateMismatch,
                 deploy.SealingKeyCustody,
             ) as exc:
                 # `bundle.too_large` is live here, not theoretical: the sibling
@@ -753,7 +760,7 @@ async def process_push(
                 await deploy.check_routes_from_bytes(
                     archive, agent.approval_routes, version.id, settings
                 )
-            except deploy.ApprovalRoutesUnbound as exc:
+            except (deploy.ApprovalRoutesUnbound, approver_tickets.BundleGateMismatch) as exc:
                 return _rejected(exc, agent.id)
             await deploy.store_bundle(
                 store, session, agent.id, version, archive, extension, content_type
@@ -810,7 +817,11 @@ async def process_push(
             await deploy.check_approval_route_bindings(
                 store, version, agent.approval_routes, settings
             )
-        except (deploy.BundleTooLarge, deploy.ApprovalRoutesUnbound) as exc:
+        except (
+            deploy.BundleTooLarge,
+            deploy.ApprovalRoutesUnbound,
+            approver_tickets.BundleGateMismatch,
+        ) as exc:
             # `bundle.too_large` is unreachable here while
             # `revalidate_stored_bundle` above guards the same bytes under the
             # same caps, and is caught anyway so the ordering is a property of

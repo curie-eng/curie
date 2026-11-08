@@ -1934,6 +1934,9 @@ fn route_write_refusal_names_every_deployment_declaring_a_removed_route() {
                         resolution: crate::api::ApprovalResolutionWrite::slack("C0EXAMPLE1"),
                         notification: None,
                         approvers: None,
+                        expires_in_seconds: None,
+                        approver_ticket: None,
+                        separation: None,
                     },
                 )
             })

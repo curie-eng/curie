@@ -3118,6 +3118,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "The connector requester identity version a route write compares against, as `--requester-identity show` reports it. Omit to use the version read from the agent in the same command. Only valid with --route-resolution, --route-approvers, --routes-from or --clear-routes",
+              "id": "routes_expected_version",
+              "long": "routes-expected-version",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Show or set whether this agent's hosted connector calls carry the verified human requester. `on` requires the tenant's HTTP identity selection and an operator receiver registration listing one of the agent's bindings. Experimental in this release: keep it off outside test installs. When on, the agent's hosted connector caller tokens carry the verified human requester and the connector proxy verifies it, but the proxy does not yet pass the requester to connectors (a later release adds that), so connectors cannot act on it yet. The worker replaces a sandbox before serving a different requester, and a different person's message that arrives during a live turn waits for that turn to end; if the turn outlasts the redelivery budget the message is settled visibly without running. A person's turn runs for at most the one-hour life of their connector credential, less the boot grace and the sandbox claim time; a turn still working then is stopped and reported as `requester-window`. Precondition: the api, the worker and the agent's connector proxies must all run this release (redeploy the agent if its connector proxies predate it); a partial rollout refuses the agent's HTTP turns or connector calls",
               "id": "requester_identity",
               "long": "requester-identity",
@@ -9498,6 +9506,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "The connector requester identity version a route write compares against, as `--requester-identity show` reports it. Omit to use the version read from the agent in the same command. Only valid with --route-resolution, --route-approvers, --routes-from or --clear-routes",
+              "id": "routes_expected_version",
+              "long": "routes-expected-version",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Show or set whether this agent's hosted connector calls carry the verified human requester. `on` requires the tenant's HTTP identity selection and an operator receiver registration listing one of the agent's bindings. Experimental in this release: keep it off outside test installs. When on, the agent's hosted connector caller tokens carry the verified human requester and the connector proxy verifies it, but the proxy does not yet pass the requester to connectors (a later release adds that), so connectors cannot act on it yet. The worker replaces a sandbox before serving a different requester, and a different person's message that arrives during a live turn waits for that turn to end; if the turn outlasts the redelivery budget the message is settled visibly without running. A person's turn runs for at most the one-hour life of their connector credential, less the boot grace and the sandbox claim time; a turn still working then is stopped and reported as `requester-window`. Precondition: the api, the worker and the agent's connector proxies must all run this release (redeploy the agent if its connector proxies predate it); a partial rollout refuses the agent's HTTP turns or connector calls",
               "id": "requester_identity",
               "long": "requester-identity",
@@ -10756,6 +10772,23 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "oidc-e2e"
+        },
+        {
+          "about": "Verify approval deadlines and reference retention in a disposable install",
+          "args": [
+            {
+              "global": false,
+              "id": "args",
+              "num_args": {
+                "max": 18446744073709552000,
+                "min": 1
+              },
+              "positional": true,
+              "required": true
+            }
+          ],
+          "hidden": false,
+          "name": "approval-schedule-e2e"
         },
         {
           "about": "Drive real HTTP identity turns against a disposable install (`python3 tools/identity-e2e/identity_e2e.py`). `up` overlays a TLS test identity provider, the API's HTTP identity runtime and one email binding per agent onto an existing release; `send` posts a signed email turn; `observe` decodes the turn's connector caller token with the signature redacted; `prove --scenario <name>` runs a scripted scenario and writes JSON evidence; `down` removes it all. Every action takes an explicit --context, --namespace, --release and --state-dir",

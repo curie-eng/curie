@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -12,13 +13,14 @@ from typing import Any, NoReturn
 from aci_protocol import READER_CONTEXT, ApprovalRequest, QueuedTurn
 from curie_internal import identity_approval as wire
 from curie_internal import identity_context as codec
+from curie_internal.approver_ticket import ApprovalTicket
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, canonicalize_traceparent
 from fastapi import HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from curie_api import identity_fence, principal_authority
+from curie_api import approver_tickets, deploy, identity_fence, principal_authority
 from curie_api.crud import approvals as approvals_crud
 from curie_api.crud import channels as channels_crud
 from curie_api.models import (
@@ -32,6 +34,7 @@ from curie_api.models import (
 from curie_api.schemas.approvals import ApprovalResolutionTarget, ApprovalRouteBinding
 from curie_api.schemas.channels import BUILTIN_CLUSTER_MESSAGE_ADAPTER
 from curie_api.schemas.http_authority import HttpSelectionV1
+from curie_api.storage import ObjectStore
 
 from .http_invocation import (
     HttpInvocationRuntime,
@@ -67,6 +70,18 @@ _RECORD_FIELDS = (
     "purpose",
     "policy_identity",
     "policy_version",
+)
+# ADR 0271 decision 4 (plan D11): covered only on a dynamic row, so every
+# ordinary record digest, and every pending seal over one, stays byte for byte.
+_SELECTION_FIELDS = (
+    "selection_mode",
+    "selection_requester",
+    "selection_connector",
+    "selection_tool",
+    "selection_key_id",
+    "selection_nonce",
+    "selection_arguments_sha256",
+    "selected_approvers",
 )
 
 
@@ -134,8 +149,11 @@ def _digest(value: str) -> str:
 
 
 def approval_record_digest(approval: Approval) -> str:
-    """@spec HTTP-APPROVAL-CONTINUITY-5."""
-    return _digest(canonical_json({name: getattr(approval, name) for name in _RECORD_FIELDS}))
+    """@spec HTTP-APPROVAL-CONTINUITY-5 REQUEST-APPROVAL-4."""
+    fields: tuple[str, ...] = _RECORD_FIELDS
+    if approval.selection_mode == "dynamic":
+        fields = _RECORD_FIELDS + _SELECTION_FIELDS
+    return _digest(canonical_json({name: getattr(approval, name) for name in fields}))
 
 
 async def _http_tenant(session: AsyncSession, tenant_id: uuid.UUID) -> bool:
@@ -513,6 +531,99 @@ async def _route_snapshot(
     return snapshot
 
 
+async def _selection_snapshot(
+    session: AsyncSession, agent_id: uuid.UUID,
+) -> tuple[str, list[tuple[str, str | None]]]:
+    """The requester flag, its version and the serving versions, independently captured.
+
+    With the route snapshot this is the dynamic creation snapshot (plan D9): a
+    registration, key, flag, deployment or bundle attach landing between the
+    phases changes it. @spec REQUEST-APPROVAL-2/4.
+    """
+    found = (
+        await session.execute(
+            select(Agent.connector_requester_identity, Agent.connector_requester_identity_version)
+            .where(Agent.id == agent_id)
+        )
+    ).one_or_none()
+    if found is None:
+        _refuse(422, "invalid_approval_context")
+    serving = await approver_tickets.serving_versions(session, agent_id)
+    return canonical_json([bool(found[0]), int(found[1]), serving]), serving
+
+
+def _ticket_refusal(error: approver_tickets.ApproverTicketRefusal) -> NoReturn:
+    """@spec REQUEST-APPROVAL-2/4."""
+    _refuse(error.status, error.code)
+
+
+async def _serving_gate(
+    request: Request,
+    registration: approver_tickets.StoredRegistration,
+    serving: list[tuple[str, str | None]],
+) -> None:
+    """Every serving bundle still gates the pair on its route (plan D9a).
+
+    Outside every transaction and fence: the object store is external I/O.
+    Fail closed: no serving bundle, a missing bundle object, a poison map or a
+    moved gate refuses; an unavailable store answers unavailable.
+    @spec REQUEST-APPROVAL-2.
+    """
+    connector, tool = registration.pair
+    if not serving:
+        _refuse(409, approver_tickets.BUNDLE_GATE_MISMATCH)
+    store: ObjectStore = request.app.state.bundle_store
+    for _, bundle_ref in serving:
+        if bundle_ref is None:
+            _refuse(409, approver_tickets.BUNDLE_GATE_MISMATCH)
+        try:
+            route_map = await deploy.stored_route_map(store, bundle_ref)
+        except Exception:  # noqa: BLE001 - an unreadable store is never a gate verdict.
+            _refuse(503, "authority_unavailable")
+        if not approver_tickets.gates_pair(route_map, registration.route, connector, tool):
+            _refuse(409, approver_tickets.BUNDLE_GATE_MISMATCH)
+
+
+async def _admit_selection(
+    writer: AsyncSession,
+    registration: approver_tickets.StoredRegistration,
+    ticket: ApprovalTicket,
+    data: ApprovalRequest,
+) -> approver_tickets.ApprovalSelection:
+    """Final-reader checks inside the identity writer, before insert (plan D9).
+
+    @spec REQUEST-APPROVAL-1/4.
+    """
+    agent = None if data.agent_id is None else await writer.get(Agent, data.agent_id)
+    if agent is None:
+        _refuse(422, "invalid_approval_context")
+    try:
+        await approver_tickets.check_selected_approvers(
+            writer, registration, ticket, tenant_id=agent.tenant_id,
+        )
+    except approver_tickets.ApproverTicketRefusal as error:
+        _ticket_refusal(error)
+    if await approver_tickets.nonce_spent(writer, agent.id, ticket.nonce):
+        _refuse(409, approver_tickets.REPLAYED)
+    return approver_tickets.selection_for(registration, ticket)
+
+
+def _created_audit(
+    row: Approval, registration: approver_tickets.StoredRegistration, ticket: ApprovalTicket,
+) -> ApprovalAuditEntry:
+    """The created entry with its selection evidence; never the ticket text.
+
+    @spec REQUEST-APPROVAL-4.
+    """
+    return ApprovalAuditEntry(
+        approval_id=row.id, action="created", actor="system", actor_channel=None,
+        principal_kind=None, authenticated=False, principal_subject=None, decision="",
+        authorizer="ApproverTicketCreation", authorized=True,
+        reason="dynamic approval created from a verified approver ticket",
+        evidence=approver_tickets.creation_evidence(registration, ticket),
+    )
+
+
 def _response(
     body: wire.ApprovalCreationRequestV1,
     row: Approval,
@@ -594,57 +705,122 @@ async def create_http_approval(
     request: Request,
     body: wire.ApprovalCreationRequestV1,
 ) -> wire.ApprovalCreationResponseV1:
-    """Separate acknowledged lifecycle and creation commits. @spec HTTP-APPROVAL-CONTINUITY-9."""
+    """Separate acknowledged lifecycle and creation commits. @spec HTTP-APPROVAL-CONTINUITY-9.
+
+    ADR 0271 (@spec REQUEST-APPROVAL-2/4): the route lock runs before every
+    other creation check, so a registered connector tool never takes a looser
+    route whatever ``gate_kind`` says. A dynamic request is verified once in
+    phase one, its serving bundles are rechecked outside every transaction,
+    and its selected people, nonce, row, seal and created audit entry are
+    judged and committed together in the identity writer against an unchanged
+    snapshot. An identical retry stays historical before any of it. A dynamic
+    request also needs the original requester, freshly resolved, active and
+    unchanged, judged in the caller phase and again in the writer, never the
+    raw-account exception of ordinary admission.
+    """
     runtime, original, resume = _original(request, body)
     factory, valkey = request.app.state.sessionmaker, request.app.state.valkey
+    data = body.approval
+    registration: approver_tickets.StoredRegistration | None = None
+    ticket: ApprovalTicket | None = None
+    selection_snapshot: str | None = None
+    serving: list[tuple[str, str | None]] = []
     try:
         async with factory() as session, session.begin():
             await identity_fence.lock_identity_reader(session)
             existing = await approvals_crud.get_approval_by_dedupe_key(
-                session, body.approval.dedupe_key
+                session, data.dedupe_key
             )
             if existing is not None:
                 return _historical(runtime, body, original, existing)
             await _require_resume_row(session, runtime, resume)
-            _effect(body.approval)
-            route_snapshot = await _route_snapshot(session, body.approval)
-            if await approvals_crud.find_rejected_reraise(session, body.approval) is not None:
+            agent = await session.get(Agent, data.agent_id, populate_existing=True)
+            if agent is None:
+                _refuse(422, "invalid_approval_context")
+            agent_id = agent.id
+            try:
+                registration = approver_tickets.check_tool_route(agent, data)
+            except approver_tickets.ApproverTicketRefusal as error:
+                _ticket_refusal(error)
+            _effect(data)
+            route_snapshot = await _route_snapshot(session, data)
+            if await approvals_crud.find_rejected_reraise(session, data) is not None:
                 _refuse(409, "unsupported_approval")
-        async with current_http_approval_caller(request, original) as caller:
-            if await _route_snapshot(
-                caller.session, body.approval, expected=route_snapshot,
-            ) != route_snapshot:
+            if registration is not None:
+                try:
+                    ticket = approver_tickets.verify_creation(
+                        registration, agent=agent, data=data, original=original,
+                        clock=lambda: int(time.time()),
+                    )
+                except approver_tickets.ApproverTicketRefusal as error:
+                    _ticket_refusal(error)
+                selection_snapshot, serving = await _selection_snapshot(session, agent_id)
+        if registration is not None:
+            await _serving_gate(request, registration, serving)
+
+        async def unchanged(session: AsyncSession) -> None:
+            """The route and selection snapshots are exactly the phase-one capture."""
+            if await _route_snapshot(session, data, expected=route_snapshot) != route_snapshot:
                 _refuse(503, "authority_unavailable")
+            if selection_snapshot is not None and (
+                await _selection_snapshot(session, agent_id)
+            )[0] != selection_snapshot:
+                _refuse(503, "authority_unavailable")
+
+        async with current_http_approval_caller(request, original) as caller:
+            if registration is not None:
+                # Ordinary admission's raw-account exception is not enough here.
+                caller.require_original_requester()
+            await unchanged(caller.session)
         # The read-only caller boundary is closed before acquiring the explicit write owner.
         async with identity_fence.mutation(factory, valkey) as writer:
             async with writer.begin():
-                await revalidate_http_approval_caller(request, writer, caller)
-                if await _route_snapshot(
-                    writer, body.approval, expected=route_snapshot,
-                ) != route_snapshot:
+                await revalidate_http_approval_caller(
+                    request, writer, caller, original_requester=registration is not None,
+                )
+                # Held to the commit: a registration cannot land between this
+                # judgement and the insert (@spec REQUEST-APPROVAL-2).
+                try:
+                    locked = await approver_tickets.locked_tool_route(writer, data)
+                except approver_tickets.ApproverTicketRefusal as error:
+                    _ticket_refusal(error)
+                if locked != registration:
                     _refuse(503, "authority_unavailable")
+                await unchanged(writer)
                 existing = await approvals_crud.get_approval_by_dedupe_key(
-                    writer, body.approval.dedupe_key
+                    writer, data.dedupe_key
                 )
                 if existing is not None:
                     result = _historical(runtime, body, original, existing)
                 else:
                     await _require_resume_row(writer, runtime, resume)
                     if (
-                        await approvals_crud.find_rejected_reraise(writer, body.approval)
+                        await approvals_crud.find_rejected_reraise(writer, data)
                         is not None
                     ):
                         _refuse(409, "unsupported_approval")
+                    selection = None
+                    if registration is not None and ticket is not None:
+                        selection = await _admit_selection(writer, registration, ticket, data)
                     row = await approvals_crud.insert_approval(
-                        writer, body.approval, approval_id=uuid.uuid4(),
+                        writer, data, approval_id=uuid.uuid4(),
                         traceparent=canonicalize_traceparent(
                             request.headers.get(TRACEPARENT_STREAM_FIELD),
-                        )
+                        ),
+                        selection=selection,
                     )
                     # Seal the row as stored: JSONB normalizes some numbers.
                     await writer.flush()
                     await writer.refresh(row)
+                    if selection is not None and not approver_tickets.arguments_stable(
+                        row.granted_arguments, data.granted_arguments,
+                    ):
+                        # The signed arguments would not be the ones a grant is
+                        # minted from; the writer rolls back on the way out.
+                        _refuse(422, approver_tickets.ARGUMENTS_UNSTABLE)
                     row.identity_context = _seal(runtime, body, original, row)
+                    if registration is not None and ticket is not None:
+                        writer.add(_created_audit(row, registration, ticket))
                     await writer.flush()
                     result = _response(body, row, duplicate=False)
                     await writer.commit()
@@ -653,10 +829,14 @@ async def create_http_approval(
         try:
             async with factory() as session:
                 winner = await approvals_crud.get_approval_by_dedupe_key(
-                    session, body.approval.dedupe_key,
+                    session, data.dedupe_key,
                 )
                 if winner is not None:
                     return _historical(runtime, body, original, winner)
+                if ticket is not None and (
+                    await approver_tickets.nonce_spent(session, agent_id, ticket.nonce)
+                ):
+                    _refuse(409, approver_tickets.REPLAYED)
         except HTTPException:
             raise
         except Exception:  # noqa: BLE001 - the race reread is unavailable, never definitive.

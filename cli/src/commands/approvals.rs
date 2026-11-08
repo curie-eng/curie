@@ -25,6 +25,9 @@ pub struct ApprovalCmd {
     pub routes_from: Option<PathBuf>,
     pub list_routes: bool,
     pub clear_routes: bool,
+    /// `--routes-expected-version N`: overrides the version read from the
+    /// agent for a route write (ADR 0271).
+    pub routes_expected_version: Option<u64>,
     /// `--report-identity`: the installation-wide approval identity report.
     pub report_identity: bool,
     /// `--recover <APPROVAL_ID>`: administratively reject one approval under
@@ -223,7 +226,7 @@ pub(super) fn build_route_bindings(
                             "a route binding requires `resolution: {kind: \"slack\", \
                              address: \"C...\"}` or `resolution: {mode: \
                              \"requesting_surface\"}` and accepts optional `notification` and \
-                             `approvers` blocks, and nothing else. The retired `channel` key \
+                             `approvers` blocks and `expires_in_seconds` (positive integer or null). The retired `channel` key \
                              is not accepted",
                         ),
                     )
@@ -245,6 +248,9 @@ pub(super) fn build_route_bindings(
                 resolution: crate::api::ApprovalResolutionWrite::slack(channel),
                 notification: None,
                 approvers: None,
+                expires_in_seconds: None,
+                approver_ticket: None,
+                separation: None,
             });
     }
 
@@ -311,6 +317,103 @@ pub(super) fn build_route_bindings(
     }
 
     Ok(bindings)
+}
+
+/// Carry the routes that hold an approver-ticket selector into a flag-only
+/// route edit (ADR 0271). The write replaces the whole map and the response is
+/// never a writer, so each such route is rebuilt field by field from the
+/// readback, echoing the server-owned pin. An edited route keeps its own
+/// selector, separation and stored deadline; removing one takes an explicit
+/// `--routes-from`.
+fn carry_over_selector_routes(
+    existing: Option<&BTreeMap<String, crate::api::ApprovalRouteBindingResponse>>,
+    bindings: &mut BTreeMap<String, crate::api::ApprovalRouteBindingWrite>,
+) -> Result<()> {
+    use crate::api::{
+        ApprovalSeparationWrite, ApproverCeilingWrite, ApproverTicketWrite, ApproverUserWrite,
+    };
+    for (name, current) in existing.into_iter().flatten() {
+        let Some(ticket) = &current.approver_ticket else {
+            continue;
+        };
+        if current.notification.is_some() {
+            return Err(crate::exit::CliError::usage(format!(
+                "route {name:?} carries an approver_ticket and a notification; the API \
+                 redacts a notification's transport, so this edit cannot write the route \
+                 back faithfully"
+            ))
+            .with_fix("write the whole route map, notification included, with --routes-from")
+            .into());
+        }
+        let incomplete = || {
+            anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "route {name:?}: the API's approver_ticket readback is missing a field, \
+                     so this edit cannot write the route back faithfully"
+                ))
+                .with_fix("write the whole route map with --routes-from"),
+            )
+        };
+        let ceiling = ticket.ceiling.as_ref().ok_or_else(incomplete)?;
+        let users = match &ceiling.users {
+            None => None,
+            Some(users) => Some(
+                users
+                    .iter()
+                    .map(|user| {
+                        Ok(ApproverUserWrite {
+                            issuer: user.issuer.clone().ok_or_else(incomplete)?,
+                            subject: user.subject.clone().ok_or_else(incomplete)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+        };
+        let ticket = ApproverTicketWrite {
+            connector: ticket.connector.clone().ok_or_else(incomplete)?,
+            tool: ticket.tool.clone().ok_or_else(incomplete)?,
+            key_id: ticket.key_id.clone().ok_or_else(incomplete)?,
+            public_key: ticket.public_key.clone().ok_or_else(incomplete)?,
+            ceiling: ApproverCeilingWrite {
+                approver_role_version: ceiling.approver_role_version.ok_or_else(incomplete)?,
+                users,
+                approver_role: ceiling.approver_role.clone(),
+            },
+        };
+        let separation = match &current.separation {
+            None => None,
+            Some(separation) => Some(ApprovalSeparationWrite {
+                exclude_requester: separation.exclude_requester.ok_or_else(incomplete)?,
+            }),
+        };
+        match bindings.get_mut(name) {
+            Some(edited) => {
+                edited.approver_ticket.get_or_insert(ticket);
+                if edited.separation.is_none() {
+                    edited.separation = separation;
+                }
+                // No route flag sets a deadline, so the stored one is kept
+                // as read: a number, an explicit null, or absent (ADR 0273).
+                if edited.expires_in_seconds.is_none() {
+                    edited.expires_in_seconds = current.expires_in_seconds;
+                }
+            }
+            None => {
+                bindings.insert(
+                    name.clone(),
+                    crate::api::ApprovalRouteBindingWrite {
+                        resolution: current.resolution.clone().into(),
+                        notification: None,
+                        approvers: current.approvers.clone(),
+                        expires_in_seconds: current.expires_in_seconds,
+                        approver_ticket: Some(ticket),
+                        separation,
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A fixed target stays Slack-only; the only way off Slack is the
@@ -1030,6 +1133,16 @@ pub async fn approvals(
         || cmd.routes_from.is_some()
         || cmd.clear_routes;
 
+    // ADR 0271: the version only means something beside a route write, so a
+    // stray one is refused before any other branch can swallow it.
+    if cmd.routes_expected_version.is_some() && !route_write {
+        return Err(crate::exit::usage(
+            "--routes-expected-version applies only to a route write \
+             (--route-resolution/--route-approvers/--routes-from/--clear-routes); drop it, \
+             or add the route write it should guard",
+        ));
+    }
+
     // --- Administrative recovery (#2753) -------------------------------------
     //
     // Handled ahead of EVERY other branch, including the route and mint blocks,
@@ -1306,6 +1419,18 @@ pub async fn approvals(
         let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
         let agent = client.find_agent(&opts.agent).await?;
         let agent = if route_write {
+            // ADR 0271: a flag-only edit replaces the whole map, so a route that
+            // carries a selector must ride along or the write would unregister it.
+            let mut bindings = bindings;
+            if !cmd.clear_routes && cmd.routes_from.is_none() {
+                carry_over_selector_routes(agent.approval_routes.as_ref(), &mut bindings)?;
+            }
+            // The version the operator named, else the one just read: the API
+            // compares it against the stored one, so a write that raced another
+            // operator's is refused rather than merged.
+            let expected_version = cmd
+                .routes_expected_version
+                .or(agent.connector_requester_identity_version);
             // #2448: advisory pre-check against every active deployment's
             // declared routes. Fail-open; the platform API remains the gate.
             let (declaring, unreadable) = active_declared_routes(&client, &agent.id).await;
@@ -1321,7 +1446,10 @@ pub async fn approvals(
             }
             let cl = ui.checklist();
             let step = cl.step(&format!("updating approval routes for {}", agent.name));
-            match client.set_approval_routes(&agent.id, &bindings).await {
+            match client
+                .set_approval_routes(&agent.id, &bindings, expected_version)
+                .await
+            {
                 Ok(updated) => {
                     step.done("updated");
                     updated

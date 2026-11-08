@@ -424,6 +424,10 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                     reason,
                     recovery_key,
                 },
+            routes_version:
+                ApprovalRoutesVersionArgs {
+                    routes_expected_version,
+                },
             requester:
                 RequesterIdentityArgs {
                     requester_identity,
@@ -454,6 +458,7 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                         routes_from,
                         list_routes,
                         clear_routes,
+                        routes_expected_version,
                         report_identity,
                         recover,
                         reason,

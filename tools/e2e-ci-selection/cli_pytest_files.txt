@@ -154,6 +154,7 @@ tools/factory-e2e/tests/test_scripted_scenario.py
 tools/factory-e2e/tests/test_tls_code_host.py
 tools/fix-pin-ci/tests/test_fix_pin_ci.py
 tools/helm-ci-gate/tests/test_decide.py
+tools/identity-e2e/tests/test_approver_ticket_scenario.py
 tools/identity-e2e/tests/test_harness.py
 tools/identity-e2e/tests/test_human_restricted_connector.py
 tools/identity-e2e/tests/test_identity_compose.py

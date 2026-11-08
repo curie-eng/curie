@@ -2667,6 +2667,9 @@ fn route_binding_as_write(
         // notification first (`refuse_unwritable_notifications`).
         notification: None,
         approvers: binding.approvers.clone(),
+        expires_in_seconds: binding.expires_in_seconds,
+        approver_ticket: None,
+        separation: None,
     }
 }
 
@@ -2699,6 +2702,11 @@ fn sre_approvals_route_map(
                 users: Some(approvers.to_vec()),
                 emails: None,
             }),
+            expires_in_seconds: existing
+                .and_then(|routes| routes.get(SRE_APPROVALS_ROUTE))
+                .and_then(|binding| binding.expires_in_seconds),
+            approver_ticket: None,
+            separation: None,
         },
     );
     map
@@ -2774,7 +2782,9 @@ async fn bind_sre_approvals_route(
         .unwrap_or_default();
     if desired != current {
         refuse_unwritable_notifications(existing)?;
-        client.set_approval_routes(&agent.id, &desired).await?;
+        client
+            .set_approval_routes(&agent.id, &desired, None)
+            .await?;
         let action = if existing.is_some_and(|routes| routes.contains_key(SRE_APPROVALS_ROUTE)) {
             "rebound"
         } else {

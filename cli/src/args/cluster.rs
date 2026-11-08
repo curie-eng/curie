@@ -1330,6 +1330,8 @@ pub(crate) enum ClusterAction {
         #[command(flatten)]
         recovery: ApprovalRecoveryArgs,
         #[command(flatten)]
+        routes_version: ApprovalRoutesVersionArgs,
+        #[command(flatten)]
         requester: RequesterIdentityArgs,
     },
 }

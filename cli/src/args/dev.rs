@@ -177,6 +177,11 @@ pub(crate) enum DevAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Verify approval deadlines and reference retention in a disposable install.
+    ApprovalScheduleE2e {
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Drive real HTTP identity turns against a disposable install
     /// (`python3 tools/identity-e2e/identity_e2e.py`). `up` overlays a TLS
     /// test identity provider, the API's HTTP identity runtime and one email

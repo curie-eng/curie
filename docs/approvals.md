@@ -246,6 +246,23 @@ curie local approvals my-agent --routes-from approval-routes.json
 curie local approvals my-agent --list-routes
 ```
 
+A route's optional `expires_in_seconds` selects its decision deadline. An integer
+from 1 to 315,360,000 seconds (ten years) chooses that duration; explicit JSON null
+chooses no deadline. Omit the field to keep the producer's duration, including its
+existing null meaning.
+Session requests default to 24 hours when the route has no override. Booleans,
+zero, negative values and fractional numbers are refused. The API freezes the
+chosen deadline at creation, so retries and later route edits do not move it.
+Publication and remediation keep their independent deadline policies.
+
+Deploy compatible API readers and workers before writing deadline keys. Complete
+the [reference-retention rollout](../apps/worker/README.md#approval-deadline-and-reference-retention-rollout)
+so pending cards, notices and reply-placement references survive the whole pending
+lifetime. Terminal settlement starts a fresh 14-day retention window before card
+delivery; failed edits keep their references within that window. A no-deadline
+request still needs current answer authority. Removing its route can strand it
+until the binding is restored or an operator rejects it through recovery.
+
 The strict `--routes-from` JSON uses the complete binding shape shown above and is the only
 way to declare a notification, including the `endpoint` and `adapter` required for a
 non-Slack target. `--route-resolution` and `--route-approvers` can override resolution and
@@ -260,6 +277,172 @@ deployments append rather than stop earlier ones, so an older active deployment 
 declares the route and the preflight still refuses. The retired `--route` flag and
 `channel` JSON key are not accepted. Nothing is written unless every entry parses, so a
 typo cannot leave a half-written map behind.
+
+## Per-request approver selection (ADR 0271)
+
+Some approvals need a different set of approvers each time, chosen by the connector
+that raises them rather than fixed on the route. [ADR 0271](adr/0271-per-request-approver-sets-and-separation-of-duties.md)
+lets an operator register a signing key on one approval route for one connector tool.
+The connector then signs a short-lived ticket naming the approvers for that request.
+The platform checks the ticket when the approval is created. This section covers
+registering and reading back that selector. The wire format of the ticket is in the
+[connector host interface](interfaces/connector-host/INTERFACE.md#per-request-approval-tickets-adr-0271).
+
+Not everything is enforced yet. The platform verifies and stores a dynamic approval at
+creation, but the check that the person who answers is in the selected set, and
+separation of duties, arrive in a later slice. Until then a dynamic approval cannot be
+approved or rejected through any answer path; it expires on the usual 24 hour timeout.
+
+### Registering a selector
+
+Registration is part of the route binding. Add `approver_ticket` (and optionally
+`separation`) to the route in the JSON you pass to `--routes-from`:
+
+```json
+{
+  "approval_routes": {
+    "ledger_post": {
+      "resolution": { "kind": "slack", "address": "C0EXAMPLE1" },
+      "approver_ticket": {
+        "connector": "ledger",
+        "tool": "post_entry",
+        "key_id": "ledger-selector-1",
+        "public_key": "<unpadded base64url of a 32-byte Ed25519 public key>",
+        "ceiling": {
+          "approver_role_version": 4,
+          "users": [
+            { "issuer": "https://idp.example.test", "subject": "alice@example.test" }
+          ]
+        }
+      },
+      "separation": { "exclude_requester": true }
+    }
+  }
+}
+```
+
+```bash
+curie cluster approvals my-agent --routes-from routes.json
+curie cluster approvals my-agent --routes-from routes.json --routes-expected-version 5
+```
+
+`ceiling.users` is optional (1 to 128 unique entries) and narrows the pinned role to
+those exact people. `connector` is the declared hosted connector name, and `tool` is the
+exact upstream tool name. The key is the public half only; the private key stays with the
+connector.
+
+Prerequisites, all checked on write:
+
+1. The agent's requester identity flag (`connector_requester_identity`, ADR 0270) is on.
+   Without it the write is refused `approver_ticket_requires_requester_identity`.
+2. The agent has a restricted approver role in its access policy, and the write names that
+   policy's current version in `ceiling.approver_role_version`. The platform copies the role
+   as it stands at that version into the registration (`ceiling.approver_role`, returned on
+   readback). A later change to the agent's access policy never rewrites the copy, so a role
+   widened after registration does not widen the ceiling. To adopt the new role, write the
+   registration again naming the new version. A stale version is refused
+   `stale_role_policy_version`. An absent policy or approver role, an unrestricted role, or
+   one with no entries is refused `approver_ticket_ceiling_invalid`.
+3. At least one deployment is active, and every active deployment's bundle gates the exact
+   connector tool on this route, so the tool name resolves to this route under the bundle's
+   last-declaration-wins rule. Otherwise the write is refused `approver_ticket.bundle_gate_mismatch`
+   or, with no active deployment, `approver_ticket.no_serving_bundle`. The same check runs
+   when you deploy or upload a bundle, so a later deploy cannot move the gate off the route.
+4. A connector and tool pair is registered on at most one route (`approver_ticket_pair_conflict`).
+
+Once registered, the tool is locked to its route: an approval for it on any other route, or
+without a route, is refused `approval_route_locked`. Both creation paths check the route map
+again on the agent row they lock for their final write and hold that lock until the approval
+is committed. The registration takes the same lock. A registration that lands while an
+approval is being created is therefore judged by that creation, or waits for it to commit.
+
+### The shared configuration version
+
+Selector writes and the requester identity flag compare-and-set on the same agent value,
+`connector_requester_identity_version`. A route write that registers, replaces or removes a
+selector, or that edits a map already holding one, must carry the version you read. With
+`--routes-from`, the CLI reads the current version in the same command and sends it as
+`approval_routes_expected_version`, so ordinary use needs nothing extra. Pass
+`--routes-expected-version N` to pin the version you reviewed instead; if the agent has moved
+on, the API refuses `approval_routes.version_conflict` and writes nothing. A write that
+omits the version is refused `approval_routes.expected_version_required`. The flag can only
+be turned off after every selector is removed (`requester_identity_selector_registered`),
+and two writers holding the same version cannot both commit. Route writes that involve no
+selector are unchanged and do not bump the version. `--routes-expected-version` is accepted
+only alongside a route write flag.
+
+### Requester exclusion
+
+By default the person who asked cannot approve their own request. Omitting `separation`
+stores and returns `{"exclude_requester": true}`. Setting `"exclude_requester": false` is the
+audited opt-out for routes where one person may legitimately do both. Each change to the
+exclusion, and each registration, replacement and removal, writes an identity audit row with
+the route, key id, connector and tool, the old and new configuration version, and the old and
+new pinned role version. The public key bytes are never audited beyond the key id. Because
+enforcement lands with answer and resume authority, today the stored value is policy
+recorded and audited, not yet applied at answer time. `separation` without
+`approver_ticket`, and `exempt_group`, are refused.
+
+### Reading it back
+
+```bash
+curie cluster approvals my-agent --list-routes --json
+```
+
+The readback shows each registration with its key id, public key, ceiling (including the
+pinned `approver_role` and its version) and the effective `separation`. Edit that output and
+feed it back through `--routes-from` to change an unrelated route: a registration identical
+to the stored one, with its pinned role echoed back or omitted, keeps its existing pin and
+is not judged against the current policy version.
+
+### The creation-time ceiling rule
+
+When the connector raises a dynamic approval, the platform proves each selected approver is
+inside the pinned ceiling before storing anything. Each selected approver must be a known,
+active human in the platform's identity records and must be named by exact issuer and
+subject in the pinned role. When `ceiling.users` is set, the approver must also be listed
+there. `ceiling.users` only narrows the pinned role; it never admits someone the role does
+not name. Group entries and surface-account entries never match at creation, because the
+platform cannot establish group membership or an account association for someone who is not
+present in the request.
+
+The consequence: if the pinned role names approvers only by group, with no issuer and
+subject entry, every dynamic approval is refused `approval_ticket_outside_ceiling`, even
+when `ceiling.users` names the selected people. Name approvers by issuer and subject in the
+approver role, and optionally narrow them with `ceiling.users`, until a subject-keyed
+identity lookup exists. The answer-time check will use fresh identity facts, so this limit
+applies to creation only.
+
+### The requester must be current at creation
+
+Ordinary approval creation admits a sender named by a surface-account entry of a migrated
+invocation role even when the fresh identity lookup does not resolve, finds the account
+inactive, or resolves it to a different person. A dynamic approval never relies on that
+exception. The fresh lookup at creation must resolve the sender to an active human whose
+issuer and subject equal the requester the original invocation sealed, and the final write
+rechecks that person in the same transaction. Anything else is refused
+`caller_not_allowed`, and nothing is stored or spent.
+
+### Older API versions and downgrades
+
+Migration 0153 is an expand, so an API from before it keeps serving during a rolling upgrade
+and after an application rollback. That version knows nothing of selectors, so the database
+itself refuses what it could otherwise do:
+
+1. Record the registered tool on a looser route, with no route, or as an ordinary approval,
+   record another tool on the registered route, or record a ticket on a route that registers
+   none.
+2. Turn the requester identity flag off while a selector is registered.
+3. Approve a dynamic approval. Until answer authority lands, no version can approve one.
+
+An older version sees these as failed writes, so the action fails closed. Removing a
+registration through an older API is not refused. It writes no selector audit, and the
+tool becomes ordinary again.
+
+Downgrading the database below 0153 is refused while any dynamic approval or registered
+selector exists. A downgrade would drop each dynamic approval's selection and its spent
+ticket nonce, so the row would read back ordinary and its ticket could be used again. Roll
+the application forward instead.
 
 ## Who may resolve
 
@@ -441,11 +624,16 @@ remediation write is refused `operator_principal_required`. Both are sent as
 A single operator does not need a second person to settle a card. An authenticated
 member of the approver set may approve their own request, including the person who
 asked. Terminal resolution still works only for an explicit `approvers.users`
-binding, because an operator principal carries no channel. If nobody resolves a
-worker-raised request, it expires after 24 hours and the paused session wakes on
-the timeout branch instead of staying pending.
+binding, because an operator principal carries no channel. A finite request that
+passes its stored deadline expires and wakes the paused session on its timeout
+branch. A request with no deadline stays pending until settlement.
 
 ## Operational guarantees
+
+Publication approvals retain their 24-hour deadline. The expiry sweeper wakes
+settled sessions, and the resume reconciler re-drives resolutions whose resume
+turn never landed. Historical approvals with a null `expires_at` remain pending
+until settlement.
 
 - **A paused turn holds nothing.** The queue entry is acknowledged when the turn
   suspends; the resolution arrives later as its own queued turn. No stream entry, thread
@@ -454,14 +642,6 @@ the timeout branch instead of staying pending.
   ([ADR-0003](adr/0003-stateless-first-rehydrate-on-resume.md)). Resume cold-creates a
   fresh one and rehydrates from history. Never design a feature that needs in-process
   state to survive a pause.
-- **Worker-raised approvals expire.** Session approvals the worker creates, and
-  publication approvals, carry a 24 hour deadline. The sweeper settles a lapsed
-  record and wakes the paused session down its timeout branch
-  (`apps/api/src/curie_api/sweeper.py`), and a reconciler re-drives resolutions
-  whose resume turn never landed (`apps/api/src/curie_api/resumereconciler.py`).
-  A direct API create that omits `expires_in_seconds` is still the wire's no-SLA
-  path and is not swept. Approvals created before this deadline existed keep a
-  null `expires_at` and are not swept; settle those by hand.
 - **Every attempt is audited.** `GET /approvals/{id}/audit` returns each resolution
   attempt with the authorizer, membership evidence, `principal_kind`, and
   `authenticated` proof state, including refusals. Historical rows remain

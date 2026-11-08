@@ -1,17 +1,23 @@
+import base64
+import re
 import uuid
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, ClassVar, Literal, cast
 
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
+    GetJsonSchemaHandler,
     SerializerFunctionWrapHandler,
     field_validator,
     model_serializer,
     model_validator,
 )
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import CoreSchema
 
 from .. import adapter_principal
 from .channels import (
@@ -45,9 +51,15 @@ class _StoredWithoutNulls(BaseModel):
     dumped shape differ from the validated one.
     """
 
+    _explicit_null_fields: ClassVar[frozenset[str]] = frozenset()
+
     @model_serializer(mode="wrap")
     def _dump_without_nulls(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
-        return {k: v for k, v in handler(self).items() if v is not None}
+        return {
+            k: v
+            for k, v in handler(self).items()
+            if v is not None or k in self._explicit_null_fields & self.model_fields_set
+        }
 
 
 class ApprovalApprovers(_StoredWithoutNulls):
@@ -226,6 +238,128 @@ class ApprovalNotificationTarget(ChannelRouteWrite, _StoredWithoutNulls):
         return self
 
 
+MAX_TICKET_TEXT_BYTES = 256
+MAX_ISSUER_BYTES = 2048
+MAX_ROLE_POLICY_VERSION = 2_147_483_647
+_BASE64URL = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _clean_ticket_text(value: str, limit: int) -> str:
+    """The frozen ticket contract's text hygiene (ADR 0271): bounded UTF-8, no
+    surrounding whitespace and no control characters, so a registered value
+    compares byte for byte with the signed ticket claim."""
+
+    if value != value.strip() or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value):
+        raise ValueError("must carry no surrounding whitespace or control characters")
+    if not 1 <= len(value.encode("utf-8")) <= limit:
+        raise ValueError(f"must be 1 to {limit} UTF-8 bytes")
+    return value
+
+
+def _ticket_text(value: str) -> str:
+    return _clean_ticket_text(value, MAX_TICKET_TEXT_BYTES)
+
+
+def _issuer_text(value: str) -> str:
+    return _clean_ticket_text(value, MAX_ISSUER_BYTES)
+
+
+TicketText = Annotated[str, AfterValidator(_ticket_text)]
+
+
+class ApproverTicketCeilingUser(_StoredWithoutNulls):
+    """One exact canonical person the operator allows inside the pinned role."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    issuer: Annotated[str, AfterValidator(_issuer_text)]
+    subject: TicketText
+
+
+class ApproverTicketCeiling(_StoredWithoutNulls):
+    """The operator ceiling a selector chooses inside (ADR 0271 decision 1).
+
+    ``approver_role_version`` names the agent access-policy version whose
+    approver role the operator approves. ``approver_role`` is server-owned: the
+    platform pins that role's canonical JSON on write and returns it on
+    readback, and a write may echo it back unchanged or omit it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    approver_role_version: Annotated[int, Field(strict=True, ge=1, le=MAX_ROLE_POLICY_VERSION)]
+    users: (
+        Annotated[list[ApproverTicketCeilingUser], Field(min_length=1, max_length=128)] | None
+    ) = None
+    approver_role: Annotated[str, Field(strict=True, min_length=2)] | None = None
+
+    @field_validator("users")
+    @classmethod
+    def _unique_users(
+        cls, value: list[ApproverTicketCeilingUser] | None
+    ) -> list[ApproverTicketCeilingUser] | None:
+        if value is not None and len({(u.issuer, u.subject) for u in value}) != len(value):
+            raise ValueError("ceiling users must name each issuer and subject once")
+        return value
+
+
+class ApproverTicketRegistration(_StoredWithoutNulls):
+    """A selector registered on one approval route (ADR 0271 decision 1).
+
+    One hosted connector and one exact upstream tool, the Ed25519 public key
+    (unpadded base64url of 32 bytes) and key id its tickets are verified with,
+    and the mandatory ceiling. The private key never reaches the platform.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    connector: TicketText
+    tool: TicketText
+    key_id: TicketText
+    public_key: str
+    ceiling: ApproverTicketCeiling
+
+    @field_validator("connector")
+    @classmethod
+    def _hosted_connector(cls, value: str) -> str:
+        # The live name is mcp__<connector>__<tool>, split once on the first
+        # "__"; a plugin server is never a hosted connector.
+        if "__" in value or value.startswith("plugin_"):
+            raise ValueError(
+                "connector must be a declared hosted connector name: no '__' and no "
+                "'plugin_' prefix"
+            )
+        return value
+
+    @field_validator("public_key")
+    @classmethod
+    def _ed25519_public_key(cls, value: str) -> str:
+        if _BASE64URL.fullmatch(value):
+            try:
+                raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+            except ValueError:
+                raw = b""
+            if len(raw) == 32 and base64.urlsafe_b64encode(raw).rstrip(b"=").decode() == value:
+                return value
+        raise ValueError("public_key must be the unpadded base64url of a 32-byte Ed25519 key")
+
+    def public_key_bytes(self) -> bytes:
+        return base64.urlsafe_b64decode(self.public_key + "=" * (-len(self.public_key) % 4))
+
+
+class ApprovalSeparation(_StoredWithoutNulls):
+    """Requester exclusion for a registered selector route (ADR 0271).
+
+    Omitted on write stores ``{"exclude_requester": true}``; ``false`` is the
+    audited opt-out. ``exempt_group`` lands with its enforcement (0271b), so it
+    is refused here rather than stored unenforced.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    exclude_requester: Annotated[bool, Field(strict=True)]
+
+
 class ApprovalRouteBinding(_StoredWithoutNulls):
     """One strict workspace binding for a declared approval route (#1460).
 
@@ -234,14 +368,29 @@ class ApprovalRouteBinding(_StoredWithoutNulls):
     ``notification`` may make the pending request visible elsewhere, but its
     message carries no interaction. ``approvers`` continues to narrow WHO may
     act through the resolution card path and is never inferred from notification
-    recipients.
+    recipients. ``approver_ticket`` registers a per-request approver selector and
+    ``separation`` its requester exclusion (ADR 0271).
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    _explicit_null_fields = frozenset({"expires_in_seconds"})
+
     resolution: ApprovalResolutionTarget | ApprovalRequestingSurfaceTarget
     notification: ApprovalNotificationTarget | None = None
     approvers: ApprovalApprovers | None = None
+    expires_in_seconds: int | None = Field(default=None, strict=True, gt=0, le=315_360_000)
+    approver_ticket: ApproverTicketRegistration | None = None
+    separation: ApprovalSeparation | None = None
+
+    @model_validator(mode="after")
+    def _separation_needs_a_selector(self) -> "ApprovalRouteBinding":
+        if self.separation is not None and self.approver_ticket is None:
+            raise ValueError(
+                "separation applies only to a route that registers an approver_ticket "
+                "selector (ADR 0271): add the registration or remove separation"
+            )
+        return self
 
     @model_validator(mode="after")
     def _emails_need_the_requesting_surface(self) -> "ApprovalRouteBinding":
@@ -335,14 +484,84 @@ class ApprovalRequestingSurfaceTargetOut(BaseModel):
     mode: str
 
 
+class ApproverTicketCeilingUserOut(BaseModel):
+    """Read projection of one ceiling user; tolerant for repair."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    issuer: str | None = None
+    subject: str | None = None
+
+
+class ApproverTicketCeilingOut(BaseModel):
+    """Read projection of a registration ceiling, including the server-owned pin."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    approver_role_version: int | None = None
+    approver_role: str | None = None
+    users: list[ApproverTicketCeilingUserOut] | None = None
+
+
+class ApproverTicketOut(BaseModel):
+    """Read projection of a selector registration (ADR 0271). The public key is
+    public material and reads back so a readback can be written back."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    connector: str | None = None
+    tool: str | None = None
+    key_id: str | None = None
+    public_key: str | None = None
+    ceiling: ApproverTicketCeilingOut | None = None
+
+
+class ApprovalSeparationOut(BaseModel):
+    """Read projection of the stored, effective requester exclusion."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    exclude_requester: bool | None = None
+
+
 class ApprovalRouteBindingOut(BaseModel):
-    """The required resolution plus optional, redacted visibility policy."""
+    """The required resolution plus optional, redacted visibility policy.
+
+    ``approver_ticket`` and ``separation`` are omitted, not null, on a route
+    without a selector, so every existing route reads back exactly as before.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
     resolution: ApprovalTargetOut | ApprovalRequestingSurfaceTargetOut
     notification: ApprovalTargetOut | None = None
     approvers: ApprovalApproversOut | None = None
+    expires_in_seconds: int | None = None
+
+    @model_serializer(mode="wrap")
+    def _preserve_deadline_presence(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        result: dict[str, Any] = handler(self)
+        if "expires_in_seconds" not in self.model_fields_set:
+            result.pop("expires_in_seconds", None)
+        return result
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls, core_schema: CoreSchema, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        return handler(
+            cast(
+                CoreSchema,
+                {key: value for key, value in core_schema.items() if key != "serialization"},
+            )
+        )
+
+    approver_ticket: ApproverTicketOut | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    separation: ApprovalSeparationOut | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class ApprovalResolve(BaseModel):

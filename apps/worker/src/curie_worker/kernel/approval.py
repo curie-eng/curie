@@ -148,7 +148,10 @@ def _parse_approval_targets(
     because JSONB may be written out of band: the retired ``channel`` key, a
     non-Slack resolver, an unknown target field, a half-configured transport,
     or duplicate targets must not produce a durable approval with ambiguous
-    authority.
+    authority. The operator-owned route keys ``approvers``,
+    ``approver_ticket`` and ``separation`` (ADR-0271 decision 1) are accepted
+    but never interpreted here: card targets come only from ``resolution`` and
+    ``notification``, and every other unknown route key is refused.
 
     ADR-0168 decision 3: a Slack notification names its identity in
     ``adapter``, or none for the default, and has no endpoint; any other kind
@@ -161,7 +164,14 @@ def _parse_approval_targets(
         "resolution",
         "notification",
         "approvers",
+        "expires_in_seconds",
+        "approver_ticket",
+        "separation",
     }:
+        return None
+
+    duration = binding.get("expires_in_seconds")
+    if duration is not None and (type(duration) is not int or not 0 < duration <= 315_360_000):
         return None
 
     resolution = binding.get("resolution")
@@ -360,6 +370,7 @@ async def _settle_remembered_card(
     """
 
     assert self._card_store is not None
+    await self._card_store.settle(approval_id)
     entry = await self._card_store.read(approval_id)
     if entry is None:
         return
@@ -834,9 +845,7 @@ async def _pause_for_approval(
             assert self._approvals is not None
             # @spec HTTP-APPROVAL-CONTINUITY-3/4: only the live owner supplies identity.
             # A legacy creator keeps its exact call shape.
-            creation = (
-                {"identity": identity.creation_identity()} if selected else {}
-            )
+            creation = {"identity": identity.creation_identity()} if selected else {}
             created = await self._approvals.create(
                 ApprovalRequest(
                     agent_id=agent_id,
@@ -880,7 +889,13 @@ async def _pause_for_approval(
                     gate_kind=cast("GateKind | None", outcome.approval_gate_kind),
                     granted_tool=outcome.approval_granted_tool,
                     granted_arguments=outcome.approval_granted_arguments,
-                    expires_in_seconds=constants._SESSION_APPROVAL_EXPIRES_IN_SECONDS,
+                    expires_in_seconds=(
+                        binding["expires_in_seconds"]
+                        if route_name
+                        and isinstance(binding, dict)
+                        and "expires_in_seconds" in binding
+                        else constants._SESSION_APPROVAL_EXPIRES_IN_SECONDS
+                    ),
                 ),
                 budget_s=routing._api_write_budget_s(),
                 **creation,

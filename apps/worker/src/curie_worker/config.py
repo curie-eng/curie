@@ -1551,6 +1551,9 @@ class WorkerConfig(BaseSettings):
     )
 
     key_prefix: str = keyspace.WORKER_KEY_PREFIX_DEFAULT
+    approval_pending_retention_enabled: bool = Field(
+        default=False, validation_alias="CURIE_APPROVAL_PENDING_RETENTION_ENABLED"
+    )
 
     @property
     def runner_facing_api_base_url(self) -> str:
@@ -1731,6 +1734,12 @@ class WorkerConfig(BaseSettings):
         # Where a posted approval card lives so its own resolution or expiry can
         # settle it without sharing identity with another approval on the thread.
         return f"{self.key_prefix}:approval-card:{approval_id}"
+
+    def approval_references_pending_key(self) -> str:
+        return f"{self.key_prefix}:approval-references:pending"
+
+    def approval_retention_key(self, approval_id: str) -> str:
+        return f"{self.key_prefix}:approval-retention:{approval_id}"
 
     def approval_notice_ref_key(self, approval_id: str) -> str:
         # The reply ref a placeholderless pending notice minted AFTER its approval
