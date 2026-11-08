@@ -17,6 +17,7 @@ import http.client
 import io
 import json
 import os
+import socket
 import ssl
 import subprocess
 import tarfile
@@ -300,6 +301,80 @@ def test_a_malformed_runner_status_quarantines_the_shell(shell: Shell) -> None:
     assert retired["shell"]["quarantine_reason"] == "history-unsettled"
     assert retired["shell"]["claim"] is None
     assert shell.request("GET", "/_curie/supervisor/healthz", token=CONTROL_TOKEN)[0] == 503
+
+
+def _runner_processes(shell: Shell) -> list[str]:
+    """Processes in the container not run by root: only a runner child is."""
+
+    listing = _docker(
+        "exec",
+        shell.name,
+        "python",
+        "-c",
+        "import os\n"
+        "for pid in filter(str.isdigit, os.listdir('/proc')):\n"
+        "    try:\n"
+        "        if os.stat(f'/proc/{pid}').st_uid != 0:\n"
+        "            print(pid, open(f'/proc/{pid}/cmdline', 'rb').read())\n"
+        "    except OSError:\n"
+        "        pass\n",
+    )
+    return listing.splitlines()
+
+
+def test_a_create_whose_caller_hangs_up_mid_staging_quarantines_the_shell(
+    shell: Shell,
+) -> None:
+    # Enough members that staging outlasts the hang-up.
+    filler = {f"bundle/filler/{index:05d}": b"x" for index in range(40000)}
+    body = claim_archive(
+        "claim-a",
+        1,
+        {
+            "CURIE_RUNNER_TOKEN": f"bearer-{uuid.uuid4().hex}{uuid.uuid4().hex}",
+            "HOSTILE_KEY_PATH": KEY_PATH,
+            "HOSTILE_PHASE": "plant",
+            "HOSTILE_MARKER": uuid.uuid4().hex,
+        },
+        files={"bundle/hostile_child.py": HOSTILE, **filler},
+    )
+    head = (
+        f"PUT {claim_path('claim-a', 1)} HTTP/1.1\r\nHost: localhost\r\n"
+        f"Authorization: Bearer {CONTROL_TOKEN}\r\n"
+        f"Content-Type: application/x-tar\r\nContent-Length: {len(body)}\r\n\r\n"
+    ).encode()
+    raw = socket.create_connection(("localhost", shell.port), timeout=60)
+    caller = client_context(shell.tls).wrap_socket(raw, server_hostname="localhost")
+    try:
+        caller.sendall(head + body)
+
+        def staging() -> bool:
+            state = shell.request("GET", "/_curie/supervisor/v1/shell", token=CONTROL_TOKEN)[1]
+            assert state["state"] in ("idle", "staging"), f"staging ended first: {state}"
+            return state["state"] == "staging"
+
+        wait_until(staging, 60, "staging to start")
+    finally:
+        # Gone before any answer: the caller never learns if the claim started.
+        caller.close()
+
+    def settled() -> bool:
+        state = shell.request("GET", "/_curie/supervisor/v1/shell", token=CONTROL_TOKEN)[1]
+        return state["state"] == "quarantined"
+
+    wait_until(settled, 120, "the abandoned create to be ended")
+    state = shell.request("GET", "/_curie/supervisor/v1/shell", token=CONTROL_TOKEN)[1]
+    assert state["quarantine_reason"] == "create-unacknowledged", shell.logs()
+    assert state["claim"] is None
+    assert state["last"]["outcome"] == "quarantined"
+    assert shell.request("GET", "/_curie/supervisor/healthz", token=CONTROL_TOKEN)[0] == 503
+    # The runner child is stopped and the claim's files are gone.
+    assert _runner_processes(shell) == []
+    claims = _docker("exec", shell.name, "ls", "-A", "/var/lib/curie-shell/claims")
+    assert claims.strip() == ""
+    # A retry of the same claim is refused, never acknowledged.
+    status, answer = shell.request("PUT", claim_path("claim-a", 1), token=CONTROL_TOKEN, body=body)
+    assert status in (409, 503), answer
 
 
 def test_an_image_path_the_runner_could_write_stops_the_shell(tls: ShellTls) -> None:

@@ -18,10 +18,11 @@ from typing import Any
 import pytest
 from aiohttp import web
 from curie_shell_supervisor import stage
+from curie_shell_supervisor.child import RunnerChild
 from curie_shell_supervisor.config import SupervisorConfig
-from curie_shell_supervisor.protocol import STATE_IDLE, STATE_RUNNING, claim_path
+from curie_shell_supervisor.protocol import STATE_IDLE, STATE_QUARANTINED, claim_path
 from curie_shell_supervisor.server import Supervisor
-from curie_test_support.static_shell import CONTROL_TOKEN, claim_archive, free_port
+from curie_test_support.static_shell import CONTROL_TOKEN, claim_archive, free_port, wait_gone
 
 BEARER = "bearer-" + "d" * 40
 
@@ -66,7 +67,7 @@ async def _drop_after_upload(port: int, path: str, body: bytes, entered: threadi
     del reader
 
 
-def test_a_client_that_disconnects_during_staging_leaves_a_whole_claim(
+def test_a_create_whose_client_disconnects_is_ended_and_quarantines_the_shell(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     records = tmp_path / "records"
@@ -81,6 +82,15 @@ def test_a_client_that_disconnects_during_staging_leaves_a_whole_claim(
         return real_prepare(*args, **kwargs)
 
     monkeypatch.setattr(stage, "prepare", held_prepare)
+    spawned: list[RunnerChild] = []
+    real_spawn = RunnerChild.spawn
+
+    async def recorded_spawn(*args: Any, **kwargs: Any) -> RunnerChild:
+        child = await real_spawn(*args, **kwargs)
+        spawned.append(child)
+        return child
+
+    monkeypatch.setattr(RunnerChild, "spawn", recorded_spawn)
     body = claim_archive(
         "claim-a",
         1,
@@ -95,22 +105,33 @@ def test_a_client_that_disconnects_during_staging_leaves_a_whole_claim(
         await web.TCPSite(runner, "127.0.0.1", port).start()
         try:
             await _drop_after_upload(port, claim_path("claim-a", 1), body, entered)
-            # The handler is cancelled with the connection; the create is not.
+            # The hang-up is seen while staging is still held: the create and
+            # its follow-up are both supervisor tasks now.
+            deadline = asyncio.get_running_loop().time() + 10
+            while len(supervisor._operations) < 2:
+                assert asyncio.get_running_loop().time() < deadline, "the hang-up was ignored"
+                await asyncio.sleep(0)
             release.set()
-            await asyncio.gather(*list(supervisor._operations))
+            while supervisor._operations:
+                await asyncio.gather(*list(supervisor._operations), return_exceptions=True)
+            # The create finished, then its unacknowledged claim was ended.
             status = supervisor.status()
-            assert status["state"] == STATE_RUNNING
-            assert status["claim"]["name"] == "claim-a"
-            assert status["quarantine_reason"] is None
-            # The worker's retry of the same body is answered as already done.
+            assert status["state"] == STATE_QUARANTINED
+            assert status["quarantine_reason"] == "create-unacknowledged"
+            assert status["claim"] is None
+            assert status["last"]["outcome"] == "quarantined"
+            # The runner child was started and is gone, process group and all.
+            assert [child.returncode is not None for child in spawned] == [True]
+            assert wait_gone(spawned[0].pid, 10)
+            assert list((config.state_root / "claims").iterdir()) == []
+            # A retry of the same body is never told the claim runs.
             retry = tmp_path / "retry.tar"
             retry.write_bytes(body)
             digest = hashlib.sha256(body).hexdigest()
-            assert (await supervisor.create("claim-a", 1, retry, digest))[0] == 200
+            assert (await supervisor.create("claim-a", 1, retry, digest))[0] == 409
             code, answer = await supervisor.retire("claim-a", 1, "retire")
-            assert (code, answer["outcome"]) == (200, "cleaned")
-            assert supervisor.status()["state"] == STATE_IDLE
-            assert list((config.state_root / "claims").iterdir()) == []
+            assert (code, answer["outcome"]) == (200, "quarantined")
+            assert supervisor.status()["state"] == STATE_QUARANTINED
         finally:
             await runner.cleanup()
 

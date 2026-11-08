@@ -129,6 +129,9 @@ class Supervisor:
         # Create and retire run as supervisor-owned tasks, so a control client
         # that disconnects mid-call never abandons a half-done operation.
         self._operations: set[asyncio.Task[Any]] = set()
+        # Creates whose caller hung up before the answer: never acknowledged,
+        # so the lease they start is ended and the shell quarantined.
+        self._abandoned: set[tuple[str, int]] = set()
 
     # -- status -----------------------------------------------------------------
 
@@ -261,6 +264,8 @@ class Supervisor:
         self, claim: str, generation: int, archive: Path, digest: str
     ) -> tuple[int, dict[str, Any]]:
         async with self._lock:
+            if (claim, generation) in self._abandoned:
+                return 409, {"error": "this create was abandoned", "shell": self.status()}
             lease = self._lease
             if lease is not None:
                 if (lease.claim, lease.generation, lease.digest) == (claim, generation, digest):
@@ -327,6 +332,9 @@ class Supervisor:
             self._watch(lease, self._await_ready(lease))
             self._watch(lease, self._reap_while_running(lease))
             logger.info("claim %s generation %d started", claim, generation)
+            if (claim, generation) in self._abandoned:
+                await self._drop_abandoned(lease)
+                return 409, {"error": "this create was abandoned", "shell": self.status()}
             return 201, self.status()
 
     async def _settled(self, lease: Lease) -> bool:
@@ -388,13 +396,56 @@ class Supervisor:
                 problems.append(f"isolation check failed: {type(exc).__name__}")
         return problems
 
+    def _own(self, operation: Any) -> asyncio.Task[Any]:
+        """Run ``operation`` as a supervisor task, whatever its caller does."""
+
+        task: asyncio.Task[Any] = asyncio.create_task(operation)
+        self._operations.add(task)
+        task.add_done_callback(self._operations.discard)
+        return task
+
     async def _owned(self, operation: Any) -> tuple[int, dict[str, Any]]:
         """Run ``operation`` to completion even if the caller goes away."""
 
-        task: asyncio.Task[tuple[int, dict[str, Any]]] = asyncio.create_task(operation)
-        self._operations.add(task)
-        task.add_done_callback(self._operations.discard)
-        return await asyncio.shield(task)
+        result: tuple[int, dict[str, Any]] = await asyncio.shield(self._own(operation))
+        return result
+
+    async def _create_abandoned(
+        self, create: asyncio.Task[Any], claim: str, generation: int
+    ) -> None:
+        """After an unanswered create finishes, end the lease it started."""
+
+        with contextlib.suppress(BaseException):
+            await create
+        async with self._lock:
+            lease = self._lease
+            if lease is not None and (lease.claim, lease.generation) == (claim, generation):
+                await self._drop_abandoned(lease)
+
+    async def _drop_abandoned(self, lease: Lease) -> None:
+        """End a lease no caller was told about, and quarantine the shell.
+
+        The caller that hung up cannot know whether the claim started, so
+        nothing may run on, or reuse, a shell in that state. Holds the lock.
+        """
+
+        logger.error("create of claim %s was abandoned by its caller", lease.claim)
+        self._state = STATE_STOPPING
+        lease.stopping = True
+        try:
+            await self._end(lease)
+        finally:
+            self._lease = None
+            if self._quarantine is None:
+                self._quarantine_now("create-unacknowledged")
+        self._last = {
+            "name": lease.claim,
+            "generation": lease.generation,
+            "outcome": OUTCOME_QUARANTINED,
+            "mode": "abandoned",
+            "settled": self._last_settled,
+            "at": _now(),
+        }
 
     async def _end(self, lease: Lease) -> None:
         """Stop ``lease``'s child, cut its streams, clean up, and judge the slot."""
@@ -453,6 +504,9 @@ class Supervisor:
                     return 409, {"outcome": OUTCOME_ABSENT, "shell": self.status()}
                 outcome = OUTCOME_QUARANTINED if self._quarantine else OUTCOME_ABSENT
                 return 200, {"outcome": outcome, "shell": self.status()}
+            if (claim, generation) in self._abandoned:
+                await self._drop_abandoned(lease)
+                return 200, {"outcome": OUTCOME_QUARANTINED, "shell": self.status()}
             self._state = STATE_STOPPING
             lease.stopping = True
             try:
@@ -531,8 +585,16 @@ class Supervisor:
             archive.unlink(missing_ok=True)
             raise
         # From here the create owns the archive and runs to its end even if
-        # this client disconnects; a retry of the same body then answers 200.
-        status, body = await self._owned(self.create(*identity, archive, digest.hexdigest()))
+        # this client disconnects. A client that hangs up before the answer
+        # never learns whether its claim started, so that claim is ended and
+        # the shell quarantined once the create finishes.
+        create = self._own(self.create(*identity, archive, digest.hexdigest()))
+        try:
+            status, body = await asyncio.shield(create)
+        except asyncio.CancelledError:
+            self._abandoned.add(identity)
+            self._own(self._create_abandoned(create, *identity))
+            raise
         return web.json_response(body, status=status)
 
     async def handle_retire(self, request: web.Request) -> web.Response:
