@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Never
 
+from curie_dispatcher.app import build_redis
 from curie_internal.operator_file import (
     OperatorFileRefusal,
     decode_key_material,
@@ -160,6 +161,8 @@ def build_selected_receivers(
                 registration.scope, registration.bindings, receiver_key=registration.key,
                 web_client=web_client_factory(config, credentials),
                 api_base_url=config.api_base_url, on_stage=reached,
+                config=config,
+                redis_client=build_redis(config) if config.test_installation_enabled else None,
             ))
         except Exception:  # noqa: BLE001 - the log names the stage, never Slack or secret bytes.
             excluded.add(name)

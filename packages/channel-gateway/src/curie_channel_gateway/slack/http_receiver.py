@@ -16,17 +16,21 @@ from urllib.parse import urlsplit
 import httpx
 from curie_internal import identity_approval as approval_wire
 from curie_internal import identity_context as codec
+from curie_internal.driver_declaration import DeclaredDriver
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+from redis import Redis
 from slack_sdk.web import WebClient
 
 from curie_channel_gateway.slack.approval_actions import ResolveOutcome, parse_decision_time
 from curie_channel_gateway.slack.approval_principal import mint_chat_principal
 
-from .identities import bot_ids_from_auth_test
+from .config import DispatcherConfig
+from .identities import SlackBotIds, bot_ids_from_auth_test, delivery_key
 from .identity import slack_evidence
 from .inbound_attachments import derive_attachments
 from .inbound_text import derive_text, strip_self_mention
 from .installation_report import auth_test_report
+from .marked_actions import MARK, REFUSAL, declared_driver, reserve_turn
 from .relevance import NON_CONTENT_SUBTYPES
 
 DIRECT_MESSAGE_CHANNEL_TYPE = "im"
@@ -168,10 +172,16 @@ class PreparedSubmission:
     @spec HTTP-INVOCATION-EXECUTION-27.
     """
 
-    __slots__ = ("_content", "_proof", "_credential", "channel", "thread_ts")
+    __slots__ = (
+        "_content", "_proof", "_credential", "_driver", "_driver_admitted",
+        "_root", "channel", "thread_ts",
+    )
     _content: dict[str, Any]
     _proof: dict[str, Any]
     _credential: str
+    _driver: DeclaredDriver | None
+    _driver_admitted: bool
+    _root: bool
     channel: str
     thread_ts: str
 
@@ -208,7 +218,7 @@ _AMBIGUOUS = (
 )
 
 
-def _qualified(scope: HttpReceiverScopeV1, client: WebClient) -> None:
+def _qualified(scope: HttpReceiverScopeV1, client: WebClient) -> SlackBotIds:
     """@spec HTTP-INVOCATION-EXECUTION-2/19/21."""
     if not isinstance(client, WebClient):
         raise ValueError("invalid_http_receiver_runtime")
@@ -223,6 +233,7 @@ def _qualified(scope: HttpReceiverScopeV1, client: WebClient) -> None:
         or report["is_enterprise_install"] is not False
     ):
         raise ValueError("invalid_http_receiver_runtime")
+    return ids
 
 
 def _received_by(body: dict[str, Any], bot_user_id: str) -> bool:
@@ -344,7 +355,14 @@ async def _answer_outcome(response: httpx.Response) -> ResolveOutcome:
 class HttpReceiverRuntime:
     """Opaque operator initialization. @spec HTTP-INVOCATION-EXECUTION-1/19."""
 
-    __slots__ = ("_scope", "_bindings", "_keys", "_url", "_api_base", "_client_factory")
+    __slots__ = (
+        "_scope", "_bindings", "_keys", "_url", "_api_base", "_client_factory",
+        "_config", "_redis", "_web", "_bot_ids",
+    )
+    _config: DispatcherConfig | None
+    _redis: Redis | None
+    _web: WebClient
+    _bot_ids: SlackBotIds
     _scope: HttpReceiverScopeV1
     _bindings: Mapping[str, HttpReceiverBindingV1]
     _keys: codec.IdentityKeyring
@@ -421,12 +439,29 @@ class HttpReceiverRuntime:
         """
         scope = self._scope
         try:
+            driver = None
+            if type(event) is dict and event.get("bot_id") and self._config is not None:
+                text = strip_self_mention(derive_text(event), bot_user_id)
+                candidate = declared_driver(self._config, event)
+                if (
+                    self._config.test_installation_enabled
+                    and event.get("type") == "app_mention" and text.startswith(MARK)
+                    and candidate is not None and candidate.channel_id == event.get("channel")
+                    and event.get("bot_id") != self._bot_ids.bot_id
+                    and event.get("user") != self._bot_ids.bot_user_id
+                    and candidate.bot_user_id != self._bot_ids.bot_user_id
+                    and not (self._bot_ids.app_id and event.get("app_id") == self._bot_ids.app_id)
+                ):
+                    command = text[len(MARK):].strip().split()
+                    if command and command[0] in {"approve", "reject"}:
+                        return None
+                    driver = candidate
             if (
                 type(body) is not dict or type(event) is not dict
                 or body.get("event") != event or body.get("type") != "event_callback"
                 or body.get("team_id") != scope.installation_account
                 or not (event.get("type") == "app_mention" or is_plain_direct_message(event))
-                or event.get("bot_id")
+                or (event.get("bot_id") and driver is None)
                 or event.get("subtype") in NON_CONTENT_SUBTYPES
                 or slack_identity != scope.channel_identity_name or bot_user_id != scope.bot_user_id
                 or not _received_by(body, scope.bot_user_id)
@@ -437,13 +472,15 @@ class HttpReceiverRuntime:
                 return None
             binding = self._bindings[channel]
             timestamp = event.get("thread_ts") or event.get("ts")
-            sender = event.get("user")
+            sender = driver.bot_user_id if driver is not None else event.get("user")
             if type(timestamp) is not str or not timestamp or type(sender) is not str or not sender:
                 return None
             delivery = body.get("event_id")
             if type(delivery) is not str or not delivery:
                 return None
-            evidence = slack_evidence(body)
+            evidence = slack_evidence(
+                {**body, "event": {**event, "user": sender}} if driver is not None else body,
+            )
             if evidence is None:
                 return None
             evidence = {
@@ -493,9 +530,77 @@ class HttpReceiverRuntime:
         object.__setattr__(prepared, "_content", content)
         object.__setattr__(prepared, "_proof", proof)
         object.__setattr__(prepared, "_credential", binding.channel_credential)
+        object.__setattr__(prepared, "_driver", driver)
+        object.__setattr__(prepared, "_driver_admitted", False)
+        object.__setattr__(prepared, "_root", not bool(event.get("thread_ts")))
         object.__setattr__(prepared, "channel", channel)
         object.__setattr__(prepared, "thread_ts", conversation)
         return prepared
+
+    def admit_test_driver(self, prepared: PreparedSubmission) -> ReceiverSubmission | None:
+        """Check normal identity before the shared ADR 0202 claim, ping and turn budget."""
+        from curie_dispatcher.queue import claim_event
+
+        driver = prepared._driver
+        if driver is None or prepared._driver_admitted:
+            return None
+        config, store = self._config, self._redis
+        if config is None or store is None:
+            return _REFUSED
+        payload, proof = self._signed(prepared._content, prepared._proof, "")
+        verdict = asyncio.run(self._driver_admission(payload, proof, prepared._credential))
+        if verdict is not None:
+            return verdict
+        try:
+            if not claim_event(store, config, delivery_key(
+                prepared._content["delivery_id"], self.identity_name,
+            )):
+                return ReceiverSubmission(status="accepted", stream_id=None, duplicate=True)
+            is_ping = prepared._content["text"] == f"{MARK} ping"
+            if is_ping and prepared._root:
+                self._web.chat_postMessage(
+                    channel=prepared.channel, thread_ts=prepared.thread_ts,
+                    text=f"This installation accepts test actions from <@{driver.bot_user_id}>.",
+                )
+                return ReceiverSubmission(status="accepted", stream_id=None)
+            if is_ping or not reserve_turn(
+                store, config, identity=self.identity_name,
+                channel=prepared.channel, thread=prepared.thread_ts,
+            ):
+                self._web.chat_postMessage(
+                    channel=prepared.channel, thread_ts=prepared.thread_ts, text=REFUSAL,
+                )
+                return _REFUSED
+            object.__setattr__(prepared, "_driver_admitted", True)
+        except Exception:  # noqa: BLE001 - failed admission never starts a turn
+            return _UNAVAILABLE
+        return None
+
+    async def _driver_admission(
+        self, payload: bytes, proof: str, credential: str,
+    ) -> ReceiverSubmission | None:
+        try:
+            async with asyncio.timeout(5):
+                async with self._client_factory() as client:
+                    request = httpx.Request(
+                        "POST", self._url + "/admission", content=payload, headers={
+                            "Content-Type": "application/json", "X-API-Key": credential,
+                            "X-Curie-Receiver-Proof": proof,
+                        },
+                    )
+                    response = await client.send(
+                        request, stream=True, auth=None, follow_redirects=False,
+                    )
+                    try:
+                        if response.status_code == 204:
+                            return None
+                        return _REFUSED if response.status_code in {401, 403, 409, 413, 422} else (
+                            _UNAVAILABLE
+                        )
+                    finally:
+                        await response.aclose()
+        except Exception:  # noqa: BLE001 - failed identity admission fails closed
+            return _UNAVAILABLE
 
     def _signed(
         self, content: dict[str, Any], proof: dict[str, Any], reply_ref: str,
@@ -523,6 +628,9 @@ class HttpReceiverRuntime:
                 reply_ref != "" and not is_reply_slot(reply_ref)
             ):
                 return _REFUSED
+            verdict = self.admit_test_driver(prepared)
+            if verdict is not None:
+                return verdict
             payload, token = self._signed(prepared._content, prepared._proof, reply_ref)
         except (ValueError, TypeError, AttributeError, RecursionError):
             return _REFUSED
@@ -683,6 +791,7 @@ def build_http_receiver_runtime(
     receiver_key: bytes, web_client: WebClient, api_base_url: str,
     http_client_factory: Callable[[], httpx.AsyncClient] | None = None,
     on_stage: Callable[[Literal["auth_test", "runtime"]], None] | None = None,
+    config: DispatcherConfig | None = None, redis_client: Redis | None = None,
 ) -> HttpReceiverRuntime:
     """@spec HTTP-INVOCATION-EXECUTION-1/2/19/25.
 
@@ -721,10 +830,17 @@ def build_http_receiver_runtime(
             raise ValueError
         if on_stage is not None:
             on_stage("auth_test")
-        _qualified(scope, web_client)
+        bot_ids = _qualified(scope, web_client)
+        if config is not None and config.test_installation_enabled:
+            if redis_client is None or not bot_ids.bot_id:
+                raise ValueError("invalid_test_driver_runtime")
         if on_stage is not None:
             on_stage("runtime")
         runtime = object.__new__(HttpReceiverRuntime)
+        object.__setattr__(runtime, "_config", config)
+        object.__setattr__(runtime, "_redis", redis_client)
+        object.__setattr__(runtime, "_web", web_client)
+        object.__setattr__(runtime, "_bot_ids", bot_ids)
         object.__setattr__(runtime, "_scope", scope)
         object.__setattr__(runtime, "_bindings", MappingProxyType(by_channel))
         object.__setattr__(runtime, "_keys", keys)

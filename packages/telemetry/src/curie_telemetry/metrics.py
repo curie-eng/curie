@@ -399,6 +399,7 @@ _HTTP_OPERATIONS = [
     "/channels/admission",
     "/channels/token",
     "/channels/turns",
+    "/channels/turns/admission",
     "/cluster-message-replies/{reply_ref}",
     "/config",
     "/connector-capabilities/probes",

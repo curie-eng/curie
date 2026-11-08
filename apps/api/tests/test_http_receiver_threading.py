@@ -8,12 +8,17 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import socket
+from collections.abc import Iterator
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import httpx
+import pytest
 import redis
+import uvicorn
 from aci_protocol import QueuedTurn
 from aiohttp import web
 from aiohttp.test_utils import TestServer
@@ -164,5 +169,174 @@ def test_http_receiver_preserves_native_parent_through_queue_and_actual_slack_re
         assert identity_client.close_status().state == "closed"
     finally:
         keys = membership._keys(valkey, scope["binding"])
+        if keys:
+            valkey.delete(*keys)
+
+
+@contextmanager
+def _live_api(client: TestClient) -> Iterator[str]:
+    """Serve the actual API on its existing lifespan loop, with an owned TCP listener."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.setblocking(False)
+    server = uvicorn.Server(uvicorn.Config(
+        client.app, lifespan="off", log_config=None, access_log=False,
+    ))
+
+    async def serve() -> None:
+        await server.serve(sockets=[listener])
+
+    async def ready() -> None:
+        async with asyncio.timeout(5):
+            while not server.started:
+                await asyncio.sleep(0)
+
+    assert client.portal is not None
+    future = client.portal.start_task_soon(serve)
+    try:
+        client.portal.call(ready)
+        yield f"http://127.0.0.1:{listener.getsockname()[1]}"
+    finally:
+        server.should_exit = True
+        try:
+            future.result(timeout=5)
+        finally:
+            listener.close()
+        assert future.done() and listener.fileno() == -1
+
+
+@pytest.mark.parametrize("command", ["act", "ping"])
+def test_declared_http_driver_reaches_real_group_admission(
+    clean_db: None, valkey: redis.Redis, runs_stream: str,
+    synthetic_provider: SimpleNamespace, command: str,
+) -> None:
+    """A configured driver user passes receiver proofs and is refused by directory group."""
+    from curie_channel_gateway.slack.config import DispatcherConfig
+    from curie_channel_gateway.slack.http_receiver import (
+        HttpReceiverBindingV1,
+        HttpReceiverScopeV1,
+        build_http_receiver_runtime,
+    )
+
+    scope = membership._scope(synthetic_provider.url)
+    identity_client = HttpIdentityClient(tls_context=synthetic_provider.tls)
+    responses: list[tuple[str, int]] = []
+    requests: list[httpx.Request] = []
+    try:
+        with TestClient(create_app(
+            http_identity_runtime=membership._runtime(membership._runtime_api(), scope),
+            http_identity_client=identity_client,
+        )) as client, _live_api(client) as api_url:
+            credential = membership._credential(client, scope)
+
+            async def observe(result: httpx.Response) -> None:
+                requests.append(result.request)
+                responses.append((result.request.url.path, result.status_code))
+                if result.status_code == 403:
+                    await result.aread()
+                    assert result.json() == {"detail": "caller_not_allowed"}
+
+            slack = WebClient(token=SLACK_TOKEN)
+            slack.auth_test = MagicMock(return_value={
+                "ok": True, "team_id": membership.ACCOUNT, "user_id": BOT,
+                "bot_id": "B0EXAMPLE1", "is_enterprise_install": False,
+            })
+            slack.chat_postMessage = MagicMock(return_value={"ok": True, "ts": MESSAGE_TS})
+            config = DispatcherConfig(
+                api_key="synthetic-test-installation-key",
+                approval_chat_attester_secret="synthetic-test-installation-attester",
+                test_installation_enabled=True,
+                test_installation_drivers=[{
+                    "channel_id": scope["address"], "bot_id": "B0EXAMPLEDRIVER",
+                    "bot_user_id": membership.SENDER,
+                }],
+                dedupe_prefix="ut10:" + scope["binding"] + ":",
+            )
+            runtime = build_http_receiver_runtime(
+                HttpReceiverScopeV1(
+                    schema_version=1, receiver_id=scope["receiver_id"], receiver_generation=1,
+                    channel_identity_id=scope["identity"], channel_identity_name=scope["adapter"],
+                    provider_installation_id=scope["installation"],
+                    namespace=scope["namespace"].model_dump(),
+                    installation_account=membership.ACCOUNT, bot_user_id=BOT,
+                ),
+                (HttpReceiverBindingV1(
+                    schema_version=1, native_channel_id=scope["address"],
+                    binding_id=scope["binding"], binding_generation=scope["generation"],
+                    channel_credential=credential,
+                ),),
+                receiver_key=scope["receiver_key"], web_client=slack,
+                api_base_url=api_url,
+                http_client_factory=lambda: httpx.AsyncClient(
+                    event_hooks={"response": [observe]},
+                ),
+                config=config, redis_client=valkey,
+            )
+            # Slack bot mentions carry bot_id and may name another user:
+            # https://docs.slack.dev/reference/events/app_mention/
+            event = {
+                "type": "app_mention", "channel": scope["address"], "user": "U0EXAMPLEOTHER",
+                "bot_id": "B0EXAMPLEDRIVER", "user_team": membership.ACCOUNT,
+                "text": f"<@{BOT}> [test action] {command}", "ts": MESSAGE_TS,
+            }
+            body = {
+                "type": "event_callback", "event_id": "EvDriverGroupRefused",
+                "team_id": membership.ACCOUNT,
+                "authorizations": [{"team_id": membership.ACCOUNT, "user_id": BOT, "is_bot": True}],
+                "is_ext_shared_channel": False, "event": event,
+            }
+            synthetic_provider.member = False
+            result = runtime.submit(
+                body=body, event=event, slack_identity=scope["adapter"], bot_user_id=BOT,
+            )
+            assert result.status == "refused"
+            assert responses == [("/channels/turns/admission", 403)]
+            observed_sender = synthetic_provider.requests[0]["scope"]["sender"]["native_id"]
+            assert observed_sender == membership.SENDER
+            assert valkey.xlen(runs_stream) == 0
+            assert not list(valkey.scan_iter(match=config.dedupe_prefix + "*"))
+            slack.chat_postMessage.assert_not_called()
+            synthetic_provider.member = True
+            body["event_id"] = "EvDriverGroupAllowed"
+            result = runtime.submit(
+                body=body, event=event, slack_identity=scope["adapter"], bot_user_id=BOT,
+            )
+            assert result.status == "accepted"
+            entries = valkey.xrange(runs_stream)
+            if command == "ping":
+                assert not entries
+                slack.chat_postMessage.assert_called_once_with(
+                    channel=scope["address"], thread_ts=MESSAGE_TS,
+                    text=f"This installation accepts test actions from <@{membership.SENDER}>.",
+                )
+            else:
+                assert len(entries) == 1
+                turn = QueuedTurn.model_validate_json(entries[0][1]["payload"])
+                assert turn.author == membership.SENDER
+                assert responses[-2:] == [
+                    ("/channels/turns/admission", 204), ("/channels/turns", 200),
+                ]
+            count = len(synthetic_provider.requests)
+            original = requests[0]
+            for tamper in ("body", "proof", "credential", "missing"):
+                raw, headers = original.content, dict(original.headers)
+                headers.pop("content-length", None)
+                if tamper == "body":
+                    changed = json.loads(raw)
+                    changed["text"] = "tampered signed text"
+                    raw = json.dumps(changed).encode()
+                elif tamper == "proof":
+                    headers["x-curie-receiver-proof"] = "invalid"
+                elif tamper == "credential":
+                    headers["x-api-key"] = "chn.invalid"
+                else:
+                    headers.pop("x-curie-receiver-proof")
+                refused = client.post("/channels/turns/admission", content=raw, headers=headers)
+                assert refused.status_code == 401, refused.text
+                assert len(synthetic_provider.requests) == count
+        assert identity_client.close_status().state == "closed"
+    finally:
+        keys = membership._keys(valkey, scope["binding"])
+        keys.update(valkey.scan_iter(match="ut10:" + scope["binding"] + ":*"))
         if keys:
             valkey.delete(*keys)
