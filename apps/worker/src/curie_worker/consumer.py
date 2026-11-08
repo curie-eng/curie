@@ -59,6 +59,7 @@ from redis.exceptions import RedisError
 
 from . import capacity_wait as capacity_wait_module
 from .capacity_wait import (
+    REQUESTER_HANDOFF_REASON,
     WAIT_GENERATION_FIELD,
     WAIT_REPLY_REF_FIELD,
     WAIT_TERMINAL_ONLY_FIELD,
@@ -67,6 +68,7 @@ from .capacity_wait import (
     CapacityWaitRefused,
     CapacityWaitRequested,
     CapacityWaitStore,
+    RequesterHandoffWaitRequested,
     ThreadOrderWaitRequested,
     order_delivery_scope,
     wait_delivery_scope,
@@ -877,8 +879,22 @@ class Consumer(StreamConsumer):
                                 entry_id, qevent, wait_generation, lease
                             )
                             return
-                        except CapacityWaitRequested:
+                        except CapacityWaitRequested as requested:
+                            # ADR 0270 decision 3: a different requester's
+                            # deferral waits outside the thread order, so the
+                            # live turn's requester keeps steering it. Its
+                            # order slot, registered before the kernel ran, is
+                            # released first, and the record's sticky reason
+                            # keeps every wake and re-park out of the order.
+                            handoff = isinstance(requested, RequesterHandoffWaitRequested)
                             try:
+                                if handoff and self._kernel._can_park(qevent):
+                                    await self._waits.finish_order(
+                                        _thread_key_for(qevent),
+                                        qevent.event_id,
+                                        lease,
+                                        started=True,
+                                    )
                                 record = await self._waits.park(
                                     entry_id,
                                     fields,
@@ -886,9 +902,10 @@ class Consumer(StreamConsumer):
                                     lease,
                                     thread_key=(
                                         _thread_key_for(qevent)
-                                        if self._kernel._can_park(qevent)
+                                        if self._kernel._can_park(qevent) and not handoff
                                         else None
                                     ),
+                                    reason=REQUESTER_HANDOFF_REASON if handoff else "",
                                 )
                             except Exception:
                                 logger.exception(

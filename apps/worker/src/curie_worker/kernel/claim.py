@@ -43,6 +43,8 @@ from ..capacity_wait import (
     CapacityWaitExpired,
     CapacityWaitRefused,
     CapacityWaitRequested,
+    RequesterHandoffWaitRequested,
+    current_order,
     current_wait,
 )
 from ..connector_grant import mint as mint_connector_grant
@@ -290,7 +292,12 @@ def _requester_handoff_pending(thread_key: str, queued_event_id: str) -> BaseExc
     """Log a different-requester deferral and return the exception to raise.
 
     The line names the event and the thread only, never the requester or its
-    digest. Inside a capacity wait the deferral is that wait's own retry.
+    digest. ADR 0270 decision 3: inside a capacity wait the deferral is that
+    wait's own retry. A delivery that can park asks the consumer for a durable
+    requester handoff wait. The consumer opens this delivery's thread order
+    scope exactly when ``can_park`` holds for it, so that scope is the
+    kernel's proof. Any other delivery (an approval resume, a factory turn, a
+    direct kernel caller) keeps the pending deferral.
     """
 
     logger.info(
@@ -301,6 +308,9 @@ def _requester_handoff_pending(thread_key: str, queued_event_id: str) -> BaseExc
     )
     if current_wait() is not None:
         return CapacityWaitRequested()
+    ordering = current_order()
+    if ordering is not None and ordering[1] == queued_event_id:
+        return RequesterHandoffWaitRequested()
     return failures.RequesterHandoffPending(
         f"thread {thread_key} has a live turn for a different requester; deferring"
     )
@@ -550,6 +560,14 @@ async def _route_and_start(
 
     enforced = requester_enforced()
     desired_requester, _desired_exp = caller_requester_facts(boot_env)
+    # ADR 0270 decision 3: an opted-in approval resume boots with a fresh
+    # short-lived credential for the original requester, so it never adopts a
+    # live warm route (a failed suspend leaves the paused runner live). The
+    # snapshot's route is replaced through the turn budget handoff below, whose
+    # fence accepts the paused runner's ``awaiting-approval`` status, and a
+    # claim with no route to replace refuses a live route instead of adopting
+    # it. A flag-off resume adopts as before.
+    resume_replaces = approval_resume and enforced
 
     def caller_needed_for(candidate: SandboxHandle) -> int | None:
         # Only a requester route has a token window to cover; computed for
@@ -606,7 +624,12 @@ async def _route_and_start(
         and workspace_repo is not None
         and existing_handle is not None
         and existing_handle.workspace_repo is None
-        and not await self._workspace_handoff_ready(existing_handle, remaining_s=remaining_s)
+        and not await self._workspace_handoff_ready(
+            existing_handle,
+            remaining_s=remaining_s,
+            # ADR 0270 decision 3: a replacing resume meets its paused runner.
+            lineage_reconciliation=resume_replaces,
+        )
     ):
         raise failures.ThreadBusyError(
             f"thread {thread_key} has not reached a durable workspace handoff boundary"
@@ -633,16 +656,22 @@ async def _route_and_start(
     # message arriving while a turn is live keeps the one-live-session
     # rule instead: it adopts and steers, and the replacement applies
     # from the next new turn.
-    turn_budget_replacement = existing_handle is not None and _boots_differently(
-        existing_handle,
-        boot_env,
-        caller_run=caller_run,
-        requester_enforced=enforced,
-        caller_needed=caller_needed_for(existing_handle),
+    turn_budget_replacement = existing_handle is not None and (
+        resume_replaces
+        or _boots_differently(
+            existing_handle,
+            boot_env,
+            caller_run=caller_run,
+            requester_enforced=enforced,
+            caller_needed=caller_needed_for(existing_handle),
+        )
     )
     if (
         turn_budget_replacement
         and existing_handle is not None
+        # A replacing resume never keeps the route to steer a live turn: the
+        # fence below refuses a live runner, and the redelivery replaces it.
+        and not resume_replaces
         and not source.is_job
         and verified_review is None
         and await self._turn_active(existing_handle, remaining_s=remaining_s)
@@ -651,7 +680,14 @@ async def _route_and_start(
     if (
         turn_budget_replacement
         and existing_handle is not None
-        and not await self._workspace_handoff_ready(existing_handle, remaining_s=remaining_s)
+        and not await self._workspace_handoff_ready(
+            existing_handle,
+            remaining_s=remaining_s,
+            # The fence's only use of this flag is to also accept an idle
+            # ``awaiting-approval`` runner with durable history: exactly the
+            # paused runner a replacing resume continues (ADR 0270 decision 3).
+            lineage_reconciliation=resume_replaces,
+        )
     ):
         raise failures.ThreadBusyError(
             f"thread {thread_key} has not reached a durable turn budget handoff boundary"
@@ -776,8 +812,15 @@ async def _route_and_start(
                 agent_name=agent_name,
                 runner_resources=runner_resources,
                 remaining_s=remaining_s,
-                attachment_fresh_only=attachment_fresh_only,
+                # ADR 0270 decision 3: a replacing resume with no route to
+                # replace never adopts one that appeared since the snapshot.
+                # The claim refuses it (a retryable RouteChangedError) and the
+                # retry's snapshot replaces it through the handoff above.
+                attachment_fresh_only=(
+                    attachment_fresh_only or (resume_replaces and replace_handle is None)
+                ),
                 caller_run=caller_run,
+                resume_replacement=resume_replaces,
             )
             # ADR 0270 decision 3: the claimed handle, not only the snapshot.
             # A claim can adopt a live route the snapshot never saw (no route
@@ -1400,6 +1443,7 @@ async def _claim_or_resume(
     remaining_s: float | None = None,
     attachment_fresh_only: bool = False,
     caller_run: str | None = None,
+    resume_replacement: bool = False,
 ) -> SandboxHandle:
     wait = current_wait()
     previous_handle: SandboxHandle | None = None
@@ -1522,7 +1566,9 @@ async def _claim_or_resume(
                     lambda probe_remaining_s: self._workspace_handoff_ready(
                         replace_handle,
                         remaining_s=probe_remaining_s,
-                        lineage_reconciliation=force_lineage_replacement,
+                        # ADR 0270 decision 3: a replacing approval resume
+                        # meets its paused ``awaiting-approval`` runner.
+                        lineage_reconciliation=(force_lineage_replacement or resume_replacement),
                         pending_publication_approval=pending_publication_approval,
                     ),
                     failure=(
