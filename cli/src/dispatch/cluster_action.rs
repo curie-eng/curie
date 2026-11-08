@@ -1276,7 +1276,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 conn.api_key,
                 &conn.namespace,
                 &conn.release,
-                dry_run,
+                dry_run && !matches!(action.as_str(), "adopt" | "replace"),
             )
             .await?;
             emit(commands::identity_operator(api_url, api_key, method, path, apply, dry_run).await?)
