@@ -220,6 +220,10 @@ async def _start_turn_under_hook_control(
     from .identity import check
 
     await check(self, "start")
+    # ADR 0270 decision 3: a turn on a principal-bearing route runs for at most
+    # the requester window. Every credential below, and the runner's stream
+    # deadline, is bound from this capped budget.
+    remaining_s, window_bound = self._bound_requester_turn(handle, remaining_s)
     if event.tool_access is not None:
         # @spec WORKER-TOOL-ACCESS-2: every path that opens a turn comes
         # through here, the attachment handoff included.
@@ -270,6 +274,8 @@ async def _start_turn_under_hook_control(
                     await deactivate_turn_progress(self._progress, plan)
                 raise
             await _own_opened_turn(self, handle, turn, plan)
+            if window_bound:
+                turn.requester_window_bound = True
             if mint is not None:
                 self._record_turn_deadline(mint.grant, remaining_s)
             memory._note_live_memory_turn(turn)
@@ -289,6 +295,8 @@ async def _start_turn_under_hook_control(
             await deactivate_turn_progress(self._progress, plan)
         raise
     await _own_opened_turn(self, handle, turn, plan)
+    if window_bound:
+        turn.requester_window_bound = True
     if mint is not None:
         self._record_turn_deadline(mint.grant, remaining_s)
     # This attempt owns the turn, so it closes the steers that join it.

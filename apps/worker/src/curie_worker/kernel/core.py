@@ -306,6 +306,9 @@ class Kernel:
     _log_claim_latency = staticmethod(claim._log_claim_latency)
     _turn_active = claim._turn_active
     _cap_caller_token_to_deadline = claim._cap_caller_token_to_deadline
+    _requester_turn_cap_s = claim._requester_turn_cap_s
+    _requester_turn_budget = claim._requester_turn_budget
+    _bound_requester_turn = claim._bound_requester_turn
     _requester_needed_exp = claim._requester_needed_exp
     _require_requester_window = claim._require_requester_window
     _claim_or_resume = claim._claim_or_resume

@@ -180,17 +180,70 @@ def _boots_differently(
     return CONNECTOR_CALLER_TOKEN_ENV in env and not handle.carries_caller_token
 
 
+def _requester_turn_cap_s(self: Kernel) -> float:
+    """The longest runtime bound a principal-bearing turn may have.
+
+    ADR 0270 decision 3: the requester cct lives one hour from its claim-time
+    mint, and a cold claim and the boot grace come out of that hour before
+    the turn can start.
+    """
+
+    return float(
+        REQUESTER_CALLER_TOKEN_TTL_SECONDS
+        - BOOT_TOKEN_GRACE_SECONDS
+        - self._substrate.claim_timeout_seconds
+    )
+
+
+def _requester_turn_budget(self: Kernel, remaining_s: float | None) -> float:
+    """``remaining_s`` capped at the requester window (ADR 0270 decision 3).
+
+    Passing the capped budget to the runner bounds the turn's stream deadline,
+    and every credential minted from the same budget, to the window.
+    """
+
+    cap = self._requester_turn_cap_s()
+    return cap if remaining_s is None else min(remaining_s, cap)
+
+
+def _bound_requester_turn(
+    self: Kernel, handle: SandboxHandle, remaining_s: float | None
+) -> tuple[float | None, bool]:
+    """The budget a turn on ``handle`` opens with, and whether the window bounds it.
+
+    ADR 0270 decision 3. A turn on a route that booted with a requester digest
+    runs for at most the requester window: its configured runtime bound is
+    capped there instead of refusing the turn. The INFO line names the thread
+    and the two bounds, never the requester. Any other route is unchanged.
+    """
+
+    if not _is_requester_digest(handle.caller_requester):
+        return remaining_s, False
+    configured = self._runner.turn_deadline_s(remaining_s)
+    cap = self._requester_turn_cap_s()
+    if configured <= cap:
+        return remaining_s, False
+    logger.info(
+        "requester turn on thread %s bounded to %.0fs by the requester token window "
+        "(configured bound %.0fs)",
+        handle.thread_key,
+        cap,
+        configured,
+    )
+    return self._requester_turn_budget(remaining_s), True
+
+
 def _requester_needed_exp(self: Kernel, remaining_s: float | None, run: WorkItemRun | None) -> int:
     """The expiry a requester token must reach to cover a turn opened now.
 
-    ADR 0270 decision 3: now, plus the turn's runtime bound for this budget,
-    plus the boot grace, lowered to the run's execution deadline when the
-    delivery owns one (the turn cannot outlive it).
+    ADR 0270 decision 3: now, plus the turn's runtime bound for this budget
+    capped at the requester window, plus the boot grace, lowered to the run's
+    execution deadline when the delivery owns one (the turn cannot outlive it).
     """
 
     needed = (
         int(clock.time.time())
-        + math.ceil(self._runner.turn_deadline_s(remaining_s))
+        + math.ceil(self._runner.turn_deadline_s(self._requester_turn_budget(remaining_s)))
         + BOOT_TOKEN_GRACE_SECONDS
     )
     deadline = run.execution_deadline if run is not None else None

@@ -1137,47 +1137,146 @@ def test_a_deferred_delivery_stays_pending_then_runs_once(make_harness) -> None:
 # -- 11: the boot guard ---------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("runner_total_s", "human", "refused"),
-    [(3500.0, True, True), (600.0, True, False), (3500.0, False, False)],
-    ids=["human-over-the-window", "control-600s", "principal-less-3500s"],
-)
-def test_a_turn_longer_than_the_requester_window_refuses_before_boot(
-    make_harness, runner_total_s: float, human: bool, refused: bool
-) -> None:
-    """@spec CONNECTOR-REQUESTER-3: 3500 + 60 grace + 90 claim reserve > 3600.
+# 3600 s requester window, less the 60 s boot grace and the 90 s claim reserve.
+_REQUESTER_CAP_S = 3450.0
 
-    An opted-in human turn whose runtime bound cannot fit the one-hour token
-    refuses terminally before boot. Controls: a 600 s bound boots with the
-    principal; a principal-less turn is not subject to the guard.
+
+@pytest.mark.parametrize(
+    ("runner_total_s", "human", "capped"),
+    [
+        (10800.0, True, True),
+        (3500.0, True, True),
+        (600.0, True, False),
+        (10800.0, False, False),
+    ],
+    ids=["human-chart-default-10800s", "human-3500s", "control-600s", "principal-less-10800s"],
+)
+def test_an_opted_in_turn_is_capped_at_the_requester_window_and_boots(
+    make_harness,
+    caplog: pytest.LogCaptureFixture,
+    runner_total_s: float,
+    human: bool,
+    capped: bool,
+) -> None:
+    """@spec CONNECTOR-REQUESTER-3: bound the opted-in execution to the window.
+
+    The chart's default runner bound is 10800 s. An opted-in human turn under
+    it boots with its principal, and its boot token and runner stream deadline
+    are capped at 3600 - 60 grace - 90 claim = 3450 s instead of refusing. A
+    600 s bound already fits and is unchanged; a principal-less turn is not
+    capped at all.
     """
     require_execution_interface()
     require_requester_interface()
+    caplog.set_level(logging.INFO)
 
     async def run() -> None:
-        binding = RequesterBinding(flag=True)
+        binding = MintingRequesterBinding(flag=True)
         core = RequesterCore(binding.requester_wire() if human else None)
         async with make_harness(
             binding=binding,
             identity_authority=core,
             claim_timeout_seconds=90.0,
             runner_total_timeout_s=runner_total_s,
-            delivery_budget_s=3600.0,
+            delivery_budget_s=runner_total_s,
         ) as h:
-            event = qevent("a long turn", thread="boot-guard")
+            event = qevent("a long turn", thread="window-cap")
             await process(h, event)
             assert binding.flag_reads
-            if refused:
-                assert binding.boot_kwargs == [], "a token was minted for a refused turn"
-                assert_refused_before_boot(h, binding)
-                assert h.sink.events == []
-                assert await is_done(h, event)
-                return
-            assert len(binding.boot_kwargs) == 1
+            assert len(binding.boot_kwargs) == 1, "the turn was refused"
             expected = principal_for(binding.requester_wire()) if human else None
             assert binding.boot_kwargs[0].get("caller_principal") == expected
+            ttl = float(binding.boot_kwargs[0]["token_ttl_s"])
+            bounded = logged(caplog, "bounded to 3450s by the requester token window")
+            if capped:
+                assert ttl == _REQUESTER_CAP_S
+                assert bounded, "the cap was applied silently"
+                assert logged(caplog, "effective timeout 3450.000s")
+            else:
+                assert runner_total_s - 30 < ttl <= runner_total_s
+                assert not bounded
             assert len(h.fake_k8s.claim_envs) == 1
             assert h.runner.opened == [event.text]
+            assert await is_done(h, event)
+
+    asyncio.run(run())
+
+
+def test_a_claim_reserve_that_leaves_no_window_refuses_before_boot(make_harness) -> None:
+    """@spec CONNECTOR-REQUESTER-3: a bound that cannot be lowered still refuses.
+
+    A claim reserve of 3545 s plus the 60 s boot grace leaves no part of the
+    one-hour window, and the runner's minimum request time cannot go below
+    zero, so the opted-in turn refuses before any token is minted. No opted-in
+    turn runs longer than the window.
+    """
+    require_execution_interface()
+    require_requester_interface()
+
+    async def run() -> None:
+        binding = MintingRequesterBinding(flag=True)
+        core = RequesterCore(binding.requester_wire())
+        async with make_harness(
+            binding=binding,
+            identity_authority=core,
+            claim_timeout_seconds=3545.0,
+            runner_total_timeout_s=600.0,
+            delivery_budget_s=600.0,
+        ) as h:
+            event = qevent("no window left", thread="window-none")
+            await process(h, event)
+            assert binding.flag_reads
+            assert binding.boot_kwargs == [], "a token was minted for a refused turn"
+            assert_refused_before_boot(h, binding)
+            assert h.sink.events == []
+            assert await is_done(h, event)
+
+    asyncio.run(run())
+
+
+def test_the_window_ends_a_long_turn_visibly_and_never_retries(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """@spec CONNECTOR-REQUESTER-3: the cap ends the turn like a deadline, visibly.
+
+    A 3539.5 s claim reserve leaves a 0.5 s window, so a turn that keeps
+    running is stopped there. The outcome is ``requester-window``: shown to the
+    requester with its guidance, logged at INFO, and not retried, because a
+    retry would run the same request past the window on a fresh token.
+    """
+    require_execution_interface()
+    require_requester_interface()
+    caplog.set_level(logging.INFO)
+
+    async def run() -> None:
+        binding = MintingRequesterBinding(flag=True)
+        core = RequesterCore(binding.requester_wire())
+        async with make_harness(
+            binding=binding,
+            identity_authority=core,
+            claim_timeout_seconds=3539.5,
+            runner_total_timeout_s=600.0,
+            delivery_budget_s=600.0,
+            max_attempts=3,
+        ) as h:
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.timeout_status = 200
+            # No Final: the turn is still working when the window ends it.
+            h.runner.default_script = [TextDelta(text="working")]
+            event = qevent("keep working", thread="window-end")
+            try:
+                await process(h, event)
+            finally:
+                hold.set()
+            assert len(binding.boot_kwargs) == 1
+            assert h.runner.opened == [event.text], "the capped turn was retried"
+            assert h.runner.timeout_calls == 1
+            assert logged(caplog, "ended at the requester token window")
+            assert h.sink.last_text is not None
+            assert "requester-window" in h.sink.last_text
+            assert "one-hour limit" in h.sink.last_text
+            assert await is_done(h, event)
 
     asyncio.run(run())
 

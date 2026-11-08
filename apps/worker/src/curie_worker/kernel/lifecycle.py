@@ -939,9 +939,15 @@ async def _process_event(
             )
             if principal is not None:
                 # ADR 0270 decision 3: a requester cct lives one hour from its
-                # claim-time mint. A turn whose runtime bound, boot grace and
-                # cold claim budget cannot fit in it refuses before boot, so no
-                # admitted configuration fails the window on every claim.
+                # claim-time mint. The turn's runtime bound is capped at what
+                # is left of that hour after the boot grace and a cold claim,
+                # so the boot token is minted from the capped budget. Only a
+                # bound that cannot be lowered that far (the runner's minimum
+                # request time) still refuses before boot: no opted-in turn
+                # runs longer than the window.
+                boot_env_kwargs["token_ttl_s"] = self._runner.turn_deadline_s(
+                    self._requester_turn_budget(claim._remaining_budget(lease))
+                )
                 window_s = (
                     float(boot_env_kwargs["token_ttl_s"])
                     + BOOT_TOKEN_GRACE_SECONDS
@@ -950,7 +956,7 @@ async def _process_event(
                 if window_s > REQUESTER_CALLER_TOKEN_TTL_SECONDS:
                     logger.info(
                         "requester turn %s refused before boot: its runtime bound "
-                        "exceeds the requester token window",
+                        "cannot be lowered into the requester token window",
                         event_id,
                     )
                     raise identity.HttpIdentityRefused()

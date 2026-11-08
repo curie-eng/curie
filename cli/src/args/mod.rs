@@ -82,7 +82,10 @@ pub(crate) struct RequesterIdentityArgs {
     /// replaces a sandbox before serving a different requester, and a
     /// different person's message that arrives during a live turn waits for
     /// that turn to end; if the turn outlasts the redelivery budget the
-    /// message is settled visibly without running. Precondition: the api, the
+    /// message is settled visibly without running. A person's turn runs for at
+    /// most the one-hour life of their connector credential, less the boot
+    /// grace and the sandbox claim time; a turn still working then is stopped
+    /// and reported as `requester-window`. Precondition: the api, the
     /// worker and the agent's connector proxies must all run this release
     /// (redeploy the agent if its connector proxies predate it); a partial
     /// rollout refuses the agent's HTTP turns or connector calls.

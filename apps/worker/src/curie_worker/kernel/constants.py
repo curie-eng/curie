@@ -261,6 +261,11 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
 
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
 
+#: ADR 0270 decision 3: a principal-bearing turn ran until the requester token
+#: window ended it. Worker local, and not retryable: a retry would run the same
+#: person's request past the window on a fresh token.
+REQUESTER_WINDOW_CLASSIFICATION = "requester-window"
+
 WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset(
     {
         "ownership-store-unavailable",
@@ -272,6 +277,7 @@ WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset(
         # does not advertise channel read enforcement. Worker local, so a
         # runner ErrorEvent naming it is not trusted. Not retryable.
         CHANNEL_READ_UNENFORCED_CLASSIFICATION,
+        REQUESTER_WINDOW_CLASSIFICATION,
     }
 )
 
@@ -313,6 +319,11 @@ _ESCALATION_CAUSES = {
 # Operator guidance appended to an escalation lead for classifications whose
 # fix is a known knob (#3071). Keyed by the displayed classification token.
 _CLASSIFICATION_GUIDANCE = {
+    REQUESTER_WINDOW_CLASSIFICATION: (
+        "The turn reached the one-hour limit of the requester's connector credential "
+        "(connector requester identity is on for this agent) and was stopped. Work "
+        "already performed may have side effects; split the request into shorter turns."
+    ),
     "history-persistence-error": (
         "Conversation history capacity exceeded. Work already performed may have side "
         "effects; inspect the result. The run can be retried; if one turn is over the "
