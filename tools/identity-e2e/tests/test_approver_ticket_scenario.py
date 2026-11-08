@@ -530,11 +530,11 @@ def test_the_gated_bundle_passes_intake_and_declares_only_its_route(
 def test_the_multipart_upload_reaches_fastapi_as_the_archive() -> None:
     app = FastAPI()
 
-    @app.put("/upload")
     async def upload(file: UploadFile) -> dict[str, Any]:
         data = await file.read()
         return {"name": file.filename, "sha256": hashlib.sha256(data).hexdigest()}
 
+    app.add_api_route("/upload", upload, methods=["PUT"])
     data = gated_archive(tickets.TICKET_ROUTE)
     body, content_type = tickets.multipart("file", "bundle.tar.gz", data, "application/gzip")
     with TestClient(app) as client:
