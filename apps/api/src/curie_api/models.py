@@ -36,7 +36,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
-from .approval_wording import approval_display
+from .approval_wording import approval_display, describe_approval
 from .db import SCHEMA, Base
 from .forges.types import RepositoryRef, TrackerIssueRef
 from .repo_full_name import normalize_repo_full_name
@@ -676,7 +676,13 @@ class Approval(Base):
     summary: Mapped[str]
     @property
     def display_summary(self) -> str:
-        """Computed presentation; grants still bind to the stored exact fields."""
+        """Computed presentation; grants still bind to the stored exact fields.
+
+        A dynamic row describes its stored grant, never its summary text
+        (ADR 0271 decision 8); the describer leaves out the opaque ticket.
+        """
+        if self.selection_mode == "dynamic":
+            return describe_approval(self.granted_tool, self.granted_arguments)
         return approval_display(self.summary, self.granted_tool, self.granted_arguments)
 
     # The reply handle of the requesting turn, replayed onto the resume turn so

@@ -708,3 +708,213 @@ def test_cancellation_closes_response_and_cleanup_fault_never_masks_cancelled_er
         assert len(seen) == 1
 
     asyncio.run(go())
+
+
+# --- ADR 0271 decisions 4 and 8: the V2 receipt carries the stored values ------------
+
+STORED_TOOL = "mcp__access__execute"
+TICKET = "cat1.SyntheticTicketPayload.SyntheticTicketSignature"
+STORED_ARGUMENTS = {"account": "acct-example-1", "approval_ticket": TICKET, "change": {"role": "é"}}
+APPROVER_ISSUER = "https://idp.example.test/directory"
+SELECTED = [
+    {"tenant_id": UUID, "issuer": APPROVER_ISSUER, "subject": "SyntheticApproverA"},
+    {"tenant_id": UUID, "issuer": APPROVER_ISSUER, "subject": "SyntheticApproverB"},
+]
+STORED_FIELDS = ("granted_tool", "granted_arguments", "selected_approvers")
+
+
+def v2_body(request: dict[str, Any]) -> dict[str, Any]:
+    """@spec REQUEST-APPROVAL-4: independent oracle for a dynamic approval's receipt."""
+    return {
+        **response_body(request),
+        "schema_version": 2,
+        "granted_tool": STORED_TOOL,
+        "granted_arguments": canonical(STORED_ARGUMENTS).decode(),
+        "selected_approvers": copy.deepcopy(SELECTED),
+    }
+
+
+def require_stored_fields() -> None:
+    """@spec REQUEST-APPROVAL-4: absence of the stored fields is an execution assertion."""
+    import dataclasses
+
+    names = {field.name for field in dataclasses.fields(modules()[0].CreatedApproval)}
+    missing = sorted(set(STORED_FIELDS) - names)
+    assert not missing, f"CreatedApproval does not carry stored values: {missing}"
+
+
+def principals(value: Any) -> list[dict[str, Any]]:
+    """@spec REQUEST-APPROVAL-4: project selected people whatever immutable carrier holds them."""
+    import dataclasses
+
+    result = []
+    for item in value:
+        if isinstance(item, dict):
+            result.append(dict(item))
+        elif hasattr(item, "model_dump"):
+            result.append(item.model_dump(mode="json"))
+        elif dataclasses.is_dataclass(item):
+            result.append(dataclasses.asdict(item))
+        else:
+            raise AssertionError(f"unexpected selected approver carrier: {type(item).__name__}")
+    return result
+
+
+def assert_stored(result: Any) -> None:
+    """@spec REQUEST-APPROVAL-4 REQUEST-APPROVAL-8: the receipt's stored values, exactly."""
+    assert result.granted_tool == STORED_TOOL
+    assert type(result.granted_arguments) is dict
+    assert result.granted_arguments == STORED_ARGUMENTS
+    assert result.granted_arguments["approval_ticket"] == TICKET
+    assert principals(result.selected_approvers) == SELECTED
+
+
+@pytest.mark.parametrize(("status", "historical"), [(201, "pending"), (200, "approved")])
+def test_creation_v2_receipt_sets_the_stored_grant_and_selection(
+    status: int, historical: str,
+) -> None:
+    """@spec REQUEST-APPROVAL-4: fresh and historical V2 receipts both carry stored values."""
+    require_stored_fields()
+
+    async def go() -> None:
+        """@spec REQUEST-APPROVAL-4."""
+        seen, streams = [], []
+
+        async def handle(request: httpx.Request) -> httpx.Response:
+            """@spec REQUEST-APPROVAL-4."""
+            seen.append(request)
+            body = v2_body(json.loads(request.content))
+            body.update(status=historical, duplicate=status == 200)
+            stream = Stream(canonical(body))
+            streams.append(stream)
+            return httpx.Response(status, stream=stream)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            result = await invoke(client(http))
+        assert isinstance(result, modules()[0].CreatedApproval)
+        assert (result.id, result.status, result.requested_by, result.requester_known) == (
+            OTHER, historical, None, True,
+        )
+        assert_stored(result)
+        assert len(seen) == 1 and all(stream.finished for stream in streams)
+        # The request is unchanged: only the receipt is versioned.
+        wire = json.loads(seen[0].content)
+        assert set(wire) == {"schema_version", "request_id", "approval", "identity"}
+        assert wire["schema_version"] == 1
+
+    asyncio.run(go())
+
+
+def test_creation_v1_receipt_and_legacy_creation_leave_stored_values_empty() -> None:
+    """@spec REQUEST-APPROVAL-4 HTTP-APPROVAL-CONTINUITY-3: an ordinary receipt claims nothing."""
+    require_stored_fields()
+
+    async def go() -> None:
+        """@spec REQUEST-APPROVAL-4."""
+        seen = []
+
+        async def handle(request: httpx.Request) -> httpx.Response:
+            """@spec REQUEST-APPROVAL-4."""
+            seen.append(request)
+            if request.url.path == "/approvals":
+                return httpx.Response(
+                    201, json={"id": OTHER, "status": "pending", "requested_by": "legacy"}
+                )
+            return httpx.Response(201, stream=Stream(canonical(response_body(
+                json.loads(request.content)
+            ))))
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            owner = client(http)
+            for result in (await invoke(owner), await owner.create(approval())):
+                assert result.id == OTHER and result.status == "pending"
+                assert result.granted_tool is None
+                assert result.granted_arguments is None
+                assert not result.selected_approvers
+        assert [request.url.path for request in seen] == [CREATE_PATH, "/approvals"]
+
+    asyncio.run(go())
+
+
+def _malformed(fault: str, body: dict[str, Any]) -> dict[str, Any]:
+    """@spec REQUEST-APPROVAL-4: one defect in an otherwise valid V2 receipt."""
+    people = copy.deepcopy(SELECTED)
+    changes: dict[str, Any] = {
+        "version_text": {"schema_version": "2"},
+        "version_bool": {"schema_version": True},
+        "version_three": {"schema_version": 3},
+        "noncanonical_arguments": {"granted_arguments": json.dumps(STORED_ARGUMENTS)},
+        "unsorted_arguments": {"granted_arguments": '{"b":1,"a":2}'},
+        "arguments_object": {"granted_arguments": copy.deepcopy(STORED_ARGUMENTS)},
+        "arguments_array": {"granted_arguments": "[]"},
+        "arguments_null": {"granted_arguments": None},
+        "empty_tool": {"granted_tool": ""},
+        "null_tool": {"granted_tool": None},
+        "no_approvers": {"selected_approvers": []},
+        "seventeen_approvers": {"selected_approvers": [
+            {**SELECTED[0], "subject": f"SyntheticApprover{index}"} for index in range(17)
+        ]},
+        "approver_accounts": {"selected_approvers": [
+            {**people[0], "recipient_accounts": [MARKER]}, people[1],
+        ]},
+        "approver_tenant": {"selected_approvers": [
+            {**people[0], "tenant_id": "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"}, people[1],
+        ]},
+        "approver_missing_subject": {"selected_approvers": [
+            {"tenant_id": UUID, "issuer": APPROVER_ISSUER}, people[1],
+        ]},
+        "unknown_member": {"extra": MARKER},
+        "correlation": {"request_id": OTHER},
+        "duplicate_flag": {"duplicate": True},
+        "fresh_not_pending": {"status": "approved"},
+    }
+    if fault == "v2_without_stored_values":
+        return {k: v for k, v in body.items() if k not in STORED_FIELDS}
+    if fault == "v1_tag_with_stored_values":
+        return {**body, "schema_version": 1}
+    return {**body, **changes[fault]}
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "version_text", "version_bool", "version_three", "v2_without_stored_values",
+        "v1_tag_with_stored_values", "noncanonical_arguments", "unsorted_arguments",
+        "arguments_object", "arguments_array", "arguments_null", "empty_tool", "null_tool",
+        "no_approvers", "seventeen_approvers", "approver_accounts", "approver_tenant",
+        "approver_missing_subject", "unknown_member", "correlation", "duplicate_flag",
+        "fresh_not_pending",
+    ],
+)
+def test_creation_malformed_v2_receipt_is_unavailable_never_a_silent_v1(fault: str) -> None:
+    """@spec REQUEST-APPROVAL-4 HTTP-APPROVAL-CONTINUITY-3: the existing unavailable failure.
+
+    The neighbouring valid V2 receipt on the same client is accepted, so the
+    refusal cannot pass by refusing every V2 receipt.
+    """
+    require_stored_fields()
+
+    async def go() -> None:
+        """@spec REQUEST-APPROVAL-4."""
+        seen, streams = [], []
+
+        async def handle(request: httpx.Request) -> httpx.Response:
+            """@spec REQUEST-APPROVAL-4."""
+            seen.append(request)
+            body = v2_body(json.loads(request.content))
+            if len(seen) == 1:
+                body = _malformed(fault, body)
+            stream = Stream(canonical(body))
+            streams.append(stream)
+            return httpx.Response(201, stream=stream)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            owner = client(http)
+            with pytest.raises(modules()[1].TurnAuthorityUnavailable) as error:
+                await invoke(owner)
+            private_error(error, "identity_authority_unavailable")
+            assert_stored(await invoke(owner))
+        assert [request.url.path for request in seen] == [CREATE_PATH, CREATE_PATH]
+        assert all(stream.finished for stream in streams)
+
+    asyncio.run(go())

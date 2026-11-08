@@ -21,6 +21,10 @@ Every product import is inside a function, so the host imports nothing but the
 standard library. Nothing either half prints carries a key, token, capsule,
 payload, nonce or ticket: results are status codes, refusal codes, ids, counts
 and digest prefixes. The selector signing seed travels to the pod on stdin only.
+The one exception is the ``sign`` action, used by the ``stored-arguments-card``
+scenario: its answer is the ticket a requester turn then carries in its tool
+call, so it returns on the exec's stdout pipe to the host, which keeps it in
+memory and never prints or records it.
 """
 
 from __future__ import annotations
@@ -291,11 +295,26 @@ def approver_filter(issuer: str, subjects: Iterable[str]) -> dict[str, Any]:
 # --- the serving bundles ----------------------------------------------------------------------
 
 
-def gated_manifest(manifest: Mapping[str, Any], gates: Sequence[tuple[str, str]]) -> dict[str, Any]:
-    """``manifest`` with exactly these ``(live tool, route)`` approval gates."""
+def gated_manifest(
+    manifest: Mapping[str, Any],
+    gates: Sequence[tuple[str, str]],
+    *,
+    summary: str | None = None,
+) -> dict[str, Any]:
+    """``manifest`` with exactly these ``(live tool, route)`` approval gates.
+
+    ``summary``, when given, is every gate's bundle-authored display template
+    (``approvalPolicy.gates[].summary``); without it the gates carry none.
+    """
 
     derived = copy.deepcopy(dict(manifest))
-    derived["approvalPolicy"] = {"gates": [{"gate": gate, "route": route} for gate, route in gates]}
+    entries: list[dict[str, str]] = []
+    for gate, route in gates:
+        entry = {"gate": gate, "route": route}
+        if summary is not None:
+            entry["summary"] = summary
+        entries.append(entry)
+    derived["approvalPolicy"] = {"gates": entries}
     return derived
 
 
@@ -1329,6 +1348,51 @@ def _create(params: Mapping[str, Any]) -> dict[str, Any]:
     return {"now": now, "cases": reports, **_counts(params)}
 
 
+def _sign(params: Mapping[str, Any]) -> dict[str, Any]:
+    """One registered-key ticket over ``arguments``, for a turn the host sends.
+
+    The ticket names ``tenant_id`` and ``agent_id``, the turn's verified
+    ``requester``, the ``registered`` connector, tool and route, and the
+    selected ``approvers``; its nonce is fresh, its issue time this pod's clock
+    less :data:`ISSUED_SKEW_S`, its lifetime :data:`TICKET_LIFETIME_S`, and its
+    digest ``execution_arguments_sha256(arguments)``. The only action whose
+    answer carries a ticket (see the module docstring); the nonce stays here.
+    """
+
+    from curie_internal.approver_ticket import (
+        TicketError,
+        execution_arguments_sha256,
+        sign_ticket,
+    )
+    from nacl.signing import SigningKey
+
+    label = "ticket"
+    item = {"ticket": ticket_spec(label), "arguments": dict(params["arguments"])}
+    try:
+        token, claims = mint_ticket(
+            item,
+            nonces={label: new_nonce()},
+            now=int(time.time()),
+            sign=sign_ticket,
+            digest=execution_arguments_sha256,
+            registered_key=SigningKey(bytes.fromhex(params["key"]["seed_hex"])),
+            other_key=SigningKey.generate,
+            tenant_id=str(params["tenant_id"]),
+            agent_id=str(params["agent_id"]),
+            requester=params["requester"],
+            approvers=params["approvers"],
+            registered=params["registered"],
+            key_id=params["key"]["key_id"],
+        )
+    except TicketError as exc:
+        raise DriverRefusal(f"the ticket does not encode ({exc.code})") from None
+    return {
+        "ticket": token,
+        "issued_at": int(claims["issued_at"]),
+        "expires_at": int(claims["expires_at"]),
+    }
+
+
 def _counts(params: Mapping[str, Any]) -> dict[str, Any]:
     """Approval rows by dedupe key, spent nonces by label and row facts, from Postgres."""
 
@@ -1570,6 +1634,7 @@ _ACTIONS: dict[str, Callable[[Mapping[str, Any]], dict[str, Any]]] = {
     "principal": _principal,
     "approver_role": _approver_role,
     "race_flag": _race_flag,
+    "sign": _sign,
 }
 
 

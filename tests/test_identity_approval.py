@@ -736,3 +736,242 @@ def test_flat_original_and_actor_outcomes_keep_nullable_principals_without_grant
     assert result.actor_scope.native_id == "answerer"
     with pytest.raises(TypeError):
         bool(result)
+
+
+# --- ADR 0271 decisions 4 and 8: the versioned creation receipt ----------------------
+
+V1_RECEIPT_FIELDS = ("schema_version", "request_id", "id", "status", "duplicate", "requested_by")
+V2_RECEIPT_FIELDS = (*V1_RECEIPT_FIELDS, "granted_tool", "granted_arguments", "selected_approvers")
+APPROVER_ISSUER = "https://idp.example.test/directory"
+TICKET = "cat1.SyntheticTicketPayload.SyntheticTicketSignature"
+
+
+def receipt_api() -> Any:
+    """@spec REQUEST-APPROVAL-4: absence of the versioned receipt is an execution assertion."""
+    module = api()
+    for symbol in ("ApprovalCreationResponseV2", "creation_receipt"):
+        assert hasattr(module, symbol), f"versioned creation receipt missing: {symbol}"
+    return module
+
+
+def approver(subject: str = "SyntheticApproverA", tenant: str = UUID) -> dict[str, Any]:
+    """@spec REQUEST-APPROVAL-4: one canonical selected principal."""
+    return {"tenant_id": tenant, "issuer": APPROVER_ISSUER, "subject": subject}
+
+
+def stored_arguments() -> dict[str, Any]:
+    """@spec REQUEST-APPROVAL-4: the stored, grant-bound arguments, ticket included."""
+    return {"account": "acct-example-1", "approval_ticket": TICKET, "change": {"role": "é"}}
+
+
+def receipt_v2() -> dict[str, Any]:
+    """@spec REQUEST-APPROVAL-4: a dynamic approval's receipt carries its stored values."""
+    return {
+        **model_bodies()["ApprovalCreationResponseV1"],
+        "schema_version": 2,
+        "granted_tool": "mcp__access__execute",
+        "granted_arguments": canonical(stored_arguments()).decode(),
+        "selected_approvers": [approver("SyntheticApproverA"), approver("SyntheticApproverB")],
+    }
+
+
+def test_v2_receipt_requires_every_field_and_is_closed_frozen_and_not_permission() -> None:
+    """@spec REQUEST-APPROVAL-4 HTTP-APPROVAL-CONTINUITY-2: strict and closed like V1."""
+    model = receipt_api().ApprovalCreationResponseV2
+    body = receipt_v2()
+    assert set(model.model_fields) == set(V2_RECEIPT_FIELDS) == set(body)
+    value = model.model_validate(body)
+    assert value.model_dump(mode="json") == body
+    assert model.model_validate_json(value.model_dump_json()) == value
+    assert value.granted_arguments == body["granted_arguments"]
+    assert type(value.granted_arguments) is str
+    for field in body:
+        with pytest.raises(ValueError):
+            model.model_validate({k: v for k, v in body.items() if k != field})
+    with pytest.raises(ValueError):
+        model.model_validate({**body, "unknown": MARKER})
+    with pytest.raises(ValueError):
+        model.model_validate(value.model_copy(update={"unknown": MARKER}))
+    with pytest.raises(TypeError):
+        bool(value)
+    for field in ("granted_tool", "granted_arguments", "selected_approvers"):
+        with pytest.raises((ValueError, AttributeError, TypeError)):
+            setattr(value, field, MARKER)
+    source = receipt_v2()
+    kept = model.model_validate(source)
+    source["selected_approvers"][0]["subject"] = MARKER
+    source["selected_approvers"].append(approver("SyntheticLate"))
+    assert kept.model_dump(mode="json") == receipt_v2()
+
+
+@pytest.mark.parametrize("invalid", [1, "2", True, 2.0, 3, 0, None])
+def test_v2_schema_version_is_exactly_the_integer_two(invalid: Any) -> None:
+    """@spec REQUEST-APPROVAL-4: a 1, a "2" or a boolean is not version 2."""
+    model = receipt_api().ApprovalCreationResponseV2
+    with pytest.raises(ValueError):
+        model.model_validate({**receipt_v2(), "schema_version": invalid})
+    assert model.model_validate(receipt_v2()).schema_version == 2
+
+
+def test_v1_receipt_is_unchanged_and_never_carries_stored_values() -> None:
+    """@spec REQUEST-APPROVAL-4 HTTP-APPROVAL-CONTINUITY-3: V1 keeps its exact closed shape."""
+    module = receipt_api()
+    v1 = module.ApprovalCreationResponseV1
+    body = model_bodies()["ApprovalCreationResponseV1"]
+    assert tuple(v1.model_fields) == V1_RECEIPT_FIELDS
+    assert v1.model_validate(body).model_dump(mode="json") == body
+    with pytest.raises(ValueError):
+        v1.model_validate({**body, "schema_version": 2})
+    with pytest.raises(ValueError):
+        v1.model_validate({**receipt_v2(), "schema_version": 1})
+
+
+@pytest.mark.parametrize(
+    ("path", "invalid"),
+    [
+        ("request_id", RECEIVER.upper()),
+        ("id", OTHER.replace("-", "")),
+        ("status", "unknown"),
+        ("duplicate", 1),
+        ("requested_by", 7),
+        ("granted_tool", ""),
+        ("granted_tool", None),
+        ("granted_tool", 7),
+        ("granted_tool", b"mcp__access__execute"),
+    ],
+)
+def test_v2_reuses_the_v1_field_rules_and_requires_a_granted_tool(path: str, invalid: Any) -> None:
+    """@spec REQUEST-APPROVAL-4 HTTP-APPROVAL-CONTINUITY-2: no coercion of any field."""
+    model = receipt_api().ApprovalCreationResponseV2
+    with pytest.raises(ValueError):
+        model.model_validate(replaced(receipt_v2(), path, invalid))
+    assert model.model_validate(receipt_v2()).granted_tool == "mcp__access__execute"
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "null",
+        "[]",
+        "",
+        '"text"',
+        '{"a":1,"a":2}',
+        '{"x":{"a":1,"a":2}}',
+        '{"x":NaN}',
+        '{"x":Infinity}',
+        '{"x":"\\ud800"}',
+        '{ "x":1}',
+        '{"x": 1}',
+        '{"b":2,"a":1}',
+        '{"x":"\\u00e9"}',
+        {"x": 1},
+        None,
+        7,
+    ],
+)
+def test_v2_granted_arguments_is_the_canonical_text_of_a_json_object(invalid: Any) -> None:
+    """@spec REQUEST-APPROVAL-4 HTTP-APPROVAL-CONTINUITY-12: the existing argument rule."""
+    model = receipt_api().ApprovalCreationResponseV2
+    with pytest.raises(ValueError):
+        model.model_validate({**receipt_v2(), "granted_arguments": invalid})
+    assert model.model_validate(receipt_v2()).granted_arguments == canonical(
+        stored_arguments()
+    ).decode()
+
+
+def test_v2_granted_arguments_keeps_exact_text_up_to_the_utf8_limit() -> None:
+    """@spec REQUEST-APPROVAL-4 HTTP-APPROVAL-CONTINUITY-12: inclusive byte bound, no rewrite."""
+    model = receipt_api().ApprovalCreationResponseV2
+    for raw in (
+        "{}",
+        canonical({"array": [3, 1, None, False], "nested": {"é": "é"}}).decode(),
+        canonical({"x": "é" * 8188}).decode(),
+    ):
+        value = model.model_validate({**receipt_v2(), "granted_arguments": raw})
+        assert value.granted_arguments == raw
+    assert len(canonical({"x": "é" * 8188})) == 16_384
+    with pytest.raises(ValueError):
+        model.model_validate(
+            {**receipt_v2(), "granted_arguments": canonical({"x": "é" * 8188 + "x"}).decode()}
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "approvers"),
+    [
+        ("empty", []),
+        ("seventeen", [approver(f"SyntheticApprover{i}") for i in range(17)]),
+        ("missing_tenant", [{"issuer": APPROVER_ISSUER, "subject": "SyntheticApproverA"}]),
+        ("missing_issuer", [{"tenant_id": UUID, "subject": "SyntheticApproverA"}]),
+        ("missing_subject", [{"tenant_id": UUID, "issuer": APPROVER_ISSUER}]),
+        ("recipient_accounts", [{**approver(), "recipient_accounts": []}]),
+        ("extra_member", [{**approver(), "unknown": MARKER}]),
+        ("uppercase_tenant", [approver(tenant=RECEIVER.upper())]),
+        ("unhyphenated_tenant", [approver(tenant=UUID.replace("-", ""))]),
+        ("empty_subject", [approver(subject="")]),
+        ("numeric_subject", [{**approver(), "subject": 7}]),
+        ("bytes_issuer", [{**approver(), "issuer": b"issuer"}]),
+        ("string_member", ["SyntheticApproverA"]),
+        ("object_not_list", {"0": approver()}),
+        ("null", None),
+    ],
+)
+def test_v2_selected_approvers_are_one_to_sixteen_canonical_principals(
+    name: str, approvers: Any,
+) -> None:
+    """@spec REQUEST-APPROVAL-3/4: exactly tenant_id, issuer and subject per person."""
+    model = receipt_api().ApprovalCreationResponseV2
+    with pytest.raises(ValueError):
+        model.model_validate({**receipt_v2(), "selected_approvers": approvers})
+    for count in (1, 16):
+        people = [approver(f"SyntheticApprover{i}") for i in range(count)]
+        value = model.model_validate({**receipt_v2(), "selected_approvers": people})
+        assert value.model_dump(mode="json")["selected_approvers"] == people
+
+
+def test_creation_receipt_returns_the_model_its_schema_version_names() -> None:
+    """@spec REQUEST-APPROVAL-4: V1 and V2 both read; each as exactly its own model."""
+    module = receipt_api()
+    v1_body = model_bodies()["ApprovalCreationResponseV1"]
+    v1 = module.creation_receipt(v1_body)
+    assert type(v1) is module.ApprovalCreationResponseV1
+    assert v1 == module.ApprovalCreationResponseV1.model_validate(v1_body)
+    v2 = module.creation_receipt(receipt_v2())
+    assert type(v2) is module.ApprovalCreationResponseV2
+    assert v2.model_dump(mode="json") == receipt_v2()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("v1_tag_with_stored_values", {**receipt_v2(), "schema_version": 1}),
+        ("v2_tag_without_stored_values", {**model_bodies()["ApprovalCreationResponseV1"],
+                                          "schema_version": 2}),
+        ("v2_with_noncanonical_arguments", {**receipt_v2(), "granted_arguments": '{ "a":1}'}),
+        ("v2_with_no_approvers", {**receipt_v2(), "selected_approvers": []}),
+        ("version_three", {**receipt_v2(), "schema_version": 3}),
+        ("string_version", {**receipt_v2(), "schema_version": "2"}),
+        ("string_v1_version", {**model_bodies()["ApprovalCreationResponseV1"],
+                               "schema_version": "1"}),
+        ("boolean_version", {**model_bodies()["ApprovalCreationResponseV1"],
+                             "schema_version": True}),
+        ("float_version", {**receipt_v2(), "schema_version": 2.0}),
+        ("null_version", {**receipt_v2(), "schema_version": None}),
+        ("missing_version", {k: v for k, v in receipt_v2().items() if k != "schema_version"}),
+        ("list", [receipt_v2()]),
+        ("text", json.dumps(receipt_v2())),
+        ("null", None),
+        ("number", 2),
+    ],
+)
+def test_creation_receipt_refuses_anything_else_and_never_guesses_a_version(
+    name: str, value: Any,
+) -> None:
+    """@spec REQUEST-APPROVAL-4: no silent V1 for a malformed V2, no V2 inferred from fields."""
+    module = receipt_api()
+    with pytest.raises((ValueError, TypeError)):
+        module.creation_receipt(value)
+    assert type(module.creation_receipt(receipt_v2())) is module.ApprovalCreationResponseV2
+    assert type(module.creation_receipt(model_bodies()["ApprovalCreationResponseV1"])) is (
+        module.ApprovalCreationResponseV1
+    )

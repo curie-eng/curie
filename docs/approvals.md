@@ -331,6 +331,13 @@ creation, but the check that the person who answers is in the selected set, and
 separation of duties, arrive in a later slice. Until then a dynamic approval cannot be
 approved or rejected through any answer path; it expires on the usual 24 hour timeout.
 
+A dynamic approval's card, the pending notice and the API's `display_summary` describe the
+tool and arguments the platform stored at creation, with the `approval_ticket` left out of
+the preview. A bundle's gate summary or the model's wording never replaces them. When an
+approved call runs, the connector proxy spends its grant once and passes the grant id to
+the connector as `X-Curie-Grant-Verified`, so a connector can refuse an execution call that
+was not approved.
+
 ### Registering a selector
 
 Registration is part of the route binding. Add `approver_ticket` (and optionally

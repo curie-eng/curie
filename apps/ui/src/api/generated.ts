@@ -3266,7 +3266,7 @@ export interface paths {
         put?: never;
         /**
          * Create Identity Approval
-         * @description @spec HTTP-APPROVAL-CONTINUITY-3.
+         * @description V2 only for a dynamic approval. @spec HTTP-APPROVAL-CONTINUITY-3 REQUEST-APPROVAL-4.
          */
         post: operations["create_identity_approval_v1_internal_identity_approvals_post"];
         delete?: never;
@@ -5166,6 +5166,41 @@ export interface components {
              * @constant
              */
             schema_version: 1;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "approved" | "rejected" | "expired";
+        };
+        /**
+         * ApprovalCreationResponseV2
+         * @description A dynamic approval's receipt: V1 plus the persisted grant and selection.
+         *
+         *     ``granted_arguments`` is the canonical JSON text of the stored object, the
+         *     opaque ``approval_ticket`` included; the worker renders these stored values,
+         *     never its original model summary. Display data, never a permit.
+         *     @spec REQUEST-APPROVAL-4 REQUEST-APPROVAL-8 HTTP-APPROVAL-CONTINUITY-3.
+         */
+        ApprovalCreationResponseV2: {
+            /** Duplicate */
+            duplicate: boolean;
+            /** Granted Arguments */
+            granted_arguments: string;
+            /** Granted Tool */
+            granted_tool: string;
+            /** Id */
+            id: string;
+            /** Request Id */
+            request_id: string;
+            /** Requested By */
+            requested_by: string | null;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 2;
+            /** Selected Approvers */
+            selected_approvers: components["schemas"]["SelectedApproverV1"][];
             /**
              * Status
              * @enum {string}
@@ -10276,6 +10311,18 @@ export interface components {
         ScheduleListOut: {
             /** Schedules */
             schedules: components["schemas"]["AgentSchedulesOut"][];
+        };
+        /**
+         * SelectedApproverV1
+         * @description One verified selected person, projected to canonical identity. @spec REQUEST-APPROVAL-4.
+         */
+        SelectedApproverV1: {
+            /** Issuer */
+            issuer: string;
+            /** Subject */
+            subject: string;
+            /** Tenant Id */
+            tenant_id: string;
         };
         /** Selection */
         Selection: {
@@ -18468,7 +18515,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ApprovalCreationResponseV1"];
+                    "application/json": components["schemas"]["ApprovalCreationResponseV1"] | components["schemas"]["ApprovalCreationResponseV2"];
                 };
             };
             /** @description Validation Error */

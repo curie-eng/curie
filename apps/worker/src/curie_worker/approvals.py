@@ -16,6 +16,7 @@ second pending record for one human decision.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import math
 import re
@@ -32,7 +33,8 @@ from curie_dispatcher.approval_actions import parse_decision_time
 from curie_internal.identity_approval import (
     ApprovalCreationIdentityV1,
     ApprovalCreationRequestV1,
-    ApprovalCreationResponseV1,
+    ApprovalCreationResponseV2,
+    creation_receipt,
 )
 from curie_telemetry import inject_trace_context
 
@@ -144,12 +146,21 @@ __all__ = [
 
 @dataclass(frozen=True)
 class CreatedApproval:
-    """Record identity plus display metadata; never an authorization principal."""
+    """Record identity plus display metadata; never an authorization principal.
+
+    The stored fields come only from a V2 creation receipt (a dynamic
+    approval, ADR 0271 decisions 4 and 8): the persisted grant, ticket
+    included, and the selected people. The pause renders them instead of the
+    run's own summary. Every other creation leaves them None and empty.
+    """
 
     id: str
     status: str
     requested_by: str | None = None
     requester_known: bool = False
+    granted_tool: str | None = None
+    granted_arguments: dict[str, Any] | None = None
+    selected_approvers: tuple[dict[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -688,16 +699,27 @@ class ApprovalClient:
                 raise ApprovalContinuityRefused()
             if status not in {200, 201}:
                 raise ValueError
-            receipt = ApprovalCreationResponseV1.model_validate(body)
+            # @spec REQUEST-APPROVAL-4: exactly the version the receipt names.
+            receipt = creation_receipt(body)
             if (
                 receipt.request_id != captured.request_id
                 or receipt.duplicate is not (status == 200)
                 or status == 201 and receipt.status != "pending"
             ):
                 raise ValueError
+            if type(receipt) is not ApprovalCreationResponseV2:
+                return CreatedApproval(
+                    id=receipt.id, status=receipt.status, requested_by=receipt.requested_by,
+                    requester_known=True,
+                )
+            # The V2 model admits only the canonical text of a JSON object.
             return CreatedApproval(
                 id=receipt.id, status=receipt.status, requested_by=receipt.requested_by,
-                requester_known=True,
+                requester_known=True, granted_tool=receipt.granted_tool,
+                granted_arguments=json.loads(receipt.granted_arguments),
+                selected_approvers=tuple(
+                    person.model_dump(mode="json") for person in receipt.selected_approvers
+                ),
             )
         except ApprovalContinuityRefused:
             raise

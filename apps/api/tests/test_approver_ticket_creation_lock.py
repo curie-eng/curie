@@ -72,6 +72,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from apps.api.tests.test_approver_ticket_creation import receipt
 from apps.api.tests.test_http_approval_creation import accepted
 
 PLAIN: dict[str, Any] = {"target": "acct-example-1"}
@@ -173,7 +174,7 @@ def test_http_creation_refuses_a_registration_landing_before_its_writer(
     assert approval_rows(agent) == []
     owning = ingress(case)
     dynamic = dynamic_request(owning, carried(case, PLAIN))
-    accepted(create(case.client, dynamic), dynamic)
+    receipt(create(case.client, dynamic), dynamic)
     assert [row["selection_mode"] for row in approval_rows(agent)] == ["dynamic"]
 
 

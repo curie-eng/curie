@@ -2423,6 +2423,84 @@
         "title": "ApprovalCreationResponseV1",
         "type": "object"
       },
+      "ApprovalCreationResponseV2": {
+        "additionalProperties": false,
+        "description": "A dynamic approval's receipt: V1 plus the persisted grant and selection.\n\n``granted_arguments`` is the canonical JSON text of the stored object, the\nopaque ``approval_ticket`` included; the worker renders these stored values,\nnever its original model summary. Display data, never a permit.\n@spec REQUEST-APPROVAL-4 REQUEST-APPROVAL-8 HTTP-APPROVAL-CONTINUITY-3.",
+        "properties": {
+          "duplicate": {
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "granted_arguments": {
+            "title": "Granted Arguments",
+            "type": "string"
+          },
+          "granted_tool": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Granted Tool",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "requested_by": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By"
+          },
+          "schema_version": {
+            "const": 2,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "selected_approvers": {
+            "items": {
+              "$ref": "#/components/schemas/SelectedApproverV1"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "title": "Selected Approvers",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "approved",
+              "rejected",
+              "expired"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "id",
+          "status",
+          "duplicate",
+          "requested_by",
+          "granted_tool",
+          "granted_arguments",
+          "selected_approvers"
+        ],
+        "title": "ApprovalCreationResponseV2",
+        "type": "object"
+      },
       "ApprovalGrantAuthorityRequestV1": {
         "additionalProperties": false,
         "description": "@spec HTTP-APPROVAL-CONTINUITY-12.",
@@ -14052,6 +14130,35 @@
           "schedules"
         ],
         "title": "ScheduleListOut",
+        "type": "object"
+      },
+      "SelectedApproverV1": {
+        "additionalProperties": false,
+        "description": "One verified selected person, projected to canonical identity. @spec REQUEST-APPROVAL-4.",
+        "properties": {
+          "issuer": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Issuer",
+            "type": "string"
+          },
+          "subject": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Subject",
+            "type": "string"
+          },
+          "tenant_id": {
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "issuer",
+          "subject"
+        ],
+        "title": "SelectedApproverV1",
         "type": "object"
       },
       "Selection": {
@@ -30566,7 +30673,7 @@
     },
     "/v1/internal/identity/approvals": {
       "post": {
-        "description": "@spec HTTP-APPROVAL-CONTINUITY-3.",
+        "description": "V2 only for a dynamic approval. @spec HTTP-APPROVAL-CONTINUITY-3 REQUEST-APPROVAL-4.",
         "operationId": "create_identity_approval_v1_internal_identity_approvals_post",
         "parameters": [
           {
@@ -30601,7 +30708,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ApprovalCreationResponseV1"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApprovalCreationResponseV1"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ApprovalCreationResponseV2"
+                    }
+                  ],
+                  "title": "Response Create Identity Approval V1 Internal Identity Approvals Post"
                 }
               }
             },

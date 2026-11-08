@@ -30,8 +30,9 @@ Actions:
    changed, then verifies the removal.
 
 State (generated keys, ids, channel tokens) lives in ``--state-dir`` with
-mode 0700 and 0600 files. No action prints a key, bearer, proof or token.
-See docs/testing/identity-e2e.md.
+mode 0700 and 0600 files. No action prints a key, bearer, proof or token. A
+failed command's error names the command and exit code only; its raw output
+goes to ``last-exec-error.txt`` there. See docs/testing/identity-e2e.md.
 """
 
 from __future__ import annotations
@@ -79,12 +80,19 @@ from identity_assets import (
     secret_manifest,
     set_path,
 )
-from identity_pod_scripts import DIRECT_EFFECT_SCRIPT, PROXY_REPLAY_SCRIPT, ROUTE_DOCTOR_SCRIPT
+from identity_pod_scripts import (
+    DIRECT_EFFECT_SCRIPT,
+    GRANT_PROBE_SCRIPT,
+    PROXY_REPLAY_SCRIPT,
+    ROUTE_DOCTOR_SCRIPT,
+    SPEND_KEYS_SCRIPT,
+)
 from identity_target import (
     ADAPTER,
     ADOPT_SCRIPT,
     API_PORT,
     HERE,
+    LAST_EXEC_ERROR,
     REPO,
     ROLE_FILTER_SCRIPT,
     SIGN_SCRIPT,
@@ -94,7 +102,9 @@ from identity_target import (
     b64url,
     b64url_decode,
     http,
+    last_exec_error,
     log,
+    set_private_log_dir,
     summarize_event,
     write_private,
 )
@@ -103,6 +113,12 @@ DEFAULT_CHART = REPO / "charts" / "curie"
 STATE_FILE = "state.json"
 STATE_VERSION = 1
 CALLER_TOKEN_ENV = "CURIE_CONNECTOR_CALLER_TOKEN"
+# The worker-minted connector tool grant an approved resume boots with
+# (kernel/claim.py::_connector_tool_grant). It is not one of the claim's scoped
+# tokens (sandbox/claim_tokens.py::CLAIM_TOKEN_ENVS), so it reaches the runner
+# as a value entry of the claim's spec.env rather than through the claim's
+# token Secret.
+CONNECTOR_TOOL_GRANT_ENV = "CURIE_CONNECTOR_TOOL_GRANT"
 CLAIM_RESOURCE = "sandboxclaims.extensions.agents.x-k8s.io"
 AGENT_LABEL = "curietech.ai/agent"
 # A hosted connector's objects, as plugin_format.connector_render renders them:
@@ -145,10 +161,19 @@ _PROXY_DECISION = re.compile(
 )
 _PROXY_SUFFIX = re.compile(rf"\s+(?P<key>[a-z_]+)=(?P<value>{_QUOTED}|\S+)")
 # The reference connector's one line per tool call (human_restricted_connector):
-# the outcome, and the fingerprint of the X-Curie-Principal it read or `-`.
+# the tool, the outcome, the fingerprint of the X-Curie-Principal it read or `-`,
+# and then the fingerprint of the attested grant id or `-` (ADR 0271). A
+# connector that predates the grant field ends the line after the requester.
+_EFFECT_TOOLS = ("record_effect", "execute_attested", "execute_approved")
+_FINGERPRINT_OR_DASH = r"[0-9a-f]{16}|-"
 _EFFECT_LINE = re.compile(
-    r"\brecord_effect outcome=(?P<outcome>[a-z_]+) requester=(?P<requester>[0-9a-f]{16}|-)(?=\s|$)"
+    rf"\b(?P<tool>{'|'.join(_EFFECT_TOOLS)}) outcome=(?P<outcome>[a-z_]+) "
+    rf"requester=(?P<requester>{_FINGERPRINT_OR_DASH})"
+    rf"(?: grant=(?P<grant>{_FINGERPRINT_OR_DASH})|(?! grant=))(?=\s|$)"
 )
+# The caller proxy's optional per-request suffixes. Each is a key only when the
+# line carries it, and reads as None when it does not (_Decision).
+_OPTIONAL_DECISION_KEYS = ("route", "grant", "attested")
 
 
 def slug(name: str) -> str:
@@ -232,17 +257,25 @@ def principal_fingerprint(principal: Mapping[str, Any]) -> str:
 def parse_effect_line(line: str) -> dict[str, Any] | None:
     """One reference connector outcome line, or None for any other line.
 
-    The line is ``record_effect outcome=<ok|code> requester=<fp|->``, after an
-    optional ``kubectl logs --timestamps`` stamp and any logging prefix.
-    Returns ``{"at_epoch", "outcome", "requester"}``; ``at_epoch`` is None
-    without a stamp.
+    The line is ``<tool> outcome=<ok|code> requester=<fp|-> grant=<fp|->``
+    for ``record_effect``, ``execute_attested`` or ``execute_approved``, after
+    an optional ``kubectl logs --timestamps`` stamp and any logging prefix.
+    Returns ``{"at_epoch", "tool", "outcome", "requester", "grant"}``;
+    ``at_epoch`` is None without a stamp, and ``grant`` is None on a line from
+    a connector that predates the field.
     """
 
     at, rest = split_log_stamp(line.strip())
     match = _EFFECT_LINE.search(rest)
     if match is None:
         return None
-    return {"at_epoch": at, "outcome": match["outcome"], "requester": match["requester"]}
+    return {
+        "at_epoch": at,
+        "tool": match["tool"],
+        "outcome": match["outcome"],
+        "requester": match["requester"],
+        "grant": match["grant"],
+    }
 
 
 def connector_server_container(deployment: Mapping[str, Any]) -> str:
@@ -296,14 +329,31 @@ def split_log_stamp(line: str) -> tuple[float | None, str]:
     return epoch(match["stamp"] + fraction + zone), line[match.end() :]
 
 
+class _Decision(dict[str, Any]):
+    """A parsed proxy decision: an optional suffix the line lacks reads as None.
+
+    ``route``, ``grant`` and ``attested`` are keys only when the line carries
+    them, so a decision compares equal to the plain dict of what it logged,
+    yet ``decision["attested"]`` is None on a line without it.
+    """
+
+    def __missing__(self, key: str) -> Any:
+        if key in _OPTIONAL_DECISION_KEYS:
+            return None
+        raise KeyError(key)
+
+
 def parse_proxy_decision(line: str) -> dict[str, Any] | None:
     """One caller proxy decision line, or None for any other line.
 
     The line is the proxy's per-request log, optionally after a kubectl
     timestamp: ``caller=<agent|-> outcome=<admitted|refusal> method=<m>
-    path=<repr>`` then, in any order, ``route=<repr>``, ``grant=<reason>`` and
-    ``principal=<present|absent>``. ``principal`` is None when the line has none
-    (a refusal, a route decision, or a proxy that predates the field).
+    path=<repr>`` then, in any order, ``route=<repr>``, ``grant=<reason>``,
+    ``principal=<present|absent>`` and ``attested=present`` (ADR 0271 decision
+    7: the request spent a grant and carries its attestation). ``principal`` is
+    None when the line has none (a refusal, a route decision, or a proxy that
+    predates the field); ``route``, ``grant`` and ``attested`` are keys only
+    when present and read as None otherwise.
     """
 
     _, rest = split_log_stamp(line.strip())
@@ -331,14 +381,14 @@ def parse_proxy_decision(line: str) -> dict[str, Any] | None:
                 return None
         suffixes[suffix["key"]] = value
         remaining = remaining[suffix.end() :]
-    decision: dict[str, Any] = {
-        "caller": match["caller"],
-        "outcome": match["outcome"],
-        "method": match["method"],
-        "path": path,
-        "principal": suffixes.pop("principal", None),
-    }
-    for key in ("route", "grant"):
+    decision = _Decision(
+        caller=match["caller"],
+        outcome=match["outcome"],
+        method=match["method"],
+        path=path,
+        principal=suffixes.pop("principal", None),
+    )
+    for key in _OPTIONAL_DECISION_KEYS:
         if key in suffixes:
             decision[key] = suffixes[key]
     return decision
@@ -1292,6 +1342,152 @@ class Harness:
         result.update(connector=connector, pod=pod, started=started, finished=finished)
         return result
 
+    # grant attestation (ADR 0271 decision 7) --------------------------------------
+
+    def connector_tool_grant(self, claim: str) -> tuple[str | None, str]:
+        """The raw ``CURIE_CONNECTOR_TOOL_GRANT`` ``claim``'s runner boots with, and where.
+
+        Looked up in the claim's token Secret first, the way
+        :meth:`caller_token` reads the caller token, then in the claim's own
+        ``spec.env`` value entries, which is where the worker delivers it: the
+        grant is not a scoped claim token, so it never moves to the Secret. The
+        second element is ``token_secret``, ``claim_env`` or ``absent``. The
+        caller holds the grant in memory only and records only the fingerprint
+        of its ``jti``.
+        """
+
+        result = self.target.kubectl("get", "secret", f"{claim}-tokens", "-o", "json", check=False)
+        if result.returncode == 0:
+            encoded = json.loads(result.stdout).get("data", {}).get(CONNECTOR_TOOL_GRANT_ENV)
+            if encoded:
+                return base64.b64decode(encoded).decode("ascii"), "token_secret"
+        item = self.target.kubectl_json("get", CLAIM_RESOURCE, claim)
+        for entry in (item.get("spec") or {}).get("env") or []:
+            if (
+                isinstance(entry, dict)
+                and entry.get("name") == CONNECTOR_TOOL_GRANT_ENV
+                and not entry.get("containerName")
+                and isinstance(entry.get("value"), str)
+                and entry["value"]
+            ):
+                return str(entry["value"]), "claim_env"
+        return None, "absent"
+
+    def grant_spends(self) -> list[str]:
+        """The fingerprints of every spent connector grant ``jti`` in Valkey, sorted.
+
+        From inside the worker container with the worker's own Valkey client:
+        one entry per ``connector-grant:<jti>`` key, the first 16 hex of the
+        ``jti``'s sha256, which is what the reference connector logs as
+        ``grant=``. Never a ``jti``.
+        """
+
+        result = self.target.worker_python(SPEND_KEYS_SCRIPT, {})
+        if not isinstance(result, dict) or "error" in result:
+            failure = result.get("error") if isinstance(result, dict) else result
+            raise HarnessError(f"the grant spend keys could not be read: {failure}")
+        return sorted(str(item) for item in result.get("fingerprints") or [])
+
+    def connector_server_env(
+        self, name: str, connector: str, names: Sequence[str]
+    ) -> dict[str, str | None]:
+        """The Deployment's values of ``names`` in ``connector``'s server container.
+
+        None for a name the container does not set. A name set from a
+        reference (``valueFrom``) is refused, since no restore could put it
+        back. Only the asked names are returned: the container's other
+        variables carry the authority bearer.
+        """
+
+        deployment = self.connector_deployment(name, connector)
+        container = connector_server_container(deployment)
+        containers = deployment["spec"]["template"]["spec"]["containers"]
+        spec = next(item for item in containers if item.get("name") == container)
+        found: dict[str, str | None] = {key: None for key in names}
+        for entry in spec.get("env") or []:
+            key = entry.get("name")
+            if key not in found:
+                continue
+            if "value" not in entry:
+                raise HarnessError(f"{connector}'s {key} is set from a reference, not a value")
+            found[key] = str(entry["value"])
+        return found
+
+    def set_connector_server_env(
+        self, name: str, connector: str, changes: Mapping[str, str | None]
+    ) -> None:
+        """Set (or, for None, remove) env values on ``connector``'s server container.
+
+        ``kubectl set env`` on the Deployment, then waits for its rollout, so
+        the pod that serves next runs with the new values. With the connector
+        reconciler off nothing renders the Deployment again behind it.
+        """
+
+        deployment = self.connector_deployment(name, connector)
+        container = connector_server_container(deployment)
+        assignments = [
+            f"{key}-" if value is None else f"{key}={value}" for key, value in changes.items()
+        ]
+        target = str(deployment["metadata"]["name"])
+        self.target.kubectl("set", "env", f"deployment/{target}", "-c", container, *assignments)
+        self.target.rollout(target, timeout="300s")
+
+    def connector_pod_env(
+        self, name: str, connector: str, container: str, names: Sequence[str]
+    ) -> dict[str, Any]:
+        """``names`` as the running pod serving ``connector`` sets them in ``container``.
+
+        Read from the newest ready pod's own spec, so it is what that pod runs
+        with, not what its Deployment says now. Returns ``pod`` and ``env``
+        (None for a name not set as a value); only the asked names.
+        """
+
+        deployment = self.connector_deployment(name, connector)
+        pods = self._pods(deployment)
+        pod = ready_pod(pods)
+        if pod is None:
+            raise HarnessError(f"no ready pod serves connector {connector} of {name}")
+        spec = next(item for item in pods if item["metadata"]["name"] == pod)["spec"]
+        found: dict[str, str | None] = {key: None for key in names}
+        for item in spec.get("containers") or []:
+            if item.get("name") != container:
+                continue
+            for entry in item.get("env") or []:
+                if entry.get("name") in found and isinstance(entry.get("value"), str):
+                    found[str(entry["name"])] = str(entry["value"])
+        return {"pod": pod, "env": found}
+
+    def grant_probes(
+        self, name: str, params: Mapping[str, Any], connector: str = REFERENCE_CONNECTOR
+    ) -> dict[str, Any]:
+        """Run the grant probes against ``name``'s ``connector`` caller proxy from inside its pod.
+
+        Execs into the caller-proxy container of a ready pod and posts each
+        case of ``params["cases"]`` to the live proxy on loopback (see
+        ``GRANT_PROBE_SCRIPT``). ``params`` carry the caller token and whatever
+        signing seeds or supplied grants the cases need, on stdin only. Returns
+        the per-case ``answers`` (status, error flag, first text line, refusal,
+        drop, grant fingerprint and the pod-clock window), plus the pod and the
+        host time window.
+        """
+
+        deployment = self.connector_deployment(name, connector)
+        if proxied_connector(deployment) is None:
+            raise HarnessError(f"connector {connector} of {name} has no caller proxy")
+        pod = ready_pod(self._pods(deployment))
+        if pod is None:
+            raise HarnessError(f"no ready pod serves connector {connector} of {name}")
+        started = time.time()
+        result = self.target.exec_python(
+            pod, CALLER_PROXY_CONTAINER, GRANT_PROBE_SCRIPT, params, timeout=240
+        )
+        finished = time.time()
+        if not isinstance(result, dict) or "error" in result:
+            failure = result.get("error") if isinstance(result, dict) else result
+            raise HarnessError(f"the grant probes in {pod} failed: {failure}")
+        result.update(connector=connector, pod=pod, started=started, finished=finished)
+        return result
+
     def route_doctor(
         self, claim: str, caller_token_exp: int, *, only_if: int | None = None
     ) -> dict[str, Any]:
@@ -1513,6 +1709,9 @@ class Harness:
         report["verified"] = self._verify_removed(previous)
         for name in (STATE_FILE, "ca.pem", "ca.key", "server.pem", "server.key"):
             (self.state.directory / name).unlink(missing_ok=True)
+        if last_exec_error() is None:
+            # An earlier action's raw command output; one this down wrote stays to read.
+            (self.state.directory / LAST_EXEC_ERROR).unlink(missing_ok=True)
         shutil.rmtree(self.state.directory / "curie-config", ignore_errors=True)
         if (self.state.directory / REFERENCE_BUNDLE_DIR).exists():
             # It holds the authority bearer in the connector's env.
@@ -1636,7 +1835,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     target = _target(args)
-    harness = Harness(target, State(args.state_dir.resolve()))
+    state_dir = args.state_dir.resolve()
+    harness = Harness(target, State(state_dir))
+    # A failed command's error names the command and exit code only; its raw
+    # output goes to the private state directory.
+    set_private_log_dir(state_dir)
     try:
         if args.action == "up":
             roster = DEFAULT_ROSTER if args.roster is None else json.loads(args.roster.read_text())
@@ -1670,14 +1873,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.evidence is not None:
                 args.evidence.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
             print(json.dumps(evidence, indent=2, sort_keys=True))
-            return 0 if evidence.get("passed") else 1
+            if evidence.get("passed"):
+                return 0
+            _point_at_raw_output()
+            return 1
         else:
             result = harness.down()
     except HarnessError as exc:
         print(json.dumps({"action": args.action, "error": str(exc)}), file=sys.stderr)
+        _point_at_raw_output()
         return 1
+    finally:
+        set_private_log_dir(None)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
+
+
+def _point_at_raw_output() -> None:
+    """Name the private file holding the raw output of this run's failed command, if any."""
+
+    path = last_exec_error()
+    if path is not None:
+        log(f"the failed command's raw output is in {path} (mode 0600; it may hold private values)")
 
 
 if __name__ == "__main__":

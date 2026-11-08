@@ -34,6 +34,7 @@ from approver_ticket_support import (
 from approver_ticket_support import synthetic_provider as synthetic_provider
 from approver_ticket_support import ticket_case as ticket_case
 
+from apps.api.tests.test_approver_ticket_creation import receipt
 from apps.api.tests.test_http_approval_creation import accepted, rows
 
 GATE_KINDS = (None, "policy", "permission")
@@ -123,7 +124,7 @@ def test_http_creation_locks_the_registered_pair_to_its_route(
         assert rows(request["approval"]["dedupe_key"])[0]["route"] == OTHER_ROUTE
     owning = ingress(case)
     request = dynamic_request(owning, carried(case, PLAIN))
-    accepted(create(case.client, request), request)
+    receipt(create(case.client, request), request)
     assert len(approval_rows(agent)) == 4
 
 

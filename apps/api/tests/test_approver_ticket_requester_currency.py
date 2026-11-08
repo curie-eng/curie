@@ -41,6 +41,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from apps.api.tests import test_http_invocation_membership as membership
+from apps.api.tests.test_approver_ticket_creation import receipt
 from apps.api.tests.test_http_approval_creation import accepted, rows
 from apps.api.tests.test_http_requester_projection import CHANGED_SUBJECT, admit_raw_sender
 from apps.api.tests.test_http_requester_projection import synthetic_provider as synthetic_provider
@@ -90,7 +91,7 @@ def test_a_ticket_needs_the_original_requester_freshly_resolved(
     case.provider.subjects.clear()
     owning = ingress(case)
     current = dynamic_request(owning, carried(case, PLAIN))
-    accepted(create(case.client, current), current)
+    receipt(create(case.client, current), current)
     assert sorted(row["selection_mode"] for row in approval_rows(agent)) == [
         "dynamic", "ordinary",
     ]
@@ -137,5 +138,5 @@ def test_a_requester_disabled_before_the_writer_refuses_there(
     assert disabled == ["disabled"]
     assert rows(request["approval"]["dedupe_key"]) == []
     assert approval_rows(agent) == []
-    accepted(create(case.client, request), request)
+    receipt(create(case.client, request), request)
     assert [row["selection_mode"] for row in approval_rows(agent)] == ["dynamic"]

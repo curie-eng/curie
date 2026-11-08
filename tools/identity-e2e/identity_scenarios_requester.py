@@ -34,6 +34,7 @@ from identity_e2e import (
     ADMIN_MEMBERSHIP,
     AUTHORITY_GROUP,
     REFERENCE_CONNECTOR,
+    Api,
     Harness,
     HarnessError,
     caller_fingerprint,
@@ -597,12 +598,16 @@ def effect_call(
 
 
 def _quietly(call: Callable[[], Any]) -> Any:
-    """``call()``, or None when it fails; for restores in a ``finally``."""
+    """``call()``, or None when it fails; for restores in a ``finally``.
+
+    A failure is logged by its exception type only: its text can carry a
+    private value, such as a failed query's bound parameters.
+    """
 
     try:
         return call()
     except HarnessError as exc:
-        log(f"restore failed: {exc}")
+        log(f"restore failed: {type(exc).__name__}")
         return None
 
 
@@ -783,7 +788,7 @@ def requester_effect(harness: Harness, args: Any, evidence: Evidence) -> None:
             )
         finally:
             restored = _quietly(
-                lambda: harness.provider_admin(ADMIN_MEMBERSHIP, {**membership, "member": True})
+                lambda: harness.provider_admin(ADMIN_MEMBERSHIP, {**membership, "member": True}),
             )
             seen["restore_status"] = restored
         check(restored == 200, f"restoring {sender}'s membership answered {restored}")
@@ -1260,26 +1265,7 @@ def requester_approval(harness: Harness, args: Any, evidence: Evidence) -> None:
             status, body = api.call("PATCH", f"/agents/{agent_id}", {"approval_routes": routes})
             seen["route"] = {"status": status, "binding": routes[APPROVAL_ROUTE]}
             check(status == 200, f"binding the approval route answered {status}: {body}")
-            role = harness.target.pod_python(
-                ROLE_FILTER_SCRIPT,
-                {
-                    "tenant_id": harness.data["tenant_id"],
-                    "agent_id": agent_id,
-                    "role": "approver",
-                    "filter": role_filter(),
-                },
-            )
-            restore["approver_role"] = {
-                "previous": role.get("previous"),
-                "previous_present": role.get("previous_present"),
-            }
-            seen["approver_role"] = {
-                "action": role.get("action"),
-                "legacy_state": role.get("legacy_state"),
-                "version": role.get("version"),
-                "filter": role_filter(),
-                "previous_present": role.get("previous_present"),
-            }
+            restore["approver_role"], seen["approver_role"] = set_approver_role(harness, agent_id)
         require_passed(evidence)
 
         with evidence.step(
@@ -1334,72 +1320,13 @@ def requester_approval(harness: Harness, args: Any, evidence: Evidence) -> None:
             ) as seen,
             harness.api() as api,
         ):
-            approval_id = state["approval_id"]
-            minted = api.ok(
-                "POST",
-                "/approvals/principals/adapter",
-                {"subject": ADAPTER, "binding_ids": [binding_id], "ttl_s": 3600},
-            )
-            seen["adapter_principal"] = {
-                key: minted.get(key) for key in ("subject", "binding_ids", "scopes", "expires_at")
-            }
-            body = json.dumps({"decision": "approved"}, separators=(",", ":")).encode()
-            registration = harness.data["registration"]
-            signed = harness.target.pod_python(
-                ANSWER_SIGN_SCRIPT,
-                {
-                    "key": harness.data["keys"]["receiver"],
-                    "proof": {
-                        "schema_version": 1,
-                        "purpose": "approval_answer",
-                        "operation": "resolve",
-                        "receiver_id": registration["receiver_id"],
-                        "receiver_generation": registration["generation"],
-                        "binding_id": binding_id,
-                        "approval_id": approval_id,
-                        "sender": approver,
-                        "body_sha256": hashlib.sha256(body).hexdigest(),
-                    },
-                },
-            )
-            answered_at = time.time()
-            status, payload = http(
-                "POST",
-                f"{api.base}/approvals/{approval_id}/resolve",
-                raw=body,
-                headers={
-                    ADAPTER_PRINCIPAL_HEADER: str(minted["token"]),
-                    APPROVAL_ACTOR_HEADER: approver,
-                    APPROVAL_PROOF_HEADER: str(signed["proof"]),
-                },
-            )
-            state["answered_at"] = answered_at
-            seen["resolve"] = {"status": status, "answer": summarize_event(payload)}
-            check(status == 200, f"the email approval answer answered {status}: {payload}")
-            check(
-                isinstance(payload, dict)
-                and payload.get("status") == "approved"
-                and payload.get("resolved_by") == approver,
-                f"the answer did not resolve the approval approved by {approver}",
-            )
-            audit = list(api.ok("GET", f"/approvals/{approval_id}/audit"))
-            resolved = [row for row in audit if row.get("action") == "resolved"]
-            seen["audit"] = [
-                {
-                    key: row.get(key)
-                    for key in ("action", "actor", "principal_kind", "authorizer", "authorized")
-                }
-                for row in resolved
-            ]
-            check(
-                any(
-                    row.get("actor") == approver
-                    and row.get("principal_kind") == "adapter"
-                    and row.get("authorizer") == HTTP_ANSWER_AUTHORIZER
-                    and row.get("authorized") is True
-                    for row in resolved
-                ),
-                f"no audit row records {approver}'s authorized answer by {HTTP_ANSWER_AUTHORIZER}",
+            state["answered_at"] = answer_by_email(
+                harness,
+                api,
+                seen,
+                binding_id=binding_id,
+                approval_id=state["approval_id"],
+                approver=approver,
             )
         require_passed(evidence)
 
@@ -1465,28 +1392,168 @@ def restore_approval_setup(
                 failures.append(f"routes: {status} {body}")
         previous = restore.get("approver_role")
         if previous is not None:
-            role = _quietly(
-                lambda: harness.target.pod_python(
-                    ROLE_FILTER_SCRIPT,
-                    {
-                        "tenant_id": harness.data["tenant_id"],
-                        "agent_id": agent_id,
-                        "role": "approver",
-                        "filter": previous["previous"],
-                    },
-                )
+            seen["approver_role"], failure, residual = restore_approver_role(
+                harness, agent_id, previous, step="P0"
             )
-            seen["approver_role"] = (
-                None
-                if role is None
-                else {key: role.get(key) for key in ("action", "legacy_state", "version")}
-            )
-            if role is None:
-                failures.append("approver role: the restore failed")
-            elif not previous.get("previous_present"):
-                # agent_role_policy has no removal: the role stays configured
-                # with no filter, which the answer path reads as unrestricted.
-                seen["residual"] = (
-                    "the approver role had no entry before P0; it now has one with no filter"
-                )
+            if failure is not None:
+                failures.append(failure)
+            elif residual is not None:
+                seen["residual"] = residual
         check(not failures, f"restoring P0's changes failed; repair by hand: {failures}")
+
+
+def set_approver_role(harness: Harness, agent_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Set the agent's approver role filter to the member group (ADR 0267).
+
+    Through the API's role policy owner in the API pod, so the HTTP approver
+    role evaluates the answering human on fresh provider facts. Returns what
+    :func:`restore_approver_role` needs to put it back, and the evidence.
+    """
+
+    role = harness.target.pod_python(
+        ROLE_FILTER_SCRIPT,
+        {
+            "tenant_id": harness.data["tenant_id"],
+            "agent_id": agent_id,
+            "role": "approver",
+            "filter": role_filter(),
+        },
+    )
+    restore = {
+        "previous": role.get("previous"),
+        "previous_present": role.get("previous_present"),
+    }
+    seen = {
+        "action": role.get("action"),
+        "legacy_state": role.get("legacy_state"),
+        "version": role.get("version"),
+        "filter": role_filter(),
+        "previous_present": role.get("previous_present"),
+    }
+    return restore, seen
+
+
+def restore_approver_role(
+    harness: Harness,
+    agent_id: str,
+    previous: Mapping[str, Any],
+    *,
+    step: str,
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    """Put back the approver role filter :func:`set_approver_role` replaced.
+
+    Returns the evidence (None when the restore failed), the failure and the
+    residual: ``agent_role_policy`` has no removal, so a role that had no entry
+    before ``step`` stays configured with no filter, which the answer path
+    reads as unrestricted.
+    """
+
+    role = _quietly(
+        lambda: harness.target.pod_python(
+            ROLE_FILTER_SCRIPT,
+            {
+                "tenant_id": harness.data["tenant_id"],
+                "agent_id": agent_id,
+                "role": "approver",
+                "filter": previous["previous"],
+            },
+        ),
+    )
+    if role is None:
+        return None, "approver role: the restore failed", None
+    seen = {key: role.get(key) for key in ("action", "legacy_state", "version")}
+    if not previous.get("previous_present"):
+        return (
+            seen,
+            None,
+            f"the approver role had no entry before {step}; it now has one with no filter",
+        )
+    return seen, None, None
+
+
+def answer_by_email(
+    harness: Harness,
+    api: Api,
+    seen: dict[str, Any],
+    *,
+    binding_id: str,
+    approval_id: str,
+    approver: str,
+) -> float:
+    """``approver`` approves ``approval_id`` by a signed email approval answer (ADR 0267).
+
+    Mints an adapter credential for the email binding, signs the answer proof
+    for ``{"decision":"approved"}`` inside the API pod with the receiver key
+    (as ``send`` signs a receiver proof) and posts it to
+    ``/approvals/<id>/resolve`` as the mail adapter does. Requires a 200
+    resolving it approved by ``approver``, and an audit row recording the
+    approver's authorized answer by ``HttpApprovalAnswer``. Returns the host
+    time just before the post.
+    """
+
+    minted = api.ok(
+        "POST",
+        "/approvals/principals/adapter",
+        {"subject": ADAPTER, "binding_ids": [binding_id], "ttl_s": 3600},
+    )
+    seen["adapter_principal"] = {
+        key: minted.get(key) for key in ("subject", "binding_ids", "scopes", "expires_at")
+    }
+    body = json.dumps({"decision": "approved"}, separators=(",", ":")).encode()
+    registration = harness.data["registration"]
+    signed = harness.target.pod_python(
+        ANSWER_SIGN_SCRIPT,
+        {
+            "key": harness.data["keys"]["receiver"],
+            "proof": {
+                "schema_version": 1,
+                "purpose": "approval_answer",
+                "operation": "resolve",
+                "receiver_id": registration["receiver_id"],
+                "receiver_generation": registration["generation"],
+                "binding_id": binding_id,
+                "approval_id": approval_id,
+                "sender": approver,
+                "body_sha256": hashlib.sha256(body).hexdigest(),
+            },
+        },
+    )
+    answered_at = time.time()
+    status, payload = http(
+        "POST",
+        f"{api.base}/approvals/{approval_id}/resolve",
+        raw=body,
+        headers={
+            ADAPTER_PRINCIPAL_HEADER: str(minted["token"]),
+            APPROVAL_ACTOR_HEADER: approver,
+            APPROVAL_PROOF_HEADER: str(signed["proof"]),
+        },
+    )
+    seen["resolve"] = {"status": status, "answer": summarize_event(payload)}
+    check(status == 200, f"the email approval answer answered {status}: {payload}")
+    check(
+        isinstance(payload, dict)
+        and payload.get("status") == "approved"
+        and payload.get("resolved_by") == approver,
+        f"the answer did not resolve the approval approved by {approver}",
+    )
+    audit = list(api.ok("GET", f"/approvals/{approval_id}/audit"))
+    resolved = [row for row in audit if row.get("action") == "resolved"]
+    seen["audit"] = [
+        {
+            key: row.get(key)
+            for key in ("action", "actor", "principal_kind", "authorizer", "authorized")
+        }
+        for row in resolved
+    ]
+    check(
+        any(
+            row.get("actor") == approver
+            and row.get("principal_kind") == "adapter"
+            and row.get("authorizer") == HTTP_ANSWER_AUTHORIZER
+            and row.get("authorized") is True
+            for row in resolved
+        ),
+        f"no audit row records {approver}'s authorized answer by {HTTP_ANSWER_AUTHORIZER}",
+    )
+    return answered_at

@@ -30,8 +30,9 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
 import approver_ticket_driver as tickets
+import identity_privacy
 from identity_assets import ed25519_pair
-from identity_e2e import Api, Harness, HarnessError, epoch, turn_summary
+from identity_e2e import Api, Harness, HarnessError, caller_fingerprint, epoch, turn_summary
 from identity_target import REPO, http, write_private
 
 # The fake model's test-only directive: the turn dials every hosted connector
@@ -88,8 +89,34 @@ def check(condition: bool, message: str) -> None:
         raise StepFailed(message)
 
 
+def refusal(status: int, body: Any) -> str:
+    """A failed API answer as its status and refusal code, never the rest of its body.
+
+    The code is the body's ``detail`` when it is a string, else ``detail.code``
+    or a top-level ``code``; an error body can echo the request's input.
+    """
+
+    detail = body.get("detail") if isinstance(body, Mapping) else None
+    if isinstance(detail, str):
+        code: Any = detail
+    elif isinstance(detail, Mapping) and detail.get("code") is not None:
+        code = detail["code"]
+    else:
+        code = body.get("code") if isinstance(body, Mapping) else None
+    return f"{status}" if code is None else f"{status} {str(code)[:200]}"
+
+
 class Evidence:
-    """The JSON evidence one ``prove`` run writes."""
+    """The JSON evidence one ``prove`` run writes.
+
+    A run that holds a private value (a principal, token, grant, ticket or key)
+    passes it to :meth:`hold_private` as soon as it has it. :meth:`finish` then
+    replaces, under ``identity_privacy``'s rules, every held value,
+    principal-shaped object and token envelope the evidence carries, before
+    anything writes or prints it; when it replaced anything the evidence
+    records ``privacy`` and the run fails. A run that holds nothing finishes as
+    it recorded.
+    """
 
     def __init__(self, name: str) -> None:
         self.data: dict[str, Any] = {
@@ -97,6 +124,44 @@ class Evidence:
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "steps": [],
         }
+        # None until the run holds a private value; only then does finish() scrub.
+        self._private: list[str] | None = None
+        self._redactions = 0
+
+    def hold_private(self, values: Iterable[Any]) -> None:
+        """Hold ``values`` as private values of this run. Cumulative.
+
+        Non-strings and empty strings are ignored, but any call puts the run
+        under the privacy rules at :meth:`finish`. A non-empty string shorter
+        than ``identity_privacy.MIN_SECRET`` characters is refused, since the
+        evidence could not be searched for it: use longer roster subjects.
+        """
+
+        values = list(values)
+        if any(
+            isinstance(value, str) and 0 < len(value) < identity_privacy.MIN_SECRET
+            for value in values
+        ):
+            raise HarnessError(
+                f"a private value of this run is shorter than {identity_privacy.MIN_SECRET} "
+                "characters, so the evidence cannot be searched for it; use longer roster "
+                "subjects"
+            )
+        held = [] if self._private is None else self._private
+        held += [value for value in identity_privacy.searchable(values) if value not in held]
+        self._private = held
+
+    def scrub(self, *trees: Any, secrets: Iterable[str] = ()) -> int:
+        """Replace in place what the privacy rules refuse in the evidence and in ``trees``.
+
+        Searches for the held values and ``secrets``. Returns how many nodes it
+        replaced, and adds them to the count :meth:`finish` records.
+        """
+
+        wanted = [*(self._private or ()), *secrets]
+        count = sum(identity_privacy.scrub(tree, wanted) for tree in (self.data, *trees))
+        self._redactions += count
+        return count
 
     @contextlib.contextmanager
     def step(self, step_id: str, title: str) -> Iterator[dict[str, Any]]:
@@ -115,16 +180,28 @@ class Evidence:
             self.data["steps"].append(entry)
 
     def finish(self) -> dict[str, Any]:
+        if self._private is not None:
+            self.scrub()
+            self._private.clear()
         steps = self.data["steps"]
         self.data["passed"] = (
-            bool(steps) and "aborted" not in self.data and all(step["passed"] for step in steps)
+            bool(steps)
+            and "aborted" not in self.data
+            and all(step["passed"] for step in steps)
+            and not self._redactions
         )
+        if self._redactions:
+            self.data["privacy"] = {"redactions": self._redactions}
         self.data["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         return self.data
 
 
 def run(name: str, harness: Harness, args: Any) -> dict[str, Any]:
-    """Run one registered scenario and return its finished evidence."""
+    """Run one registered scenario and return its finished evidence.
+
+    Any other exception the scenario raises aborts it by its type name only,
+    since its text can carry a private value, and the evidence still finishes.
+    """
 
     if name not in SCENARIOS:
         raise HarnessError(f"unknown scenario {name}; known: {', '.join(sorted(SCENARIOS))}")
@@ -133,6 +210,8 @@ def run(name: str, harness: Harness, args: Any) -> dict[str, Any]:
         SCENARIOS[name](harness, args, evidence)
     except (StepFailed, HarnessError) as exc:
         evidence.data["aborted"] = str(exc)
+    except Exception as exc:  # noqa: BLE001 - recorded by type; its text may be private
+        evidence.data["aborted"] = type(exc).__name__
     return evidence.finish()
 
 
@@ -214,7 +293,7 @@ def set_requester_flag(api: Api, agent_id: str, wanted: bool, *, what: str) -> t
                 "connector_requester_identity_expected_version": version,
             },
         )
-        check(status == 200, f"{what} answered {status}: {body}")
+        check(status == 200, f"{what} answered {refusal(status, body)}")
         flag, version = requester_flag(api, agent_id)
     return flag, version
 
@@ -1554,6 +1633,52 @@ TICKET_TURNS = (
 )
 
 
+def redacted_turns(turns: Mapping[str, Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """What evidence keeps of :attr:`TicketScenario.turns`: ids, the sender and a fingerprint.
+
+    Per label, the event and stream ids, the sender's address, and of the
+    ingress capsule only whether it carries a principal, the first 16 hex of
+    the sha256 of its canonical principal as compact sorted JSON, and the
+    scope's agent id. Never the canonical principal, the rest of the scope or
+    any other capsule field.
+    """
+
+    redacted = {}
+    for label, turn in turns.items():
+        raw = turn.get("capsule_facts")
+        facts: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
+        scope = facts.get("scope") if isinstance(facts.get("scope"), Mapping) else {}
+        canonical = facts.get("canonical")
+        fingerprint = None
+        if canonical is not None:
+            fingerprint = caller_fingerprint(
+                json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+            )
+        redacted[label] = {
+            "event_id": turn.get("event_id"),
+            "stream_id": turn.get("stream_id"),
+            "sender": turn.get("sender"),
+            "capsule": {
+                "principal_present": bool(facts.get("principal_present")),
+                "canonical_fingerprint": fingerprint,
+                "scope_agent_id": scope.get("agent_id"),
+            },
+        }
+    return redacted
+
+
+def principal_rows_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """What evidence keeps of principals rows: the count, an active human, the distinct types."""
+
+    return {
+        "rows": len(rows),
+        "active_human": any(
+            row.get("type") == "human" and row.get("status") == "active" for row in rows
+        ),
+        "types": sorted({str(row["type"]) for row in rows if row.get("type") is not None}),
+    }
+
+
 def refused_with(status: int, body: Any, wanted: int, code: str) -> bool:
     """A refusal with this status whose body names ``code`` (as a detail or a code field)."""
 
@@ -1724,18 +1849,21 @@ class TicketScenario:
             latest[str(item["environment"])] = item
         return [latest[name] for name in sorted(latest)]
 
-    def deploy_version(self, api: Api, label: str, route: str) -> tuple[str, list[tuple[int, Any]]]:
+    def deploy_version(
+        self, api: Api, label: str, route: str, *, summary: str | None = None
+    ) -> tuple[str, list[tuple[int, Any]]]:
         """A new version of examples/weather gating the pair on ``route``, deployed per environment.
 
         The bundle is uploaded (it must be accepted: an inactive version's
         bundle is not route-checked), then ``POST /deployments`` runs once per
         environment the agent serves in; the answers are returned unjudged.
+        ``summary`` is the gate's display template, when the run sets one.
         """
 
         manifest = json.loads((TICKET_BUNDLE / tickets.MANIFEST_PATH).read_text())
         gate = tickets.live_tool(tickets.CONNECTOR, tickets.TOOL)
         data = tickets.bundle_archive(
-            TICKET_BUNDLE, tickets.gated_manifest(manifest, [(gate, route)])
+            TICKET_BUNDLE, tickets.gated_manifest(manifest, [(gate, route)], summary=summary)
         )
         write_private(self.harness.state.directory / f"approver-ticket-{label}.tar.gz", data)
         version = api.ok(
@@ -1926,7 +2054,7 @@ class TicketScenario:
         role = self.original["approver_role"]
         setup.update(
             key_id=key["key_id"],
-            ceiling_subjects=self.ceiling,
+            ceiling_humans=len(self.ceiling),
             original={
                 "flag": flag,
                 "version": version,
@@ -1942,13 +2070,14 @@ class TicketScenario:
             },
         )
 
-    def install(self) -> None:
+    def install(self, *, summary: str | None = None) -> None:
         """Bind both owned routes, serve only the gated bundle, and restrict the approver role.
 
         Both routes are bound before the gated version is deployed, because a
         deployment is refused while its bundle declares a route the agent has
         not bound. Every original active deployment is then ended, because a
         registration needs every active version to gate the pair (plan D5).
+        ``summary`` gives the served gate a display template; by default it has none.
         """
 
         setup = self.evidence.data["setup"]
@@ -1960,7 +2089,9 @@ class TicketScenario:
                     f"binding {list(tickets.OWNED_ROUTES)} answered {status}: "
                     f"{tickets.detail_code(body)}"
                 )
-            version_id, results = self.deploy_version(api, "gate", tickets.TICKET_ROUTE)
+            version_id, results = self.deploy_version(
+                api, "gate", tickets.TICKET_ROUTE, summary=summary
+            )
             setup["gated_version"] = version_id
             refused = [
                 (status, tickets.detail_code(body)) for status, body in results if status != 201
@@ -1984,7 +2115,11 @@ class TicketScenario:
         setup["approver_role"] = {key: role.get(key) for key in ("action", "version")}
 
     def restore(self) -> None:
-        """Put back what ``changes`` records; a failure fails the run, naming what is left."""
+        """Put back what ``changes`` records; a failure fails the run, naming what is left.
+
+        A failed action records its exception type name only: its text can
+        carry a private value.
+        """
 
         report: dict[str, Any] = {"done": [], "failed": []}
         self.evidence.data["restore"] = report
@@ -1993,7 +2128,7 @@ class TicketScenario:
             try:
                 report["done"].append({"action": name, "result": action()})
             except (HarnessError, StepFailed, KeyError, TypeError, ValueError) as exc:
-                report["failed"].append({"action": name, "error": str(exc)[:400]})
+                report["failed"].append({"action": name, "error": type(exc).__name__})
 
         changes = self.changes
         if changes["routes"] or changes["flag"] or changes["deployments"] or changes["ended"]:
@@ -2008,7 +2143,7 @@ class TicketScenario:
                         attempt("approval routes", lambda: self._restore_routes(api))
                     attempt("verify", lambda: self._verify_restored(api))
             except HarnessError as exc:
-                report["failed"].append({"action": "port-forward", "error": str(exc)[:400]})
+                report["failed"].append({"action": "port-forward", "error": type(exc).__name__})
         if changes["approver_role"]:
             attempt("approver role", self._restore_role)
         report["left"] = (
@@ -2396,18 +2531,19 @@ class TicketScenario:
 
     # turns and creation steps -----------------------------------------------------------
 
-    def send_turns(self) -> None:
+    def send_turns(self, turns: Sequence[tuple[str, str]] = TICKET_TURNS) -> None:
         """Real email turns whose ingress capsules the creation steps use.
 
         The approver writes first, so they have a canonical principals row; then
         the requester writes once per dedupe key the steps need. No step waits
         for any of these turns' sandboxes: creation reads only the ingress
-        capsule and payload in the runs stream.
+        capsule and payload in the runs stream. ``turns`` are ``(label, who)``
+        pairs; a scenario that needs fewer than :data:`TICKET_TURNS` names its own.
         """
 
         with self.harness.api() as api:
             self.ensure_registered(api)
-        for label, who in TICKET_TURNS:
+        for label, who in turns:
             sent = self.harness.send(
                 self.agent, self.senders[who], f"approver-ticket-creation: {label} turn"
             )
@@ -2430,17 +2566,23 @@ class TicketScenario:
                 for label, turn in self.turns.items()
             },
         )["turns"]
-        for label, who in TICKET_TURNS:
+        for label, who in turns:
             facts = captured[label]
             wanted = self.requester if who == "requester" else self.approver
-            if (
-                facts.get("canonical") != wanted
-                or not facts.get("principal_present")
-                or (facts.get("scope") or {}).get("agent_id") != self.agent_id
-            ):
+            # The facts hold the canonical principal: the message names checks only.
+            failed = [
+                name
+                for name, held in (
+                    ("canonical principal", facts.get("canonical") == wanted),
+                    ("principal present", bool(facts.get("principal_present"))),
+                    ("scope agent", (facts.get("scope") or {}).get("agent_id") == self.agent_id),
+                )
+                if not held
+            ]
+            if failed:
                 raise HarnessError(
                     f"the {label} turn's capsule does not name {self.senders[who]} as a "
-                    f"verified human on {self.agent}: {facts}"
+                    f"verified human on {self.agent}: its {', '.join(failed)} check failed"
                 )
             self.turns[label]["capsule_facts"] = facts
         rows = self.drive(
@@ -2449,8 +2591,8 @@ class TicketScenario:
             issuer=self.issuer,
             subject=self.approver["subject"],
         )["rows"]
-        self.evidence.data["turns"] = self.turns
-        self.evidence.data["approver_principal"] = rows
+        self.evidence.data["turns"] = redacted_turns(self.turns)
+        self.evidence.data["approver_principal"] = principal_rows_summary(rows)
         if not any(row.get("type") == "human" and row.get("status") == "active" for row in rows):
             raise HarnessError(
                 f"{self.senders['approver']} has no active human principals row after their turn"
@@ -2884,6 +3026,9 @@ def approver_ticket_creation(harness: Harness, args: Any, evidence: Evidence) ->
 
 
 # The ADR 0270 slice 2 requester scenarios (requester-effect, requester-expiry,
-# requester-approval) live in their own module and register here, last, so
-# every name they import from this one already exists.
+# requester-approval) and the ADR 0271 grant-attestation and stored-arguments-card
+# scenarios live in their own modules and register here, last, so every name they
+# import from this one already exists.
+import identity_scenarios_attestation  # noqa: E402,F401
 import identity_scenarios_requester  # noqa: E402,F401
+import identity_scenarios_stored_card  # noqa: E402,F401

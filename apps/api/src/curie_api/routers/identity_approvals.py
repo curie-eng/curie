@@ -3,7 +3,11 @@
 from collections.abc import Callable, Coroutine
 from typing import Any
 
-from curie_internal.identity_approval import ApprovalCreationRequestV1, ApprovalCreationResponseV1
+from curie_internal.identity_approval import (
+    ApprovalCreationRequestV1,
+    ApprovalCreationResponseV1,
+    ApprovalCreationResponseV2,
+)
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -53,13 +57,17 @@ router = APIRouter(
 )
 
 
-@router.post("", response_model=ApprovalCreationResponseV1, status_code=201)
+@router.post(
+    "",
+    response_model=ApprovalCreationResponseV1 | ApprovalCreationResponseV2,
+    status_code=201,
+)
 async def create_identity_approval(
     request: Request,
     body: ApprovalCreationRequestV1,
     response: Response,
-) -> ApprovalCreationResponseV1:
-    """@spec HTTP-APPROVAL-CONTINUITY-3."""
+) -> ApprovalCreationResponseV1 | ApprovalCreationResponseV2:
+    """V2 only for a dynamic approval. @spec HTTP-APPROVAL-CONTINUITY-3 REQUEST-APPROVAL-4."""
     result = await create_http_approval(request, body)
     response.status_code = 200 if result.duplicate else 201
     return result
