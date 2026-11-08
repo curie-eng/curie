@@ -11,7 +11,10 @@ key can only be written down as the exact text that was signed.
 from __future__ import annotations
 
 import base64
+import binascii
 import json
+import random
+import string
 import tomllib
 import unicodedata
 from pathlib import Path
@@ -482,3 +485,197 @@ def test_the_worker_wheel_ships_the_proxy_package() -> None:
     )
     packages = project["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"]
     assert "src/curie_connector_proxy" in packages
+
+
+# --------------------------------------------------------------------------- #
+# ADR 0270 decision 4: the X-Curie-Principal value the proxy sets, and the
+# bounded strict reader a connector uses on it. Both read the corpus sections
+# `principal_headers` and `malformed_principal_headers`.
+# --------------------------------------------------------------------------- #
+
+_HEADER_CASES: list[dict[str, Any]] = _CORPUS["principal_headers"]["cases"]
+_HEADER_BY_NAME = {str(c["name"]): c for c in _HEADER_CASES}
+_BAD_HEADERS: list[dict[str, Any]] = _CORPUS["malformed_principal_headers"]["cases"]
+_BAD_HEADER_BY_NAME = {str(c["name"]): str(c["value"]) for c in _BAD_HEADERS}
+_HUMAN_HEADER = "the_human_requester_header"
+
+
+def _header_principal(case: dict[str, Any]) -> caller.Principal:
+    fields = case["principal"]
+    return caller.Principal(
+        tenant_id=str(fields["tenant_id"]),
+        issuer=str(fields["issuer"]),
+        subject=str(fields["subject"]),
+    )
+
+
+# @spec CONNECTOR-REQUESTER-4
+@pytest.mark.parametrize("case", _HEADER_CASES, ids=lambda c: str(c["name"]))
+def test_every_principal_header_round_trips(case: dict[str, Any]) -> None:
+    principal = _header_principal(case)
+    assert caller.principal_header_value(principal) == case["header"]
+    assert caller.read_principal_header(str(case["header"])) == principal
+
+
+# @spec CONNECTOR-REQUESTER-4
+@pytest.mark.parametrize("case", _BAD_HEADERS, ids=lambda c: str(c["name"]))
+def test_every_malformed_principal_header_is_refused(case: dict[str, Any]) -> None:
+    assert caller.read_principal_header(str(case["value"])) is None
+
+
+# Each second spelling beside the genuine header it was made from: a lenient
+# reader would read the same requester from both.
+_SPELLINGS = [
+    ("a_padded_header", _HUMAN_HEADER),
+    ("a_header_in_the_standard_alphabet", "a_header_using_both_url_safe_characters"),
+    ("a_header_with_stray_trailing_bits", _HUMAN_HEADER),
+    ("a_header_with_a_non_ascii_character", _HUMAN_HEADER),
+    ("a_header_with_inner_whitespace", _HUMAN_HEADER),
+    ("a_header_with_a_trailing_newline", _HUMAN_HEADER),
+    ("a_header_with_a_byte_order_mark", _HUMAN_HEADER),
+    ("a_header_with_unsorted_keys", _HUMAN_HEADER),
+    ("a_header_of_spaced_json", _HUMAN_HEADER),
+    ("a_header_with_trailing_whitespace_in_its_json", _HUMAN_HEADER),
+    ("a_header_with_an_escaped_solidus", _HUMAN_HEADER),
+    ("a_header_with_escaped_non_ascii", "a_non_ascii_issuer_and_subject_header"),
+]
+
+
+# @spec CONNECTOR-REQUESTER-4
+@pytest.mark.parametrize(("refused", "genuine"), _SPELLINGS, ids=[r for r, _ in _SPELLINGS])
+def test_a_second_spelling_of_a_genuine_principal_is_refused(refused: str, genuine: str) -> None:
+    case = _HEADER_BY_NAME[genuine]
+    # Liveness: the one spelling reads back as the requester.
+    assert caller.read_principal_header(str(case["header"])) == _header_principal(case)
+    assert caller.read_principal_header(_BAD_HEADER_BY_NAME[refused]) is None
+
+
+def _counting_decoder(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Count base64 decodes: every `base64` decoder ends in `binascii.a2b_base64`."""
+
+    calls: list[int] = []
+    real = binascii.a2b_base64
+
+    def counting(*args: Any, **kwargs: Any) -> bytes:
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(binascii, "a2b_base64", counting)
+    return calls
+
+
+# @spec CONNECTOR-REQUESTER-4
+def test_one_character_past_the_length_bound_is_refused_before_decoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bound = caller.PRINCIPAL_HEADER_MAX_CHARS
+    assert type(bound) is int
+    genuine = _HEADER_BY_NAME[_HUMAN_HEADER]
+    text = str(genuine["header"])
+    over = (text * (bound // len(text) + 2))[: bound + 1]
+    assert len(over) == bound + 1
+    # The corpus's past-the-bound case is past this reader's bound too.
+    past = _BAD_HEADER_BY_NAME["a_header_past_the_length_bound"]
+    assert len(past) > bound
+    calls = _counting_decoder(monkeypatch)
+    assert caller.read_principal_header(over) is None
+    assert caller.read_principal_header(past) is None
+    assert calls == []
+    # Liveness, and proof the count sees this reader's decoding at all.
+    assert caller.read_principal_header(text) == _header_principal(genuine)
+    assert calls
+
+
+# @spec CONNECTOR-REQUESTER-4
+def test_the_longest_ascii_principal_is_within_the_length_bound() -> None:
+    case = _HEADER_BY_NAME["a_principal_at_its_field_bounds_header"]
+    principal = _header_principal(case)
+    assert (len(principal.issuer), len(principal.subject)) == (2048, 256)
+    assert len(str(case["header"])) <= caller.PRINCIPAL_HEADER_MAX_CHARS
+    assert caller.read_principal_header(str(case["header"])) == principal
+    # One past either field bound is refused by the field bound, not the length.
+    for name in (
+        "a_header_with_an_issuer_of_2049_characters",
+        "a_header_with_a_subject_of_257_characters",
+    ):
+        value = _BAD_HEADER_BY_NAME[name]
+        assert len(value) <= caller.PRINCIPAL_HEADER_MAX_CHARS, name
+        assert caller.read_principal_header(value) is None, name
+
+
+# @spec CONNECTOR-REQUESTER-4
+def test_the_widest_principal_a_caller_token_carries_is_readable() -> None:
+    # Non-ASCII text is wider in the header than its character count, so a
+    # bound sized to the longest ASCII principal would refuse a requester the
+    # proxy forwards. This one fills a cct to its 4096-character bound.
+    from curie_worker import caller_token
+
+    principal = caller_token.CallerPrincipal(
+        tenant_id="44444444-4444-4444-8444-444444444444",
+        issuer="https://idp.example.test/" + "a" * (2048 - 25),
+        subject="\U0001d11e" * 52 + "u" * (256 - 52),
+    )
+    token = caller_token.mint(
+        str(_SIGNER["seed"]), agent="acme-dev", exp=_exp(_SIGNER), principal=principal
+    )
+    assert len(token) <= caller_token.MAX_TOKEN_CHARS
+    decision = _decide(_SIGNER, token, admits={"acme-dev"}, now=_exp(_SIGNER) - 1)
+    assert decision.principal is not None
+    header = caller.principal_header_value(decision.principal)
+    longest_ascii = str(_HEADER_BY_NAME["a_principal_at_its_field_bounds_header"]["header"])
+    assert len(header) > len(longest_ascii)
+    assert len(header) <= caller.PRINCIPAL_HEADER_MAX_CHARS
+    assert caller.read_principal_header(header) == decision.principal
+
+
+def _junk() -> list[str]:
+    rng = random.Random(270)
+    url_safe = string.ascii_letters + string.digits + "-_"
+    values = [
+        "",
+        "=",
+        "==",
+        "A",
+        "AA",
+        "AAA",
+        "AAAA",
+        "-",
+        "_",
+        "....",
+        " ",
+        "\t",
+        "\r\n",
+        "\x00",
+        "\ud800",
+        "\udfff\ud800",
+        "é" * 8,
+        "\U0001d11e",
+        "cct.",
+        _b64url(b"{}"),
+        _b64url(b"[]"),
+        _b64url(b"true"),
+        _b64url(("[" * 1500 + "]" * 1500).encode("ascii")),
+        _b64url(('{"a":' * 500 + "1" + "}" * 500).encode("ascii")),
+        _b64url(b'{"issuer":"\\u12","subject":"s","tenant_id":"t"}'),
+        _b64url(b"9" * 3000),
+        _b64url(b'{"issuer":1e999,"subject":-0,"tenant_id":[]}'),
+        _b64url(
+            b'{"issuer":{"issuer":"x"},"subject":"s",'
+            b'"tenant_id":"44444444-4444-4444-8444-444444444444"}'
+        ),
+    ]
+    for _ in range(150):
+        size = rng.randrange(0, 96)
+        values.append("".join(rng.choice(url_safe) for _ in range(size)))
+        values.append(_b64url(rng.randbytes(size)))
+        values.append("".join(chr(rng.randrange(0x110000)) for _ in range(rng.randrange(12))))
+    return values
+
+
+# @spec CONNECTOR-REQUESTER-4
+def test_the_principal_header_reader_never_raises_on_junk() -> None:
+    for value in _junk():
+        assert caller.read_principal_header(value) is None, repr(value[:40])
+    # Liveness: the same reader admits a genuine header.
+    case = _HEADER_BY_NAME[_HUMAN_HEADER]
+    assert caller.read_principal_header(str(case["header"])) == _header_principal(case)

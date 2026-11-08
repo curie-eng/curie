@@ -8,13 +8,16 @@ this module signs.
 from __future__ import annotations
 
 import base64
+import binascii
 import dataclasses
 import json
+import re
 import unicodedata
 from pathlib import Path
 from typing import Any
 
 import pytest
+from curie_connector_proxy import caller as proxy_caller
 from curie_worker import caller_token
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
@@ -29,6 +32,8 @@ _FILE_KEYS = {
     "malformed_principals",
     "tampered_principals",
     "forged_principal_headers",
+    "principal_headers",
+    "malformed_principal_headers",
 }
 _VECTOR_KEYS = {"name", "why", "seed", "public", "agent", "exp", "minted"}
 _RUN_KEYS = {"run", "work_item"}
@@ -534,3 +539,319 @@ def test_a_damaged_key_that_would_repair_into_a_different_key_is_refused() -> No
 
     with pytest.raises(ValueError):
         caller_token.signing_key(damaged)
+
+
+# --------------------------------------------------------------------------- #
+# ADR 0270 decision 4: the X-Curie-Principal header the caller proxy sets.
+# The corpus is checked here against the encoding its comment writes out and a
+# strict reader written from that comment, so it is right before the proxy's
+# own projection and reader are written against it.
+# --------------------------------------------------------------------------- #
+
+_HEADER_SECTION_KEYS = {"comment", "cases"}
+_HEADER_CASE_KEYS = {"name", "why", "principal", "header"}
+_MALFORMED_HEADER_CASE_KEYS = {"name", "why", "value"}
+_URL_SAFE = re.compile(r"[A-Za-z0-9_-]+")
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# Above every principal the field bounds admit (a six-character JSON escape for
+# each of 2048 + 256 characters encodes to 18535), so this reference refuses on
+# length only what no field bound could admit.
+_REFERENCE_MAX_CHARS = 32 * 1024
+# The first check of the reference reader each malformed header fails.
+_HEADER_REFUSAL_REASONS = {
+    "an_empty_header": "empty",
+    "a_padded_header": "alphabet",
+    "a_header_in_the_standard_alphabet": "alphabet",
+    "a_header_with_stray_trailing_bits": "trailing_bits",
+    "a_header_of_an_impossible_length": "decode",
+    "a_header_with_a_non_ascii_character": "alphabet",
+    "a_header_with_inner_whitespace": "alphabet",
+    "a_header_with_a_trailing_newline": "alphabet",
+    "a_caller_token_as_the_header": "alphabet",
+    "a_caller_token_payload_as_the_header": "keys",
+    "a_header_of_invalid_utf8": "utf8",
+    "a_header_with_a_utf8_encoded_surrogate": "utf8",
+    "a_header_with_a_byte_order_mark": "json",
+    "a_header_with_an_escaped_lone_surrogate": "subject",
+    "a_header_of_an_array": "not_object",
+    "a_header_of_null": "not_object",
+    "a_header_of_a_bare_string": "not_object",
+    "a_header_that_is_not_json": "json",
+    "a_header_with_a_duplicate_subject": "duplicate",
+    "a_header_with_a_nan_subject": "constant",
+    "a_header_with_an_infinite_tenant": "constant",
+    "a_header_with_unsorted_keys": "canonical",
+    "a_header_of_spaced_json": "canonical",
+    "a_header_with_trailing_whitespace_in_its_json": "canonical",
+    "a_header_with_escaped_non_ascii": "canonical",
+    "a_header_with_an_escaped_solidus": "canonical",
+    "a_header_with_an_extra_key": "keys",
+    "a_header_without_tenant_id": "keys",
+    "a_header_of_an_empty_object": "keys",
+    "a_header_with_a_numeric_tenant": "tenant",
+    "a_header_with_an_uppercase_tenant": "tenant",
+    "a_header_with_an_unhyphenated_tenant": "tenant",
+    "a_header_with_an_empty_issuer": "issuer",
+    "a_header_with_an_empty_subject": "subject",
+    "a_header_with_a_numeric_issuer": "issuer",
+    "a_header_with_a_null_subject": "subject",
+    "a_header_with_an_issuer_of_2049_characters": "issuer",
+    "a_header_with_a_subject_of_257_characters": "subject",
+    "a_header_past_the_length_bound": "length",
+}
+
+
+def _header_cases() -> list[dict[str, Any]]:
+    cases = _corpus()["principal_headers"]["cases"]
+    assert isinstance(cases, list) and cases
+    return cases
+
+
+def _malformed_headers() -> list[dict[str, Any]]:
+    cases = _corpus()["malformed_principal_headers"]["cases"]
+    assert isinstance(cases, list) and cases
+    return cases
+
+
+def _header_case(name: str) -> dict[str, Any]:
+    return next(c for c in _header_cases() if c["name"] == name)
+
+
+def _malformed_header(name: str) -> str:
+    return str(next(c for c in _malformed_headers() if c["name"] == name)["value"])
+
+
+def _documented_header(principal: dict[str, Any]) -> str:
+    """The encoding the corpus comment writes out, independent of any reader."""
+
+    text = json.dumps(
+        {
+            "issuer": principal["issuer"],
+            "subject": principal["subject"],
+            "tenant_id": principal["tenant_id"],
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return _b64url(text.encode("utf-8"))
+
+
+class _Refused(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _no_constant(name: str) -> Any:
+    raise _Refused("constant")
+
+
+def _reference_read(value: str) -> dict[str, Any]:
+    """A strict reader written from the corpus comment. Raises naming the first failed check."""
+
+    if not value:
+        raise _Refused("empty")
+    if len(value) > _REFERENCE_MAX_CHARS:
+        raise _Refused("length")
+    if not value.isascii() or _URL_SAFE.fullmatch(value) is None:
+        raise _Refused("alphabet")
+    try:
+        raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except (binascii.Error, ValueError):
+        raise _Refused("decode") from None
+    if _b64url(raw) != value:
+        raise _Refused("trailing_bits")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise _Refused("utf8") from None
+    try:
+        parsed = json.loads(text, object_pairs_hook=_strict_object, parse_constant=_no_constant)
+    except _DuplicateKey:
+        raise _Refused("duplicate") from None
+    except ValueError:
+        raise _Refused("json") from None
+    if not isinstance(parsed, dict):
+        raise _Refused("not_object")
+    if set(parsed) != _PRINCIPAL_FIELDS:
+        raise _Refused("keys")
+    tenant = parsed["tenant_id"]
+    if not isinstance(tenant, str) or _UUID.fullmatch(tenant) is None:
+        raise _Refused("tenant")
+    for field, bound in (("issuer", 2048), ("subject", 256)):
+        text_value = parsed[field]
+        if not isinstance(text_value, str) or not 1 <= len(text_value) <= bound:
+            raise _Refused(field)
+        try:
+            text_value.encode("utf-8")
+        except UnicodeEncodeError:
+            raise _Refused(field) from None
+    if _documented_header(parsed) != value:
+        raise _Refused("canonical")
+    return parsed
+
+
+# @spec CONNECTOR-REQUESTER-4
+def test_the_principal_header_sections_carry_only_known_keys() -> None:
+    corpus = _corpus()
+    for section in ("principal_headers", "malformed_principal_headers"):
+        assert set(corpus[section]) == _HEADER_SECTION_KEYS, section
+        assert isinstance(corpus[section]["comment"], str) and corpus[section]["comment"]
+    for case in _header_cases():
+        assert set(case) == _HEADER_CASE_KEYS, case.get("name")
+        assert set(case["principal"]) == _PRINCIPAL_FIELDS, case["name"]
+        assert all(isinstance(value, str) for value in case["principal"].values()), case["name"]
+        assert isinstance(case["header"], str), case["name"]
+    for case in _malformed_headers():
+        assert set(case) == _MALFORMED_HEADER_CASE_KEYS, case.get("name")
+        assert isinstance(case["value"], str), case["name"]
+    names = [
+        str(entry["name"])
+        for entry in (
+            *_vectors(),
+            *_malformed(),
+            *_tampered(),
+            *corpus["forged_principal_headers"]["cases"],
+            *_header_cases(),
+            *_malformed_headers(),
+        )
+    ]
+    assert len(names) == len(set(names))
+
+
+# @spec CONNECTOR-REQUESTER-4
+@pytest.mark.parametrize("case", _header_cases(), ids=lambda c: str(c["name"]))
+def test_every_principal_header_is_the_documented_encoding(case: dict[str, Any]) -> None:
+    header = str(case["header"])
+    assert header == _documented_header(case["principal"])
+    assert _URL_SAFE.fullmatch(header) is not None and "=" not in header
+    assert _reference_read(header) == case["principal"]
+    # Raw UTF-8, not ASCII escapes: each value appears as JSON without them.
+    decoded = _b64url_decode(header)
+    for value in case["principal"].values():
+        assert json.dumps(value, ensure_ascii=False).encode("utf-8") in decoded, case["name"]
+
+
+# @spec CONNECTOR-REQUESTER-4
+def test_the_principal_header_corpus_is_not_vacuous() -> None:
+    principals = [case["principal"] for case in _header_cases()]
+    assert _by_name(_HUMAN)[_PRINCIPAL_KEY] in principals
+    assert any(
+        not principal["issuer"].isascii() and not principal["subject"].isascii()
+        for principal in principals
+    )
+    assert any("-" in case["header"] and "_" in case["header"] for case in _header_cases())
+    at_bounds = _header_case("a_principal_at_its_field_bounds_header")["principal"]
+    assert (len(at_bounds["issuer"]), len(at_bounds["subject"])) == (2048, 256)
+
+
+# @spec CONNECTOR-REQUESTER-4
+@pytest.mark.parametrize("case", _header_cases(), ids=lambda c: str(c["name"]))
+def test_every_principal_header_principal_mints_a_caller_token(case: dict[str, Any]) -> None:
+    # A proxy test mints a cct for each case under the vectors' seed, so each
+    # has to fit the token bound; the header is shorter than its token.
+    first = _vectors()[0]
+    token = caller_token.mint(
+        str(first["seed"]),
+        agent=str(first["agent"]),
+        exp=int(first["exp"]),
+        principal=caller_token.CallerPrincipal(**case["principal"]),
+    )
+    assert len(token) <= caller_token.MAX_TOKEN_CHARS
+    assert len(str(case["header"])) < len(token)
+
+
+# @spec CONNECTOR-REQUESTER-4
+@pytest.mark.parametrize("case", _malformed_headers(), ids=lambda c: str(c["name"]))
+def test_every_malformed_principal_header_is_refused_for_its_stated_reason(
+    case: dict[str, Any],
+) -> None:
+    with pytest.raises(_Refused) as refused:
+        _reference_read(str(case["value"]))
+    assert refused.value.reason == _HEADER_REFUSAL_REASONS[case["name"]], case["name"]
+
+
+# @spec CONNECTOR-REQUESTER-4
+def test_the_malformed_principal_headers_cover_every_refusal() -> None:
+    assert set(_HEADER_REFUSAL_REASONS) == {str(c["name"]) for c in _malformed_headers()}
+    assert set(_HEADER_REFUSAL_REASONS.values()) == {
+        "empty",
+        "length",
+        "alphabet",
+        "decode",
+        "trailing_bits",
+        "utf8",
+        "json",
+        "constant",
+        "duplicate",
+        "not_object",
+        "keys",
+        "tenant",
+        "issuer",
+        "subject",
+        "canonical",
+    }
+    assert len(_malformed_header("a_header_past_the_length_bound")) > _REFERENCE_MAX_CHARS
+
+
+# @spec CONNECTOR-REQUESTER-4
+def test_the_spelling_refusals_are_a_genuine_principal_to_a_lenient_reader() -> None:
+    # Not vacuous: each of these would read as a real requester if a reader
+    # normalized, stripped, re-padded, switched alphabet or skipped the
+    # canonical comparison, so only the strict checks refuse them.
+    human = str(_header_case("the_human_requester_header")["header"])
+    human_principal = _header_case("the_human_requester_header")["principal"]
+    url_safe = str(_header_case("a_header_using_both_url_safe_characters")["header"])
+    non_ascii = _header_case("a_non_ascii_issuer_and_subject_header")["principal"]
+
+    def padded(text: str) -> str:
+        return text + "=" * (-len(text) % 4)
+
+    assert base64.urlsafe_b64decode(_malformed_header("a_padded_header")) == _b64url_decode(human)
+    standard = _malformed_header("a_header_in_the_standard_alphabet")
+    assert base64.b64decode(padded(standard), validate=True) == _b64url_decode(url_safe)
+    sloppy = _malformed_header("a_header_with_stray_trailing_bits")
+    assert sloppy != human
+    assert base64.urlsafe_b64decode(padded(sloppy)) == _b64url_decode(human)
+    assert "".join(_malformed_header("a_header_with_inner_whitespace").split()) == human
+    assert _malformed_header("a_header_with_a_trailing_newline").strip() == human
+    homoglyph = _malformed_header("a_header_with_a_non_ascii_character")
+    assert unicodedata.normalize("NFKC", homoglyph) == human
+    marked = _b64url_decode(_malformed_header("a_header_with_a_byte_order_mark"))
+    assert json.loads(marked.decode("utf-8-sig")) == human_principal
+    for name, principal in (
+        ("a_header_with_unsorted_keys", human_principal),
+        ("a_header_of_spaced_json", human_principal),
+        ("a_header_with_trailing_whitespace_in_its_json", human_principal),
+        ("a_header_with_an_escaped_solidus", human_principal),
+        ("a_header_with_escaped_non_ascii", non_ascii),
+    ):
+        assert json.loads(_b64url_decode(_malformed_header(name))) == principal, name
+
+
+# @spec CONNECTOR-REQUESTER-4
+def test_a_principal_bearing_vector_projects_to_its_principal_header() -> None:
+    # The token corpus and the header corpus are one wire: the principal a
+    # minted cct carries, read by the proxy's verifier, projects to the case
+    # with that principal.
+    by_principal = {json.dumps(c["principal"], sort_keys=True): c for c in _header_cases()}
+    tied: set[str] = set()
+    for vector in _vectors():
+        if _PRINCIPAL_KEY not in vector:
+            continue
+        case = by_principal.get(json.dumps(vector[_PRINCIPAL_KEY], sort_keys=True))
+        if case is None:
+            continue
+        keys = [proxy_caller.public_key(str(vector["public"]))]
+        decision = proxy_caller.claims(keys, str(vector["minted"]))
+        assert decision is not None and decision.principal is not None, vector["name"]
+        assert proxy_caller.principal_header_value(decision.principal) == case["header"]
+        tied.add(str(vector["name"]))
+    assert {
+        _HUMAN,
+        "the_same_requester_on_a_work_item_run",
+        "a_non_ascii_subject_is_carried_escaped",
+        "a_control_character_is_carried_escaped",
+        "a_principal_at_its_field_bounds",
+    } <= tied

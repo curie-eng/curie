@@ -83,9 +83,9 @@ _NOT_FORWARDED = frozenset(
         caller.AGENT_HEADER.lower(),
         caller.RUN_HEADER.lower(),
         caller.WORK_ITEM_HEADER.lower(),
-        # Inbound copies are forged, on cct and ccr paths alike. ADR 0270
-        # decision 4 sets it from the verified claim in a later change; until
-        # then the connector never sees one.
+        # Inbound copies are forged, on cct and ccr paths alike, and all are
+        # dropped. ADR 0270 decision 4: the proxy sets one from the verified
+        # claim of an admitted cct, never on a route.
         caller.PRINCIPAL_HEADER.lower(),
     }
 )
@@ -612,6 +612,25 @@ def _too_large(request: web.Request, agent: str | None, route: RouteConfig | Non
     return web.Response(status=REFUSAL_STATUS, text="the request body is too large\n")
 
 
+def _identity_headers(decision: caller.Decision, *, route: bool) -> list[tuple[str, str]]:
+    """The verified identity an admitted request carries to the connector.
+
+    Called only after every admission and grant check. ``X-Curie-Principal``
+    is set once, from an admitted ``cct``'s principal (ADR 0270 decision 4); a
+    route token carries no human. The value is never logged.
+    """
+
+    headers: list[tuple[str, str]] = []
+    if decision.agent is not None:
+        headers.append((caller.AGENT_HEADER, decision.agent))
+    if decision.run is not None and decision.work_item is not None:
+        headers.append((caller.RUN_HEADER, decision.run))
+        headers.append((caller.WORK_ITEM_HEADER, decision.work_item))
+    if not route and decision.principal is not None:
+        headers.append((caller.PRINCIPAL_HEADER, caller.principal_header_value(decision.principal)))
+    return headers
+
+
 @web.middleware
 async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
     del handler  # Every request is decided and answered here; never delegated.
@@ -702,11 +721,8 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
         )
     # ADR 0178 decision 5. The token stays stripped. The connector sees the
     # verified claims as headers only this proxy can set.
-    if decision.agent is not None:
-        forwarded.add(caller.AGENT_HEADER, decision.agent)
-    if decision.run is not None and decision.work_item is not None:
-        forwarded.add(caller.RUN_HEADER, decision.run)
-        forwarded.add(caller.WORK_ITEM_HEADER, decision.work_item)
+    for name, value in _identity_headers(decision, route=route is not None):
+        forwarded.add(name, value)
     data: object
     if buffered:
         data = body

@@ -76,13 +76,14 @@ pub(crate) struct RequesterIdentityArgs {
     /// selection and an operator receiver registration listing one of the
     /// agent's bindings. Experimental in this release: keep it off outside
     /// test installs. When on, the agent's hosted connector caller tokens
-    /// carry the verified human requester and the connector proxy verifies it,
-    /// but the proxy does not yet pass the requester to connectors (a later
-    /// release adds that), so connectors cannot act on it yet. The worker
-    /// replaces a sandbox before serving a different requester, and a
-    /// different person's message that arrives during a live turn waits for
-    /// that turn to end; if the turn outlasts the redelivery budget the
-    /// message is settled visibly without running. A person's turn runs for at
+    /// carry the verified human requester. On a cluster install the connector
+    /// proxy verifies it and passes it to hosted connectors as
+    /// `X-Curie-Principal`; the local tier runs no caller proxy, so its
+    /// connectors never receive the requester. The worker replaces a sandbox
+    /// before serving a different requester, and a different person's message
+    /// that arrives during a live turn waits for that turn to end, for up to
+    /// the capacity wait budget (24 hours by default); a message still waiting
+    /// then ends without running. A person's turn runs for at
     /// most the one-hour life of their connector credential, less the boot
     /// grace and the sandbox claim time; a turn still working then is stopped
     /// and reported as `requester-window`. Precondition: the api, the
