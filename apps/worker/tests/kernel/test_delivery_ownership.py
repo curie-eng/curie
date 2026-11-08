@@ -1046,7 +1046,7 @@ def test_a_hard_killed_owner_leaves_its_lease_to_expire_before_a_replacement_run
 # --- R6, the ACK half: a fenced-out owner may not settle ----------------------
 
 
-def test_an_owner_that_loses_its_lease_refuses_the_terminal_ack(make_harness) -> None:
+def test_an_owner_that_loses_its_lease_refuses_the_terminal_ack(make_harness, sync_redis) -> None:
     """AC4: lease loss prevents a stale owner ACKing.
 
     The ownership store is made to disagree with the owner mid-turn (the lease
@@ -1082,7 +1082,9 @@ def test_an_owner_that_loses_its_lease_refuses_the_terminal_ack(make_harness) ->
             )
             entry_id, fields = await _read_one(h, h.config.consumer_name)
             await consumer._dispatch(entry_id, fields)
-            await _wait_until(lambda: h.runner.turn_active)
+            await _wait_until(
+                lambda: sync_redis.hget(consumer._waits._record("fence-1"), "order_started") == "1"
+            )
 
             lease = spy.leases_for("fence-1")[0]
             assert lease is not None, "the kernel was handed no lease"
