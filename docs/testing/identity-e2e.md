@@ -605,6 +605,82 @@ appear as the fingerprint of their `jti`, humans as the fingerprint of their
 first line of each tool result, the proxy's refusal code, the grant
 fingerprint and the pod-clock window of each request.
 
+## What stored-arguments-card proves
+
+ADR 0271 decision 8 and required evidence item 6 on a live install: the card
+of a dynamic approval, the requester's pending notice and the API's
+`display_summary` describe the arguments the approval stores, through the
+existing describer. Neither the bundle's display template nor the opaque
+`approval_ticket` replaces them or appears beside them. Run it with:
+
+```bash
+curie dev identity-e2e -- prove $T --scenario stored-arguments-card --evidence card.json
+```
+
+It needs what `approver-ticket-creation` needs: `--flag-agent` (default: the
+first agent `up` registered) brought up with `--bundle examples/weather`, so it
+serves the `netpol-probe` connector; `--sender` (the requester) and
+`--second-sender` (the selected approver), two different active verified
+humans in the roster; and no selector registration already stored on the
+agent. The scenario turns the requester flag on itself. `--wait` bounds each
+wait for the approval row, the card and the notice.
+
+Each step records its own evidence:
+
+1. S0: the `approver-ticket-creation` setup (both owned routes bound, only the
+   gated version served, the approver role restricted to the roster's active
+   humans), except that the served gate carries a `summary` template holding a
+   per-run template marker and no placeholders, so the runner's own display
+   for the held call is that marker. The run's selector is then registered on
+   `ticket-review` for `netpol-probe`/`search_dashboards` with the flag on, and
+   real email turns from the approver and the requester give both humans an
+   active canonical row in `principals`.
+2. S1: the API pod signs a ticket with the run's selector seed for the
+   requester's verified identity from that turn's capsule, the registered
+   route, agent, connector and tool, and the selected approver, with a fresh
+   nonce, issued now and valid for 240 s, over `{"query": <stored marker>}`
+   by `execution_arguments_sha256`. The requester's email turn carries
+   `[fake:gated-connector-tool netpol-probe search_dashboards {"query": "<stored marker>", "approval_ticket": "<ticket>"}]`,
+   the runner's gate holds the call, and the worker creates the approval
+   through the HTTP creation boundary. The stored row is read from the API's
+   Postgres, because the public read model carries neither `selection_mode`
+   nor `granted_arguments`: exactly one approval on the conversation grants
+   `mcp__netpol-probe__search_dashboards`, and it is dynamic, pending, over the
+   stored marker, and stores the ticket the turn carried (matched by
+   fingerprint).
+3. S2: the card the worker delivered to the email thread (its text and its
+   prompt), the requester's pending notice and `GET /approvals/<id>`'s
+   `display_summary` each show the stored marker, and none shows the template
+   marker, the `cat1.` prefix, any 24 consecutive characters of the ticket or a
+   label for the ticket field. The whole card event is checked for the same
+   leaks. The route resolves on the requesting surface, so the card lands in
+   the email thread and the notice above it is the fixed line
+   `Approval requested. See the card below.`, which carries no summary: that
+   notice is checked for the leaks, and only a notice that carries the summary
+   (`Awaiting approval (<id>): ...`) must also show the stored marker.
+   `display_summary` must be at most 2400 characters plus the describer's
+   truncation notice.
+4. S3 always runs, in a `finally` block, and a failed restore fails the run.
+   It runs the `approver-ticket-creation` restore and its check of the
+   registration, flag, deployments and routes, then puts back the approver
+   role, and removes the selector seed from the state.
+
+The 2400-character truncation itself is proved by unit tests
+(`apps/worker/tests/kernel/test_approval_stored_display.py` and
+`apps/api/tests/test_approval_presentation.py`), not live: a dynamic
+approval's arguments, ticket included, must fit the 4096-character connector
+grant, which keeps every live preview under the limit. The S1 approval stays
+pending until it expires, after the 24-hour session default because the ticket
+route binds no expiry, and its expiry resumes the paused conversation on the
+restored deployment. The run's agent version stays, undeployed.
+
+No evidence carries a ticket, key or token. The ticket stays in memory: it
+crosses the API pod's exec pipe and the requester's turn, and the evidence
+keeps lengths, booleans and fingerprints (the first 16 hex characters of a
+sha256) of the ticket and of each judged text. The approval's `summary`
+field, the runner's machine string of the raw call, is never read into the
+evidence.
+
 ## Add a scenario
 
 1. Write a function in `identity_scenarios.py` and register it with

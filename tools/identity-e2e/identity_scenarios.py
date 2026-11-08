@@ -1724,18 +1724,21 @@ class TicketScenario:
             latest[str(item["environment"])] = item
         return [latest[name] for name in sorted(latest)]
 
-    def deploy_version(self, api: Api, label: str, route: str) -> tuple[str, list[tuple[int, Any]]]:
+    def deploy_version(
+        self, api: Api, label: str, route: str, *, summary: str | None = None
+    ) -> tuple[str, list[tuple[int, Any]]]:
         """A new version of examples/weather gating the pair on ``route``, deployed per environment.
 
         The bundle is uploaded (it must be accepted: an inactive version's
         bundle is not route-checked), then ``POST /deployments`` runs once per
         environment the agent serves in; the answers are returned unjudged.
+        ``summary`` is the gate's display template, when the run sets one.
         """
 
         manifest = json.loads((TICKET_BUNDLE / tickets.MANIFEST_PATH).read_text())
         gate = tickets.live_tool(tickets.CONNECTOR, tickets.TOOL)
         data = tickets.bundle_archive(
-            TICKET_BUNDLE, tickets.gated_manifest(manifest, [(gate, route)])
+            TICKET_BUNDLE, tickets.gated_manifest(manifest, [(gate, route)], summary=summary)
         )
         write_private(self.harness.state.directory / f"approver-ticket-{label}.tar.gz", data)
         version = api.ok(
@@ -1942,13 +1945,14 @@ class TicketScenario:
             },
         )
 
-    def install(self) -> None:
+    def install(self, *, summary: str | None = None) -> None:
         """Bind both owned routes, serve only the gated bundle, and restrict the approver role.
 
         Both routes are bound before the gated version is deployed, because a
         deployment is refused while its bundle declares a route the agent has
         not bound. Every original active deployment is then ended, because a
         registration needs every active version to gate the pair (plan D5).
+        ``summary`` gives the served gate a display template; by default it has none.
         """
 
         setup = self.evidence.data["setup"]
@@ -1960,7 +1964,9 @@ class TicketScenario:
                     f"binding {list(tickets.OWNED_ROUTES)} answered {status}: "
                     f"{tickets.detail_code(body)}"
                 )
-            version_id, results = self.deploy_version(api, "gate", tickets.TICKET_ROUTE)
+            version_id, results = self.deploy_version(
+                api, "gate", tickets.TICKET_ROUTE, summary=summary
+            )
             setup["gated_version"] = version_id
             refused = [
                 (status, tickets.detail_code(body)) for status, body in results if status != 201
@@ -2396,18 +2402,19 @@ class TicketScenario:
 
     # turns and creation steps -----------------------------------------------------------
 
-    def send_turns(self) -> None:
+    def send_turns(self, turns: Sequence[tuple[str, str]] = TICKET_TURNS) -> None:
         """Real email turns whose ingress capsules the creation steps use.
 
         The approver writes first, so they have a canonical principals row; then
         the requester writes once per dedupe key the steps need. No step waits
         for any of these turns' sandboxes: creation reads only the ingress
-        capsule and payload in the runs stream.
+        capsule and payload in the runs stream. ``turns`` are ``(label, who)``
+        pairs; a scenario that needs fewer than :data:`TICKET_TURNS` names its own.
         """
 
         with self.harness.api() as api:
             self.ensure_registered(api)
-        for label, who in TICKET_TURNS:
+        for label, who in turns:
             sent = self.harness.send(
                 self.agent, self.senders[who], f"approver-ticket-creation: {label} turn"
             )
@@ -2430,7 +2437,7 @@ class TicketScenario:
                 for label, turn in self.turns.items()
             },
         )["turns"]
-        for label, who in TICKET_TURNS:
+        for label, who in turns:
             facts = captured[label]
             wanted = self.requester if who == "requester" else self.approver
             if (
@@ -2884,8 +2891,9 @@ def approver_ticket_creation(harness: Harness, args: Any, evidence: Evidence) ->
 
 
 # The ADR 0270 slice 2 requester scenarios (requester-effect, requester-expiry,
-# requester-approval) and the ADR 0271 grant-attestation scenario live in their
-# own modules and register here, last, so every name they import from this one
-# already exists.
+# requester-approval) and the ADR 0271 grant-attestation and stored-arguments-card
+# scenarios live in their own modules and register here, last, so every name they
+# import from this one already exists.
 import identity_scenarios_attestation  # noqa: E402,F401
 import identity_scenarios_requester  # noqa: E402,F401
+import identity_scenarios_stored_card  # noqa: E402,F401
