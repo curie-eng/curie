@@ -56,7 +56,10 @@ claim outlived the stop), `cleanup-unverified` (something the claim could
 have left was still there after cleanup; the supervisor logs what),
 `history-unsettled` (the runner was busy, gave a malformed answer, or its
 history was not durable within the settle timeout; the child is still
-stopped and its files wiped) and `retire-failed` (retirement itself raised).
+stopped and its files wiped), `retire-failed` (retirement itself raised) and
+`create-unacknowledged` (the control client hung up before a create answered:
+the create still finishes, then its claim is stopped and wiped, because that
+caller cannot know whether it started; a retry of that create is refused).
 Any failure during a create or a retirement ends in quarantine, never in a
 shell that reports itself healthy. A create and a retirement run to their
 end even if the worker's connection drops. A quarantined shell answers 503 on its health path, so the container
