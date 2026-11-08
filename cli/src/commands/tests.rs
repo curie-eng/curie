@@ -1937,6 +1937,7 @@ fn route_write_refusal_names_every_deployment_declaring_a_removed_route() {
                         expires_in_seconds: None,
                         approver_ticket: None,
                         separation: None,
+                        remind_every_s: None,
                     },
                 )
             })

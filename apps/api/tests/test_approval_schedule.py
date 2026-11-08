@@ -10,13 +10,35 @@ from curie_api.schemas.approvals import ApprovalRouteBinding, ApprovalRouteBindi
 from pydantic import ValidationError
 
 DEADLINE_VECTORS = json.loads(
-    (Path(__file__).resolve().parents[3] / "tests/vectors/approval-route-deadlines.json")
-    .read_text()
+    (
+        Path(__file__).resolve().parents[3] / "tests/vectors/approval-route-deadlines.json"
+    ).read_text()
+)
+
+REMINDER_VECTORS = json.loads(
+    (
+        Path(__file__).resolve().parents[3] / "tests/vectors/approval-route-reminders.json"
+    ).read_text()
 )
 
 
 def binding(**fields: Any) -> dict[str, Any]:
     return {"resolution": {"kind": "slack", "address": "C0EXAMPLE1"}, **fields}
+
+
+@pytest.mark.parametrize("value", REMINDER_VECTORS["valid"])
+def test_reminder_interval_round_trip(value: int | None) -> None:
+    written = ApprovalRouteBinding.model_validate(binding(remind_every_s=value)).model_dump()
+    assert written.get("remind_every_s") == value
+    assert (
+        ApprovalRouteBindingOut.model_validate(written).model_dump().get("remind_every_s") == value
+    )
+
+
+@pytest.mark.parametrize("value", REMINDER_VECTORS["invalid"])
+def test_reminder_interval_rejects_invalid_values(value: Any) -> None:
+    with pytest.raises(ValidationError):
+        ApprovalRouteBinding.model_validate(binding(remind_every_s=value))
 
 
 @pytest.mark.parametrize("value", DEADLINE_VECTORS["valid"])

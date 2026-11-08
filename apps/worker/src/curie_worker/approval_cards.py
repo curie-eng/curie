@@ -134,6 +134,7 @@ class ApprovalCardRef:
     requested_by: str = ""
     kind: str = ""
     adapter: str | None = None
+    conversation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -192,6 +193,7 @@ def _parse_ref(data: dict[str, Any]) -> ApprovalCardRef | None:
             requested_by=str(data.get("requested_by") or ""),
             kind=str(data.get("kind") or ""),
             adapter=data.get("adapter"),
+            conversation_id=data.get("conversation_id"),
         )
     except (ValueError, KeyError, TypeError):
         # A shape-drifted entry must not break the resume; treat it as no
@@ -242,6 +244,7 @@ class ApprovalCardStore:
         requested_by: str = "",
         kind: str = "",
         adapter: str | None = None,
+        conversation_id: str | None = None,
     ) -> None:
         # Reject the empty id before it collapses every such write onto the same
         # bare approval card key.
@@ -255,6 +258,7 @@ class ApprovalCardStore:
             requested_by=requested_by,
             kind=kind,
             adapter=adapter,
+            conversation_id=conversation_id,
         )
         await self._write(approval_id, ref)
 

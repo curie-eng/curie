@@ -146,6 +146,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0148"] == "expand"
     assert kinds["0149"] == "expand"
     assert kinds["0151"] == "expand"
+    assert kinds["0152"] == "expand"
     assert kinds["0153"] == "expand"
 
 

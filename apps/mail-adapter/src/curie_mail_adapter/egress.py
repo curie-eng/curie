@@ -259,6 +259,11 @@ class EgressHandler(BaseHTTPRequestHandler):
             return status, recorded_at if event.target.reply_ref is None else None
         if isinstance(event, ReplyPost):
             interaction = event.message.interaction
+            card_ref = event.target.reply_ref or ""
+            if interaction is None and card_ref.startswith(APPROVAL_CARD_REF_PREFIX):
+                return self.adapter.send_approval_reminder(
+                    conversation_id, card_ref, event.message.text
+                ), None
             if isinstance(interaction, ConfirmIntent) and conversation_id:
                 return self.adapter.record_approval_card(
                     conversation_id,

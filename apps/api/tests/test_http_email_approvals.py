@@ -115,6 +115,7 @@ def email_case(
             case = email_receivers._queued(valkey, runs_stream, slack["context_key"])
             assert case.context.scope.provider == "email"
             case.client, case.provider, case.scope, case.email = client, provider, slack, email
+            case.email_channel_token = token
             case.request = request_for(case)
             assert case.request["approval"]["reply_kind"] == "email"
             assert case.request["approval"]["card_channel"] == email_receivers.INBOX

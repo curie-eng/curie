@@ -334,6 +334,7 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     assert can_serve("0148", window, known) is False
     assert can_serve("0149", window, known) is False
     assert can_serve("0151", window, known) is False
+    assert can_serve("0152", window, known) is False
     assert can_serve("0153", window, known) is True
 
 

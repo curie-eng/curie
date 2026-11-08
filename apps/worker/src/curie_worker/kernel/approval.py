@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -43,6 +44,7 @@ from ..approvals import (
     approver_fields,
     decided_field,
 )
+from ..binding import binding_adapter_for_handle
 from ..reply_sink import (
     CLUSTER_MESSAGE_ADAPTER,
     TargetRoute,
@@ -167,11 +169,15 @@ def _parse_approval_targets(
         "expires_in_seconds",
         "approver_ticket",
         "separation",
+        "remind_every_s",
     }:
         return None
 
     duration = binding.get("expires_in_seconds")
     if duration is not None and (type(duration) is not int or not 0 < duration <= 315_360_000):
+        return None
+    interval = binding.get("remind_every_s")
+    if interval is not None and (type(interval) is not int or not 0 < interval <= 2**31 - 1):
         return None
 
     resolution = binding.get("resolution")
@@ -1076,12 +1082,14 @@ async def _pause_for_approval(
         handle.channel,
     )
     card_endpoint = handle.endpoint if in_requesting_channel else None
-    # A policy route names only a channel. A Slack turn lends its adapter
-    # so a named identity posts the card under that same identity. An adapter
-    # from another kind cannot carry a Slack policy card.
-    card_adapter = (
-        None if not in_requesting_channel and handle.kind != SLACK_KIND else route.adapter
-    )
+    # A policy route names only a channel. A Slack turn lends its bot identity;
+    # the relay's delivery adapter and other channel kinds cannot carry it.
+    if in_requesting_channel:
+        card_adapter = route.adapter
+    elif handle.kind == SLACK_KIND:
+        card_adapter = binding_adapter_for_handle(handle)
+    else:
+        card_adapter = None
     # The relay (#2883) carries the card on the turn's own ref, so no card
     # message follows the notice there, and its reader parses the approval id
     # out of the notice text.
@@ -1269,6 +1277,15 @@ async def _pause_for_approval(
                     # the live card did, and once the sandbox is gone this
                     # is the worker's only copy of it (#1084).
                     requested_by=requested_by,
+                    conversation_id=(
+                        (
+                            thread
+                            if in_requesting_channel and re.fullmatch(r"\d+\.\d+", thread)
+                            else card_ts
+                        )
+                        if card_kind == "slack"
+                        else thread
+                    ),
                 )
                 registered = True
             except Exception as exc:  # noqa: BLE001 - best-effort memory

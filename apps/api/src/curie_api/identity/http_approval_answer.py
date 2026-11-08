@@ -823,6 +823,7 @@ async def _answer(
             )).scalar_one_or_none()
             locked = _pending(locked, snapshot)
             locked.status = ApprovalStatus(answer.decision)
+            locked.next_remind_at = None
             locked.resolved_by = principal.subject
             locked.resolution_note = answer.note
             locked.resolved_at = datetime.now(UTC).replace(tzinfo=None)

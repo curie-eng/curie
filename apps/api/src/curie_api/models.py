@@ -618,6 +618,12 @@ class Approval(Base):
 
     __tablename__ = "approvals"
     __table_args__ = (
+        Index(
+            "ix_approvals_next_remind_at",
+            "next_remind_at",
+            "id",
+            postgresql_where=text("next_remind_at IS NOT NULL"),
+        ),
         # @spec HTTP-APPROVAL-CONTINUITY-5. Private, bounded provenance.
         CheckConstraint(
             "identity_context IS NULL OR octet_length(identity_context) <= 16384",
@@ -710,6 +716,7 @@ class Approval(Base):
     # rejected; a resolve attempt flips it to expired instead.
     expires_at: Mapped[datetime | None] = mapped_column(default=None)
     remind_every_s: Mapped[int | None] = mapped_column(default=None)
+    next_remind_at: Mapped[datetime | None] = mapped_column(default=None)
     resolved_by: Mapped[str | None] = mapped_column(default=None)
     resolution_note: Mapped[str | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())

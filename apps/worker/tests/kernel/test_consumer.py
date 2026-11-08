@@ -2290,13 +2290,47 @@ def test_lost_capacity_wake_lease_does_not_stop_later_turn(
             parked_event = _qevent("parked", thread="lease-shared", event_id="lease-parked")
             first = _capacity_consumer(h)
             await first.ensure_group()
-            await h.async_redis.xadd(h.config.stream, to_stream_fields(parked_event))
-            first_task = asyncio.create_task(first.run())
-            try:
-                await _wait_capacity_state(first, parked_event.event_id, "waiting")
-            finally:
-                first.request_stop()
-                await first_task
+            parked_id, parked_fields = await _pending_local_entry(h, parked_event)
+            await first._dispatch(parked_id, parked_fields)
+            await asyncio.gather(*list(first._inflight))
+            await _wait_capacity_state(first, parked_event.event_id, "waiting")
+            await first._repair_wait_notices()
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            await h.async_redis.zadd(consumer._waits._due, {parked_event.event_id: 0})
+            assert await consumer._waits.wake_due() == 1
+            woken = await consumer._waits.get(parked_event.event_id)
+            assert woken is not None and woken.state == "woken"
+            wake_id, wake_fields = (
+                await h.async_redis.xreadgroup(
+                    h.config.consumer_group,
+                    h.config.consumer_name,
+                    {h.config.stream: ">"},
+                    count=1,
+                )
+            )[0][1][0]
+            lease_store = DeliveryLeaseStore(h.async_redis, h.config)
+            lease = await lease_store.acquire(
+                h.config.stream,
+                h.config.consumer_group,
+                wake_id,
+                consumer=h.config.consumer_name,
+            )
+            old_epoch = uuid.uuid4().hex
+            if record_old_epoch:
+                assert (
+                    await consumer._waits.mark_active(
+                        parked_event.event_id, woken.generation, lease, old_epoch
+                    )
+                    == "active"
+                )
+                assert await consumer._waits.confirm_grant(
+                    parked_event.event_id, woken.generation, lease, old_epoch
+                )
+                h.runner.admission_results[old_epoch] = "granted"
+            await h.async_redis.delete(
+                h.config.delivery_lease_key(h.config.stream, h.config.consumer_group, wake_id)
+            )
 
             h.fake_k8s.quota_rejection = None
             hold = asyncio.Event()
@@ -2309,43 +2343,8 @@ def test_lost_capacity_wake_lease_does_not_stop_later_turn(
                 await _wait_until(lambda: h.runner.queried == ["later"])
                 later_epoch = h.runner.turn_epoch
                 assert later_epoch is not None
-                consumer = _capacity_consumer(h)
-                await consumer.ensure_group()
-                await h.async_redis.zadd(consumer._waits._due, {parked_event.event_id: 0})
-                assert await consumer._waits.wake_due() == 1
-                woken = await consumer._waits.get(parked_event.event_id)
-                assert woken is not None and woken.state == "woken"
-                wake_id, wake_fields = (
-                    await h.async_redis.xreadgroup(
-                        h.config.consumer_group,
-                        h.config.consumer_name,
-                        {h.config.stream: ">"},
-                        count=1,
-                    )
-                )[0][1][0]
-                lease_store = DeliveryLeaseStore(h.async_redis, h.config)
-                lease = await lease_store.acquire(
-                    h.config.stream,
-                    h.config.consumer_group,
-                    wake_id,
-                    consumer=h.config.consumer_name,
-                )
-                old_epoch = uuid.uuid4().hex
                 if record_old_epoch:
                     assert old_epoch != later_epoch
-                    assert (
-                        await consumer._waits.mark_active(
-                            parked_event.event_id, woken.generation, lease, old_epoch
-                        )
-                        == "active"
-                    )
-                    assert await consumer._waits.confirm_grant(
-                        parked_event.event_id, woken.generation, lease, old_epoch
-                    )
-                    h.runner.admission_results[old_epoch] = "granted"
-                await h.async_redis.delete(
-                    h.config.delivery_lease_key(h.config.stream, h.config.consumer_group, wake_id)
-                )
 
                 await consumer._interrupt_on_lease_lost(wake_id, wake_fields)
                 assert h.runner.turn_active
@@ -4673,7 +4672,6 @@ def test_prompt_selection_stays_timely_while_heavy_reclaim_waits_for_capacity(
             reclaim_min_idle_ms=80,
             dead_consumer_idle_ms=0,
             consumer_heartbeat_ttl_ms=30,
-            consumer_capability_ttl_ms=160,
         ) as h:
             hold = asyncio.Event()
             h.runner.hold = hold
@@ -4703,27 +4701,15 @@ def test_prompt_selection_stays_timely_while_heavy_reclaim_waits_for_capacity(
             assert await h.async_redis.xreadgroup(
                 h.config.consumer_group, "backstop-peer", {h.config.stream: ">"}, count=1
             )
-            await asyncio.sleep(0.09)
-
-            prompt_id = await h.async_redis.xadd(
-                h.config.stream, to_stream_fields(_qevent("prompt", event_id="prompt"))
-            )
-            assert await h.async_redis.xreadgroup(
-                h.config.consumer_group, "prompt-peer", {h.config.stream: ">"}, count=1
-            )
-            store = ConsumerLivenessStore(h.async_redis)
-            await store.publish(
-                stream=h.config.stream,
-                group=h.config.consumer_group,
-                consumer="prompt-peer",
-                heartbeat_ttl_ms=1,
-                capability_ttl_ms=h.config.consumer_capability_ttl_ms,
-            )
-            await _wait_key(
-                h.async_redis,
-                consumer_heartbeat_key(h.config.stream, h.config.consumer_group, "prompt-peer"),
-                present=False,
-            )
+            assert await h.async_redis.xclaim(
+                h.config.stream,
+                h.config.consumer_group,
+                "backstop-peer",
+                0,
+                [old_id],
+                idle=h.config.reclaim_min_idle_ms + 1,
+                justid=True,
+            ) == [old_id]
 
             heavy = asyncio.create_task(consumer._reclaim_once())
             deadline = time.monotonic() + 1
@@ -4744,8 +4730,32 @@ def test_prompt_selection_stays_timely_while_heavy_reclaim_waits_for_capacity(
             )
             assert not heavy.done(), "heavy dispatch should be blocked on the occupied semaphore"
 
+            prompt_id = await h.async_redis.xadd(
+                h.config.stream, to_stream_fields(_qevent("prompt", event_id="prompt"))
+            )
+            assert await h.async_redis.xreadgroup(
+                h.config.consumer_group, "prompt-peer", {h.config.stream: ">"}, count=1
+            )
+            store = ConsumerLivenessStore(h.async_redis)
+            await store.publish(
+                stream=h.config.stream,
+                group=h.config.consumer_group,
+                consumer="prompt-peer",
+                heartbeat_ttl_ms=1,
+                capability_ttl_ms=h.config.consumer_capability_ttl_ms,
+            )
+            await _wait_key(
+                h.async_redis,
+                consumer_heartbeat_key(h.config.stream, h.config.consumer_group, "prompt-peer"),
+                present=False,
+            )
             assert await consumer._prompt_reclaim_once() == 0
-            await asyncio.sleep(h.config.consumer_heartbeat_ttl_ms / 1000 + 0.015)
+            absence = asyncio.Event()
+            asyncio.get_running_loop().call_later(
+                h.config.consumer_heartbeat_ttl_ms / 1000 + 0.015,
+                absence.set,
+            )
+            await absence.wait()
             prompt = asyncio.create_task(consumer._prompt_reclaim_once())
             deadline = time.monotonic() + 0.25
             while time.monotonic() < deadline:

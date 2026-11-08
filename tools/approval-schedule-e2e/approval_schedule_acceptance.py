@@ -58,8 +58,13 @@ class Install:
         self.ns = "test-approval-schedule"
         self.release = "approval-schedule"
         self.fullname = "approval-schedule-curie"
+        if args.criterion and args.criterion.startswith("REMINDERS"):
+            self.ns = "test-approval-reminders"
+            self.release = "approval-reminders"
+            self.fullname = "approval-reminders-curie"
         self.forwarders: list[subprocess.Popen[bytes]] = []
         self.cluster_resources: list[tuple[str, str]] = []
+        self.image_pins: set[str] = set()
         self.cli = ROOT / "cli/target/debug/curie"
 
     def kube(self, *argv: str, data: str | None = None) -> str:
@@ -69,6 +74,14 @@ class Install:
         return command("helm", *argv, "--kube-context", self.args.context, "-n", self.ns)
 
     def import_image(self, image: str) -> str:
+        first = image.split("/", 1)[0]
+        if "/" not in image:
+            source = f"docker.io/library/{image}"
+        elif "." not in first and ":" not in first and first != "localhost":
+            source = f"docker.io/{image}"
+        else:
+            source = image
+        self.image_pins.add(source)
         saver = subprocess.Popen(
             ["docker", "--context", self.args.docker_context, "image", "save", image],
             stdout=subprocess.PIPE,
@@ -92,6 +105,8 @@ class Install:
                     "ctr",
                     "images",
                     "import",
+                    "--label",
+                    "io.cri-containerd.pinned=pinned",
                     "-",
                 ],
                 stdin=saver.stdout,
@@ -115,10 +130,10 @@ class Install:
             "images",
             "list",
         )
-        source = f"docker.io/library/{image}"
         row = next(line.split() for line in listing.splitlines() if line.startswith(source + " "))
         digest = row[2]
         pinned = source.rsplit(":", 1)[0] + "@" + digest
+        self.image_pins.add(pinned)
         self.kube(
             "exec",
             "image-import",
@@ -129,6 +144,7 @@ class Install:
             "ctr",
             "images",
             "tag",
+            "--force",
             source,
             pinned,
         )
@@ -193,6 +209,12 @@ class Install:
         response = self.http.request(method, path, **kwargs)
         assert response.is_success, f"{method} {path}: {response.status_code} {response.text}"
         return response.json() if response.content else None
+
+    def connect_api(self) -> None:
+        if hasattr(self, "http"):
+            self.http.close()
+        self.url = f"http://127.0.0.1:{self.forward('api', 8000)}"
+        self.http = httpx.Client(base_url=self.url, headers={"X-API-Key": TEST_KEY}, timeout=15)
 
     def start(self) -> None:
         importer = {
@@ -299,6 +321,7 @@ class Install:
                 "ClusterRoleBinding",
                 "ValidatingAdmissionPolicy",
                 "ValidatingAdmissionPolicyBinding",
+                "Namespace",
             }:
                 name = obj["metadata"]["name"]
                 assert name.startswith((self.release, self.ns)), "cluster resource is not owned"
@@ -323,8 +346,7 @@ class Install:
         )
         self.kube("scale", f"deployment/{self.fullname}-api", "--replicas=1")
         self.kube("rollout", "status", f"deployment/{self.fullname}-api", "--timeout=90s")
-        self.url = f"http://127.0.0.1:{self.forward('api', 8000)}"
-        self.http = httpx.Client(base_url=self.url, headers={"X-API-Key": TEST_KEY}, timeout=15)
+        self.connect_api()
 
     def start_probe(self) -> None:
         if hasattr(self, "probe_pod"):
@@ -421,7 +443,10 @@ await store.remember_reply_below_card(approval_id)""",
                 f"printf '+{days}d\\n' > /clock/offset",
             )
 
-    def verify_http_owner(self) -> None:
+    def verify_http_owner(
+        self,
+        paths: tuple[str, ...] = ("apps/api/tests/test_http_approval_creation.py",),
+    ) -> None:
         deployment = json.loads(self.kube("get", f"deployment/{self.fullname}-api", "-o", "json"))
         source = deployment["spec"]["template"]["spec"]["containers"][0]
         env = list(source["env"])
@@ -464,7 +489,7 @@ await store.remember_reply_below_card(approval_id)""",
                                     "pytest",
                                     "-q",
                                     "--tb=short",
-                                    "apps/api/tests/test_http_approval_creation.py",
+                                    *paths,
                                 ],
                             }
                         ],
@@ -943,6 +968,11 @@ assert await redis.sismember(config.approval_references_pending_key(), {orphan["
         return {"repository": repository, "digest": digest, "tag": "", "pullPolicy": "Never"}
 
     def verify(self) -> None:
+        if self.args.criterion and self.args.criterion.startswith("REMINDERS"):
+            from approval_reminder_acceptance import verify_reminders
+
+            verify_reminders(self)
+            return
         route = {
             "resolution": {"mode": "requesting_surface"},
             "approvers": {"users": ["U0EXAMPLE2"]},
@@ -1061,6 +1091,20 @@ assert await redis.sismember(config.approval_references_pending_key(), {orphan["
         for process in self.forwarders:
             process.terminate()
             process.wait()
+        if self.image_pins:
+            image_command = (
+                "exec",
+                "image-import",
+                "--",
+                "chroot",
+                "/node",
+                self.args.node_cli,
+                "ctr",
+                "images",
+            )
+            present = {row.split()[0] for row in self.kube(*image_command, "list").splitlines()[1:]}
+            for ref in sorted(self.image_pins & present):
+                self.kube(*image_command, "label", ref, "io.cri-containerd.pinned-")
         subprocess.run(
             [
                 "helm",
@@ -1099,7 +1143,7 @@ def main() -> None:
     parser.add_argument("--previous-api-image", required=True)
     parser.add_argument("--values-file", required=True)
     parser.add_argument("--listen-host", default=os.environ.get("CURIE_LOCAL_STUB_HOST"))
-    parser.add_argument("--criterion", choices=["AC1", "AC2", "AC3"])
+    parser.add_argument("--criterion", choices=["AC1", "AC2", "AC3", "REMINDERS"])
     args = parser.parse_args()
     head = command("git", "rev-parse", "HEAD").strip()
     assert command("git", "rev-parse", args.candidate).strip() == head, "candidate is not HEAD"
@@ -1122,6 +1166,41 @@ def main() -> None:
     try:
         install.start()
         install.verify()
+    except Exception:
+        try:
+            pods = json.loads(install.kube("get", "pods", "-o", "json"))["items"]
+            print(
+                json.dumps(
+                    {
+                        "pods": [
+                            {
+                                "name": pod["metadata"]["name"],
+                                "phase": pod.get("status", {}).get("phase"),
+                                "containers": [
+                                    {
+                                        "name": container["name"],
+                                        "ready": container["ready"],
+                                        "reason": next(
+                                            iter(container.get("state", {}).values()), {}
+                                        ).get("reason"),
+                                    }
+                                    for container in pod.get("status", {}).get(
+                                        "containerStatuses", []
+                                    )
+                                ],
+                            }
+                            for pod in pods
+                        ]
+                    }
+                ),
+                flush=True,
+            )
+            for pod in pods:
+                if "schema-migrate" in pod["metadata"]["name"]:
+                    print(install.kube("logs", pod["metadata"]["name"], "--tail=40"), flush=True)
+        except RuntimeError:
+            print("verification diagnostics unavailable", flush=True)
+        raise
     finally:
         install.close()
 

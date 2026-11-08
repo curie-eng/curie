@@ -5586,6 +5586,8 @@ export interface components {
             /** Expires In Seconds */
             expires_in_seconds?: number | null;
             notification?: components["schemas"]["ApprovalNotificationTarget"] | null;
+            /** Remind Every S */
+            remind_every_s?: number | null;
             /** Resolution */
             resolution: components["schemas"]["ApprovalResolutionTarget"] | components["schemas"]["ApprovalRequestingSurfaceTarget"];
             separation?: components["schemas"]["ApprovalSeparation"] | null;
@@ -5603,6 +5605,8 @@ export interface components {
             /** Expires In Seconds */
             expires_in_seconds?: number | null;
             notification?: components["schemas"]["ApprovalTargetOut"] | null;
+            /** Remind Every S */
+            remind_every_s?: number | null;
             /** Resolution */
             resolution: components["schemas"]["ApprovalTargetOut"] | components["schemas"]["ApprovalRequestingSurfaceTargetOut"];
             separation?: components["schemas"]["ApprovalSeparationOut"] | null;

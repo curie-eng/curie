@@ -321,6 +321,7 @@ async def expire_http_approval(
             saved = verified_capsule(runtime, row)
             assert saved is not None
             row.status = ApprovalStatus.expired
+            row.next_remind_at = None
             row.resolved_at = now
             await writer.flush()
             await writer.refresh(row)

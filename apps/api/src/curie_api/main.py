@@ -32,6 +32,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from curie_api.crud import agents as crud_agents
 
 from . import __version__, oidc
+from .approval_reminders import enqueue_reminder
 from .channel_identities import start_static_slack_bootstrap
 from .code_host_trust import code_host_verify
 from .commitpoller import CommitPoller, GitHubBranchTip
@@ -295,6 +296,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 publication_patch_retention_seconds=(settings.publication_patch_retention_seconds),
                 http_expiry=app.state.http_approval_expiry,
                 identity_runtime=identity_runtime(app.state),
+                reminder_enqueue=(
+                    partial(enqueue_reminder, valkey, settings.runs_stream)
+                    if settings.approval_reminders_enabled
+                    else None
+                ),
                 remediation_admissions=(
                     partial(
                         reconcile_admissions,

@@ -2670,6 +2670,7 @@ fn route_binding_as_write(
         expires_in_seconds: binding.expires_in_seconds,
         approver_ticket: None,
         separation: None,
+        remind_every_s: binding.remind_every_s,
     }
 }
 
@@ -2707,6 +2708,9 @@ fn sre_approvals_route_map(
                 .and_then(|binding| binding.expires_in_seconds),
             approver_ticket: None,
             separation: None,
+            remind_every_s: existing
+                .and_then(|routes| routes.get(SRE_APPROVALS_ROUTE))
+                .and_then(|binding| binding.remind_every_s),
         },
     );
     map

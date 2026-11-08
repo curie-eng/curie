@@ -458,6 +458,12 @@ pub struct ApprovalRouteBindingResponse {
         skip_serializing_if = "Option::is_none"
     )]
     pub expires_in_seconds: Option<Option<u64>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_reminder_interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub remind_every_s: Option<Option<u64>>,
     /// ADR 0271: the approver-ticket selector registered on this route, with
     /// the server-owned pinned `ceiling.approver_role`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -520,6 +526,19 @@ where
     if value.is_some_and(|duration| !(1..=315_360_000).contains(&duration)) {
         return Err(serde::de::Error::custom(
             "expires_in_seconds must be between 1 and 315360000, or null",
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn deserialize_reminder_interval<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)?;
+    if value.is_some_and(|interval| !(1..=i32::MAX as u64).contains(&interval)) {
+        return Err(serde::de::Error::custom(
+            "remind_every_s must be between 1 and 2147483647, or null",
         ));
     }
     Ok(Some(value))
@@ -617,6 +636,12 @@ pub struct ApprovalRouteBindingWrite {
         skip_serializing_if = "Option::is_none"
     )]
     pub expires_in_seconds: Option<Option<u64>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_reminder_interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub remind_every_s: Option<Option<u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approver_ticket: Option<ApproverTicketWrite>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -746,6 +771,12 @@ pub struct RouteBindingInput {
     pub approver_ticket: Option<ApproverTicketWrite>,
     #[serde(default)]
     pub separation: Option<ApprovalSeparationWrite>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_reminder_interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub remind_every_s: Option<Option<u64>>,
 }
 
 /// An `approvers` block as written in a `--routes-from` file. Strict by design.
@@ -779,6 +810,7 @@ impl From<RouteBindingInput> for ApprovalRouteBindingWrite {
             expires_in_seconds: input.expires_in_seconds,
             approver_ticket: input.approver_ticket,
             separation: input.separation,
+            remind_every_s: input.remind_every_s,
         }
     }
 }

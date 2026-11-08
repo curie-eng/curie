@@ -88,6 +88,7 @@ def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None
     assert kinds["0148"] == "expand"
     assert kinds["0149"] == "expand"
     assert kinds["0151"] == "expand"
+    assert kinds["0152"] == "expand"
     assert kinds["0153"] == "expand"
     serving = load("packages/protected-hooks/src/curie_protected_hooks/schema_serving.json")
     assert serving["revision_parents"]["0139"] == ["0138"]
@@ -99,6 +100,7 @@ def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None
     assert serving["revision_parents"]["0148"] == ["0146", "0147"]
     assert serving["revision_parents"]["0149"] == ["0148"]
     assert serving["revision_parents"]["0151"] == ["0149"]
+    assert serving["revision_parents"]["0152"] == ["0151"]
     assert serving["revision_parents"]["0153"] == ["0152"]
     chart_rows = load("charts/curie/files/schema-compat.json")["revisions"]
     chart = {row["revision"]: row for row in chart_rows}

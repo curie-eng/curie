@@ -1062,6 +1062,19 @@ class MailAdapter:
             return status, None
         return 200, f"{APPROVAL_CARD_REF_PREFIX}{approval_id}"
 
+    def send_approval_reminder(self, conversation_id: str, card_ref: str, text: str) -> int:
+        ref = self.state.approval_ref_for(card_ref[len(APPROVAL_CARD_REF_PREFIX) :])
+        if ref is None:
+            return 404
+        if ref["conversation_id"] != conversation_id:
+            return 422
+        if ref["state"] != "live":
+            return 200
+        sent = self.provider.send_reply(ref["reply_ref"], text, True)
+        if isinstance(sent, Failure):
+            return 424 if sent.kind == "egress_refused" else 502
+        return 200
+
     def settle_approval_card(self, card_ref: str, settled: SettledOutcome) -> int:
         """Send the one follow-up for a settled card and spend its reference.
 

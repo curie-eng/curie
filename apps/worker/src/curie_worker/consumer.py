@@ -40,11 +40,13 @@ import asyncio
 import hashlib
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 from datetime import UTC, datetime
 
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn
 from curie_dispatcher.queue import from_stream_fields
+from curie_internal.approval_reminder import APPROVAL_REMINDER_FIELD, ApprovalReminderV1
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     channel_event_id_scope,
@@ -197,6 +199,7 @@ class Consumer(StreamConsumer):
         leases: DeliveryLeaseStore,
         max_concurrency: int | None = None,
         drain: UpgradeDrainGate | None = None,
+        reminders: Callable[[ApprovalReminderV1], Awaitable[None]] | None = None,
     ) -> None:
         # Capacity parking requires a real delivery fence, so every runs
         # consumer supplies the same lease store the production entry point uses.
@@ -217,6 +220,7 @@ class Consumer(StreamConsumer):
         # rather than widening StreamBroker for one unrelated feature.
         self._valkey: Redis = redis
         self._kernel = kernel
+        self._reminders = reminders
         self._config = config
         self._waits = CapacityWaitStore(redis, config)
         # None, which the production entry point passes, sizes the lane from
@@ -550,6 +554,18 @@ class Consumer(StreamConsumer):
                         # race.
                         return
                     try:
+                        if APPROVAL_REMINDER_FIELD in fields:
+                            if (
+                                STREAM_PAYLOAD_FIELD in fields
+                                or "curie_identity_context_v1" in fields
+                            ):
+                                raise ValueError("reminder entries cannot carry a turn")
+                            raw_reminder = fields[APPROVAL_REMINDER_FIELD]
+                            if not isinstance(raw_reminder, str) or len(raw_reminder) > 1024:
+                                raise ValueError("invalid approval reminder size")
+                            reminder = ApprovalReminderV1.model_validate_json(raw_reminder)
+                        else:
+                            reminder = None
                         # @spec HTTP-INVOCATION-EXECUTION-18: hash before any wire rewrite.
                         identity_arguments: dict[str, str] = {}
                         if "curie_identity_context_v1" in fields:
@@ -563,7 +579,8 @@ class Consumer(StreamConsumer):
                                 # @spec HTTP-APPROVAL-CONTINUITY-4: exact bytes for creation.
                                 "original_payload": raw_payload,
                             }
-                        qevent = from_stream_fields(fields)
+                        if reminder is None:
+                            qevent = from_stream_fields(fields)
                     except Exception as exc:
                         if hasattr(span, "set_status"):
                             span.set_status(StatusCode.ERROR)
@@ -582,6 +599,17 @@ class Consumer(StreamConsumer):
                             reason="unparseable",
                             delivery_count=await self._pending_delivery_count(entry_id),
                         )
+                        return
+
+                    if reminder is not None:
+                        if self._reminders is None:
+                            raise RuntimeError("approval reminder delivery is not configured")
+                        lease.raise_if_lost()
+                        await self._reminders(reminder)
+                        lease.raise_if_lost()
+                        await self._ack(entry_id)
+                        await self._settle_delivery_best_effort(entry_id)
+                        process_outcome = "success"
                         return
 
                     # The ``curie.queue.process`` span opened before the parse,
@@ -1033,6 +1061,8 @@ class Consumer(StreamConsumer):
         the pre-ack fence enforces on its own; and the replacement's preflight is
         the second, independent guard against a turn that keeps running here.
         """
+        if APPROVAL_REMINDER_FIELD in fields:
+            return
         try:
             # Read before any await: the loss task drops ``_notice_lease``.
             lease = self._held_leases.get(entry_id) or self._notice_lease.get(entry_id)
@@ -1056,6 +1086,8 @@ class Consumer(StreamConsumer):
 
     async def _notice_vanished_entry(self, entry_id: str, fields: dict[str, str]) -> None:
         """Post the not-started edit when the broker entry itself is gone."""
+        if APPROVAL_REMINDER_FIELD in fields:
+            return
         try:
             qevent = from_stream_fields(fields)
             lease = self._held_leases.get(entry_id) or self._notice_lease.get(entry_id)

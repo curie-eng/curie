@@ -3393,6 +3393,19 @@
               }
             ]
           },
+          "remind_every_s": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 2147483647.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remind Every S"
+          },
           "resolution": {
             "anyOf": [
               {
@@ -3464,6 +3477,17 @@
                 "type": "null"
               }
             ]
+          },
+          "remind_every_s": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remind Every S"
           },
           "resolution": {
             "anyOf": [

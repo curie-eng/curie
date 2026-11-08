@@ -82,6 +82,49 @@ def _ask(mail: MailState, adapter: MailAdapter, url: str) -> str:
     return reference
 
 
+def test_standalone_reminder_after_completed_turn_reuses_card_reference(
+    mail: MailState,
+    approvals_adapter: MailAdapter,
+    url: str,
+) -> None:
+    seed_historical_reply(mail, approvals_adapter.state, cc=[APPROVER])
+    status, ack = post_event(
+        url, approval_card("appr-1", requested_by=REQUESTER, approvers=[APPROVER])
+    )
+    assert (status, ack) == (200, {"ref": CARD_REF})
+    assert post_event(url, completed("ev-1", outcome="awaiting-approval"))[0] == 200
+    (reference,) = APPROVAL_REF_PATTERN.findall(mail.replies_to("msg-1")[0])
+    assert mail.deliveries[-1][1] == frozenset({REQUESTER, APPROVER})
+    assert approvals_adapter.state.live_reply_refs("thr-1") == []
+    event = reply_post("Still awaiting your decision: Send the quote")
+    event["target"]["reply_ref"] = CARD_REF
+    assert post_event(url, event)[0] == 200
+    replies = mail.replies_to("msg-1")
+    assert len(replies) == 2
+    assert replies[-1] == "Still awaiting your decision: Send the quote"
+    assert mail.deliveries[-1][1] == frozenset({REQUESTER, APPROVER})
+    assert APPROVAL_REF_PATTERN.findall(replies[-1]) == []
+    assert approvals_adapter.state.approval_ref_for("appr-1")["reference"] == reference
+    assert len(approvals_adapter.state.approval_refs_in("thr-1")) == 1
+    assert approvals_adapter.state.live_reply_refs("thr-1") == []
+
+
+def test_reminder_cannot_cross_conversation_or_send_after_settlement(
+    mail: MailState,
+    approvals_adapter: MailAdapter,
+    url: str,
+) -> None:
+    reference = _ask(mail, approvals_adapter, url)
+    event = reply_post("Still awaiting your decision", conversation_id="another-thread")
+    event["target"]["reply_ref"] = CARD_REF
+    assert post_event(url, event)[0] == 422
+    assert len(mail.replies_to("msg-1")) == 1
+    approvals_adapter.state.set_approval_ref_state(reference, "answered")
+    event["target"]["conversation_id"] = "thr-1"
+    assert post_event(url, event)[0] == 200
+    assert len(mail.replies_to("msg-1")) == 1
+
+
 def _reply(
     mail: MailState,
     adapter: MailAdapter,

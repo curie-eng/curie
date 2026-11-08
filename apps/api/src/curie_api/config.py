@@ -526,6 +526,9 @@ class Settings(BaseSettings):
     # resumes their stranded sessions. Values <= 0 disable the sweeper (the
     # operator kill lever and the fully-inert-app escape hatch for tests).
     approval_sweep_interval_s: float = 30.0
+    approval_reminders_enabled: bool = Field(
+        default=False, validation_alias="CURIE_APPROVAL_REMINDERS_ENABLED"
+    )
     # Publication patches are private control-plane inputs. The ingress bound
     # and terminal retention are operator-owned, and the periodic approval
     # sweeper also reaps terminal bytes after this retention window.
