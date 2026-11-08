@@ -38,6 +38,8 @@ CLIENT = b"""
 import json, os, stat, urllib.request, urllib.error
 from pathlib import Path
 p = Path(os.environ["CURIE_CONNECTOR_UPLOAD_TOKENS_FILE"])
+assert "CURIE_RUNNER_TOKEN" not in os.environ
+assert "CURIE_CONNECTOR_CALLER_TOKEN" not in os.environ
 token = json.loads(p.read_text())["reviewer"]
 url = json.loads(os.environ["CURIE_CONNECTOR_UPLOAD_ENDPOINTS"])["reviewer"]
 results = []
@@ -55,6 +57,16 @@ Path(os.environ["HOME"], "upload-result.json").write_text(json.dumps({
     "uid": p.stat().st_uid,
 }))
 """
+BOOT = b"""
+import os, runpy, subprocess, sys
+from curie_runner.subprocess_env import cli_parent_env
+subprocess.run(
+    [sys.executable, "-I", "-m", "curie_runner.shell_launcher", "-c",
+     'exec "$CURIE_SHELL_PYTHON" "$CURIE_PLUGIN_DIR/upload.py"'],
+    env=cli_parent_env(os.environ), check=True,
+)
+runpy.run_module("curie_runner", run_name="__main__")
+"""
 
 
 def _bundle() -> bytes:
@@ -62,6 +74,7 @@ def _bundle() -> bytes:
         ".claude-plugin/plugin.json": b'{"name":"acme-bot","version":"1.0.0"}',
         "connectors.yaml": b"connectors:\n  reviewer:\n    image: acme/reviewer:1\n",
         "upload.py": CLIENT,
+        "boot.py": BOOT,
     }
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as archive:
@@ -124,10 +137,7 @@ def test_bundle_upload_uses_delivered_token_and_claim_wipe_removes_it(
                     slot="upload-slot",
                     tls=tls,
                     root=tmp_path / "shell",
-                    runner_command=(
-                        f'sh -c \'{sys.executable} "$CURIE_PLUGIN_DIR/upload.py" '
-                        f"&& exec {sys.executable} -m curie_runner'"
-                    ),
+                    runner_command=f"sh -c 'exec {sys.executable} \"$CURIE_PLUGIN_DIR/boot.py\"'",
                 )
                 valkey = connect_or_skip(decode_responses=False)
                 prefix = "test-upload-" + uuid.uuid4().hex
@@ -150,6 +160,9 @@ def test_bundle_upload_uses_delivered_token_and_claim_wipe_removes_it(
                 ]
                 env = {
                     "CURIE_RUNNER_TOKEN": "runner-" + uuid.uuid4().hex,
+                    "CURIE_CONNECTOR_CALLER_TOKEN": caller_token.mint(
+                        SEED, agent="acme-dev", exp=int(time.time()) + 3600
+                    ),
                     "CURIE_BUNDLE_REF": "bundle.tar.gz",
                     "CURIE_SESSION_ID": "upload-proof",
                     "CURIE_FAKE_MODEL": "1",

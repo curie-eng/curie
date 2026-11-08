@@ -154,7 +154,7 @@ def test_bash_env_omits_platform_credentials_while_the_model_call_keeps_its_key(
         app["command"] = (
             f"source {startup}; env; bash -c env; "
             'cat "$CURIE_CONNECTOR_UPLOAD_TOKENS_FILE"; '
-            'bash -c \'cat "$CURIE_CONNECTOR_UPLOAD_TOKENS_FILE"\''
+            "bash -c 'cat \"$CURIE_CONNECTOR_UPLOAD_TOKENS_FILE\"'"
         )
         app.router.add_post("/v1/messages", _messages)
         app.router.add_route("*", "/{tail:.*}", _anything_else)

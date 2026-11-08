@@ -338,8 +338,20 @@ def test_upload_token_file_is_runner_owned_and_removed_with_claim(tls, upload_st
     from curie_worker.sandbox import SubstrateConfig
 
     probe = b"""
-import base64, json, os, runpy, stat
+import base64, json, os, runpy, stat, subprocess, sys
 from pathlib import Path
+from curie_runner.subprocess_env import cli_parent_env
+if os.environ.get("UPLOAD_PROBE_CHILD") != "1":
+    env = {**cli_parent_env(os.environ), "UPLOAD_PROBE_CHILD": "1"}
+    subprocess.run(
+        [sys.executable, "-I", "-m", "curie_runner.shell_launcher", "-c",
+         'exec "$CURIE_SHELL_PYTHON" "$CURIE_PLUGIN_DIR/probe.py"'],
+        env=env, check=True,
+    )
+    runpy.run_module("curie_runner", run_name="__main__")
+    raise SystemExit()
+assert "CURIE_RUNNER_TOKEN" not in os.environ
+assert "CURIE_CONNECTOR_CALLER_TOKEN" not in os.environ
 name = os.environ.get("CURIE_CONNECTOR_UPLOAD_TOKENS_FILE")
 result = {"enabled": name is not None, "uid": os.getuid()}
 if name:
@@ -351,7 +363,6 @@ if name:
                       for key, value in tokens.items()
                   })
 Path(os.environ["HOME"], "upload-probe.json").write_text(json.dumps(result))
-runpy.run_module("curie_runner", run_name="__main__")
 """
     files = {
         "probe.py": probe,
