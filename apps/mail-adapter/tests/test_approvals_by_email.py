@@ -125,6 +125,23 @@ def test_reminder_cannot_cross_conversation_or_send_after_settlement(
     assert len(mail.replies_to("msg-1")) == 1
 
 
+def test_reminder_with_missing_card_reference_is_acknowledged_without_sending(
+    mail: MailState,
+    approvals_adapter: MailAdapter,
+    url: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="curie_mail_adapter.adapter")
+    event = reply_post("Still awaiting your decision")
+    event["target"]["reply_ref"] = CARD_REF
+    assert post_event(url, event)[0] == 200
+    assert post_event(url, event)[0] == 200
+    assert mail.deliveries == []
+    assert approvals_adapter.state.approval_refs_in("thr-1") == []
+    assert approvals_adapter.state.live_reply_refs("thr-1") == []
+    assert "approval reminder skipped: missing card reference" in caplog.text
+
+
 def _reply(
     mail: MailState,
     adapter: MailAdapter,
