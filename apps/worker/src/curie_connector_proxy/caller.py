@@ -29,6 +29,8 @@ PREFIX = "cct"
 HEADER = "X-Curie-Caller"
 # ADR 0270 decision 4: only this proxy may set it. Inbound copies are forged.
 PRINCIPAL_HEADER = "X-Curie-Principal"
+# ADR 0271 decision 7: the spent grant's jti, set only by this proxy. Inbound copies are forged.
+GRANT_VERIFIED_HEADER = "X-Curie-Grant-Verified"
 
 MISSING = "missing"
 INVALID = "invalid"
@@ -126,6 +128,12 @@ def public_key(text: str) -> VerifyKey:
             f"is {_KEY_BYTES}"
         )
     return VerifyKey(raw)
+
+
+def is_canonical_uuid(text: str) -> bool:
+    """Whether ``text`` is a lowercase hyphenated UUID, the one spelling the worker mints."""
+
+    return _UUID.fullmatch(text) is not None
 
 
 def _segment(text: str) -> bytes | None:
