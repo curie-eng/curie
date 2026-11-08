@@ -323,7 +323,8 @@ pub(super) fn build_route_bindings(
 /// route edit (ADR 0271). The write replaces the whole map and the response is
 /// never a writer, so each such route is rebuilt field by field from the
 /// readback, echoing the server-owned pin. An edited route keeps its own
-/// selector and separation; removing one takes an explicit `--routes-from`.
+/// selector, separation and stored deadline; removing one takes an explicit
+/// `--routes-from`.
 fn carry_over_selector_routes(
     existing: Option<&BTreeMap<String, crate::api::ApprovalRouteBindingResponse>>,
     bindings: &mut BTreeMap<String, crate::api::ApprovalRouteBindingWrite>,
@@ -390,6 +391,11 @@ fn carry_over_selector_routes(
                 edited.approver_ticket.get_or_insert(ticket);
                 if edited.separation.is_none() {
                     edited.separation = separation;
+                }
+                // No route flag sets a deadline, so the stored one is kept
+                // as read: a number, an explicit null, or absent (ADR 0273).
+                if edited.expires_in_seconds.is_none() {
+                    edited.expires_in_seconds = current.expires_in_seconds;
                 }
             }
             None => {

@@ -525,6 +525,42 @@ fn a_single_route_edit_preserves_a_carried_routes_deadline_and_its_explicit_null
 }
 
 #[test]
+fn a_same_route_edit_keeps_the_selector_routes_stored_deadline() {
+    // Editing the selector route itself must not drop its deadline (ADR 0273
+    // decision 1): a number, an explicit null and an absent key are three
+    // stored states, and the flag edit can set none of them.
+    for deadline in [
+        Some(serde_json::json!(900)),
+        Some(serde_json::Value::Null),
+        None,
+    ] {
+        let mut stored = serde_json::json!({
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "approver_ticket": registration_readback(),
+            "separation": {"exclude_requester": true},
+        });
+        if let Some(deadline) = &deadline {
+            stored["expires_in_seconds"] = deadline.clone();
+        }
+        let api = api(serde_json::json!({"ledger_post": stored.clone()}), 6, false);
+        let run = run(&args(
+            &api.server.base_url,
+            &["--route-resolution", "ledger_post=C0EXAMPLE3"],
+        ));
+        assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+        let sent = patches(&api.server);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let mut expected = stored;
+        expected["resolution"] = serde_json::json!({"kind": "slack", "address": "C0EXAMPLE3"});
+        assert_eq!(
+            sent[0]["approval_routes"]["ledger_post"], expected,
+            "deadline {deadline:?}: {}",
+            sent[0]
+        );
+    }
+}
+
+#[test]
 fn a_single_route_edit_on_an_agent_without_selectors_sends_only_that_route() {
     let api = api(
         serde_json::json!({"deal_desk": plain_route("C0EXAMPLE2")}),
