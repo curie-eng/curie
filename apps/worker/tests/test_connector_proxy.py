@@ -9,6 +9,7 @@ tests/vectors/connector-caller-refusal.json, which the runner reads too.
 from __future__ import annotations
 
 import asyncio
+import base64
 import gzip
 import json
 import logging
@@ -36,7 +37,7 @@ _REFUSAL = json.loads(
 _VECTOR = next(v for v in _TOKENS["vectors"] if v["name"] == "a_plain_agent_name")
 _TOKEN = str(_VECTOR["minted"])
 _BEFORE_EXPIRY = int(_VECTOR["exp"]) - 10
-_GRANT_SEED = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+_GRANT_SEED = base64.b64encode(bytes(range(32))).decode()
 _GATED_TOOLS = ("github/merge_pull_request",)
 _CONNECTOR = "github"
 _MERGE_CALL = (

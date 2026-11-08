@@ -19,7 +19,7 @@ _VECTOR = (
     Path(__file__).resolve().parents[3] / "tests" / "vectors" / "connector-caller-token.json"
 )
 _FILE_KEYS = {"comment", "prefix", "vectors"}
-_VECTOR_KEYS = {"name", "why", "seed", "public", "agent", "exp", "minted"}
+_VECTOR_KEYS = {"name", "why", "seed_range", "public", "agent", "exp", "minted"}
 _RUN_KEYS = {"run", "work_item"}
 
 
@@ -60,7 +60,7 @@ def test_the_worker_mints_exactly_the_frozen_token(vector: dict[str, object]) ->
         else {}
     )
     minted = caller_token.mint(
-        str(vector["seed"]),
+        base64.b64encode(bytes(range(*vector["seed_range"]))).decode(),
         agent=str(vector["agent"]),
         exp=int(str(vector["exp"])),
         **extra,
@@ -72,7 +72,7 @@ def test_the_worker_mints_exactly_the_frozen_token(vector: dict[str, object]) ->
 def test_every_frozen_token_verifies_under_its_public_key(vector: dict[str, object]) -> None:
     # The corpus has to be right before a verifier is written against it, so
     # the signature and the claims are checked here with the primitive itself.
-    seed = base64.b64decode(str(vector["seed"]))
+    seed = bytes(range(*vector["seed_range"]))
     public = base64.b64decode(str(vector["public"]))
     assert bytes(SigningKey(seed).verify_key) == public
 
@@ -87,7 +87,7 @@ def test_every_frozen_token_verifies_under_its_public_key(vector: dict[str, obje
 
 
 def test_one_of_the_run_pair_is_refused_without_echoing_it() -> None:
-    seed = str(_vectors()[0]["seed"])
+    seed = base64.b64encode(bytes(range(*_vectors()[0]["seed_range"]))).decode()
     run = "11111111-1111-4111-8111-111111111111"
     work_item = "22222222-2222-4222-8222-222222222222"
     with pytest.raises(ValueError, match="present together") as caught:
@@ -112,7 +112,7 @@ def test_the_refusal_never_echoes_the_key() -> None:
 
 def test_surrounding_whitespace_in_a_mounted_key_is_ignored() -> None:
     # A Secret written with `echo` carries a trailing newline.
-    seed = str(_vectors()[0]["seed"])
+    seed = base64.b64encode(bytes(range(*_vectors()[0]["seed_range"]))).decode()
     assert caller_token.mint(seed + "\n", agent="acme-dev", exp=1790000000) == _vectors()[0][
         "minted"
     ]

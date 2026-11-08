@@ -71,16 +71,27 @@ until the shell answers again.
 Each fenced turn records its claim and delivery lease before it starts. After
 that lease is first observed absent, `CURIE_ABANDONED_TURN_GRACE_S` allows
 90 seconds for cleanup, plus the maintenance cadence. Maintenance takes the
-thread lock and checks the exact claim again. Settling a delivery removes its
-watch; maintenance also discards watches whose event is terminal. An idle runner
-with deferred history from a completed delivery keeps its route and its existing
-workspace handoff fence. For unfinished deliveries, an idle runner with durable
-history keeps its route. An active, unreadable or non-durable runner is retired
-through the supervisor. Abandoned-turn retirement always quarantines the static
-shell after stopping its child and running cleanup. Its health endpoint returns
-503; capacity returns only after the platform replaces the shell. This recovery
-also applies to Docker and Kubernetes through their normal claim retirement paths. An unreachable shell stays leased until retirement can
-be confirmed.
+thread lock and checks the exact claim again. Settlement retains the watch
+for maintenance, including when the delivery is terminal. For an unfinished
+delivery, maintenance retires an active, unreadable or non-durable runner;
+an idle runner with durable history keeps its route. For a terminal delivery,
+maintenance retires only a runner observed to be active. An idle runner keeps
+its route even if history is deferred or a previous history loss still makes
+it report non-durable. Maintenance removes that idle runner's watch and keeps
+an unreadable terminal runner's watch for a later status read. After three
+failed reads, maintenance forgets that terminal watch without retiring the
+runner. This permits two transient failures while bounding status probes to
+15 seconds per terminal watch across maintenance ticks and worker restarts.
+For an unfinished delivery, an unreadable runner latches the action marker
+before retirement, so recovery escalates rather than risking a replay.
+Maintenance also removes
+the watch when the claim is gone or retirement succeeds.
+Retirement stops the child and verifies cleanup. If the runner
+settles before the supervisor checks it, the cleaned shell can be reused;
+otherwise the shell is quarantined and its health endpoint returns 503 until
+the platform replaces it. This recovery also applies to Docker and Kubernetes
+through their normal claim retirement paths. An unreachable shell stays leased
+until retirement can be confirmed.
 
 The runner-local `CURIE_RUNNER_CLEANUP_TIMEOUT_S` defaults to 30 seconds,
 matching the existing abandoned-turn drain window. Set it on shells through
@@ -102,10 +113,19 @@ Recovery of an admitted capacity turn first quiesces its recorded runner epoch,
 then removes the exact predecessor watch before starting its replacement turn.
 A completed predecessor is recognized through the existing terminal ledger;
 other unfinished predecessors must still reach a durable handoff boundary.
+Reclaim waits for a different delivery's live watched turn without interrupting it.
 The runner retains whether its latest turn emitted a side effect in authenticated
-status. Recovery persists that marker before retiring the claim and checks it
-again after preflight, so an unacknowledged side effect escalates instead of
-replaying. Each failed retirement retains its watch for the next pass without
+status. Recovery persists that marker before retiring the claim or replacing
+an unfinished predecessor's watch for a follow-up. It checks the marker again
+after interrupt completion and again under the thread lock after the handoff
+check, so an unacknowledged side effect escalates instead of replaying.
+Reclaimed deliveries check their marker before steering as well as before
+starting a turn. An attachment cold handoff preserves an unfinished
+predecessor's marker before retiring its runner.
+The status flag identifies the runner's latest turn, not an event. If delivery
+ownership changed before recovery reads it, recovery can conservatively attribute
+the flag to a watched delivery and escalate even when that delivery performed no
+action. Each failed retirement retains its watch for the next pass without
 preventing other maintenance.
 
 Known gap: turns started through the attachment handoff do not register a
