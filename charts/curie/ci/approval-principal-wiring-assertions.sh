@@ -57,6 +57,13 @@ def refs(name):
     env = pod["containers"][0].get("env") or []
     return {entry["name"]: entry for entry in env}
 
+for caller in ("api", "worker"):
+    caller_env = refs("curie-" + caller)
+    if "SLACK_BOT_TOKEN" in caller_env or "CURIE_CHANNEL_GATEWAY_TOKEN" not in caller_env:
+        raise SystemExit("application must use the gateway caller credential")
+if "SLACK_BOT_TOKEN" not in refs("curie-channel-gateway"):
+    raise SystemExit("gateway has no provider credential")
+
 env_name = "CURIE_APPROVAL_CHAT_ATTESTER_SECRET"
 for deployment in ("curie-api", "curie-dispatcher"):
     entry = refs(deployment).get(env_name)
@@ -72,7 +79,7 @@ for deployment in ("curie-api", "curie-dispatcher"):
     if entry != expected:
         raise SystemExit(f"{deployment} has wrong {env_name} wiring: {entry!r}")
 
-for deployment in ("curie-worker", "curie-ui"):
+for deployment in ("curie-worker", "curie-ui", "curie-channel-gateway"):
     if env_name in refs(deployment):
         raise SystemExit(f"{deployment} must not receive {env_name}")
 

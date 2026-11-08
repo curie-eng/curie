@@ -59,6 +59,29 @@
   "name": "curie",
   "subcommands": [
     {
+      "about": "Migrate a protected worker process.json from v1 to v2 offline",
+      "args": [
+        {
+          "global": false,
+          "help": "Directory containing the stopped worker's process.json",
+          "id": "runtime_dir",
+          "long": "runtime-dir",
+          "positional": false,
+          "required": true
+        },
+        {
+          "global": false,
+          "help": "Private v2 channel_gateway JSON object",
+          "id": "gateway_config",
+          "long": "gateway-config",
+          "positional": false,
+          "required": true
+        }
+      ],
+      "hidden": false,
+      "name": "migrate-protected-process"
+    },
+    {
       "about": "Scaffold a keyless first reply, using a saved or environment model credential when available",
       "args": [
         {
