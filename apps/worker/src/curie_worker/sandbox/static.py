@@ -65,6 +65,7 @@ from typing import Any, Literal
 
 import redis
 from aci_protocol import BootEnv
+from curie_internal.connector_endpoints import BINDING_ENV, ConnectorEndpointBinding
 from curie_shell_supervisor import protocol
 from curie_shell_supervisor.protocol import (
     ARCHIVE_MEDIA_TYPE,
@@ -88,6 +89,7 @@ from plugin_format import (
 from ..attachments import ATTACHMENTS_REF_ENV, AttachmentLimits
 from ..binding import BUNDLE_REF_ENV, CONNECTOR_SECRET_KEYS_ENV, RUNNER_TOKEN_ENV
 from ..bundle_store import BundleReader
+from ..connector_uploads import mint_claim_upload_tokens
 from ..workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV, WorkspaceLimits
 from .claim_tokens import executor_claim_env, executor_withheld_names
 from .staging import WORKER_OWNED_ENV, ClaimInputStaging, NoAttachments
@@ -386,6 +388,7 @@ class StaticPoolSandboxClient(ClaimInputStaging):
         attachment_limits: AttachmentLimits | None = None,
         retire_timeout_seconds: float = 60.0,
         allow_unisolated_shells: bool = False,
+        connector_upload_signing_key: str = "",
     ) -> None:
         if not slots:
             raise ValueError("a static pool needs at least one shell")
@@ -399,6 +402,7 @@ class StaticPoolSandboxClient(ClaimInputStaging):
         self._ssl = ssl_context
         self._prefix = f"{key_prefix}:static"
         self._retire_timeout_s = retire_timeout_seconds
+        self._connector_upload_signing_key = connector_upload_signing_key
         # Only tests run shells without a separate child uid; a deployment's
         # shell that reports no isolation is never leased.
         self._allow_unisolated = allow_unisolated_shells
@@ -748,6 +752,18 @@ class StaticPoolSandboxClient(ClaimInputStaging):
                 "attachments": attachment_mode,
                 "workspace": workspace is not None,
             }
+            endpoints = (
+                ConnectorEndpointBinding.model_validate_json(env[BINDING_ENV])
+                if BINDING_ENV in env
+                else None
+            )
+            upload_tokens = mint_claim_upload_tokens(
+                self._connector_upload_signing_key,
+                bundle=Path(bundle) if bundle is not None else None,
+                endpoints=endpoints,
+            )
+            if upload_tokens:
+                manifest[protocol.UPLOAD_TOKENS_FIELD] = upload_tokens
             handle, path = tempfile.mkstemp(prefix="curie-shell-stage-", suffix=".tar")
             archive = Path(path)
             try:
