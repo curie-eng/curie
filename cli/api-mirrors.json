@@ -564,17 +564,19 @@
       "struct": "RemediationVerifierRunOut",
       "schema": "RemediationVerifierRunOut",
       "omissions": []
-    }
-  ],
-  "non_mirrors": [
+    },
     {
       "struct": "HookWakeSecret",
-      "reason": "GET /agents/{agent_id}/hooks/{hook}/wake-secret returns the wake key. This checkout's openapi.json does not name HookWakeSecretOut, so the CLI struct is not a generated mirror. The operator read prints the secret only on the success path."
+      "schema": "HookWakeSecretOut",
+      "omissions": []
     },
     {
       "struct": "HookWakeRotation",
-      "reason": "POST /agents/{agent_id}/hooks/{hook}/wake-secret/rotate returns the new generation. This checkout's openapi.json does not name HookWakeRotationOut. The CLI struct keeps only agent_id, hook, and generation, so a secret on the response is ignored and not displayed."
-    },
+      "schema": "HookWakeRotationOut",
+      "omissions": []
+    }
+  ],
+  "non_mirrors": [
     {
       "struct": "HookConfigInput",
       "reason": "Operator JSON file that selects only the two hook maps for a partial AgentUpdate PATCH. It is not an API response and intentionally has no full AgentUpdate mirror."
