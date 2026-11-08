@@ -2369,13 +2369,12 @@ stores it on the binding, so a declared identity can be bound to any channel,
 including one another identity already answers in (ADR-0168 decision 3).
 
 Each identity's bot token is also the one its turns are answered with. The
-worker sets the assistant status, edits the reply, posts and settles approval
-cards and downloads attached files with the token of the identity a turn
-arrived on, and the API resolves an approval's Slack user-group approvers with
-it, so each Slack app needs its own `files:read` and `usergroups:read` scopes.
-A worker holding no token for the identity a turn names drops the turn before
-it runs, logs the identity, and leaves the placeholder as the dispatcher posted
-it: it never answers as another bot.
+worker delegates assistant status, replies, approval cards and attached-file
+fetches to that identity's gateway ports. The API asks the same identity's
+membership source for approval authorization. Each Slack app therefore needs
+its own `files:read` and `usergroups:read` scopes. An undeclared identity is
+refused before a turn runs; missing provider credentials refuse at the gateway.
+Neither application borrows another bot's identity.
 
 A second identity also puts a rate limit on fan-out between siblings (ADR-0168
 decision 6): 5 sibling-written turns per session key, and 5 conversations
