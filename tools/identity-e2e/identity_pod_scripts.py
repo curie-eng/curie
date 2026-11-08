@@ -1,10 +1,10 @@
-"""In-pod scripts the requester scenarios run inside the release's own containers.
+"""In-pod scripts the identity scenarios run inside the release's own containers.
 
 Each reads its parameters as JSON on stdin and prints one JSON line, so no
-token, key or proof ever travels on argv or reaches a log. They import only
-the deployed product code of the container they run in: the API for the
-answer proof, the worker for its sandbox route store, and a hosted
-connector's caller proxy for replays.
+token, grant, ticket, key or proof ever travels on argv or reaches a log. They
+import only the deployed product code of the container they run in: the API
+for the answer proof, the worker for its sandbox route store and the grant
+spend keys, and a hosted connector's caller proxy for replays and grant probes.
 """
 
 from __future__ import annotations
@@ -222,6 +222,204 @@ def main():
         "text": content[0].get("text"),
         "source_loopback": ipaddress.ip_address(source).is_loopback,
     }
+
+
+try:
+    result = main()
+except Exception as exc:
+    result = {"error": type(exc).__name__}
+print(json.dumps(result))
+"""
+
+# Runs in the worker container. Scans the connector grant spend keys the caller
+# proxies write in Valkey (``connector-grant:<jti>``, SET NX EX by
+# curie_connector_proxy.server._ValkeyGrantStore) with the worker's own Valkey
+# client, and answers only the first 16 hex of each jti's sha256: the same
+# fingerprint the reference connector logs for an attested grant. A jti is
+# never printed.
+SPEND_KEYS_SCRIPT = """
+import hashlib, json, sys
+import redis
+from curie_worker.config import WorkerConfig
+
+P = json.load(sys.stdin)
+PREFIX = "connector-grant:"
+
+
+def main():
+    client = redis.Redis(**WorkerConfig().valkey_client_kwargs(), socket_timeout=10)
+    found = set()
+    for key in client.scan_iter(match=PREFIX + "*", count=1000):
+        jti = str(key)[len(PREFIX):]
+        found.add(hashlib.sha256(jti.encode("utf-8")).hexdigest()[:16])
+    return {"fingerprints": sorted(found), "count": len(found)}
+
+
+try:
+    result = main()
+except Exception as exc:
+    result = {"error": type(exc).__name__}
+print(json.dumps(result))
+"""
+
+# Runs in a hosted connector pod's caller-proxy container (the worker image),
+# with the caller token, the install's caller signing seed and the run's
+# selector seed on stdin. For each case in order it builds one JSON-RPC
+# tools/call (or a two-element batch with a ping), adds the approval ticket the
+# case asks for (signed with curie_internal.approver_ticket.sign_ticket, fresh
+# 32-byte nonce, issued now, five minutes to expire, digest by
+# execution_arguments_sha256, with the case's tampering), mints the case's
+# grant with curie_worker.connector_grant.mint over the canonical arguments
+# (fresh uuid4 jti, ten minutes to expire), or replays an earlier case's exact
+# call and grant, and POSTs it to the live proxy on loopback with the case's
+# forged headers. It answers per case only the HTTP status, the tool result's
+# error flag and first text line, the proxy's refusal code and whether its body
+# is the frozen one, whether the connection was dropped (the proxy's 502), the
+# grant's jti fingerprint and the pod-clock window of the request. No token,
+# grant, ticket, key or jti is printed.
+GRANT_PROBE_SCRIPT = """
+import base64, hashlib, http.client, json, os, sys, time, uuid
+
+P = json.load(sys.stdin)
+GRANT_HEADER = "X-Curie-Connector-Grant"
+TEXT_LIMIT = 200
+
+
+def b64url(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def fingerprint(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def ticket(arguments, tamper):
+    from curie_internal.approver_ticket import execution_arguments_sha256, sign_ticket
+    from nacl.signing import SigningKey
+    now = int(time.time())
+    digested = dict(arguments)
+    if tamper == "digest":
+        digested["note"] = str(digested.get("note", "")) + " (not the signed arguments)"
+    payload = {
+        "version": 1,
+        "purpose": "approval_request",
+        "tenant_id": P["tenant_id"],
+        "agent_id": P["agent_id"],
+        "connector": P["connector"],
+        "tool": P["ticket_tool"],
+        "route": P["other_route"] if tamper == "route" else P["route"],
+        "key_id": P["key_id"],
+        "requester": P["other_requester"] if tamper == "requester" else P["requester"],
+        "nonce": b64url(os.urandom(32)),
+        "issued_at": now,
+        "expires_at": now + 300,
+        "arguments_sha256": execution_arguments_sha256(digested),
+        "approvers": [P["approver"]],
+    }
+    if tamper == "key":
+        key = SigningKey.generate()
+    else:
+        key = SigningKey(base64.b64decode(P["selector_seed"], validate=True))
+    return sign_ticket(payload, signing_key=key)
+
+
+def grant(tool, arguments):
+    from curie_connector_proxy.canonical import canonical_arguments
+    from curie_worker.connector_grant import mint
+    jti = str(uuid.uuid4())
+    token = mint(
+        P["caller_seed"], agent=P["agent"], connector=P["connector"], tool=tool,
+        args=canonical_arguments(arguments), exp=int(time.time()) + 600, jti=jti,
+    )
+    return token, fingerprint(jti)
+
+
+def post(port, body, headers):
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    try:
+        connection.putrequest("POST", "/mcp", skip_accept_encoding=True)
+        for name, value in headers:
+            connection.putheader(name, value)
+        connection.putheader("Content-Length", str(len(body)))
+        connection.endheaders(body)
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
+
+
+def judged(status, raw):
+    from curie_connector_proxy import caller
+    from curie_connector_proxy.server import refusal_body
+    out = {"status": status, "is_error": None, "text": None, "refusal": None,
+           "frozen_refusal_body": None, "dropped": status == 502}
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return out
+    if not isinstance(body, dict):
+        return out
+    result = body.get("result")
+    if isinstance(result, dict):
+        out["is_error"] = bool(result.get("isError"))
+        content = result.get("content") or []
+        first = content[0].get("text") if content and isinstance(content[0], dict) else None
+        if isinstance(first, str):
+            out["text"] = first.split("\\n", 1)[0][:TEXT_LIMIT]
+    error = body.get("error")
+    data = error.get("data") if isinstance(error, dict) else None
+    reason = data.get("curie_caller") if isinstance(data, dict) else None
+    if isinstance(reason, str) and reason in caller.REFUSALS:
+        out["refusal"] = reason
+        out["frozen_refusal_body"] = body == refusal_body(reason)
+    return out
+
+
+def call(port, case, sent):
+    if case.get("replay_of"):
+        tool, arguments, token, held = sent[case["replay_of"]]
+    else:
+        tool = case["tool"]
+        arguments = dict(case["arguments"])
+        if case.get("ticket") is not None:
+            arguments["approval_ticket"] = ticket(arguments, case["ticket"].get("tamper"))
+        token, held = None, None
+        if case.get("grant"):
+            granted = case.get("grant_arguments")
+            token, held = grant(tool, arguments if granted is None else dict(granted))
+    sent[case["id"]] = (tool, arguments, token, held)
+    message = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": tool, "arguments": arguments}}
+    if case.get("batch"):
+        message = [message, {"jsonrpc": "2.0", "id": 2, "method": "ping"}]
+    headers = [
+        ("Content-Type", "application/json"),
+        ("Accept", "application/json, text/event-stream"),
+        ("X-Curie-Caller", P["token"]),
+    ]
+    if token is not None:
+        headers.append((GRANT_HEADER, token))
+    for name in case.get("forged") or ():
+        headers.append((name, str(uuid.uuid4())))
+    started = time.time()
+    status, raw = post(port, json.dumps(message).encode("utf-8"), headers)
+    finished = time.time()
+    return {**judged(status, raw), "grant_fingerprint": held,
+            "started": started, "finished": finished}
+
+
+def main():
+    port = int(os.environ["CURIE_CALLER_PROXY_PORT"])
+    sent = {}
+    answers = []
+    for case in P["cases"]:
+        try:
+            answer = call(port, case, sent)
+        except Exception as exc:
+            answer = {"error": type(exc).__name__}
+        answers.append({"id": case["id"], **answer})
+        time.sleep(float(P["gap_s"]))
+    return {"answers": answers}
 
 
 try:

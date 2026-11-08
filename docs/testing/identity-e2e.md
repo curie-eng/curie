@@ -11,10 +11,12 @@ The driver is [`tools/identity-e2e/identity_e2e.py`](../../tools/identity-e2e/id
 It is standard library Python on the host. Product calls that need signing keys
 or the database run inside the release's own API pod, so they use the deployed
 build. The provider is [`tools/identity-e2e/fake_idp.py`](../../tools/identity-e2e/fake_idp.py)
-and the scenarios are in [`tools/identity-e2e/identity_scenarios.py`](../../tools/identity-e2e/identity_scenarios.py)
-and [`tools/identity-e2e/identity_scenarios_requester.py`](../../tools/identity-e2e/identity_scenarios_requester.py).
+and the scenarios are in [`tools/identity-e2e/identity_scenarios.py`](../../tools/identity-e2e/identity_scenarios.py),
+[`tools/identity-e2e/identity_scenarios_requester.py`](../../tools/identity-e2e/identity_scenarios_requester.py)
+and [`tools/identity-e2e/identity_scenarios_attestation.py`](../../tools/identity-e2e/identity_scenarios_attestation.py).
 The same scenarios on the Docker substrate, against an isolated `curie local up`
-stack, are in [Identity E2E on Docker](identity-e2e-docker.md).
+stack, are in [Identity E2E on Docker](identity-e2e-docker.md), except
+`grant-attestation`, which needs the Kubernetes caller proxy.
 
 ## What you need
 
@@ -121,14 +123,17 @@ T="--context kind-identity-e2e --namespace identity-e2e --release identity-e2e -
 `up --reference-connector --bundle examples/weather` renders the bundle into
 `reference-bundle/` under the state directory with one more hosted connector,
 `human-restricted` ([`human_restricted_connector.py`](../../tools/identity-e2e/human_restricted_connector.py)),
-and deploys every missing agent from that rendered copy. The connector has one
-tool, `record_effect`. Before each effect it reads the `X-Curie-Principal` its
-caller proxy set and asks the provider whether that exact tenant, issuer and
-subject may act now (ADR 0270 decisions 4 and 5). It answers `effect=<n>
-requester=<fp>` or `refused <code>`, and logs one line per call,
-`record_effect outcome=<ok|code> requester=<fp or ->`, where `<fp>` is the
-first 16 hex characters of the sha256 of the header value. It never logs the
-principal.
+and deploys every missing agent from that rendered copy. Its tool
+`record_effect` reads the `X-Curie-Principal` its caller proxy set before each
+effect and asks the provider whether that exact tenant, issuer and subject may
+act now (ADR 0270 decisions 4 and 5). It answers `effect=<n> requester=<fp>` or
+`refused <code>`, and logs one line per call, `<tool> outcome=<ok|code>
+requester=<fp or -> grant=<fp or ->`, where `<fp>` is the first 16 hex
+characters of the sha256 of the header value. It never logs the principal. Its
+two protected execution tools, `execute_attested` and `execute_approved`, also
+need the proxy's `X-Curie-Grant-Verified` attestation, and the second a valid
+approval ticket; [What grant-attestation proves](#what-grant-attestation-proves)
+covers them.
 
 The provider then also serves that current authority on its sink listener at
 `http://<release>-identity-e2e-idp.<namespace>.svc:8080/authority`. `up`
@@ -477,8 +482,9 @@ The refusal steps also check that no approval row was stored and no nonce was
 spent.
 
 Carried: the ADR 0271 item 2 check of a direct execution call without the
-verified-grant header needs the connector proxy header from slice 0271c, so
-this scenario does not run it. The evidence lists it under `carried`.
+verified-grant header needs the connector proxy header, so this scenario does
+not run it. The evidence lists it under `carried`, and `grant-attestation` G1
+runs it.
 
 Restore runs in a `finally` block even after a failure, and a failed restore
 fails the run. It removes the registration with a versioned route write, puts
@@ -492,6 +498,112 @@ unrestricted instead of not configured. A configuration stored as SQL NULL goes
 back to NULL. The run's agent versions stay, undeployed, and approvals it
 created stay pending until they expire. The evidence keeps statuses, refusal
 codes, row counts and key ids, never tickets, keys, capsules or tokens.
+
+## What grant-attestation proves
+
+ADR 0271 decision 7, acceptance item 5 and the carried part of item 2: through
+the real worker, caller proxy and reference connector, with the two protected
+execution tools held for approval by the runner but absent from the proxy's
+gated list, a grant-less call has no effect; the grant the worker mints for an
+approved resume rides unspent on unrelated calls, is spent once by the
+approved call and is attested to the connector; and replay, forged attestation
+headers, changed arguments, batches and tampered tickets refuse, with an
+uncertain execution never resent. It needs `up --reference-connector`, two
+verified humans in `identity-e2e-members` (`--sender` writes, `--second-sender`
+approves) and the worker's connector reconciler off, which is the chart
+default:
+
+```bash
+curie dev identity-e2e -- prove $T --scenario grant-attestation --evidence attestation.json
+```
+
+The caller proxy exists only on Kubernetes, so there is no Docker variant, and
+the scenario refuses to start on the Docker harness. Every email turn's text
+carries `grant-attestation <step> <nonce>` with a nonce for the run, and each
+step reads the proxy's and the connector's logs only from its own send (2 s of
+clock skew allowed). Spends are read from Valkey before and after each step,
+from inside the worker container with the worker's own client, as the first 16
+hex characters of the sha256 of each `connector-grant:<jti>` key's `jti`: the
+same fingerprint the connector logs as `grant=`.
+
+1. G0: the worker Deployment does not set `CURIE_CONNECTOR_RECONCILE` true, so
+   nothing renders the connector again during the run; the release's caller key
+   pair is the one `up` set; the flag is turned on and the approver role is set
+   to `identity-e2e-members` as in `requester-approval` P0. The harness reads
+   the agent's stored `approval_required_tools` with SQL, then adds
+   `mcp__human-restricted__execute_attested` and
+   `mcp__human-restricted__execute_approved` through `PATCH /agents/<id>`.
+   The runner reads that row at every claim, while the caller proxy keeps the
+   gated list rendered when the agent was deployed. It generates an Ed25519
+   selector key pair for the run, keeps the seed in the private state, sets the
+   connector server container's `TICKET_PUBLIC_KEY`, `TICKET_KEY_ID`
+   (`identity-e2e-selector`), `TICKET_ROUTE` (`identity-e2e-ticket`) and
+   `TICKET_AGENT_ID` with `kubectl set env` and waits for the rollout. The
+   serving pod's own `CURIE_CALLER_PROXY_GATED_TOOLS` must match neither tool.
+2. G1: `--sender` calls `execute_attested` directly
+   (`[fake:connector-tool ...]`) with no approval. The claim carries no grant;
+   the proxy admits the call without attesting it; the connector refuses
+   `attestation_missing` and logs `grant=-`; nothing is spent.
+3. G2: `--sender` trips the runner's gate with
+   `[fake:gated-connector-tool human-restricted execute_attested {...}]` on a
+   new conversation C. The API lists a pending permission-gate approval
+   granting that tool on C, its card reaches the email thread, and nothing
+   reached the connector or was spent.
+4. G3: `--second-sender` approves by a signed email answer, as in
+   `requester-approval` P2. The resume runs on a new claim whose caller token
+   names the requester, never the approver, and its turn is delivered. The
+   resume claim carries the worker-minted `CURIE_CONNECTOR_TOOL_GRANT` for
+   exactly the approved connector, tool, agent and arguments with a canonical
+   UUID `jti`; the evidence records only where it was found and the `jti`'s
+   fingerprint. The harness looks in the claim's token Secret first, the way
+   it reads the caller token, then in the claim's `spec.env`: the worker does
+   not count the grant among the claim's scoped tokens, so it arrives there.
+   Nothing is spent yet. The resume claim's caller token is held in memory for
+   G9.
+5. G4 to G8 are email turns from `--sender` on C. Each must create no claim
+   and its dial must send the resume claim's caller token, so it ran in the
+   resumed sandbox whose boot env carries the grant as a static header; only
+   then is it judged. G4: an unrelated `record_effect` succeeds, the proxy
+   attests and refuses nothing, the connector logs `grant=-`, and the grant is
+   still unspent. G5: `execute_attested` with the approved arguments; the proxy
+   logs `attested=present` once, exactly one spend appears and it is the G3
+   fingerprint, and the connector applies the effect under the requester's
+   fingerprint with that grant. G6: another unrelated `record_effect` succeeds
+   with no spend. G7: the approved call again is refused `grant_required`
+   (`not_spent`) with no connector line. G8: `execute_attested` with other
+   arguments forwards unattested, spends nothing and is refused
+   `attestation_missing`.
+6. G9: from inside the connector pod's caller-proxy container, one script
+   posts to the live proxy on loopback with the captured caller token, grants
+   minted with the install's caller signing key (which `up` set) and tickets
+   signed with the selector seed, all passed on stdin. The proxy's gated list
+   must still be G0's. Each probe is judged in its own pod-clock window against
+   the proxy's decisions, the connector's lines and the spend set: a forged
+   `X-Curie-Grant-Verified` in three casings and repeated, with no grant, is
+   stripped (`attestation_missing`); a valid ticket on `execute_approved` is
+   attested and applied, and its replay is refused `not_spent`; a batch
+   carrying the matching call is refused `batched_call` before any spend, and
+   the same grant alone is then attested and applied; tickets for another
+   requester, another route, another signing key and other arguments are
+   attested and then refused `ticket_requester_mismatch`,
+   `ticket_scope_mismatch`, `ticket_invalid` and `ticket_arguments_mismatch`
+   with no effect; `drop_reply` answers the proxy's 502 with exactly one
+   effect and one spend, and its resend is refused `not_spent`; a call whose
+   arguments differ from its grant forwards unattested with no spend, and a
+   replay of an applied grant afterwards is still refused. The spends G9 made
+   must be exactly one per attested probe.
+7. G10 always runs. It puts back `approval_required_tools` (checked with SQL),
+   the connector's `TICKET_*` settings (checked on the serving pod), the flag
+   and the approver role, removes the selector seed from the state, and
+   requires the serving pod's gated list to equal G0's. As in
+   `requester-approval`, an approver role that had no entry stays with no
+   filter.
+
+No evidence carries a grant, ticket, key, token or principal value. Grants
+appear as the fingerprint of their `jti`, humans as the fingerprint of their
+`X-Curie-Principal` value, and the probe script prints only statuses, the
+first line of each tool result, the proxy's refusal code, the grant
+fingerprint and the pod-clock window of each request.
 
 ## Add a scenario
 
@@ -511,7 +623,12 @@ codes, row counts and key ids, never tickets, keys, capsules or tokens.
    `harness.connector_effects(...)`, and worker messages with
    `harness.worker_log(...)`. `harness.capture_caller_token(claim)` returns a
    claim's raw token for `harness.proxy_replay(...)`; keep it in memory and
-   record only its fingerprint and `exp`.
+   record only its fingerprint and `exp`. `harness.connector_tool_grant(claim)`
+   returns the grant a claim's runner boots with, under the same rule, and
+   `harness.grant_spends()` the spent grants as `jti` fingerprints.
+   `harness.connector_server_env(...)` and
+   `harness.set_connector_server_env(...)` read and change a connector server
+   container's env; put it back in a `finally`.
 4. Use `harness.target.sql(...)` or `harness.route_doctor(...)` only to
    corrupt state that no product surface can write, and restore it in a
    `finally` block. `route_doctor` is the route doctoring exception:
@@ -547,3 +664,8 @@ codes, row counts and key ids, never tickets, keys, capsules or tokens.
    docker-image`), before `up --reference-connector` deploys the agents.
 6. `requester-expiry` cannot shorten its one-hour wait: X6 proves the live
    proxy's own clock refuses the token, which a controlled clock cannot.
+7. `grant-attestation` needs the connector reconciler off. With it on, the
+   reconciler may render the connector again from the agent's current
+   `approval_required_tools`, so the proxy would gate the protected tools
+   itself and the run would no longer show that they hold without the gated
+   list.

@@ -2884,6 +2884,8 @@ def approver_ticket_creation(harness: Harness, args: Any, evidence: Evidence) ->
 
 
 # The ADR 0270 slice 2 requester scenarios (requester-effect, requester-expiry,
-# requester-approval) live in their own module and register here, last, so
-# every name they import from this one already exists.
+# requester-approval) and the ADR 0271 grant-attestation scenario live in their
+# own modules and register here, last, so every name they import from this one
+# already exists.
+import identity_scenarios_attestation  # noqa: E402,F401
 import identity_scenarios_requester  # noqa: E402,F401
