@@ -154,7 +154,7 @@ Three independent axes, and keeping them separate is the point:
   members are the approvers, which is the zero-setup default. Notification recipients never
   become approvers merely by receiving the ping.
 
-A Slack notification can use the worker's default transport. Any other notification kind
+A Slack notification can use the gateway's default Slack identity. Any other notification kind
 must store both `endpoint` and `adapter`; those transport details are write-only and are
 redacted from API and `--list-routes` output. The target's `kind` and `address` remain visible.
 A fixed resolution target stays Slack-only, and a notification never resolves anything.
