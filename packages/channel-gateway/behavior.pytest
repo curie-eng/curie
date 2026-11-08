@@ -21,9 +21,6 @@ apps/dispatcher/tests/test_http_receiver_direct_messages.py
 apps/dispatcher/tests/test_http_receiver_dispatch.py
 apps/dispatcher/tests/test_http_receiver_initializer.py
 apps/dispatcher/tests/test_http_receiver_startup_boundary.py
--o
-markers=channel_gateway_baseline: This selected-click fixture fails locally at 28370c4e and 5e88f9eccd while CI passes it; this is the sole named exclusion.
---deselect=apps/dispatcher/tests/test_http_receiver_answers.py::test_selected_click_acks_before_one_proved_submission_of_exact_bytes
 apps/worker/tests/test_slack_sink.py
 apps/worker/tests/test_blocks.py
 apps/worker/tests/test_blocks_progress.py

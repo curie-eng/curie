@@ -117,7 +117,7 @@ def build_app(
         # connection is the source of truth for token validity.
         app_kwargs["token_verification_enabled"] = False
 
-    app = App(**app_kwargs)
+    app = App(process_before_response=False, **app_kwargs)
     register_kwargs: dict[str, Any] = {
         "web_client": web_client,
         "redis_client": redis_client,
