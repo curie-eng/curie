@@ -63,6 +63,7 @@ from aci_protocol.turn import DEFAULT_IDENTITY, slack_speaking_identity
 from curie_channel_gateway.ports.reads import FileSource
 from curie_channel_gateway.reply_transport import ADAPTER_SECRET_HEADER
 from curie_channel_gateway.slack.files import FileResponse, SlackFileError
+from curie_channel_gateway.tls import gateway_file_context
 from curie_internal.workspace_objects import WorkspaceObjectPort
 
 from .ledger_client import ThreadAttachmentRef
@@ -855,10 +856,12 @@ def _file_transport(
             _NoRedirect(),
             urllib.request.ProxyHandler({}),
             _ScopedHTTPHandler(),
-            _ScopedHTTPSHandler(),
+            _ScopedHTTPSHandler(context=gateway_file_context(url)),
         )
         if scope is not None
-        else urllib.request.build_opener(_NoRedirect())
+        else urllib.request.build_opener(
+            _NoRedirect(), urllib.request.HTTPSHandler(context=gateway_file_context(url))
+        )
     )
     try:
         response = opener.open(request, timeout=timeout)

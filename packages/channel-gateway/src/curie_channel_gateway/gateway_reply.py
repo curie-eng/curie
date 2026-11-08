@@ -20,6 +20,7 @@ from .reply_errors import (
 from .reply_route import ReplyRoute
 from .reply_transport import MAX_ACK_BODY_BYTES, BestEffortUnreachableAck
 from .request_replay import request_headers
+from .tls import gateway_verify
 
 
 @dataclass(frozen=True)
@@ -42,7 +43,9 @@ class GatewayReplySink:
         self._endpoint = endpoint.rstrip("/")
         self._token = token
         self._identities = identities
-        self._http = httpx.AsyncClient(timeout=timeout_s, follow_redirects=False)
+        self._http = httpx.AsyncClient(
+            timeout=timeout_s, follow_redirects=False, verify=gateway_verify()
+        )
 
     async def aclose(self) -> None:
         await self._http.aclose()

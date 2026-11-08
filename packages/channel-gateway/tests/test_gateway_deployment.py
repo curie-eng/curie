@@ -50,10 +50,15 @@ def test_gateway_chart_custody_and_persistent_replay():
     assert any(volume.get("persistentVolumeClaim") for volume in pod["volumes"])
 
 
-def test_gateway_chart_refuses_an_implicit_http_listener():
+def test_gateway_chart_provisions_tls_without_operator_values():
     result = render("channelGateway.deploy=true")
-    assert result.returncode != 0
-    assert "channelGateway.tlsSecret is required" in result.stderr
+    assert result.returncode == 0, result.stderr
+    docs = [item for item in yaml.safe_load_all(result.stdout) if item]
+    secret = next(
+        item for item in docs if item["metadata"]["name"] == "acme-curie-channel-gateway-tls"
+    )
+    assert secret["kind"] == "Secret"
+    assert set(secret["data"]) == {"ca.crt", "tls.crt", "tls.key"}
     assert (
         render("channelGateway.deploy=true", "channelGateway.tlsSecret=acme-gateway-tls").returncode
         == 0
@@ -62,7 +67,12 @@ def test_gateway_chart_refuses_an_implicit_http_listener():
 
 @pytest.mark.parametrize(
     ("tls_secret", "allow_http", "scheme"),
-    [("acme-gateway-tls", False, "https"), ("acme-gateway-tls", True, "https"), ("", True, "http")],
+    [
+        ("", False, "https"),
+        ("acme-gateway-tls", False, "https"),
+        ("acme-gateway-tls", True, "https"),
+        ("", True, "http"),
+    ],
 )
 def test_gateway_chart_clients_match_the_listener(tls_secret, allow_http, scheme):
     result = render(
@@ -93,9 +103,9 @@ def test_gateway_chart_clients_match_the_listener(tls_secret, allow_http, scheme
     listener = deployments["acme-curie-channel-gateway"]["spec"]["template"]["spec"]["containers"][
         0
     ]
-    assert (
-        "CURIE_CHANNEL_GATEWAY_TLS_CERT" in {entry["name"] for entry in listener["env"]}
-    ) == bool(tls_secret)
+    assert ("CURIE_CHANNEL_GATEWAY_TLS_CERT" in {entry["name"] for entry in listener["env"]}) == (
+        scheme == "https"
+    )
 
 
 def test_compose_only_provider_services_hold_slack_tokens():
@@ -121,9 +131,12 @@ def test_slack_upgrade_requires_a_gateway(identity):
             "dispatcher.slack.identities[0].appTokenExistingSecret=acme-slack",
         ],
     }[identity]
-    result = render(*settings)
+    automatic = render(*settings)
+    assert automatic.returncode == 0, automatic.stderr
+    assert "name: acme-curie-channel-gateway" in automatic.stdout
+    result = render(*settings, "channelGateway.deploy=false")
     assert result.returncode != 0
-    assert "Slack identities require channelGateway.deploy or channelGateway.url" in result.stderr
+    assert "set channelGateway.deploy=true or channelGateway.url" in result.stderr
     assert render(*settings, "channelGateway.url=https://gateway.example.com").returncode == 0
     assert (
         render(
@@ -143,3 +156,74 @@ def test_gateway_tls_secret_rejects_an_explicit_http_url(deploy):
     )
     assert result.returncode != 0
     assert "channelGateway.url must use https when channelGateway.tlsSecret is set" in result.stderr
+
+
+def test_gateway_remains_off_without_slack_configuration():
+    result = render()
+    assert result.returncode == 0, result.stderr
+    assert "name: acme-curie-channel-gateway" not in result.stdout
+
+
+def test_unchanged_slack_secret_references_move_to_gateway():
+    result = render(
+        "dispatcher.slack.botTokenExistingSecret=acme-slack",
+        "dispatcher.slack.botTokenExistingSecretKey=bot",
+        "dispatcher.slack.appTokenExistingSecret=acme-slack",
+        "dispatcher.slack.appTokenExistingSecretKey=app",
+    )
+    assert result.returncode == 0, result.stderr
+    deployments = {
+        item["metadata"]["name"]: item
+        for item in yaml.safe_load_all(result.stdout)
+        if item and item["kind"] == "Deployment"
+    }
+    for suffix in ("api", "worker", "channel-gateway"):
+        pod = deployments["acme-curie-" + suffix]["spec"]["template"]["spec"]
+        env = {entry["name"]: entry for entry in pod["containers"][0]["env"]}
+        assert pod["enableServiceLinks"] is False
+        if suffix == "channel-gateway":
+            assert env["SLACK_BOT_TOKEN"]["valueFrom"]["secretKeyRef"] == {
+                "name": "acme-slack",
+                "key": "bot",
+            }
+        else:
+            assert "SLACK_BOT_TOKEN" not in env
+            assert (
+                env["CURIE_CHANNEL_GATEWAY_CA_FILE"]["value"] == "/var/run/curie/gateway-tls/ca.crt"
+            )
+            assert any(
+                volume.get("secret", {}).get("secretName") == "acme-curie-channel-gateway-tls"
+                for volume in pod["volumes"]
+            )
+
+
+@pytest.mark.parametrize("specific", ["", "acme-gateway-storage"])
+def test_gateway_replay_storage_uses_the_chart_storage_class(specific):
+    result = render(
+        "dispatcher.slack.botTokenExistingSecret=acme-slack",
+        "global.storageClass=acme-platform-storage",
+        f"channelGateway.replayStorageClass={specific}",
+    )
+    assert result.returncode == 0, result.stderr
+    claim = next(
+        item for item in yaml.safe_load_all(result.stdout)
+        if item and item["kind"] == "PersistentVolumeClaim"
+        and item["metadata"]["name"] == "acme-curie-channel-gateway-replay"
+    )
+    assert claim["spec"]["storageClassName"] == (specific or "acme-platform-storage")
+
+
+def test_gateway_settings_accept_the_chart_default_literal_environment():
+    from curie_channel_gateway.slack.read_server import GatewayConfig
+
+    result = render("dispatcher.slack.botTokenExistingSecret=acme-slack")
+    assert result.returncode == 0, result.stderr
+    gateway = next(
+        item for item in yaml.safe_load_all(result.stdout)
+        if item and item["kind"] == "Deployment"
+        and item["metadata"]["name"] == "acme-curie-channel-gateway"
+    )
+    env = gateway["spec"]["template"]["spec"]["containers"][0]["env"]
+    config = GatewayConfig(**{entry["name"]: entry["value"] for entry in env if "value" in entry})
+    assert config.max_file_bytes == 33554432
+    assert config.port == 8081

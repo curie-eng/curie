@@ -79,11 +79,14 @@ spec:
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 8 }}
       annotations:
+        {{- with (include "curie.channelGateway.tlsChecksum" .) }}
+        checksum/gateway-tls: {{ . | quote }}
+        {{- end }}
         {{- with (include "curie.secretChecksum" (dict
         "root" $
-        "keys" (list "channelGatewayApiToken" "apiKey" "approvalChatAttesterSecret" "remediationAuthorityKey" "internalWorkerToken" "installationId" "githubWebhookSecret")
+        "keys" (list "apiKey" "approvalChatAttesterSecret" "remediationAuthorityKey" "internalWorkerToken" "installationId" "githubWebhookSecret")
         "refs" $checksumRefs
-        "env" (printf "%s\n%s\n%s\n%s\n%s" (include "curie.env.postgres" $) (include "curie.env.valkey" $) (include "curie.env.slack" (dict "root" $ "workload" "api")) (include "curie.env.otel" (dict "root" $ "extraEnv" $.Values.api.extraEnv)) $checksumExtraEnv))) }}
+        "env" (printf "%s\n%s\n%s\n%s\n%s\n%s" (include "curie.env.postgres" $) (include "curie.env.valkey" $) (include "curie.env.slack" (dict "root" $ "workload" "api")) (include "curie.env.channelGateway" (dict "root" $ "caller" "api")) (include "curie.env.otel" (dict "root" $ "extraEnv" $.Values.api.extraEnv)) $checksumExtraEnv))) }}
         checksum/secret: {{ . }}
         {{- end }}
         {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
@@ -536,8 +539,9 @@ spec:
           {{- $forgeCredentials := include "curie.factory.hasCredentials" . }}
           {{- $httpIdentity := include "curie.httpIdentity.apiSecret" . }}
           {{- $providerCa := include "curie.httpIdentity.providerCaBundle" . }}
-          {{- if or $codeHostTrust $forgeCredentials $httpIdentity }}
+          {{- if or $codeHostTrust $forgeCredentials $httpIdentity (include "curie.channelGateway.tlsSecret" .) }}
           volumeMounts:
+            {{- include "curie.channelGateway.clientMount" . | nindent 12 }}
             {{- include "curie.codeHostTrust.volumeMount" . | nindent 12 }}
             {{- include "curie.factory.credentialMount" . | nindent 12 }}
             {{- if $httpIdentity }}
@@ -546,8 +550,9 @@ spec:
               readOnly: true
             {{- end }}
           {{- end }}
-      {{- if or $codeHostTrust $forgeCredentials $httpIdentity }}
+      {{- if or $codeHostTrust $forgeCredentials $httpIdentity (include "curie.channelGateway.tlsSecret" .) }}
       volumes:
+        {{- include "curie.channelGateway.clientVolume" . | nindent 8 }}
         {{- include "curie.codeHostTrust.volume" . | nindent 8 }}
         {{- include "curie.factory.credentialVolume" . | nindent 8 }}
         {{- if $httpIdentity }}

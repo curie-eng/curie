@@ -207,7 +207,7 @@
       "additionalProperties": false,
       "properties": {
         "deploy": {
-          "type": "boolean"
+          "type": ["boolean", "null"]
         },
         "port": {
           "type": "integer",
