@@ -87,6 +87,13 @@ _LANES = (
 # itself under a name the SDK owns.
 _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
     {
+        # The static pool substrate's worker settings: run._static_pool_client
+        # reads the shell inventory, the shell CA and the shell control
+        # credential from the WORKER's env. The control credential is also a
+        # host credential that filter_agent_child_env keeps off every claim.
+        "CURIE_STATIC_SHELLS",
+        "CURIE_STATIC_SHELL_CA_FILE",
+        "CURIE_STATIC_SHELL_CONTROL_TOKEN",
         # The worker service's own settings (WorkerConfig validation_alias), read
         # from the WORKER's env at worker startup. Never a sandbox boot key.
         # The inbound-attachment lane's operator envelope (#2567): the lane's own
@@ -597,6 +604,12 @@ _EXEMPT: dict[tuple[str, str], str] = {
     ("apps/worker/src/curie_worker/run.py", "CURIE_RUNNER_PORT"): "substrate producer",
     (
         "apps/worker/src/curie_worker/sandbox/docker.py",
+        "CURIE_SANDBOX_ID",
+    ): "substrate producer",
+    # The worker-owned names Docker and the static pool both keep off the
+    # claim env; each substrate supplies the sandbox id itself.
+    (
+        "apps/worker/src/curie_worker/sandbox/staging.py",
         "CURIE_SANDBOX_ID",
     ): "substrate producer",
     (

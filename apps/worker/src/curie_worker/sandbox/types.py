@@ -154,6 +154,9 @@ HOST_APPLICATION_CREDENTIAL_ENV_NAMES: frozenset[str] = frozenset(
         "CURIE_SEALING_PRIVATE_KEY",
         "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
         "CURIE_CONNECTOR_CALLER_SIGNING_KEY",
+        # The static-pool shell control credential: it can start or retire
+        # any claim on any shell.
+        "CURIE_STATIC_SHELL_CONTROL_TOKEN",
     }
 )
 
@@ -183,6 +186,24 @@ def filter_agent_child_env(env: Mapping[str, str] | None) -> dict[str, str]:
         if not _is_host_application_credential(name)
         or (name in declared_connector_secret_names and not is_reserved_boot_env_name(name))
     }
+
+
+# How the worker dials a runner: plain HTTP to a pod or a
+# container on a trusted network, or HTTPS to a static-pool shell supervisor,
+# which validates the certificate and the host name.
+Transport = Literal["http", "https"]
+TRANSPORTS: frozenset[str] = frozenset({"http", "https"})
+
+
+def _check_endpoint(transport: str, host: str, base_path: str) -> None:
+    """Refuse an endpoint whose parts would compose a different URL."""
+
+    if transport not in TRANSPORTS:
+        raise ValueError(f"unsupported runner transport {transport!r}")
+    if "/" in host or "://" in host:
+        raise ValueError("a runner host carries no scheme or path")
+    if base_path and (not base_path.startswith("/") or base_path.endswith("/") or "?" in base_path):
+        raise ValueError("a runner base path is absolute with no trailing slash or query")
 
 
 class RouteState(StrEnum):
@@ -257,6 +278,16 @@ class SandboxHandle:
     # repository's entry is replaced, not reused.
     runner_digests: tuple[str, ...] | None = None
     runner_docker: bool = False
+    # How the worker dials this runner, and the path prefix under which the
+    # endpoint serves its ACI routes. A static-pool shell answers HTTPS under
+    # ``/c/<claim>/<generation>``; Kubernetes and Docker routes are plain HTTP
+    # at the root. A route stored before these fields existed is migrated to
+    # HTTP at the root when it is read (``RouteRecord.from_json``).
+    transport: Transport = "http"
+    base_path: str = ""
+
+    def __post_init__(self) -> None:
+        _check_endpoint(self.transport, self.service_fqdn, self.base_path)
 
     @property
     def sandbox_id(self) -> str:
@@ -266,7 +297,7 @@ class SandboxHandle:
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.service_fqdn}:{self.port}"
+        return f"{self.transport}://{self.service_fqdn}:{self.port}{self.base_path}"
 
 
 @dataclass
@@ -285,6 +316,11 @@ class RouteRecord:
     def from_json(cls, raw: str) -> RouteRecord:
         payload = json.loads(raw)
         state = RouteState(payload.pop("state", RouteState.LIVE.value))
+        # Data migration of routes stored before the endpoint fields existed:
+        # every such route was written by a plain HTTP substrate at the root,
+        # so it reads back as exactly that and drains on its own TTL.
+        payload.setdefault("transport", "http")
+        payload.setdefault("base_path", "")
         # JSON has no tuple; equality with a freshly claimed handle needs one.
         if payload.get("runner_digests") is not None:
             payload["runner_digests"] = tuple(payload["runner_digests"])
@@ -489,9 +525,10 @@ class SandboxView:
     """What the substrate needs to know about a Sandbox.
 
     ``port`` is the dial port when it is sandbox-specific (the Docker substrate
-    publishes each runner on its own loopback host port); ``None`` means the
-    substrate falls back to the fleet-wide ``SubstrateConfig.runner_port`` (the
-    Kubernetes path, where every sandbox listens on the same in-cluster port).
+    publishes each runner on its own loopback host port, a static-pool shell
+    names its supervisor port); ``None`` means the substrate falls back to the
+    fleet-wide ``SubstrateConfig.runner_port`` (the Kubernetes path, where
+    every sandbox listens on the same in-cluster port).
     """
 
     name: str
@@ -499,6 +536,10 @@ class SandboxView:
     service_fqdn: str | None
     operating_mode: str
     port: int | None = None
+    # The dial transport and ACI path prefix the substrate hands to the route
+    # (see ``SandboxHandle``). ``service_fqdn`` stays a bare host name.
+    transport: Transport = "http"
+    base_path: str = ""
 
 
 @dataclass(frozen=True)

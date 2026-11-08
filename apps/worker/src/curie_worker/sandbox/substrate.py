@@ -22,6 +22,7 @@ transcript key -- is the caller's job.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import secrets
@@ -54,6 +55,7 @@ from .affinity import AffinityStore
 from .docker import DockerSandboxClient
 from .k8s import KubernetesSandboxClient
 from .quota import admission_quota_headroom, resource_vector
+from .static import StaticPoolSandboxClient
 from .types import (
     AGENT_LABEL,
     EXECUTOR_THREAD_KEY_PREFIX,
@@ -72,6 +74,7 @@ from .types import (
     KubeTransientError,
     MissingAgentPoolError,
     NoRouteError,
+    PressureCandidate,
     PressureScanResult,
     QuotaRejection,
     RepoRunnerPoolRefused,
@@ -783,14 +786,32 @@ class SandboxSubstrate:
             return result
         # Executor routes never reach the kernel's reclamation (@spec
         # ACTION-EXECUTOR-5): the loop releases its own sandbox on every path.
-        return PressureScanResult(
-            tuple(
-                candidate
-                for candidate in result.candidates
-                if candidate.record.handle.namespace == self._config.namespace
-                and not is_executor_thread_key(candidate.thread_key)
-            ),
-            "complete",
+        candidates = tuple(
+            candidate
+            for candidate in result.candidates
+            if candidate.record.handle.namespace == self._config.namespace
+            and not is_executor_thread_key(candidate.thread_key)
+        )
+        if isinstance(self._k8s, StaticPoolSandboxClient):
+            candidates = await asyncio.to_thread(self._static_pressure_candidates, candidates)
+        return PressureScanResult(candidates, "complete")
+
+    def _static_pressure_candidates(
+        self, candidates: tuple[PressureCandidate, ...]
+    ) -> tuple[PressureCandidate, ...]:
+        """Only idle routes in an exhausted static pool can make room there.
+
+        Static capacity is per pool (a per-agent shell set), unlike a
+        namespace quota, so retiring a route of a pool with free shells would
+        cost that thread its warm runner and free nothing anyone waits for.
+        """
+
+        assert isinstance(self._k8s, StaticPoolSandboxClient)
+        exhausted = self._k8s.exhausted_pools()
+        return tuple(
+            candidate
+            for candidate in candidates
+            if self._k8s.claim_pool(candidate.record.handle.claim_name) in exhausted
         )
 
     async def pressure_get(self, thread_key: str) -> RouteRecord | None:
@@ -1597,6 +1618,14 @@ class SandboxSubstrate:
                             rejection, request_timeout_seconds=min(_GONE_READ_TIMEOUT_S, remaining)
                         ):
                             return True
+                        elif (
+                            isinstance(self._k8s, StaticPoolSandboxClient)
+                            and isinstance(rejection, AdmissionRejection)
+                            and self._k8s.pool_has_headroom(rejection.quota_name)
+                        ):
+                            # The retired route's shell was proven clean and
+                            # returned to the pool the refused claim needs.
+                            return True
                     except Exception as exc:  # noqa: BLE001 - quota state is unknown
                         logger.warning(
                             "idle route reclamation could not prove quota headroom: %s",
@@ -2138,6 +2167,8 @@ class SandboxSubstrate:
             namespace=config.namespace,
             service_fqdn=bound.service_fqdn or "",
             port=bound.port if bound.port is not None else config.runner_port,
+            transport=bound.transport,
+            base_path=bound.base_path,
             # The route must describe the runner that actually booted.  Bound
             # claims receive their authoritative identity in this exact env;
             # the explicit values remain fallbacks for lifecycle callers that

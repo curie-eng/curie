@@ -19,7 +19,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NoReturn, TypedDict
+from typing import Any, Literal, NoReturn, TypedDict
 
 import httpx
 from aci_protocol.s3 import build_s3_client
@@ -98,8 +98,12 @@ from .sandbox import (
     RunnerHardening,
     SandboxClient,
     SandboxSubstrate,
+    StaticPoolSandboxClient,
     SubstrateConfig,
     SuspendedThreadError,
+    agent_warm_pool_name,
+    parse_static_shells,
+    shell_ssl_context,
 )
 from .sandbox.quota import parse_admission_config
 from .schema_startup import assert_worker_schema
@@ -274,14 +278,43 @@ def _agent_names(env: Mapping[str, str], key: str) -> frozenset[str]:
     return frozenset(name.strip() for name in env.get(key, "").split(",") if name.strip())
 
 
+SandboxSubstrateKind = Literal["kubernetes", "docker", "static"]
+_SANDBOX_SUBSTRATES: tuple[SandboxSubstrateKind, ...] = ("kubernetes", "docker", "static")
+
+
+def sandbox_substrate(env: Mapping[str, str]) -> SandboxSubstrateKind:
+    """``CURIE_SANDBOX_SUBSTRATE``: kubernetes (the default), docker or static.
+
+    Any other value refuses worker start. It used to select Kubernetes
+    silently, which turned a typo into a worker claiming pods it was never
+    meant to reach.
+    """
+
+    raw = env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").strip().lower()
+    for kind in _SANDBOX_SUBSTRATES:
+        if raw == kind:
+            return kind
+    raise ValueError(
+        f"CURIE_SANDBOX_SUBSTRATE={raw!r} is not a sandbox substrate; "
+        "use kubernetes, docker or static"
+    )
+
+
 def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
     # claim_timeout is overridable so a slow cluster can raise it; when unset the
     # authoritative default lives in SubstrateConfig. Keep any override below the
     # per-thread lock TTL (WorkerConfig.lock_ttl_ms) -- see that comment.
     overrides: dict[str, Any] = {}
+    substrate = sandbox_substrate(env)
     admission = parse_admission_config(env.get("CURIE_SANDBOX_ADMISSION"))
-    if admission is not None and env.get("CURIE_SANDBOX_SUBSTRATE") == "docker":
-        raise ValueError("Docker substrate cannot use Kubernetes quota admission")
+    if admission is not None and substrate != "kubernetes":
+        raise ValueError(f"the {substrate} substrate cannot use Kubernetes quota admission")
+    repo_runner_pools = parse_repo_runner_pools(env.get(REPO_RUNNER_POOLS_ENV)).root
+    if repo_runner_pools and substrate == "static":
+        # A repository runner pool is a Kubernetes warm pool, and a Docker
+        # enabled one adds a privileged per-claim tool daemon (ADR 0216, 0217);
+        # a static shell is neither, so binding one is refused, not ignored.
+        raise ValueError(f"the static substrate cannot serve {REPO_RUNNER_POOLS_ENV}")
     claim_timeout = _bounded_seconds(env, "CURIE_CLAIM_TIMEOUT_SECONDS", float)
     if claim_timeout is not None:
         overrides["claim_timeout_seconds"] = claim_timeout
@@ -306,7 +339,7 @@ def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
         connector_secret_pools=_agent_names(env, "CURIE_AGENT_CONNECTOR_SECRET_POOLS"),
         # ADR 0216: malformed input fails worker startup rather than routing a
         # bound repository to the generic pool.
-        repo_runner_pools=parse_repo_runner_pools(env.get(REPO_RUNNER_POOLS_ENV)).root,
+        repo_runner_pools=repo_runner_pools,
         platform_runner_digest=platform_runner_digest(env.get("CURIE_RUNNER_IMAGE")),
         runner_port=int(env.get("CURIE_RUNNER_PORT", "8080")),
         **overrides,
@@ -366,14 +399,78 @@ def _attachment_limits(config: WorkerConfig) -> AttachmentLimits:
     )
 
 
+def _static_pool_client(
+    config: WorkerConfig,
+    env: Mapping[str, str],
+    sub_config: SubstrateConfig,
+    redis_client: Redis | None,
+) -> StaticPoolSandboxClient:
+    """The static shell pool (``CURIE_SANDBOX_SUBSTRATE=static``).
+
+    The deployment supplies the shell inventory (``CURIE_STATIC_SHELLS``), the
+    CA bundle that signs every shell's certificate
+    (``CURIE_STATIC_SHELL_CA_FILE``) and the control credential the shells
+    share with the worker (``CURIE_STATIC_SHELL_CONTROL_TOKEN``). Leases live
+    in the worker's own Valkey beside the routes.
+    """
+
+    if config.action_executor_enabled:
+        # The executor's serving attestation reads Kubernetes Deployments,
+        # which a static pool has none of; static connector endpoints refuse
+        # it for the same reason.
+        raise ValueError("the static substrate does not run the action executor")
+    if redis_client is None:
+        raise ValueError("the static substrate keeps its leases in the worker's Valkey")
+    slots = parse_static_shells(env.get("CURIE_STATIC_SHELLS"))
+    ca_file = env.get("CURIE_STATIC_SHELL_CA_FILE")
+    if not ca_file:
+        raise ValueError("CURIE_STATIC_SHELL_CA_FILE names the CA that signs the shells")
+    pools = {slot.pool for slot in slots}
+    missing = sorted(
+        agent
+        for agent in sub_config.agent_pools | sub_config.connector_secret_pools
+        if agent_warm_pool_name(sub_config.warm_pool, agent) not in pools
+    )
+    if missing:
+        raise ValueError(
+            "CURIE_AGENT_SANDBOX_POOLS or CURIE_AGENT_CONNECTOR_SECRET_POOLS names agents "
+            "with no static shell: " + ", ".join(missing)
+        )
+    if sub_config.warm_pool not in pools:
+        logger.warning(
+            "no static shell serves the generic pool %s; claims of agents without "
+            "their own shells will be refused",
+            sub_config.warm_pool,
+        )
+    return StaticPoolSandboxClient(
+        slots=slots,
+        redis_client=redis_client,
+        control_token=env.get("CURIE_STATIC_SHELL_CONTROL_TOKEN", ""),
+        ssl_context=shell_ssl_context(ca_file),
+        bundle_store=BundleStore(config),
+        key_prefix=sub_config.key_prefix,
+        bundle_max_uncompressed_bytes=config.bundle_max_uncompressed_bytes,
+        bundle_max_compression_ratio=config.bundle_max_compression_ratio,
+        bundle_max_members=config.bundle_max_members,
+        workspace_limits=_workspace_limits(config),
+        attachment_limits=_attachment_limits(config),
+    )
+
+
 def _sandbox_client(
-    config: WorkerConfig, env: Mapping[str, str], sub_config: SubstrateConfig
+    config: WorkerConfig,
+    env: Mapping[str, str],
+    sub_config: SubstrateConfig,
+    *,
+    redis_client: Redis | None = None,
 ) -> SandboxClient:
-    """The cluster/Docker seam, chosen by ``CURIE_SANDBOX_SUBSTRATE``.
+    """The cluster/Docker/static seam, chosen by ``CURIE_SANDBOX_SUBSTRATE``.
 
     ``kubernetes`` (default) claims agent-sandbox CRs; ``docker`` boots runner
-    containers locally (middle mode on a laptop, no cluster). The eval consumer
-    shares the substrate this client backs, so the choice applies to both lanes.
+    containers locally (middle mode on a laptop, no cluster); ``static`` leases
+    long-lived shells from a fixed pool (``redis_client`` holds the leases).
+    The eval consumer shares the substrate this client backs, so the choice
+    applies to both lanes.
 
     Local middle mode defaults to a REAL model. Fake model is an explicit
     offline/test opt-in, so a Docker worker with neither a model credential,
@@ -383,7 +480,9 @@ def _sandbox_client(
     (``CLAUDE_CODE_OAUTH_TOKEN`` / ``ANTHROPIC_API_KEY``) or the ACI
     ``CURIE_CREDENTIALS`` reference, which the runner maps onto an SDK var.
     """
-    substrate = env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower()
+    substrate = sandbox_substrate(env)
+    if substrate == "static":
+        return _static_pool_client(config, env, sub_config, redis_client)
     if substrate == "docker":
         bundle_store = BundleStore(config)
         has_credential = bool(config.credentials) or any(v in env for v in _MODEL_CREDENTIAL_ENV)
@@ -529,8 +628,9 @@ def build(
     )
     owner.register_close("pressure-redis", pressure_async_redis.aclose, order=41)
     sub_config = _substrate_config(env)
+    sandbox_client = _sandbox_client(config, env, sub_config, redis_client=sync_redis)
     substrate = SandboxSubstrate(
-        _sandbox_client(config, env, sub_config),
+        sandbox_client,
         AffinityStore(sync_redis, pressure_client=pressure_async_redis),
         sub_config,
     )
@@ -538,6 +638,12 @@ def build(
         connect_timeout_s=config.runner_connect_timeout_s,
         total_timeout_s=config.runner_total_timeout_s,
         snapshot_patch_max_bytes=config.publication_patch_max_bytes,
+        # A static shell answers HTTPS under the deployment's shell CA.
+        ssl_context=(
+            shell_ssl_context(env["CURIE_STATIC_SHELL_CA_FILE"])
+            if isinstance(sandbox_client, StaticPoolSandboxClient)
+            else None
+        ),
     )
     owner.register_close("runner", runner.close, order=10)
     workspace_s3 = build_s3_client(
@@ -786,8 +892,7 @@ def build(
         # refusal in the kernel before either durable row is created.
         publication_creator=(
             approval_client
-            if config.publication_enabled
-            and env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower() == "kubernetes"
+            if config.publication_enabled and sandbox_substrate(env) == "kubernetes"
             else None
         ),
         # The same client, handed in twice under the two roles the kernel needs
@@ -1493,8 +1598,7 @@ def _build_publication_loop(
     """Build the worker-owned Kubernetes publication lane, never a local twin."""
 
     if (
-        not config.publication_enabled
-        or env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower() != "kubernetes"
+        not config.publication_enabled or sandbox_substrate(env) != "kubernetes"
     ):
         return None
     namespace = config.publication_namespace
