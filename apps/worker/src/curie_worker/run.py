@@ -26,6 +26,7 @@ from aci_protocol.s3 import build_s3_client
 from aci_protocol.turn import DEFAULT_IDENTITY
 from aiohttp import web
 from curie_channel_gateway.read_transport import GatewayClient, RemoteFileSource
+from curie_channel_gateway.tls import gateway_http_mounts
 from curie_channel_gateway.token_custody import refuse_slack_tokens
 from curie_internal.valkey import AsyncRedis, Redis
 from curie_internal.workspace_objects import WorkspaceObjectPort
@@ -720,7 +721,9 @@ def build(
     attachments = _attachment_coordinator(config, workspace_objects, slack_files)
     # One API-lane HTTP client shared by the approval writer (#244) and the two
     # eval-lane reporters below; httpx.AsyncClient is task-safe.
-    eval_http = httpx.AsyncClient(timeout=30.0)
+    eval_http = httpx.AsyncClient(
+        timeout=30.0, mounts=gateway_http_mounts(config.channel_gateway_url)
+    )
     owner.register_close("eval-http", eval_http.aclose, order=30)
     # @spec HTTP-INVOCATION-EXECUTION-18/22: one client answers the kernel's
     # current checks and the binding owner's per-identity classification.
