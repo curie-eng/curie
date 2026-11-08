@@ -176,7 +176,7 @@ affinity:
      define's body and fails CI if the two lists drift.
 
      IMPORTANT: the pin scans this body for env-name-shaped uppercase tokens, so
-     the body must contain EXACTLY these eight keys and no other stray ones (this
+     the body must contain EXACTLY the enumerated keys and no other stray ones (this
      comment lives OUTSIDE the define so it is never scanned): the four runner
      credential keys plus the transport-control keys. The whole
      CURIE_ namespace is fenced separately by the hasPrefix rule in the
