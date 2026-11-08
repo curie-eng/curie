@@ -398,6 +398,9 @@ fn carry_over_selector_routes(
                 if edited.expires_in_seconds.is_none() {
                     edited.expires_in_seconds = current.expires_in_seconds;
                 }
+                if edited.remind_every_s.is_none() {
+                    edited.remind_every_s = current.remind_every_s;
+                }
             }
             None => {
                 bindings.insert(
@@ -407,6 +410,7 @@ fn carry_over_selector_routes(
                         notification: None,
                         approvers: current.approvers.clone(),
                         expires_in_seconds: current.expires_in_seconds,
+                        remind_every_s: current.remind_every_s,
                         approver_ticket: Some(ticket),
                         separation,
                     },

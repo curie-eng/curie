@@ -11,7 +11,7 @@ from curie_api.identity.http_approval import approval_record_digest
 def test_cursor_upgrade_keeps_old_rows_disabled_and_preserves_seal(
     isolated_migration_db: IsolatedMigrationDb,
 ):
-    isolated_migration_db.at("0152")
+    isolated_migration_db.at("0153")
     approval_id = uuid.uuid4()
     sql_rows(
         "INSERT INTO curie.approvals (id, conversation_id, author, summary, "
@@ -22,7 +22,7 @@ def test_cursor_upgrade_keeps_old_rows_disabled_and_preserves_seal(
     )
     before = sql_dicts("SELECT * FROM curie.approvals WHERE id=:id", {"id": approval_id})[0]
     digest = approval_record_digest(SimpleNamespace(**before))
-    command.upgrade(alembic_config(), "0153")
+    command.upgrade(alembic_config(), "0154")
     after = sql_dicts("SELECT * FROM curie.approvals WHERE id=:id", {"id": approval_id})[0]
     assert after == {**before, "next_remind_at": None}
     sql_rows(
@@ -31,7 +31,7 @@ def test_cursor_upgrade_keeps_old_rows_disabled_and_preserves_seal(
     )
     scheduled = sql_dicts("SELECT * FROM curie.approvals WHERE id=:id", {"id": approval_id})[0]
     assert approval_record_digest(SimpleNamespace(**scheduled)) == digest
-    command.downgrade(alembic_config(), "0152")
+    command.downgrade(alembic_config(), "0153")
     downgraded = sql_dicts("SELECT * FROM curie.approvals WHERE id=:id", {"id": approval_id})[0]
     assert "next_remind_at" not in downgraded
     assert approval_record_digest(SimpleNamespace(**downgraded)) == digest

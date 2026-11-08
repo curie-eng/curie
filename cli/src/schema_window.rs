@@ -768,8 +768,8 @@ print(json.dumps(graph))
         // raise the serving floor. Agent ORM reads require the 0151 connector
         // requester identity columns, and Approval ORM reads require the 0152 schedule
         // interval and the 0153 selection columns.
-        assert_eq!(candidate.schema_min, "0153");
-        assert_eq!(candidate.schema_head, "0153");
+        assert_eq!(candidate.schema_min, "0154");
+        assert_eq!(candidate.schema_head, "0154");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -812,7 +812,8 @@ print(json.dumps(graph))
         assert!(!live_in_window("0149", &current));
         assert!(!live_in_window("0151", &current));
         assert!(!live_in_window("0152", &current));
-        assert!(live_in_window("0153", &current));
+        assert!(!live_in_window("0153", &current));
+        assert!(live_in_window("0154", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

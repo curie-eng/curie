@@ -1,7 +1,7 @@
 """Index the nullable reminder due cursor.
 
-Revision ID: 0153
-Revises: 0152
+Revision ID: 0154
+Revises: 0153
 """
 
 from collections.abc import Sequence
@@ -9,8 +9,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0153"
-down_revision: str = "0152"
+revision: str = "0154"
+down_revision: str = "0153"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

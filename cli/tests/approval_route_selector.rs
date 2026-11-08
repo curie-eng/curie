@@ -578,10 +578,7 @@ fn flag_edits_preserve_selector_routes_reminder_intervals() {
                 false,
             );
             let edit = format!("{edited_route}=C0EXAMPLE3");
-            let run = run(&args(
-                &api.server.base_url,
-                &["--route-resolution", &edit],
-            ));
+            let run = run(&args(&api.server.base_url, &["--route-resolution", &edit]));
             assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
             let sent = patches(&api.server);
             assert_eq!(sent.len(), 1, "{sent:?}");
