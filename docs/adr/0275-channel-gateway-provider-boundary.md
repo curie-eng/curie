@@ -19,7 +19,8 @@ rendering, clicks, replies and provider reads. Its `curie_channel_gateway.ports`
 package depends on neutral channel contracts and the standard library. The
 import-linter contract in `pyproject.toml` forbids provider SDK, API and worker
 imports from these ports. It is exercised with violating imports as well as the
-valid package. No production composition uses the new ports in this slice.
+valid package. Provider composition lives in
+`curie_channel_gateway.slack.read_server.application`.
 
 The gateway authenticates Slack via signature verification or Socket Mode. It
 mints the chat-attester principal and signs receiver answer proofs over exact
