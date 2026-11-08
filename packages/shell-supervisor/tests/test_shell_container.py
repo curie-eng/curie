@@ -1,4 +1,4 @@
-"""The built shell image, run as a root container, recycles a shell cleanly.
+"""Built runner and shell images import and start the real runner.
 
 Set ``CURIE_SHELL_IMAGE`` to a shell image built from
 ``packages/shell-supervisor/Dockerfile``; without it these tests skip, unless
@@ -6,9 +6,9 @@ Set ``CURIE_SHELL_IMAGE`` to a shell image built from
 into a failure. Docker is driven through its CLI, and the container's
 supervisor port is published on loopback.
 
-The claims run ``hostile_child.py`` in place of the runner, as the runner's
-uid: the first writes into every directory it can and creates every kind of
-IPC object, the second looks for any of it.
+Recycling proofs additionally run ``hostile_child.py`` as the runner's uid:
+the first claim writes into every writable directory and creates IPC objects,
+and the second looks for any of it.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ from curie_test_support.static_shell import (
 )
 
 IMAGE = os.environ.get("CURIE_SHELL_IMAGE", "")
+RUNNER_IMAGE = os.environ.get("CURIE_RUNNER_IMAGE", "curie-runner")
 REQUIRED = os.environ.get("CURIE_SHELL_CONTAINER_PROOF") == "required"
 KEY_PATH = "/etc/curie-shell/tls.key"
 CERT_PATH = "/etc/curie-shell/tls.crt"
@@ -87,7 +88,13 @@ def _root_owned(files: dict[str, bytes]) -> bytes:
 
 
 class Shell:
-    def __init__(self, tls: ShellTls, *, command: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        tls: ShellTls,
+        *,
+        command: list[str] | None = None,
+        runner_command: str | None = RUNNER_COMMAND,
+    ) -> None:
         self.tls = tls
         self.name = f"curie-shell-proof-{uuid.uuid4().hex[:8]}"
         self.port = free_port()
@@ -97,6 +104,8 @@ class Shell:
             self.name,
             "--label",
             "keep=false",
+            "--label",
+            f"curie.test.owner={self.name}",
             "-p",
             f"127.0.0.1:{self.port}:8443",
             "-e",
@@ -107,8 +116,11 @@ class Shell:
             f"CURIE_SUPERVISOR_TLS_CERT_FILE={CERT_PATH}",
             "-e",
             f"CURIE_SUPERVISOR_TLS_KEY_FILE={KEY_PATH}",
-            "-e",
-            f"CURIE_SUPERVISOR_RUNNER_COMMAND={RUNNER_COMMAND}",
+            *(
+                ["-e", f"CURIE_SUPERVISOR_RUNNER_COMMAND={runner_command}"]
+                if runner_command is not None
+                else []
+            ),
             "-e",
             "CURIE_SUPERVISOR_SETTLE_TIMEOUT_SECONDS=5",
             IMAGE,
@@ -157,6 +169,135 @@ class Shell:
 
     def remove(self) -> None:
         _docker("rm", "-f", self.name, check=False)
+        assert not _docker("ps", "-aq", "--filter", f"name=^/{self.name}$").strip()
+
+
+def _runner_status(port: int, token: str | None) -> tuple[int, dict[str, Any]]:
+    connection = http.client.HTTPConnection("localhost", port, timeout=2)
+    try:
+        headers = {} if token is None else {"Authorization": f"Bearer {token}"}
+        connection.request("GET", "/v1/status", headers=headers)
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+    finally:
+        connection.close()
+
+
+@pytest.fixture(scope="module")
+def runner_container() -> Iterator[tuple[str, int, str]]:
+    name = f"curie-runner-proof-{uuid.uuid4().hex[:8]}"
+    port = free_port()
+    token = f"runner-{uuid.uuid4().hex}"
+    raw = io.BytesIO()
+    manifest = json.dumps({"name": "image-proof", "version": "0.0.0"}).encode()
+    with tarfile.open(fileobj=raw, mode="w") as archive:
+        info = tarfile.TarInfo("image-bundle/.claude-plugin/plugin.json")
+        info.size, info.mode = len(manifest), 0o644
+        archive.addfile(info, io.BytesIO(manifest))
+    try:
+        _docker(
+            "create",
+            "--name",
+            name,
+            "--label",
+            f"curie.test.owner={name}",
+            "-p",
+            f"127.0.0.1:{port}:8080",
+            "-e",
+            "CURIE_FAKE_MODEL=1",
+            "-e",
+            f"CURIE_RUNNER_TOKEN={token}",
+            "-e",
+            "CURIE_PLUGIN_DIR=/tmp/image-bundle",
+            RUNNER_IMAGE,
+        )
+        _docker("cp", "-", f"{name}:/tmp/", stdin=raw.getvalue())
+        _docker("start", name)
+        yield name, port, token
+    finally:
+        _docker("rm", "-f", name, check=False)
+        assert not _docker("ps", "-aq", "--filter", f"name=^/{name}$").strip()
+
+
+@pytest.mark.parametrize("image", [RUNNER_IMAGE, IMAGE], ids=["runner", "shell"])
+def test_built_image_imports_the_runner(image: str) -> None:
+    _docker(
+        "run",
+        "--rm",
+        "--label",
+        "curie.test.owner=runner-import-proof",
+        "--entrypoint",
+        "python",
+        image,
+        "-c",
+        "import curie_runner",
+    )
+
+
+def test_runner_default_entrypoint_serves_authenticated_status(
+    runner_container: tuple[str, int, str],
+) -> None:
+    name, port, token = runner_container
+
+    def ready() -> bool:
+        assert _docker("inspect", "-f", "{{.State.Running}}", name).strip() == "true"
+        try:
+            status, body = _runner_status(port, token)
+        except OSError:
+            return False
+        assert status == 200, body
+        return body["ready"] is True
+
+    wait_until(ready, 60, "the runner image's default entrypoint to serve")
+    status, body = _runner_status(port, token)
+    assert status == 200 and body["status"] == "idle"
+    assert _runner_status(port, None)[0] == 401
+
+
+@pytest.fixture(scope="module")
+def real_runner_shell(tls: ShellTls) -> Iterator[Shell]:
+    started = Shell(tls, runner_command=None)
+    try:
+        yield started
+    finally:
+        started.remove()
+
+
+def test_shell_default_entrypoint_starts_the_real_runner(real_runner_shell: Shell) -> None:
+    shell = real_runner_shell
+    wait_until(shell.answers, 60, "the shell image's default entrypoint to serve")
+    bearer = f"bearer-{uuid.uuid4().hex}{uuid.uuid4().hex}"
+    archive = claim_archive(
+        "runner-boot",
+        1,
+        {"CURIE_FAKE_MODEL": "1", "CURIE_RUNNER_TOKEN": bearer},
+        files={
+            "bundle/.claude-plugin/plugin.json": json.dumps(
+                {"name": "image-proof", "version": "0.0.0"}
+            ).encode(),
+        },
+    )
+    status, answer = shell.request(
+        "PUT", claim_path("runner-boot", 1), token=CONTROL_TOKEN, body=archive
+    )
+    assert status == 201, answer
+
+    def ready() -> bool:
+        current = shell.request("GET", "/_curie/supervisor/v1/shell", token=CONTROL_TOKEN)[1]
+        assert current["claim"]["child_exit"] is None, shell.logs()
+        if current["claim"]["ready"] is not True:
+            return False
+        status, answer = shell.request(
+            "GET", proxy_base_path("runner-boot", 1) + "/v1/status", token=bearer
+        )
+        assert status == 200, answer
+        return answer["ready"] is True
+
+    wait_until(ready, 60, "the shell's real runner child to serve")
+    status, answer = shell.request(
+        "GET", proxy_base_path("runner-boot", 1) + "/v1/status", token=bearer
+    )
+    assert status == 200 and answer["ready"] is True and answer["status"] == "idle", answer
 
 
 @pytest.fixture(scope="module")
