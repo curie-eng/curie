@@ -72,7 +72,7 @@ class TargetRoute(BaseModel):
     server-controlled ingress URL; ``adapter`` is the operator-chosen slug that
     selects the per-adapter egress secret (D4.2). For a Slack turn, ``adapter``
     is its bot identity (ADR-0168 decision 3), None reading as ``default``, and
-    the Slack sink picks its bot token by it (``slack_tokens.token_identity``);
+    the gateway picks its provider identity by it;
     ``endpoint`` is only a CLI stub's per-turn Slack origin, otherwise None
     (the worker's configured transport).
     """
