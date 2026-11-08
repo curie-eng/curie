@@ -292,11 +292,13 @@ def _requester_handoff_pending(thread_key: str, queued_event_id: str) -> BaseExc
     """Log a different-requester deferral and return the exception to raise.
 
     The line names the event and the thread only, never the requester or its
-    digest. ADR 0270 decision 3: inside a capacity wait the deferral is that
-    wait's own retry. A delivery that can park asks the consumer for a durable
-    requester handoff wait. The consumer opens this delivery's thread order
-    scope exactly when ``can_park`` holds for it, so that scope is the
-    kernel's proof. Any other delivery (an approval resume, a factory turn, a
+    digest. ADR 0270 decision 3: a delivery that can park asks the consumer
+    for a durable requester handoff wait, also when it is already a woken
+    capacity or thread order wait, so the wait leaves the thread order and the
+    live turn's requester keeps steering. The consumer opens this delivery's
+    thread order scope exactly when ``can_park`` holds for it, so that scope
+    is the kernel's proof. Inside any other wait the deferral is that wait's
+    own retry, and any other delivery (an approval resume, a factory turn, a
     direct kernel caller) keeps the pending deferral.
     """
 
@@ -306,11 +308,11 @@ def _requester_handoff_pending(thread_key: str, queued_event_id: str) -> BaseExc
         queued_event_id,
         thread_key,
     )
-    if current_wait() is not None:
-        return CapacityWaitRequested()
     ordering = current_order()
     if ordering is not None and ordering[1] == queued_event_id:
         return RequesterHandoffWaitRequested()
+    if current_wait() is not None:
+        return CapacityWaitRequested()
     return failures.RequesterHandoffPending(
         f"thread {thread_key} has a live turn for a different requester; deferring"
     )
