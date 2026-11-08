@@ -953,40 +953,55 @@ def test_judge_resume_reads_an_outage_through_both_checks_and_their_audit_rows()
 
 
 def test_selection_facts_read_top_level_or_nested_evidence() -> None:
-    top = {"evidence": {"kind": answers.SELECTION_KIND, "requester_equal": True}}
-    assert answers.evidence_fact(top, "equality") is True
+    refused = RECORDED_RESUME_REFUSED_CEILING
+    assert answers.selection_facts(refused) == refused["evidence"]
+    assert answers.evidence_fact(refused, "exclusion") is True
+    assert answers.evidence_fact(refused, "equality") is None
+    resolved = recorded_resolved(
+        "6784266a-043c-47fd-bca5-a3b919ed0b7e", 3, "2026-11-08T15:35:40.077319"
+    )
+    assert answers.selection_facts(resolved) == selection_evidence(3)
+    assert answers.evidence_fact(resolved, "equality") is False
+    assert answers.evidence_fact(resolved, "exemption_used") is False
     assert answers.evidence_fact(RESOLVED_ROW, "equality") is False
-    nested = {"evidence": {"selection": {"exemption_used": True}}}
-    assert answers.evidence_fact(nested, "exemption_used") is True
-    ordinary = {"evidence": {"separation": {"requester_equality": True}}}
-    assert answers.selection_facts(ordinary) == {}
-    assert answers.evidence_fact(ordinary, "equality") is True
+    # A member outside the selection evidence is never read, so it fails a judge.
+    elsewhere = {"evidence": {"kind": "http_approval_answer", "route": {"equality": True}}}
+    assert answers.selection_facts(elsewhere) == {}
+    assert answers.evidence_fact(elsewhere, "equality") is None
     assert answers.selection_facts(None) == {}
-    assert answers.refusal_code(denied_row(refusal_code="x")) == "x"
+    assert answers.refusal_code(refused) == answers.OUTSIDE_CEILING
+    assert answers.refusal_status(refused) == 403
     assert answers.refusal_status(denied_row(status=True)) is None
     assert answers.newest([RESOLVED_ROW, {**RESOLVED_ROW, "id": 9}], answers.RESOLVED)["id"] == 9
 
 
-def test_separation_change_reads_flat_or_nested_values() -> None:
-    flat = {
+def test_separation_change_reads_the_event_details() -> None:
+    exempt = {"issuer": ISSUER, "id": answers.EXEMPT_GROUP}
+    details = {
+        "route": tickets.TICKET_ROUTE,
+        "key_id": RUN_KEY_ID,
+        "connector": "netpol-probe",
+        "tool": "search_dashboards",
+        "old_exclude_requester": True,
+        "new_exclude_requester": False,
+        "old_exempt_group": exempt,
+        "new_exempt_group": None,
+        "old_configuration_version": 4,
+        "new_configuration_version": 5,
+    }
+    change = answers.separation_change(details)
+    assert change == {
         "route": tickets.TICKET_ROUTE,
         "old_exclude_requester": True,
         "new_exclude_requester": False,
+        "old_exempt_group": exempt,
+        "new_exempt_group": None,
         "old_configuration_version": 4,
         "new_configuration_version": 5,
     }
-    nested = {
-        "route": tickets.TICKET_ROUTE,
-        "old": {"exclude_requester": True},
-        "new": {"exclude_requester": False, "exempt_group": {"id": answers.EXEMPT_GROUP}},
-        "old_configuration_version": 4,
-        "new_configuration_version": 5,
-    }
-    for details in (flat, nested):
-        change = answers.separation_change(details)
-        assert (change["old_exclude_requester"], change["new_exclude_requester"]) == (True, False)
-        assert (change["old_configuration_version"], change["new_configuration_version"]) == (4, 5)
-    assert answers.separation_change(nested)["new_exempt_group"] == {"id": answers.EXEMPT_GROUP}
+    # A member the event does not carry reads None, so it fails a judge.
+    nested = {"route": tickets.TICKET_ROUTE, "old": {"exclude_requester": True}}
+    assert answers.separation_change(nested)["old_exclude_requester"] is None
 
 
 def test_only_an_unchanged_503_or_an_unavailable_check_is_retried() -> None:

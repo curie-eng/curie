@@ -524,7 +524,6 @@ class AnswerScenario(TicketScenario):
             exempt_group=answers.EXEMPT_GROUP,
             operator_user=answers.OPERATOR_USER,
             roster={"overridden": served.get("overridden"), "generation": served.get("generation")},
-            evidence_names={name: list(keys) for name, keys in answers.EVIDENCE_NAMES.items()},
         )
 
     def install(self) -> None:
@@ -923,8 +922,7 @@ class AnswerScenario(TicketScenario):
         found = answers.evidence_fact(row, name)
         check(
             found is wanted,
-            f"{what}: the audit row's selection evidence reads {name}={found!r}, not {wanted!r} "
-            f"(names tried: {list(answers.EVIDENCE_NAMES[name])})",
+            f"{what}: the audit row's selection evidence reads {name}={found!r}, not {wanted!r}",
         )
 
     # item 3: decision 5 ----------------------------------------------------------------------

@@ -837,13 +837,15 @@ own evidence:
 20. `static-exclusion-route`: a third route without a selector lists the requester and the approver by email and an operator by Slack user, and excludes the requester. On an ordinary approval there, the requester is refused `separation_requester_excluded` and the approver approves.
 21. `operator-principal-refused`: an operator principal for the user that route lists is refused 403 on a dynamic approval and on a static exclusion approval, each with a `denied` audit row of principal kind `operator` naming `canonical_route_operator_refused`, and both rows stay pending.
 
-The plan names the selection evidence's requester equality, exclusion and
-exemption use but not their member names, so the judges read the first of
-several candidate names, and the evidence lists them under
-`setup.evidence_names`. The evidence keeps HTTP statuses, refusal codes,
-scrubbed audit rows, selected subjects and selection digests, identity audit
-events, principal statuses, worker wait counts and durations, and key ids,
-never keys, tokens, proofs, capsules, nonces or tickets.
+The judges read the members the API writes: `equality`, `exclusion` and
+`exemption_used` of the selection evidence, `status` of a refusal's audit row
+(its refusal code is matched in the row's evidence or reason), and the flat
+`old_` and `new_` members of an `approval_separation.changed` event. A judged
+member the evidence does not carry fails the step. The evidence keeps HTTP
+statuses, refusal codes, scrubbed audit rows, selected subjects and selection
+digests, identity audit events, principal statuses, worker wait counts and
+durations, and key ids, never keys, tokens, proofs, capsules, nonces or
+tickets.
 
 Restore runs in a `finally` block even after a failure, and a failed restore
 fails the run. It resets the roster and checks that nothing is overridden. It

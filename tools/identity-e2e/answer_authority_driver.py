@@ -171,24 +171,19 @@ REQUESTER_EXCLUDED = "separation_requester_excluded"
 OPERATOR_REFUSED = "canonical_route_operator_refused"
 SELECTION_KIND = "approval_selection"
 SEPARATION_CHANGED = "approval_separation.changed"
+# The members of that event's details the scenario judges and records.
+SEPARATION_CHANGE_FIELDS = (
+    "route",
+    "old_exclude_requester",
+    "new_exclude_requester",
+    "old_exempt_group",
+    "new_exempt_group",
+    "old_configuration_version",
+    "new_configuration_version",
+)
 RESOLVED = "resolved"
 DENIED = "denied"
 RESUME_REFUSED = "resume_refused"
-
-# Evidence member names the plan describes but does not spell; the first
-# present one is read, and every candidate is listed in the run's evidence.
-EQUALITY_KEYS = ("equality", "requester_equal", "requester_equality", "equal")
-EXCLUSION_KEYS = ("exclusion", "exclude_requester")
-EXEMPTION_USED_KEYS = ("exemption_used",)
-CODE_KEYS = ("code", "refusal_code")
-STATUS_KEYS = ("status", "refusal_status", "http_status", "status_code")
-EVIDENCE_NAMES = {
-    "equality": EQUALITY_KEYS,
-    "exclusion": EXCLUSION_KEYS,
-    "exemption_used": EXEMPTION_USED_KEYS,
-    "code": CODE_KEYS,
-    "status": STATUS_KEYS,
-}
 
 # Audit and response members never copied into evidence.
 _SECRET_NAMES = frozenset(
@@ -659,22 +654,6 @@ def audit_summary(row: Mapping[str, Any]) -> dict[str, Any]:
 # --- judges -------------------------------------------------------------------------------
 
 
-def pick(mapping: Any, names: Sequence[str]) -> Any:
-    """The first of ``names`` present in ``mapping`` or one level below it, else None."""
-
-    if not isinstance(mapping, Mapping):
-        return None
-    for name in names:
-        if name in mapping:
-            return mapping[name]
-    for item in mapping.values():
-        if isinstance(item, Mapping):
-            for name in names:
-                if name in item:
-                    return item[name]
-    return None
-
-
 def selection_facts(row: Mapping[str, Any] | None) -> dict[str, Any]:
     """The selection evidence of an audit row: the evidence itself or its ``selection``."""
 
@@ -687,8 +666,15 @@ def selection_facts(row: Mapping[str, Any] | None) -> dict[str, Any]:
     return dict(nested) if isinstance(nested, Mapping) else {}
 
 
+def _evidence(row: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    evidence = (row or {}).get("evidence")
+    return evidence if isinstance(evidence, Mapping) else {}
+
+
 def refusal_code(row: Mapping[str, Any] | None) -> Any:
-    return pick((row or {}).get("evidence"), CODE_KEYS)
+    """The ``code`` a refusal audit row's evidence records, else None."""
+
+    return _evidence(row).get("code")
 
 
 def names_code(row: Mapping[str, Any] | None, code: str) -> bool:
@@ -700,7 +686,9 @@ def names_code(row: Mapping[str, Any] | None, code: str) -> bool:
 
 
 def refusal_status(row: Mapping[str, Any] | None) -> Any:
-    found = pick((row or {}).get("evidence"), STATUS_KEYS)
+    """The HTTP ``status`` a refusal audit row's evidence records, else None."""
+
+    found = _evidence(row).get("status")
     return found if isinstance(found, int) and not isinstance(found, bool) else None
 
 
@@ -710,15 +698,14 @@ def newest(rows: Iterable[Mapping[str, Any]], action: str) -> dict[str, Any] | N
 
 
 def evidence_fact(row: Mapping[str, Any] | None, name: str) -> Any:
-    """One named fact of an audit row (see :data:`EVIDENCE_NAMES`).
+    """One member of an audit row's selection evidence, else None.
 
-    Read from the selection evidence first, then from the whole evidence, since
-    an ordinary approval on a static exclusion route has no selection.
+    The members judged are ``equality``, ``exclusion`` and ``exemption_used``,
+    read from :func:`selection_facts` only, so a member the row does not carry
+    reads None and fails a judge that wants true or false.
     """
 
-    names = EVIDENCE_NAMES[name]
-    found = pick(selection_facts(row), names)
-    return pick((row or {}).get("evidence"), names) if found is None else found
+    return selection_facts(row).get(name)
 
 
 def judge_answer(
@@ -812,29 +799,13 @@ def judge_resume(result: Mapping[str, Any], *, decision: str) -> list[str]:
 
 
 def separation_change(details: Mapping[str, Any]) -> dict[str, Any]:
-    """An ``approval_separation.changed`` event's old and new values and versions.
+    """An ``approval_separation.changed`` event's route, old and new values and versions.
 
-    The selector audit writes ``old_exclude_requester``/``new_exclude_requester``;
-    a nested ``old``/``new`` value object is read too, since the plan names only
-    "old and new values".
+    The selector audit writes each as a flat member of the event's details; a
+    member it does not carry reads None.
     """
 
-    def value(side: str, name: str) -> Any:
-        flat = f"{side}_{name}"
-        if flat in details:
-            return details[flat]
-        nested = details.get(side)
-        return nested.get(name) if isinstance(nested, Mapping) else None
-
-    return {
-        "route": details.get("route"),
-        "old_exclude_requester": value("old", "exclude_requester"),
-        "new_exclude_requester": value("new", "exclude_requester"),
-        "old_exempt_group": value("old", "exempt_group"),
-        "new_exempt_group": value("new", "exempt_group"),
-        "old_configuration_version": details.get("old_configuration_version"),
-        "new_configuration_version": details.get("new_configuration_version"),
-    }
+    return {name: details.get(name) for name in SEPARATION_CHANGE_FIELDS}
 
 
 def ticket_readback(routes: Any, route: str = tickets.TICKET_ROUTE) -> dict[str, Any]:
@@ -888,14 +859,9 @@ def publishes_wake(result: Mapping[str, Any]) -> bool:
 # --- inside the API pod -------------------------------------------------------------------------
 
 
-class DriverRefusal(Exception):
-    """A refusal whose message is safe to print."""
-
-
-def _settings() -> Any:
-    from curie_api.config import get_settings
-
-    return get_settings()
+# The creation driver's, so ``dispatch`` reports either driver's refusal alike.
+DriverRefusal = tickets.DriverRefusal
+_settings = tickets._settings
 
 
 def _runtime() -> Any:
@@ -1432,7 +1398,7 @@ def dispatch(params: Any) -> dict[str, Any]:
         return {"error": f"unknown action {str(action)[:40]!r}"}
     try:
         return handler(params)
-    except (DriverRefusal, tickets.DriverRefusal) as exc:
+    except DriverRefusal as exc:
         return {"error": str(exc)}
     except Exception as exc:  # noqa: BLE001 - product exception text may quote inputs.
         database = tickets._database_message(exc)
