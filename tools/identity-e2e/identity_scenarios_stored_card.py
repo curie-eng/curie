@@ -262,6 +262,16 @@ def approval_rows(harness: Harness, agent_id: str, conversation: str) -> list[di
     return rows
 
 
+def stored_tickets(rows: Iterable[Mapping[str, Any]]) -> list[Any]:
+    """The ``approval_ticket`` each row's ``granted_arguments`` stores, to hold as private."""
+
+    return [
+        arguments.get("approval_ticket")
+        for arguments in (row.get("granted_arguments") for row in rows)
+        if isinstance(arguments, Mapping)
+    ]
+
+
 def await_rows(
     harness: Harness, agent_id: str, conversation: str, wait: float
 ) -> list[dict[str, Any]]:
@@ -309,6 +319,15 @@ def stored_arguments_card(harness: Harness, args: Any, evidence: Evidence) -> No
     """
 
     run = TicketScenario(harness, args, evidence)
+    humans = [{**human, "tenant_id": run.tenant_id} for human in (run.requester, run.approver)]
+    # Every private value is held as soon as the run has it, so finish() scrubs
+    # it out of the evidence even when the run stops before S3.
+    evidence.hold_private(
+        private_values(
+            [human["subject"] for human in humans],
+            [principal_header_value(human) for human in humans],
+        )
+    )
     tag = uuid.uuid4().hex[:12]
     stored_marker = f"stored-card-{tag}"
     template_marker = f"template-card-{uuid.uuid4().hex[:12]}"
@@ -335,6 +354,7 @@ def stored_arguments_card(harness: Harness, args: Any, evidence: Evidence) -> No
             "the approver's and requester's canonical principal rows",
         ) as seen:
             run.prepare()
+            evidence.hold_private([run.key.get("seed_hex")])
             run.install(summary=template)
             run.send_turns(CARD_TURNS)
             setup = evidence.data.get("setup") or {}
@@ -390,6 +410,7 @@ def stored_arguments_card(harness: Harness, args: Any, evidence: Evidence) -> No
                 arguments=arguments,
             )
             secret["ticket"] = str(signed["ticket"])
+            evidence.hold_private([secret["ticket"]])
             seen["ticket"] = {
                 "fingerprint": caller_fingerprint(secret["ticket"]),
                 "length": len(secret["ticket"]),
@@ -410,6 +431,7 @@ def stored_arguments_card(harness: Harness, args: Any, evidence: Evidence) -> No
             conversation = str(sent["conversation_id"])
             since = float(sent["sent_at"]) - CLOCK_SKEW_S
             rows = await_rows(harness, run.agent_id, conversation, wait)
+            evidence.hold_private(stored_tickets(rows))
             seen["rows_on_conversation"] = len(rows)
             if not any(row.get("granted_tool") == LIVE_TOOL for row in rows):
                 turn = turn_summary(harness.replies(run.agent, since, conversation))
@@ -491,13 +513,13 @@ def stored_arguments_card(harness: Harness, args: Any, evidence: Evidence) -> No
             }
             seen["card_text_equals_display_summary"] = text == display
     finally:
-        humans = [{**human, "tenant_id": run.tenant_id} for human in (run.requester, run.approver)]
         private = private_values(
             [human["subject"] for human in humans],
             [principal_header_value(human) for human in humans],
             secret.get("ticket"),
             run.key.get("seed_hex"),
         )
+        evidence.hold_private(private)
         secret.clear()
         try:
             restore_step(harness, evidence, run, state, private)

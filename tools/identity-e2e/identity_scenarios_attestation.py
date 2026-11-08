@@ -29,6 +29,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from fnmatch import fnmatchcase
 from typing import Any
 
+import identity_privacy
 from identity_assets import ed25519_pair
 from identity_e2e import (
     AUTHORITY_GROUP,
@@ -118,11 +119,6 @@ _DIAL_LINE = re.compile(
 )
 _DIAL_CALLER = re.compile(r"(?:^|\s)caller=(?P<caller>\S+)\s*$")
 _DIAL_FIELD = re.compile(r"(?:^|\s)(?P<key>effect|requester|grant)=(?P<value>\S+)")
-# The evidence privacy guard: a caller, grant or replay token envelope
-# (curie_connector_proxy.caller) or an approver ticket (curie_internal.approver_ticket),
-# and the shortest secret worth searching for.
-_ENVELOPE = re.compile(r"(?P<prefix>cct|ccg|ccr|cat1)\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}")
-MIN_SECRET = 8
 
 
 def live_name(tool: str) -> str:
@@ -575,61 +571,35 @@ def require_named_principal(observed: Mapping[str, Any], principal: Any, who: st
     )
 
 
-def _private_leaf(text: str, path: str, secrets: Sequence[str]) -> None:
-    where = path or "<root>"
-    found = _ENVELOPE.search(text)
-    check(found is None, f"the evidence carries a {found and found['prefix']}. envelope at {where}")
-    check(
-        not any(secret in text for secret in secrets),
-        f"the evidence carries a private value of the run at {where}",
-    )
-
-
-def _private_walk(node: Any, path: str, secrets: Sequence[str]) -> int:
-    if isinstance(node, str):
-        _private_leaf(node, path, secrets)
-        return 1
-    if node is None or isinstance(node, (bool, int, float)):
-        return 0
-    if isinstance(node, Mapping):
-        where = path or "<root>"
-        check(
-            not ("issuer" in node and "subject" in node),
-            f"the evidence carries a principal-shaped object (issuer and subject) at {where}",
-        )
-        for key in node:
-            try:
-                _private_leaf(str(key), path, secrets)
-            except StepFailed:
-                raise StepFailed(
-                    f"a key of the mapping at {where} carries an envelope or a private value"
-                ) from None
-        return sum(
-            _private_walk(value, f"{path}.{key}" if path else str(key), secrets)
-            for key, value in node.items()
-        )
-    if isinstance(node, (list, tuple, set, frozenset)):
-        return sum(
-            _private_walk(value, f"{path}[{index}]", secrets) for index, value in enumerate(node)
-        )
-    _private_leaf(str(node), path, secrets)
-    return 1
+def _refuse(message: str) -> None:
+    raise StepFailed(message)
 
 
 def require_private_evidence(data: Any, *, secrets: Iterable[str] = ()) -> int:
     """``data`` carries no principal, token, grant, ticket or other private value of the run.
 
-    Walks a JSON-like tree and fails on a mapping with both an ``issuer`` and
-    a ``subject`` key, on a string (or a mapping key) holding a ``cct.``,
-    ``ccg.``, ``ccr.`` or ``cat1.`` envelope of two base64url segments of at
-    least 16 characters, and on one holding any of ``secrets`` (those shorter
-    than :data:`MIN_SECRET` characters are ignored). The failure names the
-    JSON path of the offending node, never its value. Returns the number of
-    string leaves checked.
+    Walks a JSON-like tree under :func:`identity_privacy.walk` and fails on the
+    first mapping with both an ``issuer`` and a ``subject`` key, string (or
+    mapping key) holding a ``cct.``, ``ccg.``, ``ccr.`` or ``cat1.`` envelope of
+    two base64url segments of at least 16 characters, or string holding any of
+    ``secrets`` (those shorter than :data:`identity_privacy.MIN_SECRET`
+    characters are ignored). The failure names the JSON path of the offending
+    node, never its value. Returns the number of string leaves checked.
     """
 
-    wanted = tuple({s for s in secrets if isinstance(s, str) and len(s) >= MIN_SECRET})
-    return _private_walk(data, "", wanted)
+    return identity_privacy.walk(data, "", identity_privacy.searchable(secrets), _refuse)[1]
+
+
+def scrub_private(data: Any, *, secrets: Iterable[str] = ()) -> int:
+    """Replace in place what :func:`require_private_evidence` would fail on; returns the count.
+
+    The same rules, from the same walker: a principal-shaped mapping becomes
+    ``"[redacted: principal]"``, a string carrying an envelope or a secret
+    becomes ``"[redacted]"``, and such a mapping key becomes ``"[redacted key <n>]"``
+    with its value kept and scrubbed. Zero leaves ``data`` unchanged.
+    """
+
+    return identity_privacy.scrub(data, secrets)
 
 
 def _withheld_unless_private(text: str, secrets: Sequence[str]) -> str:
@@ -651,9 +621,12 @@ def require_private_run(
 
     Scans the whole evidence with this step's own ``seen`` where the step will
     record it, under :func:`require_private_evidence` with ``secrets`` (every
-    private value the run held in memory). Then raises the step's pending
-    ``failure``, withheld when it would itself carry a private value. A guard
-    failure fails the step.
+    private value the run held in memory). A guard failure fails the step:
+    first the whole evidence and ``seen`` are scrubbed in place
+    (:meth:`Evidence.scrub`, which also fails the run at ``finish``), so neither
+    the raised message, which names only a JSON path, nor anything the run
+    writes or prints carries the value. Then raises the step's pending
+    ``failure``, withheld when it would itself carry a private value.
     """
 
     held = tuple(secrets)
@@ -662,6 +635,7 @@ def require_private_run(
     try:
         checked = require_private_evidence(view, secrets=held)
     except StepFailed as exc:
+        evidence.scrub(seen, secrets=held)
         raise StepFailed(str(exc) if pending is None else f"{exc}; also: {pending}") from None
     seen["private_evidence"] = {"strings_checked": checked}
     if pending is not None:
@@ -1019,6 +993,17 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
     if requester == approver:
         raise HarnessError("grant-attestation needs two humans; --second-sender equals --sender")
     principal_a, principal_b = principal_for(harness, requester), principal_for(harness, approver)
+    # Every private value is held as soon as the run has it, so finish() scrubs
+    # it out of the evidence even when the run stops before G10.
+    evidence.hold_private(
+        private_values(
+            principal_a["subject"],
+            principal_b["subject"],
+            principal_header_value(principal_a),
+            principal_header_value(principal_b),
+            harness.data.get("keys", {}).get("caller_signing"),
+        )
+    )
     requester_fp = principal_fingerprint(principal_a)
     entry = harness.agent_entry(agent)
     agent_id, binding_id = str(entry["agent_id"]), str(entry["binding_id"])
@@ -1054,6 +1039,7 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
         ) as seen:
             setup(
                 harness,
+                evidence,
                 seen,
                 agent=agent,
                 agent_id=agent_id,
@@ -1087,6 +1073,7 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
             if grant is not None:
                 # Held until G10's guard, which searches the evidence for it.
                 captured.setdefault("grants", []).append(grant)
+                evidence.hold_private([grant])
             check(grant is None, f"the claim of a turn with no approval carries a grant ({where})")
             dial = fake_dial(turn.get("texts") or [], REFERENCE_CONNECTOR, ATTESTED_TOOL)
             seen["dial"] = dial
@@ -1202,6 +1189,7 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
             assert grant is not None
             # Held until G10's guard, which searches the evidence for it.
             captured.setdefault("grants", []).append(grant)
+            evidence.hold_private([grant])
             facts = grant_facts(grant, agent=agent, tool=ATTESTED_TOOL, arguments=approved)
             del grant
             seen["grant"].update(
@@ -1223,6 +1211,7 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
                 f"{ {key: value for key, value in facts.items() if key != 'jti_fingerprint'} }",
             )
             token = harness.capture_caller_token(resume_claim)
+            evidence.hold_private([token])
             check(token is not None, f"the resume claim {resume_claim} has no caller token")
             assert token is not None
             check(
@@ -1429,6 +1418,7 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
             keys.get("selector_signing"),
             keys.get("caller_signing"),
         )
+        evidence.hold_private(private)
         captured.clear()
         try:
             restore_grant_setup(
@@ -1446,6 +1436,7 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
 
 def setup(
     harness: Harness,
+    evidence: Evidence,
     seen: dict[str, Any],
     *,
     agent: str,
@@ -1454,7 +1445,10 @@ def setup(
     restore: dict[str, Any],
     state: dict[str, Any],
 ) -> None:
-    """G0. Every change is recorded in ``restore`` before it is made, for G10."""
+    """G0. Every change is recorded in ``restore`` before it is made, for G10.
+
+    The selector seed is held in ``evidence`` as soon as it exists.
+    """
 
     require_install_ready(harness, seen, (agent,))
     seen["reference_connector"] = require_reference_connector(harness, (agent,))
@@ -1508,6 +1502,7 @@ def setup(
     directory.mkdir(mode=0o700, exist_ok=True)
     os.chmod(directory, 0o700)
     seed, verify = ed25519_pair(directory)
+    evidence.hold_private([seed])
     keys["selector_signing"], keys["selector_verify"] = seed, verify
     harness.state.save()
     previous = harness.connector_server_env(agent, REFERENCE_CONNECTOR, TICKET_ENV)

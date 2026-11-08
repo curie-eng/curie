@@ -614,7 +614,12 @@ any object with both an `issuer` and a `subject` key, any `cct.`, `ccg.`,
 `ccr.` or `cat1.` envelope, and any private value the run held in memory: both
 humans' subjects and `X-Curie-Principal` values, the captured caller token,
 every grant it read, the selector seed and the caller signing seed. The
-failure names only the JSON path of what it found.
+failure names only the JSON path of what it found. A rejected value is
+replaced (`[redacted]`, or `[redacted: principal]` for a principal-shaped
+object) before the evidence is written or printed, the evidence records how
+many under `privacy`, and the run fails. The run holds each private value from
+the moment it has it, so a run that stops before G10 is scrubbed the same way
+when it finishes.
 
 ## What stored-arguments-card proves
 
@@ -694,7 +699,9 @@ approval's `summary` field, the runner's machine string of the raw call, is
 never read into the evidence. S3 checks the whole evidence last, after its
 restore and including its own step, as `grant-attestation` G10 does, with the
 two humans' subjects and `X-Curie-Principal` values, the ticket and the
-selector seed as the run's private values.
+selector seed as the run's private values, and every ticket read back from the
+approval rows. As there, a rejected value is replaced before the evidence is
+written or printed, and the run fails, also when the run stops before S3.
 
 ## Add a scenario
 

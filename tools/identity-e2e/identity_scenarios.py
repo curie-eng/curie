@@ -30,6 +30,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
 import approver_ticket_driver as tickets
+import identity_privacy
 from identity_assets import ed25519_pair
 from identity_e2e import Api, Harness, HarnessError, caller_fingerprint, epoch, turn_summary
 from identity_target import REPO, http, write_private
@@ -89,7 +90,16 @@ def check(condition: bool, message: str) -> None:
 
 
 class Evidence:
-    """The JSON evidence one ``prove`` run writes."""
+    """The JSON evidence one ``prove`` run writes.
+
+    A run that holds a private value (a principal, token, grant, ticket or key)
+    passes it to :meth:`hold_private` as soon as it has it. :meth:`finish` then
+    replaces, under ``identity_privacy``'s rules, every held value,
+    principal-shaped object and token envelope the evidence carries, before
+    anything writes or prints it; when it replaced anything the evidence
+    records ``privacy`` and the run fails. A run that holds nothing finishes as
+    it recorded.
+    """
 
     def __init__(self, name: str) -> None:
         self.data: dict[str, Any] = {
@@ -97,6 +107,33 @@ class Evidence:
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "steps": [],
         }
+        # None until the run holds a private value; only then does finish() scrub.
+        self._private: list[str] | None = None
+        self._redactions = 0
+
+    def hold_private(self, values: Iterable[Any]) -> None:
+        """Hold ``values`` as private values of this run. Cumulative.
+
+        Strings shorter than ``identity_privacy.MIN_SECRET`` characters and
+        non-strings are ignored, but any call puts the run under the privacy
+        rules at :meth:`finish`.
+        """
+
+        held = [] if self._private is None else self._private
+        held += [value for value in identity_privacy.searchable(values) if value not in held]
+        self._private = held
+
+    def scrub(self, *trees: Any, secrets: Iterable[str] = ()) -> int:
+        """Replace in place what the privacy rules refuse in the evidence and in ``trees``.
+
+        Searches for the held values and ``secrets``. Returns how many nodes it
+        replaced, and adds them to the count :meth:`finish` records.
+        """
+
+        wanted = [*(self._private or ()), *secrets]
+        count = sum(identity_privacy.scrub(tree, wanted) for tree in (self.data, *trees))
+        self._redactions += count
+        return count
 
     @contextlib.contextmanager
     def step(self, step_id: str, title: str) -> Iterator[dict[str, Any]]:
@@ -115,10 +152,18 @@ class Evidence:
             self.data["steps"].append(entry)
 
     def finish(self) -> dict[str, Any]:
+        if self._private is not None:
+            self.scrub()
+            self._private.clear()
         steps = self.data["steps"]
         self.data["passed"] = (
-            bool(steps) and "aborted" not in self.data and all(step["passed"] for step in steps)
+            bool(steps)
+            and "aborted" not in self.data
+            and all(step["passed"] for step in steps)
+            and not self._redactions
         )
+        if self._redactions:
+            self.data["privacy"] = {"redactions": self._redactions}
         self.data["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         return self.data
 
