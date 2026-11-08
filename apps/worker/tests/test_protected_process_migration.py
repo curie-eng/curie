@@ -4,7 +4,6 @@ import json
 import os
 import stat
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -12,7 +11,7 @@ import pytest
 from .test_protected_process_settings import product, value
 
 ROOT = Path(__file__).resolve().parents[3]
-SCRIPT = ROOT / "scripts/migrate-protected-process.py"
+CLI = Path(os.environ.get("CURIE_BIN", ROOT / "cli/target/debug/curie"))
 
 
 def old_settings():
@@ -38,8 +37,9 @@ def run(tmp_path, settings, gateway):
     config.write_text(json.dumps(gateway))
     result = subprocess.run(
         [
-            sys.executable,
-            str(SCRIPT),
+            str(CLI),
+            "migrate-protected-process",
+            "--json",
             "--runtime-dir",
             str(runtime),
             "--gateway-config",
@@ -60,6 +60,7 @@ def test_migration_removes_raw_credentials_and_runtime_accepts_result(tmp_path):
     expected.update(schema_version=2, channel_gateway=gateway)
     runtime, process, result = run(tmp_path, settings, gateway)
     assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"schema_version": 2, "migrated": True}
     assert json.loads(process.read_bytes()) == expected
     assert stat.S_IMODE(process.stat().st_mode) == 0o600
     actual = product().load_process_settings(str(runtime))
@@ -88,6 +89,37 @@ def test_migration_refuses_invalid_inputs_without_changing_source(tmp_path, muta
         settings["slack"]["identity_tokens"] = []
     _, process, result = run(tmp_path, settings, gateway)
     assert result.returncode == 1
-    assert "Fix:" in result.stderr
+    assert json.loads(result.stdout)["fix"]
     assert json.loads(process.read_bytes()) == settings
     assert sorted(path.name for path in process.parent.iterdir()) == ["process.json"]
+
+
+@pytest.mark.parametrize(
+    "mutation", ["symlink", "duplicate", "duplicate-map", "oversized", "malformed"]
+)
+def test_cli_migration_refuses_unsafe_source_and_preserves_bytes(tmp_path, mutation):
+    settings, gateway = old_settings()
+    runtime, process, result = run(tmp_path, settings, gateway)
+    assert result.returncode == 0
+    raw = json.dumps(settings)
+    if mutation == "duplicate":
+        raw = raw.replace('"schema_version": 1', '"schema_version": 1, "schema_version": 1')
+    elif mutation == "duplicate-map":
+        raw = raw.replace('"acme-adapter":', '"acme-adapter": "duplicate", "acme-adapter":')
+    elif mutation == "oversized":
+        raw += " " * 65536
+    elif mutation == "malformed":
+        raw = '{"schema_version":'
+    process.write_text(raw)
+    if mutation == "symlink":
+        target = tmp_path / "source.json"
+        process.rename(target)
+        process.symlink_to(target)
+    result = subprocess.run([
+        str(CLI), "migrate-protected-process", "--json", "--runtime-dir", str(runtime),
+        "--gateway-config", str(tmp_path / "gateway.json"),
+    ], capture_output=True, text=True, env={"PATH": os.defpath})
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["fix"]
+    assert process.read_text() == raw
+    assert "private-migration-sentinel" not in result.stdout + result.stderr

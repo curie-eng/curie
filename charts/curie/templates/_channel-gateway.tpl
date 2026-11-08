@@ -42,6 +42,7 @@
 - name: gateway-tls
   secret:
     secretName: {{ $secret }}
+    optional: true
     items:
       - key: ca.crt
         path: ca.crt
@@ -67,5 +68,38 @@
 {{- end }}
 - name: CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE
   value: {{ $http | quote }}
+{{- end -}}
+{{- end -}}
+
+{{- define "curie.channelGateway.tlsData" -}}
+{{- if not (hasKey . "_curieGatewayTLSData") -}}
+{{- $gateway := include "curie.channelGateway.values" . | fromYaml -}}
+{{- $name := include "curie.channelGateway.tlsSecret" . -}}
+{{- $data := dict -}}
+{{- if $name -}}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $name | default dict -}}
+{{- $data = $existing.data | default dict -}}
+{{- if and (eq (include "curie.channelGateway.deploy" .) "true") (not $gateway.tlsSecret) (not $gateway.allowInsecure) -}}
+{{- if not $data }}
+{{- $host := printf "%s-channel-gateway" (include "curie.fullname" .) }}
+{{- $ca := genCA (printf "%s-ca" $host) 3650 }}
+{{- $cert := genSignedCert $host nil (list $host (printf "%s.%s" $host .Release.Namespace) (printf "%s.%s.svc" $host .Release.Namespace) (printf "%s.%s.svc.cluster.local" $host .Release.Namespace)) 3650 $ca }}
+{{- $data = dict "ca.crt" ($ca.Cert | b64enc) "tls.crt" ($cert.Cert | b64enc) "tls.key" ($cert.Key | b64enc) }}
+{{- else }}
+{{- range $key := list "ca.crt" "tls.crt" "tls.key" }}
+{{- if not (index $data $key) }}{{- fail "channel gateway TLS Secret is incomplete: restore ca.crt, tls.crt and tls.key, or rotate it as documented in the chart upgrade guide" }}{{- end }}
+{{- end }}
+{{- end }}
+{{- end -}}
+{{- end -}}
+{{- $_ := set . "_curieGatewayTLSData" $data -}}
+{{- end -}}
+{{- index . "_curieGatewayTLSData" | toYaml -}}
+{{- end -}}
+
+{{- define "curie.channelGateway.tlsChecksum" -}}
+{{- $name := include "curie.channelGateway.tlsSecret" . -}}
+{{- if $name -}}
+{{- printf "%s\n%s" $name (include "curie.channelGateway.tlsData" .) | sha256sum -}}
 {{- end -}}
 {{- end -}}

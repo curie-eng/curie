@@ -1227,3 +1227,14 @@ provider with `curie cluster identity-authority`, and manage issuer group
 role filters with `curie cluster role-filter`. See the
 [operator runbook](../docs/http-identity-operator.md) for protected credential
 registration, versioned requests and refusal recovery.
+
+### Protected process migration
+
+Stop the protected worker, then run
+`curie migrate-protected-process --runtime-dir /private/acme/runtime --gateway-config /private/acme/gateway.json`.
+The gateway file contains the v2 `channel_gateway` object described in the
+[channel gateway upgrade guide](../packages/channel-gateway/README.md#protected-worker-process-files).
+The command validates both inputs, removes raw Slack credentials, and atomically
+replaces `process.json` with mode `0600`. It refuses already migrated or invalid
+files without changing them. `--json` emits one result object; errors include a
+fix and never include configuration values. Restart the worker after success.

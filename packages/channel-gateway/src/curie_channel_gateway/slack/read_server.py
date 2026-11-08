@@ -67,7 +67,10 @@ async def application(config: GatewayConfig, slack: SlackProviderConfig) -> web.
             replay=RequestReplayStore(config.replay_db),
             max_file_bytes=config.max_file_bytes,
             groups={
-                name: SlackUserGroupClient(http, token=token, ttl_s=config.group_cache_ttl_s)
+                name: SlackUserGroupClient(
+                    http, token=token, ttl_s=config.group_cache_ttl_s,
+                    base_url=config.slack_api_base_url or "https://slack.com/api/",
+                )
                 for name, token in tokens.items()
                 if token
             },

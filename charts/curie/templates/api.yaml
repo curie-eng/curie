@@ -79,6 +79,9 @@ spec:
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 8 }}
       annotations:
+        {{- with (include "curie.channelGateway.tlsChecksum" .) }}
+        checksum/gateway-tls: {{ . | quote }}
+        {{- end }}
         {{- with (include "curie.secretChecksum" (dict
         "root" $
         "keys" (list "apiKey" "approvalChatAttesterSecret" "remediationAuthorityKey" "internalWorkerToken" "installationId" "githubWebhookSecret")

@@ -78,7 +78,7 @@ remain off until configured. `charts/curie/templates/_channel-gateway.tpl` and
 `charts/curie/templates/channel-gateway-tls.yaml` in the chart realize that upgrade wiring.
 
 Protected-worker process files require the offline
-`scripts/migrate-protected-process.py` migration from v1 to v2. Runtime accepts
+`curie migrate-protected-process` migration from v1 to v2. Runtime accepts
 only v2 and names the migration when rejecting v1. Custom launchers must move
 provider credentials into the gateway and configure their caller credentials.
 This is not a behavior-neutral runtime upgrade for those launchers.

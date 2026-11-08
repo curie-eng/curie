@@ -507,6 +507,10 @@ pub(crate) fn skill_runner_image(
 pub(crate) async fn run(command: Option<Command>) -> Result<()> {
     match command {
         None => curie::interactive::run().await,
+        Some(Command::MigrateProtectedProcess {
+            runtime_dir,
+            gateway_config,
+        }) => emit(curie::process_migrate::run(&runtime_dir, &gateway_config)?),
         Some(Command::Try { keep }) => {
             let image =
                 artifacts::resolve_image(None, artifacts::Channel::current(), artifacts::version());

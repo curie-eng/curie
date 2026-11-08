@@ -11,7 +11,11 @@ import httpx
 @lru_cache(maxsize=4)
 def _context(ca_file: str) -> ssl.SSLContext:
     context = ssl.create_default_context()
-    context.load_verify_locations(cafile=ca_file)
+    try:
+        context.load_verify_locations(cafile=ca_file)
+    except FileNotFoundError:
+        # A publicly trusted TLS Secret may omit the optional CA projection.
+        pass
     return context
 
 

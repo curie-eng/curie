@@ -209,6 +209,9 @@ spec:
   template:
     metadata:
       annotations:
+        {{- with (include "curie.channelGateway.tlsChecksum" .) }}
+        checksum/gateway-tls: {{ . | quote }}
+        {{- end }}
         {{- with (include "curie.secretChecksum" (dict
         "root" $
         "keys" (list "internalWorkerToken" "installationId")
