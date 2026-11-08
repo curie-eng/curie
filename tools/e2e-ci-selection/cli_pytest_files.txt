@@ -160,6 +160,7 @@ tools/identity-e2e/tests/test_identity_compose.py
 tools/identity-e2e/tests/test_provider.py
 tools/identity-e2e/tests/test_reference_bundle.py
 tools/identity-e2e/tests/test_requester_claim_checks.py
+tools/identity-e2e/tests/test_requester_expiry_checks.py
 tools/identity-e2e/tests/test_requester_handoff_checks.py
 tools/p0-closes-ci/tests/test_p0_closes_ci.py
 tools/preflight/tests/test_full_preflight.py
