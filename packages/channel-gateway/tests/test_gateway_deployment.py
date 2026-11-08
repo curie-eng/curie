@@ -3,6 +3,7 @@
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -57,6 +58,38 @@ def test_gateway_chart_refuses_an_implicit_http_listener():
         render("channelGateway.deploy=true", "channelGateway.tlsSecret=acme-gateway-tls").returncode
         == 0
     )
+
+
+@pytest.mark.parametrize(
+    ("tls_secret", "allow_http", "scheme"),
+    [("acme-gateway-tls", False, "https"), ("acme-gateway-tls", True, "https"), ("", True, "http")],
+)
+def test_gateway_chart_clients_match_the_listener(tls_secret, allow_http, scheme):
+    result = render(
+        "channelGateway.deploy=true",
+        f"channelGateway.tlsSecret={tls_secret}",
+        f"channelGateway.allowInsecure={str(allow_http).lower()}",
+    )
+    assert result.returncode == 0, result.stderr
+    deployments = {
+        item["metadata"]["name"]: item
+        for item in yaml.safe_load_all(result.stdout)
+        if item and item["kind"] == "Deployment"
+    }
+    for suffix in ("api", "worker"):
+        env = deployments["acme-curie-" + suffix]["spec"]["template"]["spec"]["containers"][0][
+            "env"
+        ]
+        endpoint = next(
+            entry["value"] for entry in env if entry["name"] == "CURIE_CHANNEL_GATEWAY_URL"
+        )
+        assert endpoint == f"{scheme}://acme-curie-channel-gateway:8081"
+    listener = deployments["acme-curie-channel-gateway"]["spec"]["template"]["spec"]["containers"][
+        0
+    ]
+    assert (
+        "CURIE_CHANNEL_GATEWAY_TLS_CERT" in {entry["name"] for entry in listener["env"]}
+    ) == bool(tls_secret)
 
 
 def test_compose_only_provider_services_hold_slack_tokens():
