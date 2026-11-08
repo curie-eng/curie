@@ -28,6 +28,7 @@ import uuid
 from typing import Any
 
 import pytest
+from curie_worker import protected_recovery
 from curie_worker.capacity_wait import CapacityWaitRequested, CapacityWaitStore
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore
@@ -530,9 +531,11 @@ def test_a_delivery_that_cannot_park_keeps_the_pending_deferral(make_harness) ->
 def test_a_capacity_park_records_no_reason(make_harness, caplog: pytest.LogCaptureFixture) -> None:
     """@spec CONNECTOR-REQUESTER-3 (regression): ``reason`` is "" on every other record.
 
-    A capacity park through the store's existing signature keeps its log line
-    and reads back an empty reason, and so does a record written before the
-    field existed (the field removed from the stored hash).
+    A capacity park through the store's existing signature keeps its log line,
+    reads back an empty reason, and stores no ``reason`` field at all: its hash
+    keeps the field set the protected wait store admits before it schedules a
+    wake (a stored empty field made every protected wait unschedulable). That
+    hash is also the shape of a record written before the field existed.
     """
     caplog.set_level(logging.DEBUG, logger="curie_worker")
 
@@ -565,9 +568,8 @@ def test_a_capacity_park_records_no_reason(make_harness, caplog: pytest.LogCaptu
             assert getattr(record, "reason", _NO_FIELD) == ""
             assert logged(caplog, f"capacity wait parked event_id={event.event_id} cause=capacity")
 
-            await h.async_redis.hdel(waits._record(event.event_id), "reason")
-            legacy = await waits.get(event.event_id)
-            assert legacy is not None and legacy.state == "waiting"
-            assert getattr(legacy, "reason", _NO_FIELD) == ""
+            stored = await h.async_redis.hgetall(waits._record(event.event_id))
+            assert "reason" not in stored
+            assert set(stored) <= protected_recovery._WAIT_HASH_FIELDS
 
     asyncio.run(run())
