@@ -169,6 +169,33 @@ def test_custom_header_absent_from_cli_argv() -> None:
     _assert_sentinel_off_argv({"X-Api-Key": "custom_sentinel_2635"}, "custom_sentinel_2635")
 
 
+def test_cli_process_group_launcher_does_not_import_workspace_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_runner.mcp_argv import CredentialSafeCLITransport
+
+    marker = tmp_path / "startup-loaded"
+    (tmp_path / "sitecustomize.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('loaded')\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    monkeypatch.setenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
+    transport = CredentialSafeCLITransport(
+        "", ClaudeAgentOptions(cli_path="/bin/true", cwd=str(tmp_path))
+    )
+
+    async def go() -> None:
+        await transport.connect()
+        try:
+            assert transport._process is not None
+            await transport._process.wait()
+        finally:
+            await transport.close()
+
+    anyio.run(go)
+    assert not marker.exists(), "the CLI launcher imported workspace-controlled startup code"
+
+
 def test_forced_stop_kills_the_cli_process_group(tmp_path: Path, monkeypatch) -> None:
     from curie_runner.mcp_argv import CredentialSafeCLITransport
     from curie_test_support.static_shell import wait_gone, wait_until
