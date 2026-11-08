@@ -35,6 +35,7 @@ from aci_protocol import (
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore
+from curie_worker.kernel.routing import _thread_key_for
 
 # importlib import mode does not add the test root to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -127,6 +128,11 @@ def test_an_old_runner_leaves_the_entry_pending_and_completes_nothing(
             await consumer.ensure_group()
 
             qe = _qevent(thread="tMix", event_id="mix-1")
+            await asyncio.to_thread(
+                h.substrate.claim,
+                _thread_key_for(qe),
+                env={"CURIE_RUNNER_TOKEN": "recovery-test-token"},
+            )
             await h.async_redis.xadd(h.config.stream, to_stream_fields(qe))
             task = asyncio.create_task(consumer.run())
 
@@ -137,7 +143,8 @@ def test_an_old_runner_leaves_the_entry_pending_and_completes_nothing(
                 await asyncio.sleep(0.01)
             await asyncio.sleep(0.3)
             consumer.request_stop()
-            await task
+            async with asyncio.timeout(10):
+                await task
 
             summary = await h.async_redis.xpending(
                 h.config.stream, h.config.consumer_group
