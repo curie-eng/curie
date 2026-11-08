@@ -361,7 +361,7 @@ if args == [
     print('{"state":"claims_enabled","since":null,"revision":null}')
     sys.exit(0)
 
-# Connected mode reads the worker's configured Slack origin. This read is not a
+# Connected mode reads the gateway's configured Slack origin. This read is not a
 # rollout/trust read and must remain on the connected branch.
 if "get deployment" in joined and "app.kubernetes.io/component=channel-gateway" in joined and "jsonpath=" in joined:
     if os.environ.get("CURIE_TEST_GATEWAY_MISSING") == "1":
@@ -918,7 +918,13 @@ fn connected_message_refuses_a_missing_gateway_before_posting_a_placeholder() {
         .output()
         .expect("run connected message without a gateway");
     assert!(!output.status.success(), "{}", describe(&output));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("channel gateway Deployment"));
+    assert!(
+        json_output(&output)["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("channel gateway Deployment")),
+        "{}",
+        describe(&output)
+    );
     assert!(slack.recorded().is_empty());
     assert_eq!(fixture.state()["turns"].as_array().map(Vec::len), Some(0));
 }
