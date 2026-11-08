@@ -545,6 +545,8 @@ class ApprovalRouteBindingOut(BaseModel):
         result: dict[str, Any] = handler(self)
         if "expires_in_seconds" not in self.model_fields_set:
             result.pop("expires_in_seconds", None)
+        if self.remind_every_s is None:
+            result.pop("remind_every_s", None)
         return result
 
     @classmethod

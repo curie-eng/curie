@@ -1,5 +1,9 @@
 {
   "producers": {
+    "apps/api/src/curie_api/approval_reminders.py:enqueue_reminder:1": {
+      "language": "python",
+      "purpose": "payload-less approval reminder side-field on the runs stream"
+    },
     "apps/api/src/curie_api/delivery.py:module:1": {
       "language": "lua",
       "purpose": "Guarded invocation enqueue with sealed context and transport identity"

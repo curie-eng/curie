@@ -1065,7 +1065,8 @@ class MailAdapter:
     def send_approval_reminder(self, conversation_id: str, card_ref: str, text: str) -> int:
         ref = self.state.approval_ref_for(card_ref[len(APPROVAL_CARD_REF_PREFIX) :])
         if ref is None:
-            return 404
+            logger.info("approval reminder skipped: missing card reference")
+            return 200
         if ref["conversation_id"] != conversation_id:
             return 422
         if ref["state"] != "live":
