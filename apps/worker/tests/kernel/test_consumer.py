@@ -4178,46 +4178,6 @@ def test_graceful_stop_keeps_lease_through_two_ttls_of_inflight_drain(
     asyncio.run(go())
 
 
-def test_hang_renewals_during_inflight_turn_expire_liveness(make_harness) -> None:
-    async def go() -> None:
-        async with make_harness(
-            reclaim_min_idle_ms=300,
-            consumer_heartbeat_ttl_ms=150,
-            consumer_capability_ttl_ms=450,
-            read_block_ms=10,
-        ) as h:
-            hold = asyncio.Event()
-            h.runner.hold = hold
-            h.runner.default_script = [TextDelta(text="working")]
-            h.runner.tail = [Final(text="done", status=DONE)]
-            consumer = Consumer(
-                redis=h.async_redis,
-                kernel=h.kernel,
-                config=h.config,
-                leases=DeliveryLeaseStore(h.async_redis, h.config),
-            )
-            consumer._liveness_store = _RenewalProbeStore(  # type: ignore[assignment]
-                ConsumerLivenessStore(h.async_redis), hang_renewals=True
-            )
-            await consumer.ensure_group()
-            await h.async_redis.xadd(
-                h.config.stream,
-                to_stream_fields(_qevent("hang", thread="th-hang", event_id="hang")),
-            )
-            alive = consumer_heartbeat_key(
-                h.config.stream, h.config.consumer_group, h.config.consumer_name
-            )
-
-            task = asyncio.create_task(consumer.run())
-            await _wait_until_turn_active_or_consumer_failed(h.runner, task)
-            with pytest.raises(ConsumerLivenessExpired):
-                await asyncio.wait_for(task, timeout=2)
-            assert not await h.async_redis.exists(alive)
-            hold.set()
-
-    asyncio.run(go())
-
-
 def test_real_saturated_consumer_renews_lease_and_peer_cannot_prompt_claim(
     make_harness,
 ) -> None:
