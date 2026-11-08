@@ -425,11 +425,13 @@ rechecks that person in the same transaction. Anything else is refused
 
 ### Older API versions and downgrades
 
-Migration 0154 is an expand, so an API from before it keeps serving during a rolling upgrade
+Migration 0153 is an expand, so an API from before it keeps serving during a rolling upgrade
 and after an application rollback. That version knows nothing of selectors, so the database
 itself refuses what it could otherwise do:
 
-1. Record the registered tool on a looser route, with no route, or as an ordinary approval.
+1. Record the registered tool on a looser route, with no route, or as an ordinary approval,
+   record another tool on the registered route, or record a ticket on a route that registers
+   none.
 2. Turn the requester identity flag off while a selector is registered.
 3. Approve a dynamic approval. Until answer authority lands, no version can approve one.
 
@@ -437,7 +439,7 @@ An older version sees these as failed writes, so the action fails closed. Removi
 registration through an older API is not refused. It writes no selector audit, and the
 tool becomes ordinary again.
 
-Downgrading the database below 0154 is refused while any dynamic approval or registered
+Downgrading the database below 0153 is refused while any dynamic approval or registered
 selector exists. A downgrade would drop each dynamic approval's selection and its spent
 ticket nonce, so the row would read back ordinary and its ticket could be used again. Roll
 the application forward instead.

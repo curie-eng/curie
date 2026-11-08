@@ -20,11 +20,16 @@ its version (@spec REQUEST-APPROVAL-1/2/4):
    route map carries an ``approver_ticket`` key keeps
    ``connector_requester_identity`` on, so an older flag writer cannot turn it
    off under a registration.
-2. ``approvals_approver_ticket_route_lock``: an approval for a registered
-   pair's live name (``mcp__<connector>__<tool>``) is inserted only on the
-   owning route as a dynamic row for that pair, so an older creation owner
-   cannot record it on a looser route, routeless, or as an ordinary row. A
-   stored registration without a text connector and tool refuses every
+2. ``approvals_approver_ticket_route_lock``: the route lock both ways, on
+   exactly the rows the two creation owners write (``purpose = 'session'``,
+   the rows ``approver_tickets.check_tool_route`` judges). A registered
+   pair's live name (``mcp__<connector>__<tool>``) is stored only on its
+   owning route, an owning route stores only that pair and only as a dynamic
+   row for it, and a top-level ``approval_ticket`` or a dynamic row (of any
+   purpose) needs an owning route. So an older creation owner cannot record
+   the pair on a looser route, routeless or as an ordinary row, another tool
+   on the owning route, or a ticket on an unregistered route. A stored
+   registration without a text connector and tool refuses every creation
    insert for its agent, like the application's fail-closed read.
 3. ``approvals_dynamic_unapproved``: a dynamic approval never becomes
    ``approved`` until decision 5's answer authority replaces this trigger, so
@@ -80,7 +85,11 @@ DECLARE
     stored_routes jsonb;
     entry record;
     registration jsonb;
+    live text;
+    owned boolean := false;
+    created boolean;
 BEGIN
+    created := NEW.purpose = 'session';
     IF NEW.selection_mode = 'dynamic' AND NEW.status = 'approved' THEN
         RAISE EXCEPTION USING
             ERRCODE = '23514',
@@ -88,32 +97,54 @@ BEGIN
                 || 'until its selected approver set is enforced at answer time';
     END IF;
     SELECT approval_routes INTO stored_routes FROM {SCHEMA}.agents WHERE id = NEW.agent_id;
-    IF jsonb_typeof(stored_routes) IS DISTINCT FROM 'object' THEN
-        RETURN NEW;
+    IF jsonb_typeof(stored_routes) = 'object' THEN
+        FOR entry IN SELECT key, value FROM jsonb_each(stored_routes) LOOP
+            CONTINUE WHEN jsonb_typeof(entry.value) IS DISTINCT FROM 'object'
+                OR (entry.value -> 'approver_ticket') IS NULL;
+            registration := entry.value -> 'approver_ticket';
+            IF jsonb_typeof(registration -> 'connector') IS DISTINCT FROM 'string'
+               OR jsonb_typeof(registration -> 'tool') IS DISTINCT FROM 'string' THEN
+                CONTINUE WHEN NOT created;
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    MESSAGE = 'approver_ticket_state_invalid: a stored approver_ticket '
+                        || 'registration of this agent has no connector or tool';
+            END IF;
+            live := 'mcp__' || (registration ->> 'connector') || '__' || (registration ->> 'tool');
+            IF NEW.route <> '' AND NEW.route = entry.key THEN
+                owned := true;
+                CONTINUE WHEN NOT created;
+                IF NEW.granted_tool IS DISTINCT FROM live THEN
+                    RAISE EXCEPTION USING
+                        ERRCODE = '23514',
+                        MESSAGE = 'approval_ticket_route_mismatch: a route that registers an '
+                            || 'approver_ticket records only its registered tool';
+                END IF;
+                IF NEW.selection_mode IS DISTINCT FROM 'dynamic'
+                   OR NEW.selection_connector IS DISTINCT FROM registration ->> 'connector'
+                   OR NEW.selection_tool IS DISTINCT FROM registration ->> 'tool' THEN
+                    RAISE EXCEPTION USING
+                        ERRCODE = '23514',
+                        MESSAGE = 'approval_ticket_required: a registered approver_ticket tool '
+                            || 'is recorded only as a dynamic approval for that tool';
+                END IF;
+            ELSIF created AND NEW.granted_tool = live THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    MESSAGE = 'approval_route_locked: a registered approver_ticket tool is '
+                        || 'recorded only on its owning route';
+            END IF;
+        END LOOP;
     END IF;
-    FOR entry IN SELECT key, value FROM jsonb_each(stored_routes) LOOP
-        CONTINUE WHEN jsonb_typeof(entry.value) IS DISTINCT FROM 'object'
-            OR (entry.value -> 'approver_ticket') IS NULL;
-        registration := entry.value -> 'approver_ticket';
-        IF jsonb_typeof(registration -> 'connector') IS DISTINCT FROM 'string'
-           OR jsonb_typeof(registration -> 'tool') IS DISTINCT FROM 'string' THEN
-            RAISE EXCEPTION USING
-                ERRCODE = '23514',
-                MESSAGE = 'approver_ticket_state_invalid: a stored approver_ticket '
-                    || 'registration of this agent has no connector or tool';
-        END IF;
-        IF NEW.granted_tool = 'mcp__' || (registration ->> 'connector') || '__'
-                || (registration ->> 'tool')
-           AND (NEW.route IS DISTINCT FROM entry.key
-                OR NEW.selection_mode IS DISTINCT FROM 'dynamic'
-                OR NEW.selection_connector IS DISTINCT FROM registration ->> 'connector'
-                OR NEW.selection_tool IS DISTINCT FROM registration ->> 'tool') THEN
-            RAISE EXCEPTION USING
-                ERRCODE = '23514',
-                MESSAGE = 'approval_route_locked: a registered approver_ticket tool is '
-                    || 'recorded only on its owning route as a dynamic approval';
-        END IF;
-    END LOOP;
+    IF NOT owned AND (
+        NEW.selection_mode = 'dynamic'
+        OR (created AND (NEW.granted_arguments -> 'approval_ticket') IS NOT NULL)
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            MESSAGE = 'approval_ticket_unregistered: a ticket or dynamic approval needs a '
+                || 'route that registers an approver_ticket';
+    END IF;
     RETURN NEW;
 END;
 $$
@@ -215,10 +246,15 @@ def downgrade() -> None:
     ``approver_ticket`` registration, exist only at this revision. Dropping
     them would turn each dynamic row ordinary with its ticket reusable, and
     leave a registration no older release enforces, so the downgrade refuses
-    and names what it found. Without them every approval row stays.
+    and names what it found. It locks both tables first, so nothing can add
+    either between its counts and its drops. Without them every approval row
+    stays.
     @spec REQUEST-APPROVAL-4.
     """
     bind = op.get_bind()
+    # Held to the end of this migration's transaction, so nothing can create a
+    # dynamic approval or a registration between the counts and the drops.
+    op.execute(f"LOCK TABLE {SCHEMA}.agents, {SCHEMA}.approvals IN ACCESS EXCLUSIVE MODE")
     dynamic = bind.execute(
         sa.text(f"SELECT count(*) FROM {SCHEMA}.approvals WHERE selection_mode = 'dynamic'")
     ).scalar_one()
