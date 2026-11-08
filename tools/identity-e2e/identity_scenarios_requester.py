@@ -357,8 +357,10 @@ def require_bounded(messages: Sequence[Any]) -> dict[str, Any]:
     """The worker bounded opted-in turns inside the requester token's hour.
 
     At least one ``bounded to <n>s by the requester token window`` line, and
-    every bound shorter than both the token's lifetime and the configured bound
-    it replaced.
+    every bound shorter than the token's lifetime and no longer than the
+    configured bound it replaced. The worker logs only when the configured
+    bound exceeds the cap, but prints both rounded to whole seconds, so a
+    configured bound under a second above the cap prints equal to it.
     """
 
     bounds = requester_bounds(messages)
@@ -371,7 +373,7 @@ def require_bounded(messages: Sequence[Any]) -> dict[str, Any]:
         entry
         for entry in bounds
         if not entry["bound_s"] < REQUESTER_TOKEN_TTL_S
-        or not entry["bound_s"] < entry["configured_s"]
+        or not entry["bound_s"] <= entry["configured_s"]
     ]
     check(not wrong, f"a bound reaches past the requester token or its configured bound: {wrong}")
     return {"bounds": bounds[:5], "count": len(bounds)}
@@ -1069,6 +1071,13 @@ def requester_expiry(harness: Harness, args: Any, evidence: Evidence) -> None:
         seen["logged"] = require_replay_logged(
             decisions, replay, agent=agent, outcome=EXPIRED, principal=None
         )
+        # C3's turn is judged on the proxy decisions after this replay's own
+        # `expired` line, which can fall inside the send's clock-skew margin.
+        replay_logged_at = max(
+            float(item.get("at_epoch") or 0)
+            for item in decisions
+            if item.get("caller") == agent and item.get("outcome") == EXPIRED
+        )
         idle: dict[str, Any] = {}
         seen["C3"] = idle
         sent, observed, turn = conversation_turn(
@@ -1091,6 +1100,7 @@ def requester_expiry(harness: Harness, args: Any, evidence: Evidence) -> None:
             observed=observed,
             turn=turn,
             principal=principal_a,
+            after=replay_logged_at,
         )
         seen["fresh"] = require_fresher(c3["observed"], observed, now=float(sent["sent_at"]))
     captured.clear()

@@ -440,6 +440,7 @@ def require_connector_turn(
     turn: Mapping[str, Any],
     since: float,
     expected_principal: Any,
+    after: float | None = None,
 ) -> None:
     """One human turn's claim, reply and connector decisions, judged.
 
@@ -447,6 +448,8 @@ def require_connector_turn(
     (none when it is None); the turn completed with a delivered reply; and the
     reply dialled every hosted connector, which admitted the agent with the
     principal present or absent to match, in the proxy log since ``since``.
+    ``after`` drops decisions logged at or before it: a harness request the
+    step made itself just before the send, inside the clock-skew margin.
     """
 
     check(bool(observed.get("caller_token_present")), "no connector caller token reached the claim")
@@ -460,6 +463,8 @@ def require_connector_turn(
     connectors = harness.connectors(agent)
     seen["connectors"] = connectors
     decisions = harness.proxy_decisions(agent, since=since - 2)
+    if after is not None:
+        decisions = [item for item in decisions if float(item.get("at_epoch") or 0) > after]
     seen["decisions"] = decisions
     seen["connector_call"] = require_connector_admitted(
         turn.get("texts") or [],
@@ -1076,6 +1081,7 @@ def judge_conversation_turn(
     observed: Mapping[str, Any],
     turn: Mapping[str, Any],
     principal: Any,
+    after: float | None = None,
 ) -> None:
     """:func:`require_connector_turn`, then the reply's dials sent the claim's token."""
 
@@ -1087,6 +1093,7 @@ def judge_conversation_turn(
         turn=turn,
         since=float(sent["sent_at"]),
         expected_principal=principal,
+        after=after,
     )
     seen["reply_fingerprint"] = require_reply_fingerprint(
         turn.get("texts") or [], str(observed.get("caller_fingerprint"))
