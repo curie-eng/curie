@@ -712,13 +712,11 @@ class ApprovalClient:
                     id=receipt.id, status=receipt.status, requested_by=receipt.requested_by,
                     requester_known=True,
                 )
-            arguments = json.loads(receipt.granted_arguments)
-            if type(arguments) is not dict:
-                raise ValueError
+            # The V2 model admits only the canonical text of a JSON object.
             return CreatedApproval(
                 id=receipt.id, status=receipt.status, requested_by=receipt.requested_by,
                 requester_known=True, granted_tool=receipt.granted_tool,
-                granted_arguments=arguments,
+                granted_arguments=json.loads(receipt.granted_arguments),
                 selected_approvers=tuple(
                     person.model_dump(mode="json") for person in receipt.selected_approvers
                 ),

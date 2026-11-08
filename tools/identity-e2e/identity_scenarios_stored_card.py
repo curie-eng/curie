@@ -381,7 +381,7 @@ def stored_arguments_card(harness: Harness, args: Any, evidence: Evidence) -> No
             )["rows"]
             seen["requester_principal"] = principal_rows_summary(rows)
             check(
-                any(row.get("type") == "human" and row.get("status") == "active" for row in rows),
+                seen["requester_principal"]["active_human"],
                 f"{run.senders['requester']} has no active human principals row after their turn",
             )
         require_passed(evidence)

@@ -109,7 +109,7 @@ def test_quietly_logs_the_exception_type_only(capsys: pytest.CaptureFixture[str]
     def call() -> None:
         raise HarnessError(f"sql failed for {SUBJECT}")
 
-    assert req_helpers._quietly(Evidence("zz"), call) is None
+    assert req_helpers._quietly(call) is None
     captured = capsys.readouterr()
     assert captured.err.strip().endswith("restore failed: HarnessError")
     assert len(captured.err.strip().splitlines()) == 1
@@ -118,7 +118,7 @@ def test_quietly_logs_the_exception_type_only(capsys: pytest.CaptureFixture[str]
 
 
 def test_quietly_success_returns_the_value_silently(capsys: pytest.CaptureFixture[str]) -> None:
-    assert req_helpers._quietly(Evidence("zz"), lambda: 5) == 5
+    assert req_helpers._quietly(lambda: 5) == 5
     assert capsys.readouterr().err == ""
 
 
@@ -127,7 +127,7 @@ def test_quietly_propagates_other_exceptions() -> None:
         raise KeyError(SUBJECT)
 
     with pytest.raises(KeyError):
-        req_helpers._quietly(Evidence("zz"), call)
+        req_helpers._quietly(call)
 
 
 # --- scrub_text is gone --------------------------------------------------------------

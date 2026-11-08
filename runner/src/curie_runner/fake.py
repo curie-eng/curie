@@ -658,9 +658,7 @@ class FakeModelSession:
             return progress_demo_turn()
         if GATED_CONNECTOR_TOOL_MARKER in last:
             gated = _parse_gated_connector_tool(last)
-            if gated:
-                return gated_connector_tool_turn(*gated)
-            return default_turn()
+            return gated_connector_tool_turn(*gated) if gated else default_turn()
         if CONNECTOR_TOOL_MARKER in last:
             return connector_tool_turn(last)
         if CONNECTOR_CALL_MARKER in last:

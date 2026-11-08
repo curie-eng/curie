@@ -253,7 +253,7 @@ def _shown_decisions(decisions: Iterable[Mapping[str, Any]]) -> list[str]:
     ]
 
 
-def _one_effect(effects: Sequence[Mapping[str, Any]], tool: str) -> Mapping[str, Any]:
+def _one_effect(effects: Sequence[Mapping[str, Any]], tool: str, outcome: str) -> Mapping[str, Any]:
     check(
         len(effects) == 1,
         f"the connector logged {len(effects)} outcome lines for this one {tool} call: "
@@ -264,7 +264,15 @@ def _one_effect(effects: Sequence[Mapping[str, Any]], tool: str) -> Mapping[str,
         effect.get("tool") == tool,
         f"the connector's one outcome line is for {effect.get('tool')}, not {tool}",
     )
+    check(
+        effect.get("outcome") == outcome,
+        f"the connector logged {tool} outcome={effect.get('outcome')}, expected {outcome}",
+    )
     return effect
+
+
+def _logged(effect: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: effect.get(key) for key in ("tool", "outcome", "requester", "grant")}
 
 
 def require_unattested(
@@ -305,25 +313,13 @@ def require_unattested(
     )
     admitted = [d for d in window if d.get("outcome") == "admitted"]
     check(bool(admitted), "the caller proxy logged no admitted request in the window")
-    effect = _one_effect(lines, tool)
-    check(
-        effect.get("outcome") == outcome,
-        f"the connector logged {tool} outcome={effect.get('outcome')}, expected {outcome}",
-    )
+    effect = _one_effect(lines, tool, outcome)
     check(
         effect.get("grant") == "-",
         f"the connector logged grant={effect.get('grant')} for an unattested call, expected "
         "grant=- (None means a connector that predates the field)",
     )
-    return {
-        "admitted": len(admitted),
-        "logged": {
-            "tool": effect.get("tool"),
-            "outcome": effect.get("outcome"),
-            "requester": effect.get("requester"),
-            "grant": effect.get("grant"),
-        },
-    }
+    return {"admitted": len(admitted), "logged": _logged(effect)}
 
 
 def require_attested_effect(
@@ -354,11 +350,7 @@ def require_attested_effect(
     )
     refused = [d for d in decisions if d.get("outcome") == GRANT_REQUIRED]
     check(not refused, f"the caller proxy also refused a grant check: {_shown_decisions(refused)}")
-    effect = _one_effect(effects, tool)
-    check(
-        effect.get("outcome") == outcome,
-        f"the connector logged {tool} outcome={effect.get('outcome')}, expected {outcome}",
-    )
+    effect = _one_effect(effects, tool, outcome)
     check(
         effect.get("requester") == requester,
         f"the connector logged requester={effect.get('requester')}, expected the attested "
@@ -374,16 +366,7 @@ def require_attested_effect(
         f"the connector logged grant={effect.get('grant')}, not the grant the proxy spent "
         f"({spent[0]})",
     )
-    return {
-        "attested": len(attested),
-        "spent": spent[0],
-        "logged": {
-            "tool": effect.get("tool"),
-            "outcome": effect.get("outcome"),
-            "requester": effect.get("requester"),
-            "grant": effect.get("grant"),
-        },
-    }
+    return {"attested": len(attested), "spent": spent[0], "logged": _logged(effect)}
 
 
 def require_proxy_refused(
@@ -562,11 +545,6 @@ def claim_facts(observed: Mapping[str, Any]) -> dict[str, Any]:
 
     raw = observed.get("claims")
     claims: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
-    principal = claims.get("principal")
-    principal_fp = None
-    if isinstance(principal, Mapping):
-        with contextlib.suppress(KeyError, TypeError):
-            principal_fp = principal_fingerprint(principal)
     return {
         "claim": observed.get("claim"),
         "claim_created": observed.get("claim_created"),
@@ -575,7 +553,7 @@ def claim_facts(observed: Mapping[str, Any]) -> dict[str, Any]:
         "caller_fingerprint": observed.get("caller_fingerprint"),
         "agent": claims.get("agent"),
         "exp": claims.get("exp"),
-        "principal_fingerprint": principal_fp,
+        "principal_fingerprint": _principal_fp(claims.get("principal")),
         "turn": observed.get("turn"),
     }
 
@@ -912,17 +890,9 @@ def judge_probe(
     held = answer.get("grant_fingerprint")
     if kind == "unattested":
         outcome = expect["outcome"]
-        check(
-            (answer.get("status"), answer.get("is_error"), answer.get("text"))
-            == (200, True, f"refused {outcome}"),
-            f"the probe answered {shown}, expected 200 with the tool result refused {outcome}",
-        )
+        _require_refused_result(answer, shown, outcome)
         judged = require_unattested(
             decisions, effects, tool=tool, outcome=outcome, since=float("-inf")
-        )
-        check(
-            held is None or held not in new_spent,
-            f"the grant {held} was spent although the call forwarded unattested",
         )
     elif kind == "forwarded":
         text = answer.get("text")
@@ -938,10 +908,6 @@ def judge_probe(
         )
         logged = judged["logged"]["requester"]
         check(logged == requester, f"the connector logged requester={logged}, expected {requester}")
-        check(
-            held is None or held not in new_spent,
-            f"the grant {held} was spent although the call forwarded unattested",
-        )
     elif kind in ("attested", "dropped"):
         outcome = expect.get("outcome", OK)
         spent = [held] if isinstance(held, str) and held in new_spent else []
@@ -964,11 +930,7 @@ def judge_probe(
                 f"{requester} grant={held}",
             )
         else:
-            check(
-                (answer.get("status"), answer.get("is_error"), answer.get("text"))
-                == (200, True, f"refused {outcome}"),
-                f"the probe answered {shown}, expected 200 with the tool result refused {outcome}",
-            )
+            _require_refused_result(answer, shown, outcome)
     elif kind == "refused":
         check(
             answer.get("status") == 403
@@ -979,7 +941,20 @@ def judge_probe(
         judged = require_proxy_refused(decisions, effects, reason=expect["reason"])
     else:
         raise HarnessError(f"probe {case['id']} has an unknown expectation {kind}")
+    if kind in ("unattested", "forwarded"):
+        check(
+            held is None or held not in new_spent,
+            f"the grant {held} was spent although the call forwarded unattested",
+        )
     return {"answer": shown, "grant_fingerprint": held, "judged": judged}
+
+
+def _require_refused_result(answer: Mapping[str, Any], shown: Any, outcome: str) -> None:
+    check(
+        (answer.get("status"), answer.get("is_error"), answer.get("text"))
+        == (200, True, f"refused {outcome}"),
+        f"the probe answered {shown}, expected 200 with the tool result refused {outcome}",
+    )
 
 
 def expected_spends(
@@ -1753,7 +1728,7 @@ def restore_grant_setup(
                     )
                 return {"status": status, "readback": stored_approval_tools(harness, agent_id)}
 
-            done = req_helpers._quietly(evidence, put_back_tools)
+            done = req_helpers._quietly(put_back_tools)
             seen["approval_required_tools"] = {"restored": previous_tools, **(done or {})}
             if done is None or done["status"] != 200:
                 failures.append("approval_required_tools: the PATCH failed")
@@ -1769,7 +1744,7 @@ def restore_grant_setup(
                 )
                 return harness.connector_pod_env(agent, REFERENCE_CONNECTOR, server, TICKET_ENV)
 
-            serving = req_helpers._quietly(evidence, put_back_env)
+            serving = req_helpers._quietly(put_back_env)
             seen["ticket_env"] = (
                 None
                 if serving is None
@@ -1802,14 +1777,13 @@ def restore_grant_setup(
                         flag, version = requester_flag(api, agent_id)
                 return {"flag": flag, "version": version}
 
-            flagged = req_helpers._quietly(evidence, put_back_flag)
+            flagged = req_helpers._quietly(put_back_flag)
             seen["flag"] = flagged
             if flagged is None or bool(flagged["flag"]) != wanted:
                 failures.append(f"flag: not restored to {wanted}")
         legacy = restore.get("approver_legacy")
         if legacy is not None:
             unmigrated = req_helpers._quietly(
-                evidence,
                 lambda: harness.target.pod_python(
                     APPROVER_LEGACY_SCRIPT,
                     {
@@ -1826,14 +1800,14 @@ def restore_grant_setup(
         previous_role = restore.get("approver_role")
         if previous_role is not None:
             seen["approver_role"], failure, residual = req_helpers.restore_approver_role(
-                harness, evidence, agent_id, previous_role, step="G0"
+                harness, agent_id, previous_role, step="G0"
             )
             if failure is not None:
                 failures.append(failure)
             elif residual is not None:
                 seen["residual"] = residual
         if "gated" in state:
-            now_gated = req_helpers._quietly(evidence, lambda: serving_gated_tools(harness, agent))
+            now_gated = req_helpers._quietly(lambda: serving_gated_tools(harness, agent))
             seen["gated_tools"] = now_gated
             if now_gated is None or now_gated["patterns"] != list(state["gated"]):
                 failures.append(

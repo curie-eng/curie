@@ -48,7 +48,7 @@ def test_quietly_logs_the_failure_without_private_values(
     def call() -> None:
         raise HarnessError(f"sql failed params=({SUBJECT!r}, {TICKET!r})")
 
-    assert requester._quietly(held(SUBJECT), call) is None
+    assert requester._quietly(call) is None
     captured = capsys.readouterr()
     assert captured.err.strip().endswith("restore failed: HarnessError")
     assert SUBJECT not in captured.err
@@ -57,7 +57,7 @@ def test_quietly_logs_the_failure_without_private_values(
 
 
 def test_quietly_returns_the_value_and_logs_nothing(capsys: pytest.CaptureFixture[str]) -> None:
-    assert requester._quietly(held(SUBJECT), lambda: {"ok": 1}) == {"ok": 1}
+    assert requester._quietly(lambda: {"ok": 1}) == {"ok": 1}
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
@@ -68,7 +68,7 @@ def test_quietly_propagates_other_exceptions() -> None:
         raise KeyError("boom")
 
     with pytest.raises(KeyError):
-        requester._quietly(held(SUBJECT), call)
+        requester._quietly(call)
 
 
 # --- import order -----------------------------------------------------------------

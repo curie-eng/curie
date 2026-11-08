@@ -207,7 +207,7 @@ TOOL: dict[str, Any] = {
     ),
     "inputSchema": {
         "type": "object",
-        "properties": {"note": {"type": "string", "description": "A free-text note."}},
+        "properties": {"note": _NOTE},
     },
 }
 TOOLS: list[dict[str, Any]] = [
