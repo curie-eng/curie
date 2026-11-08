@@ -260,9 +260,15 @@ def test_attestation_approval_tools_patch_failure_names_status_and_code_only(
         data: dict[str, Any] = {
             "keys": {"caller_signing": "k"},
             "helm_previous": {"connectorCaller.signingKey": "x"},
+            "tenant_id": "00000000-0000-4000-8000-000000000001",
         }
         state = SimpleNamespace(directory=Path("/nonexistent"))
-        target = SimpleNamespace(kubectl_json=lambda *a: {}, component=lambda name: name)
+        target = SimpleNamespace(
+            kubectl_json=lambda *a: {},
+            component=lambda name: name,
+            # The approver-role migration answers as the live pod script does.
+            pod_python=lambda *a, **k: {"action": "unchanged", "legacy_state": "migrated"},
+        )
 
         @contextlib.contextmanager
         def api(self) -> Any:
