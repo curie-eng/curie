@@ -470,6 +470,22 @@ class Markers:
         value = await self._redis.hget(self._turn_recovery_key(), claim_name)
         return value.decode() if isinstance(value, bytes) else value
 
+    async def watched_turn_live(self, claim_name: str, expected: str) -> bool:
+        return bool(
+            await self._redis.eval(
+                """
+                local value = redis.call('HGET', KEYS[1], ARGV[1])
+                if value ~= ARGV[2] then return 0 end
+                local record = cjson.decode(value)
+                return redis.call('GET', record.lease_key) == record.owner and 1 or 0
+                """,
+                1,
+                self._turn_recovery_key(),
+                claim_name,
+                expected,
+            )
+        )
+
     async def abandoned_turn(self, claim_name: str, expected: str) -> bool:
         return bool(
             await self._redis.eval(

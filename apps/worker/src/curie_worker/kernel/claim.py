@@ -1025,6 +1025,8 @@ async def _route_and_start(
                     raise failures.HandoffPending(
                         f"thread {thread_key} still has an unsettled leased turn"
                     )
+            if await self._markers.saw_side_effect(queued_event_id):
+                raise failures.PriorSideEffectObserved()
             await self._markers.watch_turn(
                 thread_key, handle.claim_name, delivery_lease, queued_event_id
             )

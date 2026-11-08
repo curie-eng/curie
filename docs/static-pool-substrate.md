@@ -72,11 +72,15 @@ Each fenced turn records its claim and delivery lease before it starts. After
 that lease is first observed absent, `CURIE_ABANDONED_TURN_GRACE_S` allows
 90 seconds for cleanup, plus the maintenance cadence. Maintenance takes the
 thread lock and checks the exact claim again. Settlement retains the watch
-for maintenance, including when the delivery is terminal. Maintenance removes
-it after observing an idle runner with durable history, confirming the claim
-is gone, or retiring it. An idle runner with durable history keeps its
-route. An active, unreadable or non-durable runner is retired through the
-supervisor. Retirement stops the child and verifies cleanup. If the runner
+for maintenance, including when the delivery is terminal. For an unfinished
+delivery, maintenance retires an active, unreadable or non-durable runner;
+an idle runner with durable history keeps its route. For a terminal delivery,
+maintenance retires only a runner observed to be active. An idle runner keeps
+its route even if history is deferred or a previous history loss still makes
+it report non-durable. Maintenance removes that idle runner's watch and keeps
+an unreadable terminal runner's watch for a later status read. It also removes
+the watch when the claim is gone or retirement succeeds.
+Retirement stops the child and verifies cleanup. If the runner
 settles before the supervisor checks it, the cleaned shell can be reused;
 otherwise the shell is quarantined and its health endpoint returns 503 until
 the platform replaces it. This recovery also applies to Docker and Kubernetes
@@ -103,10 +107,16 @@ Recovery of an admitted capacity turn first quiesces its recorded runner epoch,
 then removes the exact predecessor watch before starting its replacement turn.
 A completed predecessor is recognized through the existing terminal ledger;
 other unfinished predecessors must still reach a durable handoff boundary.
+Reclaim waits for a different delivery's live watched turn without interrupting it.
 The runner retains whether its latest turn emitted a side effect in authenticated
 status. Recovery persists that marker before retiring the claim or replacing
 an unfinished predecessor's watch for a follow-up. It checks the marker again
-after preflight, so an unacknowledged side effect escalates instead of replaying. Each failed retirement retains its watch for the next pass without
+after interrupt completion and again under the thread lock after the handoff
+check, so an unacknowledged side effect escalates instead of replaying.
+The status flag identifies the runner's latest turn, not an event. If delivery
+ownership changed before recovery reads it, recovery can conservatively attribute
+the flag to a watched delivery and escalate even when that delivery performed no
+action. Each failed retirement retains its watch for the next pass without
 preventing other maintenance.
 
 Known gap: turns started through the attachment handoff do not register a

@@ -419,9 +419,15 @@ def _needs_images(paths: list[str]) -> bool:
         if "Dockerfile" in name or name.endswith(".dockerfile"):
             return True
         # The shell supervisor is proven only inside the shell image.
-        if path.startswith("packages/shell-supervisor/") or path in {
-            "runner/src/curie_runner/session.py",
-            "runner/src/curie_runner/server.py",
+        if path.startswith((
+            "packages/shell-supervisor/",
+            "runner/src/curie_runner/",
+            "apps/worker/src/curie_worker/kernel/",
+        )) or path in {
+            "apps/worker/src/curie_worker/markers.py",
+            "apps/worker/src/curie_worker/delivery_lease.py",
+            "apps/worker/src/curie_worker/stream_consumer.py",
+            "apps/worker/src/curie_worker/runner_client.py",
         }:
             return True
     return False
