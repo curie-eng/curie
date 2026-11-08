@@ -199,7 +199,10 @@ it sets `X-Curie-Agent` from the verified token. When the token also carries
 `run` and `work_item` (ADR 0178), it sets `X-Curie-Run` and
 `X-Curie-Work-Item` from those claims. Inbound copies of the three headers
 are dropped first, so a caller cannot supply them. A token without the pair
-sets no run headers. A connector trusts the identity headers only on this
+sets no run headers. An admitted `cct` that carries a requester also gets one
+`X-Curie-Principal`, described below
+(`apps/worker/src/curie_connector_proxy/server.py::_identity_headers`). A
+connector trusts the identity headers only on this
 loopback forward. The `-direct` Service skips the proxy, so a connector
 reached there has no run. It checks every
 path the same way, the MCP client's OAuth discovery and registration requests
@@ -318,15 +321,68 @@ agent's token keeps its exact bytes. The proxy drops every inbound
 (`apps/worker/src/curie_connector_proxy/caller.py::PRINCIPAL_HEADER`), in any
 letter case and however often it repeats, on `cct` and `ccr` paths alike,
 before the forward
-(`apps/worker/src/curie_connector_proxy/server.py::_NOT_FORWARDED`). This
-release does not yet set that header from the verified claim, so a connector
-sees no principal header at all; decision 4's projection is a later change.
+(`apps/worker/src/curie_connector_proxy/server.py::_NOT_FORWARDED`). Then,
+after the signature, expiry, agent admission and any required tool-grant check
+have passed, it sets exactly one `X-Curie-Principal` from the verified
+principal of the admitted `cct`
+(`apps/worker/src/curie_connector_proxy/server.py::_identity_headers`, ADR 0270
+decision 4). The value is the unpadded base64url (`A-Z`, `a-z`, `0-9`, `-` and
+`_`, no `=`) of the UTF-8 bytes of the principal as JSON with exactly the keys
+`issuer`, `subject` and `tenant_id`, sorted, separated by `,` and `:` with no
+whitespace and no ASCII escaping, so non-ASCII text is raw UTF-8 while a
+control character, quote or backslash keeps its JSON escape
+(`apps/worker/src/curie_connector_proxy/caller.py::principal_header_value`).
+One principal has one spelling; the `principal_headers` section of
+`tests/vectors/connector-caller-token.json` freezes it. A principal-less `cct`,
+a `ccr` route request and a refused request carry no principal header. The
+caller token itself is never forwarded, and the proxy never logs the header's
+value.
+
+A connector reads the header with a bounded strict reader and treats a value
+it refuses as no requester. The reader checks the length before any decoding:
+at most 18535 characters, the longest value any principal within the field
+bounds encodes to. It then admits only the unpadded base64url alphabet and its
+one canonical spelling (no stray trailing bits), decodes strict UTF-8, parses
+JSON that refuses a repeated key, NaN and Infinity, requires exactly the three
+fields under the rules above, and last requires the value to equal the
+encoding of the principal it parsed. A second spelling of a principal, such as
+unsorted keys, spaced JSON, escaped non-ASCII, an escaped solidus or a byte
+order mark, is therefore refused even where a JSON parser accepts it. The proxy
+package's reader is
+`apps/worker/src/curie_connector_proxy/caller.py::read_principal_header`, and
+the reference connector `tools/identity-e2e/human_restricted_connector.py`
+carries its own. The `malformed_principal_headers` section of the same corpus
+lists values every reader refuses.
+
+The header is an identity the proxy attests, not a portable credential. A
+connector trusts it only on the loopback forward from its own caller proxy,
+like the other identity headers (ADR 0178 decision 6). The `-direct` Service
+bypasses the proxy, so a request there cannot establish a human with this
+header, whatever it sends. The decoded principal belongs to one HTTP request:
+the connector keeps it in that request's context and never takes it from a
+process global, an MCP session id or a previous request.
+
+The principal names the original human within the configured receiver and
+identity provider trust boundary. It carries no group membership, role,
+entitlement or exemption (ADR 0270 decision 5). A tool that requires a human
+refuses a principal-less call with a named `missing_requester` reason and never
+substitutes an argument, a previous request or a service account. Before its
+effect, it checks current downstream authority for the exact `tenant_id`,
+`issuer` and `subject`, and refuses when that authority is unavailable.
+Model-written flags and names supply no authority.
+
+Nothing revokes a copied `cct` early. It stays admissible until its signed
+expiry, at most one hour after it was minted, even after the requester hands
+off or the sandbox that held it is suspended or terminated. This replay window
+is accepted (ADR 0270 decision 3). Expiry refuses later admission and does not
+cancel an effect already in progress.
 
 `connector_requester_identity` is experimental in this release and should stay
 off outside test installs. When it is on, an opted-in agent's hosted-connector
-caller tokens carry the verified human requester and the connector proxy
-verifies it, but the proxy does not yet pass the requester to connectors (a
-later release adds that), so connectors cannot act on it yet. The worker
+caller tokens carry the verified human requester, the connector proxy verifies
+it, and the proxy passes it to the agent's admitted hosted connectors as
+`X-Curie-Principal`. With it off, no token carries a principal and no
+connector receives the header. The worker
 replaces a sandbox before serving a different requester and never runs one
 person's message under another person's token. A different person's message
 that arrives during a live turn waits for that turn to end, and if the turn
@@ -339,7 +395,9 @@ proxies predate it. A mixed state fails closed rather than leaking or widening
 authority: an older worker cannot read the turn authority answer that carries
 the requester and refuses the turn, and an older proxy refuses a
 principal-bearing `cct` as `invalid`, so the agent's connector calls are
-refused until the rollout completes.
+refused until the rollout completes. An older proxy also never sets
+`X-Curie-Principal`, so a connector tool that requires a human refuses
+`missing_requester` behind it until the rollout completes.
 
 ## Implementations today
 

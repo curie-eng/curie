@@ -98,7 +98,12 @@ as a whole; remembered only):
   pins the optional requester `principal` (ADR 0270): principal-bearing tokens
   the minter reproduces and the verifier admits, malformed and tampered
   principals the verifier refuses as invalid, and forged `X-Curie-Principal`
-  headers the proxy strips on `cct` and `ccr` paths.
+  headers the proxy strips on `cct` and `ccr` paths. Its `principal_headers`
+  and `malformed_principal_headers` sections freeze the one header spelling the
+  proxy sets (`principal_header_value`) and the values a reader refuses, read by
+  both header readers: the proxy package's `read_principal_header`
+  (`apps/worker/src/curie_connector_proxy/caller.py`) and the reference
+  connector's reader (`tools/identity-e2e/human_restricted_connector.py`).
   [vector: `tests/vectors/connector-caller-token.json`]
 21. connector proxy refusal vs runner diagnosis -- the proxy's refusal body
   (`apps/worker/src/curie_connector_proxy/server.py`) and the runner's

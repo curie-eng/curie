@@ -8,7 +8,9 @@ nothing here re-serializes the claims.
 ADR 0270 decision 2: a ``cct`` may carry ``principal``, the verified human
 requester, complete or absent. Its rules are restated here rather than imported,
 because the proxy does not depend on the worker package. Principal values are
-never logged.
+never logged. ADR 0270 decision 4: ``principal_header_value`` is the one
+``X-Curie-Principal`` spelling the proxy sets, and ``read_principal_header`` the
+bounded strict reader a connector applies to it.
 """
 
 from __future__ import annotations
@@ -64,6 +66,17 @@ _PRINCIPAL_FIELDS = frozenset({"tenant_id", "issuer", "subject"})
 # The bounds the worker's ``CallerPrincipal`` enforces.
 _ISSUER_MAX_CHARS = 2048
 _SUBJECT_MAX_CHARS = 256
+# ADR 0270 decision 4: the longest X-Curie-Principal value any principal the
+# field bounds admit can encode to. The JSON skeleton
+# `{"issuer":"","subject":"","tenant_id":""}` is 41 bytes and the tenant 36. A
+# character is at most 6 bytes in it (a control character's `\u00XX` escape; a
+# non-ASCII character is at most 4 bytes of raw UTF-8), so the JSON is at most
+# 41 + 36 + 6 * (2048 + 256) = 13901 bytes, which is 18535 unpadded base64url
+# characters. That admits every principal a cct can carry, whatever its width
+# under the token's 4096-character bound, and refuses on length alone only
+# what no field bound could admit.
+_PRINCIPAL_JSON_MAX_BYTES = 41 + 36 + 6 * (_ISSUER_MAX_CHARS + _SUBJECT_MAX_CHARS)
+PRINCIPAL_HEADER_MAX_CHARS = (4 * _PRINCIPAL_JSON_MAX_BYTES + 2) // 3
 _GRANT_CLAIMS = frozenset({"agent", "connector", "tool", "args", "exp", "jti"})
 _ROUTE_CLAIMS = frozenset({"agent", "connector", "exp"})
 
@@ -208,6 +221,58 @@ def _principal(value: object) -> Principal | None:
     if issuer is None or subject is None:
         return None
     return Principal(tenant_id=tenant_id, issuer=issuer, subject=subject)
+
+
+def principal_header_value(principal: Principal) -> str:
+    """The one ``X-Curie-Principal`` spelling of ``principal`` (ADR 0270 decision 4).
+
+    Unpadded base64url of compact, sorted-key JSON with exactly ``issuer``,
+    ``subject`` and ``tenant_id``, non-ASCII text as raw UTF-8.
+    """
+
+    text = json.dumps(
+        {
+            "issuer": principal.issuer,
+            "subject": principal.subject,
+            "tenant_id": principal.tenant_id,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return base64.urlsafe_b64encode(text.encode("utf-8")).rstrip(b"=").decode("ascii")
+
+
+def _no_constant(name: str) -> object:
+    # NaN and Infinity are not JSON, though Python's parser accepts them.
+    raise ValueError(name)
+
+
+def read_principal_header(value: str) -> Principal | None:
+    """The principal an ``X-Curie-Principal`` value names, or None. Never raises.
+
+    Bounded and strict: the length is checked before any decoding; then the
+    unpadded base64url alphabet and its one canonical spelling, strict UTF-8,
+    JSON with no repeated key and no NaN or Infinity, the three fields under
+    the ``cct`` rules, and last that ``value`` is exactly the encoding
+    ``principal_header_value`` gives the parsed principal.
+    """
+
+    if not 0 < len(value) <= PRINCIPAL_HEADER_MAX_CHARS:
+        return None
+    raw = _segment(value)
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_unique_keys, parse_constant=_no_constant
+        )
+    except (ValueError, RecursionError):
+        return None
+    principal = _principal(parsed)
+    if principal is None or principal_header_value(principal) != value:
+        return None
+    return principal
 
 
 def _caller(keys: Sequence[VerifyKey], token: str) -> tuple[Decision, int] | None:
