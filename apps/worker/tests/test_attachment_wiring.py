@@ -126,7 +126,9 @@ def built(monkeypatch: pytest.MonkeyPatch) -> Any:
     # A developer box usually HAS a kubeconfig, which is why leaving either of
     # these live passes locally and fails in CI with "Invalid kube-config file"
     # -- a machine-shaped green, and exactly how this test first shipped broken.
-    monkeypatch.setattr(run, "_sandbox_client", lambda config, env, sub: object())
+    monkeypatch.setattr(
+        run, "_sandbox_client", lambda config, env, sub_config, *, redis_client=None: object()
+    )
     # `_build_publication_loop` constructs a KubernetesPublicationCluster; its
     # own docstring says it is built at boot precisely so a bad kubeconfig fails
     # here. `None` is a value it legitimately returns when publication is off,

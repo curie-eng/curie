@@ -6881,7 +6881,11 @@ def test_production_ttls_reach_workspace_lease_during_streaming_and_pause(
                     "s3_secret_key": os.environ.get("TEST_S3_SECRET_KEY", "rustfssecret"),
                 }
             )
-            monkeypatch.setattr(run, "_sandbox_client", lambda *_args: h.fake_k8s)
+            monkeypatch.setattr(
+                run,
+                "_sandbox_client",
+                lambda config, env, sub_config, *, redis_client=None: h.fake_k8s,
+            )
             runtime = run.build(
                 config,
                 {

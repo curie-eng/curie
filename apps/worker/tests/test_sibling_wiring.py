@@ -54,7 +54,9 @@ def built(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(_KernelSpy, "real", run.Kernel)
     monkeypatch.setattr(run, "Kernel", _KernelSpy)
     monkeypatch.setattr(boto3, "client", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(run, "_sandbox_client", lambda config, env, sub: object())
+    monkeypatch.setattr(
+        run, "_sandbox_client", lambda config, env, sub_config, *, redis_client=None: object()
+    )
     monkeypatch.setattr(run, "_build_publication_loop", lambda *_a, **_k: None)
 
     def _build(env: Mapping[str, str], **config_overrides: Any) -> dict[str, Any]:
