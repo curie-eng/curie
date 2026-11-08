@@ -97,6 +97,7 @@ FOREIGN_ACCOUNT = "T0EXAMPLEFRGN"
 INVALID_PRINCIPAL = "missing or invalid approval principal"
 ARGS: dict[str, Any] = {"account": "acct-example-1", "change": {"role": "reader"}, "count": 2}
 CREATION_KEYS = {"schema_version", "request_id", "id", "status", "duplicate", "requested_by"}
+DYNAMIC_KEYS = {"granted_tool", "granted_arguments", "selected_approvers"}
 CARD_KEYS = {"schema_version", "request_id", "approval_id", "status", "card_channel", "duplicate"}
 CARD_EVIDENCE_KEYS = {
     "kind", "identity", "provider_installation_id", "namespace_id", "recipient", "channel",
@@ -395,14 +396,15 @@ def dm_created(
     response: Any, request: dict[str, Any], delivery: dict[str, Any], *,
     duplicate: bool = False,
 ) -> dict[str, Any]:
-    """A DM creation response: the ordinary keys plus exactly the pinned ``delivery``.
+    """A DM creation response: the dynamic V2 receipt plus exactly the pinned ``delivery``.
 
-    @spec APPROVER-DM-2.
+    @spec APPROVER-DM-2 REQUEST-APPROVAL-4.
     """
     assert response.status_code == (200 if duplicate else 201), response.text
     assert response.headers["cache-control"] == "no-store"
     body = response.json()
-    assert set(body) == CREATION_KEYS | {"delivery"}, body
+    assert set(body) == CREATION_KEYS | DYNAMIC_KEYS | {"delivery"}, body
+    assert body["schema_version"] == 2, body
     assert body["request_id"] == request["request_id"]
     assert body["duplicate"] is duplicate and body["status"] == "pending", body
     assert body["delivery"] == delivery, body

@@ -642,11 +642,16 @@ def test_selected_dm_turn_requires_pending_retention(
 
 
 def _creation_handler(
-    seen: list[httpx.Request], *, status: int, delivery: dict[str, Any] | None
+    seen: list[httpx.Request], *, status: int, delivery: dict[str, Any] | None,
+    version: int | None = None,
 ) -> Any:
+    """A DM receipt is the dynamic V2 receipt; an ordinary one stays V1."""
+
     async def handle(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        body = clients.response_body(json.loads(request.content))
+        sent = json.loads(request.content)
+        dynamic = (version or (1 if delivery is None else 2)) == 2
+        body = clients.v2_body(sent) if dynamic else clients.response_body(sent)
         body.update(duplicate=status == 200)
         if delivery is not None:
             body["delivery"] = delivery
@@ -678,6 +683,21 @@ def test_creation_response_with_delivery_is_parsed_into_created_approval(status:
         assert result.delivery.recipient == RECIPIENT
         assert result.duplicate is (status == 200)
         assert len(seen) == 1
+
+    asyncio.run(go())
+
+
+def test_a_v1_receipt_carrying_delivery_is_unavailable() -> None:
+    """@spec APPROVER-DM-2: delivery rides only the dynamic V2 receipt."""
+
+    async def go() -> None:
+        seen: list[httpx.Request] = []
+        transport = httpx.MockTransport(
+            _creation_handler(seen, status=201, delivery=DELIVERY_WIRE, version=1)
+        )
+        async with httpx.AsyncClient(transport=transport) as http:
+            with pytest.raises(TurnAuthorityUnavailable):
+                await clients.invoke(clients.client(http))
 
     asyncio.run(go())
 
