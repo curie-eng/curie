@@ -2,8 +2,8 @@
 
 Admission is the boundary: real migrated SQL rows and real Valkey entries.
 The API, worker, sandbox controller and runner use production wiring. Only
-model inference uses the runner's shipped fake tier. Missing prerequisites
-and teardown failures are fixture errors.
+model inference uses a scripted external provider with the real SDK and Bash.
+Missing prerequisites and teardown failures are fixture errors.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import asyncio
 import base64
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -28,7 +29,9 @@ from curie_worker.config import WorkerConfig
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "apps/worker/tests"))
+sys.path.insert(0, str(REPO / "tools/model-script"))
 
+from model_script import message_to_sse  # noqa: E402
 from queue_fixtures import wait_until  # noqa: E402
 
 NAME = "test-adr0274-wake-worker"
@@ -56,6 +59,8 @@ class WakeStack:
         self.slack_calls = []
         self.slack = None
         self.slack_thread = None
+        self.effect_marker = root / "bash-effect"
+        self.bash_requests = 0
 
     def run(self, *args: str, stdin: str | None = None, timeout: int = 600) -> str:
         result = subprocess.run(
@@ -115,11 +120,32 @@ class WakeStack:
     def start(self):
         callback = os.environ["CURIE_LOCAL_STUB_HOST"]
         calls = self.slack_calls
+        runtime = self
 
         class Slack(BaseHTTPRequestHandler):
             def do_POST(self):
+                payload = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                if self.path == "/effect":
+                    runtime.effect_marker.write_text("executed")
+                    self.send_response(200)
+                    self.end_headers()
+                    return
+                if self.path.startswith("/model/"):
+                    body = (
+                        runtime.model_response(json.loads(payload))
+                        if self.path.split("?", 1)[0].endswith("/messages")
+                        else b'{"input_tokens":1}'
+                    )
+                    self.send_response(200)
+                    self.send_header(
+                        "Content-Type",
+                        "text/event-stream" if body.startswith(b"event:") else "application/json",
+                    )
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 calls.append(self.path)
-                self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 body = b'{"ok":true,"ts":"1"}'
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
@@ -137,6 +163,13 @@ class WakeStack:
         self.slack_thread = threading.Thread(target=self.slack.serve_forever, daemon=True)
         self.slack_thread.start()
         slack_url = f"http://{callback}:{self.slack.server_port}/api/"
+        effect_url = f"http://{callback}:{self.slack.server_port}/effect"
+        effect_code = (
+            "import urllib.request;"
+            f"urllib.request.urlopen(urllib.request.Request({effect_url!r},data=b'executed')).read()"
+        )
+        self.effect_command = f"python3 -c {shlex.quote(effect_code)}"
+        model_url = f"http://{callback}:{self.slack.server_port}/model"
         self.run("docker", "info", timeout=30)
         for role in ("api", "worker"):
             self.run(
@@ -179,6 +212,7 @@ class WakeStack:
                 "image": self.image("worker"),
                 "slackApiBaseUrl": slack_url,
                 "slackTrustedOrigins": "",
+                "extraEnv": [{"name": "CURIE_MODEL_BASE_URL", "value": model_url}],
             },
             "ui": {"deploy": False},
             "dispatcher": {"deploy": False, "slack": {"botToken": "example-slack-token"}},
@@ -200,7 +234,17 @@ class WakeStack:
                     "tag": self.tag,
                     "imagePullPolicy": "Never",
                     "prewarm": {"enabled": False},
-                    "fakeModel": True,
+                    "fakeModel": False,
+                    "credentials": "not-needed",
+                    "extraEnv": [
+                        {"name": name, "value": "1"}
+                        for name in (
+                            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+                            "CLAUDE_CODE_DISABLE_TERMINAL_TITLE",
+                            "DISABLE_TELEMETRY",
+                            "DISABLE_ERROR_REPORTING",
+                        )
+                    ],
                 },
             },
         }
@@ -219,7 +263,6 @@ class WakeStack:
             "--chart",
             str(REPO / "charts/curie"),
             "--dev",
-            "--fake-model",
             "--no-expose",
             "--forward-only",
             "--adopt",
@@ -267,6 +310,39 @@ class WakeStack:
         self.sql(
             "UPDATE curie.agents SET approval_required_tools = '[\"Bash\"]'::jsonb "
             "WHERE name = 'acme-wake-gated'"
+        )
+
+    def model_response(self, request):
+        # Messages shapes measured through the real CLI are recorded in
+        # runner/tests/test_tool_result_real_cli.py (SDK 0.2.159, CLI 2.1.281).
+        has_result = any(
+            isinstance(block, dict) and block.get("type") == "tool_result"
+            for message in request.get("messages", [])
+            if isinstance(message.get("content"), list)
+            for block in message["content"]
+        )
+        use_bash = not has_result and any(
+            tool.get("name") == "Bash" for tool in request.get("tools", [])
+        )
+        if use_bash:
+            self.bash_requests += 1
+        return message_to_sse(
+            {
+                "id": f"msg_acme_{uuid.uuid4().hex}",
+                "model": request.get("model", "claude-sonnet-5"),
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_acme_wake",
+                        "name": "Bash",
+                        "input": {"command": self.effect_command},
+                    }
+                    if use_bash
+                    else {"type": "text", "text": "done"}
+                ],
+                "stop_reason": "tool_use" if use_bash else "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
         )
 
     def image(self, role):
@@ -489,25 +565,6 @@ class WakeStack:
         assert all(set(claim) == {"agent", "exp"} for claim in claims)
         assert {"acme-wake-idle", "acme-wake-http"} <= {claim["agent"] for claim in claims}
 
-    def scheduler_tick(self):
-        self.kube(
-            "exec",
-            f"deployment/{FULLNAME}-worker",
-            "--",
-            "python3",
-            "-c",
-            "import asyncio,os;from curie_worker.run import build;"
-            "from curie_worker.config import WorkerConfig;"
-            "from curie_worker.worker_lifecycle import WorkerResources;\n"
-            "async def tick():\n"
-            " resources=WorkerResources()\n"
-            " try:\n"
-            "  runtime=build(WorkerConfig(),os.environ,resources=resources)\n"
-            "  await runtime.cron_loop.one_pass()\n"
-            " finally: await resources.aclose()\n"
-            "asyncio.run(tick())",
-        )
-
     def capture_failure(self):
         for name, argv in (
             ("worker", ("logs", f"deployment/{FULLNAME}-worker", "--tail=150")),
@@ -563,6 +620,7 @@ def test_webhook_wake_worker_boundary(stack):
     stack.worker(True)
     assert stack.settled(initial, "ran")["renewed"]
     stack.wait_done(event)
+    assert stack.effect_marker.read_text() == "executed"
     transcript = stack.transcripts("acme-wake-idle")
     assert transcript
     stale = event.model_copy(update={"event_id": event.event_id + ":stale"})
@@ -582,17 +640,23 @@ def test_webhook_wake_worker_boundary(stack):
     stack.worker(True)
     stack.settled(paused, "blocked", "hook_paused")
     stack.pause("acme-wake-idle", False)
-    stack.enqueue(old.model_copy(update={"event_id": old.event_id + ":after-resume"}))
+    redelivery = old.model_copy(update={"event_id": old.event_id + ":after-resume"})
+    stack.enqueue(redelivery)
+    stack.wait_done(redelivery)
     fresh, _ = stack.seed()
     stack.settled(fresh, "ran")
-    stack.scheduler_tick()
     assert stack.state(paused)["outcome"] == "blocked"
     print("pause: terminal blocked/hook_paused; fresh wake executes after resume")
 
-    gated, _ = stack.seed("acme-wake-gated")
+    stack.effect_marker.unlink(missing_ok=True)
+    attempted = stack.bash_requests
+    gated, gated_event = stack.seed("acme-wake-gated")
     stack.settled(gated, "failed", "approval_gate_targetless")
+    stack.wait_done(gated_event)
+    assert stack.bash_requests > attempted
+    assert not stack.effect_marker.exists()
     assert stack.sql("SELECT count(*) FROM curie.approvals") == "0"
-    print("approval: targetless refusal without card or resume")
+    print("approval: targetless refusal without Bash effect, card or resume")
 
     stack.worker(False)
     killed, _ = stack.seed()
@@ -608,8 +672,8 @@ def test_webhook_wake_worker_boundary(stack):
         for _, fields in rows
     ]
     assert len(events) == 8
-    assert all(":sweep:" not in item.event_id and item.reply_handle is None for item in events)
+    assert all(item.reply_handle is None for item in events)
     assert stack.redis("SCARD", cfg.completions_pending_key()) == 0
     assert stack.sql("SELECT count(*) FROM curie.hook_runs") == "6"
     assert stack.slack_calls == []
-    print("settlement: no chat, status, placeholder, sweep notice, outbox or successor")
+    print("settlement: no chat, status, placeholder, outbox or successor")
