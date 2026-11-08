@@ -25,17 +25,20 @@ def test_application_boot_refuses_slack_tokens(monkeypatch, settings, variable):
     assert sentinel not in str(error.value)
 
 
-def test_group_transport_authentication_freshness_and_narrowing():
+@pytest.mark.parametrize("base_url", ["https://slack.com/api/", "http://slack.example.com/api/"])
+def test_group_transport_authentication_freshness_and_narrowing(base_url):
     async def scenario():
         users = ["U0EXAMPLE1", "U0EXAMPLE2"]
         calls = []
 
         def slack(request):
+            # Slack method and response: https://docs.slack.dev/reference/methods/usergroups.users.list
+            assert str(request.url).split("?", 1)[0] == base_url + "usergroups.users.list"
             calls.append(request)
             return httpx.Response(200, json={"ok": True, "users": list(users)})
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(slack)) as provider:
-            groups = SlackUserGroupClient(provider, token="provider-credential")
+            groups = SlackUserGroupClient(provider, token="provider-credential", base_url=base_url)
             app = gateway_application(
                 replay=RequestReplayStore(":memory:"),
                 tokens={"api": "api-credential", "worker": "worker-credential"},

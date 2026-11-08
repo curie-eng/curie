@@ -42,8 +42,6 @@ from ..group_models import (
 )
 from ..ports.groups import GroupMembershipSource
 
-_USERGROUPS_USERS_LIST = "https://slack.com/api/usergroups.users.list"
-
 
 class SlackUserGroupClient:
     """Reads Slack user-group membership, with a per-group TTL cache.
@@ -59,12 +57,14 @@ class SlackUserGroupClient:
         http: httpx.AsyncClient,
         *,
         token: str,
+        base_url: str = "https://slack.com/api/",
         ttl_s: float = 60.0,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         mono: Callable[[], float] = time.monotonic,
     ) -> None:
         self._http = http
         self._token = token
+        self._endpoint = base_url.rstrip("/") + "/usergroups.users.list"
         self._ttl_s = ttl_s
         # ``clock`` is the WALL clock, stamped onto the audit-facing ``fetched_at``
         # ("when Slack answered"). ``mono`` is a MONOTONIC clock used ONLY to age
@@ -169,7 +169,7 @@ class SlackUserGroupClient:
     async def _fetch(self, group_id: str) -> frozenset[str]:
         try:
             response = await self._http.get(
-                _USERGROUPS_USERS_LIST,
+                self._endpoint,
                 params={"usergroup": group_id},
                 headers={"Authorization": f"Bearer {self._token}"},
             )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import stat
 import tarfile
@@ -120,6 +121,36 @@ def test_the_bundle_is_read_only_and_home_is_private(tmp_path: Path) -> None:
     assert stat.S_IMODE(staged.home.stat().st_mode) == 0o700
     assert stage.wipe(staged.root)
     assert not staged.root.exists()
+
+
+def test_upload_tokens_are_private_claim_files_and_wiped(tmp_path: Path) -> None:
+    tokens = {"reviewer": "ccu.example.signature"}
+    staged, manifest = _stage(tmp_path, connector_upload_tokens=tokens)
+    env = stage.child_environment(manifest, staged, config=_config(tmp_path), environ={})
+    path = Path(env["CURIE_CONNECTOR_UPLOAD_TOKENS_FILE"])
+    assert path.is_relative_to(staged.root)
+    assert json.loads(path.read_text()) == tokens
+    assert stat.S_IMODE(path.stat().st_mode) == 0o400
+    assert path.stat().st_uid == os.getuid()
+    assert all(token not in value for token in tokens.values() for value in env.values())
+    assert stage.wipe(staged.root)
+    assert not path.exists()
+
+
+def test_no_upload_tokens_means_no_file_or_environment_override(tmp_path: Path) -> None:
+    staged, manifest = _stage(
+        tmp_path,
+        env={"CURIE_RUNNER_TOKEN": BEARER, "CURIE_CONNECTOR_UPLOAD_TOKENS_FILE": "/untrusted"},
+    )
+    env = stage.child_environment(manifest, staged, config=_config(tmp_path), environ={})
+    assert "CURIE_CONNECTOR_UPLOAD_TOKENS_FILE" not in env
+    assert not (staged.root / "connector-upload-tokens.json").exists()
+
+
+@pytest.mark.parametrize("tokens", [[], {"reviewer": 1}, {"reviewer": ""}])
+def test_invalid_upload_token_payload_is_refused(tmp_path: Path, tokens: object) -> None:
+    with pytest.raises(stage.StageError, match="upload tokens"):
+        _stage(tmp_path, connector_upload_tokens=tokens)
 
 
 def test_a_lazy_attachment_cache_starts_empty_and_writable(tmp_path: Path) -> None:

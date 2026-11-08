@@ -267,6 +267,236 @@ def test_built_image_imports_the_runner(image: str) -> None:
 
 
 @pytest.fixture(scope="module")
+def upload_store():
+    from curie_worker.bundle_store import BundleStore
+    from curie_worker.config import WorkerConfig
+
+    name = "curie-upload-store-" + uuid.uuid4().hex[:8]
+    port = free_port()
+    store = BundleStore(
+        WorkerConfig(
+            s3_endpoint_url=f"http://localhost:{port}",
+            s3_access_key="rustfs",
+            s3_secret_key="rustfssecret",
+            bundle_bucket="upload-proof-" + uuid.uuid4().hex,
+        )
+    )
+    created = False
+    try:
+        _docker(
+            "run",
+            "-d",
+            "--name",
+            name,
+            "--label",
+            f"curie.test.owner={name}",
+            "-p",
+            f"127.0.0.1:{port}:9000",
+            "-e",
+            "RUSTFS_ACCESS_KEY=rustfs",
+            "-e",
+            "RUSTFS_SECRET_KEY=rustfssecret",
+            "rustfs/rustfs:1.0.0-beta.12",
+            "/data",
+        )
+
+        def ready():
+            connection = http.client.HTTPConnection("localhost", port, timeout=2)
+            try:
+                connection.request("GET", "/health")
+                response = connection.getresponse()
+                response.read()
+                return response.status == 200
+            except OSError:
+                return False
+            finally:
+                connection.close()
+
+        wait_until(ready, 30, "upload proof object store ready")
+        store._client.create_bucket(Bucket=store._bucket)
+        created = True
+        yield store
+    finally:
+        try:
+            if created:
+                store._client.delete_object(Bucket=store._bucket, Key="bundle.tar.gz")
+                store._client.delete_bucket(Bucket=store._bucket)
+        finally:
+            _docker("rm", "-fv", name, check=False)
+            assert not _docker("ps", "-aq", "--filter", f"label=curie.test.owner={name}").strip()
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_upload_token_file_is_runner_owned_and_removed_with_claim(tls, upload_store, enabled):
+    import base64
+    import time
+
+    from curie_internal.connector_endpoints import BINDING_ENV, StaticConnectorEndpoints
+    from curie_worker import caller_token
+    from curie_worker.config import WorkerConfig
+    from curie_worker.run import _sandbox_client
+    from curie_worker.sandbox import SubstrateConfig
+
+    probe = b"""
+import base64, json, os, runpy, stat, subprocess, sys
+from pathlib import Path
+from curie_runner.subprocess_env import cli_parent_env
+if os.environ.get("UPLOAD_PROBE_CHILD") != "1":
+    env = {**cli_parent_env(os.environ), "UPLOAD_PROBE_CHILD": "1"}
+    subprocess.run(
+        [sys.executable, "-I", "-m", "curie_runner.shell_launcher", "-c",
+         'exec "$CURIE_SHELL_PYTHON" "$CURIE_PLUGIN_DIR/probe.py"'],
+        env=env, check=True,
+    )
+    runpy.run_module("curie_runner", run_name="__main__")
+    raise SystemExit()
+assert "CURIE_RUNNER_TOKEN" not in os.environ
+assert "CURIE_CONNECTOR_CALLER_TOKEN" not in os.environ
+name = os.environ.get("CURIE_CONNECTOR_UPLOAD_TOKENS_FILE")
+result = {"enabled": name is not None, "uid": os.getuid()}
+if name:
+    path = Path(name)
+    tokens = json.loads(path.read_text())
+    result.update(file=name, mode=stat.S_IMODE(path.stat().st_mode),
+                  owner=path.stat().st_uid, claims={
+                      key: json.loads(base64.urlsafe_b64decode(value.split(".")[1] + "=="))
+                      for key, value in tokens.items()
+                  })
+Path(os.environ["HOME"], "upload-probe.json").write_text(json.dumps(result))
+"""
+    files = {
+        "probe.py": probe,
+        ".claude-plugin/plugin.json": b'{"name":"acme-bot","version":"1.0.0"}',
+        "connectors.yaml": b"connectors:\n  reviewer:\n    image: acme/reviewer:1\n",
+    }
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as archive:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    upload_store._client.put_object(
+        Bucket=upload_store._bucket, Key="bundle.tar.gz", Body=gzip.compress(raw.getvalue())
+    )
+    endpoints = StaticConnectorEndpoints.model_validate(
+        {
+            "version": 1,
+            "agents": {
+                "acme-dev": {
+                    "reviewer": {
+                        "base_url": "https://connectors.example.com",
+                        **(
+                            {"upload_url": "https://uploads.example.com/v1/upload"}
+                            if enabled
+                            else {}
+                        ),
+                    }
+                }
+            },
+        }
+    )
+    valkey = _crash_valkey()
+    prefix = "upload-proof-" + uuid.uuid4().hex
+    shell = Shell.__new__(Shell)
+    client = None
+    try:
+        shell.__init__(tls, runner_command="sh -c 'exec python \"$CURIE_PLUGIN_DIR/probe.py\"'")
+        client = _sandbox_client(
+            WorkerConfig(
+                connector_caller_signing_key=base64.b64encode(bytes(range(32))).decode(),
+                connector_endpoints=endpoints,
+                s3_endpoint_url=upload_store._client.meta.endpoint_url,
+                s3_access_key="rustfs",
+                s3_secret_key="rustfssecret",
+                bundle_bucket=upload_store._bucket,
+            ),
+            {
+                "CURIE_SANDBOX_SUBSTRATE": "static",
+                "CURIE_STATIC_SHELLS": json.dumps(
+                    [
+                        {
+                            "slot": shell.slot,
+                            "host": "localhost",
+                            "port": shell.port,
+                            "pool": "upload-pool",
+                        }
+                    ]
+                ),
+                "CURIE_STATIC_SHELL_CA_FILE": str(tls.ca),
+                "CURIE_STATIC_SHELL_CONTROL_TOKEN": CONTROL_TOKEN,
+            },
+            SubstrateConfig(namespace="default", warm_pool="upload-pool", key_prefix=prefix),
+            redis_client=valkey,
+        )
+        wait_until(shell.answers, 60, "shell ready")
+        before = int(time.time())
+        client.create_claim(
+            "upload-proof",
+            pool="upload-pool",
+            deadline=time.monotonic() + 30,
+            env={
+                **_runner_environment("runner-" + uuid.uuid4().hex),
+                "CURIE_BUNDLE_REF": "bundle.tar.gz",
+                "CURIE_CONNECTOR_UPLOAD_TOKENS_FILE": "/wrong",
+                "CURIE_CONNECTOR_CALLER_TOKEN": caller_token.mint(
+                    base64.b64encode(bytes(range(32))).decode(),
+                    agent="acme-dev",
+                    exp=before + 3600,
+                ),
+                BINDING_ENV: endpoints.bind("acme-dev").model_dump_json(),
+            },
+            agent_name="acme-dev",
+        )
+
+        def ready():
+            return shell.request("GET", "/_curie/supervisor/v1/shell", token=CONTROL_TOKEN)[1][
+                "claim"
+            ]["ready"]
+
+        wait_until(ready, 60, "runner ready after reading upload credentials")
+        result = json.loads(
+            _docker(
+                "exec",
+                shell.name,
+                "python",
+                "-c",
+                "import pathlib; p=next(pathlib.Path('/var/lib/curie-shell/claims').glob("
+                "'*/home/upload-probe.json')); print(p.read_text())",
+            )
+        )
+        assert result["uid"] == 1000
+        assert result["enabled"] is enabled
+        if enabled:
+            assert result["owner"] == 1000 and result["mode"] == 0o400
+            assert set(result["claims"]) == {"reviewer"}
+            claims = result["claims"]["reviewer"]
+            assert claims["agent"] == "acme-dev" and claims["connector"] == "reviewer"
+            assert before + 3600 <= claims["exp"] <= int(time.time()) + 3600
+        client.delete_claim("upload-proof", request_timeout_seconds=15)
+        assert (
+            _docker(
+                "exec",
+                shell.name,
+                "python",
+                "-c",
+                "import pathlib; "
+                "assert not list(pathlib.Path('/var/lib/curie-shell/claims').iterdir())",
+            )
+            == ""
+        )
+    finally:
+        try:
+            if client is not None:
+                client.delete_claim("upload-proof", request_timeout_seconds=15)
+        finally:
+            if hasattr(shell, "name"):
+                shell.remove()
+            for key in valkey.scan_iter(match=prefix + "*"):
+                valkey.delete(key)
+            valkey.close()
+
+
+@pytest.fixture(scope="module")
 def crash_platform():
     import asyncio
 

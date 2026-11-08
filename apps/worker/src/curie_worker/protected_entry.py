@@ -46,6 +46,16 @@ from .protected_worker_bootstrap import (
 )
 from .reply_sink import ReplySinkRouter
 
+PROCESS_MIGRATION_HINT = (
+    "process.json v1 is unsupported; run curie migrate-protected-process "
+    "--runtime-dir <directory> --gateway-config <gateway.json>; "
+    "see the channel gateway upgrade guide"
+)
+
+
+class ProcessSettingsMigrationRequired(WorkerBootstrapInvalid):
+    """The operator must migrate the file before starting this image."""
+
 
 @dataclass(frozen=True, slots=True, repr=False)
 class ProcessSettings:
@@ -76,6 +86,7 @@ def _http_origin(raw: str, *, allow_path: bool = False) -> None:
 
 def load_process_settings(directory: str) -> ProcessSettings:
     """Read one bounded regular process.json; no environment fallback."""
+    needs_migration = False
     try:
         refuse_slack_tokens({})
         root = _open_root(directory)
@@ -86,6 +97,12 @@ def load_process_settings(directory: str) -> ProcessSettings:
             )
         finally:
             os.close(root)
+        needs_migration = (
+            type(value) is dict
+            and type(value.get("schema_version")) is int
+            and value["schema_version"] == 1
+        )
+        _require(not needs_migration)
         _require(
             type(value) is dict
             and value.keys()
@@ -154,6 +171,13 @@ def load_process_settings(directory: str) -> ProcessSettings:
         )
     except Exception:  # noqa: BLE001  Never retain private configuration diagnostics.
         pass
+    if needs_migration:
+        error = ProcessSettingsMigrationRequired(PROCESS_MIGRATION_HINT)
+        try:
+            raise error from None
+        finally:
+            error.__context__ = None
+            error.__cause__ = None
     _refuse()
 
 
@@ -272,12 +296,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run one provisioned protected worker")
     parser.add_argument("--runtime-dir", required=True)
     args = parser.parse_args()
+    diagnostic = "protected worker stopped without confirmed completion"
     try:
         asyncio.run(_serve(args.runtime_dir))
         return
+    except ProcessSettingsMigrationRequired:
+        diagnostic = PROCESS_MIGRATION_HINT
     except Exception:  # noqa: BLE001  Process diagnostics must not disclose supplied credentials.
         pass
-    error = SystemExit("protected worker stopped without confirmed completion")
+    error = SystemExit(diagnostic)
     try:
         raise error from None
     finally:
