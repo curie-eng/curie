@@ -1,10 +1,13 @@
 """Standalone Slack gateway process; application services hold only caller credentials."""
 
+import logging
 import ssl
+from importlib.metadata import version
 from pathlib import Path
 
 import httpx
 from aiohttp import web
+from curie_telemetry import bootstrap_service_telemetry
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -97,13 +100,21 @@ def main() -> None:
         context.load_cert_chain(config.tls_cert, config.tls_key)
     elif not config.allow_insecure_http:
         raise ValueError("gateway requires TLS certificate and key or explicit insecure opt-out")
-    web.run_app(
-        application(config, SlackProviderConfig()),
-        host=config.host,
-        port=config.port,
-        ssl_context=context,
-        access_log=None,
+    telemetry = bootstrap_service_telemetry(
+        "curie-channel-gateway",
+        service_version=version("curie-channel-gateway"),
+        logger=logging.getLogger("curie_channel_gateway"),
     )
+    try:
+        web.run_app(
+            application(config, SlackProviderConfig()),
+            host=config.host,
+            port=config.port,
+            ssl_context=context,
+            access_log=None,
+        )
+    finally:
+        telemetry.shutdown()
 
 
 if __name__ == "__main__":

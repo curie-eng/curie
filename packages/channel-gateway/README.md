@@ -159,8 +159,55 @@ send the shared corpus through the current worker transport to a real HTTP
 receiver. Keep these selectors and assertions working after each move; update
 only import wiring when a provider's module location changes.
 
-The sole named deselection is the selected-click ack timing fixture: it fails
-locally at the two baseline commits recorded in the argument file while CI
-passes it. The argument file carries that note as marker metadata because pytest
-argument files do not support comments. Run serially against private Valkey;
-shared Valkey plus parallel caller-admission tests can produce false failures.
+Run serially against private Valkey; shared Valkey plus parallel caller-admission
+tests can produce false failures. The selected-click acknowledgement and
+exactly-once submission cases are included in the argument file.
+
+## Upgrading existing installations
+
+The Helm chart automatically deploys the gateway when Slack is configured and
+no gateway URL is supplied. Keep the same values file and Secret objects. The
+chart moves bot-token references from the API and worker to the gateway. Slack
+intake remains in the dispatcher. Separate gateway caller credentials and
+internal TLS are provisioned automatically. Other optional capabilities remain
+subject to their existing configuration switches. See the chart's
+[upgrade and certificate rotation guide](../../charts/curie/README.md#channel-gateway-upgrade).
+
+Custom API and worker launchers must remove raw Slack tokens from their process
+environments and configure `CURIE_CHANNEL_GATEWAY_URL` and their separate
+`CURIE_CHANNEL_GATEWAY_TOKEN`. The runtime refuses provider credentials rather
+than supporting both configurations. For a private CA, mount its PEM file and
+set `CURIE_CHANNEL_GATEWAY_CA_FILE`; the additional trust is scoped to gateway
+traffic. Never disable certificate verification.
+
+### Protected-worker process files
+
+Stop the protected worker and its provisioner before migrating a writable copy
+of `process.json`. Provision the gateway with the former Slack tokens and the
+same identity names, then write a private `gateway.json` containing the v2
+`channel_gateway` object:
+
+```json
+{
+  "url": "https://gateway.example.com",
+  "token": "REPLACE_WITH_WORKER_CALLER_CREDENTIAL",
+  "allow_insecure_http": false,
+  "identities": ["default"]
+}
+```
+
+From the source checkout, run the one-shot migration with the runtime directory
+and private gateway configuration paths:
+
+```bash
+uv run python3 scripts/migrate-protected-process.py --runtime-dir /private/acme/runtime --gateway-config /private/acme/gateway.json
+```
+
+The command accepts only v1, validates the complete v2 file with the runtime
+loader, writes it atomically with mode 0600, and removes the `slack` object and
+its raw tokens. Database, API, adapter and launch TLS configuration are retained.
+A refusal leaves the source file unchanged and prints no input values. Restart
+the provisioner with the migrated file and recreate any read-only projected
+copy before starting the worker. Schema v1 remains rejected at runtime and its
+error names this migration. Helm-managed ordinary workers have no `process.json`
+and require no manual file migration.
