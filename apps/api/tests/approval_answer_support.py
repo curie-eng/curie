@@ -288,14 +288,16 @@ def synthetic_provider(tmp_path: Path) -> Iterator[SimpleNamespace]:
 # --- the receiving API and the case -------------------------------------------------
 
 
-def runtime_for(scope: dict[str, Any]) -> Any:
+def runtime_for(scope: dict[str, Any], *, credential: bool = True) -> Any:
     """The operator registration of the vertical suite, every roster account a human.
 
-    @spec REQUEST-APPROVAL-5/6.
+    ``credential=False`` registers no provider credential for the tenant's
+    stored HTTP selection, as when the provider secret is not mounted, so
+    every capture's credential resolution is unavailable. @spec REQUEST-APPROVAL-5/6.
     """
     module = membership._runtime_api()
     providers = build_provider_credential_registry(
-        ((scope["configuration"], ProviderBearer(membership.BEARER)),)
+        ((scope["configuration"], ProviderBearer(membership.BEARER)),) if credential else ()
     )
     registration_v1 = module.ReceiverRegistrationV1(
         schema_version=1, receiver_id=scope["receiver_id"], generation=1,
@@ -494,16 +496,17 @@ def fence_stable(valkey: redis.Redis) -> None:
 # --- answers ------------------------------------------------------------------------
 
 
-def answer_as(
-    case: SimpleNamespace, row: dict[str, Any], native: str, *, decision: str = "approved",
-) -> Any:
-    """``native`` clicks the card: chat attestation plus a receiver-signed answer proof.
+def answer_headers(
+    case: SimpleNamespace, row: dict[str, Any], native: str, body: bytes, *,
+    operation: str = "resolve",
+) -> dict[str, str]:
+    """``native``'s chat attestation plus a receiver-signed answer proof over ``body``.
 
     The exact construction of ``test_http_approval_answers.answer`` for any
-    registered account. @spec REQUEST-APPROVAL-5/6.
+    registered account and either operation (``resolve`` or ``recover``).
+    @spec REQUEST-APPROVAL-5/6.
     """
     scope = case.scope
-    body = json.dumps({"decision": decision}, separators=(",", ":")).encode()
     evidence = slack_evidence(user_id=native)
     apr = approval_principal.mint(
         get_settings().approval_chat_attester_secret, subject=native, kind="chat",
@@ -512,7 +515,7 @@ def answer_as(
         slack=SlackEvidence.model_validate(evidence),
     )
     proof = {
-        "schema_version": 1, "purpose": "approval_answer", "operation": "resolve",
+        "schema_version": 1, "purpose": "approval_answer", "operation": operation,
         "receiver_id": scope["receiver_id"], "receiver_generation": 1,
         "channel_identity_id": scope["identity"],
         "provider_installation_id": scope["installation"],
@@ -526,12 +529,24 @@ def answer_as(
         "receiver", ((scope["receiver_id"], 1, scope["receiver_key"]),),
     )
     token = wire.sign_approval_answer_proof(wire.ApprovalAnswerProofV1.model_validate(proof), ring)
+    return {
+        "X-Curie-Approval-Principal": apr, PROOF_HEADER: token,
+        "Content-Type": "application/json",
+    }
+
+
+def answer_as(
+    case: SimpleNamespace, row: dict[str, Any], native: str, *, decision: str = "approved",
+) -> Any:
+    """``native`` clicks the card: chat attestation plus a receiver-signed answer proof.
+
+    The exact construction of ``test_http_approval_answers.answer`` for any
+    registered account. @spec REQUEST-APPROVAL-5/6.
+    """
+    body = json.dumps({"decision": decision}, separators=(",", ":")).encode()
     return case.client.post(
         f"/approvals/{row['id']}/resolve", content=body,
-        headers={
-            "X-Curie-Approval-Principal": apr, PROOF_HEADER: token,
-            "Content-Type": "application/json",
-        },
+        headers=answer_headers(case, row, native, body),
     )
 
 

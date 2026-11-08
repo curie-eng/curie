@@ -17,35 +17,48 @@ everything. Synthetic, reserved example values only.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import json
+import os
+import uuid
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from _migration_support import sql_dicts
+from _migration_support import sql_dicts, sql_rows
 from approval_answer_support import (
     ANY_CODE,
+    CONFIGURATION_VERSION,
     EQUALITY,
     EXCLUSION,
+    FIXED,
     NATIVE_A,
     NATIVE_B,
     NATIVE_OUTSIDER,
     NATIVE_UNRESOLVED,
+    SELECTION,
+    SENDER,
     actions,
     answer_as,
+    answer_headers,
     answered,
     approval_row,
+    audit_rows,
     configured,
     dynamic,
     fence_stable,
     grant_check,
     no_wake,
     one_more_resume_refusal,
+    ordinary,
     person,
     published,
     refused,
     republish,
     resume_refusals,
+    runtime_for,
+    still_pending,
     store_snapshot,
     turn_check,
 )
@@ -60,6 +73,7 @@ from approver_ticket_support import (
     REQUESTER,
     ROUTE,
     agent_state,
+    api_headers,
     pinned_role,
     selector_key,
     set_approver_role,
@@ -68,6 +82,10 @@ from approver_ticket_support import (
     subject_entry,
     surface_entry,
 )
+from curie_api.config import get_settings
+from curie_api.crud.approvals import RECOVERY_AUDIT_ACTION
+
+from apps.api.tests.test_http_approval_legacy_writers import RECOVERY_ENV
 
 CONTINUE = ("continue", "current_authority")
 REFUSE = ("refuse", "caller_not_allowed")
@@ -394,6 +412,155 @@ def test_every_refusal_on_a_canonical_route_leaves_one_denied_audit_row(
     answered(case, row, NATIVE_A)
 
 
+# The phase 1 reader capture refuses after the actor authenticated: the provider
+# credential cannot be resolved (503), or the agent is not active (403).
+CAPTURE_FAILURES: dict[str, int] = {"credential": 503, "agent": 403}
+
+
+def _agent_status(agent: str, status: str) -> None:
+    """The stored agent lifecycle state (ADR 0166).
+
+    No operator route writes it yet, so it is written with SQL.
+    @spec REQUEST-APPROVAL-5.
+    """
+    sql_rows(
+        "UPDATE curie.agents SET status = :status WHERE id = :id",
+        {"status": status, "id": uuid.UUID(agent)},
+    )
+
+
+@contextmanager
+def _capture_failure(case: SimpleNamespace, cause: str) -> Iterator[None]:
+    """One cause the phase 1 capture refuses for, restored when the block ends.
+
+    ``credential``: the serving API's HTTP identity runtime registers no
+    provider credential, as when the provider secret is not mounted, so
+    resolving it at capture is unavailable. ``agent``: the agent is paused,
+    which the capture refuses for the original invoker. @spec REQUEST-APPROVAL-5.
+    """
+    state = case.client.app.state
+    serving = state.http_identity_runtime
+    if cause == "credential":
+        state.http_identity_runtime = runtime_for(case.scope, credential=False)
+    else:
+        assert cause == "agent", cause
+        _agent_status(case.scope["agent"], "paused")
+    try:
+        yield
+    finally:
+        if cause == "credential":
+            state.http_identity_runtime = serving
+        else:
+            _agent_status(case.scope["agent"], "active")
+
+
+def _refused_at_capture(
+    case: SimpleNamespace, row: dict[str, Any], native: str, status: int,
+) -> dict[str, Any]:
+    """Refused before any directory lookup and audited once, at stage ``capture``.
+
+    @spec REQUEST-APPROVAL-5.
+    """
+    lookups = len(case.provider.requests)
+    evidence = refused(case, row, native, status)
+    assert len(case.provider.requests) == lookups, case.provider.requests[lookups:]
+    assert (evidence["status"], evidence["detail"], evidence["stage"]) == (
+        status, FIXED[status], "capture",
+    ), evidence
+    assert "code" in evidence, evidence
+    return evidence
+
+
+@pytest.mark.parametrize("cause", list(CAPTURE_FAILURES))
+def test_an_authenticated_answer_refused_at_capture_on_a_canonical_route_is_audited(
+    selection_case: SimpleNamespace, cause: str,
+) -> None:
+    """@spec REQUEST-APPROVAL-5: phase 1 refusals after authentication leave a ``denied`` row.
+
+    The selected approver's answer is correctly signed. With the provider
+    credential not registered (503 ``authority_unavailable``) or the agent
+    paused (403 ``caller_not_allowed``) the reader capture refuses before any
+    lookup: the public status is unchanged, the row stays pending and one
+    ``denied`` row names the status, its detail and stage ``capture``. Once
+    the cause is removed the same approver is admitted with selection evidence.
+    """
+    case = selection_case
+    configured(case)
+    row = dynamic(case, (APPROVER_A,))
+    with _capture_failure(case, cause):
+        _refused_at_capture(case, row, NATIVE_A, CAPTURE_FAILURES[cause])
+    no_wake(case, row["id"])
+    selection = answered(case, row, NATIVE_A)
+    assert (selection["mode"], selection["route"]) == ("dynamic", ROUTE), selection
+    assert len(actions(row["id"], "denied")) == 1
+
+
+@pytest.mark.parametrize("cause", list(CAPTURE_FAILURES))
+def test_a_capture_refusal_is_audited_only_on_a_canonical_route(
+    selection_case: SimpleNamespace, cause: str,
+) -> None:
+    """@spec REQUEST-APPROVAL-5/6: an ordinary route keeps its unaudited capture refusal.
+
+    An ordinary HTTP approval on a route without exclusion is not canonical:
+    the same cause refuses the requester's self-confirmation with the same
+    public status and writes no audit row, as before; restored, ADR 0106
+    self-confirmation is admitted. The next approval, dynamic, refused for the
+    same cause is audited once, so the route alone decides.
+
+    Each row is answered before the next turn is accepted (a new turn moves the
+    binding generation and voids an earlier row's capture).
+    """
+    case = selection_case
+    configured(case)
+    status = CAPTURE_FAILURES[cause]
+    plain = ordinary(case, None)
+    with _capture_failure(case, cause):
+        response = answer_as(case, plain, SENDER)
+    assert response.status_code == status, response.text
+    assert response.json() == {"detail": FIXED[status]}
+    still_pending(plain["id"])
+    assert audit_rows(plain["id"]) == []
+    restored = answer_as(case, plain, SENDER)
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["status"] == "approved"
+    assert [entry["action"] for entry in audit_rows(plain["id"])] == ["resolved"]
+
+    row = dynamic(case, (APPROVER_A,))
+    with _capture_failure(case, cause):
+        _refused_at_capture(case, row, NATIVE_A, status)
+    answered(case, row, NATIVE_A)
+
+
+def test_an_unverified_receiver_proof_on_a_canonical_route_is_not_audited(
+    selection_case: SimpleNamespace,
+) -> None:
+    """@spec REQUEST-APPROVAL-5: an actor that never authenticated leaves no ``denied`` row.
+
+    A proof signed with a key the receiver registration does not hold is
+    refused 401 before capture, with or without the provider credential, and
+    adds no audit row. The correctly signed answer while the credential is
+    unavailable is the authenticated neighbor: audited once at capture, then
+    admitted once the credential is restored.
+    """
+    case = selection_case
+    configured(case)
+    row = dynamic(case, (APPROVER_A,))
+    forged = SimpleNamespace(client=case.client, scope={**case.scope, "receiver_key": b"u" * 32})
+    lookups = len(case.provider.requests)
+    response = answer_as(forged, row, NATIVE_A)
+    assert response.status_code == 401, response.text
+    with _capture_failure(case, "credential"):
+        response = answer_as(forged, row, NATIVE_A)
+    assert response.status_code == 401, response.text
+    still_pending(row["id"])
+    assert actions(row["id"], "denied") == []
+    assert len(case.provider.requests) == lookups
+
+    with _capture_failure(case, "credential"):
+        _refused_at_capture(case, row, NATIVE_A, 503)
+    answered(case, row, NATIVE_A)
+
+
 def test_a_provider_outage_at_resume_leaves_resume_refused_rows(
     selection_case: SimpleNamespace,
 ) -> None:
@@ -460,3 +627,77 @@ def test_revoked_authority_after_an_approved_answer_refuses_the_resume(
 
     restore()
     assert turn_check(case, entry, row["id"]) == CONTINUE
+
+
+# --- AC1.10: administrative recovery on a canonical route records its judgment ---------
+
+
+def _recovered(
+    case: SimpleNamespace, row: dict[str, Any], native: str, recovery_key: str,
+) -> dict[str, Any]:
+    """``native`` recovers ``row`` as rejected through ``POST /approvals/{id}/recover``.
+
+    The platform key, the operator's recovery grant (enabled for this request
+    only) and, for a selected row, ``native``'s chat attestation plus a
+    receiver-signed ``recover`` proof over the exact body. Returns the
+    evidence of the one recovery audit row. @spec REQUEST-APPROVAL-5/6.
+    """
+    body = json.dumps({
+        "disposition": "rejected", "reason": "synthetic stranded approval",
+        "recovery_key": recovery_key,
+    }, separators=(",", ":")).encode()
+    headers = {**answer_headers(case, row, native, body, operation="recover"), **api_headers()}
+    os.environ[RECOVERY_ENV] = "true"
+    get_settings.cache_clear()
+    try:
+        response = case.client.post(
+            f"/approvals/{row['id']}/recover", content=body, headers=headers,
+        )
+    finally:
+        os.environ.pop(RECOVERY_ENV, None)
+        get_settings.cache_clear()
+    assert response.status_code == 200, response.text
+    assert (response.json()["status"], response.json()["actor"]) == ("rejected", native)
+    stored = approval_row(row["id"])
+    assert (stored["status"], stored["resolved_by"]) == ("rejected", native)
+    recovered = actions(row["id"], RECOVERY_AUDIT_ACTION)
+    assert len(recovered) == 1, recovered
+    entry = recovered[0]
+    assert (entry["actor"], entry["decision"], entry["authorized"]) == (native, "rejected", True)
+    evidence = entry["evidence"]
+    assert isinstance(evidence, dict) and evidence["kind"] == "administrative_recovery", evidence
+    assert evidence["recovery_key"] == recovery_key, evidence
+    assert isinstance(evidence["facts"], list), evidence
+    assert evidence["authenticated_actor"]["kind"] == "chat", evidence
+    assert actions(row["id"], "denied") == []
+    return dict(evidence)
+
+
+def test_a_recovery_on_a_canonical_route_records_the_selection_judgment(
+    selection_case: SimpleNamespace,
+) -> None:
+    """@spec REQUEST-APPROVAL-5/6: break-glass recovery is judged as a rejection, and says so.
+
+    The requester is selected on a route that excludes it, which still permits
+    a rejection. Its recovery of its own dynamic request keeps the
+    administrative recovery evidence and adds the canonical-route judgment
+    under ``selection``: the requester as the actor, equality true, exclusion
+    on and the current configuration version. Recovering an ordinary approval
+    keeps today's evidence, with no ``selection``.
+    """
+    case = selection_case
+    configured(case)
+    row = dynamic(case, (REQUESTER, APPROVER_A))
+    evidence = _recovered(case, row, SENDER, f"rk-{uuid.uuid4().hex}")
+    selection = evidence.get("selection")
+    assert isinstance(selection, dict) and selection["kind"] == SELECTION, evidence
+    assert (selection["mode"], selection["route"]) == ("dynamic", ROUTE), selection
+    assert selection["requester"]["subject"] == REQUESTER, selection
+    assert selection["actor"] == selection["requester"], selection
+    assert selection[EQUALITY] is True and selection[EXCLUSION] is True, selection
+    assert selection[CONFIGURATION_VERSION] == case.scope["config_version"], selection
+    assert selection["decision"] == "rejected", selection
+
+    plain = ordinary(case, None)
+    evidence = _recovered(case, plain, SENDER, f"rk-{uuid.uuid4().hex}")
+    assert "selection" not in evidence, evidence
