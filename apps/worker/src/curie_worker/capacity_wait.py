@@ -290,7 +290,10 @@ if not state then redis.call('HSET', record, 'fields', payload) end
 redis.call('HSET', record,
   'state', 'waiting', 'generation', generation, 'first_wait_ms', first,
   'deadline_ms', deadline, 'due_ms', next_due, 'deferrals', deferrals,
-  'cause', '', 'notice_pending', notice_flag, 'reason', reason)
+  'cause', '', 'notice_pending', notice_flag)
+-- Only a named reason is stored: a capacity or order wait keeps the field set
+-- it always had, which the protected wait store admits before any wake.
+if reason ~= '' then redis.call('HSET', record, 'reason', reason) end
 redis.call('PEXPIREAT', record, retained_until)
 redis.call('ZADD', due, next_due, ARGV[11])
 redis.call('ZADD', waiting, retained_until, ARGV[11])
