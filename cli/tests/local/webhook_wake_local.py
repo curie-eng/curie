@@ -7,6 +7,7 @@ import json
 import os
 import socket
 import threading
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from test_webhook_wake_qualification import Qualification
@@ -50,11 +51,31 @@ class LocalQualification(Qualification):
                 listener.close()
         api, postgres, valkey, s3, console, stub = ports
         calls = self.slack_calls
+        runtime = self
+        callback = os.environ["CURIE_LOCAL_STUB_HOST"]
+        self.effect_command = "printf executed > /tmp/curie-wake-bash-effect"
+        self.model_url = f"http://{callback}:{stub}/model"
 
         class Slack(BaseHTTPRequestHandler):
             def do_POST(self):
+                payload = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                if self.path.startswith("/model/"):
+                    runtime.model_paths.append(self.path)
+                    body = (
+                        runtime.model_response(json.loads(payload))
+                        if self.path.split("?", 1)[0].endswith("/messages")
+                        else b'{"input_tokens":1}'
+                    )
+                    self.send_response(200)
+                    self.send_header(
+                        "Content-Type",
+                        "text/event-stream" if body.startswith(b"event:") else "application/json",
+                    )
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 calls.append(self.path)
-                self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 body = b'{"ok":true,"ts":"1"}'
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
@@ -67,7 +88,6 @@ class LocalQualification(Qualification):
         self.slack = ThreadingHTTPServer(("0.0.0.0", stub), Slack)
         self.slack_thread = threading.Thread(target=self.slack.serve_forever, daemon=True)
         self.slack_thread.start()
-        callback = os.environ["CURIE_LOCAL_STUB_HOST"]
         self.env.update(
             {
                 "COMPOSE_PROJECT_NAME": self.project,
@@ -80,7 +100,9 @@ class LocalQualification(Qualification):
                 "CURIE_LOCAL_POSTGRES_HOST": "127.0.0.1",
                 "CURIE_LOCAL_POSTGRES_PORT": str(postgres),
                 "CURIE_LOCAL_IMAGE_TAG": self.tag,
-                "CURIE_FAKE_MODEL": "1",
+                "CURIE_FAKE_MODEL": "0",
+                "CURIE_CREDENTIALS": "not-needed",
+                "CURIE_MODEL_BASE_URL": self.model_url,
                 "CURIE_RUNNER_IMAGE": self.images["runner"],
             }
         )
@@ -102,6 +124,7 @@ class LocalQualification(Qualification):
       S3_ENDPOINT_URL: http://127.0.0.1:{s3}
       CURIE_API_URL: http://127.0.0.1:{api}
       CURIE_DOCKER_NETWORK: {self.network}
+      CURIE_RUNNER_TOTAL_TIMEOUT_S: ${{CURIE_RUNNER_TOTAL_TIMEOUT_S:-600}}
       SLACK_API_BASE_URL: http://{callback}:{stub}/api/
       SLACK_BOT_TOKEN: example-slack-token
 networks:
@@ -109,6 +132,7 @@ networks:
     name: {self.network}
 ''')
         files = ["-f", str(REPO / "compose.dev.yaml"), "-f", str(override)]
+        self.files = files
         self.compose = ["docker", "compose", "-p", self.project, *files]
         self.env["COMPOSE_FILE"] = os.pathsep.join([str(REPO / "compose.dev.yaml"), str(override)])
         self.run(self.cli, "build", "--tag", self.images["runner"], timeout=1800)
@@ -206,6 +230,201 @@ networks:
         else:
             self.run(*self.compose, "stop", "curie-worker")
 
+    def restart_api(self):
+        container = self.run(*self.compose, "ps", "-q", "curie-api").strip()
+        self.run("docker", "restart", container)
+        asyncio.run(
+            wait_until(
+                lambda: (
+                    self.run(
+                        "docker", "inspect", "--format", "{{.State.Health.Status}}", container
+                    ).strip()
+                    == "healthy"
+                ),
+                "restarted API",
+                timeout=90,
+                interval=0.5,
+            )
+        )
+
+    def local_up(self):
+        self.run(
+            self.cli,
+            "local",
+            "up",
+            "--minimal",
+            "--project",
+            self.project,
+            *self.files,
+            timeout=600,
+        )
+
+    def configure_lease(self, budget, lease):
+        self.env["CURIE_DELIVERY_BUDGET_S"] = str(budget)
+        self.env["CURIE_RUNNER_TOTAL_TIMEOUT_S"] = str(budget)
+        if lease is None:
+            self.env.pop("CURIE_HOOK_CLAIM_LEASE_S", None)
+        else:
+            self.env["CURIE_HOOK_CLAIM_LEASE_S"] = str(lease)
+        self.local_up()
+        self.claim_lease_s = budget if lease is None else lease
+        api = self.api_python(
+            "import json;from curie_api.config import get_settings;"
+            "print(json.dumps(get_settings().effective_hook_claim_lease_s))"
+        )
+        worker = json.loads(
+            self.kube(
+                "exec",
+                "deployment/local-worker",
+                "--",
+                "python3",
+                "-c",
+                "import json;from curie_worker.config import WorkerConfig;"
+                "print(json.dumps(WorkerConfig().effective_hook_claim_lease_s))",
+            )
+        )
+        assert api == worker == self.claim_lease_s
+        self.worker(False)
+
+    def fault_mode(self, mode):
+        return json.loads(
+            self.run(
+                "docker",
+                "exec",
+                self.proxy,
+                "python3",
+                "-c",
+                "import json,urllib.request;"
+                f"raw=json.dumps({{'mode':{mode!r}}}).encode();"
+                "request=urllib.request.Request('http://127.0.0.1:8000/',data=raw);"
+                "print(urllib.request.urlopen(request,timeout=10).read().decode())",
+            )
+        )
+
+    @contextmanager
+    def transport_fault(self):
+        from pathlib import Path
+
+        import webhook_wake_fault_proxy
+
+        self.proxy = f"{self.project}-fault-proxy"
+        if self.run("docker", "ps", "-aq", "--filter", f"name=^/{self.proxy}$").strip():
+            raise RuntimeError("fault proxy already exists; preserve its owner")
+        image = self.run(*self.compose, "images", "-q", "curie-api").strip()
+        original = self.files[:]
+        override = self.root / "compose.fault.yaml"
+        override.write_text(
+            f"services:\n  curie-api:\n    environment:\n      VALKEY_HOST: {self.proxy}\n"
+        )
+        try:
+            self.run(
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                self.proxy,
+                "--network",
+                f"{self.project}_default",
+                "--label",
+                f"curietech.ai/stack={self.network}",
+                "--env",
+                "UPSTREAM_HOST=valkey",
+                "--entrypoint",
+                "python3",
+                image,
+                "-c",
+                Path(webhook_wake_fault_proxy.__file__).read_text(),
+            )
+            self.files += ["-f", str(override)]
+            self.compose += ["-f", str(override)]
+            self.env["COMPOSE_FILE"] = os.pathsep.join(self.files[1::2])
+            self.local_up()
+            self.worker(False)
+            yield
+        finally:
+            self.files = original
+            self.compose = ["docker", "compose", "-p", self.project, *original]
+            self.env["COMPOSE_FILE"] = os.pathsep.join(original[1::2])
+            self.local_up()
+            self.run("docker", "rm", "-f", self.proxy)
+            assert not self.run("docker", "ps", "-aq", "--filter", f"name=^/{self.proxy}$").strip()
+
+    def redeploy(self, agent, bundle, label):
+        return json.loads(
+            self.run(
+                self.cli,
+                "local",
+                "deploy",
+                "--agent",
+                agent,
+                "--plugin-dir",
+                str(bundle),
+                "--label",
+                label,
+                "--json",
+            )
+        )
+
+    def run_record(self, agent, run):
+        return json.loads(
+            self.run(
+                self.cli,
+                "local",
+                "hook",
+                "record",
+                agent,
+                "queue-ready",
+                run,
+                "--json",
+            )
+        )
+
+    def runner(self, agent):
+        containers = self.run(
+            "docker",
+            "ps",
+            "-q",
+            "--filter",
+            f"label=curietech.ai/stack={self.network}",
+            "--filter",
+            "label=curietech.ai/component=claim-runner",
+        ).split()
+        matches = []
+        for container in containers:
+            labels = json.loads(
+                self.run("docker", "inspect", "--format", "{{json .Config.Labels}}", container)
+            )
+            if self.agents[agent] in labels["curietech.ai/claim"]:
+                matches.append(container)
+        assert len(matches) == 1
+        return matches[0]
+
+    def sandbox_manifest(self, agent):
+        return json.loads(
+            self.run(
+                "docker",
+                "exec",
+                self.runner(agent),
+                "python3",
+                "-c",
+                "import os;from pathlib import Path;"
+                "print((Path(os.environ['CURIE_PLUGIN_DIR'])/'.claude-plugin/plugin.json').read_text())",
+            )
+        )
+
+    def marker_value(self, agent):
+        return json.loads(
+            self.run(
+                "docker",
+                "exec",
+                self.runner(agent),
+                "python3",
+                "-c",
+                "import json;from pathlib import Path;p=Path('/tmp/curie-wake-bash-effect');"
+                "print(json.dumps(p.read_text() if p.exists() else None))",
+            )
+        )
+
     def deploy_extra(self, agent, bundle):
         receipt = json.loads(
             self.run(
@@ -227,6 +446,9 @@ networks:
         self.receipts[agent] = receipt
 
     def capture_failure(self):
+        command = self.root / "command-failure.log"
+        if command.exists():
+            (self.root / "failure-command.log").write_text(command.read_text())
         output = self.run(*self.compose, "logs", "--no-color", "--tail", "150", "curie-worker")
         (self.root / "failure-worker.log").write_text(output)
         (self.root / "failure-state.log").write_text(

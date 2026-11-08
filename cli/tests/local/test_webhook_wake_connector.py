@@ -177,3 +177,41 @@ def test_mcp_key_leak_is_refused_before_the_item_is_changed(mcp_queue):
     assert queue.observation()["calls"] == [
         {"tool": "complete", "human_header": False, "key_header": True, "agent": ""}
     ]
+
+
+def test_read_and_completion_barriers_keep_a_late_item_for_the_next_poll(mcp_queue):
+    queue, url = mcp_queue
+    queue.add("item-1", "first item")
+    queue.barriers(read=True, complete=True)
+
+    async def exercise():
+        async with streamable_http_client(url) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                reading = asyncio.create_task(session.call_tool("queue_read", {}))
+                try:
+                    assert await asyncio.to_thread(queue.read_seen.wait, 5)
+                    queue.add("item-2", "arrived after the read")
+                    queue.barriers(read=False, complete=True)
+                    result = await reading
+                    assert json.loads(result.content[0].text) == {
+                        "items": [{"id": "item-1", "text": "first item"}]
+                    }
+                    completing = asyncio.create_task(
+                        session.call_tool(
+                            "queue_complete", {"item_id": "item-1", "result": "receipt-ok"}
+                        )
+                    )
+                    assert await asyncio.to_thread(queue.complete_seen.wait, 5)
+                    assert queue.observation()["items"] == [
+                        {"id": "item-1", "result": "receipt-ok"},
+                        {"id": "item-2", "result": None},
+                    ]
+                    queue.barriers()
+                    assert not (await completing).is_error
+                finally:
+                    queue.barriers()
+                    await reading
+
+    asyncio.run(exercise())
+    assert queue.pending() == [{"id": "item-2", "text": "arrived after the read"}]

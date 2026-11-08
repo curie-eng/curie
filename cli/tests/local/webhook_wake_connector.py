@@ -23,6 +23,12 @@ from mcp.types import ToolAnnotations
 class Queue:
     def __init__(self, path):
         self.path = path
+        self.read_gate = threading.Event()
+        self.complete_gate = threading.Event()
+        self.read_gate.set()
+        self.complete_gate.set()
+        self.read_seen = threading.Event()
+        self.complete_seen = threading.Event()
         with self.connect() as db:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS items "
@@ -56,7 +62,29 @@ class Queue:
             )
             if cursor.rowcount != 1:
                 raise ToolError("item_not_pending")
+        self.complete_seen.set()
+        if not self.complete_gate.wait(timeout=60):
+            raise ToolError("qualification_completion_barrier_expired")
         return {"recorded": True, "id": item}
+
+    def read(self):
+        items = self.pending()
+        self.read_seen.set()
+        if not self.read_gate.wait(timeout=60):
+            raise ToolError("qualification_read_barrier_expired")
+        return {"items": items}
+
+    def barriers(self, read=False, complete=False):
+        for held, gate, seen in (
+            (read, self.read_gate, self.read_seen),
+            (complete, self.complete_gate, self.complete_seen),
+        ):
+            if held:
+                seen.clear()
+                gate.clear()
+            else:
+                gate.set()
+        return {"read": read, "complete": complete}
 
     def audit(self, tool, headers, key):
         human = any(
@@ -89,6 +117,8 @@ class Queue:
                     for row in db.execute("SELECT * FROM calls")
                 ],
                 "polls": [row[0] for row in db.execute("SELECT status FROM polls")],
+                "read_waiting": self.read_seen.is_set() and not self.read_gate.is_set(),
+                "complete_waiting": self.complete_seen.is_set() and not self.complete_gate.is_set(),
             }
 
     def poll(self, url, key):
@@ -162,6 +192,8 @@ def control_server(queue, url, key, address=("0.0.0.0", 8001)):
                     self.answer(201, {"stored": True})
                 elif self.path == "/poll":
                     self.answer(200, queue.poll(url, key))
+                elif self.path == "/barriers":
+                    self.answer(200, queue.barriers(**value))
                 else:
                     self.answer(404, {"error": "unknown_path"})
             except (ValueError, KeyError, TypeError, sqlite3.IntegrityError):
@@ -179,7 +211,7 @@ def build_mcp(queue, key):
     def queue_read(ctx: Context) -> str:
         """Read pending queue items. Use queue_complete to record each result."""
         queue.audit("read", ctx.headers or {}, key)
-        return json.dumps({"items": queue.pending()})
+        return json.dumps(queue.read())
 
     @server.tool(annotations=ToolAnnotations(read_only_hint=False, open_world_hint=False))
     def queue_complete(item_id: str, result: str, ctx: Context) -> str:

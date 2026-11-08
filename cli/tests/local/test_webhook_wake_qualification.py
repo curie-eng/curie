@@ -1,23 +1,28 @@
 """Signed HTTP qualification on the disposable ADR 0274 worker install.
 
-Run through ``curie dev test-env run -- uv run pytest -s <this file>``.
+Run through ``curie dev test-env run -- uv run pytest -o addopts= -s -rs <this file>``.
 The sibling worker fixture owns a real kind install and verifies teardown.
 This suite moves admission to HTTP, using an independent contract signer.
-The separate hosted case requires a live provider and a connector-only SecretRef.
+Hosted cases use a connector-only SecretRef. The live cases require
+``WAKE_TEST_MODEL_CREDENTIAL`` and otherwise record an explicit acceptance gap.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 import uuid
+from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 import yaml
-from test_webhook_wake_worker import FULLNAME, NAME, WakeStack
+from test_webhook_wake_worker import FULLNAME, NAME, WakeStack, wait_until
 
 BODY = b"{}"
 HOOK = "queue-ready"
@@ -47,10 +52,327 @@ def signed_headers(key, agent, hook, delivery, timestamp, body=BODY):
 class Qualification(WakeStack):
     def __init__(self, root):
         super().__init__(root)
+        self.env["CURIE_CREDENTIALS"] = "not-needed"
+        self.env["COMPOSE_DISABLE_ENV_FILE"] = "1"
         self.cluster = "test-adr0274-wake-e2e"
         self.context = f"kind-{self.cluster}"
         self.receipts = {}
         self.namespace_owned = False
+        self.exports = []
+        self.export_event = threading.Event()
+
+    def model_response(self, request):
+        tools = {item["name"] for item in request.get("tools", [])}
+        read = next((name for name in tools if name.endswith("queue_read")), None)
+        complete = next((name for name in tools if name.endswith("queue_complete")), None)
+        if read is None or complete is None:
+            return super().model_response(request)
+        from test_webhook_wake_worker import message_to_sse
+
+        def documents(value):
+            if isinstance(value, dict):
+                yield value
+                for child in value.values():
+                    yield from documents(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from documents(child)
+            elif isinstance(value, str):
+                try:
+                    yield from documents(json.loads(value))
+                except ValueError:
+                    pass
+
+        messages = request.get("messages", [])
+        opening = 0
+        for index, message in enumerate(messages):
+            content = message.get("content", [])
+            tool_result = isinstance(content, list) and any(
+                isinstance(block, dict) and block.get("type") == "tool_result" for block in content
+            )
+            if message.get("role") == "user" and not tool_result:
+                opening = index
+        values = list(documents(messages[opening:]))
+        completed = any(value.get("recorded") is True for value in values)
+        items = next((value["items"] for value in reversed(values) if "items" in value), None)
+        tool = None if completed or items == [] else read if items is None else complete
+        arguments = {} if not items else {"item_id": items[0]["id"], "result": "receipt-ok"}
+        return message_to_sse(
+            {
+                "id": f"msg_acme_{uuid.uuid4().hex}",
+                "model": request.get("model", "claude-sonnet-5"),
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": f"toolu_acme_{uuid.uuid4().hex}",
+                        "name": tool,
+                        "input": arguments,
+                    }
+                    if tool
+                    else {"type": "text", "text": "done"}
+                ],
+                "stop_reason": "tool_use" if tool else "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+        )
+
+    def start(self):
+        super().start()
+        runtime = self
+        parent = self.slack.RequestHandlerClass
+
+        class Telemetry(parent):
+            def do_POST(self):
+                if not self.path.startswith("/otlp/"):
+                    return super().do_POST()
+                runtime.exports.append(
+                    (self.path, self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+                )
+                runtime.export_event.set()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-protobuf")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        self.slack.RequestHandlerClass = Telemetry
+        self.upgrade(
+            {
+                "otelCollector": {
+                    "deploy": False,
+                    "telemetryDisabled": False,
+                    "endpoint": self.model_url.rsplit("/", 1)[0] + "/otlp",
+                    "protocol": "http/protobuf",
+                    "egress": [
+                        {
+                            "cidr": f"{os.environ['CURIE_LOCAL_STUB_HOST']}/32",
+                            "ports": [{"protocol": "TCP", "port": self.slack.server_port}],
+                        }
+                    ],
+                }
+            }
+        )
+
+    def upgrade(self, values):
+        from test_webhook_wake_worker import REPO
+
+        path = self.root / "qualification-values.yaml"
+        path.write_text(yaml.safe_dump(values))
+        self.run(
+            "helm",
+            "upgrade",
+            NAME,
+            str(REPO / "charts/curie"),
+            "--kube-context",
+            self.context,
+            "--namespace",
+            NAME,
+            "--reuse-values",
+            "-f",
+            str(path),
+            "--wait",
+            "--timeout",
+            "300s",
+            timeout=360,
+        )
+
+    def telemetry_snapshot(self):
+        from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import (
+            ExportMetricsServiceRequest,
+        )
+        from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+            ExportTraceServiceRequest,
+        )
+
+        services, wakes = set(), []
+        for path, raw in self.exports:
+            if path.endswith("/traces"):
+                request = ExportTraceServiceRequest.FromString(raw)
+                for resource in request.resource_spans:
+                    services.update(
+                        attribute.value.string_value
+                        for attribute in resource.resource.attributes
+                        if attribute.key == "service.name"
+                    )
+            if path.endswith("/metrics"):
+                request = ExportMetricsServiceRequest.FromString(raw)
+                for resource in request.resource_metrics:
+                    for scope in resource.scope_metrics:
+                        for metric in scope.metrics:
+                            if metric.name != "curie.schedule.fire":
+                                continue
+                            for point in metric.sum.data_points:
+                                attributes = {
+                                    item.key: item.value.string_value for item in point.attributes
+                                }
+                                if attributes.get("trigger") == "webhook":
+                                    wakes.append(attributes)
+        return {"services": services, "wakes": wakes}
+
+    def wait_telemetry(self):
+        deadline = time.monotonic() + 75
+        while True:
+            self.export_event.clear()
+            snapshot = self.telemetry_snapshot()
+            services_present = {"curie-api", "curie-worker", "curie-runner"} <= snapshot["services"]
+            if services_present and snapshot["wakes"]:
+                return snapshot
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not self.export_event.wait(remaining):
+                raise AssertionError("missing actual API/worker/runner traces or webhook metrics")
+
+    def restart_api(self):
+        self.kube("rollout", "restart", f"deployment/{FULLNAME}-api")
+        self.kube("rollout", "status", f"deployment/{FULLNAME}-api", "--timeout=180s")
+
+    def configure_lease(self, budget, lease):
+        self.upgrade(
+            {
+                "worker": {
+                    "deliveryBudgetSeconds": budget,
+                    "runnerTotalTimeoutSeconds": budget,
+                    "hookClaimLeaseSeconds": lease,
+                }
+            }
+        )
+        self.claim_lease_s = lease if lease is not None else budget
+        api = self.api_python(
+            "import json;from curie_api.config import get_settings;"
+            "print(json.dumps(get_settings().effective_hook_claim_lease_s))"
+        )
+        worker = json.loads(
+            self.kube(
+                "exec",
+                f"deployment/{FULLNAME}-worker",
+                "--",
+                "python3",
+                "-c",
+                "import json;from curie_worker.config import WorkerConfig;"
+                "print(json.dumps(WorkerConfig().effective_hook_claim_lease_s))",
+            )
+        )
+        assert api == worker == self.claim_lease_s
+        self.worker(False)
+
+    def wait_lease(self, run):
+        return self.api_python(
+            "import asyncio,json,os,select,time,uuid\n"
+            "import asyncpg\nfrom curie_api.config import get_settings\n"
+            "async def wait():\n"
+            " c=await asyncpg.connect(get_settings().database_url.replace("
+            "'postgresql+asyncpg://','postgresql://'))\n"
+            " try:\n"
+            "  while True:\n"
+            "   remaining=await c.fetchval('SELECT extract(epoch FROM "
+            "lease_expires_at-clock_timestamp()) FROM curie.hook_runs WHERE id=$1',"
+            f"uuid.UUID('{run}'))\n"
+            "   if remaining <= 0: break\n"
+            "   fd=os.timerfd_create(time.CLOCK_MONOTONIC)\n"
+            "   try:\n"
+            "    os.timerfd_settime(fd,initial=float(remaining))\n"
+            "    select.select([fd],[],[],float(remaining)+5)\n"
+            "   finally: os.close(fd)\n"
+            "  print(json.dumps({'expired_on_database_clock':True}))\n"
+            " finally: await c.close()\n"
+            "asyncio.run(wait())\n"
+        )
+
+    def fault_mode(self, mode):
+        return json.loads(
+            self.kube(
+                "exec",
+                "test-adr0274-wake-proxy",
+                "--",
+                "python3",
+                "-c",
+                "import json,urllib.request;"
+                f"raw=json.dumps({{'mode':{mode!r}}}).encode();"
+                "request=urllib.request.Request('http://127.0.0.1:8000/',data=raw);"
+                "print(urllib.request.urlopen(request,timeout=10).read().decode())",
+            )
+        )
+
+    @contextmanager
+    def transport_fault(self):
+        import webhook_wake_fault_proxy
+
+        name = "test-adr0274-wake-proxy"
+        host = self.api_python(
+            "import json,urllib.parse;from curie_api.config import get_settings;"
+            "print(json.dumps(urllib.parse.urlsplit(get_settings().valkey_dsn()).hostname))"
+        ).split(".")[0]
+        service = json.loads(self.kube("get", "service", host, "-o", "json"))
+        endpoints = json.loads(self.kube("get", "endpoints", host, "-o", "json"))
+        upstream = endpoints["subsets"][0]["addresses"][0]["ip"]
+        resources = [
+            {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": name},
+                "data": {"proxy.py": Path(webhook_wake_fault_proxy.__file__).read_text()},
+            },
+            {
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": name, "labels": {**service["spec"]["selector"], "app": name}},
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "proxy",
+                            "image": self.images["api"],
+                            "imagePullPolicy": "Never",
+                            "command": ["python3", "/fixture/proxy.py"],
+                            "env": [{"name": "UPSTREAM_HOST", "value": upstream}],
+                            "volumeMounts": [{"name": "fixture", "mountPath": "/fixture"}],
+                            "readinessProbe": {"tcpSocket": {"port": 6379}, "periodSeconds": 1},
+                        }
+                    ],
+                    "volumes": [{"name": "fixture", "configMap": {"name": name}}],
+                },
+            },
+            {
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {"name": name},
+                "spec": {"selector": {"app": name}, "ports": [{"port": 8000}]},
+            },
+        ]
+        try:
+            self.kube(
+                "apply",
+                "-f",
+                "-",
+                stdin=json.dumps({"apiVersion": "v1", "kind": "List", "items": resources}),
+            )
+            self.kube("wait", "--for=condition=Ready", f"pod/{name}", "--timeout=90s")
+            self.kube(
+                "patch",
+                "service",
+                host,
+                "--type=json",
+                "-p",
+                json.dumps([{"op": "replace", "path": "/spec/selector", "value": {"app": name}}]),
+            )
+            self.restart_api()
+            yield
+        finally:
+            self.kube(
+                "patch",
+                "service",
+                host,
+                "--type=json",
+                "-p",
+                json.dumps(
+                    [
+                        {
+                            "op": "replace",
+                            "path": "/spec/selector",
+                            "value": service["spec"]["selector"],
+                        }
+                    ]
+                ),
+            )
+            self.restart_api()
+            self.kube("delete", "pod,service,configmap", name, "--ignore-not-found", "--wait=true")
 
     def kube(self, *args, stdin=None):
         output = super().kube(*args, stdin=stdin)
@@ -65,7 +387,7 @@ class Qualification(WakeStack):
         finally:
             super().close()
 
-    def scheduler_tick(self):
+    def scheduler_tick(self, offset_seconds=0):
         self.kube(
             "exec",
             "-i",
@@ -74,6 +396,7 @@ class Qualification(WakeStack):
             "python3",
             "-",
             stdin="import asyncio,os\n"
+            "from datetime import UTC,datetime,timedelta\n"
             "from curie_worker.run import build\n"
             "from curie_worker.config import WorkerConfig\n"
             "from curie_worker.worker_lifecycle import WorkerResources\n"
@@ -81,14 +404,27 @@ class Qualification(WakeStack):
             " resources=WorkerResources()\n"
             " try:\n"
             "  runtime=build(WorkerConfig(),os.environ,resources=resources)\n"
-            "  await runtime.cron_loop.one_pass()\n"
+            f"  now=datetime.now(UTC)+timedelta(seconds={offset_seconds})\n"
+            "  await runtime.cron_loop.one_pass(now)\n"
             " finally: await resources.aclose()\n"
             "asyncio.run(tick())\n",
         )
 
     def capture_failure(self):
-        super().capture_failure()
+        command = self.root / "command-failure.log"
+        if command.exists():
+            (self.root / "failure-command.log").write_text(command.read_text())
+        (self.root / "failure-model.json").write_text(
+            json.dumps({"paths": self.model_paths, "bash_requests": self.bash_requests})
+        )
+        for role in ("api", "worker"):
+            try:
+                output = self.kube("logs", f"deployment/{FULLNAME}-{role}", "--tail=300")
+            except RuntimeError:
+                output = "Container logs were unavailable during failure capture."
+            (self.root / f"failure-{role}.log").write_text(output)
         pods = json.loads(self.kube("get", "pods", "-o", "json"))["items"]
+        (self.root / "failure-pods.json").write_text(json.dumps(pods))
         for index, pod in enumerate(pods):
             for container in pod["spec"]["containers"]:
                 role = container["name"]
@@ -169,13 +505,36 @@ class Qualification(WakeStack):
             "stream": self.redis("XRANGE", "curie:runs", "-", "+"),
         }
 
+    def wake_batch(self, agent="acme-wake-idle", count=8):
+        key, agent_id = self.key(agent), self.agents[agent]
+        headers = [
+            signed_headers(key, agent_id, HOOK, uuid.uuid4().hex, int(time.time()))
+            for _ in range(count)
+        ]
+        return self.api_python(
+            "import concurrent.futures,json,urllib.request,urllib.error\n"
+            f"headers={headers!r}\n"
+            "def send(item):\n"
+            f" request=urllib.request.Request('http://127.0.0.1:8000/hooks/{agent_id}/{HOOK}/wake',"
+            "data=b'{}',headers=item)\n"
+            " try: response=urllib.request.urlopen(request,timeout=30)\n"
+            " except urllib.error.HTTPError as error: response=error\n"
+            " with response: return {'status':response.status,'body':json.loads(response.read())}\n"
+            f"with concurrent.futures.ThreadPoolExecutor(max_workers={count}) as pool:\n"
+            " print(json.dumps(list(pool.map(send,headers))))\n"
+        )
+
     def assert_refused(self, status, reason, **kwargs):
         before = self.snapshot()
+        agent = self.agents[kwargs.get("agent", "acme-wake-idle")]
+        pattern = f"curie:hook-wake:v1:*:{agent}:*"
+        reservations = set(self.redis("KEYS", pattern))
         answers = self.wake(**kwargs)
         assert all(
             item["status"] == status and item["body"] == {"detail": reason} for item in answers
         )
         assert self.snapshot() == before
+        assert not set(self.redis("KEYS", pattern)) - reservations
 
     def queued(self, agent="acme-wake-idle", **kwargs):
         answer = self.wake(agent, **kwargs)[0]
@@ -183,6 +542,34 @@ class Qualification(WakeStack):
         assert set(answer["body"]) == {"status", "run_id"}
         assert answer["body"]["status"] == "queued"
         return answer["body"]["run_id"]
+
+    def pause(self, agent, enabled):
+        action = "pause" if enabled else "resume"
+        answer = self.http(
+            f"/schedules/{self.agents[agent]}/{HOOK}/{action}", method="POST", admin=True
+        )[0]
+        assert answer["status"] == 200
+        assert answer["body"] == {"agent": agent, "name": HOOK, "paused": enabled}
+
+    def run_record(self, agent, run):
+        return json.loads(
+            self.run(
+                self.cli,
+                "cluster",
+                "hook",
+                "--context",
+                self.context,
+                "--namespace",
+                NAME,
+                "--release",
+                NAME,
+                "record",
+                agent,
+                HOOK,
+                run,
+                "--json",
+            )
+        )
 
     def add_agent(self, agent):
         bundle = self.root / agent
@@ -237,6 +624,45 @@ class Qualification(WakeStack):
         self.agents[agent] = receipt["agent"]["id"]
         self.receipts[agent] = receipt
 
+    def redeploy(self, agent, bundle, label):
+        return json.loads(
+            self.run(
+                self.cli,
+                "cluster",
+                "deploy",
+                "--context",
+                self.context,
+                "--namespace",
+                NAME,
+                "--release",
+                NAME,
+                "--agent",
+                agent,
+                "--plugin-dir",
+                str(bundle),
+                "--label",
+                label,
+                "--json",
+            )
+        )
+
+    def sandbox_manifest(self, agent):
+        pods = [pod for pod, claim in self.agent_callers() if claim["agent"] == agent]
+        assert len(pods) == 1
+        return json.loads(
+            self.kube(
+                "exec",
+                pods[0],
+                "-c",
+                "runner",
+                "--",
+                "python3",
+                "-c",
+                "import json,os;from pathlib import Path;"
+                "print((Path(os.environ['CURIE_PLUGIN_DIR'])/'.claude-plugin/plugin.json').read_text())",
+            )
+        )
+
     def deploy(self, agent):
         super().deploy(agent)
         bundle = self.root / agent
@@ -276,16 +702,25 @@ def qualification(request, tmp_path_factory):
         runtime.start()
         yield runtime
     finally:
-        runtime.close()
+        try:
+            if request.session.testsfailed:
+                runtime.capture_failure()
+        finally:
+            runtime.close()
 
 
 def test_acceptance_1(qualification):
     """Receipt secrecy is one part of item 1; connector boot needs its own proof."""
     stack = qualification
-    key = stack.key()
-    for receipt in stack.receipts.values():
-        assert "wake_triggers" in receipt
-        assert_no_key(receipt, key)
+    for agent, receipt in stack.receipts.items():
+        assert receipt["wake_triggers"] == [
+            {
+                "name": HOOK,
+                "path": f"/hooks/{stack.agents[agent]}/{HOOK}/wake",
+                "mode": "targetless",
+            }
+        ]
+        assert_no_key(receipt, stack.key(agent))
     assert stack.redis("XLEN", "curie:runs") == 0
 
 
@@ -395,12 +830,22 @@ def test_source_controls(qualification, guard):
         column, value = (
             ("hook_partitions", {"pointer": "/item/id"})
             if guard == "partition"
-            else ("source_bindings", {"workload_pointer": "/workload", "map": {}})
+            else (
+                "source_bindings",
+                {
+                    "workload_pointer": "/workload",
+                    "map": {"acme": {"repository": "acme-corp/acme-bot", "revision": "main"}},
+                },
+            )
         )
-        stack.sql(
-            f"UPDATE curie.agents SET {column}='{json.dumps({HOOK: value})}'::jsonb "
-            f"WHERE id='{agent_id}'"
-        )
+        updated = stack.http(
+            f"/agents/{agent_id}",
+            method="PATCH",
+            admin=True,
+            body=json.dumps({column: {HOOK: value}}),
+            headers={"Content-Type": "application/json"},
+        )[0]
+        assert updated["status"] == 200
     before = stack.snapshot()
     stack.assert_refused(409, "wake_source_not_ordinary", agent=agent, key=key)
     route = f"/agents/{agent_id}/hooks/{HOOK}/wake-secret"
@@ -412,6 +857,7 @@ def test_source_controls(qualification, guard):
     assert (
         stack.sql(f"SELECT count(*) FROM curie.hook_wake_keys WHERE agent_id='{agent_id}'") == "0"
     )
+    assert stack.http("/agents", admin=True)[0]["status"] == 200
 
 
 def test_acceptance_3(qualification):
@@ -438,6 +884,85 @@ def test_acceptance_3(qualification):
     stack.settled(fresh, "ran")
 
 
+def test_signature_purposes_and_shared_key(qualification):
+    stack = qualification
+    stack.worker(False)
+    agent = stack.agents["acme-wake-idle"]
+    key = stack.key()
+    shared = stack.http(f"/agents/{agent}/hook-secret", admin=True)[0]
+    assert shared["status"] == 200
+    ordinary_key = shared["body"]["secret"]
+    stack.assert_refused(401, "invalid_wake_signature", key=ordinary_key)
+    timestamp, delivery = int(time.time()), uuid.uuid4().hex
+    headers = signed_headers(key, agent, HOOK, delivery, timestamp)
+    before = stack.snapshot()
+    headers["Content-Type"] = "application/json"
+    crossed = stack.http(f"/hooks/{agent}/{HOOK}", method="POST", body="{}", headers=headers)[0]
+    assert crossed["status"] == 401
+    context = json.dumps([HOOK, None], separators=(",", ":")).encode()
+    material = b"curie.hook.delivery.v2\n" + f"{timestamp}.{delivery}.{len(context)}:".encode()
+    material += context + BODY
+    for signing_key in (ordinary_key, key):
+        headers["X-Curie-Signature-256"] = (
+            "sha256=" + hmac.new(signing_key.encode(), material, hashlib.sha256).hexdigest()
+        )
+        crossed = stack.http(
+            f"/hooks/{agent}/{HOOK}/wake", method="POST", body="{}", headers=headers
+        )[0]
+        assert crossed["status"] == 401
+        assert crossed["body"] == {"detail": "invalid_wake_signature"}
+    assert stack.snapshot() == before
+    run = stack.queued()
+    stack.worker(True)
+    stack.settled(run, "ran")
+
+
+def test_fresh_overlap_and_dedupe_expiry(qualification):
+    stack = qualification
+    stack.worker(False)
+    answers = stack.wake_batch()
+    assert sorted(item["status"] for item in answers) == [200] * 7 + [202]
+    run = next(item["body"]["run_id"] for item in answers if item["status"] == 202)
+    before = stack.snapshot()
+    assert stack.wake_batch() == [{"status": 200, "body": {"status": "coalesced"}}] * 8
+    assert stack.snapshot() == before
+    stack.worker(True)
+    stack.settled(run, "ran")
+    stack.worker(False)
+    delivery, timestamp = uuid.uuid4().hex, int(time.time())
+    agent = stack.agents["acme-wake-idle"]
+    run = stack.queued(delivery=delivery, timestamp=timestamp)
+    generation = stack.http(f"/agents/{agent}/hooks/{HOOK}/wake-secret", admin=True)[0]["body"][
+        "generation"
+    ]
+    reservation = stack.api_python(
+        "import json;from curie_api.config import get_settings;"
+        "from curie_api.hook_wake_signing import dedupe_key;"
+        f"print(json.dumps(dedupe_key(get_settings().api_key,agent_id='{agent}',hook='{HOOK}',"
+        f"generation={generation},"
+        f"delivery_id='{delivery}')))"
+    )
+    assert 300_000 <= stack.redis("PTTL", reservation) <= 601_000
+    stack.worker(True)
+    stack.settled(run, "ran")
+    stack.worker(False)
+    before = stack.snapshot()
+    assert stack.wake(delivery=delivery, timestamp=timestamp)[0]["body"] == {"status": "coalesced"}
+    assert stack.snapshot() == before
+    assert stack.redis("PEXPIRE", reservation, "1") == 1
+    asyncio.run(
+        wait_until(
+            lambda: stack.redis("EXISTS", reservation) == 0,
+            "reservation expiry",
+            timeout=5,
+            interval=0.1,
+        )
+    )
+    fresh = stack.queued()
+    stack.worker(True)
+    stack.settled(fresh, "ran")
+
+
 def test_acceptance_4(qualification):
     """HTTP admission through real worker/sandbox; hosted MCP remains separate."""
     stack = qualification
@@ -455,8 +980,11 @@ def test_acceptance_4(qualification):
     assert stack.state(blocked)["outcome"] == "blocked"
     later = stack.queued()
     stack.settled(later, "ran")
+    attempted = stack.bash_requests
     gated = stack.queued("acme-wake-gated")
     stack.settled(gated, "failed", "approval_gate_targetless")
+    assert stack.bash_requests > attempted
+    assert stack.marker_value("acme-wake-gated") is None
     assert stack.sql("SELECT count(*) FROM curie.approvals") == "0"
     assert stack.slack_calls == []
     entries = stack.redis("XRANGE", "curie:runs", "-", "+")
@@ -496,24 +1024,250 @@ def test_acceptance_5(qualification):
     assert read["status"] == 200
     assert read["body"]["trigger"] == "webhook"
     assert_no_key(read, stack.key())
+    record = stack.run_record("acme-wake-idle", run)
+    assert record["id"] == run
+    assert record["source"] == record["trigger"] == "webhook"
+    assert_no_key(record, stack.key())
+
+
+@pytest.mark.parametrize("action", ["rotate", "pause", "source"])
+def test_admission_races(qualification, action):
+    from pathlib import Path
+
+    import webhook_wake_races
+
+    stack = qualification
+    agent = "acme-wake-idle"
+    if action == "source":
+        agent = "acme-wake-race-source"
+        stack.add_agent(agent)
+    delivery, timestamp = uuid.uuid4().hex, int(time.time())
+    key = stack.key(agent)
+    if action == "rotate":
+        admitted = stack.queued(agent, delivery=delivery, timestamp=timestamp)
+        stack.worker(True)
+        stack.settled(admitted, "ran")
+    stack.worker(False)
+    before = stack.snapshot()
+    spec = dict(
+        agent=stack.agents[agent],
+        hook=HOOK,
+        action=action,
+        headers=signed_headers(key, stack.agents[agent], HOOK, delivery, timestamp),
+    )
+    answers = stack.api_python(
+        "SPEC="
+        + repr(spec)
+        + "\n"
+        + Path(webhook_wake_races.__file__).read_text()
+        + "\nasyncio.run(coordinate(SPEC))\n"
+    )
+    if action != "source":
+        assert answers.pop(0)["status"] == 200
+    expected = (
+        (401, "invalid_wake_signature")
+        if action == "rotate"
+        else (409, "hook_paused" if action == "pause" else "wake_source_not_ordinary")
+    )
+    assert answers == [{"status": expected[0], "body": {"detail": expected[1]}}] * 4
+    assert stack.snapshot() == before
+    if action == "pause":
+        stack.pause(agent, False)
+    if action != "source":
+        later = stack.queued(agent)
+        stack.worker(True)
+        stack.settled(later, "ran")
+
+
+def test_installed_migration(qualification):
+    import webhook_wake_migration
+
+    observed = qualification.api_python(
+        "import asyncio\n"
+        + Path(webhook_wake_migration.__file__).read_text()
+        + "\nasyncio.run(qualify())\n"
+    )
+    assert observed == {
+        "history_preserved": True,
+        "webhook_accepted": True,
+        "lossy_downgrades_refused": 2,
+        "clean_downgrade": "0148",
+    }
+
+
+def test_stale_delivery_and_operator_controls(qualification):
+    from aci_protocol import QueuedTurn
+
+    stack = qualification
+    agent = stack.agents["acme-wake-idle"]
+    run = stack.queued()
+    stack.worker(True)
+    stack.settled(run, "ran")
+    before = stack.snapshot()
+    event = QueuedTurn.model_validate_json(before["stream"][-1][1]["payload"])
+    stale = event.model_copy(update={"event_id": event.event_id + ":stale"})
+    stack.enqueue(stale)
+    stack.wait_done(stale)
+    assert stack.snapshot()["runs"] == before["runs"]
+    assert stack.redis("XLEN", "curie:runs") == len(before["stream"]) + 1
+    stack.worker(False)
+    queued = stack.queued()
+    key = stack.key()
+    route = f"/agents/{agent}/hooks/{HOOK}/runs/{queued}"
+    assert stack.http(route)[0]["status"] in (401, 403)
+    assert stack.http(route, headers={"X-Api-Key": key})[0]["status"] in (401, 403)
+    assert (
+        stack.http(f"/agents/{agent}/hooks/{HOOK}/wake-secret/rotate", method="POST", admin=True)[
+            0
+        ]["status"]
+        == 200
+    )
+    assert stack.http(f"/agents/{agent}/kill", method="POST", admin=True)[0]["body"] == {
+        "killed": True
+    }
+    stack.assert_refused(409, "agent_killed")
+    stack.worker(True)
+    stack.settled(queued, "blocked", "agent_killed")
+    queried = stack.http(route, admin=True)[0]
+    assert queried["status"] == 200 and queried["body"]["trigger"] == "webhook"
+    assert stack.http(f"/agents/{agent}/resume", method="POST", admin=True)[0]["body"] == {
+        "killed": False
+    }
+    fresh = stack.queued()
+    stack.settled(fresh, "ran")
+    assert stack.slack_calls == []
+
+
+def test_deployment_replacement_and_cron_overlap(qualification):
+    stack = qualification
+    agent = "acme-wake-replacement"
+    stack.add_agent(agent)
+    stack.worker(False)
+    run = stack.queued(agent)
+    accepted_version = stack.sql(f"SELECT version_id::text FROM curie.hook_runs WHERE id='{run}'")
+    bundle = stack.root / agent
+    path = bundle / ".claude-plugin/plugin.json"
+    original = json.loads(path.read_text())
+    replacement = {**original, "version": "1.0.1"}
+    path.write_text(json.dumps(replacement))
+    stack.redeploy(agent, bundle, "replacement")
+    stack.worker(True)
+    stack.settled(run, "ran")
+    recorded = stack.sql(f"SELECT version_id::text FROM curie.hook_runs WHERE id='{run}'")
+    assert recorded == accepted_version
+    assert stack.sandbox_manifest(agent)["version"] == "1.0.1"
+    stack.worker(False)
+    overlap = stack.queued(agent)
+    replacement["version"] = "1.0.2"
+    replacement["triggers"] = [
+        {
+            "type": "cron",
+            "name": HOOK,
+            "schedule": "* * * * *",
+            "prompt": original["triggers"][0]["prompt"],
+        }
+    ]
+    path.write_text(json.dumps(replacement))
+    try:
+        stack.redeploy(agent, bundle, "cron-overlap")
+        stack.worker(False)
+        entries = stack.redis("XLEN", "curie:runs")
+        stack.scheduler_tick(offset_seconds=65)
+        rows = stack.sql(
+            "SELECT json_agg(json_build_object('source',source,'outcome',outcome,'reason',reason)) "
+            f"FROM curie.hook_runs WHERE agent_id='{stack.agents[agent]}' AND source='schedule'"
+        )
+        assert {"source": "schedule", "outcome": "skipped", "reason": "run_in_flight"} in rows
+        assert stack.redis("XLEN", "curie:runs") == entries
+        stack.worker(True)
+        stack.settled(overlap, "ran")
+    finally:
+        original["version"] = "1.0.3"
+        path.write_text(json.dumps(original))
+        stack.redeploy(agent, bundle, "restore-wake")
+    assert stack.slack_calls == []
+
+
+@pytest.mark.parametrize("budget,lease", [(60, 75), (65, None)])
+def test_transport_failure_and_timed_recovery(qualification, budget, lease):
+    stack = qualification
+    stack.configure_lease(budget, lease)
+    try:
+        with stack.transport_fault():
+            before = stack.snapshot()
+            key = stack.key()
+            stack.fault_mode("down")
+            try:
+                answer = stack.wake(key=key)[0]
+                assert answer["status"] == 503
+                assert answer["body"] == {"detail": "authority_unavailable"}
+            finally:
+                observed = stack.fault_mode("forward")
+            assert observed["refused"] > 0
+            assert stack.snapshot() == before
+            stack.fault_mode("drop_xadd")
+            try:
+                answer = stack.wake()[0]
+                assert answer["status"] == 503
+                assert answer["body"] == {"detail": "wake_enqueue_unavailable"}
+            finally:
+                observed = stack.fault_mode("forward")
+            assert observed["dropped"] > 0
+            rows = stack.sql(
+                "SELECT json_agg(json_build_object('id',id,'outcome',outcome,'lease',"
+                "extract(epoch FROM lease_expires_at-started_at))) FROM curie.hook_runs "
+                "WHERE outcome IS NULL"
+            )
+            assert len(rows) == 1 and rows[0]["outcome"] is None
+            assert abs(rows[0]["lease"] - stack.claim_lease_s) < 1
+            assert stack.snapshot()["stream"] == before["stream"]
+            lost = rows[0]["id"]
+            stack.restart_api()
+            before_expiry = stack.snapshot()
+            assert stack.wake()[0]["body"] == {"status": "coalesced"}
+            assert stack.snapshot() == before_expiry
+            assert stack.wait_lease(lost) == {"expired_on_database_clock": True}
+            fresh = stack.queued()
+            stack.settled(lost, "reclaimed", "claim_expired")
+            stack.worker(True)
+            assert stack.settled(fresh, "ran")["renewed"]
+            remaining = stack.sql(
+                "SELECT extract(epoch FROM lease_expires_at-clock_timestamp()) "
+                f"FROM curie.hook_runs WHERE id='{fresh}'"
+            )
+            assert 0 < float(remaining) <= stack.claim_lease_s + 1
+    finally:
+        stack.configure_lease(600, None)
+        stack.worker(True)
 
 
 @pytest.mark.parametrize("qualification", ["cluster"], indirect=True)
-def test_hosted_connector_session(qualification):
-    """A live model reads and writes through the real hosted MCP connector."""
-    stack = qualification
-    credential_name = next(
-        (
-            name
-            for name in ("CURIE_CREDENTIALS", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
-            if os.environ.get(name)
+@pytest.mark.parametrize("agent", ["acme-wake-idle", "acme-wake-http"])
+@pytest.mark.parametrize(
+    "provider_tier",
+    [
+        "scripted",
+        pytest.param(
+            "live",
+            marks=pytest.mark.skipif(
+                not os.environ.get("WAKE_TEST_MODEL_CREDENTIAL"),
+                reason="ADR 0274 live-provider connector/session gap: approved credential absent",
+            ),
         ),
-        None,
-    )
-    if credential_name is None:
-        raise RuntimeError("live connector qualification requires a provider credential")
-    credential = os.environ[credential_name]
-    agent = "acme-wake-idle"
+    ],
+)
+def test_hosted_connector_session(qualification, agent, provider_tier, record_property):
+    """Read and write through the real MCP path, with independent model tiers."""
+    stack = qualification
+    live = provider_tier == "live"
+    credential = os.environ.get("WAKE_TEST_MODEL_CREDENTIAL", "") if live else "not-needed"
+    if not credential:
+        gap = "ADR 0274 live-provider connector/session proof missing: approved credential absent"
+        record_property("acceptance_gap", gap)
+        pytest.skip(gap)
+    credential_name = os.environ.get("WAKE_TEST_MODEL_ENV_KEY", "ANTHROPIC_API_KEY")
+    if credential_name not in {"CURIE_CREDENTIALS", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}:
+        raise RuntimeError("approved test model credential uses an unsupported environment key")
     agent_id = stack.agents[agent]
     key = stack.key(agent)
     image = f"curie-wake-connector:{stack.tag}"
@@ -531,7 +1285,8 @@ def test_hosted_connector_session(qualification):
     )
     stack.images["connector"] = image
     stack.run("kind", "load", "docker-image", "--name", stack.cluster, image, timeout=300)
-    for name, value in (("acme-wake-credential", key), ("acme-model-credential", credential)):
+    wake_secret = f"{agent}-wake-credential"
+    for name, value in ((wake_secret, key), ("acme-model-credential", credential)):
         stack.kube(
             "apply",
             "-f",
@@ -546,10 +1301,10 @@ def test_hosted_connector_session(qualification):
             ),
         )
     extra = []
-    for name in ("ANTHROPIC_BASE_URL",):
-        if os.environ.get(name):
-            extra.append({"name": name, "value": os.environ[name]})
-    live = stack.root / "live.yaml"
+    base_url = os.environ.get("WAKE_TEST_MODEL_BASE_URL", "") if live else stack.model_url
+    if base_url:
+        extra.append({"name": "CURIE_MODEL_BASE_URL", "value": base_url})
+    values_path = stack.root / "live.yaml"
     runner = {"fakeModel": False, "extraEnv": extra}
     if credential_name == "CURIE_CREDENTIALS":
         runner.update(
@@ -563,9 +1318,9 @@ def test_hosted_connector_session(qualification):
                 "valueFrom": {"secretKeyRef": {"name": "acme-model-credential", "key": "key"}},
             }
         )
-    if os.environ.get("CURIE_MODEL"):
-        runner["model"] = os.environ["CURIE_MODEL"]
-    live.write_text(
+    if live and os.environ.get("WAKE_TEST_MODEL"):
+        runner["model"] = os.environ["WAKE_TEST_MODEL"]
+    values_path.write_text(
         yaml.safe_dump(
             {
                 "agentSandbox": {"runner": runner},
@@ -586,7 +1341,7 @@ def test_hosted_connector_session(qualification):
         NAME,
         "--reuse-values",
         "-f",
-        str(live),
+        str(values_path),
         "--wait",
         "--timeout",
         "300s",
@@ -614,7 +1369,7 @@ def test_hosted_connector_session(qualification):
                         "secrets": [
                             {
                                 "name": "CURIE_HOOK_WAKE_KEY",
-                                "from_secret": "acme-wake-credential",
+                                "from_secret": wake_secret,
                                 "key": "key",
                             }
                         ],
@@ -650,6 +1405,7 @@ def test_hosted_connector_session(qualification):
         for item in deployments
         if any(
             container["image"] == image
+            and any(agent_id in env.get("value", "") for env in container.get("env", []))
             for container in item["spec"]["template"]["spec"]["containers"]
         )
     ]
@@ -678,17 +1434,107 @@ def test_hosted_connector_session(qualification):
         )
 
     before = stack.snapshot()
+
+    def sandbox_ids():
+        return {
+            item["metadata"]["uid"]
+            for item in json.loads(stack.kube("get", "sandboxes", "-o", "json"))["items"]
+        }
+
+    sandboxes = sandbox_ids()
     assert control("/poll", {}) == {"status": "empty"}
     assert stack.snapshot() == before
+    assert sandbox_ids() == sandboxes
+    if not live:
+        stack.worker(False)
+        control("/barriers", {"read": True, "complete": True})
     control("/items", {"id": "item-1", "text": "Record the result receipt-ok."})
     polled = control("/poll", {})
     assert polled["http_status"] == 202
     run = polled["receipt"]["run_id"]
-    stack.settled(run, "ran")
+    if live:
+        stack.settled(run, "ran")
+    else:
+        try:
+            admitted = stack.snapshot()
+            assert control("/poll", {})["receipt"] == {"status": "coalesced"}
+            assert stack.snapshot() == admitted
+            stack.worker(True)
+            asyncio.run(
+                wait_until(
+                    lambda: control("/observation")["read_waiting"],
+                    "connector's last read",
+                    timeout=90,
+                    interval=0.25,
+                )
+            )
+            control("/items", {"id": "item-2", "text": "Arrived after the last queue read."})
+            assert control("/poll", {})["receipt"] == {"status": "coalesced"}
+            control("/barriers", {"read": False, "complete": True})
+            asyncio.run(
+                wait_until(
+                    lambda: control("/observation")["complete_waiting"],
+                    "connector completion",
+                    timeout=30,
+                    interval=0.25,
+                )
+            )
+            assert control("/poll", {})["receipt"] == {"status": "coalesced"}
+        finally:
+            control("/barriers", {"read": False, "complete": False})
+        stack.settled(run, "ran")
+        after = stack.snapshot()
+        assert {row["id"] for row in after["runs"]} == {row["id"] for row in admitted["runs"]}
+        assert after["stream"] == admitted["stream"]
+        assert control("/observation")["items"] == [
+            {"id": "item-1", "result": "receipt-ok"},
+            {"id": "item-2", "result": None},
+        ]
+        fresh = control("/poll", {})
+        assert fresh["http_status"] == 202
+        stack.settled(fresh["receipt"]["run_id"], "ran")
     observation = control("/observation")
-    assert observation["items"] == [{"id": "item-1", "result": "receipt-ok"}]
+    expected = [{"id": "item-1", "result": "receipt-ok"}]
+    if not live:
+        expected.append({"id": "item-2", "result": "receipt-ok"})
+    assert observation["items"] == expected
     assert {call["tool"] for call in observation["calls"]} == {"read", "complete"}
     assert all(call["agent"] == agent for call in observation["calls"])
     assert all(not call["human_header"] and not call["key_header"] for call in observation["calls"])
     assert_no_key(stack.transcripts(agent), key)
+    assert_no_key(observation, key)
+    assert_no_key(polled, key)
+    assert_no_key(json.loads(stack.kube("get", "sandboxtemplates", "-o", "json")), key)
+    for pod, claims in stack.agent_callers():
+        if claims["agent"] != agent:
+            continue
+        inspection = stack.kube(
+            "exec",
+            pod,
+            "-c",
+            "runner",
+            "--",
+            "python3",
+            "-c",
+            "import json,os;from pathlib import Path;"
+            "print(json.dumps({'env':dict(os.environ),'configs':{str(p):p.read_text() "
+            "for p in Path(os.environ['CURIE_PLUGIN_DIR']).rglob('*.json')}}))",
+        )
+        assert_no_key(json.loads(inspection), key)
+        assert "CURIE_HOOK_WAKE_KEY" not in json.loads(inspection)["env"]
+        assert_no_key(stack.kube("logs", pod, "-c", "runner"), key)
+    for role in ("api", "worker"):
+        assert_no_key(stack.kube("logs", f"deployment/{FULLNAME}-{role}"), key)
+    for role in ("server", "caller-proxy"):
+        assert_no_key(stack.kube("logs", f"deployment/{connector}", "-c", role), key)
+    snapshot = stack.wait_telemetry()
+    assert snapshot["wakes"]
+    assert any(
+        agent.encode() in raw or agent_id.encode() in raw
+        for path, raw in stack.exports
+        if path.endswith("/traces")
+    )
+    for _, exported in stack.exports:
+        if key.encode() in exported:
+            raise AssertionError("wake credential escaped into telemetry")
     assert stack.slack_calls == []
