@@ -419,6 +419,7 @@ def case(
     repeat: int = 1,
     concurrent: bool = False,
     reuse: str | None = None,
+    dm: bool = False,
 ) -> dict[str, Any]:
     """One request the pod sends, ``repeat`` times, and what it must answer.
 
@@ -427,6 +428,8 @@ def case(
     ``turn``'s queued reply handle, with ``dedupe_key`` defaulting to the turn's
     event id, unless ``approval`` gives the whole body. ``reuse`` resends an
     earlier case's exact approval in the same call under a new request id.
+    ``dm`` sends ``card_channel`` null, as the worker does for an ADR 0272
+    approver DM route.
     """
 
     return {
@@ -444,6 +447,7 @@ def case(
         "repeat": repeat,
         "concurrent": concurrent,
         "reuse": reuse,
+        "dm": dm,
         "expected": dict(expected),
     }
 
@@ -879,6 +883,8 @@ _SAFE_FIELDS = (
     "requested_by",
     "connector_requester_identity",
     "connector_requester_identity_version",
+    # ADR 0272: an approver DM creation's verified recipient (ids only).
+    "delivery",
 )
 
 
@@ -962,11 +968,21 @@ def ticket_claims(
         "issued_at": issued_at,
         "expires_at": issued_at + int(spec["lifetime"]),
         "arguments_sha256": arguments_sha256,
-        "approvers": [
-            {"tenant_id": tenant, "issuer": who["issuer"], "subject": who["subject"]}
-            for who in approvers
-        ],
+        "approvers": [approver_claim(tenant, who) for who in approvers],
     }
+
+
+def approver_claim(tenant: str, who: Mapping[str, Any]) -> dict[str, Any]:
+    """One selected approver's ticket claim, with ADR 0272 recipient accounts when given."""
+
+    claim: dict[str, Any] = {
+        "tenant_id": tenant,
+        "issuer": who["issuer"],
+        "subject": who["subject"],
+    }
+    if who.get("recipient_accounts") is not None:
+        claim["recipient_accounts"] = copy.deepcopy(list(who["recipient_accounts"]))
+    return claim
 
 
 def tamper_signature(token: str) -> str:
@@ -1017,7 +1033,8 @@ def approval_fields(
 
     The reply fields and the author are the turn's own, the dedupe key is its
     event id unless the case names one, and the card goes to the reply channel,
-    which is where a routeless or requesting-surface card goes.
+    which is where a routeless or requesting-surface card goes, except on a
+    ``dm`` case, whose card channel is null until the worker registers the DM.
     """
 
     handle = turn.reply_handle
@@ -1034,7 +1051,7 @@ def approval_fields(
         "reply_identity": handle.identity,
         "dedupe_key": item.get("dedupe_key") or turn.event_id,
         "route": item["route"],
-        "card_channel": handle.channel,
+        "card_channel": None if item.get("dm") else handle.channel,
         "gate_kind": item["gate_kind"],
         "granted_tool": item["tool"],
         "granted_arguments": dict(granted_arguments),

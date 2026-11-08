@@ -61,14 +61,19 @@ from typing import Any
 from identity_assets import (
     CREDENTIAL_ID,
     DEFAULT_ROSTER,
+    DM_ACCOUNT,
+    DM_FOREIGN_IDENTITY,
+    DM_IDENTITY,
     DOMAIN,
     INBOX_DOMAIN,
     ISSUER,
     LOOKUP_PORT,
     MEMBER_GROUP,
     OWNER_LABEL,
+    PENDING_RETENTION_ENV,
     REFERENCE_CONNECTOR,
     SINK_PORT,
+    dm_receivers,
     ed25519_pair,
     get_path,
     make_certificates,
@@ -79,6 +84,7 @@ from identity_assets import (
     runtime_document,
     secret_manifest,
     set_path,
+    with_env,
 )
 from identity_pod_scripts import (
     DIRECT_EFFECT_SCRIPT,
@@ -592,6 +598,7 @@ class Harness:
             self._agents(api, agents, bundle)
             tenant_id = self._tenant()
             self._bindings(api, tenant_id)
+            slack_receivers = self._dm_receivers(api, tenant_id)
         # The provider's authority judges one tenant, the agents', which is
         # known only once they exist; a first `up` applied it without one.
         if reference and provider_tenant != tenant_id:
@@ -662,6 +669,7 @@ class Harness:
             registration=registration,
             receiver_key=keys["receiver"],
             context_key=keys["context"],
+            slack_receivers=slack_receivers,
         )
         log("writing the API runtime Secret")
         runtime = secret_manifest(
@@ -697,6 +705,13 @@ class Harness:
                 for name, agent in self.data["agents"].items()
             },
             "roster": sorted(roster.get("senders", {})),
+            "dm_receivers": {
+                "identity": DM_IDENTITY,
+                "foreign_identity": DM_FOREIGN_IDENTITY,
+                "identity_id": self.data["slack"]["dm"]["identity_id"],
+                "installation_id": self.data["slack"]["dm"]["installation_id"],
+                "worker_pending_retention": True,
+            },
             "state_dir": str(self.state.directory),
         }
         if reference:
@@ -772,6 +787,77 @@ class Harness:
         self.data["reference_bundle"] = {"source": str(source), "path": str(produced)}
         self.state.save()
         return produced
+
+    def _dm_receivers(self, api: Api, tenant_id: str) -> list[dict[str, Any]]:
+        """The two Slack receiver registrations ``approver-dm`` needs, and the DM bot's rows.
+
+        The DM bot's installation and channel identity are created through the
+        platform admin API (``/provider-installations``, ``/channel-identities``)
+        when the tenant has none, and ``down`` deletes only what this created.
+        Its workspace namespace row has no product surface on an HTTP-selected
+        tenant, so the scenario inserts it with the id recorded here and
+        deletes it when it ends. The foreign receiver names no rows at all.
+        """
+
+        slack = self.data.setdefault("slack", {})
+        slack.setdefault("binding_id", str(uuid.uuid4()))
+        for part in ("dm", "foreign"):
+            item = slack.setdefault(part, {})
+            item.setdefault("receiver_id", str(uuid.uuid4()))
+            item.setdefault("key", b64url(secrets.token_bytes(32)))
+            item.setdefault("namespace_id", str(uuid.uuid4()))
+        foreign = slack["foreign"]
+        foreign.setdefault("identity_id", str(uuid.uuid4()))
+        foreign.setdefault("installation_id", str(uuid.uuid4()))
+        dm = slack["dm"]
+        installations = api.ok(
+            "GET", f"/provider-installations?provider=slack&tenant_id={tenant_id}"
+        )
+        installation = next(
+            (
+                row
+                for row in installations
+                if row.get("external_account_id") == DM_ACCOUNT and not row.get("authority")
+            ),
+            None,
+        )
+        if installation is None:
+            installation = api.ok(
+                "POST",
+                "/provider-installations",
+                {"provider": "slack", "external_account_id": DM_ACCOUNT, "tenant_id": tenant_id},
+            )
+            dm["installation_created"] = True
+            log(f"created the Slack installation {DM_ACCOUNT}")
+        if installation.get("status", "connected") != "connected":
+            raise HarnessError(f"the Slack installation {DM_ACCOUNT} is not connected")
+        dm["installation_id"] = str(installation["id"])
+        identities = api.ok("GET", f"/channel-identities?provider=slack&tenant_id={tenant_id}")
+        identity = next((row for row in identities if row.get("name") == DM_IDENTITY), None)
+        if identity is None:
+            identity = api.ok(
+                "POST",
+                "/channel-identities",
+                {
+                    "provider": "slack",
+                    "name": DM_IDENTITY,
+                    "tenant_id": tenant_id,
+                    "provider_installation_id": dm["installation_id"],
+                    "status": "active",
+                },
+            )
+            dm["identity_created"] = True
+            log(f"created the Slack channel identity {DM_IDENTITY}")
+        if (
+            str(identity.get("provider_installation_id")) != dm["installation_id"]
+            or identity.get("status", "active") != "active"
+        ):
+            raise HarnessError(
+                f"the channel identity {DM_IDENTITY} is not active on installation {DM_ACCOUNT}"
+            )
+        dm["identity_id"] = str(identity["id"])
+        self.state.save()
+        return dm_receivers(tenant_id, slack)
 
     def _access_policy(self, api: Api, name: str, agent: dict[str, Any]) -> None:
         """An HTTP turn needs a stored access policy: its version is provenance.
@@ -913,6 +999,11 @@ class Harness:
                 "adapter secret to a BYO Secret"
             )
         changes[f"worker.adapterCredentials.{ADAPTER}"] = keys["adapter_secret"]
+        # ADR 0272: the worker creates an approver DM approval only with ADR
+        # 0273 decision 4's pending reference retention on.
+        changes["worker.extraEnv"] = with_env(
+            get_path(values, "worker.extraEnv"), PENDING_RETENTION_ENV, "true"
+        )
         for path, value in changes.items():
             if path not in previous:
                 previous[path] = get_path(values, path)
@@ -1675,6 +1766,7 @@ class Harness:
                     report["residual"].append(
                         f"teamless access policy row on {name} (the API has no delete)"
                     )
+            self._remove_dm_rows(api, report)
         previous = self.data.get("helm_previous", {})
         if previous:
             restore = restored_values(target.helm_values(), previous)
@@ -1720,6 +1812,35 @@ class Harness:
         with contextlib.suppress(OSError):
             self.state.directory.rmdir()
         return report
+
+    def _remove_dm_rows(self, api: Api, report: dict[str, Any]) -> None:
+        """The DM bot's rows: a namespace an interrupted scenario left, then what ``up`` made."""
+
+        dm = (self.data.get("slack") or {}).get("dm") or {}
+        if dm.get("namespace_id"):
+            try:
+                deleted = self.target.sql(
+                    (
+                        "DELETE FROM curie.identity_namespaces WHERE id::text = :i",
+                        {"i": dm["namespace_id"]},
+                    )
+                )[0]
+                if deleted:
+                    report["removed"].append("approver-dm workspace namespace row")
+            except HarnessError as exc:
+                report["residual"].append(f"approver-dm namespace row: {exc}")
+        for flag, path, what in (
+            ("identity_created", "/channel-identities/", f"channel identity {DM_IDENTITY}"),
+            ("installation_created", "/provider-installations/", f"installation {DM_ACCOUNT}"),
+        ):
+            row = dm.get("identity_id" if flag == "identity_created" else "installation_id")
+            if not dm.get(flag) or not row:
+                continue
+            status, _ = api.call("DELETE", f"{path}{row}")
+            if status in (204, 404):
+                report["removed"].append(what)
+            else:
+                report["residual"].append(f"{what}: {status}")
 
     def _verify_removed(self, previous: Mapping[str, Any]) -> dict[str, Any]:
         target = self.target

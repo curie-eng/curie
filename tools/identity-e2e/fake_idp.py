@@ -63,7 +63,9 @@ The roster maps a lowercased sender address to a scripted identity::
 
 ``account_status`` ``active`` resolves, ``disabled`` or ``revoked`` is
 ``inactive``; an entry may instead name ``"outcome": "unresolved"`` or
-``"unavailable"``. A sender missing from the roster gets ``unknown``.
+``"unavailable"``. A sender missing from the roster gets ``unknown``. A
+Slack sender is looked up by its lowercased user id, so a roster key may also
+be one (``u0exampledmappr``).
 """
 
 from __future__ import annotations
@@ -91,6 +93,8 @@ PRINCIPAL_FIELDS = frozenset({"tenant_id", "issuer", "subject"})
 _TENANT = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 ENTRY_KEYS = frozenset({"subject", "sender_kind", "account_status", "groups", "outcome"})
 MAX_ADDRESS = 256
+# A Slack sender's native id is its user id; lookups are keyed lowercased.
+_SLACK_USER = re.compile(r"[uw][0-9a-z]{2,63}")
 
 
 class RosterError(ValueError):
@@ -194,14 +198,18 @@ def answer(
 def check_entry(address: Any, entry: Any, vectors: Mapping[str, Any]) -> None:
     """Refuse a roster entry the recorded vectors cannot answer, before it is stored."""
 
-    if (
-        not isinstance(address, str)
-        or not 0 < len(address) <= MAX_ADDRESS
-        or address != address.lower()
-        or address.count("@") != 1
-        or any(character.isspace() for character in address)
+    if not isinstance(address, str) or not (
+        _SLACK_USER.fullmatch(address)
+        or (
+            0 < len(address) <= MAX_ADDRESS
+            and address == address.lower()
+            and address.count("@") == 1
+            and not any(character.isspace() for character in address)
+        )
     ):
-        raise RosterError("a roster address is one lowercase email address")
+        raise RosterError(
+            "a roster address is one lowercase email address or lowercased Slack user id"
+        )
     if not isinstance(entry, dict) or not set(entry) <= ENTRY_KEYS:
         raise RosterError(f"a roster entry is an object with keys from {sorted(ENTRY_KEYS)}")
     subject = entry.get("subject")
