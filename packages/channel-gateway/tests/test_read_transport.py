@@ -489,6 +489,69 @@ def test_reply_timeout_does_not_retry_or_accept_a_replay(tmp_path):
     asyncio.run(scenario())
 
 
+def test_gateway_reply_preserves_an_opaque_provider_identity(tmp_path):
+    from aiohttp import web
+    from channel_protocol import OutboundMessage, ReplyPost, ReplyTarget
+    from curie_channel_gateway.gateway_reply import GatewayReplyRoute, GatewayReplySink
+    from curie_channel_gateway.reply_delivery import ReplyDeliveryStore
+    from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
+
+    requests = []
+
+    async def scenario():
+        async def provider(request):
+            assert request.headers["Authorization"] == "Bearer provider-only-token"
+            requests.append(await request.json())
+            return web.json_response({"ok": True, "ts": "1800000000.000100"})
+
+        slack_app = web.Application()
+        slack_app.router.add_post("/api/chat.postMessage", provider)
+        async with TestServer(slack_app) as slack:
+            adapter = SlackReplyAdapter(
+                "",
+                identity_tokens={"adapter/example": "provider-only-token"},
+                base_url=str(slack.make_url("/api/")),
+            )
+            app = gateway_application(
+                tokens={"api": "api-credential", "worker": "worker-credential"},
+                replay=RequestReplayStore(":memory:"),
+                reply=adapter,
+                reply_state=ReplyDeliveryStore(tmp_path / "replies.sqlite3"),
+                allow_insecure_http=True,
+            )
+            async with TestServer(app) as server:
+                sink = GatewayReplySink(
+                    str(server.make_url("")),
+                    "worker-credential",
+                    identities=("adapter/example",),
+                    allow_insecure_http=True,
+                )
+                try:
+                    route = GatewayReplyRoute(adapter="adapter/example")
+                    assert sink.undeliverable_reason("slack", route) is None
+                    await sink.emit(
+                        ReplyPost(
+                            version="1.0",
+                            event="reply.post",
+                            target=ReplyTarget(
+                                kind="slack",
+                                address="C0EXAMPLE1",
+                                conversation_id="1800000000.000001",
+                                reply_ref="1800000000.000001",
+                            ),
+                            message=OutboundMessage(version="1.0", text="opaque identity"),
+                            requested_by="U0EXAMPLE1",
+                        ),
+                        route=route,
+                    )
+                finally:
+                    await sink.aclose()
+
+    asyncio.run(scenario())
+    assert len(requests) == 1
+    assert requests[0]["channel"] == "C0EXAMPLE1"
+
+
 @pytest.mark.parametrize("max_age_s", [0.0, 60.0])
 def test_api_freshness_policy_rejects_revoked_cached_members(max_age_s):
     from curie_api.models import Approval

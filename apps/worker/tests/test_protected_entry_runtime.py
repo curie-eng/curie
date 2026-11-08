@@ -6,7 +6,7 @@ import dataclasses
 import time
 
 import pytest
-from curie_test_support.channel_gateway import reply_gateway
+from curie_test_support.channel_gateway import WORKER_TOKEN, slack_gateway
 from sqlalchemy import text
 
 from .protected_configuration_vectors import canonical
@@ -32,12 +32,7 @@ def test_actual_file_driven_boot_and_owned_runtime_shutdown(
             engine, schema = await database(primary_postgres, client)
             try:
                 async with external_reply() as (reply, calls), contextlib.AsyncExitStack() as owner:
-                    gateway = owner.enter_context(
-                        reply_gateway(
-                            {"adapter/example": "synthetic-slack-token"},
-                            reply._adapters["slack"]._default_base_url,
-                        )
-                    )
+                    gateway_url = owner.enter_context(slack_gateway(None, {}, reply=reply))
                     credential = owned_worker.credential()
                     for name, raw in {
                         "manifest.json": client._manifest.canonical_bytes,
@@ -64,8 +59,8 @@ def test_actual_file_driven_boot_and_owned_runtime_shutdown(
                                 "internal_worker_token": "synthetic-worker-token",
                                 "adapter_credentials": {},
                                 "channel_gateway": {
-                                    "url": gateway["channel_gateway_url"],
-                                    "token": gateway["channel_gateway_token"],
+                                    "url": gateway_url,
+                                    "token": WORKER_TOKEN,
                                     "allow_insecure_http": True,
                                     "identities": ["adapter/example"],
                                 },
