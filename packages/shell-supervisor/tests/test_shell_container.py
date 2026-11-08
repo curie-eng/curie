@@ -27,6 +27,7 @@ import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 from aci_protocol import Budget, SessionConfig, SessionStatus
@@ -107,6 +108,7 @@ class Shell:
         slot: str = "proof-0",
     ) -> None:
         self.tls = tls
+        self.slot = slot
         self.name = f"curie-shell-proof-{uuid.uuid4().hex[:8]}"
         self.port = free_port()
         _docker(
@@ -689,6 +691,7 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
         substrate.set_boot_credential_minter(binding.fresh_boot_credential)
         substrate.set_boot_credential_revoker(binding.release_boot_credential_sync)
         handle = substrate.claim(_thread_key_for(event), env=boot)
+        shell = next(shell for shell in shells if shell.port == urlsplit(handle.base_url).port)
         spec = {
             "config": config.model_dump(mode="json"),
             "ports": [shell.port for shell in shells],
@@ -706,6 +709,7 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
             "valkey": valkey,
             "config": config,
             "shell": shell,
+            "slot": shell.slot,
             "prefix": prefix,
             "event_id": identity,
             "claim": handle.claim_name,
@@ -739,8 +743,6 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
 
 @pytest.mark.parametrize("phase", ["healthy"])
 def test_crash_proof_control_completes_a_tool_and_persists_history(crash_case) -> None:
-    from urllib.parse import urlsplit
-
     case = crash_case
     state = case["provider"]
     wait_until(
@@ -816,7 +818,7 @@ def test_worker_kill_recovers_one_reply_and_retires_the_shell(crash_case, phase,
     replacement = case["restart"]()
     wait_until(
         lambda: (
-            case["valkey"].hget(case["prefix"] + ":sandbox:static:slot:proof-0", "state")
+            case["valkey"].hget(case["prefix"] + ":sandbox:static:slot:" + case["slot"], "state")
             == "quarantined"
         ),
         45,
@@ -830,7 +832,7 @@ def test_worker_kill_recovers_one_reply_and_retires_the_shell(crash_case, phase,
                 "replacement worker exited: " + (case["logs"] / "worker-1.log").read_text()[-4000:]
             )
         replies = state("/state")["replies"]
-        slot = case["valkey"].hget(case["prefix"] + ":sandbox:static:slot:proof-0", "state")
+        slot = case["valkey"].hget(case["prefix"] + ":sandbox:static:slot:" + case["slot"], "state")
         return any(r["event"] == "turn.completed" for r in replies) and slot in {
             "free",
             "quarantined",
