@@ -105,8 +105,10 @@ def test_finish_scrubs_steps_failure_and_aborted_and_fails_the_run() -> None:
     evidence.hold_private([SUBJECT])
     with evidence.step("a", "observe") as seen:
         seen["value"] = SECRET
-    with evidence.step("b", "fail"), pytest.raises(StepFailed):
+    # Evidence.step records a StepFailed as the step's failure and swallows it.
+    with evidence.step("b", "fail"):
         raise StepFailed(f"no {SECRET}")
+    assert evidence.data["steps"][-1]["passed"] is False
     evidence.data["aborted"] = f"gone {SUBJECT}"
     done = evidence.finish()
     flat = json.dumps(done)
