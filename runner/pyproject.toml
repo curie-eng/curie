@@ -5,6 +5,7 @@ description = "Curie runner: claude-agent-sdk streaming session server implement
 requires-python = ">=3.13"
 dependencies = [
     "aci-protocol",
+    "curie-internal",
     "curie-telemetry",
     "curie-telemetry-schema",
     "plugin-format",
