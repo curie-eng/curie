@@ -376,6 +376,7 @@ def crash_platform():
             _docker("rm", "-fv", name, check=False)
         _docker("network", "rm", network, check=False)
         assert not _docker("ps", "-aq", "--filter", f"label=curie.test.owner={network}").strip()
+        assert not _docker("network", "ls", "-q", "--filter", f"name=^{network}$").strip()
 
 
 @pytest.fixture
