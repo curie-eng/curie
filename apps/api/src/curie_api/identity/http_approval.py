@@ -9,7 +9,6 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from fractions import Fraction
 from typing import Any, NoReturn
 
 from aci_protocol import READER_CONTEXT, ApprovalRequest, QueuedTurn
@@ -769,15 +768,43 @@ class _DmRecipient:
     response_bytes: bytes = field(repr=False)
 
 
-def _dm_route_identity(agent: Agent, data: ApprovalRequest) -> str | None:
-    """The identity of the request route's approver-DM resolution, if any.
+def _dm_route_identity(agent: Agent | None, route: str | None) -> str | None:
+    """The identity of ``route``'s approver-DM resolution on ``agent``, if any.
 
     @spec APPROVER-DM-1.
     """
-    routes = agent.approval_routes
-    if not data.route or not isinstance(routes, dict):
+    routes = None if agent is None else agent.approval_routes
+    if not route or not isinstance(routes, dict):
         return None
-    return approver_dm.dm_route(routes.get(data.route))
+    return approver_dm.dm_route(routes.get(route))
+
+
+async def _route_recipient(
+    session: AsyncSession, runtime: HttpInvocationRuntime, row: Approval,
+) -> tuple[Agent, str, ReceiverRegistrationV1, dict[str, Any]] | None:
+    """A dynamic row's current DM route identity, that identity's receiver and
+    the one selected approver's account on it, or None when any is missing.
+
+    @spec APPROVER-DM-2.
+    """
+    agent = None if row.agent_id is None else await session.get(
+        Agent, row.agent_id, populate_existing=True,
+    )
+    identity = _dm_route_identity(agent, row.route)
+    selected = row.selected_approvers
+    if (
+        agent is None or row.selection_mode != "dynamic" or identity is None
+        or not isinstance(selected, list) or len(selected) != 1
+        or not isinstance(selected[0], dict)
+    ):
+        return None
+    registration = dm_receiver(runtime, str(agent.tenant_id), identity)
+    account = None if registration is None else dm_account(
+        registration, selected[0].get("recipient_accounts"),
+    )
+    if registration is None or account is None:
+        return None
+    return agent, identity, registration, account
 
 
 async def _provider_configuration(
@@ -865,10 +892,9 @@ def _recipient_facts(capture: _DmCapture, recipient: _DmRecipient) -> ValidatedF
     except (ValueError, TypeError):
         _refuse(503, "authority_unavailable")
     now = datetime.now(UTC)
-    instant = Fraction(int(now.timestamp())) + Fraction(now.microsecond, 1_000_000)
-    lower = Fraction(window.lower_seconds) + Fraction(window.lower_microseconds, 1_000_000)
-    upper = Fraction(window.upper_seconds) + Fraction(window.upper_microseconds, 1_000_000)
-    if not lower <= instant <= upper:
+    instant = (int(now.timestamp()), now.microsecond)
+    lower = (window.lower_seconds, window.lower_microseconds)
+    if not lower <= instant <= (window.upper_seconds, window.upper_microseconds):
         _refuse(503, "authority_unavailable")
     return facts
 
@@ -920,11 +946,12 @@ async def _recheck_dm(
     tenant lifecycle generation is never compared: the caller phase's own
     lookup moves it. Any change is unavailable. @spec APPROVER-DM-1.
     """
-    if request.app.state.http_identity_runtime is not runtime or not any(
-        registration is capture.registration for registration in runtime._receivers.values()
+    # ``dm_receiver`` picks from ``runtime._receivers``: the same pick proves it is registered.
+    if (
+        request.app.state.http_identity_runtime is not runtime
+        or dm_receiver(runtime, str(capture.tenant_id), capture.identity)
+        is not capture.registration
     ):
-        _refuse(503, "authority_unavailable")
-    if dm_receiver(runtime, str(capture.tenant_id), capture.identity) is not capture.registration:
         _refuse(503, "authority_unavailable")
     if not dm_serves_origin(capture.registration, *capture.origin):
         _refuse(503, "authority_unavailable")
@@ -966,24 +993,12 @@ async def _stored_delivery(
     card = await approver_dm.card(session, row)
     if card is not None:
         return _delivery(card.identity, card.provider_installation_id, card.recipient)
-    if row.card_channel is not None or row.agent_id is None:
-        return None
-    agent = await session.get(Agent, row.agent_id)
-    routes = None if agent is None else agent.approval_routes
-    identity = (
-        approver_dm.dm_route(routes.get(row.route))
-        if isinstance(routes, dict) and row.route else None
+    found = None if row.card_channel is not None else await _route_recipient(
+        session, runtime, row,
     )
-    selected = row.selected_approvers
-    if agent is None or identity is None or not isinstance(selected, list) or len(selected) != 1:
+    if found is None:
         return None
-    registration = dm_receiver(runtime, str(agent.tenant_id), identity)
-    chosen = selected[0]
-    account = None if registration is None or not isinstance(chosen, dict) else dm_account(
-        registration, chosen.get("recipient_accounts"),
-    )
-    if registration is None or account is None:
-        return None
+    _, identity, registration, account = found
     return _delivery(identity, registration.provider_installation_id, str(account["account_id"]))
 
 
@@ -1154,7 +1169,7 @@ async def create_http_approval(
                 except approver_tickets.ApproverTicketRefusal as error:
                     _ticket_refusal(error)
                 selection_snapshot, serving = await _selection_snapshot(session, agent_id)
-            identity = _dm_route_identity(agent, data)
+            identity = _dm_route_identity(agent, data.route)
             if identity is not None:
                 # ADR 0272 decision 1: one selected person, one current receiver
                 # and one recipient account on its installation and namespace.
@@ -1297,7 +1312,7 @@ def _registration_association(
     context and payload, and its scope that block's scope.
     @spec APPROVER-DM-2.
     """
-    if row is None or body.approval_id != str(approval_id) or str(row.id) != body.approval_id:
+    if row is None or body.approval_id != str(approval_id):
         _refuse(422, "invalid_approval_context")
     if row.dedupe_key != body.dedupe_key or row.identity_context is None:
         _refuse(422, "invalid_approval_context")
@@ -1325,32 +1340,18 @@ async def _first_registration(
     Consulted only before any registration commits (plan R4).
     @spec APPROVER-DM-2.
     """
-    agent = None if row.agent_id is None else await writer.get(
-        Agent, row.agent_id, populate_existing=True,
-    )
-    routes = None if agent is None else agent.approval_routes
-    identity = (
-        approver_dm.dm_route(routes.get(row.route))
-        if isinstance(routes, dict) and row.route else None
-    )
-    selected = row.selected_approvers
-    if (
-        agent is None or row.selection_mode != "dynamic" or identity is None
-        or identity != body.card_identity or not isinstance(selected, list)
-        or len(selected) != 1 or not isinstance(selected[0], dict)
-    ):
+    found = await _route_recipient(writer, runtime, row)
+    if found is None:
         _refuse(409, APPROVAL_CARD_MISMATCH)
-    registration = dm_receiver(runtime, str(agent.tenant_id), identity)
-    if registration is None or not dm_serves_origin(
-        registration, saved.scope.provider, saved.scope.binding_id,
+    agent, identity, registration, account = found
+    if (
+        identity != body.card_identity or account["account_id"] != body.recipient
+        or not dm_serves_origin(registration, saved.scope.provider, saved.scope.binding_id)
     ):
         _refuse(409, APPROVAL_CARD_MISMATCH)
     try:
         await _current_slack_scope(writer, registration, agent.tenant_id)
     except HTTPException:
-        _refuse(409, APPROVAL_CARD_MISMATCH)
-    account = dm_account(registration, selected[0].get("recipient_accounts"))
-    if account is None or account["account_id"] != body.recipient:
         _refuse(409, APPROVAL_CARD_MISMATCH)
     return registration
 

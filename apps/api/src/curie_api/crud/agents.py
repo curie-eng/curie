@@ -35,7 +35,6 @@ from ..publication_policy import PublicationPolicyConflict
 
 # ADR 0272 decision 1 route-write refusal codes. @spec APPROVER-DM-1.
 APPROVER_DM_STATIC_ROUTE = "approver_dm_static_route"
-APPROVER_DM_NOTIFICATION = "approver_dm_notification"
 APPROVER_DM_RECEIVER_MISSING = "approver_dm_receiver_missing"
 
 # ADR 0270 decision 1 refusal codes. @spec CONNECTOR-REQUESTER-1.
@@ -411,9 +410,10 @@ async def check_approver_dm_routes(
     Judged on the whole replacement map, kept routes included, inside the
     caller's row-locked transaction. A DM resolution needs its route's own
     ``approver_ticket`` selector (only a dynamic approval has one selected
-    person to deliver to), carries no notification, and names an active Slack
-    bot identity of the agent's tenant for which the live runtime registers a
-    receiver. Raises ``ApprovalRoutesRefused`` (422). @spec APPROVER-DM-1.
+    person to deliver to) and names an active Slack bot identity of the
+    agent's tenant for which the live runtime registers a receiver. A
+    notification beside it is refused by ``ApprovalRouteBinding`` before this
+    runs. Raises ``ApprovalRoutesRefused`` (422). @spec APPROVER-DM-1.
     """
 
     for name, binding in routes.items():
@@ -426,12 +426,6 @@ async def check_approver_dm_routes(
                 APPROVER_DM_STATIC_ROUTE,
                 f"route {name!r} resolves to approver_dm but registers no approver_ticket "
                 "selector; an approver DM is only for a dynamic route's one selected approver",
-            )
-        if binding.get("notification") is not None:
-            raise ApprovalRoutesRefused(
-                422,
-                APPROVER_DM_NOTIFICATION,
-                f"route {name!r} resolves to approver_dm and cannot carry a notification",
             )
         if not await approver_dm_receiver_registered(
             session, runtime, tenant_id=agent.tenant_id, identity=identity
