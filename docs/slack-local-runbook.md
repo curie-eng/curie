@@ -24,7 +24,8 @@ flowchart LR
   slack -->|Socket Mode outbound| dispatcher
   dispatcher -->|enqueue run| valkey
   valkey -->|claim run| worker
-  worker -->|reply via bot token| slack
+  worker -->|authenticated reply| gateway
+  gateway -->|reply via bot token| slack
 ```
 
 ## 1. Create the Slack app
@@ -134,9 +135,9 @@ What each export does:
   stub and points its outbound posts at real slack.com. The worker's default is
   `${SLACK_API_BASE_URL-http://localhost:8155/api/}` with a single `-`, so
   leaving the variable UNSET keeps the stub, and setting it empty overrides it.
-- The worker reads `SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-xoxb-dev}`, so the same
-  `export SLACK_BOT_TOKEN` covers BOTH the dispatcher (inbound) and the worker
-  (outbound real replies).
+- The gateway reads `SLACK_BOT_TOKEN`; the dispatcher uses it for inbound Slack
+  operations. API and worker use separate gateway caller credentials and reject
+  Slack token environment variables at startup.
 
 Socket Mode is outbound-only: the dispatcher dials Slack over an outbound
 WebSocket, so your laptop needs no public ingress, port-forward, or tunnel.

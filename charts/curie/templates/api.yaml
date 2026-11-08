@@ -81,7 +81,7 @@ spec:
       annotations:
         {{- with (include "curie.secretChecksum" (dict
         "root" $
-        "keys" (list "apiKey" "approvalChatAttesterSecret" "remediationAuthorityKey" "internalWorkerToken" "installationId" "githubWebhookSecret")
+        "keys" (list "channelGatewayApiToken" "apiKey" "approvalChatAttesterSecret" "remediationAuthorityKey" "internalWorkerToken" "installationId" "githubWebhookSecret")
         "refs" $checksumRefs
         "env" (printf "%s\n%s\n%s\n%s\n%s" (include "curie.env.postgres" $) (include "curie.env.valkey" $) (include "curie.env.slack" (dict "root" $ "workload" "api")) (include "curie.env.otel" (dict "root" $ "extraEnv" $.Values.api.extraEnv)) $checksumExtraEnv))) }}
         checksum/secret: {{ . }}
@@ -490,14 +490,9 @@ spec:
               value: {{ $resumeReconcilerGrace | quote }}
             - name: RESUME_RECONCILER_BATCH_LIMIT
               value: {{ .Values.api.resumeReconciler.batchLimit | quote }}
-            # Slack bot token for the approval user-group authorizer (#420): the
-            # API resolves usergroups.users.list itself rather than trusting a
-            # caller-asserted membership claim (ADR-0034). Every Slack identity's
-            # bot token comes from the one helper dispatcher.yaml and worker.yaml
-            # also render (curie.env.slack), so the three cannot drift apart.
-            # Rendered unconditionally; a declared approver group with no token
-            # then fails closed at resolve time, which is the intended posture.
+            # Identity declarations select gateway ports without mounting provider credentials.
             {{- include "curie.env.slack" (dict "root" . "workload" "api") | trim | nindent 12 }}
+            {{- include "curie.env.channelGateway" (dict "root" . "caller" "api") | nindent 12 }}
             # Expiry sweeper cadence (#412). Rendered unconditionally, not behind
             # an optional-value guard, because the disable value 0 is falsy in Go
             # templates and would be silently dropped, leaving the app default

@@ -12,12 +12,32 @@ from typing import Any, Literal
 import pytest
 import redis
 from aiohttp.test_utils import TestServer
+from curie_test_support.channel_gateway import reply_gateway
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker.config import WorkerConfig
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.deploy_notice import DeployNoticeConsumer
-from curie_worker.reply_sink import build_reply_sink
+from curie_worker.reply_sink import build_reply_sink as production_reply_sink
 from redis.asyncio import Redis as AsyncRedis
+
+_gateways = []
+
+
+@pytest.fixture(autouse=True)
+def owned_gateways():
+    try:
+        yield
+    finally:
+        while _gateways:
+            _gateways.pop().__exit__(None, None, None)
+
+
+def build_reply_sink(config, *, provider_tokens, base_url=""):
+    gateway = reply_gateway(provider_tokens, base_url)
+    values = gateway.__enter__()
+    _gateways.append(gateway)
+    return production_reply_sink(config.model_copy(update=values))
+
 
 sys.path.insert(0, str(Path(__file__).parent))
 from capture_fixtures import Capture  # noqa: E402
@@ -54,15 +74,15 @@ def test_notice_posts_as_the_bound_identity_and_acks(
         await server.start_server()
         port = server.port
         assert port is not None
+        base_url = f"http://127.0.0.1:{port}/slack/api/"
         config = WorkerConfig(
-            slack_bot_token="xoxb-default-test",
-            slack_api_base_url=f"http://127.0.0.1:{port}/slack/api/",
             read_block_ms=100,
             key_prefix=names["prefix"],
         )
         sink = build_reply_sink(
             config,
-            slack_tokens={"default": "xoxb-default-test", "ops": "xoxb-ops-test"},
+            provider_tokens={"default": "xoxb-default-test", "ops": "xoxb-ops-test"},
+            base_url=base_url,
         )
         valkey = AsyncRedis(
             host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW, decode_responses=True
@@ -126,7 +146,7 @@ def test_malformed_notice_is_dead_lettered_and_acked(
 ) -> None:
     async def go() -> None:
         config = WorkerConfig(read_block_ms=100, key_prefix=names["prefix"])
-        sink = build_reply_sink(config, slack_tokens={})
+        sink = build_reply_sink(config, provider_tokens={})
         valkey = AsyncRedis(
             host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW, decode_responses=True
         )
@@ -173,12 +193,12 @@ def test_reenqueued_notice_keeps_one_slack_delivery_identity(
         server = TestServer(capture.app)
         await server.start_server()
         assert server.port is not None
+        base_url = f"http://127.0.0.1:{server.port}/slack/api/"
         config = WorkerConfig(
-            slack_api_base_url=f"http://127.0.0.1:{server.port}/slack/api/",
             read_block_ms=100,
             key_prefix=names["prefix"],
         )
-        sink = build_reply_sink(config, slack_tokens={"ops": "xoxb-ops-test"})
+        sink = build_reply_sink(config, provider_tokens={"ops": "xoxb-ops-test"}, base_url=base_url)
         valkey = AsyncRedis(
             host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW, decode_responses=True
         )
@@ -244,12 +264,13 @@ def test_notice_never_falls_back_to_another_slack_identity(
         await server.start_server()
         port = server.port
         assert port is not None
+        base_url = f"http://127.0.0.1:{port}/slack/api/"
         config = WorkerConfig(
-            slack_bot_token="xoxb-default-test",
-            slack_api_base_url=f"http://127.0.0.1:{port}/slack/api/",
             read_block_ms=100,
         )
-        sink = build_reply_sink(config, slack_tokens={"default": "xoxb-default-test"})
+        sink = build_reply_sink(
+            config, provider_tokens={"default": "xoxb-default-test"}, base_url=base_url
+        )
         valkey = AsyncRedis(
             host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW, decode_responses=True
         )
@@ -350,12 +371,12 @@ def test_notice_from_a_newer_api_with_an_extra_field_is_still_delivered(
         server = TestServer(capture.app)
         await server.start_server()
         assert server.port is not None
+        base_url = f"http://127.0.0.1:{server.port}/slack/api/"
         config = WorkerConfig(
-            slack_api_base_url=f"http://127.0.0.1:{server.port}/slack/api/",
             read_block_ms=100,
             key_prefix=names["prefix"],
         )
-        sink = build_reply_sink(config, slack_tokens={"ops": "xoxb-ops-test"})
+        sink = build_reply_sink(config, provider_tokens={"ops": "xoxb-ops-test"}, base_url=base_url)
         valkey = AsyncRedis(
             host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW, decode_responses=True
         )
@@ -417,15 +438,15 @@ def test_a_notice_slack_keeps_refusing_is_dead_lettered_at_the_delivery_cap(
         server = TestServer(capture.app)
         await server.start_server()
         assert server.port is not None
+        base_url = f"http://127.0.0.1:{server.port}/slack/dead/"
         config = WorkerConfig(
-            slack_api_base_url=f"http://127.0.0.1:{server.port}/slack/dead/",
             read_block_ms=100,
             key_prefix=names["prefix"],
             max_delivery=2,
             reclaim_min_idle_ms=0,
             reclaim_interval_s=0.1,
         )
-        sink = build_reply_sink(config, slack_tokens={"ops": "xoxb-ops-test"})
+        sink = build_reply_sink(config, provider_tokens={"ops": "xoxb-ops-test"}, base_url=base_url)
         valkey = AsyncRedis(
             host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW, decode_responses=True
         )

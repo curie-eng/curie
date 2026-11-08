@@ -788,6 +788,7 @@ dependencies = [
     { name = "asyncpg" },
     { name = "boto3" },
     { name = "boto3-stubs", extra = ["s3"] },
+    { name = "curie-channel-gateway" },
     { name = "curie-channel-protocol" },
     { name = "curie-internal" },
     { name = "curie-protected-hooks" },
@@ -815,6 +816,7 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.30" },
     { name = "boto3", specifier = ">=1.43.55" },
     { name = "boto3-stubs", extras = ["s3"], specifier = ">=1.43.57" },
+    { name = "curie-channel-gateway", editable = "packages/channel-gateway" },
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
     { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-protected-hooks", editable = "packages/protected-hooks" },
@@ -1112,6 +1114,7 @@ dependencies = [
     { name = "aiohttp" },
     { name = "asyncpg" },
     { name = "cryptography" },
+    { name = "curie-channel-gateway" },
     { name = "pytest" },
     { name = "redis" },
     { name = "sqlalchemy", extra = ["asyncio"] },
@@ -1122,6 +1125,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.11" },
     { name = "asyncpg", specifier = ">=0.30" },
     { name = "cryptography", specifier = ">=50.0.2" },
+    { name = "curie-channel-gateway", editable = "packages/channel-gateway" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "redis", specifier = ">=8.1.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
@@ -1171,7 +1175,6 @@ dependencies = [
     { name = "pynacl" },
     { name = "pyyaml" },
     { name = "redis" },
-    { name = "slack-sdk" },
     { name = "sqlalchemy", extra = ["asyncio"] },
 ]
 
@@ -1200,7 +1203,6 @@ requires-dist = [
     { name = "pynacl", specifier = ">=1.5" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "redis", specifier = ">=5.2" },
-    { name = "slack-sdk", specifier = ">=3.43" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.51" },
 ]
 

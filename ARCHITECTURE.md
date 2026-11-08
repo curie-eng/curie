@@ -1123,12 +1123,12 @@ The sink builds (and caches) a client per endpoint
 ([`packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter`](packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py),
 behind the [`ReplySink`](apps/worker/src/curie_worker/reply_sink.py) port), and refuses
 any endpoint outside the configured Slack origin.
-The worker-global `SLACK_API_BASE_URL`
-([`apps/worker/src/curie_worker/config.py::WorkerConfig.slack_api_base_url`](apps/worker/src/curie_worker/config.py))
-is now the **fallback**: `endpoint = None` means "use the worker's configured
-default", i.e. real Slack. That is what routes a reply back to the ingress that
-enqueued the turn. As a result, a real Slack workspace and a no-Slack CLI stub
-can coexist on **one** worker rather than needing one worker per channel.
+The gateway's `SLACK_API_BASE_URL`
+([`packages/channel-gateway/src/curie_channel_gateway/slack/read_server.py::GatewayConfig.slack_api_base_url`](packages/channel-gateway/src/curie_channel_gateway/slack/read_server.py))
+selects the default provider endpoint when the reply handle carries none. The
+worker forwards the server-authored reply target over authenticated gateway
+transport; only the gateway holds Slack credentials and applies the provider
+origin policy. Real Slack and a trusted CLI stub can share one worker.
 
 The CLI's `curie local message` path does four things:
 

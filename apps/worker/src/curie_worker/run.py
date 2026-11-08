@@ -25,6 +25,8 @@ import httpx
 from aci_protocol.s3 import build_s3_client
 from aci_protocol.turn import DEFAULT_IDENTITY
 from aiohttp import web
+from curie_channel_gateway.read_transport import GatewayClient, RemoteFileSource
+from curie_channel_gateway.token_custody import refuse_slack_tokens
 from curie_internal.valkey import AsyncRedis, Redis
 from curie_internal.workspace_objects import WorkspaceObjectPort
 from curie_protected_hooks.source_policy_sql import SourceGate
@@ -44,7 +46,7 @@ from .attachments import (
     AttachmentCoordinator,
     AttachmentLimits,
     ChannelPortFileClient,
-    SlackFileClient,
+    _file_transport,
 )
 from .binding import BindingResolver
 from .bundle_store import BundleStore
@@ -108,7 +110,6 @@ from .sandbox import (
 from .sandbox.quota import parse_admission_config
 from .schema_startup import assert_worker_schema
 from .sibling_turns import build_sibling_limit
-from .slack_tokens import slack_bot_tokens
 from .stream_retention import StreamRetention, build_stream_retention
 from .sweep import SweepCoverage
 from .threadlock import ThreadLock
@@ -548,29 +549,15 @@ async def _close_sync(close: Callable[[], None]) -> None:
 
 
 def _attachment_coordinator(
-    config: WorkerConfig, objects: WorkspaceObjectPort, slack_tokens: Mapping[str, str]
+    config: WorkerConfig, objects: WorkspaceObjectPort, slack_files: Mapping[str, RemoteFileSource]
 ) -> AttachmentCoordinator | None:
     """Keep legacy object retention cleanup active during lazy rollout."""
     return (
         AttachmentCoordinator(
-            # The lane is on when any identity holds a token, so `default`'s
-            # may be blank here; `_files_for` refuses that identity before any
-            # fetch rather than this module standing in a broken port for it.
-            files=(
-                SlackFileClient(
-                    token=config.slack_bot_token,
-                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
-                )
-                if config.slack_bot_token
-                else None
-            ),
+            # Bind every configured identity to its gateway file source.
+            files=slack_files.get(DEFAULT_IDENTITY),
             identity_files={
-                name: SlackFileClient(
-                    token=token,
-                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
-                )
-                for name, token in slack_tokens.items()
-                if name != DEFAULT_IDENTITY
+                name: source for name, source in slack_files.items() if name != DEFAULT_IDENTITY
             },
             channel_files=(
                 ChannelPortFileClient(
@@ -586,7 +573,7 @@ def _attachment_coordinator(
         if config.attachment_enabled
         and (
             config.attachment_mode == "lazy"
-            or any(slack_tokens.values())
+            or bool(slack_files)
             or bool(config.adapter_credentials)
         )
         else None
@@ -597,6 +584,7 @@ def build(
     config: WorkerConfig, env: Mapping[str, str], *, resources: WorkerResources | None = None
 ) -> Runtime:
     """@spec PROTECTED-HOOK-SOURCE-2."""
+    refuse_slack_tokens(env)
     owner = resources if resources is not None else WorkerResources()
     owner.register_close("memory-drain", drain_pending_memory_closes, order=0)
     # Channel read revocations likewise (ADR 0100): one not finished leaves the
@@ -691,8 +679,8 @@ def build(
     # v0.8.8 answers it. The chart's ``worker.attachments.enabled`` gates the
     # sandbox half from the same value, so there is one knob and not two.
     #
-    # In eager mode the credential condition is separate: the lane downloads a referenced
-    # file with a Slack bot token, or with a channel-port adapter's secret
+    # In eager mode the lane downloads through gateway caller credentials or
+    # a channel-port adapter's secret
     # (ADR-0153), and the kernel treats a wired lane as authoritative. An
     # install holding neither (compose smoke) keeps running every turn exactly
     # as it does today rather than failing on the first message with a file.
@@ -708,10 +696,27 @@ def build(
     # through a short-lived one-object presigned URL redeemed by the sandbox's
     # attachments-init container.
     #
-    # Each Slack identity's bot token, read once from this process's env
-    # (ADR-0168 decision 5), so the lane and the sink serve the same set.
-    slack_tokens = slack_bot_tokens(config, environ=env)
-    attachments = _attachment_coordinator(config, workspace_objects, slack_tokens)
+    # File sources bind an identity at the gateway; the worker holds only its caller token.
+    gateway_identities = tuple(identity.name for identity in config.slack_identities) or (
+        DEFAULT_IDENTITY,
+    )
+    slack_files = (
+        {
+            name: RemoteFileSource(
+                config.channel_gateway_url,
+                config.channel_gateway_token,
+                name,
+                allow_insecure_http=config.channel_gateway_allow_insecure,
+                transport=_file_transport,
+                chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+                max_bytes=config.attachment_max_file_bytes,
+            )
+            for name in gateway_identities
+        }
+        if config.channel_gateway_url
+        else {}
+    )
+    attachments = _attachment_coordinator(config, workspace_objects, slack_files)
     # One API-lane HTTP client shared by the approval writer (#244) and the two
     # eval-lane reporters below; httpx.AsyncClient is task-safe.
     eval_http = httpx.AsyncClient(timeout=30.0)
@@ -771,11 +776,7 @@ def build(
         broker = AttachmentBroker(
             internal_token=config.internal_worker_token,
             routes_for_agent=binding.routes_for_agent,
-            slack_files={
-                name: SlackFileClient(token=token, read_chunk_bytes=64 * 1024)
-                for name, token in slack_tokens.items()
-                if token
-            },
+            slack_files=slack_files,
             channel_files=(
                 ChannelPortFileClient(
                     credentials=config.adapter_credentials, read_chunk_bytes=64 * 1024
@@ -813,14 +814,25 @@ def build(
             worker_token=config.internal_worker_token,
         ),
     )
-    sink = build_reply_sink(config, slack_tokens=slack_tokens)
+    sink = build_reply_sink(config)
     owner.register_close("reply-sink", sink.aclose, order=20)
     # ADR-0168 decision 6. None unless a sibling identity can exist here, so a
     # stock install asks no auth.test, reads no binding and makes no Valkey
     # call for it.
-    sibling_limit = build_sibling_limit(
-        config, async_redis, slack_tokens=slack_tokens, channel=binding
+    gateway_senders = (
+        GatewayClient(
+            eval_http,
+            config.channel_gateway_url,
+            config.channel_gateway_token,
+            allow_insecure_http=config.channel_gateway_allow_insecure,
+            identities=gateway_identities,
+        )
+        if config.channel_gateway_url and len(config.slack_identities) > 1
+        else None
     )
+    if gateway_senders is not None:
+        owner.register_close("gateway-senders", gateway_senders.aclose, order=19)
+    sibling_limit = build_sibling_limit(config, async_redis, slack=gateway_senders, channel=binding)
     card_store = ApprovalCardStore(async_redis, config)
     work_items = (
         WorkItemDispatchClient(

@@ -497,7 +497,7 @@ The floor of 2 is enforced because `max_delivery=1` would dead-letter every
 ordinary worker crash on its first reclaim; values below 3 undermine the crash
 recovery of ADR-0013.
 
-Config surface (`WorkerConfig`): `VALKEY_*`, `SLACK_BOT_TOKEN`,
+Config surface (`WorkerConfig`): `VALKEY_*`, `CURIE_CHANNEL_GATEWAY_URL`, `CURIE_CHANNEL_GATEWAY_TOKEN`,
 `CURIE_STREAM` / `CURIE_CONSUMER_GROUP` / `CURIE_CONSUMER_NAME`,
 `CURIE_WORKER_MAX_CONCURRENCY` (turns one worker runs at once, default `16`,
 `1` through `256`; chart `worker.maxConcurrency`),
@@ -586,7 +586,7 @@ source without a container rebuild -- point it at the stack's exposed ports:
 export CLAUDE_CODE_OAUTH_TOKEN=...        # or ANTHROPIC_API_KEY=... / CURIE_CREDENTIALS=...
 env CURIE_SANDBOX_SUBSTRATE=docker \
     VALKEY_HOST=localhost VALKEY_PORT=26379 VALKEY_PASSWORD=valkeypass \
-    SLACK_API_BASE_URL=http://localhost:8155/api/ SLACK_BOT_TOKEN=xoxb-dev \
+    CURIE_CHANNEL_GATEWAY_URL=http://localhost:8081 CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE=true \
     CURIE_DOCKER_NETWORK=curie_default \
     OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
     uv run python -m curie_worker &
@@ -606,8 +606,8 @@ env CURIE_SANDBOX_SUBSTRATE=docker \
   failure).
 - `CURIE_RUNNER_IMAGE` overrides the runner image tag (default
   `curie-runner`).
-- `VALKEY_HOST`/`VALKEY_PORT`/`VALKEY_PASSWORD` and `SLACK_BOT_TOKEN` point at
-  the compose stack's exposed ports and dev bot token (see `compose.dev.yaml`);
+- `VALKEY_HOST`/`VALKEY_PORT`/`VALKEY_PASSWORD` point at the compose stores.
+  The worker uses a gateway caller credential for provider operations;
   `SLACK_API_BASE_URL` points at the stack's Slack stub instead of real
   slack.com.
 

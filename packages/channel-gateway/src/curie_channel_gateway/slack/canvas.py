@@ -30,8 +30,8 @@ from typing import Any
 import httpx
 from channel_protocol import ChannelCapability
 
-from .errors import ChannelReadRefused
-from .readers import (
+from ..read_errors import ChannelReadRefused
+from ..read_models import (
     BindingRoute,
     CanvasCellRecord,
     CanvasDocument,
@@ -41,7 +41,7 @@ from .readers import (
     CanvasSummaryRecord,
     CanvasTableRecord,
 )
-from .slack_reads import SLACK_API, TEXT_LIMIT, TRUNCATION_MARKER, SlackChannelReader
+from .reads import SLACK_API, TEXT_LIMIT, TRUNCATION_MARKER, SlackChannelReader
 
 FILES_INFO = "files.info"
 FILES_LIST = "files.list"

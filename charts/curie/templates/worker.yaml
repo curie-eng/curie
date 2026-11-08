@@ -211,7 +211,7 @@ spec:
       annotations:
         {{- with (include "curie.secretChecksum" (dict
         "root" $
-        "keys" (list "internalWorkerToken" "installationId")
+        "keys" (list "channelGatewayWorkerToken" "internalWorkerToken" "installationId")
         "refs" $checksumRefs
         "env" (printf "%s\n%s\n%s\n%s\n%s" (include "curie.env.postgres" $) (include "curie.env.valkey" $) (include "curie.env.slack" (dict "root" $ "workload" "worker")) (include "curie.env.otel" (dict "root" $ "extraEnv" $.Values.worker.extraEnv)) $checksumExtraEnv))) }}
         checksum/secret: {{ . }}
@@ -436,10 +436,9 @@ spec:
               value: {{ index .Values.worker.publication.resources.requests "ephemeral-storage" | quote }}
             - name: CURIE_PUBLICATION_EPHEMERAL_LIMIT
               value: {{ index .Values.worker.publication.resources.limits "ephemeral-storage" | quote }}
-            # Every Slack identity's bot token, from the one helper api.yaml and
-            # dispatcher.yaml also render (curie.env.slack), so the three cannot
-            # drift apart.
+            # Identity declarations select gateway ports without mounting provider credentials.
             {{- include "curie.env.slack" (dict "root" . "workload" "worker") | trim | nindent 12 }}
+            {{- include "curie.env.channelGateway" (dict "root" . "caller" "worker") | nindent 12 }}
             # The sealing keys (ADR-0094). The connector reconciler runs here,
             # so this is the only workload that needs to DECRYPT a sealed
             # value; nothing else in the release gets them. Both are optional:
@@ -684,14 +683,6 @@ spec:
                   {{- /* BYO (issue #1759): the referenced key must already
                          hold the JSON-encoded map. */}}
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.worker.adapterCredentialsExistingSecret "existingSecretKey" .Values.worker.adapterCredentialsExistingSecretKey "defaultKey" "adapterCredentials") | nindent 18 }}
-            # No-Slack egress routing: when set, the worker's Slack sink posts its
-            # placeholder edits at this base URL (the `curie cluster message` CLI stub)
-            # instead of real Slack. Empty (the default) leaves the sink on real
-            # Slack. Rendered only when non-empty (values-not-templates).
-            {{- if .Values.worker.slackApiBaseUrl }}
-            - name: SLACK_API_BASE_URL
-              value: {{ .Values.worker.slackApiBaseUrl | quote }}
-            {{- end }}
             # Extra trusted Slack origins (ADR-0096 D4.4), a DEV-ONLY widening of
             # where the bot token may be sent. Empty (the default) renders
             # nothing, leaving the configured Slack origin as the only trusted

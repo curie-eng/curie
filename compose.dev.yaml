@@ -484,18 +484,10 @@ services:
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
       GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-dev-webhook-secret}
-      # Approval user-group authorizers (#420) look up Slack usergroup
-      # membership from the API itself, so the API reads the same bot token the
-      # worker and dispatcher use. Empty by default: the Slack-free local loop
-      # needs nothing here, and a route that declares an approver group without a
-      # token fails closed at resolve time rather than widening to channel
-      # membership. Needs the `usergroups:read` bot scope.
-      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
-      # How long a fetched user-group member set is reused. The fallback repeats
-      # the app's own 60s default rather than being empty, because the setting is
-      # float-typed: an empty value fails validation and the API would not boot.
-      # Set SLACK_USERGROUP_CACHE_TTL_S=0 to fetch on every resolve.
-      SLACK_USERGROUP_CACHE_TTL_S: ${SLACK_USERGROUP_CACHE_TTL_S:-60}
+      # Provider reads authenticate to the gateway with an API-only credential.
+      CURIE_CHANNEL_GATEWAY_URL: http://host.docker.internal:8081
+      CURIE_CHANNEL_GATEWAY_TOKEN: ${CURIE_CHANNEL_GATEWAY_API_TOKEN:-curie-dev-gateway-api}
+      CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE: "true"
       # Single-dash defaults preserve an explicitly empty endpoint/protocol.
       # `curie local up --minimal` uses that empty value to keep the core-only
       # stack inert when the full-profile Collector is absent.
@@ -647,19 +639,10 @@ services:
       # worker's self-dial URL (#678). curie-api joins curie_runner (via its
       # network membership), so this name resolves from a spawned runner.
       - CURIE_RUNNER_API_URL=http://curie-api:8000
-      - SLACK_API_BASE_URL=${SLACK_API_BASE_URL-http://localhost:8155/api/}
-      # Additional Slack origins a per-turn reply endpoint may name (ADR-0096
-      # D4.4). The CLI stub advertises itself as `localhost` on native-Docker
-      # Linux and `host.docker.internal` under Docker Desktop (#680), and it
-      # binds an EPHEMERAL port on `curie chat`, so the single
-      # SLACK_API_BASE_URL above cannot also name it -- without these the origin
-      # pin refuses the local loop. A portless entry trusts any port on that
-      # host, which is why the ephemeral-port stub works. DEV ONLY: the deployed
-      # chart defaults this to empty, and a LAN-host dev setup (`cluster message
-      # --listen-host <ip>`, or CURIE_LOCAL_STUB_HOST) must extend this list
-      # with that host itself.
-      - CURIE_SLACK_TRUSTED_ORIGINS=${CURIE_SLACK_TRUSTED_ORIGINS-http://localhost,http://127.0.0.1,http://host.docker.internal}
-      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-xoxb-dev}
+      - CURIE_CHANNEL_GATEWAY_URL=http://localhost:8081
+      - CURIE_CHANNEL_GATEWAY_TOKEN=${CURIE_CHANNEL_GATEWAY_WORKER_TOKEN:-curie-dev-gateway-worker}
+      - CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE=true
+      - CURIE_ATTACHMENT_MAX_FILE_BYTES=${CURIE_ATTACHMENT_MAX_FILE_BYTES:-33554432}
       # Per-adapter egress credentials (ADR-0096 D4.2): a JSON object mapping an
       # adapter slug (the binding row's `adapter`) to the secret the worker
       # presents as X-Curie-Adapter-Secret when it delivers reply events there.
@@ -759,7 +742,7 @@ services:
   #
   # Enable it:
   #   export SLACK_APP_TOKEN=xapp-... SLACK_BOT_TOKEN=xoxb-...
-  #   export SLACK_API_BASE_URL=          # empty: un-wire the worker's stub
+  #   export SLACK_API_BASE_URL=          # empty: un-wire the gateway's stub
   #   docker compose --profile full --profile slack -f compose.dev.yaml up -d
   #   (or: curie local up --slack)
   #
@@ -767,6 +750,35 @@ services:
   # A local dispatcher and a cluster dispatcher on the same Slack app conflict.
   # Use one dispatcher per app. This is why the service is behind the `slack`
   # profile and disabled by default.
+  curie-gateway-replay-perms:
+    profiles: *core_profiles
+    image: ghcr.io/curie-eng/curie-dispatcher:latest
+    user: "0:0"
+    command: ["python", "-c", "import os; os.chown('/state', 1000, 1000)"]
+    volumes:
+      - curie_gateway_replay:/state
+
+  curie-channel-gateway:
+    profiles: *core_profiles
+    image: ghcr.io/curie-eng/curie-dispatcher:latest
+    command: ["python", "-m", "curie_channel_gateway.slack.read_server"]
+    network_mode: host
+    depends_on:
+      curie-gateway-replay-perms:
+        condition: service_completed_successfully
+    volumes:
+      - curie_gateway_replay:/var/lib/curie-gateway
+    environment:
+      CURIE_CHANNEL_GATEWAY_API_TOKEN: ${CURIE_CHANNEL_GATEWAY_API_TOKEN:-curie-dev-gateway-api}
+      CURIE_CHANNEL_GATEWAY_WORKER_TOKEN: ${CURIE_CHANNEL_GATEWAY_WORKER_TOKEN:-curie-dev-gateway-worker}
+      CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE: "true"
+      CURIE_CHANNEL_GATEWAY_MAX_FILE_BYTES: ${CURIE_ATTACHMENT_MAX_FILE_BYTES:-33554432}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-xoxb-dev}
+      SLACK_API_BASE_URL: ${SLACK_API_BASE_URL-http://localhost:8155/api/}
+      CURIE_SLACK_TRUSTED_ORIGINS: ${CURIE_SLACK_TRUSTED_ORIGINS-http://localhost,http://127.0.0.1,http://host.docker.internal}
+      SLACK_USERGROUP_CACHE_TTL_S: ${SLACK_USERGROUP_CACHE_TTL_S:-60}
+    restart: unless-stopped
+
   curie-dispatcher:
     # Its own variable, same reasoning as curie-ui above (#1915). This one bit
     # hardest locally: the CLI invoked `curie_dispatcher.enqueue_once`, the
@@ -815,6 +827,7 @@ networks:
     name: curie_runner
 
 volumes:
+  curie_gateway_replay:
   postgres_data:
   valkey_data:
   clickhouse_data:

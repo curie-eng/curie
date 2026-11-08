@@ -48,9 +48,8 @@ from curie_channel_gateway.reply_errors import (
     UntrustedSlackEndpointError,
 )
 from curie_channel_gateway.slack import slack_sink as slack_sink_module
-from curie_channel_gateway.slack.slack_sink import (
-    SlackReplyAdapter,
-)
+from curie_channel_gateway.slack.read_server import GatewayConfig
+from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import TargetRoute
 from slack_sdk.errors import SlackApiError
@@ -154,9 +153,9 @@ def test_config_reads_slack_api_base_url_from_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("SLACK_API_BASE_URL", raising=False)
-    assert WorkerConfig().slack_api_base_url == ""
+    assert GatewayConfig().slack_api_base_url == ""
     monkeypatch.setenv("SLACK_API_BASE_URL", "http://localhost:9999")
-    assert WorkerConfig().slack_api_base_url == "http://localhost:9999"
+    assert GatewayConfig().slack_api_base_url == "http://localhost:9999"
 
 
 def test_update_converts_markdown_to_mrkdwn() -> None:

@@ -4,6 +4,10 @@ The umbrella Helm chart: Langfuse + Postgres + Valkey + ClickHouse + RustFS +
 OTel Collector, plus the Agent Sandbox substrate and its security rails. Full
 component and rail detail in `charts/curie/README.md`.
 
+The gateway in `templates/channel-gateway.yaml` also requires one replica and
+Recreate: its durable SQLite replay ledger has one writer. Scaling requires a
+shared replay store and a separate reviewed change; there is no replica knob.
+
 ## Load-bearing invariants
 
 - **Values, not templates, for anything that varies by environment.** Per

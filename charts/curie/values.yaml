@@ -1714,6 +1714,32 @@ api:
     seccompProfile:
       type: RuntimeDefault
 
+channelGateway:
+  # Enable after providing a server certificate trusted by the API and worker.
+  deploy: false
+  replayStorageSize: 1Gi
+  replayStorageClass: ""
+  port: 8081
+  url: ""
+  allowInsecure: false
+  tlsSecret: ""
+  apiToken: null
+  workerToken: null
+  groupCacheTtlSeconds: 60
+  readinessProbe:
+    initialDelaySeconds: 1
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+  livenessProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {cpu: 1000m, memory: 512Mi}
+
 dispatcher:
   deploy: true
   # The dispatcher is not a rolling workload. It deploys with strategy Recreate
@@ -1780,9 +1806,9 @@ dispatcher:
   # Slack credentials. Socket Mode means the process dials out (no ingress), so
   # there is no Service. Left empty the supervisor just backs off and retries, so
   # the pod stays up without them; fill them (or an existingSecret) to connect.
-  # slackBotToken is shared with the worker (it edits the Slack placeholder) and,
-  # when set, with the API, whose approval user-group authorizers look up
-  # usergroup membership themselves (#420, ADR-0034). That lookup needs the
+  # slackBotToken belongs to dispatcher and gateway. The gateway performs
+  # provider reads and worker replies; API and worker hold only caller tokens.
+  # User-group membership lookup needs the
   # `usergroups:read` bot scope, which existing Slack apps get only by
   # reinstalling the app to the workspace. Changing this token requires a pod
   # rollout of the consumers, not just a `helm upgrade`: a secretKeyRef env
@@ -1824,7 +1850,7 @@ dispatcher:
     # entry named `default` with the block's token fields left empty. A list
     # that ends up with no `default` fails the render, because a Slack route
     # that names no identity means `default`. A list entry's tokens render as
-    # CURIE_SLACK_BOT_TOKEN__<n> (worker, API, dispatcher) and
+    # CURIE_SLACK_BOT_TOKEN__<n> (gateway, dispatcher) and
     # CURIE_SLACK_APP_TOKEN__<n> / CURIE_SLACK_SIGNING_SECRET__<n> (dispatcher),
     # where <n> is the entry's position, and CURIE_SLACK_IDENTITIES tells all
     # three which name reads which variable. That declaration is what the API
@@ -2474,15 +2500,14 @@ worker:
   # these three values only, because the worker refuses any other at startup.
   turnReceipt: "off"
   # No-Slack egress routing. When non-empty, renders SLACK_API_BASE_URL on the
-  # worker Deployment so its Slack sink uses that global base URL instead of real
-  # Slack. Empty (the default) leaves the worker on real Slack. `curie cluster
+  # gateway Deployment as its default provider endpoint. Empty uses real Slack. `curie cluster
   # message` does not change this value: its synthetic turn carries a per-turn
   # reply endpoint for the command's local Slack Web API stub.
   slackApiBaseUrl: ""
   # ADDITIONAL Slack origins a per-turn reply endpoint may name (ADR-0096
   # D4.4), comma-separated `scheme://host[:port]`. EMPTY (the default) is the
   # production posture: the configured Slack origin (slackApiBaseUrl, or real
-  # Slack) is the only endpoint the worker will send the bot token to, and every
+  # Slack) is the only endpoint the gateway will send the bot token to, and every
   # cross-origin endpoint a turn names is refused before any request.
   #
   # DEV ONLY. `curie cluster message` temporarily adds the exact advertised stub
