@@ -100,6 +100,7 @@ from .routers import (
     identity_approvals,
     identity_authority,
     identity_connect,
+    identity_operator,
     memory,
     observability,
     provider_installations,
@@ -735,6 +736,7 @@ def create_app(
     app.include_router(provider_installations.router)
     app.include_router(channel_identities.router)
     app.include_router(identity_admin.router)
+    app.include_router(identity_operator.router)
     app.include_router(identity_authority.router)
     app.include_router(identity_authority.grant_router)
     app.include_router(identity_authority.classification_router)

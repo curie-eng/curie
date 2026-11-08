@@ -2263,6 +2263,27 @@ pub(crate) fn memory_state_url(
 }
 
 impl ApiClient {
+    pub async fn identity_operator_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let mut request = self
+            .http
+            .request(method, format!("{}{path}", self.base_url))
+            .header("X-API-Key", &self.api_key);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request.send().await.context("identity operator request")?;
+        Self::expect_ok(response, "identity operator request")
+            .await?
+            .json()
+            .await
+            .context("decoding identity operator response")
+    }
+
     /// Read a route selected by the directory verb's bounded resource inventory.
     pub async fn directory_admin_read(&self, path: &str) -> Result<serde_json::Value> {
         let response = self

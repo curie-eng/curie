@@ -1262,6 +1262,46 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 .await?,
             )
         }
+        ClusterAction::IdentityAuthority {
+            action,
+            tenant,
+            apply,
+            after,
+            conn,
+            dry_run,
+        } => {
+            let (method, path) = commands::authority_target(&action, tenant, after)?;
+            let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
+            emit(commands::identity_operator(api_url, api_key, method, path, apply, dry_run).await?)
+        }
+        ClusterAction::RoleFilter {
+            action,
+            tenant,
+            agent,
+            role,
+            apply,
+            conn,
+            dry_run,
+        } => {
+            let (method, path) =
+                commands::role_filter_target(&action, tenant, agent, role.as_deref())?;
+            let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
+            emit(commands::identity_operator(api_url, api_key, method, path, apply, dry_run).await?)
+        }
         ClusterAction::Directory {
             tenant,
             resource,

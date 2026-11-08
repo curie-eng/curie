@@ -190,7 +190,7 @@ def _runtime_api() -> ModuleType:
     return module
 
 
-def _scope(endpoint: str, *, grid: bool = False) -> dict[str, Any]:
+def _scope(endpoint: str, *, grid: bool = False, adopt_identity: bool = True) -> dict[str, Any]:
     """@spec HTTP-INVOCATION-EXECUTION-4/5/15/21: real adopted scope, no legacy projections."""
     account = GRID_WORKSPACE if grid else ACCOUNT
     kind, key = ("slack_enterprise", GRID_ORG) if grid else ("slack_workspace", ACCOUNT)
@@ -206,13 +206,18 @@ def _scope(endpoint: str, *, grid: bool = False) -> dict[str, Any]:
         """@spec HTTP-INVOCATION-EXECUTION-4/5/15."""
         tenant, agent = await seed(factory)
         async with factory() as session, session.begin():
-            adopted = await principal_authority.adopt_http_authority(
-                session,
-                tenant_id=tenant,
-                expected_version=0,
-                expected_lifecycle_generation=0,
+            from curie_api.schemas.http_authority import AuthorityConfigV1
+
+            configuration = AuthorityConfigV1(
+                schema_version=1, tenant_id=str(tenant), version=1,
                 selection=selection(lookup_url=endpoint),
             )
+            if adopt_identity:
+                adopted = await principal_authority.adopt_http_authority(
+                    session, tenant_id=tenant, expected_version=0,
+                    expected_lifecycle_generation=0, selection=configuration.selection,
+                )
+                configuration = adopted.configuration
             installation = ProviderInstallation(
                 tenant_id=tenant,
                 provider="slack",
@@ -258,8 +263,10 @@ def _scope(endpoint: str, *, grid: bool = False) -> dict[str, Any]:
                 installation=str(installation.id),
                 adapter=identity.name,
                 namespace=NamespaceV1(id=str(namespace.id), authority="", kind=kind, key=key),
-                configuration=adopted.configuration,
+                configuration=configuration,
             )
+        if not adopt_identity:
+            return
         async with factory() as session, session.begin():
             result = await agent_role_policy.apply_role_change(
                 session,
@@ -678,6 +685,79 @@ def test_grid_workspace_member_queues_one_organisation_context_and_outsiders_ref
             assert observed["scope"]["sender"]["namespace"] == organisation
             assert observed["scope"]["sender"]["native_id"] == SENDER
             assert QueuedTurn.model_validate_json(entry[1]["payload"]).author == SENDER
+    finally:
+        keys = _keys(valkey, scope["binding"])
+        if keys:
+            valkey.delete(*keys)
+
+
+def test_operator_adopts_and_filters_real_tls_membership(
+    clean_db: None, valkey: redis.Redis, runs_stream: str,
+    synthetic_provider: SimpleNamespace,
+) -> None:
+    provider = synthetic_provider
+    scope = _scope(provider.url, adopt_identity=False)
+    runtime = _runtime(_runtime_api(), scope)
+    identity_client = HttpIdentityClient(tls_context=provider.tls)
+    try:
+        with TestClient(create_app(
+            http_identity_runtime=runtime, http_identity_client=identity_client,
+        )) as client:
+            headers = {"X-API-Key": get_settings().api_key}
+            path = f"/identity/authorities/{scope['tenant']}"
+            adopted = client.put(path, headers=headers, json={
+                "request_id": str(uuid.uuid4()), "expected_version": 0,
+                "expected_lifecycle_generation": 0,
+                "selection": scope["configuration"].selection.model_dump(mode="json"),
+            })
+            assert adopted.status_code == 200, adopted.text
+            filtered = client.put(
+                f"/identity/roles/{scope['tenant']}/{scope['agent']}/invocation",
+                headers=headers, json={
+                    "request_id": str(uuid.uuid4()), "expected_version": 0,
+                    "groups": [{"issuer": ISSUER, "id": GROUP}],
+                },
+            )
+            assert filtered.status_code == 200, filtered.text
+            token = _credential(client, scope)
+            accepted = _post(client, token, *_submission(scope))
+            assert accepted.status_code == 200, accepted.text
+            entries = valkey.xrange(runs_stream)
+            assert len(entries) == 1
+            provider.member = False
+            denied = _post(client, token, *_submission(scope))
+            assert denied.status_code == 403
+            assert denied.json() == {"detail": "caller_not_allowed"}
+            assert valkey.xrange(runs_stream) == entries
+            assert len(provider.requests) == 2
+            current = client.get(path, headers=headers).json()
+            retired = client.post(path + "/retire", headers=headers, json={
+                "request_id": str(uuid.uuid4()),
+                "expected_version": current["configuration"]["version"],
+                "expected_lifecycle_generation": current["lifecycle_generation"],
+            })
+            assert retired.status_code == 200, retired.text
+            provider.member = True
+            unavailable = _post(client, token, *_submission(scope))
+            assert unavailable.status_code == 503
+            assert unavailable.json()["detail"] == "identity_authority_unavailable"
+            assert len(provider.requests) == 2
+            assert valkey.xrange(runs_stream) == entries
+            from aci_protocol import ApprovalRequest
+
+            approval = ApprovalRequest(
+                agent_id=uuid.UUID(scope["agent"]), conversation_id="synthetic-retired",
+                author=SENDER, summary="Synthetic retired authority request",
+                reply_kind="slack", reply_channel=scope["address"],
+                reply_adapter=scope["adapter"], reply_placeholder="1760000000.000123",
+                dedupe_key="synthetic-retired-" + uuid.uuid4().hex,
+            )
+            refused_approval = client.post(
+                "/approvals", headers=headers, json=approval.model_dump(mode="json"),
+            )
+            assert refused_approval.status_code == 409, refused_approval.text
+            assert refused_approval.json() == {"detail": "unsupported_approval"}
+        assert identity_client.close_status().state == "closed"
     finally:
         keys = _keys(valkey, scope["binding"])
         if keys:

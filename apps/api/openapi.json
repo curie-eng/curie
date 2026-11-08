@@ -3442,6 +3442,64 @@
         "title": "Attachment",
         "type": "object"
       },
+      "AuthorityMutation": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_lifecycle_generation": {
+            "minimum": 0.0,
+            "title": "Expected Lifecycle Generation",
+            "type": "integer"
+          },
+          "expected_version": {
+            "minimum": 0.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "expected_version",
+          "expected_lifecycle_generation"
+        ],
+        "title": "AuthorityMutation",
+        "type": "object"
+      },
+      "AuthoritySelectionMutation": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_lifecycle_generation": {
+            "minimum": 0.0,
+            "title": "Expected Lifecycle Generation",
+            "type": "integer"
+          },
+          "expected_version": {
+            "minimum": 0.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "selection": {
+            "$ref": "#/components/schemas/HttpSelectionV1"
+          }
+        },
+        "required": [
+          "request_id",
+          "expected_version",
+          "expected_lifecycle_generation",
+          "selection"
+        ],
+        "title": "AuthoritySelectionMutation",
+        "type": "object"
+      },
       "BehaviorPacksConfig": {
         "description": "An agent's opt-in behavior packs. Validated on write and stored as JSON on\nthe agent row; the worker parses the same JSON at bind time.",
         "properties": {
@@ -5249,6 +5307,27 @@
         ],
         "title": "CredentialHeader",
         "type": "string"
+      },
+      "CredentialReferenceV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-AUTHORITY-CONFIG-V1-4.",
+        "properties": {
+          "generation": {
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "generation"
+        ],
+        "title": "CredentialReferenceV1",
+        "type": "object"
       },
       "Declaration": {
         "additionalProperties": false,
@@ -7399,6 +7478,61 @@
         "title": "GreetingPackConfig",
         "type": "object"
       },
+      "GroupFilterMutation": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "minimum": 0.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "groups": {
+            "items": {
+              "$ref": "#/components/schemas/GroupV1"
+            },
+            "maxItems": 128,
+            "minItems": 1,
+            "title": "Groups",
+            "type": "array"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "expected_version",
+          "groups"
+        ],
+        "title": "GroupFilterMutation",
+        "type": "object"
+      },
+      "GroupV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-IDENTITY-V1-2.",
+        "properties": {
+          "id": {
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "issuer": {
+            "description": "Structural HTTPS issuer constraints preserve exact-string URL parsing compatibility. Unicode NFKC netloc checks require semantic validation with the pure facts validator; schema validation alone is insufficient.",
+            "minLength": 1,
+            "pattern": "^(?![\\x09-\\x0d\\x1c-\\x20\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000])(?![\\s\\S]*[\\x09-\\x0d\\x1c-\\x20\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]$(?![\\s\\S]))[\\x00-\\x20]*[hH][\\t\\r\\n]*[tT][\\t\\r\\n]*[tT][\\t\\r\\n]*[pP][\\t\\r\\n]*[sS][\\t\\r\\n]*:[\\t\\r\\n]*/[\\t\\r\\n]*/[\\t\\r\\n]*(?:\\[[\\t\\r\\n]*(?:v[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*)+\\.[\\t\\r\\n]*(?:[^/?#@\\]\\t\\r\\n][\\t\\r\\n]*)+|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){7}|:[\\t\\r\\n]*:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,6})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){1}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,5})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){2}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,4})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){3}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,3})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){4}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,2})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){5}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,1})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){6}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,0})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){7}:[\\t\\r\\n]*|(?:(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){6}|:[\\t\\r\\n]*:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,5}|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){1}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,4}|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){2}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,3}|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){3}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,2}|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){4}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,1}|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){5}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,0})(?:2[\\t\\r\\n]*5[\\t\\r\\n]*[0-5][\\t\\r\\n]*|2[\\t\\r\\n]*[0-4][\\t\\r\\n]*[0-9][\\t\\r\\n]*|1[\\t\\r\\n]*(?:[0-9][\\t\\r\\n]*){2}|[1-9][\\t\\r\\n]*[0-9][\\t\\r\\n]*|[0-9][\\t\\r\\n]*)(?:\\.[\\t\\r\\n]*(?:2[\\t\\r\\n]*5[\\t\\r\\n]*[0-5][\\t\\r\\n]*|2[\\t\\r\\n]*[0-4][\\t\\r\\n]*[0-9][\\t\\r\\n]*|1[\\t\\r\\n]*(?:[0-9][\\t\\r\\n]*){2}|[1-9][\\t\\r\\n]*[0-9][\\t\\r\\n]*|[0-9][\\t\\r\\n]*)){3})(?:%[\\t\\r\\n]*(?:[^%/?#@\\]\\t\\r\\n][\\t\\r\\n]*)+)?)\\][\\t\\r\\n]*(?::[\\t\\r\\n]*(?:[^/?#@\\t\\r\\n][\\t\\r\\n]*)*)?|(?:[^:/?#@\\[\\]\\t\\r\\n][\\t\\r\\n]*)+(?::[\\t\\r\\n]*(?:[^/?#@\\[\\]\\t\\r\\n][\\t\\r\\n]*)*)?)(?:/[^?#]*)?(?:\\?[\\t\\r\\n]*)?(?:#[\\t\\r\\n]*)?$(?![\\s\\S])",
+            "title": "Issuer",
+            "type": "string"
+          }
+        },
+        "required": [
+          "issuer",
+          "id"
+        ],
+        "title": "GroupV1",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -8067,6 +8201,54 @@
           "reason"
         ],
         "title": "HookSupportOut",
+        "type": "object"
+      },
+      "HttpSelectionV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-AUTHORITY-CONFIG-V1-1.\n\n@spec HTTP-AUTHORITY-CONFIG-V1-3 to HTTP-AUTHORITY-CONFIG-V1-5.",
+        "properties": {
+          "credential_ref": {
+            "$ref": "#/components/schemas/CredentialReferenceV1"
+          },
+          "issuer": {
+            "title": "Issuer",
+            "type": "string"
+          },
+          "lookup_url": {
+            "title": "Lookup Url",
+            "type": "string"
+          },
+          "max_clock_skew_ms": {
+            "minimum": 0.0,
+            "title": "Max Clock Skew Ms",
+            "type": "integer"
+          },
+          "max_identity_age_ms": {
+            "exclusiveMinimum": 0.0,
+            "title": "Max Identity Age Ms",
+            "type": "integer"
+          },
+          "max_membership_age_ms": {
+            "exclusiveMinimum": 0.0,
+            "title": "Max Membership Age Ms",
+            "type": "integer"
+          },
+          "mode": {
+            "const": "http",
+            "title": "Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode",
+          "issuer",
+          "lookup_url",
+          "credential_ref",
+          "max_identity_age_ms",
+          "max_membership_age_ms",
+          "max_clock_skew_ms"
+        ],
+        "title": "HttpSelectionV1",
         "type": "object"
       },
       "IssueReadContext": {
@@ -8793,6 +8975,27 @@
           "type"
         ],
         "title": "ObservationNode",
+        "type": "object"
+      },
+      "OperatorMutation": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "minimum": 0.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "expected_version"
+        ],
+        "title": "OperatorMutation",
         "type": "object"
       },
       "Owner": {
@@ -27000,6 +27203,358 @@
         ]
       }
     },
+    "/identity/authorities": {
+      "get": {
+        "operationId": "list_authorities_identity_authorities_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Authorities Identity Authorities Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Authorities",
+        "tags": [
+          "identity-operator"
+        ]
+      }
+    },
+    "/identity/authorities/{tenant_id}": {
+      "get": {
+        "operationId": "get_authority_identity_authorities__tenant_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Authority Identity Authorities  Tenant Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Authority",
+        "tags": [
+          "identity-operator"
+        ]
+      },
+      "put": {
+        "operationId": "adopt_authority_identity_authorities__tenant_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthoritySelectionMutation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Adopt Authority Identity Authorities  Tenant Id  Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Adopt Authority",
+        "tags": [
+          "identity-operator"
+        ]
+      }
+    },
+    "/identity/authorities/{tenant_id}/replace": {
+      "post": {
+        "operationId": "replace_authority_identity_authorities__tenant_id__replace_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthoritySelectionMutation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Replace Authority Identity Authorities  Tenant Id  Replace Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Replace Authority",
+        "tags": [
+          "identity-operator"
+        ]
+      }
+    },
+    "/identity/authorities/{tenant_id}/retire": {
+      "post": {
+        "operationId": "retire_authority_identity_authorities__tenant_id__retire_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthorityMutation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Retire Authority Identity Authorities  Tenant Id  Retire Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Retire Authority",
+        "tags": [
+          "identity-operator"
+        ]
+      }
+    },
     "/identity/connect/{token}": {
       "get": {
         "operationId": "identity_connect_page_identity_connect__token__get",
@@ -27150,6 +27705,263 @@
         "summary": "Resolve",
         "tags": [
           "identity"
+        ]
+      }
+    },
+    "/identity/roles/{tenant_id}/{agent_id}": {
+      "get": {
+        "operationId": "list_role_filters_identity_roles__tenant_id___agent_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Role Filters Identity Roles  Tenant Id   Agent Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Role Filters",
+        "tags": [
+          "identity-operator"
+        ]
+      }
+    },
+    "/identity/roles/{tenant_id}/{agent_id}/{role}": {
+      "delete": {
+        "operationId": "remove_group_filter_identity_roles__tenant_id___agent_id___role__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "role",
+            "required": true,
+            "schema": {
+              "enum": [
+                "invocation",
+                "approver"
+              ],
+              "title": "Role",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OperatorMutation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Remove Group Filter Identity Roles  Tenant Id   Agent Id   Role  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Group Filter",
+        "tags": [
+          "identity-operator"
+        ]
+      },
+      "put": {
+        "operationId": "set_group_filter_identity_roles__tenant_id___agent_id___role__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "role",
+            "required": true,
+            "schema": {
+              "enum": [
+                "invocation",
+                "approver"
+              ],
+              "title": "Role",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GroupFilterMutation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Set Group Filter Identity Roles  Tenant Id   Agent Id   Role  Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Group Filter",
+        "tags": [
+          "identity-operator"
         ]
       }
     },

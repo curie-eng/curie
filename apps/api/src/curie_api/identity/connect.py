@@ -54,7 +54,9 @@ async def configured_provider(
         if config is None:
             return None
         if config.http_selection is not None:
-            principal_authority.stored_configuration(config)
+            selected = principal_authority.stored_configuration(config)
+            if selected.selection.mode == "disabled":
+                return None
     except principal_authority.PrincipalAuthorityRefusal:
         return None
     if config.governed_domains is None or config.managed_by is None:
