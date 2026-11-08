@@ -1,7 +1,7 @@
 """Gate a dynamic approval's answer on the enforcing answer owner. @spec REQUEST-APPROVAL-5.
 
 Revision ID: 0156
-Revises: 0153
+Revises: 0154
 
 ADR 0271 decision 5. Revision 0153 added ``approvals_dynamic_unapproved``, a
 BEFORE UPDATE trigger backed by ``enforce_dynamic_approval_unapproved()``, that

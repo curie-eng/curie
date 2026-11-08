@@ -74,7 +74,7 @@ def revision_ready() -> None:
     )
     script = graph.get_revision(REVISION)
     assert script is not None and script.down_revision == BELOW, (
-        "0156 must revise the 0153 selection revision directly"
+        "0156 must revise the 0154 reminder cursor revision directly"
     )
     assert Path(script.path).name == MIGRATION_FILE, script.path
 
