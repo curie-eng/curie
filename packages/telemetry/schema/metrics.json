@@ -464,6 +464,8 @@
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
+          "/agents/{agent_id}/hooks/{hook}/wake-secret",
+          "/agents/{agent_id}/hooks/{hook}/wake-secret/rotate",
           "/agents/{agent_id}/remediation-qualifications/{qualification_id}",
           "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs",
           "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs/{run_id}",
@@ -524,6 +526,7 @@
           "/ready",
           "/hooks/{agent_id}/{hook}",
           "/hooks/{agent_id}/{hook}/support",
+          "/hooks/{agent_id}/{hook}/wake",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
           "/langfuse/traces/{trace_id}/eval-case",
@@ -646,7 +649,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1656,
+      "cardinality_bound": 1680,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -698,6 +701,8 @@
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
+          "/agents/{agent_id}/hooks/{hook}/wake-secret",
+          "/agents/{agent_id}/hooks/{hook}/wake-secret/rotate",
           "/agents/{agent_id}/remediation-qualifications/{qualification_id}",
           "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs",
           "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs/{run_id}",
@@ -758,6 +763,7 @@
           "/ready",
           "/hooks/{agent_id}/{hook}",
           "/hooks/{agent_id}/{hook}/support",
+          "/hooks/{agent_id}/{hook}/wake",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
           "/langfuse/traces/{trace_id}/eval-case",
@@ -887,7 +893,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 8280,
+      "cardinality_bound": 8400,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -939,6 +945,8 @@
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
+          "/agents/{agent_id}/hooks/{hook}/wake-secret",
+          "/agents/{agent_id}/hooks/{hook}/wake-secret/rotate",
           "/agents/{agent_id}/remediation-qualifications/{qualification_id}",
           "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs",
           "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs/{run_id}",
@@ -999,6 +1007,7 @@
           "/ready",
           "/hooks/{agent_id}/{hook}",
           "/hooks/{agent_id}/{hook}/support",
+          "/hooks/{agent_id}/{hook}/wake",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
           "/langfuse/traces/{trace_id}/eval-case",
@@ -1128,7 +1137,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 8280,
+      "cardinality_bound": 8400,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

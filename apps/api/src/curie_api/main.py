@@ -93,6 +93,7 @@ from .routers import (
     github_reviews,
     hook_fire,
     hook_source_policy,
+    hook_wake,
     hooks,
     identity,
     identity_admin,
@@ -709,6 +710,7 @@ def create_app(
     app.include_router(runs.router)
     app.include_router(schedules.router)
     app.include_router(hook_fire.router)
+    app.include_router(hook_wake.admin_router)
     app.include_router(state.router)
     app.include_router(state.internal_router)
     app.include_router(state.released_router)
@@ -758,6 +760,7 @@ def create_app(
     app.include_router(teams.router)
     app.include_router(agent_access.router)
     app.include_router(hooks.router)
+    app.include_router(hook_wake.router)
 
     # @spec IDENTITY-WRITER-LIFETIME-V1-8. Telemetry stays outside preparation.
     app.add_middleware(IdentityFenceMiddleware)
