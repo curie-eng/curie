@@ -69,6 +69,7 @@ from _hook_wake_support import (
     reference_ttl,
     restricted_valkey,
     rotate_path,
+    secret_path,
     seed_configuration,
     seed_partition,
     seed_source,
@@ -81,6 +82,7 @@ from _hook_wake_support import (
     stream_entries,
     turns,
     unix_now,
+    unreachable_database,
     unreachable_valkey_dsn,
     wait_for_lock_waiters,
     wake,
@@ -205,6 +207,62 @@ def test_every_invalid_credential_answers_one_uniform_401(wake_db: str) -> None:
                 assert response.json() == INVALID_SIGNATURE, (label, response.text)
                 bodies.add(response.content)
             assert len(bodies) == 1
+            await unchanged(ctx, before)
+            assert_queued(await wake(ctx))
+
+    drive(scenario)
+
+
+def _wire(response: httpx.Response) -> tuple[int, bytes, str | None]:
+    """What a caller can tell two refusals apart by: status, exact body, content type."""
+    return response.status_code, response.content, response.headers.get("content-type")
+
+
+async def _delete_agent(ctx: WakeApp, agent_id: str, version_id: str) -> None:
+    """Delete an agent through the API: end its active deployments, then the agent.
+
+    The agent delete leaves bundle objects in RustFS and cascades away the
+    version row the shared cleanup finds them by, so the object goes first.
+    """
+    listed = await ctx.client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=ctx.headers
+    )
+    assert listed.status_code == 200, listed.text
+    for deployment in listed.json():
+        if deployment["status"] == "active":
+            ended = await ctx.client.delete(f"/deployments/{deployment['id']}", headers=ctx.headers)
+            assert ended.status_code == 204, ended.text
+    await put_bundle_object(ctx.app, version_id, None)
+    deleted = await ctx.client.delete(f"/agents/{agent_id}", headers=ctx.headers)
+    assert deleted.status_code == 204, deleted.text
+    absent = await ctx.client.get(f"/agents/{agent_id}", headers=ctx.headers)
+    assert absent.status_code == 404, absent.text
+
+
+def test_a_correctly_signed_wake_for_an_unknown_agent_is_the_uniform_401(wake_db: str) -> None:
+    async def scenario() -> None:
+        async with wake_app() as ctx:
+            gone, _name, gone_version = await ctx.add_agent()
+            assert gone_version is not None
+            # While the agent exists, the reference key is exactly the key the API issues.
+            issued = await ctx.client.get(secret_path(gone), headers=ctx.headers)
+            assert issued.status_code == 200, issued.text
+            assert issued.json()["secret"] == ctx.key(WAKE, agent_id=gone, generation=1)
+            await _delete_agent(ctx, gone, gone_version)
+            never = str(uuid.uuid4())
+
+            before = await snapshot(ctx)
+            wrong = reference_key("not-the-installation-key", ctx.agent_id, WAKE, 1)
+            uniform = await wake(ctx, key=wrong)
+            assert_refused(uniform, 401, INVALID_SIGNATURE)
+            for label, agent in (("never created", never), ("deleted", gone)):
+                signed = signed_headers(ctx.key(WAKE, agent_id=agent, generation=1), agent, WAKE)
+                response = await wake(ctx, agent_id=agent, headers=signed)
+                assert response.status_code == 401, (label, response.text)
+                assert response.json() == INVALID_SIGNATURE, (label, response.text)
+                assert _wire(response) == _wire(uniform), label
+                assert await hook_runs(ctx.app, agent) == [], label
+                assert await dedupe_keys(ctx, agent) == [], label
             await unchanged(ctx, before)
             assert_queued(await wake(ctx))
 
@@ -376,11 +434,9 @@ def test_names_without_a_wake_declaration_answer_not_declared(wake_db: str) -> N
     async def scenario() -> None:
         async with wake_app() as ctx:
             bare, _name, _version = await ctx.add_agent(deploy=False)
-            missing = str(uuid.uuid4())
             before = await snapshot(ctx)
             for agent, hook in (
                 (bare, WAKE),
-                (missing, WAKE),
                 (ctx.agent_id, CRON),
                 (ctx.agent_id, UNDECLARED),
                 (ctx.agent_id, PLAIN),
@@ -706,6 +762,42 @@ def test_valkey_unreachable_refuses_without_any_run(wake_db: str) -> None:
             assert_refused(refused, 503, AUTHORITY_UNAVAILABLE)
             assert await snapshot(ctx) == ([], [])
             assert await dedupe_keys(ctx) == []
+            assert_queued(await wake(ctx, headers=headers))
+
+    drive(scenario)
+
+
+# --- case 14b: unreachable database authority ---
+
+
+def test_unreachable_metadata_database_answers_authority_unavailable(wake_db: str) -> None:
+    async def scenario() -> None:
+        async with wake_app() as ctx:
+            headers = signed_headers(ctx.key(), ctx.agent_id, WAKE)
+            before = await snapshot(ctx)
+            async with unreachable_database(ctx.app, sessions=True, gate=True):
+                refused = await wake(ctx, headers=headers)
+            assert_refused(refused, 503, AUTHORITY_UNAVAILABLE)
+            await unchanged(ctx, before)
+            # Nothing was reserved: the same signed delivery admits once the database is back.
+            assert_queued(await wake(ctx, headers=headers))
+
+    drive(scenario)
+
+
+def test_unreachable_source_gate_database_answers_authority_unavailable(wake_db: str) -> None:
+    async def scenario() -> None:
+        async with wake_app() as ctx:
+            headers = signed_headers(ctx.key(), ctx.agent_id, WAKE)
+            before = await snapshot(ctx)
+            # Generation metadata stays readable, so authentication passes and the gate refuses.
+            async with unreachable_database(ctx.app, sessions=False, gate=True):
+                refused = await wake(ctx, headers=headers)
+                # The gate is reached only after authentication: a wrong key is still the 401.
+                unauthenticated = await wake(ctx, key=ctx.key(OTHER_WAKE))
+            assert_refused(refused, 503, AUTHORITY_UNAVAILABLE)
+            assert_refused(unauthenticated, 401, INVALID_SIGNATURE)
+            await unchanged(ctx, before)
             assert_queued(await wake(ctx, headers=headers))
 
     drive(scenario)

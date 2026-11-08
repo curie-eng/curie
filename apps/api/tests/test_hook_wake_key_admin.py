@@ -14,6 +14,7 @@ import httpx
 import pytest
 from _hook_wake_support import (
     ADMIN_UNAUTHORIZED,
+    AUTHORITY_UNAVAILABLE,
     BODY_INVALID,
     CRON,
     DECLARATION_UNAVAILABLE,
@@ -42,6 +43,7 @@ from _hook_wake_support import (
     settle_run,
     signed_headers,
     stored_generation,
+    unreachable_database,
     wake,
     wake_app,
     wake_environment,
@@ -296,5 +298,39 @@ def test_wake_secret_rotation_at_the_stored_maximum_is_exhausted(wake_db: str) -
             assert_admin_refused(await admin(ctx, "rotate"), 503, GENERATION_EXHAUSTED)
             assert await wake_key_rows(ctx) == before
             assert_queued(await wake(ctx, key=current.json()["secret"]))
+
+    drive(scenario)
+
+
+# --- case 7: unreachable database authority -------------------------------------------------
+
+
+def test_wake_secret_routes_answer_authority_unavailable_when_the_database_is_unreachable(
+    wake_db: str,
+) -> None:
+    async def scenario() -> None:
+        async with wake_app() as ctx:
+            assert (await admin(ctx, "rotate")).status_code == 200
+            before = await wake_key_rows(ctx)
+            assert [row["generation"] for row in before] == [2]
+            # Both, request sessions alone, then the source gate alone. The gate is
+            # entered before any session query, so only the sessions-alone case
+            # reaches a request session read with a live gate.
+            for sessions, gate in ((True, True), (True, False), (False, True)):
+                async with unreachable_database(ctx.app, sessions=sessions, gate=gate):
+                    for operation in OPERATIONS:
+                        label = (operation, sessions, gate)
+                        refused = await admin(ctx, operation)
+                        assert refused.status_code == 503, (label, refused.text)
+                        assert refused.json() == AUTHORITY_UNAVAILABLE, (label, refused.text)
+                        assert_no_store(refused)
+                        assert ctx.key(generation=2) not in refused.text, label
+            assert await wake_key_rows(ctx) == before
+            current = await admin(ctx, "read")
+            assert current.status_code == 200, current.text
+            assert current.json()["generation"] == 2
+            assert current.json()["secret"] == ctx.key(generation=2)
+            rotated = await admin(ctx, "rotate")
+            assert rotated.status_code == 200 and rotated.json()["generation"] == 3
 
     drive(scenario)

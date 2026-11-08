@@ -38,11 +38,13 @@ import redis.asyncio as aioredis
 from _migration_support import IsolatedMigrationDb
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn
 from curie_api.config import get_settings
+from curie_api.db import create_sessionmaker
 from curie_api.killswitch import kill_key
 from curie_api.main import create_app
 from curie_protected_hooks.source_policy_records import target_intent_sha256
+from curie_protected_hooks.source_policy_sql import SourceGate
 from redis.exceptions import RedisError
-from sqlalchemy import text
+from sqlalchemy import URL, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -477,6 +479,41 @@ async def side_client(valkey_url: str) -> AsyncIterator[httpx.AsyncClient]:
         else:
             os.environ["VALKEY_URL"] = saved
         get_settings.cache_clear()
+
+
+@asynccontextmanager
+async def unreachable_database(app: Any, *, sessions: bool, gate: bool) -> AsyncIterator[None]:
+    """Point request sessions and/or the source gate at a database nothing serves.
+
+    The engine targets 127.0.0.1 port 1, where nothing listens, so the asyncpg
+    driver itself refuses while opening a connection; NullPool keeps nothing
+    open. ``sessions`` swaps ``app.state.sessionmaker`` (every request session,
+    so wake generation metadata), ``gate`` swaps ``app.state.source_gate``. The
+    app's own engines are untouched, the originals always come back, and the
+    dead engine is disposed.
+    """
+    dead = create_async_engine(
+        URL.create(
+            "postgresql+asyncpg",
+            username="unreachable",
+            password="unused",
+            host="127.0.0.1",
+            port=1,
+            database="unreachable",
+        ),
+        poolclass=NullPool,
+    )
+    saved_sessions, saved_gate = app.state.sessionmaker, app.state.source_gate
+    try:
+        if sessions:
+            app.state.sessionmaker = create_sessionmaker(dead)
+        if gate:
+            app.state.source_gate = SourceGate(dead)
+        yield
+    finally:
+        app.state.sessionmaker = saved_sessions
+        app.state.source_gate = saved_gate
+        await dead.dispose()
 
 
 # --- requests ----------------------------------------------------------------
