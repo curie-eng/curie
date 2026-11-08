@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import os
 import socket
@@ -203,25 +202,23 @@ networks:
 
     def worker(self, enabled):
         if enabled:
-            self.run(*self.compose, "up", "-d", "--wait", "--no-deps", "curie-worker")
+            self.run(*self.compose, "start", "--wait", "curie-worker")
         else:
             self.run(*self.compose, "stop", "curie-worker")
 
-    def assert_agent_callers(self):
-        ids = self.run(
-            "docker", "ps", "-aq", "--filter", f"label=curietech.ai/stack={self.network}"
-        ).split()
-        claims = []
-        for container in ids:
-            config = json.loads(self.run("docker", "inspect", container))[0]
-            for item in config["Config"]["Env"]:
-                if item.startswith("CURIE_CONNECTOR_CALLER_TOKEN="):
-                    encoded = item.split("=", 1)[1].split(".")[1]
-                    claims.append(
-                        json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
-                    )
-        assert claims and all(set(claim) == {"agent", "exp"} for claim in claims)
-        assert {"acme-wake-idle", "acme-wake-http"} <= {claim["agent"] for claim in claims}
+    def capture_failure(self):
+        output = self.run(*self.compose, "logs", "--no-color", "--tail", "150", "curie-worker")
+        (self.root / "failure-worker.log").write_text(output)
+        (self.root / "failure-state.log").write_text(
+            json.dumps(
+                {
+                    "runs": self.sql(
+                        "SELECT COALESCE(json_agg(r), '[]'::json) FROM curie.hook_runs r"
+                    ),
+                    "groups": self.redis("XINFO", "GROUPS", "curie:runs"),
+                }
+            )
+        )
 
     def close(self):
         try:

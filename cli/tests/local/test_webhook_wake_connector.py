@@ -175,5 +175,5 @@ def test_mcp_key_leak_is_refused_before_the_item_is_changed(mcp_queue):
     asyncio.run(exercise())
     assert queue.observation()["items"] == [{"id": "item-1", "result": None}]
     assert queue.observation()["calls"] == [
-        {"tool": "complete", "human_header": False, "key_header": True}
+        {"tool": "complete", "human_header": False, "key_header": True, "agent": ""}
     ]

@@ -285,7 +285,6 @@ def test_acceptance_4(qualification):
     stack.settled(idle, "ran")
     http_run = stack.queued("acme-wake-http")
     stack.settled(http_run, "ran")
-    stack.assert_agent_callers()
     stack.worker(False)
     blocked = stack.queued()
     stack.pause("acme-wake-idle", True)
@@ -303,7 +302,11 @@ def test_acceptance_4(qualification):
     entries = stack.redis("XRANGE", "curie:runs", "-", "+")
     events = [json.loads(fields["payload"]) for _, fields in entries]
     assert all(
-        event["reply_handle"] is None and ":sweep:" not in event["event_id"] for event in events
+        event["reply_handle"] is None
+        and event.get("author_principal") is None
+        and event["author"] == "cron:queue-ready"
+        and ":sweep:" not in event["event_id"]
+        for event in events
     )
 
 
@@ -509,6 +512,7 @@ def test_hosted_connector_session(qualification):
     observation = control("/observation")
     assert observation["items"] == [{"id": "item-1", "result": "receipt-ok"}]
     assert {call["tool"] for call in observation["calls"]} == {"read", "complete"}
+    assert all(call["agent"] == agent for call in observation["calls"])
     assert all(not call["human_header"] and not call["key_header"] for call in observation["calls"])
     assert_no_key(stack.transcripts(agent), key)
     assert stack.slack_calls == []

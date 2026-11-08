@@ -30,7 +30,8 @@ class Queue:
             )
             db.execute(
                 "CREATE TABLE IF NOT EXISTS calls "
-                "(tool TEXT NOT NULL, human_header INTEGER NOT NULL, key_header INTEGER NOT NULL)"
+                "(tool TEXT NOT NULL, human_header INTEGER NOT NULL, key_header INTEGER NOT NULL, "
+                "agent TEXT NOT NULL)"
             )
             db.execute("CREATE TABLE IF NOT EXISTS polls (delivery TEXT, status INTEGER)")
 
@@ -63,8 +64,11 @@ class Queue:
             for name in headers
         )
         leaked = any(key in value for value in headers.values())
+        agent = next(
+            (value for name, value in headers.items() if name.lower() == "x-curie-agent"), ""
+        )
         with self.connect() as db:
-            db.execute("INSERT INTO calls VALUES(?,?,?)", (tool, human, leaked))
+            db.execute("INSERT INTO calls VALUES(?,?,?,?)", (tool, human, leaked, agent))
         if leaked:
             raise ToolError("wake_credential_in_mcp_headers")
 
@@ -76,7 +80,12 @@ class Queue:
                     for row in db.execute("SELECT id,result FROM items ORDER BY id")
                 ],
                 "calls": [
-                    {"tool": row[0], "human_header": bool(row[1]), "key_header": bool(row[2])}
+                    {
+                        "tool": row[0],
+                        "human_header": bool(row[1]),
+                        "key_header": bool(row[2]),
+                        "agent": row[3],
+                    }
                     for row in db.execute("SELECT * FROM calls")
                 ],
                 "polls": [row[0] for row in db.execute("SELECT status FROM polls")],
