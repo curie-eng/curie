@@ -439,6 +439,7 @@ def test_bolt_and_the_web_client_are_built_from_the_identity_given(
     assert client_calls == [{"token": "xoxb-ops", "timeout": 2}]
     assert app_calls == [
         {
+            "process_before_response": False,
             "signing_secret": "signing-ops",
             "token": "xoxb-ops",
             "token_verification_enabled": False,
@@ -449,8 +450,6 @@ def test_bolt_and_the_web_client_are_built_from_the_identity_given(
 def test_a_stock_config_builds_bolt_and_the_web_client_as_it_always_did(
     redis_client: redis.Redis, config: DispatcherConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Passes before and after this change: it pins the stock construction."""
-
     app_calls: list[dict[str, Any]] = []
     client_calls: list[dict[str, Any]] = []
 
@@ -471,6 +470,7 @@ def test_a_stock_config_builds_bolt_and_the_web_client_as_it_always_did(
     assert client_calls == [{"token": "xoxb-test", "timeout": 2}]
     assert app_calls == [
         {
+            "process_before_response": False,
             "signing_secret": "unused-in-socket-mode",
             "token": "xoxb-test",
             "token_verification_enabled": False,

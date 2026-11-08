@@ -31,6 +31,7 @@ from .conftest import _authorize, _set_run_env, _TestTelemetry
 
 OPS = SlackIdentityCredentials(name="ops-bot", app_token="xapp-ops", bot_token="xoxb-ops")
 _STOCK_APP_KWARGS = {
+    "process_before_response": False,
     "signing_secret": "unused-in-socket-mode",
     "token": "xoxb-test",
     "token_verification_enabled": False,
