@@ -243,13 +243,14 @@ def canonical_actor(
 
 
 def check_selected_approver(
-    row: Approval, policy: RoutePolicy, *, tenant_id: str, facts: ValidatedFacts,
-    principal_applied: bool, evidence: dict[str, Any],
+    row: Approval, policy: RoutePolicy, *, actor: Person | None, facts: ValidatedFacts,
+    evidence: dict[str, Any],
 ) -> Person:
     """The actor is a stored selected person, still inside the current ceiling.
 
-    The stored selection is parsed strictly at every answer. The actor must be
-    a resolved, active, applied human whose canonical identity is in that set;
+    The stored selection is parsed strictly at every answer. ``actor`` is the
+    caller's ``canonical_actor`` from the same fresh ``facts``: it must be a
+    resolved, active, applied human whose canonical identity is in that set;
     the current registration's ``ceiling.users``, when set, must name it, and
     its pinned role must match the actor's fresh facts. A raw surface-account
     entry can match that role only for a resolved actor, and never replaces the
@@ -262,7 +263,6 @@ def check_selected_approver(
     if selected is None:
         raise _refuse(SNAPSHOT_INVALID, evidence)
     evidence["selected_count"] = len(selected)
-    actor = canonical_actor(facts, tenant_id=tenant_id, principal_applied=principal_applied)
     if actor is None:
         raise _refuse(ACTOR_NOT_CANONICAL, evidence)
     if actor not in selected:
@@ -278,22 +278,23 @@ def check_selected_approver(
 
 
 def check_separation(
-    policy: RoutePolicy, *, requester: Person | None, tenant_id: str, facts: ValidatedFacts,
-    principal_applied: bool, decision: str, evidence: dict[str, Any],
+    policy: RoutePolicy, *, requester: Person | None, actor: Person | None,
+    facts: ValidatedFacts, decision: str, evidence: dict[str, Any],
 ) -> None:
     """Requester exclusion by canonical equality, with an optional current exemption.
 
-    Equality compares tenant, issuer and subject, so two channel accounts of
-    one person are equal. Exclusion off, a rejection, or distinct people
-    permit (the equality is recorded). Equal people under exclusion are
-    permitted only while the actor, who is then the requester, belongs to the
-    exempt group by its fresh membership; membership the observation does not
-    carry is unavailable, never exempt. @spec REQUEST-APPROVAL-6.
+    ``actor`` is the caller's ``canonical_actor`` from the same fresh ``facts``,
+    which also carry its group membership. Equality compares tenant, issuer and
+    subject, so two channel accounts of one person are equal. Exclusion off, a
+    rejection, or distinct people permit (the equality is recorded). Equal
+    people under exclusion are permitted only while the actor, who is then the
+    requester, belongs to the exempt group by its fresh membership; membership
+    the observation does not carry is unavailable, never exempt.
+    @spec REQUEST-APPROVAL-6.
     """
     evidence["requester"] = _shown(requester)
     if requester is None:
         raise _refuse(REQUESTER_UNKNOWN, evidence)
-    actor = canonical_actor(facts, tenant_id=tenant_id, principal_applied=principal_applied)
     if actor is None:
         raise _refuse(ACTOR_UNKNOWN, evidence)
     equal = actor == requester
@@ -370,12 +371,9 @@ def check_answer(
         ):
             raise _refuse(ACTOR_CHANGED, evidence)
     if policy.dynamic:
-        check_selected_approver(
-            row, policy, tenant_id=tenant_id, facts=facts,
-            principal_applied=principal_applied, evidence=evidence,
-        )
+        check_selected_approver(row, policy, actor=actor, facts=facts, evidence=evidence)
     check_separation(
-        policy, requester=_requester(row, saved), tenant_id=tenant_id, facts=facts,
-        principal_applied=principal_applied, decision=decision, evidence=evidence,
+        policy, requester=_requester(row, saved), actor=actor, facts=facts,
+        decision=decision, evidence=evidence,
     )
     return evidence

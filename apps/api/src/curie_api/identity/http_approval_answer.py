@@ -171,14 +171,16 @@ class _RefusalAudit:
 async def _audit_refusal(
     factory: Any, row: Approval, who: _RefusalAudit, refusal: HTTPException, stage: str,
 ) -> None:
-    """One audit row for a refusal on a canonical route, in its own short transaction.
+    """One audit row for a 403 or 503 refusal on a canonical route, in its own short transaction.
 
-    Called only after every reader, writer and identity fence of the refused
-    operation has closed, never under one. The evidence names the public
-    status and detail, the stage and, when the selection policy refused, its
-    code and selection evidence. A failure to write it is logged and never
-    changes the refusal. @spec REQUEST-APPROVAL-5/6.
+    Any other status writes nothing. Called only after every reader, writer and
+    identity fence of the refused operation has closed, never under one. The
+    evidence names the public status and detail, the stage and, when the
+    selection policy refused, its code and selection evidence. A failure to
+    write it is logged and never changes the refusal. @spec REQUEST-APPROVAL-5/6.
     """
+    if refusal.status_code not in (403, 503):
+        return
     evidence: dict[str, Any] = {
         "kind": approval_selection.EVIDENCE_KIND, "mode": row.selection_mode,
         "route": row.route, "key_id": row.selection_key_id, "decision": who.decision,
@@ -920,9 +922,10 @@ async def _answer(
     is audited once, at the phase 1 capture as at every later stage; an actor
     that never authenticated is refused unaudited. @spec REQUEST-APPROVAL-5/6.
     """
-    # Phase 1: short reader capture of every required source.
     audited: Approval | None = None
+    composition: _Composition | None = None
     try:
+        # Phase 1: short reader capture of every required source.
         async with factory() as session, session.begin():
             await identity_fence.lock_identity_reader(session)
             row = _pending(await session.get(Approval, approval_id, populate_existing=True))
@@ -952,40 +955,29 @@ async def _answer(
                 session, runtime, "approver", actor_scope.registration, actor_scope.source,
             )
             snapshot = approval_record_digest(row)
+        composition = _Composition(
+            request, runtime, client, factory, valkey, approval_id, snapshot, row,
+            route_binding, approver_sets, principal.subject, actor_scope.channel,
+            [caller, actor], {"invocation": saved, "approver": None}, saved,
+            decision=answer.decision,
+        )
+        return await _decide(composition, principal, answer, actor_scope)
     except ApprovalSettled:
         raise
     except (Exception, BaseExceptionGroup) as error:  # noqa: BLE001 - normalized below.
-        # @spec REQUEST-APPROVAL-5/6: a capture refusal after authentication on
-        # a canonical route is audited once, after this reader has rolled back
-        # and closed; every other failure propagates unchanged. The normalized
-        # refusal is never bound to a local (see below).
+        # @spec REQUEST-APPROVAL-5/6: every refusal on a canonical route after the
+        # actor authenticated is audited once, after the phase that raised it has
+        # closed its reader, writer and fence: the phase 1 capture as every later
+        # phase. A grouped or unexpected failure reads as unavailable unless a
+        # definitive denial is inside it. A non-canonical route, or a failure
+        # before authentication, propagates unchanged and unaudited.
         if audited is None:
             raise
-        await _audit_answer_refusal(
-            factory, audited, principal, answer, _boundary_refusal(error), "capture",
-        )
-        raise _boundary_refusal(error) from None
-    composition = _Composition(
-        request, runtime, client, factory, valkey, approval_id, snapshot, row, route_binding,
-        approver_sets, principal.subject, actor_scope.channel, [caller, actor],
-        {"invocation": saved, "approver": None}, saved, decision=answer.decision,
-    )
-    if not approval_selection.canonical_route(row, route_binding):
-        return await _decide(composition, principal, answer, actor_scope)
-    # @spec REQUEST-APPROVAL-5/6: every refusal on a canonical route after the
-    # actor authenticated is audited once, after the phase that raised it has
-    # closed its reader, writer and fence: the capture refusals above, and here
-    # those of the later phases. A grouped or unexpected failure reads as
-    # unavailable unless a definitive denial is inside it.
-    try:
-        return await _decide(composition, principal, answer, actor_scope)
-    except ApprovalSettled:
-        raise
-    except (Exception, BaseExceptionGroup) as error:  # noqa: BLE001 - normalized below.
         # The normalized refusal is never bound to a local: a frame holding the
         # exception that holds the frame would keep both alive until a GC pass.
         await _audit_answer_refusal(
-            factory, row, principal, answer, _boundary_refusal(error), composition.stage,
+            factory, audited, principal, answer, _boundary_refusal(error),
+            "capture" if composition is None else composition.stage,
         )
         raise _boundary_refusal(error) from None
 
@@ -998,11 +990,10 @@ async def _audit_answer_refusal(
 
     @spec REQUEST-APPROVAL-5/6.
     """
-    if refusal.status_code in (403, 503):
-        await _audit_refusal(factory, row, _RefusalAudit(
-            "denied", principal.subject, principal.actor_channel, principal.kind, True,
-            answer.decision,
-        ), refusal, stage)
+    await _audit_refusal(factory, row, _RefusalAudit(
+        "denied", principal.subject, principal.actor_channel, principal.kind, True,
+        answer.decision,
+    ), refusal, stage)
 
 
 async def _decide(
@@ -1154,8 +1145,6 @@ async def _audit_resume_refusal(
     the refused check has closed. A retried check adds a row per refusal.
     @spec REQUEST-APPROVAL-5/6.
     """
-    if refusal.status_code not in (403, 503):
-        return
     scope = saved.actor_scope
     await _audit_refusal(factory, row, _RefusalAudit(
         _RESUME_REFUSED, scope.native_id if scope is not None else (row.resolved_by or ""),
