@@ -16,8 +16,25 @@ Python interpreter (the harness uses the API image). Two listeners:
 2. Plain HTTP (``--sink-port``): ``POST /reply/<label>`` is the email reply
    endpoint the harness binds; it requires the worker's
    ``X-Curie-Adapter-Secret`` and records the event. ``GET /records`` returns
-   what was recorded (lookup scopes and outcomes, reply events), never a
-   bearer or adapter secret. ``GET /healthz`` answers readiness.
+   what was recorded (lookup scopes and outcomes, reply events, authority
+   decisions and admin changes), never a bearer or adapter secret.
+   ``GET /healthz`` answers readiness.
+
+The sink listener also serves current downstream authority for the reference
+human-restricted connector (ADR 0270 decision 5), when an authority bearer is
+configured (``--authority-bearer-file``; otherwise ``/authority`` is 404):
+
+1. ``POST /authority`` with ``Authorization: Bearer <authority bearer>`` and a
+   principal ``{"tenant_id", "issuer", "subject"}`` answers
+   ``{"decision": "allow"}`` only for the configured ``--tenant``, the roster
+   issuer, and exactly one roster sender with that subject who is an active
+   human in ``--authority-group`` (default ``identity-e2e-members``); any other
+   principal is ``{"decision": "deny"}``. 401 without the bearer, 503 while
+   the authority is unavailable.
+2. ``POST /admin/membership`` ``{"sender", "group", "member"}`` adds or removes
+   one roster sender's group, and ``POST /admin/authority`` ``{"available"}``
+   takes the authority down or brings it back. Both require the adapter
+   secret. A membership change is a roster change, so lookups see it too.
 
 The roster maps a lowercased sender address to a scripted identity::
 
@@ -45,6 +62,7 @@ import argparse
 import copy
 import hmac
 import json
+import re
 import ssl
 import sys
 import threading
@@ -58,6 +76,9 @@ MAX_RECORDS = 500
 ECHOED = ("schema_version", "request_id", "purpose", "authority_version", "scope")
 ADAPTER_SECRET_HEADER = "X-Curie-Adapter-Secret"
 OUTCOMES = frozenset({"resolved", "inactive", "unresolved", "unavailable"})
+DEFAULT_AUTHORITY_GROUP = "identity-e2e-members"
+PRINCIPAL_FIELDS = frozenset({"tenant_id", "issuer", "subject"})
+_TENANT = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 class RosterError(ValueError):
@@ -168,13 +189,28 @@ class Provider:
         vectors: Mapping[str, Any],
         bearer: str,
         adapter_secret: str,
+        authority_bearer: str | None = None,
+        tenant: str | None = None,
+        authority_group: str = DEFAULT_AUTHORITY_GROUP,
     ) -> None:
         if not bearer or not adapter_secret:
             raise RosterError("the bearer and adapter secret must be non-empty")
+        if authority_bearer is not None and (
+            not authority_bearer or authority_bearer in {bearer, adapter_secret}
+        ):
+            raise RosterError("the authority bearer must be non-empty and its own secret")
+        if tenant is not None and _TENANT.fullmatch(tenant) is None:
+            raise RosterError("the tenant must be a lowercase hyphenated UUID")
+        if not authority_group:
+            raise RosterError("the authority group must be non-empty")
         self.roster = roster
         self.vectors = vectors
+        self.tenant = tenant
+        self.authority_group = authority_group
         self._bearer = bearer
         self._adapter_secret = adapter_secret
+        self._authority_bearer = authority_bearer
+        self._authority_available = True
         self._lock = threading.Lock()
         self._records: list[dict[str, Any]] = []
 
@@ -198,6 +234,61 @@ class Provider:
         return header is not None and hmac.compare_digest(
             header.encode("utf-8"), self._adapter_secret.encode("utf-8")
         )
+
+    @property
+    def serves_authority(self) -> bool:
+        return self._authority_bearer is not None
+
+    def authority_bearer_ok(self, header: str | None) -> bool:
+        if header is None or self._authority_bearer is None:
+            return False
+        expected = "Bearer " + self._authority_bearer
+        return hmac.compare_digest(header.encode("utf-8"), expected.encode("utf-8"))
+
+    @property
+    def authority_available(self) -> bool:
+        with self._lock:
+            return self._authority_available
+
+    def set_authority_available(self, available: bool) -> None:
+        with self._lock:
+            self._authority_available = available
+
+    def set_membership(self, sender: str, group: str, member: bool) -> bool:
+        """Add or remove one roster sender's group; False when the sender is unknown."""
+
+        with self._lock:
+            entry = self.roster.get("senders", {}).get(sender.lower())
+            if not isinstance(entry, dict):
+                return False
+            groups = [str(g) for g in entry.get("groups") or () if str(g) != group]
+            # A new list, so a lookup reading the old one concurrently sees a whole roster.
+            entry["groups"] = [*groups, group] if member else groups
+            return True
+
+    def decide(self, principal: Mapping[str, str]) -> str:
+        """``allow`` or ``deny`` for one principal, from the roster as it is now."""
+
+        with self._lock:
+            if self.tenant is None or principal["tenant_id"] != self.tenant:
+                return "deny"
+            if principal["issuer"] != self.roster.get("issuer"):
+                return "deny"
+            matches = [
+                entry
+                for entry in self.roster.get("senders", {}).values()
+                if isinstance(entry, dict) and entry.get("subject") == principal["subject"]
+            ]
+            if len(matches) != 1:
+                return "deny"
+            entry = matches[0]
+            try:
+                active = _outcome(entry) == "resolved"
+            except RosterError:
+                active = False
+            human = entry.get("sender_kind", "human") == "human"
+            member = self.authority_group in [str(g) for g in entry.get("groups") or ()]
+            return "allow" if active and human and member else "deny"
 
 
 def _handler(provider: Provider, *, lookup: bool) -> type[BaseHTTPRequestHandler]:
@@ -245,6 +336,10 @@ def _handler(provider: Provider, *, lookup: bool) -> type[BaseHTTPRequestHandler
                 self._lookup(raw)
             elif not lookup and self.path.startswith("/reply/"):
                 self._reply(self.path.removeprefix("/reply/"), raw)
+            elif not lookup and self.path == "/authority":
+                self._authority(raw)
+            elif not lookup and self.path in {"/admin/membership", "/admin/authority"}:
+                self._admin(self.path, raw)
             else:
                 self._send(404, {"error": "not_found"})
 
@@ -283,6 +378,94 @@ def _handler(provider: Provider, *, lookup: bool) -> type[BaseHTTPRequestHandler
                 self._send(400, {"error": "bad_request"})
                 return
             provider.record({"type": "reply", "label": label, "status": 200, "event": event})
+            self._send(200, {"ok": True})
+
+        def _authority(self, raw: bytes) -> None:
+            if not provider.serves_authority:
+                provider.record({"type": "authority", "status": 404})
+                self._send(404, {"error": "not_found"})
+                return
+            if not provider.authority_bearer_ok(self.headers.get("Authorization")):
+                provider.record({"type": "authority", "status": 401})
+                self._send(401, {"error": "unauthorized"})
+                return
+            if not provider.authority_available:
+                provider.record({"type": "authority", "status": 503})
+                self._send(503, {"error": "unavailable"})
+                return
+            try:
+                principal = json.loads(raw)
+            except ValueError:
+                principal = None
+            if (
+                not isinstance(principal, dict)
+                or set(principal) != PRINCIPAL_FIELDS
+                or not all(isinstance(value, str) for value in principal.values())
+            ):
+                provider.record({"type": "authority", "status": 400})
+                self._send(400, {"error": "bad_request"})
+                return
+            decision = provider.decide(principal)
+            provider.record(
+                {
+                    "type": "authority",
+                    "status": 200,
+                    "subject": principal["subject"],
+                    "decision": decision,
+                }
+            )
+            self._send(200, {"decision": decision})
+
+        def _admin(self, path: str, raw: bytes) -> None:
+            if not provider.adapter_ok(self.headers.get(ADAPTER_SECRET_HEADER)):
+                provider.record({"type": "admin", "path": path, "status": 401})
+                self._send(401, {"error": "unauthorized"})
+                return
+            try:
+                change = json.loads(raw)
+            except ValueError:
+                change = None
+            if path == "/admin/authority":
+                if not isinstance(change, dict) or set(change) != {"available"}:
+                    change = None
+                elif not isinstance(change["available"], bool):
+                    change = None
+                if change is None:
+                    provider.record({"type": "admin", "path": path, "status": 400})
+                    self._send(400, {"error": "bad_request"})
+                    return
+                provider.set_authority_available(change["available"])
+                provider.record(
+                    {"type": "admin", "path": path, "status": 200, "available": change["available"]}
+                )
+                self._send(200, {"ok": True})
+                return
+            if (
+                not isinstance(change, dict)
+                or set(change) != {"sender", "group", "member"}
+                or not isinstance(change["sender"], str)
+                or not isinstance(change["group"], str)
+                or not change["group"]
+                or not isinstance(change["member"], bool)
+            ):
+                provider.record({"type": "admin", "path": path, "status": 400})
+                self._send(400, {"error": "bad_request"})
+                return
+            sender, group, member = change["sender"].lower(), change["group"], change["member"]
+            if not provider.set_membership(sender, group, member):
+                provider.record({"type": "admin", "path": path, "status": 404, "sender": sender})
+                self._send(404, {"error": "unknown_sender"})
+                return
+            provider.record(
+                {
+                    "type": "admin",
+                    "path": path,
+                    "status": 200,
+                    "sender": sender,
+                    "group": group,
+                    "member": member,
+                }
+            )
             self._send(200, {"ok": True})
 
     return Handler
@@ -324,6 +507,9 @@ def main(argv: list[str] | None = None, *, wait: Callable[[], None] | None = Non
     parser.add_argument("--vectors", required=True)
     parser.add_argument("--bearer-file", required=True)
     parser.add_argument("--adapter-secret-file", required=True)
+    parser.add_argument("--authority-bearer-file")
+    parser.add_argument("--tenant")
+    parser.add_argument("--authority-group", default=DEFAULT_AUTHORITY_GROUP)
     parser.add_argument("--cert", required=True)
     parser.add_argument("--key", required=True)
     parser.add_argument("--host", default="0.0.0.0")  # noqa: S104 - in-cluster Service target
@@ -339,6 +525,11 @@ def main(argv: list[str] | None = None, *, wait: Callable[[], None] | None = Non
         vectors=vectors,
         bearer=_read(args.bearer_file),
         adapter_secret=_read(args.adapter_secret_file),
+        authority_bearer=(
+            _read(args.authority_bearer_file) if args.authority_bearer_file else None
+        ),
+        tenant=args.tenant,
+        authority_group=args.authority_group,
     )
     servers = serve(
         provider,

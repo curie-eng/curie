@@ -1,8 +1,9 @@
 """Generated assets for the identity E2E harness.
 
 The private CA and provider certificate, the connector caller key pair, the
-test provider's Kubernetes objects, the API's ``api-runtime.json`` document
-and the default scripted roster. Each is consumed by product code, which the
+test provider's Kubernetes objects, the API's ``api-runtime.json`` document,
+the default scripted roster and the reference bundle carrying the
+human-restricted connector. Each is consumed by product code, which the
 harness tests use as the judge.
 """
 
@@ -13,6 +14,8 @@ import copy
 import hashlib
 import json
 import os
+import re
+import shutil
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -22,6 +25,7 @@ from identity_target import HERE, REPO, HarnessError, run
 
 VECTORS = REPO / "tests" / "vectors" / "http-identity-v1.json"
 PROVIDER_SCRIPT = HERE / "fake_idp.py"
+CONNECTOR_SCRIPT = HERE / "human_restricted_connector.py"
 OWNER_LABEL = "curietech.ai/identity-e2e"
 DOMAIN = "example.test"
 INBOX_DOMAIN = "inbox.example.test"
@@ -31,6 +35,20 @@ CREDENTIAL_ID = "identity-e2e"
 CONTEXT_KEY_ID = "identity-e2e-context"
 LOOKUP_PORT = 8443
 SINK_PORT = 8080
+CONNECTORS_FILE = "connectors.yaml"
+REFERENCE_CONNECTOR = "human-restricted"
+REFERENCE_IMAGE = (
+    "python:3.12-slim@sha256:12316debbfb86890f6b2d825820612741ba527ad5a44e3902759141d572bfe8f"
+)
+# The connector module's default PORT, at the /mcp path it serves.
+REFERENCE_PORT = 8000
+# The image runs the module from nothing but the env the connector declares.
+REFERENCE_BOOTSTRAP = (
+    "import os; exec(compile(os.environ['HRC_SOURCE'], 'human_restricted_connector.py', "
+    "'exec'), {'__name__': '__main__'})"
+)
+# The renderer substitutes these in a connector's args and env values.
+PLACEHOLDER = "${"
 
 # domain; no real directory is named.
 DEFAULT_ROSTER: dict[str, Any] = {
@@ -212,17 +230,41 @@ def provider_manifests(
     private_key: bytes,
     bearer: str,
     adapter_secret: str,
+    authority_bearer: str | None = None,
+    tenant: str | None = None,
+    authority_group: str | None = None,
 ) -> list[dict[str, Any]]:
-    """The test provider's ConfigMap, Secret, Deployment and Service."""
+    """The test provider's ConfigMap, Secret, Deployment and Service.
+
+    ``authority_bearer``, ``tenant`` and ``authority_group`` configure the
+    provider's ``POST /authority`` (ADR 0270 decision 5); each one omitted
+    leaves the manifests exactly as they were without it.
+    """
 
     code = {
         "fake_idp.py": PROVIDER_SCRIPT.read_text(),
         "vectors.json": VECTORS.read_text(),
         "roster.json": json.dumps(roster, indent=2, sort_keys=True),
     }
-    digest = hashlib.sha256(
-        json.dumps(code, sort_keys=True).encode() + certificate + bearer.encode()
-    ).hexdigest()[:16]
+    secrets: dict[str, bytes] = {
+        "tls.crt": certificate,
+        "tls.key": private_key,
+        "bearer": bearer.encode(),
+        "adapter-secret": adapter_secret.encode(),
+    }
+    authority_args: list[str] = []
+    rollout = json.dumps(code, sort_keys=True).encode() + certificate + bearer.encode()
+    if authority_bearer is not None:
+        secrets["authority-bearer"] = authority_bearer.encode()
+        authority_args += ["--authority-bearer-file", "/idp/secret/authority-bearer"]
+        rollout += b"\0authority-bearer\0" + authority_bearer.encode()
+    if tenant is not None:
+        authority_args += ["--tenant", tenant]
+        rollout += b"\0tenant\0" + tenant.encode()
+    if authority_group is not None:
+        authority_args += ["--authority-group", authority_group]
+        rollout += b"\0authority-group\0" + authority_group.encode()
+    digest = hashlib.sha256(rollout).hexdigest()[:16]
     selector = {"app.kubernetes.io/name": "identity-e2e-provider", OWNER_LABEL: release}
     return [
         {
@@ -231,16 +273,7 @@ def provider_manifests(
             "metadata": {"name": f"{prefix}-idp-code", "labels": _labels(release)},
             "data": code,
         },
-        secret_manifest(
-            f"{prefix}-idp",
-            release,
-            {
-                "tls.crt": certificate,
-                "tls.key": private_key,
-                "bearer": bearer.encode(),
-                "adapter-secret": adapter_secret.encode(),
-            },
-        ),
+        secret_manifest(f"{prefix}-idp", release, secrets),
         {
             "apiVersion": "apps/v1",
             "kind": "Deployment",
@@ -284,6 +317,7 @@ def provider_manifests(
                                     str(LOOKUP_PORT),
                                     "--sink-port",
                                     str(SINK_PORT),
+                                    *authority_args,
                                 ],
                                 "ports": [
                                     {"name": "lookup", "containerPort": LOOKUP_PORT},
@@ -336,6 +370,115 @@ def provider_manifests(
             },
         },
     ]
+
+
+# --- the reference bundle (ADR 0270 decision 5) --------------------------------------
+
+
+def _yaml_string(value: str) -> str:
+    """``value`` as one YAML double-quoted scalar of printable ASCII, on one line."""
+
+    out = ['"']
+    for character in value:
+        code = ord(character)
+        if character in {'"', "\\"}:
+            out.append("\\" + character)
+        elif character == "\n":
+            out.append("\\n")
+        elif character == "\t":
+            out.append("\\t")
+        elif character == "\r":
+            out.append("\\r")
+        elif 0x20 <= code < 0x7F:
+            out.append(character)
+        elif code <= 0xFF:
+            out.append(f"\\x{code:02x}")
+        elif code <= 0xFFFF:
+            out.append(f"\\u{code:04x}")
+        else:
+            out.append(f"\\U{code:08x}")
+    out.append('"')
+    return "".join(out)
+
+
+_CONNECTORS_KEY = re.compile(r"connectors:[ \t]*(?:#.*)?")
+
+
+def _with_connector(text: str, name: str, spec_lines: Sequence[str]) -> str:
+    """``text`` with one more entry appended to its block-style ``connectors`` mapping.
+
+    The source is appended to, never re-serialized, so every existing connector
+    stays byte for byte and no YAML library is needed. That needs ``connectors``
+    to be the last top-level key; any other shape is refused.
+    """
+
+    lines = text.splitlines()
+    top = [
+        index
+        for index, line in enumerate(lines)
+        if line and not line[0].isspace() and not line.startswith("#")
+    ]
+    keys = [index for index in top if _CONNECTORS_KEY.fullmatch(lines[index])]
+    if len(keys) != 1 or keys[0] != top[-1]:
+        raise ValueError(
+            f"{CONNECTORS_FILE} must end with a block-style connectors mapping to add {name}"
+        )
+    body = [
+        line for line in lines[keys[0] + 1 :] if line.strip() and not line.lstrip().startswith("#")
+    ]
+    indent = re.match(r" *", body[0]).group(0) if body else "  "  # type: ignore[union-attr]
+    if not indent:
+        raise ValueError(f"{CONNECTORS_FILE} indents its connectors with something but spaces")
+    declared = re.compile(re.escape(indent) + r"""(["']?)""" + re.escape(name) + r"\1[ \t]*:")
+    if any(declared.match(line) for line in body):
+        raise ValueError(f"{CONNECTORS_FILE} already declares {name}")
+    entry = [f"{indent}{name}:", *(f"{indent * 2}{line}" for line in spec_lines)]
+    return text + ("" if not text or text.endswith("\n") else "\n") + "\n".join(entry) + "\n"
+
+
+def reference_bundle(
+    source: Path, dest: Path, *, authority_url: str, authority_bearer: str
+) -> Path:
+    """``source`` copied to ``dest`` (which must not exist) plus the human-restricted connector.
+
+    The connector's module travels inline as its ``HRC_SOURCE`` env value and
+    the digest-pinned ``python:3.12-slim`` image runs it through a ``python3 -c``
+    bootstrap, so the bundle gains no file. The renderer substitutes
+    placeholders in args and env values, so a value carrying one is refused
+    with ValueError before anything is written. Existing connectors are kept.
+    """
+
+    module = CONNECTOR_SCRIPT.read_text(encoding="utf-8")
+    env = {
+        "HRC_SOURCE": module,
+        "AUTHORITY_URL": authority_url,
+        "AUTHORITY_BEARER": authority_bearer,
+    }
+    args = ["python3", "-c", REFERENCE_BOOTSTRAP]
+    for key, value in env.items():
+        if not value:
+            raise ValueError(f"the {REFERENCE_CONNECTOR} connector's {key} is empty")
+        if PLACEHOLDER in value:
+            raise ValueError(
+                f"the {REFERENCE_CONNECTOR} connector's {key} carries a placeholder "
+                "the renderer would substitute"
+            )
+    if any(PLACEHOLDER in arg for arg in args):
+        raise ValueError(f"the {REFERENCE_CONNECTOR} bootstrap carries a placeholder")
+    source, dest = Path(source), Path(dest)
+    connectors = source / CONNECTORS_FILE
+    text = connectors.read_text(encoding="utf-8") if connectors.is_file() else "connectors:\n"
+    spec_lines = [
+        f"image: {_yaml_string(REFERENCE_IMAGE)}",
+        "args: [" + ", ".join(_yaml_string(arg) for arg in args) + "]",
+        f"port: {REFERENCE_PORT}",
+        "env:",
+        *(f"  {key}: {_yaml_string(value)}" for key, value in env.items()),
+    ]
+    combined = _with_connector(text, REFERENCE_CONNECTOR, spec_lines)
+    shutil.copytree(source, dest)
+    (dest / CONNECTORS_FILE).write_text(combined, encoding="utf-8")
+    return dest
 
 
 def runtime_document(
