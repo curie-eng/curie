@@ -203,6 +203,30 @@ async def _revoke(session: AsyncSession, ids: list[uuid.UUID], now: datetime) ->
     return len(rows)
 
 
+async def revoke_authority_sessions(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    issuer: str,
+    inactive_only: bool = False,
+) -> int:
+    """Revoke issuer sessions after the caller has locked the authority scope."""
+    principals = list(
+        await session.scalars(
+            select(Principal)
+            .where(Principal.tenant_id == tenant_id, Principal.idp_issuer == issuer)
+            .order_by(Principal.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
+    return await _revoke(
+        session,
+        [p.id for p in principals if not inactive_only or p.status in {"disabled", "revoked"}],
+        utc_now(),
+    )
+
+
 async def _write(
     session: AsyncSession,
     *,
@@ -219,8 +243,8 @@ async def _write(
     selection = _selection(selection)
     async with session.begin_nested():
         _, row = await lock_scope(session, tenant_id)
-        if row:
-            stored_configuration(row)
+        previous = stored_configuration(row) if row else None
+        reactivating = previous is not None and isinstance(previous.selection, DisabledSelectionV1)
         _expected(row, expected_version, expected_lifecycle_generation)
         if replace:
             if row is None or row.http_selection is None:
@@ -245,23 +269,12 @@ async def _write(
             row.lifecycle_generation += 1
         row.http_selection = selection.model_dump(mode="json")
         revoked = 0
-        if not replace:
-            principals = list(
-                await session.scalars(
-                    select(Principal)
-                    .where(
-                        Principal.tenant_id == tenant_id,
-                        Principal.idp_issuer == selection.issuer,
-                    )
-                    .order_by(Principal.id)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )
-            )
-            revoked = await _revoke(
+        if not replace or reactivating:
+            revoked = await revoke_authority_sessions(
                 session,
-                [p.id for p in principals if p.status in {"disabled", "revoked"}],
-                utc_now(),
+                tenant_id=tenant_id,
+                issuer=selection.issuer,
+                inactive_only=True,
             )
         identity_audit.record(
             session,
@@ -273,7 +286,7 @@ async def _write(
             details={
                 "authority_version": row.version,
                 "lifecycle_generation": row.lifecycle_generation,
-                **({} if replace else {"revoked_session_count": revoked}),
+                **({"revoked_session_count": revoked} if not replace or reactivating else {}),
             },
         )
         await session.flush()

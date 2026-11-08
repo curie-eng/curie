@@ -38,8 +38,10 @@ mandatory. The chart mounts an operator supplied Secret through
 when providing the private CA. Slack receivers also need the matching protected
 dispatcher registration through `dispatcher.httpIdentity.existingSecret`.
 
-Register the credential before adoption. Otherwise the persisted authority has
-no usable bearer and admission refuses as `identity_authority_unavailable`.
+Register the credential before adoption. Adoption, replacement and their dry
+runs refuse an unregistered reference with `provider_credential_unavailable`
+before committing any authority change. Registrations must match the tenant,
+issuer and exact lookup URL as well as the credential ID and generation.
 This workflow requires configuration files and operator API calls, not custom
 application code. The [chart installation reference](../charts/curie/README.md#http-identity-operator-files)
 describes the protected files and activation wiring.
@@ -80,8 +82,12 @@ curie cluster identity-authority list --json
 The API routes are `PUT /identity/authorities/{tenant_id}` for adoption,
 `GET /identity/authorities/{tenant_id}` for the current authority, and
 `GET /identity/authorities` for a bounded list. Continue a list with `--after`
-and its `next_cursor`. Dry runs print the HTTP operation and path, without
-connection credentials or request contents.
+and its `next_cursor`. Adopt and replace dry runs authenticate to the API,
+resolve the credential reference against its startup registry, and validate the proposed change without
+committing it. Their requests use `?dry_run=true` on the mutation route. All dry
+runs print the HTTP operation and path without connection credentials or request
+contents. An absent or mismatched registration returns
+`provider_credential_unavailable`; provision it and restart the API first.
 
 ## Restrict a role to issuer groups
 
@@ -108,7 +114,10 @@ curie cluster role-filter set --tenant "$TENANT_ID" --agent "$AGENT_ID" --role i
 ```
 
 `PUT /identity/roles/{tenant_id}/{agent_id}/{role}` replaces that role's filter
-with issuer group selectors. Any listed group may match. The other role,
+with issuer group selectors. This replaces the entire filter, including any
+`surface_account` and `issuer_subject` selectors previously present. Any listed
+group may match. An active HTTP authority is required, and every group issuer
+must equal that authority's issuer. The other role,
 legacy caller restrictions, approval route eligibility, and existing migration
 state remain in force. `approver` restricts approval resolution for that agent;
 it does not independently grant approval permission. These are agent role
@@ -145,14 +154,18 @@ curie cluster identity-authority retire --tenant "$TENANT_ID" --apply retirement
 ```
 
 `POST /identity/authorities/{tenant_id}/retire` increments both counters and
-stores a disabled selection. It retains the ownership boundary so retirement
-cannot reopen legacy admission. HTTP identity dependent turns refuse with
+stores a disabled selection. It revokes console sessions for the issuer's
+principals and emits
+`identity.http_authority_retired` with the revocation count. It retains the
+ownership boundary so retirement cannot reopen legacy admission. HTTP identity dependent turns refuse with
 `identity_authority_unavailable`. Replacement with a current version can
-reactivate the same issuer after its credential is provisioned.
+reactivate the same issuer after its credential is provisioned. Reactivation
+applies adoption's revocation of sessions belonging to inactive principals.
 
 Every successful mutation records an `identity.operator_request` audit event
-with actor `platform`. Repeating the same request UUID and payload returns its
-original result without another mutation or audit event. That result is a
+with actor `platform`. Repeating the same request UUID and payload, while its
+authority and credential prerequisites still hold, returns its original result
+without another mutation or audit event. That result is a
 receipt, so use `get` or `list` for current state. Reusing the UUID with different
 content is `operator_request_conflict`. A stale version or generation returns
 409 with a fixed, nonempty `detail`. Read current state and issue a new request

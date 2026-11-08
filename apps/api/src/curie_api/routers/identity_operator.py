@@ -15,10 +15,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api import agent_role_policy, identity_audit, principal_authority
 from curie_api.auth import require_platform_key
-from curie_api.deps import SessionDep
+from curie_api.deps import IdentityRuntimeDep, SessionDep
+from curie_api.identity.http_credential_registry import ResolvedProviderCredential
+from curie_api.identity.http_invocation import HttpInvocationRuntime
 from curie_api.models import AgentAccessPolicy, IdentityAuditEvent, TenantIdentityProvider
 from curie_api.schemas.agent_access import SetRoleFilterV1
-from curie_api.schemas.http_authority import HttpSelectionV1
+from curie_api.schemas.http_authority import AuthorityConfigV1, HttpSelectionV1
 from curie_api.schemas.http_identity import GroupV1
 
 
@@ -170,13 +172,27 @@ async def _write_authority(
     body: AuthorityMutation,
     session: AsyncSession,
     operation: Literal["adopt", "replace", "retire"],
+    runtime: HttpInvocationRuntime | None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     try:
         _, row = await principal_authority.lock_scope(session, tenant_id)
+        if isinstance(body, AuthoritySelectionMutation):
+            candidate = AuthorityConfigV1(
+                schema_version=1,
+                tenant_id=str(tenant_id),
+                version=body.expected_version + 1,
+                selection=body.selection,
+            )
+            if runtime is None or not isinstance(
+                runtime._providers.resolve(candidate),
+                ResolvedProviderCredential,
+            ):
+                raise _refusal("provider_credential_unavailable")
         digest = _digest(operation, str(tenant_id), body)
         replay = await _replay(session, tenant_id, body, digest)
         if replay is not None:
-            return replay
+            return {"dry_run": True, **replay} if dry_run else replay
         if operation == "retire":
             if row is None or row.http_selection is None:
                 raise _refusal("http_authority_required")
@@ -187,9 +203,25 @@ async def _write_authority(
                 raise _refusal("stale_lifecycle_generation")
             if not isinstance(configuration.selection, HttpSelectionV1):
                 raise _refusal("http_authority_required")
+            revoked = await principal_authority.revoke_authority_sessions(
+                session,
+                tenant_id=tenant_id,
+                issuer=configuration.selection.issuer,
+            )
             row.http_selection = {"mode": "disabled"}
             row.version += 1
             row.lifecycle_generation += 1
+            identity_audit.record(
+                session,
+                tenant_id=tenant_id,
+                event_type="identity.http_authority_retired",
+                actor="platform",
+                details={
+                    "authority_version": row.version,
+                    "lifecycle_generation": row.lifecycle_generation,
+                    "revoked_session_count": revoked,
+                },
+            )
         else:
             assert isinstance(body, AuthoritySelectionMutation)
             write = (
@@ -206,7 +238,11 @@ async def _write_authority(
             )
             row = await session.get(TenantIdentityProvider, tenant_id)
             assert row is not None
-        return await _record(session, tenant_id, body, digest, operation, _result(row))
+        result = _result(row)
+        if dry_run:
+            await session.rollback()
+            return {"dry_run": True, **result}
+        return await _record(session, tenant_id, body, digest, operation, result)
     except principal_authority.PrincipalAuthorityRefusal as error:
         raise _refusal(error.code) from None
 
@@ -216,8 +252,10 @@ async def adopt_authority(
     tenant_id: uuid.UUID,
     body: AuthoritySelectionMutation,
     session: SessionDep,
+    runtime: IdentityRuntimeDep,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
-    return await _write_authority(tenant_id, body, session, "adopt")
+    return await _write_authority(tenant_id, body, session, "adopt", runtime, dry_run)
 
 
 @router.post("/authorities/{tenant_id}/replace")
@@ -225,8 +263,10 @@ async def replace_authority(
     tenant_id: uuid.UUID,
     body: AuthoritySelectionMutation,
     session: SessionDep,
+    runtime: IdentityRuntimeDep,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
-    return await _write_authority(tenant_id, body, session, "replace")
+    return await _write_authority(tenant_id, body, session, "replace", runtime, dry_run)
 
 
 @router.post("/authorities/{tenant_id}/retire")
@@ -235,7 +275,7 @@ async def retire_authority(
     body: AuthorityMutation,
     session: SessionDep,
 ) -> dict[str, Any]:
-    return await _write_authority(tenant_id, body, session, "retire")
+    return await _write_authority(tenant_id, body, session, "retire", None)
 
 
 @router.get("/roles/{tenant_id}/{agent_id}")
@@ -272,7 +312,15 @@ async def _write_filter(
     session: AsyncSession,
 ) -> dict[str, Any]:
     try:
-        await principal_authority.lock_scope(session, tenant_id)
+        _, authority = await principal_authority.lock_scope(session, tenant_id)
+        if isinstance(body, GroupFilterMutation):
+            if authority is None:
+                raise _refusal("http_authority_required")
+            configuration = principal_authority.stored_configuration(authority)
+            if not isinstance(configuration.selection, HttpSelectionV1):
+                raise _refusal("http_authority_required")
+            if any(group.issuer != configuration.selection.issuer for group in body.groups):
+                raise _refusal("authority_scope_mismatch")
         operation = "set_filter" if isinstance(body, GroupFilterMutation) else "remove_filter"
         digest = _digest(operation, f"{tenant_id}/{agent_id}/{role}", body)
         replay = await _replay(session, tenant_id, body, digest)

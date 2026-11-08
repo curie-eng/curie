@@ -75,6 +75,19 @@ pub async fn identity_operator(
             Ok(body)
         })
         .transpose()?;
+    let validate_authority = dry_run
+        && path.starts_with("/identity/authorities/")
+        && (method == Method::PUT || (method == Method::POST && path.ends_with("/replace")));
+    if validate_authority {
+        let client = crate::api::ApiClient::with_resolved_key(&api_url, &api_key)?;
+        client
+            .identity_operator_request(
+                method.clone(),
+                &format!("{path}?dry_run=true"),
+                body.as_ref(),
+            )
+            .await?;
+    }
     if dry_run {
         return Ok(super::DirectoryOutput::DryRun(crate::ui::DryRunPlan {
             lines: vec![format!("{method} {path}")],
@@ -103,7 +116,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_never_emits_credentials_or_request_contents() {
         let tenant = Uuid::nil();
-        let (method, path) = authority_target("adopt", Some(tenant), None).unwrap();
+        let (method, path) = authority_target("retire", Some(tenant), None).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("request.json");
         std::fs::write(&file, r#"{"bearer":"PRIVATE_BODY_MARKER"}"#).unwrap();
@@ -119,7 +132,7 @@ mod tests {
         .unwrap()
         .to_json()
         .to_string();
-        assert!(output.contains("PUT /identity/authorities/"));
+        assert!(output.contains("POST /identity/authorities/"));
         assert!(!output.contains("PRIVATE_"));
     }
 

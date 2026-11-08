@@ -86,3 +86,67 @@ fn compiled_operator_verbs_send_exact_method_scope_and_cas_body() {
         assert!(!String::from_utf8_lossy(&output.stdout).contains("synthetic-platform-key"));
     }
 }
+
+#[test]
+fn authority_dry_runs_validate_registered_credentials_without_exposing_inputs() {
+    for action in ["adopt", "replace"] {
+        for registered in [true, false] {
+            let server = serve(move |_| {
+                if registered {
+                    Response::json(200, r#"{"dry_run":true,"configuration":{"version":1}}"#)
+                } else {
+                    Response::json(409, r#"{"detail":"provider_credential_unavailable"}"#)
+                }
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let file = directory.path().join("request.json");
+            let body = json!({"request_id":"00000000-0000-4000-8000-000000000003",
+                "expected_version":0,"expected_lifecycle_generation":0,
+                "selection":{"credential_ref":{"id":"PRIVATE_REFERENCE_MARKER","generation":1}}});
+            std::fs::write(&file, body.to_string()).unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_curie"))
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .current_dir(directory.path())
+                .args([
+                    "cluster",
+                    "identity-authority",
+                    action,
+                    "--tenant",
+                    TENANT,
+                    "--apply",
+                ])
+                .arg(&file)
+                .args([
+                    "--api-url",
+                    &server.base_url,
+                    "--api-key",
+                    "PRIVATE_API_MARKER",
+                    "--dry-run",
+                    "--json",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.success(), registered);
+            let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+            if registered {
+                assert!(payload["plan"].as_array().unwrap()[0]
+                    .as_str()
+                    .unwrap()
+                    .contains("/identity/authorities/"));
+            } else {
+                assert!(payload["error"].is_string());
+                assert!(payload.get("fix").is_some());
+            }
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("PRIVATE_"));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("PRIVATE_"));
+            let requests = server.recorded();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].path.ends_with("?dry_run=true"));
+            assert_eq!(
+                serde_json::from_slice::<Value>(&requests[0].body).unwrap(),
+                body
+            );
+        }
+    }
+}
