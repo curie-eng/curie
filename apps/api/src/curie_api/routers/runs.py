@@ -12,7 +12,13 @@ from curie_api.schemas.observability import TraceTree
 from ..auth import require_api_key
 from ..deps import LangfuseDep
 from ..evalcase import trace_to_eval_case
-from ..langfuse import build_tree, hoist_approval_decision, hoist_sandbox_id
+from ..langfuse import (
+    LangfuseReadLimitExceeded,
+    LangfuseTraceNotFound,
+    build_tree,
+    hoist_approval_decision,
+    hoist_sandbox_id,
+)
 from ..metrics import agent_trace_filter
 
 router = APIRouter(
@@ -38,6 +44,17 @@ async def _trace_or_not_ready(lf: LangfuseDep, trace_id: str) -> dict[str, Any]:
         if exc.response.status_code != status.HTTP_404_NOT_FOUND:
             raise
         raise HTTPException(status.HTTP_404_NOT_FOUND, _TRACE_NOT_READY) from exc
+    except LangfuseReadLimitExceeded as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "trace exceeds read limit") from exc
+    except LangfuseTraceNotFound as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, _TRACE_NOT_READY) from exc
+
+
+async def _trace_observations(lf: LangfuseDep, trace_id: str) -> list[dict[str, Any]]:
+    try:
+        return await lf.get_observations(trace_id)
+    except LangfuseReadLimitExceeded as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "trace exceeds read limit") from exc
 
 
 @router.get("/traces")
@@ -56,7 +73,7 @@ async def get_trace(trace_id: str, lf: LangfuseDep) -> TraceTree:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, "invalid trace id"
         )
-    observations = await lf.get_observations(trace_id)
+    observations = await _trace_observations(lf, trace_id)
     if not observations:
         raise HTTPException(status.HTTP_404_NOT_FOUND, _TRACE_NOT_READY)
     trace = await _trace_or_not_ready(lf, trace_id)
@@ -79,7 +96,7 @@ async def promote_trace_to_eval_case(trace_id: str, lf: LangfuseDep) -> EvalCase
     """
     if not _TRACE_ID_RE.match(trace_id):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid trace id")
-    observations = await lf.get_observations(trace_id)
+    observations = await _trace_observations(lf, trace_id)
     if not observations:
         raise HTTPException(status.HTTP_404_NOT_FOUND, _TRACE_NOT_READY)
     trace = await _trace_or_not_ready(lf, trace_id)

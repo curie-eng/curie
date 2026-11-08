@@ -4054,6 +4054,25 @@ bundle. Two things now name the real cause:
 - the runner refuses to boot with `CURIE_BUNDLE_REF` set over an empty plugin
   dir, and says so in those terms instead of blaming the bundle.
 
+## Langfuse v4 read APIs
+
+For a Langfuse v4 backend, set `LANGFUSE_API_VERSION=v4` on the API process.
+The default is `v3`, which keeps the legacy reads used by the bundled v3 server.
+With Helm, set this through `api.extraEnv`; for a local Compose override, add it
+under the API service's `environment`.
+
+The setting switches trace and observation reads to Observations API v2 and
+aggregate reads to Metrics API v2. It does not migrate trace ingestion. The
+worker evaluation recorder still uses legacy ingestion and needs a separate
+migration before running it against a v4 backend in `events_only` mode.
+
+In v4, run counts and latency aggregates use logical root observations rather
+than trace rows. If a trace contains several application roots, each root
+contributes to these aggregates. Trace listings still collapse those roots to
+one row. Do not compare the v3 and v4 aggregate counts as if their units were
+identical. An exact trace read that exceeds the pagination bound returns an
+upstream error instead of a partial tree or eval case.
+
 ## Known gotchas
 
 Notes from the first installs of the chart on fresh clusters, kept for the
