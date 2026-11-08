@@ -4178,6 +4178,94 @@ def test_graceful_stop_keeps_lease_through_two_ttls_of_inflight_drain(
     asyncio.run(go())
 
 
+def test_hang_renewals_during_inflight_turn_expire_liveness(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def go() -> None:
+        async with make_harness(consumer_heartbeat_ttl_ms=45000) as h:
+            active = asyncio.Event()
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.tail = [Final(text="done", status=DONE)]
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
+            probe = _RenewalProbeStore(ConsumerLivenessStore(h.async_redis), hang_renewals=True)
+            consumer._liveness_store = probe  # type: ignore[assignment]
+            clock = SimpleNamespace(now=time.monotonic())
+            observed_active: list[bool] = []
+            original_sleep = consumer._sleep_generation
+            original_renew = probe.renew
+
+            class Queries(list[str]):
+                def append(self, text: str) -> None:
+                    super().append(text)
+                    assert h.runner.turn_active
+                    active.set()
+
+            h.runner.queried = Queries()
+
+            async def generation_sleep(delay: float) -> None:
+                task = asyncio.current_task()
+                assert task is not None
+                if task.get_name() != "consumer:liveness":
+                    await original_sleep(delay)
+                    return
+                await active.wait()
+                clock.now += delay
+
+            async def renew(**kwargs: Any) -> bool:
+                observed_active.append(h.runner.turn_active)
+                return await original_renew(**kwargs)
+
+            def timeout(delay: float) -> asyncio.Timeout:
+                task = asyncio.current_task()
+                assert task is not None
+                if task.get_name() == "consumer:liveness":
+                    clock.now += delay
+                    return asyncio.timeout(0)
+                return asyncio.timeout(delay)
+
+            monkeypatch.setattr(probe, "renew", renew)
+            monkeypatch.setattr(consumer, "_sleep_generation", generation_sleep)
+            monkeypatch.setattr(
+                stream_consumer_module,
+                "time",
+                SimpleNamespace(**{**vars(time), "monotonic": lambda: clock.now}),
+            )
+            monkeypatch.setattr(
+                stream_consumer_module,
+                "asyncio",
+                SimpleNamespace(**{**vars(asyncio), "timeout": timeout}),
+            )
+            await consumer.ensure_group()
+            await h.async_redis.xadd(
+                h.config.stream,
+                to_stream_fields(_qevent("hang", thread="th-hang", event_id="hang")),
+            )
+            alive = consumer_heartbeat_key(
+                h.config.stream, h.config.consumer_group, h.config.consumer_name
+            )
+            task = asyncio.create_task(consumer.run())
+            try:
+                with pytest.raises(ConsumerLivenessExpired):
+                    await asyncio.wait_for(task, timeout=5)
+                assert observed_active and all(observed_active)
+                assert not await h.async_redis.exists(alive)
+                assert not consumer._inflight_ids
+            finally:
+                hold.set()
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(go())
+
+
 def test_real_saturated_consumer_renews_lease_and_peer_cannot_prompt_claim(
     make_harness,
 ) -> None:
