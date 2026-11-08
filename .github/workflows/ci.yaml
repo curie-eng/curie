@@ -2580,11 +2580,11 @@ jobs:
             exit 1
           fi
           printf '%s\n' "$output" | grep -F "may not skip"
-      - name: "Toolchain: Load the runner and API images built by the ci-images job"
+      - name: "Toolchain: Load the runner image built by the ci-images job"
         if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         uses: ./.github/actions/load-ci-images
         with:
-          images: "{runner,api}"
+          images: runner
       - name: "Toolchain: Tag the runner image as the harness default (curie-runner)"
         if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         run: docker tag curie-ci/runner:candidate curie-runner
@@ -2597,6 +2597,11 @@ jobs:
       # this run's runner image, run as a root container: a recycled shell
       # holds nothing from the previous claim, and an image path the runner
       # could write stops the shell before it serves.
+      - name: "Shell: Load the API image for the crash proof"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
+        uses: ./.github/actions/load-ci-images
+        with:
+          images: api
       - name: "Shell: Build the shell image on the runner image"
         if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         run: >-
