@@ -1209,7 +1209,19 @@ async def _process_event(
                     else:
                         record = await wait_scope[0].get(wait_scope[1])
                         if record is not None and record.grant_epoch is not None:
+                            previous_handle = await asyncio.to_thread(
+                                self._substrate.lookup, thread_key
+                            )
+                            previous_watch = (
+                                await self._markers.watched_turn(previous_handle.claim_name)
+                                if previous_handle is not None
+                                else None
+                            )
                             await self._quiesce_capacity_epoch(thread_key, record.grant_epoch)
+                            if previous_handle is not None and previous_watch is not None:
+                                await self._markers.forget_watched_turn(
+                                    previous_handle.claim_name, previous_watch
+                                )
                 except memory.ReclaimPreflightUnsafe:
                     handoff_refusals += 1
                     attempt -= 1

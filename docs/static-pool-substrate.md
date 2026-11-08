@@ -95,6 +95,8 @@ delivery. The heartbeat retains the PEL entry without increasing its delivery
 count. The original delivery deadline bounds the wait across restarts, and an
 exhausted deadline produces the ordinary operator-visible delivery failure.
 Actual failed deliveries retain the existing maximum-delivery cap.
+Recovery of an admitted capacity turn first quiesces its recorded runner epoch,
+then removes the exact predecessor watch before starting its replacement turn.
 
 When every slot of a pool is leased, a claim fails with
 `CapacityExhaustedError` carrying a capacity rejection for one `pods` unit in
