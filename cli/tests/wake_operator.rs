@@ -935,6 +935,16 @@ fn wake_operator_key_refusals_name_the_reason_and_hide_the_secret() {
             absent: &["authority_unavailable"],
         },
         WakeRefusal {
+            status: 503,
+            detail: "wake_declaration_unavailable",
+            exit_code: 1,
+            needles: &[
+                "wake_declaration_unavailable",
+                "stored bundle could not be read",
+            ],
+            absent: &["authority_unavailable", "wake_generation_exhausted"],
+        },
+        WakeRefusal {
             status: 400,
             detail: "wake_query_forbidden",
             exit_code: 2,
