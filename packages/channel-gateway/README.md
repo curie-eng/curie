@@ -196,15 +196,14 @@ same identity names, then write a private `gateway.json` containing the v2
 }
 ```
 
-From the source checkout, run the one-shot migration with the runtime directory
+With the upgraded CLI, run the one-shot migration with the runtime directory
 and private gateway configuration paths:
 
 ```bash
-uv run python3 scripts/migrate-protected-process.py --runtime-dir /private/acme/runtime --gateway-config /private/acme/gateway.json
+curie migrate-protected-process --runtime-dir /private/acme/runtime --gateway-config /private/acme/gateway.json
 ```
 
-The command accepts only v1, validates the complete v2 file with the runtime
-loader, writes it atomically with mode 0600, and removes the `slack` object and
+The command accepts only v1, validates the v2 process contract, writes it atomically with mode 0600, and removes the `slack` object and
 its raw tokens. Database, API, adapter and launch TLS configuration are retained.
 A refusal leaves the source file unchanged and prints no input values. Restart
 the provisioner with the migrated file and recreate any read-only projected

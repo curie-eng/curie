@@ -47,7 +47,7 @@ from .protected_worker_bootstrap import (
 from .reply_sink import ReplySinkRouter
 
 PROCESS_MIGRATION_HINT = (
-    "process.json v1 is unsupported; run uv run python3 scripts/migrate-protected-process.py "
+    "process.json v1 is unsupported; run curie migrate-protected-process "
     "--runtime-dir <directory> --gateway-config <gateway.json>; "
     "see the channel gateway upgrade guide"
 )

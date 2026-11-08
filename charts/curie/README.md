@@ -2369,21 +2369,27 @@ applications now reject them. This is a runtime credential-custody change.
 
 With no `channelGateway.tlsSecret`, Helm creates
 `<fullname>-channel-gateway-tls` containing `ca.crt`, `tls.crt` and `tls.key`.
-The server certificate covers this release's service DNS names, lasts one year,
-and is signed by a CA valid for ten years. Helm `lookup` preserves the complete
+The server certificate covers this release's service DNS names. Both it and the
+signing CA last ten years. Helm `lookup` preserves the complete
 Secret across upgrades. Use a Helm client with Kubernetes API access; offline
 renderers cannot persist generated certificates and must instead provide a
-managed `channelGateway.tlsSecret` containing all three keys. API and worker
+managed `channelGateway.tlsSecret` containing the certificate and key, plus
+`ca.crt` for a private CA. Publicly trusted certificates may omit `ca.crt`; callers
+then use their system trust roots. API and worker
 mount only `ca.crt`; the gateway alone mounts the server key. The added CA is
-trusted only by gateway transports, including file downloads.
+trusted by the API request and undo recovery clients, worker shared client,
+reply sink and file-download transports, scoped to the configured gateway origin.
+The protected worker receives its CA path from its launcher environment.
 
 Rotate before the server certificate expires. For operator-managed certificates,
-replace the named Secret's three keys with a matching CA, certificate and key.
+replace the named Secret's certificate and key, and CA when private.
 For chart-managed certificates, schedule a brief Slack delivery maintenance
 window, delete only this release's gateway TLS Secret, and run `helm upgrade`
 with the unchanged values file so Helm generates a new CA and certificate.
-Restart the gateway, API and worker Deployments together so all use the new
-certificate and trust bundle, then verify delivery. Rotation is explicit;
+TLS data checksums roll the gateway, API and worker together during the upgrade
+so all use the new certificate and trust bundle; then verify delivery.
+After changing an operator-managed Secret, run `helm upgrade` with API access
+to refresh those checksums. Rotation is explicit;
 ordinary upgrades never silently rotate the certificate. Do not delete the
 replay PVC during rotation.
 

@@ -1004,6 +1004,15 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
+    /// Migrate a protected worker process.json from v1 to v2 offline.
+    MigrateProtectedProcess {
+        /// Directory containing the stopped worker's process.json.
+        #[arg(long)]
+        runtime_dir: PathBuf,
+        /// Private v2 channel_gateway JSON object.
+        #[arg(long)]
+        gateway_config: PathBuf,
+    },
     /// Scaffold a keyless first reply, using a saved or environment model credential when available.
     Try {
         /// Keep the standard scaffold in ./curie-demo for normal skill commands.

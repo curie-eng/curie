@@ -151,9 +151,29 @@ def test_mounted_gateway_ca_reaches_reads_replies_and_file_transport(
         list(response.chunks)
 
 
-def test_gateway_ca_file_errors_are_not_ignored(monkeypatch, tmp_path):
+def test_optional_gateway_ca_uses_system_trust_and_rejects_malformed_ca(monkeypatch, tmp_path):
     from curie_channel_gateway.tls import gateway_http_mounts
 
     monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_CA_FILE", str(tmp_path / "absent.pem"))
-    with pytest.raises(FileNotFoundError):
+    assert gateway_http_mounts("https://gateway.example.com")
+    invalid = tmp_path / "invalid.pem"
+    invalid.write_text("not a certificate")
+    monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_CA_FILE", str(invalid))
+    with pytest.raises(ssl.SSLError):
         gateway_http_mounts("https://gateway.example.com")
+
+
+def test_undo_recovery_http_client_trusts_gateway_ca(tls_gateway, monkeypatch):
+    from curie_api.config import Settings
+    from curie_api.remediation_undo_recovery import recovery_http_client
+
+    endpoint, _context, ca = tls_gateway
+    monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_CA_FILE", str(ca))
+    settings = Settings(CURIE_CHANNEL_GATEWAY_URL=endpoint)
+
+    async def scenario():
+        async with recovery_http_client(settings) as client:
+            # A real TLS handshake reaches the gateway's authentication boundary.
+            assert (await client.get(endpoint)).status_code == 401
+
+    asyncio.run(scenario())
