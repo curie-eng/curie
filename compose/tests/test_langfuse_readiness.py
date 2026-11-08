@@ -502,6 +502,57 @@ def test_readiness_startup_failure_reports_cause_category(
     assert f"cause={cause}" in result.stderr
 
 
+@pytest.mark.parametrize("stderr,cause,service", [
+    # Compose --wait observed with a deliberately exited Alpine container;
+    # other controls exercise Docker/Go transport and Compose error forms.
+    # https://github.com/docker/compose/blob/main/pkg/compose/start.go
+    ("container curie-example-postgres-1 exited (17)", "container-exited", "postgres"),
+    ("container curie-example-clickhouse-1 is unhealthy", "dependency-failed", "clickhouse"),
+    ("application not healthy after 10s", "healthcheck-timeout", None),
+    ("failed to resolve reference: context deadline exceeded", "network-timeout", None),
+    ("Get https://registry.example.com: net/http: TLS handshake timeout", "network-timeout", None),
+    ("read tcp: i/o timeout", "network-timeout", None),
+    ("net/http: request canceled while waiting for connection", "network-timeout", None),
+    ("Client.Timeout exceeded while awaiting headers", "network-timeout", None),
+    ("failed to resolve reference: received unexpected HTTP status: 503 Service Unavailable",
+     "registry-unavailable", None),
+    ("unexpected status from HEAD request: 502 Bad Gateway", "registry-unavailable", None),
+    ("500 Internal Server Error", "registry-unavailable", None),
+    ("504 Gateway Timeout", "registry-unavailable", None),
+    ("failed to copy: unexpected EOF", "image-transfer", None),
+    ("read: connection reset by peer", "network-connection", None),
+    ("dial tcp: connection refused", "network-connection", None),
+    ("lookup registry.example.com: no such host", "network-connection", None),
+    ("service langfuse-web is required but is disabled", "configuration", "langfuse-web"),
+    ("no such service: langfuse-web", "configuration", "langfuse-web"),
+    ("required variable EXAMPLE is missing a value", "configuration", None),
+    ("invalid interpolation format for services.postgres.environment", "configuration", "postgres"),
+    ("service postgres depends on undefined service example", "configuration", "postgres"),
+    ("container for service postgres has no healthcheck configured", "configuration", "postgres"),
+    ("Cannot connect to the Docker daemon at unix:///example.sock", "daemon-unavailable", None),
+    ("failed to copy: no space left on device", "disk", None),
+])
+def test_readiness_startup_error_diagnostics(
+    tmp_path: Path, stderr: str, cause: str, service: str | None,
+) -> None:
+    result, calls, _ = _run(
+        tmp_path, "http://127.0.0.1:1", scenario="healthy", fail_argv=_STARTUP_UP,
+        fail_stderr=(
+            " Container curie-example-valkey-1 Running\n"
+            f"{stderr}\nAuthorization: Bearer example-secret\n"
+            "https://example-user:example-password@registry.example.com/private/image\n"
+        ),
+    )
+
+    detail = f"phase=startup, exit code=1, cause={cause}"
+    if service is not None:
+        detail += f", service={service}"
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr.strip() == f"Langfuse readiness Compose command failed ({detail})"
+    assert _compose_commands(calls) == [["config", "--services"], _STARTUP_UP]
+
+
 def test_readiness_startup_failure_withholds_compose_output_details(
     tmp_path: Path, web: tuple[str, list[tuple[str, str | None]]],
 ) -> None:
