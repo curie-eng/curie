@@ -1,7 +1,7 @@
 """A failed restore must not log a private value, and every scenario module imports first.
 
-Covers ``Evidence.scrub_text``, ``identity_scenarios_requester._quietly`` and the
-import order of the scenario modules. Synthetic values only.
+Covers the ``Evidence.hold_private`` short-value refusal,
+``identity_scenarios_requester._quietly`` and the import order of the scenario modules. Synthetic values only.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ SEG = "A1b2C3d4E5f6G7h8_-9z"
 TICKET = f"cat1.{SEG}.{SEG}"
 SUBJECT = "synthetic-subject-0002"
 SHORT = "abc1234"
-REDACTED = "[redacted]"
 
 
 def held(*values: str) -> Evidence:
@@ -29,24 +28,14 @@ def held(*values: str) -> Evidence:
     return evidence
 
 
-# --- Evidence.scrub_text ----------------------------------------------------------
+# --- Evidence.hold_private --------------------------------------------------------
 
 
-def test_scrub_text_replaces_a_held_secret_and_an_envelope() -> None:
-    text = f"insert failed for {SUBJECT} with {TICKET} twice: {SUBJECT}"
-    scrubbed = held(SUBJECT).scrub_text(text)
-    assert SUBJECT not in scrubbed
-    assert TICKET not in scrubbed
-    assert scrubbed == f"insert failed for {REDACTED} with {REDACTED} twice: {REDACTED}"
-
-
-def test_scrub_text_keeps_a_short_held_value() -> None:
-    text = f"row {SHORT} missing"
-    assert held(SHORT).scrub_text(text) == text
-
-
-def test_scrub_text_returns_clean_text_unchanged() -> None:
-    assert held(SUBJECT).scrub_text("connection reset by peer") == "connection reset by peer"
+def test_hold_private_refuses_a_short_value() -> None:
+    with pytest.raises(HarnessError) as caught:
+        held(SHORT)
+    assert "shorter than 8 characters" in str(caught.value)
+    assert SHORT not in str(caught.value)
 
 
 # --- _quietly ---------------------------------------------------------------------
@@ -60,7 +49,7 @@ def test_quietly_logs_the_failure_without_private_values(
 
     assert requester._quietly(held(SUBJECT), call) is None
     captured = capsys.readouterr()
-    assert "restore failed: HarnessError" in captured.err
+    assert captured.err.strip().endswith("restore failed: HarnessError")
     assert SUBJECT not in captured.err
     assert TICKET not in captured.err
     assert SEG not in captured.err
