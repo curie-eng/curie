@@ -1,4 +1,5 @@
-{{- if .Values.channelGateway.deploy }}
+{{- $gateway := .Values.channelGateway | default dict }}
+{{- if $gateway.deploy }}
 {{- if and (not .Values.channelGateway.allowInsecure) (not .Values.channelGateway.tlsSecret) }}
 {{- fail "channelGateway.tlsSecret is required unless channelGateway.allowInsecure is explicitly true" }}
 {{- end }}

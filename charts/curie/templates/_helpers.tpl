@@ -1223,9 +1223,10 @@ credentials and the derived collector header cannot disagree. */}}
 {{- $langfuseInitProjectSecretKey := include "curie.managedSecret" (dict "root" . "key" "langfuseInitProjectSecretKey" "value" .Values.langfuse.init.projectSecretKey "default" "sk-lf-curie-dev" "hex" false "existingData" $existingSecretData) -}}
 {{- $langfuseInitUserPassword := include "curie.managedSecret" (dict "root" . "key" "langfuseInitUserPassword" "value" .Values.langfuse.init.userPassword "default" "curie-dev-password" "hex" false "existingData" $existingSecretData) -}}
 {{- $content := dict -}}
+{{- $gateway := .Values.channelGateway | default dict -}}
 {{- range $caller := list "api" "worker" -}}
 {{- $key := printf "channelGateway%sToken" (title $caller) -}}
-{{- $_ := set $content $key (include "curie.managedSecret" (dict "root" $ "key" $key "value" (index $.Values.channelGateway (printf "%sToken" $caller)) "default" (printf "curie-dev-gateway-%s" $caller) "hex" false "existingData" $existingSecretData)) -}}
+{{- $_ := set $content $key (include "curie.managedSecret" (dict "root" $ "key" $key "value" (index $gateway (printf "%sToken" $caller)) "default" (printf "curie-dev-gateway-%s" $caller) "hex" false "existingData" $existingSecretData)) -}}
 {{- end -}}
 
 {{- $_ := set $content "installationId" ((include "curie.installationId" .) | toString) -}}
