@@ -12,7 +12,6 @@ import asyncio
 import base64
 import json
 import os
-import shlex
 import subprocess
 import sys
 import threading
@@ -36,6 +35,7 @@ from queue_fixtures import wait_until  # noqa: E402
 
 NAME = "test-adr0274-wake-worker"
 FULLNAME = f"{NAME}-curie"
+EFFECT_MARKER = "/tmp/curie-wake-bash-effect"
 
 
 class WakeStack:
@@ -59,8 +59,8 @@ class WakeStack:
         self.slack_calls = []
         self.slack = None
         self.slack_thread = None
-        self.effect_marker = root / "bash-effect"
         self.bash_requests = 0
+        self.model_paths = []
 
     def run(self, *args: str, stdin: str | None = None, timeout: int = 600) -> str:
         result = subprocess.run(
@@ -125,11 +125,7 @@ class WakeStack:
         class Slack(BaseHTTPRequestHandler):
             def do_POST(self):
                 payload = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-                if self.path == "/effect":
-                    runtime.effect_marker.write_text("executed")
-                    self.send_response(200)
-                    self.end_headers()
-                    return
+                runtime.model_paths.append(self.path)
                 if self.path.startswith("/model/"):
                     body = (
                         runtime.model_response(json.loads(payload))
@@ -163,13 +159,8 @@ class WakeStack:
         self.slack_thread = threading.Thread(target=self.slack.serve_forever, daemon=True)
         self.slack_thread.start()
         slack_url = f"http://{callback}:{self.slack.server_port}/api/"
-        effect_url = f"http://{callback}:{self.slack.server_port}/effect"
-        effect_code = (
-            "import urllib.request;"
-            f"urllib.request.urlopen(urllib.request.Request({effect_url!r},data=b'executed')).read()"
-        )
-        self.effect_command = f"python3 -c {shlex.quote(effect_code)}"
-        model_url = f"http://{callback}:{self.slack.server_port}/model"
+        self.effect_command = f"printf executed > {EFFECT_MARKER}"
+        self.model_url = f"http://{callback}:{self.slack.server_port}/model"
         self.run("docker", "info", timeout=30)
         for role in ("api", "worker"):
             self.run(
@@ -212,7 +203,7 @@ class WakeStack:
                 "image": self.image("worker"),
                 "slackApiBaseUrl": slack_url,
                 "slackTrustedOrigins": "",
-                "extraEnv": [{"name": "CURIE_MODEL_BASE_URL", "value": model_url}],
+                "extraEnv": [{"name": "CURIE_MODEL_BASE_URL", "value": self.model_url}],
             },
             "ui": {"deploy": False},
             "dispatcher": {"deploy": False, "slack": {"botToken": "example-slack-token"}},
@@ -224,7 +215,17 @@ class WakeStack:
             "priorityClasses": {
                 role: {"name": f"{NAME}-{role}"} for role in ("platform", "sandbox")
             },
-            "security": {"gvisor": {"mode": "off"}},
+            "security": {
+                "gvisor": {"mode": "off"},
+                "networkPolicy": {
+                    "allowedEgress": [
+                        {
+                            "cidr": f"{callback}/32",
+                            "ports": [{"protocol": "TCP", "port": self.slack.server_port}],
+                        }
+                    ]
+                },
+            },
             "agentSandbox": {
                 "deploy": True,
                 "controller": {"deploy": True},
@@ -546,7 +547,7 @@ class WakeStack:
             "resume_from = CASE WHEN EXCLUDED.paused_at IS NULL THEN now() END"
         )
 
-    def assert_agent_callers(self):
+    def agent_callers(self):
         pods = json.loads(self.kube("get", "pods", "-o", "json"))["items"]
         claims = []
         for pod in pods:
@@ -558,20 +559,52 @@ class WakeStack:
                     secret = json.loads(self.kube("get", "secret", ref["name"], "-o", "json"))
                     token = base64.b64decode(secret["data"][ref["key"]]).decode()
                     encoded = token.split(".")[1]
-                    claims.append(
-                        json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+                    claim = json.loads(
+                        base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
                     )
+                    claims.append((pod["metadata"]["name"], claim))
+        return claims
+
+    def marker_value(self, agent):
+        pods = [pod for pod, claim in self.agent_callers() if claim["agent"] == agent]
+        assert len(pods) == 1
+        return json.loads(
+            self.kube(
+                "exec",
+                pods[0],
+                "-c",
+                "runner",
+                "--",
+                "python3",
+                "-c",
+                f"import json;from pathlib import Path;p=Path('{EFFECT_MARKER}');"
+                "print(json.dumps(p.read_text() if p.exists() else None))",
+            )
+        )
+
+    def assert_agent_callers(self):
+        claims = [claim for _, claim in self.agent_callers()]
         assert claims
         assert all(set(claim) == {"agent", "exp"} for claim in claims)
         assert {"acme-wake-idle", "acme-wake-http"} <= {claim["agent"] for claim in claims}
 
     def capture_failure(self):
+        (self.root / "failure-model.json").write_text(
+            json.dumps({"paths": self.model_paths, "bash_requests": self.bash_requests})
+        )
         for name, argv in (
             ("worker", ("logs", f"deployment/{FULLNAME}-worker", "--tail=150")),
             ("pods", ("get", "pods", "-o", "json")),
             ("events", ("get", "events", "-o", "json")),
         ):
             (self.root / f"failure-{name}.log").write_text(self.kube(*argv))
+        pods = json.loads((self.root / "failure-pods.log").read_text())["items"]
+        for pod in pods:
+            if any(container["name"] == "runner" for container in pod["spec"]["containers"]):
+                name = pod["metadata"]["name"]
+                (self.root / f"failure-{name}.log").write_text(
+                    self.kube("logs", name, "-c", "runner", "--tail=150")
+                )
         (self.root / "failure-stream.log").write_text(
             json.dumps(
                 {
@@ -620,7 +653,7 @@ def test_webhook_wake_worker_boundary(stack):
     stack.worker(True)
     assert stack.settled(initial, "ran")["renewed"]
     stack.wait_done(event)
-    assert stack.effect_marker.read_text() == "executed"
+    assert stack.marker_value("acme-wake-idle") == "executed"
     transcript = stack.transcripts("acme-wake-idle")
     assert transcript
     stale = event.model_copy(update={"event_id": event.event_id + ":stale"})
@@ -648,13 +681,12 @@ def test_webhook_wake_worker_boundary(stack):
     assert stack.state(paused)["outcome"] == "blocked"
     print("pause: terminal blocked/hook_paused; fresh wake executes after resume")
 
-    stack.effect_marker.unlink(missing_ok=True)
     attempted = stack.bash_requests
     gated, gated_event = stack.seed("acme-wake-gated")
     stack.settled(gated, "failed", "approval_gate_targetless")
     stack.wait_done(gated_event)
     assert stack.bash_requests > attempted
-    assert not stack.effect_marker.exists()
+    assert stack.marker_value("acme-wake-gated") is None
     assert stack.sql("SELECT count(*) FROM curie.approvals") == "0"
     print("approval: targetless refusal without Bash effect, card or resume")
 
