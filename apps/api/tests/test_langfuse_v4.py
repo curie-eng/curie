@@ -508,3 +508,21 @@ def test_runs_router_reports_incomplete_observations_as_upstream_failure(
         response = getattr(client, method)(f"/langfuse/traces/abc{suffix}", headers=_headers())
     assert response.status_code == 502
     assert response.json()["detail"] == "trace exceeds read limit"
+
+
+class _UnboundedTraceRoots(_UnboundedRoots):
+    def _observations(self, params: httpx.QueryParams) -> httpx.Response:
+        if params.get("isRootObservation") != "true":
+            row = _root("abc", "2026-11-17T10:00:00.000Z")
+            return httpx.Response(200, json={"data": [row], "meta": {}})
+        return super()._observations(params)
+
+
+@pytest.mark.parametrize("method,suffix", [("get", ""), ("post", "/eval-case")])
+def test_runs_router_reports_incomplete_roots_as_upstream_failure(
+    method: str, suffix: str
+) -> None:
+    with _runs_client(_UnboundedTraceRoots([])) as client:
+        response = getattr(client, method)(f"/langfuse/traces/abc{suffix}", headers=_headers())
+    assert response.status_code == 502
+    assert response.json()["detail"] == "trace exceeds read limit"
