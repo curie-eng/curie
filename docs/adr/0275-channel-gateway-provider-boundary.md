@@ -62,8 +62,8 @@ particular, replace dispatcher `AdmissionAnswer`, API `GroupMembershipSource`,
 `ChannelReader` and `CanvasReader`; keep no parallel definition or compatibility
 alias. Shared neutral value records belong in `channel-protocol` when needed.
 The executable regression selection is `packages/channel-gateway/behavior.pytest`.
-Its sole named exclusion records a selected-click baseline timing failure that
-passes CI. Extraction must retain all remaining assertions and controls.
+It includes the selected-click acknowledgement and exactly-once submission check.
+Extraction must retain all assertions and controls.
 
 This Draft records the proposed durable boundary for review. It does not accept
 the decision or authorize subsequent runtime rewiring by itself.
