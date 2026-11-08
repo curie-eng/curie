@@ -547,21 +547,45 @@ async def _process_event(
                 hook_reason="prior_side_effect",
             )
 
-        if await self._markers.saw_side_effect(event_id):
+        prior_side_effect = await self._markers.saw_side_effect(event_id)
+        predecessor_watch = None
+        if lease is not None and lease.generation > 1:
             predecessor = await asyncio.to_thread(self._substrate.lookup, thread_key)
-            predecessor_watch = (
-                await self._markers.watched_turn(predecessor.claim_name)
-                if predecessor is not None
-                else None
-            )
-            if not (
-                lease is not None
-                and lease.generation > 1
-                and predecessor_watch is not None
-                and json.loads(predecessor_watch)["event_id"] == event_id
-            ):
-                await halt_prior_side_effect()
-                return
+            if predecessor is not None:
+                predecessor_watch = await self._markers.watched_turn(predecessor.claim_name)
+                if (
+                    predecessor_watch is not None
+                    and json.loads(predecessor_watch)["event_id"] == event_id
+                ):
+                    try:
+                        status = await self._runner.status(
+                            predecessor.base_url,
+                            token=predecessor.token or None,
+                            remaining_s=min(5.0, max(0.0, lease.remaining_s())),
+                        )
+                    except Exception:  # noqa: BLE001 - preflight keeps unreadable runners fenced
+                        status = {}
+                    if status.get("side_effect_emitted") is True:
+                        await self._markers.mark_side_effect(event_id)
+                        prior_side_effect = True
+                else:
+                    predecessor_watch = None
+        if prior_side_effect:
+            if predecessor_watch is not None:
+                assert lease is not None
+                handoff_refusals = 0
+                while lease.remaining_s() > constants._MIN_ATTEMPT_BUDGET_S:
+                    lease.raise_if_lost()
+                    try:
+                        await self._preflight_reclaimed_delivery(thread_key, lease)
+                        break
+                    except memory.ReclaimPreflightUnsafe:
+                        handoff_refusals += 1
+                        await asyncio.sleep(
+                            min(self._backoff(handoff_refusals), max(0.0, lease.remaining_s()))
+                        )
+            await halt_prior_side_effect()
+            return
 
         # ADR-0168 decision 6: a turn one of this installation's own
         # identities wrote counts against the sibling limit, and past it

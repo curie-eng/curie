@@ -2399,9 +2399,9 @@ def test_failed_watch_retirement_does_not_starve_other_reaps(make_harness, monke
     asyncio.run(go())
 
 
-@pytest.mark.parametrize("persisted", [False, True])
+@pytest.mark.parametrize(("persisted", "reported"), [(False, True), (True, True), (True, False)])
 def test_reclaim_waits_for_side_effecting_predecessor_retirement(
-    make_harness, persisted: bool
+    make_harness, persisted: bool, reported: bool
 ) -> None:
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS, abandoned_turn_grace_s=0.001) as h:
@@ -2422,7 +2422,7 @@ def test_reclaim_waits_for_side_effecting_predecessor_retirement(
             )
             h.runner.turn_active = True
             h.runner.history_durable = False
-            h.runner.side_effect_emitted = True
+            h.runner.side_effect_emitted = reported
             if persisted:
                 await h.kernel._markers.mark_side_effect(event.event_id)
             await consumer._dispatch(entry, fields)
