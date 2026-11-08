@@ -4602,9 +4602,15 @@ def test_terminal_liveness_failure_cancels_generation_and_clean_restart_recovers
                 ConsumerLivenessStore(h.async_redis), hang_renewals=True
             )
             await consumer.ensure_group()
+            event = _qevent("restart", thread="th-restart", event_id="restart")
+            await asyncio.to_thread(
+                h.substrate.claim,
+                kernel_routing._thread_key_for(event),
+                env={"CURIE_RUNNER_TOKEN": "recovery-test-token"},
+            )
             entry_id = await h.async_redis.xadd(
                 h.config.stream,
-                to_stream_fields(_qevent("restart", thread="th-restart", event_id="restart")),
+                to_stream_fields(event),
             )
 
             first = asyncio.create_task(consumer.run())

@@ -1014,11 +1014,16 @@ async def _route_and_start(
             assert delivery_lease is not None
             previous = await self._markers.watched_turn(handle.claim_name)
             if previous is not None and json.loads(previous)["owner"] != delivery_lease.owner:
-                if not await self._workspace_handoff_ready(handle, remaining_s=remaining_s):
+                predecessor = json.loads(previous)
+                if not await self._markers.is_terminal(
+                    predecessor["event_id"]
+                ) and not await self._workspace_handoff_ready(handle, remaining_s=remaining_s):
                     raise failures.HandoffPending(
                         f"thread {thread_key} still has an unsettled leased turn"
                     )
-            await self._markers.watch_turn(thread_key, handle.claim_name, delivery_lease)
+            await self._markers.watch_turn(
+                thread_key, handle.claim_name, delivery_lease, queued_event_id
+            )
         if wait is None:
             turn = await self._start_turn_under_hook_control(handle, event, remaining_s)
         elif wait_budget_s is None:

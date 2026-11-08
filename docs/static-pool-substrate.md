@@ -97,6 +97,8 @@ exhausted deadline produces the ordinary operator-visible delivery failure.
 Actual failed deliveries retain the existing maximum-delivery cap.
 Recovery of an admitted capacity turn first quiesces its recorded runner epoch,
 then removes the exact predecessor watch before starting its replacement turn.
+A completed predecessor is recognized through the existing terminal ledger;
+other unfinished predecessors must still reach a durable handoff boundary.
 
 When every slot of a pool is leased, a claim fails with
 `CapacityExhaustedError` carrying a capacity rejection for one `pods` unit in

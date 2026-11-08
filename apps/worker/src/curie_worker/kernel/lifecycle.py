@@ -1218,7 +1218,11 @@ async def _process_event(
                                 else None
                             )
                             await self._quiesce_capacity_epoch(thread_key, record.grant_epoch)
-                            if previous_handle is not None and previous_watch is not None:
+                            if (
+                                previous_handle is not None
+                                and previous_watch is not None
+                                and json.loads(previous_watch)["event_id"] == event_id
+                            ):
                                 await self._markers.forget_watched_turn(
                                     previous_handle.claim_name, previous_watch
                                 )
