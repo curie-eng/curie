@@ -208,6 +208,8 @@ owned by the runner's UID (1000 in the standard image), and sets
 receive the file reference in shell and hook subprocesses and read this file
 and the URL map in `CURIE_CONNECTOR_UPLOAD_ENDPOINTS`. With no
 upload listener configured, no upload token is minted and no file is created.
+At startup, the runner snapshots every token value for outbound redaction and
+refuses to start if the configured file cannot be read or validated.
 
 Tokens expire 3600 seconds after minting. There is no automatic renewal: an
 upload after expiry receives HTTP 403 with `error.data.curie_caller` equal to
@@ -218,6 +220,11 @@ its agent and connector until expiry, including after its claim ends; this is
 the accepted bound of the existing `ccu` wire. Kubernetes and Docker substrates
 do not currently deliver upload-token files automatically; this capability
 requires the static-pool substrate.
+
+The 3600-second cap is enforced at mint time only; the listener checks expiry
+only, which is safe because only the worker holds the signing key. Binding an
+upload URL on Kubernetes or Docker logs one warning that token delivery is
+unsupported and requires the static substrate.
 
 The upload listener verifies the signature, expiry, admitted agent, and connector
 before streaming the bounded upload to task loopback. It rejects `/mcp`, other

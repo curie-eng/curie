@@ -521,6 +521,7 @@ def test_connector_endpoint_settings_reach_the_runner_on_a_shell(
         binding = BindingResolver.__new__(BindingResolver)
         binding._config = WorkerConfig(
             api_key="",
+            sandbox_substrate="static",
             bundle_plugin_dir=str(tmp_path),
             connector_caller_signing_key=signing_key,
             connector_endpoints=StaticConnectorEndpoints.model_validate(endpoints),

@@ -233,6 +233,10 @@ bound; the existing token wire has no claim identifier or revocation mechanism.
 Automatic upload-token file delivery is unsupported on the Kubernetes and Docker
 substrates.
 
+The 3600-second cap is enforced at mint time only; the listener checks expiry
+only, which is safe because only the worker holds the signing key. On Kubernetes
+or Docker, the worker warns at binding time when upload URLs are configured.
+
 Before it serves, the supervisor walks the whole filesystem (virtual
 filesystems excepted) and refuses to start, with exit code 78, when the child
 could write any path outside the scratch roots, when a setuid or setgid file

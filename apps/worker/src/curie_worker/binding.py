@@ -2080,6 +2080,16 @@ def apply_connector_endpoints(
     if not agent_name or not caller_token:
         raise ValueError("static hosted connectors require an authenticated agent and caller token")
     binding = config.connector_endpoints.bind(agent_name)
+    uploads = sorted(name for name, endpoint in binding.connectors.items() if endpoint.upload_url)
+    substrate = config.sandbox_substrate.strip().lower()
+    if uploads and substrate in {"kubernetes", "docker"}:
+        logger.warning(
+            "connector upload token delivery is not supported on the %s substrate "
+            "for agent %s (connectors: %s); use the static substrate",
+            substrate,
+            agent_name,
+            ", ".join(uploads),
+        )
     env[BINDING_ENV] = binding.model_dump_json(exclude_none=True, exclude_defaults=True)
     env[BootEnv.env_key("connector_agent")] = agent_name
     env[CONNECTOR_CALLER_TOKEN_ENV] = caller_token

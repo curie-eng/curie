@@ -10,8 +10,7 @@ import pytest
 from aci_protocol import EvalJob
 from curie_internal.connector_endpoints import BINDING_ENV
 from curie_runner import RunnerConfig
-from curie_worker.binding import BindingResolver, ResolvedDeployment
-from curie_worker.binding import apply_connector_endpoints
+from curie_worker.binding import BindingResolver, ResolvedDeployment, apply_connector_endpoints
 from curie_worker.config import WorkerConfig
 from curie_worker.eval.stream import EvalStreamConsumer
 
@@ -33,16 +32,23 @@ def _config(monkeypatch: pytest.MonkeyPatch) -> WorkerConfig:
 @pytest.mark.parametrize("substrate", ["kubernetes", "docker", "static"])
 @pytest.mark.parametrize("uploads", [False, True])
 def test_binding_warns_once_for_unsupported_upload_token_delivery(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
-    substrate: str, uploads: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    substrate: str,
+    uploads: bool,
 ) -> None:
     monkeypatch.setenv("CURIE_SANDBOX_SUBSTRATE", substrate)
     endpoints = {
-        "version": 1, "agents": {"acme-dev": {
-            name: {"base_url": "https://connectors.example.com/" + name,
-                   **({"upload_url": "https://uploads.example.com/" + name} if uploads else {})}
-            for name in ("reviewer", "uploads")
-        }},
+        "version": 1,
+        "agents": {
+            "acme-dev": {
+                name: {
+                    "base_url": "https://connectors.example.com/" + name,
+                    **({"upload_url": "https://uploads.example.com/" + name} if uploads else {}),
+                }
+                for name in ("reviewer", "uploads")
+            }
+        },
     }
     monkeypatch.setenv("CURIE_CONNECTOR_ENDPOINTS", json.dumps(endpoints))
     config = WorkerConfig(connector_caller_signing_key=_SEED)

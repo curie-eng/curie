@@ -6,9 +6,11 @@ import base64
 import json
 import re
 from collections.abc import Collection, Iterable, Mapping
+from pathlib import Path
 from typing import Any, cast
 
 from aci_protocol import BootEnv
+from curie_internal.connector_endpoints import UPLOAD_TOKENS_FILE_ENV
 from curie_telemetry.bootstrap import _exporter_headers
 from curie_telemetry.redact import (
     REDACTION_BOUNDARIES,
@@ -35,6 +37,22 @@ _ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 _CONTENT_FIELDS = frozenset(
     ("text", "message", "detail", "result", "approval_summary", "approval_display")
 )
+
+
+def _upload_token_values(path: str) -> set[str]:
+    try:
+        tokens = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(tokens, dict) or not all(
+            isinstance(name, str) and name and isinstance(token, str) and token
+            for name, token in tokens.items()
+        ):
+            raise ValueError
+    except (OSError, UnicodeError, ValueError):
+        raise ValueError(
+            f"{UPLOAD_TOKENS_FILE_ENV} must name a readable JSON map of connector names "
+            "to nonempty tokens; fix the claim token file before starting the runner"
+        ) from None
+    return set(tokens.values())
 
 
 def collect_held_secrets(
@@ -72,6 +90,8 @@ def collect_held_secrets(
     }
     names.discard(_CONNECTOR_SECRET_KEYS_ENV)
     values.update(value for env in sources for name in names if (value := env.get(name)))
+    for path in {env[UPLOAD_TOKENS_FILE_ENV] for env in sources if UPLOAD_TOKENS_FILE_ENV in env}:
+        values.update(_upload_token_values(path))
     otel_header_maps: list[dict[str, str]] = []
     if config.session.otel.headers is not None:
         otel_header_maps.append(
