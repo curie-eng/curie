@@ -2701,7 +2701,8 @@ def test_active_wait_delivery_recovers_after_deadline_without_expiry(
             # thread back to the queued notice.
             h.runner.turn_active = True
             await recovery._sem.acquire()
-            await recovery._handle(wake_id, wake_fields)
+            async with asyncio.timeout(10):
+                await recovery._handle(wake_id, wake_fields)
             assert h.sink.last_text == "recovered answer"
             assert [text for _, _, text in h.sink.updates].count(
                 "Your request is queued while sandbox admission is pending."
