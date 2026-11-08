@@ -1044,6 +1044,110 @@ def test_requester_window_rule(monkeypatch: pytest.MonkeyPatch) -> None:
             assert bound_for(requester, exp) == (None, False)
 
 
+class _ChartRunner:
+    """``RunnerClient.turn_deadline_s`` under the chart's 10800 s default.
+
+    @spec CONNECTOR-REQUESTER-3.
+    """
+
+    def turn_deadline_s(self, remaining_s: float | None) -> float:
+        if remaining_s is None:
+            return 10800.0
+        return max(0.05, min(10800.0, remaining_s))
+
+
+# @spec CONNECTOR-REQUESTER-3
+def test_a_requester_turn_ends_while_its_signed_boot_credentials_are_valid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bound covers every credential the turn depends on, minted for real.
+
+    The production minter (``BindingResolver.boot_env``) signs the boot state
+    tokens and the requester cct at T from the static 3450 s cap, so the state
+    tokens end at T + 3510 and the cct at T + 3600. A claim and preparation of
+    95 s later, the limiter bounds the turn; the production verifier
+    (``sandbox_token.verify``) must still accept the history token for the
+    whole turn plus the grace in-flight state calls get, and the cct must
+    still be live then. Bounding by the cct alone (3445 s) would end the turn
+    at T + 3540, 30 s after the history token died.
+    """
+    from curie_worker import binding as binding_module
+    from curie_worker.binding import (
+        HISTORY_TOKEN_ENV,
+        MEMORY_TOKEN_ENV,
+        BindingResolver,
+        BootEnv,
+        ResolvedDeployment,
+        boot_token_facts,
+        caller_requester_facts,
+    )
+
+    api_key = "regression-api-key"
+    agent = uuid.UUID("11111111-1111-4111-8111-111111111111")
+    resolver = BindingResolver.__new__(BindingResolver)
+    resolver._config = WorkerConfig(  # type: ignore[attr-defined]
+        api_key=api_key,
+        connector_caller_signing_key=_requester_seed(),
+        connector_release="curie",
+        connector_namespace="curie",
+    )
+    resolved = ResolvedDeployment(
+        agent_id=agent,
+        agent_name="test-agent",
+        version_id=uuid.uuid4(),
+        version_label="v1",
+        bundle_ref="bundles/x.zip",
+        max_usd_per_day=None,
+        max_output_tokens_per_run=None,
+    )
+    kernel = SimpleNamespace(
+        _runner=_ChartRunner(), _substrate=SimpleNamespace(claim_timeout_seconds=90.0)
+    )
+    static_cap = _kernel_helper("_requester_turn_cap_s")(kernel)
+    assert static_cap == 3450.0
+    frozen = SimpleNamespace(**{**vars(time), "time": lambda: float(_T)})
+    monkeypatch.setattr(binding_module, "time", frozen)
+    env = resolver.boot_env(
+        resolved,
+        "thread-1",
+        kind="slack",
+        address="C0EXAMPLE1",
+        token_ttl_s=kernel._runner.turn_deadline_s(static_cap),
+        caller_principal=caller_token.CallerPrincipal(**_ALICE),
+    )
+    history = env[HISTORY_TOKEN_ENV]
+    requester, cct_exp = caller_requester_facts(env)
+    _agent, _cred, state_exp = boot_token_facts(history)
+    assert requester == _A
+    assert state_exp == _T + 3510
+    assert cct_exp == _T + _REQUESTER_TTL
+    handle = _requester_handle(
+        caller_requester=requester, caller_token_exp=cct_exp, state_token_exp=state_exp
+    )
+
+    started = _T + 95
+    _freeze_kernel_clock(monkeypatch, float(started))
+    bound = _kernel_helper("_bound_requester_turn")
+    budget, capped = bound(kernel, handle, 10800.0 - 95)
+    assert capped is True
+    turn_end = started + kernel._runner.turn_deadline_s(budget)
+    assert turn_end == _T + 3450
+    in_flight_until = int(turn_end) + BOOT_TOKEN_GRACE_SECONDS - 1
+    for key, scope in (
+        (HISTORY_TOKEN_ENV, "state"),
+        (MEMORY_TOKEN_ENV, "state"),
+        (BootEnv.env_key("state_token"), "state.app"),
+    ):
+        assert sandbox_token.verify(
+            env[key], api_key, agent=str(agent), scope=scope, now=in_flight_until
+        ), f"{key} expired before the turn's in-flight state calls finished"
+    assert cct_exp >= turn_end + BOOT_TOKEN_GRACE_SECONDS
+    # Without the state token in the bound, the cct alone allows 3445 s and
+    # the history token is dead before that turn ends.
+    cct_only = started + (cct_exp - started - BOOT_TOKEN_GRACE_SECONDS)
+    assert not sandbox_token.verify(history, api_key, agent=str(agent), scope="state", now=cct_only)
+
+
 _DEADLINE_RESIGN_CASES = [
     # (principal, signed exp offset, deadline offset, expected exp offset or outcome)
     ("alice", 3600, 1200, 1200),

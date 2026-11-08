@@ -207,18 +207,24 @@ def _requester_turn_budget(self: Kernel, remaining_s: float | None) -> float:
 
 
 def _requester_window_s(handle: SandboxHandle) -> float | None:
-    """What the sandbox's requester token leaves for a turn opened now.
+    """What the sandbox's credentials leave for a requester turn opened now.
 
-    ADR 0270 decision 3: the token's expiry less now and the boot grace, or
-    None for a route that did not boot with a requester digest. A digest route
-    whose expiry is unknown has no window at all.
+    ADR 0270 decision 3: the earliest expiry among the credentials the turn
+    depends on, less now and the boot grace. That is the requester cct and,
+    when the route records it, the boot state token the history and state
+    calls carry (#3823), which is minted before the claim and so usually ends
+    first. None for a route that did not boot with a requester digest. A digest
+    route whose cct expiry is unknown has no window at all.
     """
 
     if not _is_requester_digest(handle.caller_requester):
         return None
     if handle.caller_token_exp is None:
         return 0.0
-    return handle.caller_token_exp - clock.time.time() - BOOT_TOKEN_GRACE_SECONDS
+    expiry = handle.caller_token_exp
+    if handle.state_token_exp is not None:
+        expiry = min(expiry, handle.state_token_exp)
+    return expiry - clock.time.time() - BOOT_TOKEN_GRACE_SECONDS
 
 
 def _bound_requester_turn(
