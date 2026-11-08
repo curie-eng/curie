@@ -205,7 +205,8 @@ staging archive carries only the minted tokens. The supervisor writes a JSON
 object mapping connector names to tokens in a fresh claim directory, mode `0400`,
 owned by the runner's UID (1000 in the standard image), and sets
 `CURIE_CONNECTOR_UPLOAD_TOKENS_FILE` to its absolute path. Bundle upload clients
-read this file and the URL map in `CURIE_CONNECTOR_UPLOAD_ENDPOINTS`. With no
+receive the file reference in shell and hook subprocesses and read this file
+and the URL map in `CURIE_CONNECTOR_UPLOAD_ENDPOINTS`. With no
 upload listener configured, no upload token is minted and no file is created.
 
 Tokens expire 3600 seconds after minting. There is no automatic renewal: an

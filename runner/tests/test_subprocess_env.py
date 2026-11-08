@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
 from curie_runner.subprocess_env import (
     BASH_CREDENTIAL_PRELUDE,
     release_platform_credentials,

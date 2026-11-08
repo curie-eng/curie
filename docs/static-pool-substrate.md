@@ -218,7 +218,8 @@ The staging manifest carries the token map separately from the child environment
 The supervisor writes `connector-upload-tokens.json` inside the new claim
 directory, owned by UID 1000 in the standard image with mode `0400`, and sets
 `CURIE_CONNECTOR_UPLOAD_TOKENS_FILE` for the runner. It owns this environment
-variable, so a supplied path cannot override it. With no upload tokens, it
+variable, so a supplied path cannot override it. The runner preserves the file
+reference for bundle shell and hook subprocesses. With no upload tokens, it
 creates no file and omits the variable. Retirement and suspension wipe the file
 with the rest of the claim directory.
 
