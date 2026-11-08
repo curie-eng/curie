@@ -106,6 +106,65 @@ class ApprovalCreationResponseV1(ApprovalWireModel):
     requested_by: codec.Identifier | None
 
 
+def _version_two(value: object) -> int:
+    """@spec REQUEST-APPROVAL-4: exactly the integer 2, never a coerced spelling."""
+    if type(value) is not int or value != 2:
+        raise ValueError("invalid_context_version")
+    return value
+
+
+def _approvers(value: object) -> object:
+    """@spec REQUEST-APPROVAL-4: a JSON array, kept immutable; nothing else is coerced."""
+    return tuple(value) if type(value) is list else value
+
+
+class SelectedApproverV1(ApprovalWireModel):
+    """One verified selected person, projected to canonical identity. @spec REQUEST-APPROVAL-4."""
+
+    tenant_id: codec.CanonicalUUID
+    issuer: codec.Issuer
+    subject: codec.Identifier
+
+
+class ApprovalCreationResponseV2(ApprovalWireModel):
+    """A dynamic approval's receipt: V1 plus the persisted grant and selection.
+
+    ``granted_arguments`` is the canonical JSON text of the stored object, the
+    opaque ``approval_ticket`` included; the worker renders these stored values,
+    never its original model summary. Display data, never a permit.
+    @spec REQUEST-APPROVAL-4 REQUEST-APPROVAL-8 HTTP-APPROVAL-CONTINUITY-3.
+    """
+
+    schema_version: Annotated[Literal[2], BeforeValidator(_version_two)]
+    request_id: codec.CanonicalUUID
+    id: codec.CanonicalUUID
+    status: Literal["pending", "approved", "rejected", "expired"]
+    duplicate: bool
+    requested_by: codec.Identifier | None
+    granted_tool: codec.Identifier
+    granted_arguments: Annotated[str, BeforeValidator(_arguments)] = Field(repr=False)
+    selected_approvers: Annotated[
+        tuple[SelectedApproverV1, ...],
+        Field(min_length=1, max_length=16, repr=False),
+        BeforeValidator(_approvers),
+    ]
+
+
+def creation_receipt(value: object) -> ApprovalCreationResponseV1 | ApprovalCreationResponseV2:
+    """Read a creation receipt as exactly the version it names; never guess one.
+
+    @spec REQUEST-APPROVAL-4 HTTP-APPROVAL-CONTINUITY-3.
+    """
+    if type(value) is not dict:
+        raise ValueError("invalid_approval_receipt")
+    version = value.get("schema_version")
+    if type(version) is int and version == 1:
+        return ApprovalCreationResponseV1.model_validate(value)
+    if type(version) is int and version == 2:
+        return ApprovalCreationResponseV2.model_validate(value)
+    raise ValueError("invalid_approval_receipt")
+
+
 class ApprovalActorScopeV1(ApprovalWireModel):
     """@spec HTTP-APPROVAL-CONTINUITY-6."""
 

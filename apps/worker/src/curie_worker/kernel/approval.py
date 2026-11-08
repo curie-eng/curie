@@ -32,7 +32,7 @@ from curie_telemetry.redact import redact_text
 from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import ValidationError
 
-from ..approval_wording import approval_display
+from ..approval_wording import approval_display, describe_approval
 from ..approvals import (
     ApprovalBackendError,
     ApprovalContinuityRefused,
@@ -973,6 +973,12 @@ async def _pause_for_approval(
         if selected:
             raise identity.HttpIdentityRefused() from None
         raise
+    if created.granted_tool is not None:
+        # ADR 0271 decision 8 (@spec REQUEST-APPROVAL-8): a V2 receipt returned
+        # the persisted grant, so the card, prompt, notice, notification and the
+        # summary remembered for settlement describe those stored values. The
+        # runner's display and the model's own arguments cannot replace them.
+        display_summary = describe_approval(created.granted_tool, created.granted_arguments)
     if self._approval_run_abandoned(qevent):
         # #4331: the thread route may now name a successor's claim, so this
         # worker neither touches the workspace nor suspends.

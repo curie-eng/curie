@@ -625,16 +625,37 @@ def _created_audit(
     )
 
 
+CreationReceipt = wire.ApprovalCreationResponseV1 | wire.ApprovalCreationResponseV2
+
+
 def _response(
     body: wire.ApprovalCreationRequestV1,
     row: Approval,
     *,
     duplicate: bool,
-) -> wire.ApprovalCreationResponseV1:
-    """@spec HTTP-APPROVAL-CONTINUITY-3."""
-    return wire.ApprovalCreationResponseV1.model_validate({
+) -> CreationReceipt:
+    """V2 for a dynamic row, from the stored row; an ordinary row keeps exact V1.
+
+    A dynamic row's receipt carries what was persisted, the ticket included,
+    and its selected people projected to tenant, issuer and subject. A stored
+    value the V2 model refuses fails the whole creation, never a silent V1.
+    @spec HTTP-APPROVAL-CONTINUITY-3 REQUEST-APPROVAL-4.
+    """
+    values: dict[str, Any] = {
         "schema_version": 1, "request_id": body.request_id, "id": str(row.id),
         "status": row.status, "duplicate": duplicate, "requested_by": body.approval.author,
+    }
+    if row.selection_mode != "dynamic":
+        return wire.ApprovalCreationResponseV1.model_validate(values)
+    return wire.ApprovalCreationResponseV2.model_validate({
+        **values,
+        "schema_version": 2,
+        "granted_tool": row.granted_tool,
+        "granted_arguments": canonical_json(row.granted_arguments),
+        "selected_approvers": [
+            {name: person[name] for name in ("tenant_id", "issuer", "subject")}
+            for person in row.selected_approvers or ()
+        ],
     })
 
 
@@ -643,7 +664,7 @@ def _historical(
     body: wire.ApprovalCreationRequestV1,
     original: codec.InvocationContextV1,
     row: Approval,
-) -> wire.ApprovalCreationResponseV1:
+) -> CreationReceipt:
     """A matching historical receipt is not permission. @spec HTTP-APPROVAL-CONTINUITY-5."""
     if row.identity_context is None:
         _refuse(409, "approval_provenance_conflict")
@@ -705,7 +726,7 @@ def _seal(
 async def create_http_approval(
     request: Request,
     body: wire.ApprovalCreationRequestV1,
-) -> wire.ApprovalCreationResponseV1:
+) -> CreationReceipt:
     """Separate acknowledged lifecycle and creation commits. @spec HTTP-APPROVAL-CONTINUITY-9.
 
     ADR 0271 (@spec REQUEST-APPROVAL-2/4): the route lock runs before every
