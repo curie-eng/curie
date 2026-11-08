@@ -74,6 +74,7 @@ from approver_ticket_support import operator_case as operator_case
 from approver_ticket_support import synthetic_provider as synthetic_provider
 from approver_ticket_support import ticket_case as ticket_case
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 
 REGISTERED = "approver_ticket.registered"
 REPLACED = "approver_ticket.replaced"
@@ -571,16 +572,25 @@ async def together(*calls: Callable[[], Any]) -> list[Any]:
 def test_invalid_stored_selector_state_refuses_creation_and_disable(
     ticket_case: SimpleNamespace, stored: str,
 ) -> None:
-    """@spec REQUEST-APPROVAL-1/2: hand-written invalid state fails closed (plan D7 rule 5)."""
+    """@spec REQUEST-APPROVAL-1/2: hand-written invalid state fails closed (plan D7 rule 5).
+
+    A registration with the flag off cannot be stored at all since migration
+    0154: storage refuses it for every writer and the row keeps its state.
+    """
     case = ticket_case
     agent = case.scope["agent"]
     enroll(case)
     routes = copy.deepcopy(agent_state(agent)["approval_routes"])
     expected_code = "approver_ticket_state_invalid"
     if stored == "flag_off":
-        store_routes(agent, routes, flag=False)
-        expected_code = "approver_ticket_requires_requester_identity"
-    elif stored == "malformed":
+        before = agent_state(agent)
+        with pytest.raises(
+            IntegrityError, match="agents_approver_ticket_requires_requester_identity_ck",
+        ):
+            store_routes(agent, routes, flag=False)
+        assert agent_state(agent) == before
+        return
+    if stored == "malformed":
         routes[ROUTE]["approver_ticket"]["public_key"] = "not-a-key"
         store_routes(agent, routes)
     else:

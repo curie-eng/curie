@@ -4,8 +4,18 @@ Plan D10: ``selection_mode`` is NOT NULL with default ``ordinary`` and a CHECK
 of ``ordinary``/``dynamic``; the selection snapshot columns are all set on a
 dynamic row and all NULL on an ordinary one; ``approvals_selection_nonce_key``
 is a partial unique index on ``(agent_id, selection_nonce)`` for non-null
-nonces. Existing approvals read back ordinary. The downgrade to 0152 drops the
-columns and the index and keeps every approval. The revision is an expand.
+nonces. Existing approvals read back ordinary. The revision is an expand.
+
+An expand keeps an older API serving it, during a rolling upgrade and after an
+application rollback alike, and such a writer names no selection column and
+knows nothing of selectors. Its exact statements are replayed here at 0153:
+storage refuses each one that would bypass a registration (a looser, missing
+or ordinary route for the registered tool, a requester flag turned off under
+a registration, an approval of a dynamic row) and keeps every neighbor.
+
+The downgrade to 0152 refuses while any dynamic approval or registration
+exists, leaving the revision, columns, rows and nonces as they were; without
+them it drops the columns, index and guards and keeps every approval.
 
 One isolated database for the whole lifecycle, seeded only with columns that
 exist at both revisions; the database itself is the oracle for each refusal.
@@ -184,13 +194,208 @@ def test_0153_upgrade_reads_existing_rows_ordinary_and_downgrade_drops_the_snaps
     _approval(agent)
     _approval(agent)
 
+    # A downgrade would turn each dynamic row ordinary and free its nonce.
+    with pytest.raises(RuntimeError, match=r"3 dynamic approval\(s\) and 0 agent"):
+        command.downgrade(config, BELOW)
+    assert stamped_revision() == REVISION
+    assert set(COLUMNS) <= column_names("approvals")
+    assert _selection(first) == complete
+    with pytest.raises(IntegrityError):
+        _approval(agent, **_dynamic("synthetic-nonce-1"))
+
+    # An install that never created a dynamic approval downgrades and keeps every row.
+    sql_rows("DELETE FROM curie.approvals WHERE selection_mode = 'dynamic'")
     command.downgrade(config, BELOW)
 
     assert stamped_revision() == BELOW
     assert set(COLUMNS).isdisjoint(column_names("approvals"))
     assert _index() is None
+    assert _guards() == set()
     kept = sql_dicts(
-        "SELECT id FROM curie.approvals WHERE id IN (:existing, :fresh, :first)",
-        {"existing": existing, "fresh": fresh, "first": first},
+        "SELECT id FROM curie.approvals WHERE id IN (:existing, :fresh)",
+        {"existing": existing, "fresh": fresh},
     )
-    assert {row["id"] for row in kept} == {existing, fresh, first}
+    assert {row["id"] for row in kept} == {existing, fresh}
+
+
+# --- storage holds the selector invariants for an older writer -------------------
+
+LIVE = "mcp__access__execute"
+OWNING = "access_review"
+LOOSER = "ops_review"
+GUARDS = {
+    ("agents", "agents_approver_ticket_requires_requester_identity_ck"),
+    ("approvals", "approvals_approver_ticket_route_lock"),
+    ("approvals", "approvals_dynamic_unapproved"),
+}
+
+
+def _guards() -> set[tuple[str, str]]:
+    """The 0153 storage guards present: the agents CHECK and the approvals triggers."""
+    checks = sql_dicts(
+        "SELECT 'agents' AS t, conname AS name FROM pg_constraint "
+        "WHERE conname = 'agents_approver_ticket_requires_requester_identity_ck'"
+    )
+    triggers = sql_dicts(
+        "SELECT 'approvals' AS t, tgname AS name FROM pg_trigger "
+        "WHERE tgname IN ('approvals_approver_ticket_route_lock', 'approvals_dynamic_unapproved')"
+    )
+    return {(row["t"], row["name"]) for row in checks + triggers}
+
+
+def _routes(*, registered: bool = True, ticket: Any = None) -> dict[str, Any]:
+    """A route map binding two routes, with the pair registered on the owning one."""
+    owning: dict[str, Any] = {"approvers": {"users": ["U0EXAMPLE1"]}}
+    if registered:
+        owning["approver_ticket"] = (
+            {"connector": "access", "tool": "execute", "key_id": "selector-example-1"}
+            if ticket is None else ticket
+        )
+        owning["separation"] = {"exclude_requester": True}
+    return {OWNING: owning, LOOSER: {"approvers": {"users": ["U0EXAMPLE2"]}}}
+
+
+def _configure(agent: uuid.UUID, routes: Any, *, flag: bool) -> None:
+    """An older or newer agent writer: the flag and the route map as one UPDATE."""
+    sql_rows(
+        "UPDATE curie.agents SET connector_requester_identity = :flag, "
+        "approval_routes = CAST(:routes AS jsonb) WHERE id = :id",
+        {"flag": flag, "routes": None if routes is None else json.dumps(routes), "id": agent},
+    )
+
+
+def _flag(agent: uuid.UUID) -> bool:
+    return bool(sql_dicts(
+        "SELECT connector_requester_identity AS f FROM curie.agents WHERE id = :id",
+        {"id": agent},
+    )[0]["f"])
+
+
+def _registered_dynamic(nonce: str) -> dict[str, Any]:
+    """A dynamic row exactly as the new creation owner writes it for the pair."""
+    return {"granted_tool": LIVE, "route": OWNING, **_dynamic(nonce)}
+
+
+def test_0153_storage_refuses_an_older_writers_selector_bypass(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    """@spec REQUEST-APPROVAL-1/2/4: overlap and rollback writers meet the same storage.
+
+    Each refused statement is one an API built before 0153 issues: its
+    approval INSERT names no selection column and its flag write is a plain
+    UPDATE. The neighbors (the new owner's dynamic row, other tools, other
+    agents, expiry, an ordinary approval) still write.
+    """
+    revision_ready()
+    config = alembic_config()
+    isolated_migration_db.at(BELOW)
+    agent, plain = _agent(), _agent()
+    command.upgrade(config, REVISION)
+    assert _guards() == GUARDS
+    _configure(agent, _routes(), flag=True)
+    before = sql_dicts("SELECT count(*) AS n FROM curie.approvals")[0]["n"]
+
+    # Creation: the registered tool is recorded only on its route, as a dynamic row.
+    for older in (
+        {"granted_tool": LIVE, "route": LOOSER},
+        {"granted_tool": LIVE, "route": None},
+        {"granted_tool": LIVE, "route": ""},
+        {"granted_tool": LIVE, "route": OWNING},
+        {**_registered_dynamic("synthetic-nonce-9"), "route": LOOSER},
+        {**_registered_dynamic("synthetic-nonce-9"), "selection_tool": "read"},
+    ):
+        with pytest.raises(IntegrityError, match="approval_route_locked"):
+            _approval(agent, **older)
+    with pytest.raises(IntegrityError, match="dynamic_selection_unavailable"):
+        _approval(agent, status="approved", **_registered_dynamic("synthetic-nonce-9"))
+    assert sql_dicts("SELECT count(*) AS n FROM curie.approvals")[0]["n"] == before
+    dynamic = _approval(agent, **_registered_dynamic("synthetic-nonce-1"))
+    for neighbor in (
+        {"granted_tool": "mcp__access__read", "route": LOOSER},
+        {"granted_tool": f"{LIVE}__extra", "route": LOOSER},
+        {"granted_tool": "mcp__plugin_access__execute", "route": LOOSER},
+        {"granted_tool": None, "route": None},
+    ):
+        _approval(agent, **neighbor)
+    elsewhere = _approval(plain, granted_tool=LIVE, route=LOOSER)
+
+    # Answering: a dynamic row is never approved; expiry and ordinary rows are unchanged.
+    with pytest.raises(IntegrityError, match="dynamic_selection_unavailable"):
+        sql_rows("UPDATE curie.approvals SET status = 'approved' WHERE id = :id", {"id": dynamic})
+    sql_rows("UPDATE curie.approvals SET status = 'approved' WHERE id = :id", {"id": elsewhere})
+    sql_rows("UPDATE curie.approvals SET status = 'expired' WHERE id = :id", {"id": dynamic})
+    assert sql_dicts(
+        "SELECT status FROM curie.approvals WHERE id = :id", {"id": dynamic},
+    ) == [{"status": "expired"}]
+
+    # The flag: never off under a registration, and never a registration without it.
+    with pytest.raises(IntegrityError, match="agents_approver_ticket_requires_requester"):
+        sql_rows(
+            "UPDATE curie.agents SET connector_requester_identity = false WHERE id = :id",
+            {"id": agent},
+        )
+    assert _flag(agent) is True
+    with pytest.raises(IntegrityError, match="agents_approver_ticket_requires_requester"):
+        _configure(plain, _routes(), flag=False)
+    with pytest.raises(IntegrityError, match="agents_approver_ticket_requires_requester"):
+        _configure(plain, _routes(registered=False) | {"x": {"approver_ticket": None}}, flag=False)
+    _configure(plain, _routes(registered=False), flag=False)
+    _configure(agent, _routes(registered=False), flag=True)
+    sql_rows(
+        "UPDATE curie.agents SET connector_requester_identity = false WHERE id = :id",
+        {"id": agent},
+    )
+    assert _flag(agent) is False
+    # Without the registration the tool is ordinary again on any route.
+    _approval(agent, granted_tool=LIVE, route=LOOSER)
+
+
+def test_0153_storage_fails_closed_on_a_registration_it_cannot_read(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    """@spec REQUEST-APPROVAL-2: no pair to lock, so no insert for the agent, like the API."""
+    revision_ready()
+    isolated_migration_db.at(BELOW)
+    agent, plain = _agent(), _agent()
+    command.upgrade(alembic_config(), REVISION)
+    for routes in (
+        _routes(ticket={}),
+        _routes(ticket={"connector": "access"}),
+        _routes(ticket={"connector": "access", "tool": 7}),
+        _routes(ticket="access"),
+        {OWNING: {"approver_ticket": None}},
+    ):
+        _configure(agent, routes, flag=True)
+        with pytest.raises(IntegrityError, match="approver_ticket_state_invalid"):
+            _approval(agent, granted_tool="mcp__other__read", route=LOOSER)
+    _approval(plain, granted_tool="mcp__other__read", route=LOOSER)
+
+
+def test_0153_downgrade_refuses_while_a_registration_exists(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    """@spec REQUEST-APPROVAL-1: no older release enforces a registration, so none is dropped.
+
+    After the registration is removed the round trip works, and the upgrade
+    puts every guard back.
+    """
+    revision_ready()
+    config = alembic_config()
+    isolated_migration_db.at(BELOW)
+    agent = _agent()
+    command.upgrade(config, REVISION)
+    _configure(agent, _routes(), flag=True)
+
+    with pytest.raises(RuntimeError, match=r"0 dynamic approval\(s\) and 1 agent"):
+        command.downgrade(config, BELOW)
+    assert stamped_revision() == REVISION
+    assert _guards() == GUARDS
+    with pytest.raises(IntegrityError, match="approval_route_locked"):
+        _approval(agent, granted_tool=LIVE, route=LOOSER)
+
+    _configure(agent, _routes(registered=False), flag=True)
+    command.downgrade(config, BELOW)
+    assert stamped_revision() == BELOW
+    assert _guards() == set()
+    command.upgrade(config, REVISION)
+    assert _guards() == GUARDS
