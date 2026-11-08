@@ -3089,7 +3089,7 @@ const GATEWAY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The container is resolved through the compose SERVICE LABEL
 /// ([`local_gateway_container`] / [`COMPOSE_GATEWAY_SERVICE`]), never by a
 /// hardcoded name. Container names carry the compose project
-/// (`<project>-curie-gateway-1`, and the CLI pins `COMPOSE_PROJECT_NAME=curie`),
+/// (`<project>-curie-channel-gateway-1`, with the project selected per run),
 /// so inspecting a bare `curie-gateway` matched nothing on a default stack and
 /// silently classified every stack as disconnected (#1031). The selector also
 /// closes the inverse hazard: an unrelated container that merely happens to be

@@ -3426,6 +3426,21 @@ pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
     for expression in &o.set_string {
         plan.set_string_expression(expression.clone());
     }
+    let mut gateway_values: BTreeMap<String, String> = o.secrets.iter().cloned().collect();
+    gateway_values.extend(plan.effective_values());
+    let slack_configured = gateway_values.iter().any(|(key, value)| {
+        key.starts_with("dispatcher.slack.")
+            && (key.ends_with(".botToken") || key.ends_with(".botTokenExistingSecret"))
+            && !value.is_empty()
+    });
+    if slack_configured
+        && gateway_values
+            .get("channelGateway.url")
+            .is_none_or(String::is_empty)
+        && !operator_set_keys(&o.operator_sets()).contains("channelGateway.deploy")
+    {
+        plan.set("channelGateway.deploy", "true");
+    }
     plan
 }
 

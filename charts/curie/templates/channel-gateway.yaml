@@ -1,4 +1,16 @@
 {{- $gateway := .Values.channelGateway | default dict }}
+{{- $slack := .Values.dispatcher.slack }}
+{{- $hasBot := or $slack.botToken $slack.botTokenExistingSecret }}
+{{- $identities := include "curie.slack.identities" . | fromJson }}
+{{- range $identity := $identities.items }}
+{{- if $identity.botSecret }}{{- $hasBot = true }}{{- end }}
+{{- end }}
+{{- if and $hasBot (not (or $gateway.deploy $gateway.url)) }}
+{{- fail "Slack identities require channelGateway.deploy or channelGateway.url" }}
+{{- end }}
+{{- if and $gateway.tlsSecret $gateway.url (not (hasPrefix "https://" $gateway.url)) }}
+{{- fail "channelGateway.url must use https when channelGateway.tlsSecret is set" }}
+{{- end }}
 {{- if $gateway.deploy }}
 {{- if and (not .Values.channelGateway.allowInsecure) (not .Values.channelGateway.tlsSecret) }}
 {{- fail "channelGateway.tlsSecret is required unless channelGateway.allowInsecure is explicitly true" }}

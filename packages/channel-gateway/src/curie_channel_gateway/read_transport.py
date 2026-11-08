@@ -179,6 +179,7 @@ def gateway_application(
         raise ValueError("gateway requires distinct non-blank caller credentials and a file cap")
     if reply is not None and reply_state is None:
         raise ValueError("gateway replies require a persistent delivery ledger")
+    file_capacity = asyncio.BoundedSemaphore(1)
     active_replies: dict[str, asyncio.Task[DeliveryResult]] = {}
     expected = {name: value.encode() for name, value in tokens.items()}
     ports = providers or GatewayProviders()
@@ -389,19 +390,36 @@ def gateway_application(
             if close is not None:
                 close()
 
-    async def fetch(request: web.Request) -> web.Response:
-        try:
-            body = await asyncio.to_thread(
-                fetch_bytes, request.match_info["identity"], request.match_info["file_id"]
+    async def fetch(request: web.Request) -> web.StreamResponse:
+        if file_capacity.locked():
+            return web.json_response({"error": "file_capacity_exhausted"}, status=503)
+        async with file_capacity:
+            download = asyncio.create_task(
+                asyncio.to_thread(
+                    fetch_bytes, request.match_info["identity"], request.match_info["file_id"]
+                )
             )
-        except GatewayLimitError:
-            return web.json_response({"error": "file_size_exceeded"}, status=413)
-        except SlackFileError as error:
-            status = error.status if error.status is not None and 400 <= error.status < 600 else 422
-            return web.json_response({"error": "provider_file_refused"}, status=status)
-        except Exception:  # noqa: BLE001 - provider failures must never echo input
-            raise web.HTTPBadGateway(text="file unavailable") from None
-        return web.Response(body=body, content_type="application/octet-stream")
+            try:
+                body = await asyncio.shield(download)
+            except asyncio.CancelledError:
+                # The provider thread retains its buffer until it finishes.
+                await asyncio.gather(download, return_exceptions=True)
+                raise
+            except GatewayLimitError:
+                return web.json_response({"error": "file_size_exceeded"}, status=413)
+            except SlackFileError as error:
+                status = (
+                    error.status if error.status is not None and 400 <= error.status < 600 else 422
+                )
+                return web.json_response({"error": "provider_file_refused"}, status=status)
+            except Exception:  # noqa: BLE001 - provider failures must never echo input
+                raise web.HTTPBadGateway(text="file unavailable") from None
+            response = web.StreamResponse(headers={"Content-Type": "application/octet-stream"})
+            response.content_length = len(body)
+            await response.prepare(request)
+            await response.write(body)
+            await response.write_eof()
+            return response
 
     async def close_replay(_app: web.Application) -> None:
         if active_replies:

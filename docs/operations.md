@@ -3210,6 +3210,25 @@ A chart upgrade is a **full** upgrade: anything the new chart does not render is
 deleted. For a Deployment that means a restart. For a StatefulSet it means the
 data too.
 
+### Channel gateway and protected workers
+
+Slack installations require `channelGateway.deploy: true` with a TLS certificate
+in `channelGateway.tlsSecret`, or an authenticated gateway at
+`channelGateway.url`. `curie cluster up` enables the gateway for a retained Slack
+installation that has no external gateway URL. Supply the TLS Secret before
+upgrading; plaintext HTTP requires an explicit `channelGateway.allowInsecure:
+true` opt-out. The chart refuses a Slack installation without a gateway, and
+rejects an HTTP URL when a TLS Secret is set.
+
+Protected workers commissioned with a schema-1 `process.json` must be
+re-commissioned before starting the upgraded worker image. The new image accepts
+only schema 2, whose `channel_gateway` configuration replaces process-owned
+Slack tokens with the gateway URL and worker caller credential. An image-only
+upgrade leaves the old process file invalid and the worker refuses to boot.
+Use the protected-worker commissioning workflow to produce a new process file
+and provision the gateway; do not copy Slack tokens into the new worker's
+environment or edit the schema number alone.
+
 ### Connector action executor (0.13.0)
 
 0.13.0 adds the connector action executor

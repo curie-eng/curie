@@ -12,6 +12,6 @@
       name: {{ include "curie.secretName" $root }}
       key: {{ printf "channelGateway%sToken" (title .caller) }}
 - name: CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE
-  value: {{ $gateway.allowInsecure | quote }}
+  value: {{ $http | quote }}
 {{- end -}}
 {{- end -}}
