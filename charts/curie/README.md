@@ -2633,3 +2633,19 @@ and teardown. The local runner receives a claim-owned writable named tmpfs cache
 `536870912`, or `512Mi`). Its contents consume effective memory resources, so
 a file below the volume capacity can still fail when the runner's memory limit
 is exhausted. Claim deletion removes only that claim's volume.
+
+
+## Declared Slack test drivers
+
+`testInstallation.enabled` defaults to `false`. The existing
+`testInstallation.drivers` entries name `channel_id`, `bot_id` and
+`bot_user_id`, plus `agent` for a sibling driver; `testInstallation.threadTurnLimit`
+bounds driver turns per thread in ten minutes. The chart passes the same values
+to the dispatcher for legacy and selected HTTP intake. Existing production,
+published-secret and driver-identity checks apply to both paths.
+
+Selected HTTP intake admits only listed, marked bot mentions, attributes them
+to the configured driver user, and applies normal API identity admission.
+Root pings reply without a turn; bot direct messages and test-driver approval
+replies remain refused. See the
+[gateway implementation notes](../../packages/channel-gateway/README.md#adr-0202-implementation-declared-http-test-drivers).

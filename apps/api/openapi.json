@@ -24744,6 +24744,65 @@
         ]
       }
     },
+    "/channels/turns/admission": {
+      "post": {
+        "description": "Apply the turn's authenticated HTTP identity admission without claiming a delivery.\n\nADR 0202 pings and bounded driver turns ask before any reply or budget write.\nThe same receiver proof, channel credential and live authority checks as\nenqueue apply; no caller or directory decision is made by the gateway.",
+        "operationId": "check_receiver_admission_channels_turns_admission_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-curie-receiver-proof",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Receiver-Proof"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check Receiver Admission",
+        "tags": [
+          "channels"
+        ]
+      }
+    },
     "/cluster-message-replies/{reply_ref}": {
       "get": {
         "operationId": "get_cluster_message_replies_cluster_message_replies__reply_ref__get",

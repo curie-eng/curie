@@ -93,6 +93,42 @@ is the existing generic adapter HTTP client; it does not implement this signed
 gateway ingress protocol. Compose worker-to-gateway delivery with
 `HttpReplyTransport` and its explicit capability snapshot.
 
+## ADR 0202 implementation: declared HTTP test drivers
+
+The selected Slack HTTP receiver uses the existing
+[ADR 0202 declaration](../../docs/adr/0202-a-test-installation-admits-a-listed-bots-actions-and-approval-replies.md).
+`testInstallation.enabled` remains false by default. The dispatcher passes
+`CURIE_TEST_INSTALLATION_ENABLED`, `CURIE_TEST_INSTALLATION_DRIVERS` and
+`CURIE_TEST_INSTALLATION_THREAD_TURN_LIMIT` through its existing configuration;
+there is no second gateway allowlist or receiver-file setting.
+
+Only an `app_mention` whose stripped text begins with `[test action]` can use
+this admission. Its `bot_id` and channel must match a declared driver. The
+receiver signs the configured `bot_user_id` as both the turn author and the
+sender evidence, ignoring the event's user for attribution. The API performs
+its normal identity lookup and caller-group check for that configured user.
+The receiver's own bot, user and app identities from `auth.test` remain refused,
+even if listed. Bot direct messages and unmarked bot mentions remain refused.
+
+Before a driver reply, dedupe claim or turn-budget reservation, the receiver
+sends the signed turn to `POST /channels/turns/admission`. That operation runs
+the same authenticated identity admission as enqueue and returns 204 without
+claiming or enqueueing a delivery. Refused caller groups return 403 and an
+unavailable directory fails closed. A normal driver action is checked again by
+`POST /channels/turns` when it is submitted.
+
+A root `[test action] ping` gets the fixed admission reply in its own thread
+without starting a turn. A threaded ping is refused. Driver turns reuse the
+legacy Valkey dedupe and ten-minute per-thread budget, including the configured
+`testInstallation.threadTurnLimit`; pings and duplicate deliveries spend no
+turn budget. With no declaration, the existing human intake and bot filters
+perform no additional API or Valkey operations.
+
+Approval replies are a remaining gap: `[test action] approve ...` and
+`[test action] reject ...` remain refused by selected HTTP receivers. They
+neither resolve approvals nor start turns. Existing human approval interactions
+keep their authenticated HTTP path.
+
 ## Authority and storage
 
 The gateway authenticates Slack deliveries by verifying the Slack signature or

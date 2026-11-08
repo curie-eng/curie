@@ -32,3 +32,5 @@ apps/api/tests/test_channel_read.py
 apps/api/tests/test_channel_canvas.py
 apps/api/tests/test_slack_usergroups.py
 apps/mail-adapter/tests/test_inbound_admission.py
+apps/dispatcher/tests/test_http_test_driver.py
+apps/api/tests/test_http_receiver_threading.py

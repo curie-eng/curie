@@ -484,6 +484,9 @@ def submit_selected_mention(
     )
     if prepared is None:
         return SelectedMention(ReceiverSubmission(status="refused", stream_id=None), None)
+    verdict = runtime.admit_test_driver(prepared)
+    if verdict is not None:
+        return SelectedMention(verdict, None)
     placeholder = _post_placeholder(
         web_client=web_client,
         config=config,
