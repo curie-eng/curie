@@ -4282,7 +4282,7 @@ export const commandManifest = {
                     "http://localhost:28000"
                   ],
                   "env": "CURIE_API_URL",
-                  "global": false,
+                  "global": true,
                   "id": "api_url",
                   "long": "api-url",
                   "positional": false,
@@ -4290,14 +4290,14 @@ export const commandManifest = {
                 },
                 {
                   "env": "CURIE_API_KEY",
-                  "global": false,
+                  "global": true,
                   "id": "api_key",
                   "long": "api-key",
                   "positional": false,
                   "required": false
                 },
                 {
-                  "global": false,
+                  "global": true,
                   "help": "Print the route and the word redacted, and exit without making a request",
                   "id": "dry_run",
                   "long": "dry-run",
@@ -4328,37 +4328,6 @@ export const commandManifest = {
                       "id": "name",
                       "positional": true,
                       "required": true
-                    },
-                    {
-                      "default_values": [
-                        "http://localhost:28000"
-                      ],
-                      "env": "CURIE_API_URL",
-                      "global": false,
-                      "id": "api_url",
-                      "long": "api-url",
-                      "positional": false,
-                      "required": false
-                    },
-                    {
-                      "env": "CURIE_API_KEY",
-                      "global": false,
-                      "id": "api_key",
-                      "long": "api-key",
-                      "positional": false,
-                      "required": false
-                    },
-                    {
-                      "global": false,
-                      "help": "Print the route and the word redacted, and exit without making a request",
-                      "id": "dry_run",
-                      "long": "dry-run",
-                      "positional": false,
-                      "possible_values": [
-                        "true",
-                        "false"
-                      ],
-                      "required": false
                     }
                   ],
                   "hidden": false,
@@ -7857,7 +7826,7 @@ export const commandManifest = {
                   "required": false
                 },
                 {
-                  "global": false,
+                  "global": true,
                   "help": "Print the route and the word redacted, and exit without making a request",
                   "id": "dry_run",
                   "long": "dry-run",
@@ -7888,18 +7857,6 @@ export const commandManifest = {
                       "id": "name",
                       "positional": true,
                       "required": true
-                    },
-                    {
-                      "global": false,
-                      "help": "Print the route and the word redacted, and exit without making a request",
-                      "id": "dry_run",
-                      "long": "dry-run",
-                      "positional": false,
-                      "possible_values": [
-                        "true",
-                        "false"
-                      ],
-                      "required": false
                     }
                   ],
                   "hidden": false,

@@ -2373,6 +2373,86 @@ fn is_unrouted(status: reqwest::StatusCode, body: &str) -> bool {
             .is_some_and(|d| d == "Not Found")
 }
 
+/// The wake-key `detail` token when it is one of the contract's reasons.
+/// Any other body, including a secret field, is dropped.
+fn allowlisted_wake_reason(body: &str) -> Option<&'static str> {
+    let detail = api_detail_reason(body)?;
+    Some(match detail.as_str() {
+        "wake_query_forbidden" => "wake_query_forbidden",
+        "wake_body_invalid" => "wake_body_invalid",
+        "wake_not_declared" => "wake_not_declared",
+        "wake_declaration_unavailable" => "wake_declaration_unavailable",
+        "wake_source_not_ordinary" => "wake_source_not_ordinary",
+        "authority_unavailable" => "authority_unavailable",
+        "wake_generation_exhausted" => "wake_generation_exhausted",
+        _ => return None,
+    })
+}
+
+const WAKE_KEY_API_KEY_FIX: &str =
+    "verify --api-key or CURIE_API_KEY matches the selected platform API";
+
+/// Map one wake-key refusal onto the CLI exit class. `reason` is an allowlisted
+/// token or absent. The message names that token and the fix. It never includes
+/// the response body.
+fn wake_key_refusal(
+    what: &str,
+    status: reqwest::StatusCode,
+    reason: Option<&str>,
+) -> anyhow::Error {
+    use crate::exit::CliError;
+    use reqwest::StatusCode;
+
+    let error = match (status, reason) {
+        (StatusCode::UNAUTHORIZED, _) => {
+            CliError::failure(format!("{what} failed with 401: {WAKE_KEY_API_KEY_FIX}"))
+                .with_fix(WAKE_KEY_API_KEY_FIX)
+        }
+        (StatusCode::NOT_FOUND, Some("wake_not_declared")) => CliError::failure(format!(
+            "{what} failed: wake_not_declared. The hook needs wake: true in the in-force bundle."
+        ))
+        .with_fix("set wake: true on the webhook in the in-force bundle and deploy it"),
+        (StatusCode::CONFLICT, Some("wake_source_not_ordinary")) => CliError::failure(format!(
+            "{what} failed: wake_source_not_ordinary. The cause is a source policy, unresolved \
+             source history, a remediation policy, a partition, or a source binding."
+        ))
+        .with_fix(
+            "remove the source policy, unresolved source history, remediation policy, partition, \
+             or source binding, then retry",
+        ),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("authority_unavailable")) => CliError::transient(
+            format!("{what} failed: authority_unavailable. The metadata authority is unavailable."),
+        )
+        .with_fix("retry once the metadata authority is available"),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("wake_generation_exhausted")) => {
+            CliError::failure(format!(
+                "{what} failed: wake_generation_exhausted. The wake key generation cannot \
+                 increase further, and the key was not rotated."
+            ))
+            .with_fix("keep the current key; another rotation cannot mint a generation")
+        }
+        (StatusCode::SERVICE_UNAVAILABLE, Some("wake_declaration_unavailable")) => {
+            CliError::failure(format!(
+                "{what} failed: wake_declaration_unavailable. The stored bundle could not be read."
+            ))
+            .with_fix("redeploy the bundle so the in-force wake declaration can be read")
+        }
+        (StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY, reason) => {
+            let detail = reason.unwrap_or("rejected");
+            CliError::usage(format!("{what} failed with {status}: {detail}"))
+                .with_fix("send the wake-key request with no query string and no body")
+        }
+        _ => {
+            let message = match reason {
+                Some(reason) => format!("{what} failed with {status}: {reason}"),
+                None => format!("{what} failed with {status}"),
+            };
+            CliError::failure(message)
+        }
+    };
+    anyhow::Error::from(error)
+}
+
 /// Validate one trace id as the single safe path segment accepted by the API.
 ///
 /// Keeping this byte-for-byte shape at the CLI boundary means a malformed id
@@ -2796,8 +2876,9 @@ impl ApiClient {
             .context("decoding wake key rotation")
     }
 
-    /// A non-success wake-key response names the API `detail` and nothing else
-    /// from the body, so a success payload or a secret field is not printed.
+    /// A non-success wake-key response is classified from its status and an
+    /// allowlisted `detail` token. The raw body is not copied into the error,
+    /// so a secret field on the refusal cannot reach the terminal.
     async fn expect_wake_ok(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
         if resp.status().is_success() {
             return Ok(resp);
@@ -2813,12 +2894,11 @@ impl ApiClient {
                  older than this CLI. Upgrade the release, or use a CLI matching it."
             );
         }
-        match api_detail_reason(&body) {
-            Some(detail) if !detail.is_empty() => {
-                bail!("{what} failed with {status}: {detail}")
-            }
-            _ => bail!("{what} failed with {status}"),
-        }
+        Err(wake_key_refusal(
+            what,
+            status,
+            allowlisted_wake_reason(&body),
+        ))
     }
 
     /// Poll one opaque disconnected cluster-message reply bucket.

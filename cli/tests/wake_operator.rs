@@ -273,6 +273,22 @@ fn assert_secret_get(request: &Request) {
     );
 }
 
+/// The wake-key stand-in enforces the admin contract before any success body.
+/// A wrong key is 401. A query is 400 `wake_query_forbidden`. A body is 422
+/// `wake_body_invalid`. A clean request returns None so the caller can answer.
+fn refuse_wake_admin_misuse(request: &Request) -> Option<Response> {
+    if request.header("X-API-Key") != Some(API_KEY) {
+        return Some(Response::json(401, r#"{"detail":"Unauthorized"}"#));
+    }
+    if request.path.contains('?') {
+        return Some(Response::json(400, r#"{"detail":"wake_query_forbidden"}"#));
+    }
+    if !request.body.is_empty() {
+        return Some(Response::json(422, r#"{"detail":"wake_body_invalid"}"#));
+    }
+    None
+}
+
 /// `record(Some("ran"))` from `hook_fire.rs`, with `trigger` and `source` both
 /// `webhook`.
 fn webhook_record() -> Value {
@@ -389,6 +405,9 @@ fn wake_operator_key_read_is_stable_on_local_and_cluster() {
         let body = body.clone();
         let path = path.clone();
         let server = serve(move |request| {
+            if let Some(refusal) = refuse_wake_admin_misuse(&request) {
+                return refusal;
+            }
             let route = route_of(&request.path);
             if request.method == "GET" && route == "/agents" {
                 return Response::json(200, &agents);
@@ -458,6 +477,9 @@ fn wake_operator_key_rotate_hides_the_secret_on_local_and_cluster() {
         let read_path = wake_secret_path();
         let rotate_path = wake_secret_rotate_path();
         let server = serve(move |request| {
+            if let Some(refusal) = refuse_wake_admin_misuse(&request) {
+                return refusal;
+            }
             let route = route_of(&request.path);
             if request.method == "GET" && route == "/agents" {
                 return Response::json(200, &agents);
@@ -710,6 +732,249 @@ fn wake_operator_runs_pause_and_resume_keep_the_hook_name() {
         "schedule dry-run must not call the API: {:?}",
         dry.recorded()
     );
+}
+
+fn flags_before_rotate(tier: &str, api_url: &str, dry_run: bool) -> Vec<String> {
+    let mut args = vec![tier.to_string(), "hook".to_string(), "wake-key".to_string()];
+    if dry_run {
+        args.push("--dry-run".to_string());
+    }
+    args.extend([
+        "--api-url".to_string(),
+        api_url.to_string(),
+        "--api-key".to_string(),
+        API_KEY.to_string(),
+        "rotate".to_string(),
+        AGENT_NAME.to_string(),
+        HOOK.to_string(),
+    ]);
+    args
+}
+
+#[test]
+fn wake_operator_key_dry_run_before_rotate_makes_no_request() {
+    let server = serve(|_| Response::json(500, r#"{"detail":"dry run touched the API"}"#));
+    for tier in ["local", "cluster"] {
+        let args = flags_before_rotate(tier, &server.base_url, true);
+        let output = invoke_owned(&args, tier == "cluster");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{tier}: {}",
+            describe(&output)
+        );
+        let text = combined(&output);
+        assert!(
+            text.contains("redacted"),
+            "{tier}: dry run before rotate must say redacted: {text}"
+        );
+        let rotate_path = format!("/agents/{AGENT_NAME}/hooks/{HOOK}/wake-secret/rotate");
+        assert!(
+            text.contains(&rotate_path),
+            "{tier}: dry run before rotate must include {rotate_path}: {text}"
+        );
+        assert_no_sentinel(&stdout(&output));
+        assert_no_sentinel(&stderr(&output));
+    }
+    assert!(
+        server.recorded().is_empty(),
+        "dry run before rotate must not call the API: {:?}",
+        server.recorded()
+    );
+    for tier in ["local", "cluster"] {
+        let help = run(&[tier, "hook", "wake-key", "--help"], tier == "cluster");
+        assert_eq!(help.status.code(), Some(0), "{tier}: {}", describe(&help));
+        let text = combined(&help);
+        assert!(
+            !text.contains("[AGENT] [NAME] <COMMAND>"),
+            "{tier}: usage must not require a command beside optional names: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "{tier} hook wake-key rotate [OPTIONS] <AGENT> <NAME>"
+            )),
+            "{tier}: usage must show rotate with its own names: {text}"
+        );
+    }
+}
+
+#[test]
+fn wake_operator_key_outer_api_url_is_honored() {
+    for tier in ["local", "cluster"] {
+        let agents = json!([agent_row()]).to_string();
+        let rotate_path = wake_secret_rotate_path();
+        let server = serve(move |request| {
+            if let Some(refusal) = refuse_wake_admin_misuse(&request) {
+                return refusal;
+            }
+            let route = route_of(&request.path);
+            if request.method == "GET" && route == "/agents" {
+                return Response::json(200, &agents);
+            }
+            if request.method == "POST" && route == rotate_path {
+                return Response::json(
+                    200,
+                    &json!({
+                        "agent_id": AGENT_ID,
+                        "hook": HOOK,
+                        "generation": 2
+                    })
+                    .to_string(),
+                );
+            }
+            Response::json(500, r#"{"detail":"unexpected"}"#)
+        });
+        let args = flags_before_rotate(tier, &server.base_url, false);
+        let output = invoke_owned(&args, tier == "cluster");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{tier}: {}",
+            describe(&output)
+        );
+        let posts: Vec<Request> = server
+            .recorded()
+            .into_iter()
+            .filter(|request| request.method == "POST")
+            .collect();
+        assert_eq!(posts.len(), 1, "{tier}: {posts:?}");
+        assert_eq!(posts[0].path, wake_secret_rotate_path(), "{tier}");
+        assert_eq!(posts[0].header("X-API-Key"), Some(API_KEY), "{tier}");
+    }
+}
+
+#[test]
+fn wake_operator_admin_server_refuses_a_query_or_a_body() {
+    let query = Request {
+        method: "GET".to_string(),
+        path: format!("{path}?unused=", path = wake_secret_path()),
+        headers: vec![("X-API-Key".to_string(), API_KEY.to_string())],
+        body: Vec::new(),
+    };
+    let query_refusal = refuse_wake_admin_misuse(&query).expect("a query is refused");
+    assert_eq!(query_refusal.status, 400);
+    assert_eq!(query_refusal.body, br#"{"detail":"wake_query_forbidden"}"#,);
+
+    let body = Request {
+        method: "POST".to_string(),
+        path: wake_secret_rotate_path(),
+        headers: vec![("X-API-Key".to_string(), API_KEY.to_string())],
+        body: b"{}".to_vec(),
+    };
+    let body_refusal = refuse_wake_admin_misuse(&body).expect("a body is refused");
+    assert_eq!(body_refusal.status, 422);
+    assert_eq!(body_refusal.body, br#"{"detail":"wake_body_invalid"}"#);
+
+    let missing_key = Request {
+        method: "GET".to_string(),
+        path: wake_secret_path(),
+        headers: Vec::new(),
+        body: Vec::new(),
+    };
+    let key_refusal = refuse_wake_admin_misuse(&missing_key).expect("a missing key is refused");
+    assert_eq!(key_refusal.status, 401);
+
+    let clean = Request {
+        method: "POST".to_string(),
+        path: wake_secret_rotate_path(),
+        headers: vec![("X-API-Key".to_string(), API_KEY.to_string())],
+        body: Vec::new(),
+    };
+    assert!(refuse_wake_admin_misuse(&clean).is_none());
+}
+
+#[test]
+fn wake_operator_key_refusals_name_the_reason_and_hide_the_secret() {
+    // status, detail, exit, phrases that must appear, phrases that must not.
+    let cases: &[(u16, &str, i32, &[&str], &[&str])] = &[
+        (
+            401,
+            "Unauthorized",
+            1,
+            &["verify --api-key or CURIE_API_KEY"],
+            &[],
+        ),
+        (
+            404,
+            "wake_not_declared",
+            1,
+            &["wake_not_declared", "wake: true", "in-force bundle"],
+            &[],
+        ),
+        (
+            409,
+            "wake_source_not_ordinary",
+            1,
+            &[
+                "wake_source_not_ordinary",
+                "source policy",
+                "unresolved source history",
+            ],
+            &[],
+        ),
+        (
+            503,
+            "authority_unavailable",
+            3,
+            &["authority_unavailable"],
+            &["wake_generation_exhausted"],
+        ),
+        (
+            503,
+            "wake_generation_exhausted",
+            1,
+            &["wake_generation_exhausted", "was not rotated"],
+            &["authority_unavailable"],
+        ),
+        (
+            400,
+            "wake_query_forbidden",
+            2,
+            &["wake_query_forbidden"],
+            &[],
+        ),
+        (422, "wake_body_invalid", 2, &["wake_body_invalid"], &[]),
+    ];
+    for (status, detail, exit_code, needles, absent) in cases {
+        let agents = json!([agent_row()]).to_string();
+        let path = wake_secret_path();
+        let body = json!({"detail": detail, "secret": SENTINEL}).to_string();
+        let server = serve(move |request| {
+            if let Some(refusal) = refuse_wake_admin_misuse(&request) {
+                return refusal;
+            }
+            let route = route_of(&request.path);
+            if request.method == "GET" && route == "/agents" {
+                return Response::json(200, &agents);
+            }
+            if request.method == "GET" && route == path {
+                return Response::json(*status, &body);
+            }
+            Response::json(500, r#"{"detail":"unexpected"}"#)
+        });
+        let output = key_invoke("local", false, &server.base_url, &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(*exit_code),
+            "{detail}: {}",
+            describe(&output)
+        );
+        let text = combined(&output);
+        for needle in *needles {
+            assert!(
+                text.contains(needle),
+                "{detail}: message must contain {needle}: {text}"
+            );
+        }
+        for phrase in *absent {
+            assert!(
+                !text.contains(phrase),
+                "{detail}: message must not contain {phrase}: {text}"
+            );
+        }
+        assert_no_sentinel(&stdout(&output));
+        assert_no_sentinel(&stderr(&output));
+    }
 }
 
 #[test]

@@ -47,7 +47,11 @@ pub(crate) enum LocalHookAction {
         dry_run: bool,
     },
     /// Read or rotate the targetless wake key for one named webhook.
-    #[command(subcommand_precedence_over_arg = true, subcommand_negates_reqs = true)]
+    #[command(
+        subcommand_precedence_over_arg = true,
+        subcommand_negates_reqs = true,
+        override_usage = "curie local hook wake-key [OPTIONS] <AGENT> <NAME>\n       curie local hook wake-key rotate [OPTIONS] <AGENT> <NAME>"
+    )]
     WakeKey {
         #[command(subcommand)]
         command: Option<LocalWakeKeyCommand>,
@@ -58,13 +62,14 @@ pub(crate) enum LocalHookAction {
         #[arg(
             long,
             default_value = message::DEFAULT_LOCAL_API_URL,
-            env = "CURIE_API_URL"
+            env = "CURIE_API_URL",
+            global = true
         )]
         api_url: String,
-        #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
+        #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default, global = true)]
         api_key: String,
         /// Print the route and the word redacted, and exit without making a request.
-        #[arg(long)]
+        #[arg(long, global = true)]
         dry_run: bool,
     },
 }
@@ -78,17 +83,6 @@ pub(crate) enum LocalWakeKeyCommand {
         agent: String,
         /// Trigger name on the in-force bundle.
         name: String,
-        #[arg(
-            long,
-            default_value = message::DEFAULT_LOCAL_API_URL,
-            env = "CURIE_API_URL"
-        )]
-        api_url: String,
-        #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
-        api_key: String,
-        /// Print the route and the word redacted, and exit without making a request.
-        #[arg(long)]
-        dry_run: bool,
     },
 }
 

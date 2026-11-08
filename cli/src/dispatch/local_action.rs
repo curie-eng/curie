@@ -392,17 +392,11 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                 api_key,
                 dry_run,
             } => {
-                let (agent, name, api_url, api_key, rotate, dry_run) = match command {
-                    Some(LocalWakeKeyCommand::Rotate {
-                        agent,
-                        name,
-                        api_url,
-                        api_key,
-                        dry_run,
-                    }) => (agent, name, api_url, api_key, true, dry_run),
+                let (agent, name, rotate) = match command {
+                    Some(LocalWakeKeyCommand::Rotate { agent, name }) => (agent, name, true),
                     None => {
                         let (agent, name) = commands::require_wake_key_target(agent, name)?;
-                        (agent, name, api_url, api_key, false, dry_run)
+                        (agent, name, false)
                     }
                 };
                 emit(

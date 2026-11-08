@@ -4411,7 +4411,7 @@
                     "http://localhost:28000"
                   ],
                   "env": "CURIE_API_URL",
-                  "global": false,
+                  "global": true,
                   "id": "api_url",
                   "long": "api-url",
                   "positional": false,
@@ -4422,14 +4422,14 @@
                     "curie-dev-key"
                   ],
                   "env": "CURIE_API_KEY",
-                  "global": false,
+                  "global": true,
                   "id": "api_key",
                   "long": "api-key",
                   "positional": false,
                   "required": false
                 },
                 {
-                  "global": false,
+                  "global": true,
                   "help": "Print the route and the word redacted, and exit without making a request",
                   "id": "dry_run",
                   "long": "dry-run",
@@ -4460,40 +4460,6 @@
                       "id": "name",
                       "positional": true,
                       "required": true
-                    },
-                    {
-                      "default_values": [
-                        "http://localhost:28000"
-                      ],
-                      "env": "CURIE_API_URL",
-                      "global": false,
-                      "id": "api_url",
-                      "long": "api-url",
-                      "positional": false,
-                      "required": false
-                    },
-                    {
-                      "default_values": [
-                        "curie-dev-key"
-                      ],
-                      "env": "CURIE_API_KEY",
-                      "global": false,
-                      "id": "api_key",
-                      "long": "api-key",
-                      "positional": false,
-                      "required": false
-                    },
-                    {
-                      "global": false,
-                      "help": "Print the route and the word redacted, and exit without making a request",
-                      "id": "dry_run",
-                      "long": "dry-run",
-                      "positional": false,
-                      "possible_values": [
-                        "true",
-                        "false"
-                      ],
-                      "required": false
                     }
                   ],
                   "hidden": false,
@@ -8004,7 +7970,7 @@
                   "required": false
                 },
                 {
-                  "global": false,
+                  "global": true,
                   "help": "Print the route and the word redacted, and exit without making a request",
                   "id": "dry_run",
                   "long": "dry-run",
@@ -8035,18 +8001,6 @@
                       "id": "name",
                       "positional": true,
                       "required": true
-                    },
-                    {
-                      "global": false,
-                      "help": "Print the route and the word redacted, and exit without making a request",
-                      "id": "dry_run",
-                      "long": "dry-run",
-                      "positional": false,
-                      "possible_values": [
-                        "true",
-                        "false"
-                      ],
-                      "required": false
                     }
                   ],
                   "hidden": false,
