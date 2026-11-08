@@ -423,9 +423,6 @@ async def reap_orphans(self: Kernel) -> list[str]:
             record = json.loads(expected)
             thread_key = record["thread_key"]
             async with self._lock.hold(self._config.lock_key(thread_key)) as fence:
-                if await self._markers.is_terminal(record["event_id"]):
-                    await self._markers.forget_watched_turn(claim_name, expected)
-                    continue
                 if not await self._markers.abandoned_turn(claim_name, expected):
                     continue
                 handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
@@ -505,9 +502,9 @@ async def _preflight_reclaimed_delivery(
     """Prove a TRANSFERRED delivery is safe to re-execute, or refuse it.
 
     A persisted side-effect marker forbids replay. A watched predecessor
-    must first become durable and idle or be retired before escalation settles
-    the delivery and clears its watch. Runner status recovers a marker lost
-    between stream emission and the previous worker's Valkey write.
+    must become durable and idle or be retired before its watch is cleared.
+    Escalation may settle first when the delivery budget expires. Runner status
+    recovers a marker lost between emission and the previous worker's Valkey write.
 
     Rule 2: a runner that still reports an active turn is interrupted and
     must become idle (or disappear) before the retry. The interrupt goes

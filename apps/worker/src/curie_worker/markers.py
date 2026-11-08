@@ -514,13 +514,6 @@ class Markers:
             expected,
         )
 
-    async def forget_settled_turn(self, event_id: str) -> None:
-        if not await self.is_terminal(event_id):
-            return
-        for claim_name, expected in (await self.watched_turns()).items():
-            if json.loads(expected)["event_id"] == event_id:
-                await self.forget_watched_turn(claim_name, expected)
-
     def _completion_storage_key(self, event_id: str, *, answer: CompletionNamespace = False) -> str:
         key = self._config.completion_key(event_id)
         if answer == "verbatim":
