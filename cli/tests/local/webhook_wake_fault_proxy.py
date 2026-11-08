@@ -13,14 +13,19 @@ def frame(stream):
     if not line:
         raise EOFError
     prefix, value = line[:1], line[1:-2]
-    if prefix == b"$":
+    if prefix in (b"$", b"!", b"="):
         length = int(value)
         body = stream.read(length + 2) if length >= 0 else b""
         return line + body, body[:-2] if length >= 0 else None
-    if prefix == b"*":
-        parts = [frame(stream) for _ in range(max(0, int(value)))]
-        return line + b"".join(raw for raw, _ in parts), [value for _, value in parts]
-    if prefix in (b"+", b"-", b":"):
+    if prefix in (b"*", b"%", b"~", b"|", b">"):
+        count = max(0, int(value)) * (2 if prefix in (b"%", b"|") else 1)
+        parts = [frame(stream) for _ in range(count)]
+        raw = line + b"".join(raw for raw, _ in parts)
+        if prefix == b"|":
+            following, result = frame(stream)
+            return raw + following, result
+        return raw, [value for _, value in parts]
+    if prefix in (b"+", b"-", b":", b",", b"#", b"_", b"("):
         return line, value
     raise ValueError("unexpected RESP frame")
 
@@ -29,6 +34,7 @@ class Fault:
     mode = "forward"
     dropped = 0
     refused = 0
+    forwarded = 0
 
 
 def main():
@@ -48,6 +54,7 @@ def main():
                                 state.dropped += 1
                                 return
                             peer.sendall(raw)
+                            state.forwarded += 1
                             reply, _ = frame(upstream)
                             self.wfile.write(reply)
                             self.wfile.flush()
@@ -60,7 +67,12 @@ def main():
 
         def do_GET(self):
             raw = json.dumps(
-                {"mode": state.mode, "dropped": state.dropped, "refused": state.refused}
+                {
+                    "mode": state.mode,
+                    "dropped": state.dropped,
+                    "refused": state.refused,
+                    "forwarded": state.forwarded,
+                }
             ).encode()
             self.send_response(200)
             self.send_header("Content-Length", str(len(raw)))

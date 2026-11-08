@@ -72,11 +72,12 @@ async def qualify():
             await database.execute(
                 "INSERT INTO curie.hook_runs "
                 "(id,agent_id,name,slot_utc,version_id,source,outcome,started_at,ended_at) "
-                "VALUES($1,$2,$3,clock_timestamp(),$4,$3,'ran',now(),now())",
+                "VALUES($1,$2,$3,clock_timestamp(),$4,$5,'ran',now(),now())",
                 row,
                 agent,
                 source,
                 version,
+                source,
             )
             return row
 

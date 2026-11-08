@@ -9,6 +9,7 @@ import json
 import socket
 import threading
 import urllib.request
+import uuid
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -21,6 +22,24 @@ from webhook_wake_connector import Queue, build_mcp, control_server
 
 KEY = "example-connector-wake-key"
 AGENT = "00000000-0000-4000-8000-000000000001"
+
+
+def test_private_inputs_are_redacted_by_the_real_failure_formatter(tmp_path):
+    from test_webhook_wake_qualification import PrivateInput, assert_no_key
+    from webhook_wake_local import LocalQualification
+
+    stack = LocalQualification(tmp_path)
+    secret = "example-private-input-" + uuid.uuid4().hex
+    command = "import sys; assert sys.stdin.read(); raise SystemExit(1)"
+    with pytest.raises(RuntimeError) as raw:
+        stack.run("python3", "-c", command, stdin=secret)
+    assert secret in str(raw.getrepr(funcargs=True))
+    with pytest.raises(RuntimeError) as private:
+        stack.run("python3", "-c", command, stdin=PrivateInput(secret))
+    assert secret not in str(private.getrepr(funcargs=True))
+    with pytest.raises(AssertionError) as leaked:
+        assert_no_key({"result": secret}, secret)
+    assert secret not in str(leaked.getrepr(funcargs=True))
 
 
 @contextmanager

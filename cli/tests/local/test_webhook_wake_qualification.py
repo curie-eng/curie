@@ -28,7 +28,13 @@ BODY = b"{}"
 HOOK = "queue-ready"
 
 
+class PrivateInput(str):
+    def __repr__(self):
+        return "<private subprocess input>"
+
+
 def assert_no_key(value, key):
+    __tracebackhide__ = True
     if key in json.dumps(value):
         raise AssertionError("wake credential escaped its approved surface")
 
@@ -155,8 +161,31 @@ class Qualification(WakeStack):
     def upgrade(self, values):
         from test_webhook_wake_worker import REPO
 
+        current = json.loads(
+            self.run(
+                "helm",
+                "get",
+                "values",
+                NAME,
+                "--kube-context",
+                self.context,
+                "--namespace",
+                NAME,
+                "-o",
+                "json",
+            )
+        )
+
+        def update(target, changes):
+            for key, value in changes.items():
+                if isinstance(value, dict):
+                    update(target.setdefault(key, {}), value)
+                else:
+                    target[key] = value
+
+        update(current, values)
         path = self.root / "qualification-values.yaml"
-        path.write_text(yaml.safe_dump(values))
+        path.write_text(yaml.safe_dump(current))
         self.run(
             "helm",
             "upgrade",
@@ -166,7 +195,7 @@ class Qualification(WakeStack):
             self.context,
             "--namespace",
             NAME,
-            "--reuse-values",
+            "--reset-values",
             "-f",
             str(path),
             "--wait",
@@ -313,7 +342,14 @@ class Qualification(WakeStack):
             {
                 "apiVersion": "v1",
                 "kind": "Pod",
-                "metadata": {"name": name, "labels": {**service["spec"]["selector"], "app": name}},
+                "metadata": {
+                    "name": name,
+                    "labels": {
+                        **service["spec"]["selector"],
+                        "app.kubernetes.io/component": "wake-fault-proxy",
+                        "app": name,
+                    },
+                },
                 "spec": {
                     "containers": [
                         {
@@ -333,7 +369,7 @@ class Qualification(WakeStack):
                 "apiVersion": "v1",
                 "kind": "Service",
                 "metadata": {"name": name},
-                "spec": {"selector": {"app": name}, "ports": [{"port": 8000}]},
+                "spec": {"selector": {"app": name}, "ports": [{"port": 6379}]},
             },
         ]
         try:
@@ -344,37 +380,17 @@ class Qualification(WakeStack):
                 stdin=json.dumps({"apiVersion": "v1", "kind": "List", "items": resources}),
             )
             self.kube("wait", "--for=condition=Ready", f"pod/{name}", "--timeout=90s")
-            self.kube(
-                "patch",
-                "service",
-                host,
-                "--type=json",
-                "-p",
-                json.dumps([{"op": "replace", "path": "/spec/selector", "value": {"app": name}}]),
-            )
-            self.restart_api()
+            self.kube("set", "env", f"deployment/{FULLNAME}-api", f"VALKEY_HOST={name}")
+            self.kube("rollout", "status", f"deployment/{FULLNAME}-api", "--timeout=180s")
             yield
         finally:
-            self.kube(
-                "patch",
-                "service",
-                host,
-                "--type=json",
-                "-p",
-                json.dumps(
-                    [
-                        {
-                            "op": "replace",
-                            "path": "/spec/selector",
-                            "value": service["spec"]["selector"],
-                        }
-                    ]
-                ),
-            )
-            self.restart_api()
+            self.kube("set", "env", f"deployment/{FULLNAME}-api", f"VALKEY_HOST={host}")
+            self.kube("rollout", "status", f"deployment/{FULLNAME}-api", "--timeout=180s")
             self.kube("delete", "pod,service,configmap", name, "--ignore-not-found", "--wait=true")
 
     def kube(self, *args, stdin=None):
+        if stdin is not None:
+            stdin = PrivateInput(stdin)
         output = super().kube(*args, stdin=stdin)
         if args == ("create", "namespace", NAME):
             self.namespace_owned = True
@@ -387,15 +403,10 @@ class Qualification(WakeStack):
         finally:
             super().close()
 
-    def scheduler_tick(self, offset_seconds=0):
-        self.kube(
-            "exec",
-            "-i",
-            f"deployment/{FULLNAME}-worker",
-            "--",
-            "python3",
-            "-",
-            stdin="import asyncio,os\n"
+    @staticmethod
+    def scheduler_code(offset_seconds):
+        return (
+            "import asyncio,os\n"
             "from datetime import UTC,datetime,timedelta\n"
             "from curie_worker.run import build\n"
             "from curie_worker.config import WorkerConfig\n"
@@ -407,8 +418,39 @@ class Qualification(WakeStack):
             f"  now=datetime.now(UTC)+timedelta(seconds={offset_seconds})\n"
             "  await runtime.cron_loop.one_pass(now)\n"
             " finally: await resources.aclose()\n"
-            "asyncio.run(tick())\n",
+            "asyncio.run(tick())\n"
         )
+
+    def scheduler_tick(self, offset_seconds=0):
+        name = "test-adr0274-wake-scheduler"
+        jobs = json.loads(self.kube("get", "jobs", "-o", "json"))["items"]
+        if any(job["metadata"]["name"] == name for job in jobs):
+            raise RuntimeError("scheduler probe already exists; preserve its owner")
+        deployment = json.loads(self.kube("get", "deployment", f"{FULLNAME}-worker", "-o", "json"))
+        template = deployment["spec"]["template"]
+        template["spec"]["restartPolicy"] = "Never"
+        containers = template["spec"]["containers"]
+        assert len(containers) == 1 and containers[0]["name"] == "worker"
+        worker = containers[0]
+        worker["command"] = ["python3", "-c", self.scheduler_code(offset_seconds)]
+        worker.pop("args", None)
+        for probe in ("readinessProbe", "livenessProbe", "startupProbe"):
+            worker.pop(probe, None)
+        job = {
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {"name": name},
+            "spec": {"backoffLimit": 0, "activeDeadlineSeconds": 90, "template": template},
+        }
+        created = False
+        try:
+            self.kube("create", "-f", "-", stdin=json.dumps(job))
+            created = True
+            self.kube("wait", "--for=condition=Complete", f"job/{name}", "--timeout=120s")
+        finally:
+            if created:
+                (self.root / "scheduler-probe.log").write_text(self.kube("logs", f"job/{name}"))
+                self.kube("delete", "job", name, "--wait=true")
 
     def capture_failure(self):
         command = self.root / "command-failure.log"
@@ -966,6 +1008,7 @@ def test_fresh_overlap_and_dedupe_expiry(qualification):
 def test_acceptance_4(qualification):
     """HTTP admission through real worker/sandbox; hosted MCP remains separate."""
     stack = qualification
+    stack.worker(True)
     idle = stack.queued()
     stack.settled(idle, "ran")
     http_run = stack.queued("acme-wake-http")
@@ -1001,6 +1044,7 @@ def test_acceptance_4(qualification):
 def test_acceptance_5(qualification):
     """Observe stored and operator provenance independently of the queue label."""
     stack = qualification
+    stack.worker(True)
     run = stack.queued()
     stack.settled(run, "ran")
     rows = stack.sql(
@@ -1028,6 +1072,7 @@ def test_acceptance_5(qualification):
     assert record["id"] == run
     assert record["source"] == record["trigger"] == "webhook"
     assert_no_key(record, stack.key())
+    assert stack.wait_telemetry()["wakes"]
 
 
 @pytest.mark.parametrize("action", ["rotate", "pause", "source"])
@@ -1190,29 +1235,32 @@ def test_deployment_replacement_and_cron_overlap(qualification):
 
 @pytest.mark.parametrize("budget,lease", [(60, 75), (65, None)])
 def test_transport_failure_and_timed_recovery(qualification, budget, lease):
+    from curie_worker.sweep import HOOK_LEASE_START_MARGIN_S
+
     stack = qualification
     stack.configure_lease(budget, lease)
     try:
         with stack.transport_fault():
             before = stack.snapshot()
             key = stack.key()
+            assert stack.fault_mode("forward")["forwarded"] > 0
             stack.fault_mode("down")
             try:
                 answer = stack.wake(key=key)[0]
-                assert answer["status"] == 503
-                assert answer["body"] == {"detail": "authority_unavailable"}
             finally:
                 observed = stack.fault_mode("forward")
-            assert observed["refused"] > 0
+            assert observed["refused"] > 0, observed
+            assert answer["status"] == 503, answer
+            assert answer["body"] == {"detail": "authority_unavailable"}
             assert stack.snapshot() == before
             stack.fault_mode("drop_xadd")
             try:
                 answer = stack.wake()[0]
-                assert answer["status"] == 503
-                assert answer["body"] == {"detail": "wake_enqueue_unavailable"}
             finally:
                 observed = stack.fault_mode("forward")
-            assert observed["dropped"] > 0
+            assert observed["dropped"] > 0, observed
+            assert answer["status"] == 503, answer
+            assert answer["body"] == {"detail": "wake_enqueue_unavailable"}
             rows = stack.sql(
                 "SELECT json_agg(json_build_object('id',id,'outcome',outcome,'lease',"
                 "extract(epoch FROM lease_expires_at-started_at))) FROM curie.hook_runs "
@@ -1235,7 +1283,7 @@ def test_transport_failure_and_timed_recovery(qualification, budget, lease):
                 "SELECT extract(epoch FROM lease_expires_at-clock_timestamp()) "
                 f"FROM curie.hook_runs WHERE id='{fresh}'"
             )
-            assert 0 < float(remaining) <= stack.claim_lease_s + 1
+            assert 0 < float(remaining) <= stack.claim_lease_s + HOOK_LEASE_START_MARGIN_S + 1
     finally:
         stack.configure_lease(600, None)
         stack.worker(True)
@@ -1453,6 +1501,7 @@ def test_hosted_connector_session(qualification, agent, provider_tier, record_pr
     assert polled["http_status"] == 202
     run = polled["receipt"]["run_id"]
     if live:
+        stack.worker(True)
         stack.settled(run, "ran")
     else:
         try:

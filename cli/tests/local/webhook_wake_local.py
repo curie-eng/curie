@@ -10,7 +10,7 @@ import threading
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from test_webhook_wake_qualification import Qualification
+from test_webhook_wake_qualification import PrivateInput, Qualification
 from test_webhook_wake_worker import REPO, wait_until
 
 
@@ -59,6 +59,14 @@ class LocalQualification(Qualification):
         class Slack(BaseHTTPRequestHandler):
             def do_POST(self):
                 payload = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                if self.path.startswith("/otlp/"):
+                    runtime.exports.append((self.path, payload))
+                    runtime.export_event.set()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-protobuf")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 if self.path.startswith("/model/"):
                     runtime.model_paths.append(self.path)
                     body = (
@@ -116,6 +124,8 @@ class LocalQualification(Qualification):
     ports: !override ["127.0.0.1:{s3}:9000", "127.0.0.1:{console}:9001"]
   curie-api:
     ports: !override ["127.0.0.1:{api}:8000"]
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://{callback}:{stub}/otlp
   curie-worker:
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:${{CURIE_LOCAL_POSTGRES_PASSWORD:-postgres}}@127.0.0.1:{postgres}/postgres
@@ -125,6 +135,8 @@ class LocalQualification(Qualification):
       CURIE_API_URL: http://127.0.0.1:{api}
       CURIE_DOCKER_NETWORK: {self.network}
       CURIE_RUNNER_TOTAL_TIMEOUT_S: ${{CURIE_RUNNER_TOTAL_TIMEOUT_S:-600}}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://{callback}:{stub}/otlp
+      CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT: http://{callback}:{stub}/otlp
       SLACK_API_BASE_URL: http://{callback}:{stub}/api/
       SLACK_BOT_TOKEN: example-slack-token
 networks:
@@ -229,6 +241,46 @@ networks:
             self.run(*self.compose, "start", "--wait", "curie-worker")
         else:
             self.run(*self.compose, "stop", "curie-worker")
+
+    def scheduler_tick(self, offset_seconds=0):
+        container = self.run(*self.compose, "ps", "-aq", "curie-worker").strip()
+        installed = json.loads(self.run("docker", "inspect", container))[0]
+        name = f"{self.project}-scheduler"
+        listing = ["docker", "ps", "-aq", "--filter", f"name=^/{name}$"]
+        if self.run(*listing).strip():
+            raise RuntimeError("scheduler probe already exists; preserve its owner")
+        environment = installed["Config"]["Env"]
+        if any("\n" in value or "\r" in value for value in environment):
+            raise RuntimeError("scheduler probe requires single-line environment values")
+        try:
+            self.run(
+                "docker",
+                "run",
+                "--rm",
+                "--name",
+                name,
+                "--label",
+                f"curietech.ai/stack={self.network}",
+                "--network",
+                installed["HostConfig"]["NetworkMode"],
+                "--volumes-from",
+                container,
+                "--user",
+                installed["Config"]["User"],
+                "--workdir",
+                installed["Config"]["WorkingDir"],
+                "--env-file",
+                "/dev/stdin",
+                installed["Image"],
+                "python3",
+                "-c",
+                self.scheduler_code(offset_seconds),
+                stdin=PrivateInput("\n".join(environment) + "\n"),
+            )
+        finally:
+            if self.run(*listing).strip():
+                self.run("docker", "rm", "-f", name)
+            assert not self.run(*listing).strip()
 
     def restart_api(self):
         container = self.run(*self.compose, "ps", "-q", "curie-api").strip()
@@ -388,16 +440,11 @@ networks:
             f"label=curietech.ai/stack={self.network}",
             "--filter",
             "label=curietech.ai/component=claim-runner",
+            "--filter",
+            f"label=curietech.ai/agent={agent}",
         ).split()
-        matches = []
-        for container in containers:
-            labels = json.loads(
-                self.run("docker", "inspect", "--format", "{{json .Config.Labels}}", container)
-            )
-            if self.agents[agent] in labels["curietech.ai/claim"]:
-                matches.append(container)
-        assert len(matches) == 1
-        return matches[0]
+        assert len(containers) == 1
+        return containers[0]
 
     def sandbox_manifest(self, agent):
         return json.loads(
