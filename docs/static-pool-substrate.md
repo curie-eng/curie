@@ -78,8 +78,8 @@ workspace handoff fence. For unfinished deliveries, an idle runner with durable
 history keeps its route. An active, unreadable or non-durable runner is retired
 through the supervisor. Abandoned-turn retirement always quarantines the static
 shell after stopping its child and running cleanup. Its health endpoint returns
-503; capacity returns only after the platform replaces the shell. This recovery also applies to Docker and Kubernetes through their normal
-claim retirement paths. An unreachable shell stays leased until retirement can
+503; capacity returns only after the platform replaces the shell. This recovery
+also applies to Docker and Kubernetes through their normal claim retirement paths. An unreachable shell stays leased until retirement can
 be confirmed.
 
 The runner-local `CURIE_RUNNER_CLEANUP_TIMEOUT_S` defaults to 30 seconds,
