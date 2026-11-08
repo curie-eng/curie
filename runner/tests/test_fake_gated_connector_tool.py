@@ -3,8 +3,8 @@
 The directive makes the default script emit one ToolUseBlock named
 ``mcp__<connector>__<tool>`` carrying exactly the JSON object, run through the
 permission gate like any scripted call. A gate that requires the tool records a
-pending approval and the turn awaits it. Nothing is dialled: the approved call
-is made later with ``[fake:connector-tool]``.
+pending approval and the turn awaits it. The directive only raises the gate;
+nothing is dialled.
 """
 
 from __future__ import annotations
@@ -90,7 +90,10 @@ async def _run(
     try:
         await runner.start()
         lines = [
-            line async for line in runner.run_turn(Event(type="message", text=prompt, user="U1", ts="1.1"))
+            line
+            async for line in runner.run_turn(
+                Event(type="message", text=prompt, user="U1", ts="1.1")
+            )
         ]
     finally:
         if server is not None:
@@ -98,7 +101,9 @@ async def _run(
     return parse_ndjson("".join(lines)), gate, seen, session
 
 
-def _drive(prompt: str, **kw: Any) -> tuple[list[Any], ApprovalGate, list[tuple[str, dict[str, Any]]]]:
+def _drive(
+    prompt: str, **kw: Any
+) -> tuple[list[Any], ApprovalGate, list[tuple[str, dict[str, Any]]]]:
     events, gate, seen, _ = anyio.run(lambda: _run(prompt, **kw))
     return events, gate, seen
 
