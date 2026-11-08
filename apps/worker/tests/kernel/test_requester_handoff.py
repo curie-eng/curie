@@ -38,24 +38,29 @@ import pytest
 from aci_protocol import Final, SessionStatus, TextDelta, TurnSource
 from curie_internal.identity_authority import TurnAuthorityScopeV1
 from curie_worker import binding as binding_module
-from curie_worker import caller_token
+from curie_worker import caller_token, capacity_wait
 from curie_worker.binding import (
     CONNECTOR_CALLER_TOKEN_ENV,
     RUNNER_TOKEN_ENV,
     SANDBOX_TOKEN_TTL_SECONDS,
     BindingResolver,
 )
+from curie_worker.capacity_wait import CapacityWaitStore
 from curie_worker.config import WorkerConfig
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.kernel import failures, identity
 from curie_worker.kernel import routing as kernel_routing
 from curie_worker.runner_client import RunnerError
+from curie_worker.sandbox.types import SandboxError
 
 from ..queue_fixtures import qevent, wait_until
+from .test_http_approval_pause import Creator, awaiting, raw_payload
+from .test_http_approval_pause import process as pause_process
 from .test_http_identity_authority import (
     CAPSULE,
     ORIGINAL_HASH,
+    Core,
     pending_entry,
     process,
     require_execution_interface,
@@ -66,6 +71,7 @@ from .test_requester_claim import (
     SCOPE,
     RequesterBinding,
     RequesterCore,
+    answer,
     assert_refused_before_boot,
     principal_for,
     require_requester_interface,
@@ -104,6 +110,31 @@ def handoff_pending() -> type[Exception]:
         "RequesterHandoffPending must keep LiveSessionBusy's deferral handling"
     )
     return cls
+
+
+def handoff_wait() -> type[Exception]:
+    """The durable wait a parkable different-requester delivery requests.
+
+    @spec CONNECTOR-REQUESTER-3.
+    """
+    cls = getattr(capacity_wait, "RequesterHandoffWaitRequested", None)
+    assert cls is not None, "capacity_wait has no RequesterHandoffWaitRequested"
+    assert issubclass(cls, capacity_wait.CapacityWaitRequested), (
+        "RequesterHandoffWaitRequested must be a capacity wait the consumer parks"
+    )
+    return cls
+
+
+def live_deferral() -> tuple[type[Exception], ...]:
+    """What a different requester meets at a live turn when no consumer drives it.
+
+    A direct kernel caller has nobody to park the delivery, so either deferral
+    satisfies these cases: the pending ``RequesterHandoffPending`` or the
+    ``RequesterHandoffWaitRequested`` a parkable delivery raises. Which one a
+    consumer receives, and what it does with it, is pinned in
+    ``test_requester_wait``. @spec CONNECTOR-REQUESTER-3.
+    """
+    return (handoff_pending(), handoff_wait())
 
 
 def window_short() -> type[Exception]:
@@ -652,7 +683,7 @@ def test_a_then_b_during_a_live_turn_defers_and_never_steers(
     """
     require_execution_interface()
     require_requester_interface()
-    pending_cls = handoff_pending()
+    deferred = live_deferral()
     caplog.set_level(logging.DEBUG, logger="curie_worker")
 
     async def run() -> None:
@@ -672,7 +703,7 @@ def test_a_then_b_during_a_live_turn_defers_and_never_steers(
                 alice_runner = runner_at(h, alice_handle)
 
                 core.requester = bob
-                with pytest.raises(pending_cls):
+                with pytest.raises(deferred):
                     await process(h, bob_turn)
 
                 assert all_steers(h) == [], "Bob's message was steered into Alice's turn"
@@ -732,7 +763,7 @@ def test_a_reclaimed_delivery_never_interrupts_another_requesters_turn(
     """
     require_execution_interface()
     require_requester_interface()
-    pending_cls = handoff_pending()
+    deferred = live_deferral()
     caplog.set_level(logging.DEBUG, logger="curie_worker")
 
     async def run() -> None:
@@ -752,7 +783,7 @@ def test_a_reclaimed_delivery_never_interrupts_another_requesters_turn(
                 core.requester = bob
                 bob_turn = qevent("bob retried", thread="reclaim-guard")
                 lease = await _leased_entry(h, store, event_id=bob_turn.event_id, generation=2)
-                with pytest.raises(pending_cls):
+                with pytest.raises(deferred):
                     await process_leased(h, bob_turn, lease)
 
                 assert alice_runner.interrupts == 0, "Bob's reclaim interrupted Alice's turn"
@@ -786,7 +817,7 @@ def test_unreadable_liveness_defers_a_different_requester(make_harness) -> None:
     """
     require_execution_interface()
     require_requester_interface()
-    pending_cls = handoff_pending()
+    deferred = live_deferral()
 
     async def run() -> None:
         binding, _alice, bob, core = parties()
@@ -802,7 +833,7 @@ def test_unreadable_liveness_defers_a_different_requester(make_harness) -> None:
             alice_runner.status_fails = True
             core.requester = bob
             bob_turn = qevent("bob asks", thread="unreadable")
-            with pytest.raises(pending_cls):
+            with pytest.raises(deferred):
                 await process(h, bob_turn)
             assert all_opened(h) == ["alice asks"]
             assert all_steers(h) == []
@@ -835,7 +866,7 @@ def test_a_route_adopted_after_an_empty_snapshot_is_refused(
     """
     require_execution_interface()
     require_requester_interface()
-    pending_cls = handoff_pending()
+    deferred = live_deferral()
 
     async def run() -> None:
         binding, _alice, bob, core = parties()
@@ -866,7 +897,7 @@ def test_a_route_adopted_after_an_empty_snapshot_is_refused(
             monkeypatch.setattr(h.substrate, "claim", claim)
             core.requester = bob
             bob_turn = qevent("bob asks", thread="empty-snapshot")
-            with pytest.raises(pending_cls):
+            with pytest.raises(deferred):
                 await process(h, bob_turn)
             assert hidden["count"] >= 1 and hidden["claims"] == 1, "the claim never adopted"
             monkeypatch.setattr(h.substrate, "lookup", real_lookup)
@@ -1060,15 +1091,17 @@ def test_an_opted_in_turn_without_a_caller_token_starts_and_is_adopted(make_harn
     asyncio.run(run())
 
 
-# -- 10: the consumer keeps a deferred delivery ---------------------------------------------
+# -- 10: the consumer parks a deferred delivery ---------------------------------------------
 
 
-def test_a_deferred_delivery_stays_pending_then_runs_once(make_harness) -> None:
+def test_a_deferred_delivery_is_parked_then_runs_once(make_harness) -> None:
     """@spec CONNECTOR-REQUESTER-3: deferred, never lost, never run twice.
 
-    The actual consumer handles Bob's entry while Alice's turn is live: it
-    stays in the PEL with no done marker. After her turn ends the entry is
-    reclaimed (generation 2), replaces the sandbox, runs once and is acked.
+    The actual consumer handles Bob's entry while Alice's turn is live. The
+    delivery can park, so it is parked durably (the entry acked, a waiting
+    record, no done marker) instead of staying in the PEL. After her turn
+    ends the due wake redelivers it, it replaces the sandbox, runs once and
+    is acked. The durable wait itself is covered in ``test_requester_wait``.
     """
     require_execution_interface()
     require_requester_interface()
@@ -1104,7 +1137,9 @@ def test_a_deferred_delivery_stays_pending_then_runs_once(make_harness) -> None:
                 assert "bob asks" not in all_opened(h)
                 assert all_steers(h) == []
                 assert all_interrupts(h) == 0
-                assert await pending_count(h) == 1
+                assert await pending_count(h) == 0, "the deferral was left in the PEL"
+                parked = await CapacityWaitStore(h.async_redis, h.config).get(bob_turn.event_id)
+                assert parked is not None and parked.state == "waiting"
                 assert not await is_done(h, bob_turn)
                 assert route(h, key) == alice_handle
             finally:
@@ -1112,16 +1147,18 @@ def test_a_deferred_delivery_stays_pending_then_runs_once(make_harness) -> None:
                 await opener
 
             complete_turns(h)
-            # Idle time zero claims the pending entry at once; the test needs
-            # the redelivery, not a reclaim delay.
-            await h.async_redis.xclaim(
-                h.config.stream,
+            # The wait is made due by moving its due score, the store's own
+            # clock; its wake appends the redelivery as a new stream entry.
+            await h.async_redis.zadd(consumer._waits._due, {bob_turn.event_id: 0})
+            assert await consumer._waits.wake_due() == 1
+            rows = await h.async_redis.xreadgroup(
                 h.config.consumer_group,
                 h.config.consumer_name,
-                min_idle_time=0,
-                message_ids=[entry_id],
+                {h.config.stream: ">"},
+                count=1,
             )
-            await consumer._handle(entry_id, observed)
+            woken_id, woken = rows[0][1][0]
+            await consumer._handle(woken_id, dict(woken))
 
             assert all_opened(h).count("bob asks") == 1
             bob_handle = route(h, key)
@@ -1130,6 +1167,8 @@ def test_a_deferred_delivery_stays_pending_then_runs_once(make_harness) -> None:
             assert all_interrupts(h) == 0
             assert await is_done(h, bob_turn)
             assert await pending_count(h) == 0
+            settled = await CapacityWaitStore(h.async_redis, h.config).get(bob_turn.event_id)
+            assert settled is not None and settled.state == "done"
 
     asyncio.run(run())
 
@@ -1321,7 +1360,7 @@ def test_reclaim_preflight_never_interrupts_a_route_handed_to_another_requester(
     """
     require_execution_interface()
     require_requester_interface()
-    pending_cls = handoff_pending()
+    deferred = live_deferral()
 
     async def run() -> None:
         binding, alice, bob, core = parties()
@@ -1357,7 +1396,7 @@ def test_reclaim_preflight_never_interrupts_a_route_handed_to_another_requester(
                     return live
 
                 h.kernel._turn_active = turn_active
-                with pytest.raises(pending_cls):
+                with pytest.raises(deferred):
                     await process_leased(h, retried, lease)
 
                 assert checked == [bob_handle], "the preflight never checked Bob's live turn"
@@ -1659,5 +1698,410 @@ def test_principal_less_turns_skip_the_window_check(
             assert binding.boot_kwargs[0].get("caller_principal") is None
             assert recorded(route(h, thread_key(event)))[0] == "none"
             assert all_opened(h) == [event.text]
+
+    asyncio.run(run())
+
+
+# -- 16: an approval resume boots a fresh token for the original requester ------------------
+
+
+_APPROVER = "USyntheticApprover"
+
+
+class ResumeBinding(MintingRequesterBinding):
+    """``MintingRequesterBinding`` that also answers a resume's grant snapshot.
+
+    The snapshot reads None: the resume is a non-grant notification, so it
+    carries no tool or arguments and boots like any opted-in turn. The SQL
+    snapshot owner has its own real-PG proof. @spec CONNECTOR-REQUESTER-3.
+    """
+
+    async def approval_grant_snapshot(self, *_args: Any) -> None:
+        """@spec CONNECTOR-REQUESTER-3."""
+        return None
+
+
+class EventCore(RequesterCore):
+    """The core double, projecting the requester per event, resumes included.
+
+    ``by_event`` names the requester the API projects for one event id; any
+    other event gets ``requester``. An approval resume continues (the base
+    double refuses it as unsupported) and projects what the test names for it,
+    which the API takes from the original invocation, never from the approver.
+    Version 1 answers carry no requester at all.
+
+    @spec CONNECTOR-REQUESTER-1 CONNECTOR-REQUESTER-3.
+    """
+
+    def __init__(self, requester: dict[str, str] | None, *, version: int = 2) -> None:
+        """@spec CONNECTOR-REQUESTER-3."""
+        super().__init__(requester, version=version)
+        self.by_event: dict[str, dict[str, str] | None] = {}
+
+    async def check(self, request: Any) -> Any:
+        """@spec CONNECTOR-REQUESTER-1 CONNECTOR-REQUESTER-3."""
+        base = await Core.check(self, request)
+        if base.decision != "continue" and request.approval_id is None:
+            return base
+        requester = self.by_event.get(request.event_id, self.requester)
+        return answer(request, version=self.version, requester=requester)
+
+
+class RecordingCreator(Creator):
+    """The HTTP approval creator double, keeping the ids it created.
+
+    @spec CONNECTOR-REQUESTER-3.
+    """
+
+    def __init__(self) -> None:
+        """@spec CONNECTOR-REQUESTER-3."""
+        super().__init__()
+        self.ids: list[str] = []
+
+    async def create(self, request: Any, **kwargs: Any) -> Any:
+        """@spec CONNECTOR-REQUESTER-3."""
+        created = await super().create(request, **kwargs)
+        self.ids.append(created.id)
+        return created
+
+
+def event_parties() -> tuple[ResumeBinding, dict[str, str], dict[str, str], EventCore]:
+    """An opted-in agent, its two verified humans, and a per-event core for Alice.
+
+    @spec CONNECTOR-REQUESTER-3.
+    """
+    binding = ResumeBinding(flag=True)
+    alice = binding.requester_wire()
+    bob = binding.requester_wire(BOB_SUBJECT)
+    return binding, alice, bob, EventCore(alice)
+
+
+def resume_of(approval_id: str, thread: str) -> Any:
+    """The resume the API enqueues once another person decided the approval.
+
+    Its wire author is the approver. @spec CONNECTOR-REQUESTER-3.
+    """
+    return qevent(
+        f"[approval resolved] approved by {_APPROVER}",
+        thread=thread,
+        event_id=f"approval-{approval_id}-resolved",
+    ).model_copy(update={"author": _APPROVER})
+
+
+async def pause_for_approval(h: Any, creator: RecordingCreator, thread: str) -> tuple[Any, str]:
+    """Alice's turn ends awaiting approval through the HTTP creation carry.
+
+    Later turns on any runner finish at once. @spec CONNECTOR-REQUESTER-3.
+    """
+    for runner in h.runners.values():
+        runner.default_script = awaiting()
+    first = qevent("alice needs sign-off", thread=thread)
+    await pause_process(h, first, raw=raw_payload(first))
+    assert len(creator.ids) == 1, "the turn never paused for approval"
+    assert await is_done(h, first)
+    for runner in h.runners.values():
+        runner.default_script = [Final(text="resumed", status=SessionStatus.DONE)]
+    return first, creator.ids[0]
+
+
+def failed_suspend(_thread_key: str, *, history_ref: str | None = None) -> None:
+    """The substrate suspend failing, which the pause treats as non-fatal.
+
+    @spec CONNECTOR-REQUESTER-3.
+    """
+    raise SandboxError("synthetic suspend failure")
+
+
+def assert_fresh_requester_token(
+    binding: MintingRequesterBinding,
+    token: str,
+    *,
+    before: str,
+    requester: dict[str, str],
+    approver: dict[str, str],
+) -> dict[str, Any]:
+    """A claim-time, one-hour cct for ``requester``, newer than ``before``.
+
+    @spec CONNECTOR-REQUESTER-3.
+    """
+    claims = cct_claims(token)
+    assert canonical(claims["principal"]) == canonical(principal_dict(requester))
+    assert claims["principal"] != principal_dict(approver), "the resume booted as the approver"
+    assert_signed_by(token, binding.signing_key)
+    assert token != before, "the resume reused the pre-pause caller token"
+    assert claims["exp"] > cct_claims(before)["exp"]
+    run = binding.minter_runs[-1]
+    assert run.cct == token, "the resumed claim was not minted at claim time"
+    assert int(run.before) + _REQUESTER_TTL_S <= claims["exp"]
+    assert claims["exp"] <= int(run.after) + _REQUESTER_TTL_S
+    return claims
+
+
+def test_an_approval_resume_never_adopts_the_live_route_a_failed_suspend_left(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec CONNECTOR-REQUESTER-3: a resume boots a fresh hour for the original requester.
+
+    Alice's turn pauses for approval and the suspend fails, which the pause
+    treats as non-fatal, so her runner stays live and reports
+    ``awaiting-approval`` as the real runner does after a pause. Another
+    person approves. The opted-in resume never adopts that warm route: it
+    replaces the sandbox, and the replacement boots a cct minted at claim time
+    for one hour whose principal is Alice, the original requester the V2
+    projection names, never the approver; a different token from the
+    pre-pause one, with a later expiry. Liveness: the resumed turn runs once,
+    on the new sandbox.
+    """
+    require_execution_interface()
+    require_requester_interface()
+    clock = install_clock(monkeypatch)
+
+    async def run() -> None:
+        binding, alice, bob, core = event_parties()
+        creator = RecordingCreator()
+        async with make_harness(
+            binding=binding, identity_authority=core, approvals=creator, per_sandbox_runners=2
+        ) as h:
+            monkeypatch.setattr(h.substrate, "suspend", failed_suspend)
+            first, approval_id = await pause_for_approval(h, creator, "resume-live")
+            key = thread_key(first)
+            paused = route(h, key)
+            paused_runner = runner_at(h, paused)
+            assert paused_runner.opened == [first.text]
+            paused_runner.session_status = SessionStatus.AWAITING_APPROVAL.value
+            before = cct_of(h.fake_k8s.claim_envs[0])
+            assert recorded(paused) == (requester_digest(alice), cct_claims(before)["exp"])
+
+            clock.advance(120)
+            resumed = resume_of(approval_id, "resume-live")
+            core.by_event[resumed.event_id] = alice
+            await process(h, resumed)
+
+            assert len(h.fake_k8s.claim_envs) == 2, "the resume adopted the route left live"
+            token = cct_of(h.fake_k8s.claim_envs[1])
+            claims = assert_fresh_requester_token(
+                binding, token, before=before, requester=alice, approver=bob
+            )
+            replaced = route(h, key)
+            assert replaced.claim_name != paused.claim_name
+            assert recorded(replaced) == (requester_digest(alice), claims["exp"])
+            assert paused_runner.opened == [first.text], "the resume ran on the paused runner"
+            assert runner_at(h, replaced).opened == [resumed.text]
+            assert all_steers(h) == []
+            assert await is_done(h, resumed)
+
+    asyncio.run(run())
+
+
+def test_an_approval_resume_after_a_suspend_claims_fresh_for_the_original_requester(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec CONNECTOR-REQUESTER-3: the normal path, suspend then a fresh claim.
+
+    The pause suspends Alice's sandbox. Another person approves; the resume
+    claims a new sandbox whose cct is minted at claim time for one hour and
+    names Alice, never the approver, and differs from the pre-pause token.
+    """
+    require_execution_interface()
+    require_requester_interface()
+    clock = install_clock(monkeypatch)
+
+    async def run() -> None:
+        binding, alice, bob, core = event_parties()
+        creator = RecordingCreator()
+        async with make_harness(
+            binding=binding, identity_authority=core, approvals=creator, per_sandbox_runners=2
+        ) as h:
+            first, approval_id = await pause_for_approval(h, creator, "resume-suspended")
+            key = thread_key(first)
+            assert [s.operating_mode for s in h.fake_k8s.sandboxes.values()] == ["Suspended"]
+            assert h.substrate.lookup(key) is None
+            before = cct_of(h.fake_k8s.claim_envs[0])
+
+            clock.advance(120)
+            resumed = resume_of(approval_id, "resume-suspended")
+            core.by_event[resumed.event_id] = alice
+            await process(h, resumed)
+
+            assert len(h.fake_k8s.claim_envs) == 2
+            token = cct_of(h.fake_k8s.claim_envs[1])
+            claims = assert_fresh_requester_token(
+                binding, token, before=before, requester=alice, approver=bob
+            )
+            handle = route(h, key)
+            assert recorded(handle) == (requester_digest(alice), claims["exp"])
+            assert runner_at(h, handle).opened == [resumed.text]
+            assert await is_done(h, resumed)
+
+    asyncio.run(run())
+
+
+def test_a_flag_off_approval_resume_still_adopts_the_live_route(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec CONNECTOR-REQUESTER-3 (liveness): only an opted-in resume replaces.
+
+    Flag off, version 1 answers, the same failed suspend: the resume adopts
+    the live principal-less route as before and runs on the paused runner.
+    """
+    require_execution_interface()
+    require_requester_interface()
+
+    async def run() -> None:
+        binding = ResumeBinding(flag=False)
+        core = EventCore(None, version=1)
+        creator = RecordingCreator()
+        async with make_harness(
+            binding=binding, identity_authority=core, approvals=creator, per_sandbox_runners=2
+        ) as h:
+            monkeypatch.setattr(h.substrate, "suspend", failed_suspend)
+            first, approval_id = await pause_for_approval(h, creator, "resume-flag-off")
+            key = thread_key(first)
+            paused = route(h, key)
+            paused_runner = runner_at(h, paused)
+            paused_runner.session_status = SessionStatus.AWAITING_APPROVAL.value
+            assert recorded(paused)[0] == "none"
+
+            resumed = resume_of(approval_id, "resume-flag-off")
+            await process(h, resumed)
+
+            assert len(h.fake_k8s.claim_envs) == 1, "a flag-off resume replaced the live route"
+            assert route(h, key).claim_name == paused.claim_name
+            assert paused_runner.opened == [first.text, resumed.text]
+            assert await is_done(h, resumed)
+
+    asyncio.run(run())
+
+
+# -- 17: the same requester, idle past the token's hour --------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("idle_s", "replaced"),
+    [(_REQUESTER_TTL_S + 120.0, True), (120.0, False)],
+    ids=["past-the-hour", "control-within-the-hour"],
+)
+def test_the_same_requester_idle_past_the_token_hour_gets_a_new_sandbox(
+    make_harness, monkeypatch: pytest.MonkeyPatch, idle_s: float, replaced: bool
+) -> None:
+    """@spec CONNECTOR-REQUESTER-3: a requester token never outlives its hour.
+
+    Alice's turn completes, then the controlled clock passes her cct's expiry
+    by two minutes. Her next message on the same thread is a new claim whose
+    cct names Alice with an expiry after the new now; the expired route is not
+    adopted. Control: two minutes later the token still covers the turn and
+    the warm route is adopted.
+    """
+    require_execution_interface()
+    require_requester_interface()
+    clock = install_clock(monkeypatch)
+
+    async def run() -> None:
+        binding, alice, _bob, core = parties()
+        async with make_harness(
+            binding=binding, identity_authority=core, per_sandbox_runners=2
+        ) as h:
+            first = qevent("alice one", thread="idle-hour")
+            key = thread_key(first)
+            await process(h, first)
+            old = route(h, key)
+            old_claims = cct_claims(cct_of(h.fake_k8s.claim_envs[0]))
+            assert recorded(old) == (requester_digest(alice), old_claims["exp"])
+
+            clock.advance(idle_s)
+            now = int(clock.time())
+            assert (old_claims["exp"] < now) is replaced
+            second = qevent("alice two", thread="idle-hour")
+            await process(h, second)
+
+            envs = h.fake_k8s.claim_envs
+            if replaced:
+                assert len(envs) == 2, "a route whose requester token expired was adopted"
+                token = cct_of(envs[1])
+                claims = cct_claims(token)
+                assert claims["principal"] == principal_dict(alice)
+                assert claims["exp"] > now
+                assert_signed_by(token, binding.signing_key)
+                assert binding.minter_runs[-1].cct == token
+                new = route(h, key)
+                assert new.claim_name != old.claim_name
+                assert recorded(new) == (requester_digest(alice), claims["exp"])
+                assert runner_at(h, old).opened == ["alice one"]
+                assert runner_at(h, new).opened == ["alice two"]
+            else:
+                assert len(envs) == 1, "a route whose token still covers the turn was replaced"
+                assert route(h, key).claim_name == old.claim_name
+                assert runner_at(h, old).opened == ["alice one", "alice two"]
+            assert all_steers(h) == []
+            assert await is_done(h, second)
+
+    asyncio.run(run())
+
+
+# -- 18: a sufficient state token never excuses a short caller token -------------------------
+
+
+@pytest.mark.parametrize(
+    ("caller_left_s", "replaced"),
+    [(120, True), (3000, False)],
+    ids=["caller-token-too-short", "control-caller-token-covers"],
+)
+def test_a_warm_route_whose_caller_token_cannot_cover_the_turn_is_replaced(
+    make_harness, caller_left_s: int, replaced: bool
+) -> None:
+    """@spec CONNECTOR-REQUESTER-3: the caller expiry is compared explicitly.
+
+    Alice's live route is rewritten as a worker records it: her digest, a
+    state token valid for a day, and a caller token with ``caller_left_s``
+    left. Her next turn needs the 600 s runner bound plus the 60 s grace. With
+    120 s left the route is replaced through the handoff, a fresh claim whose
+    cct names Alice. Control: with 3000 s left the warm route is adopted.
+    """
+    require_execution_interface()
+    require_requester_interface()
+
+    async def run() -> None:
+        binding, alice, _bob, core = parties()
+        async with make_harness(
+            binding=binding, identity_authority=core, per_sandbox_runners=2
+        ) as h:
+            first = qevent("alice one", thread="caller-window")
+            key = thread_key(first)
+            await process(h, first)
+            old = route(h, key)
+
+            now = int(time.time())
+            payload = route_payload(h, key)
+            assert payload["caller_requester"] == requester_digest(alice)
+            payload["state_token_exp"] = now + 86_400
+            payload["caller_token_exp"] = now + caller_left_s
+            write_route_payload(h, key, payload)
+            warm = route(h, key)
+            assert warm.claim_name == old.claim_name
+            assert warm.state_token_exp == now + 86_400
+            assert recorded(warm) == (requester_digest(alice), now + caller_left_s)
+
+            second = qevent("alice two", thread="caller-window")
+            await process(h, second)
+
+            envs = h.fake_k8s.claim_envs
+            if replaced:
+                assert len(envs) == 2, "a caller token too short for the turn was adopted"
+                token = cct_of(envs[1])
+                claims = cct_claims(token)
+                assert claims["principal"] == principal_dict(alice)
+                assert claims["exp"] > now + caller_left_s
+                assert binding.minter_runs[-1].cct == token
+                new = route(h, key)
+                assert new.claim_name != old.claim_name
+                assert recorded(new) == (requester_digest(alice), claims["exp"])
+                assert runner_at(h, old).opened == ["alice one"]
+                assert runner_at(h, new).opened == ["alice two"]
+            else:
+                assert len(envs) == 1, "a caller token that covers the turn was replaced"
+                assert route(h, key).claim_name == old.claim_name
+                assert runner_at(h, old).opened == ["alice one", "alice two"]
+            assert all_steers(h) == []
+            assert await is_done(h, second)
 
     asyncio.run(run())
