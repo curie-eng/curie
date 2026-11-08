@@ -1114,8 +1114,8 @@ async def _process_event(
         # message text, so kernel rule 3 stands -- may not simply route: the
         # ordinary path would STEER into a retained live turn, which is right
         # for a follow-up and wrong for a retry of the same event. Placed
-        # before the first attempt. A watched predecessor must quiesce before
-        # its side-effect escalation can settle and remove the recovery watch.
+        # before the first attempt. Maintenance retains the recovery watch
+        # if a side-effect escalation settles before its predecessor quiesces.
         reclaim_preflight_pending = (
             claim._is_fenced(lease) and lease is not None and lease.generation > 1
         )
@@ -1275,6 +1275,9 @@ async def _process_event(
                     memory_grant=memory_grant,
                     channel_read_grant=channel_read_grant,
                 )
+            except failures.PriorSideEffectObserved:
+                await halt_prior_side_effect()
+                return
             except failures._WorkItemDeferred:
                 return
             except failures.SweepClaimGone as exc:

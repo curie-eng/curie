@@ -1,5 +1,5 @@
 {
-  "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "seed_range": [0, 32],
   "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
   "agent": "acme-dev",
   "connector": "reviewer",
