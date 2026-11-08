@@ -308,7 +308,8 @@ def test_a_tool_error_result_reads_refused_with_its_code() -> None:
         text = _one_turn(session, _directive("weather", "refuse", "{}"))
 
     assert _lines(text) == [
-        f"connector-tool weather/refuse: refused not_authorized caller={_fingerprint(_CALLER_VALUE)}"
+        "connector-tool weather/refuse: refused not_authorized "
+        f"caller={_fingerprint(_CALLER_VALUE)}"
     ]
     assert stub.calls == [("refuse", {})]
 
