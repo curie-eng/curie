@@ -155,7 +155,10 @@ tools/factory-e2e/tests/test_tls_code_host.py
 tools/fix-pin-ci/tests/test_fix_pin_ci.py
 tools/helm-ci-gate/tests/test_decide.py
 tools/identity-e2e/tests/test_harness.py
+tools/identity-e2e/tests/test_human_restricted_connector.py
+tools/identity-e2e/tests/test_identity_compose.py
 tools/identity-e2e/tests/test_provider.py
+tools/identity-e2e/tests/test_reference_bundle.py
 tools/identity-e2e/tests/test_requester_claim_checks.py
 tools/identity-e2e/tests/test_requester_handoff_checks.py
 tools/p0-closes-ci/tests/test_p0_closes_ci.py
