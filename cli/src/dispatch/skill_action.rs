@@ -105,6 +105,7 @@ pub(super) async fn run(action: SkillAction) -> Result<()> {
         SkillAction::Hook { action } => match action {
             SkillHookAction::Schedule => Err(commands::skill_hook_record_unavailable("schedule")),
             SkillHookAction::Record => Err(commands::skill_hook_record_unavailable("record")),
+            SkillHookAction::WakeKey { .. } => Err(commands::skill_hook_wake_key_unavailable()),
             SkillHookAction::Fire {
                 name,
                 plugin_dir,

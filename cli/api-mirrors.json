@@ -564,6 +564,16 @@
       "struct": "RemediationVerifierRunOut",
       "schema": "RemediationVerifierRunOut",
       "omissions": []
+    },
+    {
+      "struct": "HookWakeSecret",
+      "schema": "HookWakeSecretOut",
+      "omissions": []
+    },
+    {
+      "struct": "HookWakeRotation",
+      "schema": "HookWakeRotationOut",
+      "omissions": []
     }
   ],
   "non_mirrors": [

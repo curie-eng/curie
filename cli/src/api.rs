@@ -989,6 +989,27 @@ pub struct HookFireRecord {
     pub ended_at: Option<String>,
 }
 
+/// `GET /agents/{agent_id}/hooks/{hook}/wake-secret` (`HookWakeSecretOut`).
+///
+/// No `Debug`: the secret is printed only by the read command's success path.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HookWakeSecret {
+    pub agent_id: String,
+    pub hook: String,
+    pub generation: u64,
+    pub secret: String,
+}
+
+/// `POST /agents/{agent_id}/hooks/{hook}/wake-secret/rotate` (`HookWakeRotationOut`).
+///
+/// Unknown response fields, including a secret, are ignored and never displayed.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HookWakeRotation {
+    pub agent_id: String,
+    pub hook: String,
+    pub generation: u64,
+}
+
 /// Provenance nested on ``MemoryEntryOut`` (`MemoryProvenanceOut`).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct MemoryProvenance {
@@ -2352,6 +2373,86 @@ fn is_unrouted(status: reqwest::StatusCode, body: &str) -> bool {
             .is_some_and(|d| d == "Not Found")
 }
 
+/// The wake-key `detail` token when it is one of the contract's reasons.
+/// Any other body, including a secret field, is dropped.
+fn allowlisted_wake_reason(body: &str) -> Option<&'static str> {
+    let detail = api_detail_reason(body)?;
+    Some(match detail.as_str() {
+        "wake_query_forbidden" => "wake_query_forbidden",
+        "wake_body_invalid" => "wake_body_invalid",
+        "wake_not_declared" => "wake_not_declared",
+        "wake_declaration_unavailable" => "wake_declaration_unavailable",
+        "wake_source_not_ordinary" => "wake_source_not_ordinary",
+        "authority_unavailable" => "authority_unavailable",
+        "wake_generation_exhausted" => "wake_generation_exhausted",
+        _ => return None,
+    })
+}
+
+const WAKE_KEY_API_KEY_FIX: &str =
+    "verify --api-key or CURIE_API_KEY matches the selected platform API";
+
+/// Map one wake-key refusal onto the CLI exit class. `reason` is an allowlisted
+/// token or absent. The message names that token and the fix. It never includes
+/// the response body.
+fn wake_key_refusal(
+    what: &str,
+    status: reqwest::StatusCode,
+    reason: Option<&str>,
+) -> anyhow::Error {
+    use crate::exit::CliError;
+    use reqwest::StatusCode;
+
+    let error = match (status, reason) {
+        (StatusCode::UNAUTHORIZED, _) => {
+            CliError::failure(format!("{what} failed with 401: {WAKE_KEY_API_KEY_FIX}"))
+                .with_fix(WAKE_KEY_API_KEY_FIX)
+        }
+        (StatusCode::NOT_FOUND, Some("wake_not_declared")) => CliError::failure(format!(
+            "{what} failed: wake_not_declared. The hook needs wake: true in the in-force bundle."
+        ))
+        .with_fix("set wake: true on the webhook in the in-force bundle and deploy it"),
+        (StatusCode::CONFLICT, Some("wake_source_not_ordinary")) => CliError::failure(format!(
+            "{what} failed: wake_source_not_ordinary. The cause is a source policy, unresolved \
+             source history, a remediation policy, a partition, or a source binding."
+        ))
+        .with_fix(
+            "remove the source policy, unresolved source history, remediation policy, partition, \
+             or source binding, then retry",
+        ),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("authority_unavailable")) => CliError::transient(
+            format!("{what} failed: authority_unavailable. The metadata authority is unavailable."),
+        )
+        .with_fix("retry once the metadata authority is available"),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("wake_generation_exhausted")) => {
+            CliError::failure(format!(
+                "{what} failed: wake_generation_exhausted. The wake key generation cannot \
+                 increase further, and the key was not rotated."
+            ))
+            .with_fix("keep the current key; another rotation cannot mint a generation")
+        }
+        (StatusCode::SERVICE_UNAVAILABLE, Some("wake_declaration_unavailable")) => {
+            CliError::failure(format!(
+                "{what} failed: wake_declaration_unavailable. The stored bundle could not be read."
+            ))
+            .with_fix("redeploy the bundle so the in-force wake declaration can be read")
+        }
+        (StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY, reason) => {
+            let detail = reason.unwrap_or("rejected");
+            CliError::usage(format!("{what} failed with {status}: {detail}"))
+                .with_fix("send the wake-key request with no query string and no body")
+        }
+        _ => {
+            let message = match reason {
+                Some(reason) => format!("{what} failed with {status}: {reason}"),
+                None => format!("{what} failed with {status}"),
+            };
+            CliError::failure(message)
+        }
+    };
+    anyhow::Error::from(error)
+}
+
 /// Validate one trace id as the single safe path segment accepted by the API.
 ///
 /// Keeping this byte-for-byte shape at the CLI boundary means a malformed id
@@ -2386,6 +2487,36 @@ pub(crate) fn hook_fire_path(agent: &str, name: &str) -> String {
 /// `/agents/{agent}/hooks/{name}/runs/{run_id}`.
 pub(crate) fn hook_run_path(agent: &str, name: &str, run_id: &str) -> String {
     hook_agent_path(agent, name, &["runs", run_id])
+}
+
+/// The percent-encoded request path for reading a targetless wake key:
+/// `/agents/{agent_id}/hooks/{hook}/wake-secret`.
+pub(crate) fn hook_wake_secret_path(agent_id: &str, hook: &str) -> String {
+    hook_agent_path(agent_id, hook, &["wake-secret"])
+}
+
+/// The percent-encoded request path for rotating a targetless wake key:
+/// `/agents/{agent_id}/hooks/{hook}/wake-secret/rotate`.
+pub(crate) fn hook_wake_secret_rotate_path(agent_id: &str, hook: &str) -> String {
+    hook_agent_path(agent_id, hook, &["wake-secret", "rotate"])
+}
+
+/// The deploy receipt route for one targetless wake: `/hooks/{agent_id}/{hook}/wake`.
+///
+/// This is the platform route, not the manifest webhook path and not an absolute URL.
+pub(crate) fn hook_wake_route(agent_id: &str, hook: &str) -> String {
+    let mut url = reqwest::Url::parse("http://hook.invalid").expect("static URL base parses");
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .expect("static URL base accepts path segments");
+        segments
+            .push("hooks")
+            .push(agent_id)
+            .push(hook)
+            .push("wake");
+    }
+    url.path().to_string()
 }
 
 /// Percent-encode an agent hook path by pushing each segment through a
@@ -2689,6 +2820,85 @@ impl ApiClient {
             .await
             .context("decoding hook secret response")?;
         required_response_string(&body, "secret", "hook secret response")
+    }
+
+    /// Read the current targetless wake key.
+    ///
+    /// `GET /agents/{agent_id}/hooks/{hook}/wake-secret` with no query and no body.
+    /// The secret stays inside the returned value; this method does not log it.
+    pub async fn read_hook_wake_key(&self, agent_id: &str, hook: &str) -> Result<HookWakeSecret> {
+        let url = reqwest::Url::parse(&format!(
+            "{}{}",
+            self.base_url,
+            hook_wake_secret_path(agent_id, hook)
+        ))?;
+        let resp = self
+            .send_request(
+                self.http.get(url).header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/hooks/{hook}/wake-secret",
+            )
+            .await?;
+        Self::expect_wake_ok(resp, "reading wake key")
+            .await?
+            .json()
+            .await
+            .context("decoding wake key")
+    }
+
+    /// Rotate the targetless wake key.
+    ///
+    /// `POST /agents/{agent_id}/hooks/{hook}/wake-secret/rotate` with no query and
+    /// zero body bytes. The decoded value has no secret field, so a secret on
+    /// the response is dropped and not logged.
+    pub async fn rotate_hook_wake_key(
+        &self,
+        agent_id: &str,
+        hook: &str,
+    ) -> Result<HookWakeRotation> {
+        let url = reqwest::Url::parse(&format!(
+            "{}{}",
+            self.base_url,
+            hook_wake_secret_rotate_path(agent_id, hook)
+        ))?;
+        let resp = self
+            .send_request(
+                self.http
+                    .post(url)
+                    .header("X-API-Key", &self.api_key)
+                    .body(Vec::<u8>::new()),
+                "POST /agents/{id}/hooks/{hook}/wake-secret/rotate",
+            )
+            .await?;
+        Self::expect_wake_ok(resp, "rotating wake key")
+            .await?
+            .json()
+            .await
+            .context("decoding wake key rotation")
+    }
+
+    /// A non-success wake-key response is classified from its status and an
+    /// allowlisted `detail` token. The raw body is not copied into the error,
+    /// so a secret field on the refusal cannot reach the terminal.
+    async fn expect_wake_ok(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
+        if resp.status().is_success() {
+            return Ok(resp);
+        }
+        let status = resp.status();
+        if let Some(refusal) = redirect_refusal(status, resp.headers()) {
+            bail!("{what} failed: {refusal}");
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if is_unrouted(status, &body) {
+            bail!(
+                "{what} failed: this platform release does not have that endpoint, so it is \
+                 older than this CLI. Upgrade the release, or use a CLI matching it."
+            );
+        }
+        Err(wake_key_refusal(
+            what,
+            status,
+            allowlisted_wake_reason(&body),
+        ))
     }
 
     /// Poll one opaque disconnected cluster-message reply bucket.

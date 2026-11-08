@@ -91,6 +91,15 @@ pub fn skill_hook_record_unavailable(verb: &str) -> anyhow::Error {
     crate::exit::unsupported(verb, HOOK_RECORD_REASON, alternative)
 }
 
+/// `skill hook wake-key` and `skill hook wake-key rotate` (ADR 0274).
+pub fn skill_hook_wake_key_unavailable() -> anyhow::Error {
+    crate::exit::unsupported(
+        "wake-key",
+        "the skill tier has no platform API for a durable wake key",
+        "use `curie local hook wake-key` or `curie cluster hook wake-key`",
+    )
+}
+
 /// `skill observability runs|run|metrics`: understood, but unavailable here.
 ///
 /// A skill runner can emit OTLP when explicitly wired, but it does not host the

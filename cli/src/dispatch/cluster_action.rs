@@ -1521,7 +1521,8 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
         ClusterAction::Hook { action, conn } => {
             let dry_run = match &action {
                 ClusterHookAction::Fire { dry_run, .. }
-                | ClusterHookAction::Record { dry_run, .. } => *dry_run,
+                | ClusterHookAction::Record { dry_run, .. }
+                | ClusterHookAction::WakeKey { dry_run, .. } => *dry_run,
             };
             let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
                 conn.api_url,
@@ -1565,6 +1566,31 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     })
                     .await?,
                 ),
+                ClusterHookAction::WakeKey {
+                    command,
+                    agent,
+                    name,
+                    dry_run,
+                } => {
+                    let (agent, name, rotate) = match command {
+                        Some(ClusterWakeKeyCommand::Rotate { agent, name }) => (agent, name, true),
+                        None => {
+                            let (agent, name) = commands::require_wake_key_target(agent, name)?;
+                            (agent, name, false)
+                        }
+                    };
+                    emit(
+                        commands::hook_wake_key(commands::HookWakeKeyOpts {
+                            api_url,
+                            api_key,
+                            agent,
+                            name,
+                            rotate,
+                            dry_run,
+                        })
+                        .await?,
+                    )
+                }
             }
         }
         ClusterAction::Delete {

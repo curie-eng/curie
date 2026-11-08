@@ -851,6 +851,36 @@
               "about": "Not available at this tier: there is no hook run record",
               "hidden": false,
               "name": "record"
+            },
+            {
+              "about": "Not available at this tier: there is no durable wake key",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Trigger name",
+                  "id": "name",
+                  "positional": true,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "wake-key",
+              "subcommands": [
+                {
+                  "about": "Not available at this tier: there is no durable wake key",
+                  "args": [
+                    {
+                      "global": false,
+                      "help": "Trigger name",
+                      "id": "name",
+                      "positional": true,
+                      "required": true
+                    }
+                  ],
+                  "hidden": false,
+                  "name": "rotate"
+                }
+              ]
             }
           ]
         },
@@ -4358,6 +4388,84 @@
               ],
               "hidden": false,
               "name": "record"
+            },
+            {
+              "about": "Read or rotate the targetless wake key for one named webhook",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Trigger name on the in-force bundle",
+                  "id": "name",
+                  "positional": true,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": true,
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": true,
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": true,
+                  "help": "Print the route and the word redacted, and exit without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "wake-key",
+              "subcommands": [
+                {
+                  "about": "Rotate the wake key. The new secret is not printed",
+                  "args": [
+                    {
+                      "global": false,
+                      "help": "Agent name or id",
+                      "id": "agent",
+                      "positional": true,
+                      "required": true
+                    },
+                    {
+                      "global": false,
+                      "help": "Trigger name on the in-force bundle",
+                      "id": "name",
+                      "positional": true,
+                      "required": true
+                    }
+                  ],
+                  "hidden": false,
+                  "name": "rotate"
+                }
+              ]
             }
           ]
         },
@@ -7843,6 +7951,62 @@
               ],
               "hidden": false,
               "name": "record"
+            },
+            {
+              "about": "Read or rotate the targetless wake key for one named webhook",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Trigger name on the in-force bundle",
+                  "id": "name",
+                  "positional": true,
+                  "required": false
+                },
+                {
+                  "global": true,
+                  "help": "Print the route and the word redacted, and exit without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "wake-key",
+              "subcommands": [
+                {
+                  "about": "Rotate the wake key. The new secret is not printed",
+                  "args": [
+                    {
+                      "global": false,
+                      "help": "Agent name or id",
+                      "id": "agent",
+                      "positional": true,
+                      "required": true
+                    },
+                    {
+                      "global": false,
+                      "help": "Trigger name on the in-force bundle",
+                      "id": "name",
+                      "positional": true,
+                      "required": true
+                    }
+                  ],
+                  "hidden": false,
+                  "name": "rotate"
+                }
+              ]
             }
           ]
         },

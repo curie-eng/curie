@@ -384,6 +384,33 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                 })
                 .await?,
             ),
+            LocalHookAction::WakeKey {
+                command,
+                agent,
+                name,
+                api_url,
+                api_key,
+                dry_run,
+            } => {
+                let (agent, name, rotate) = match command {
+                    Some(LocalWakeKeyCommand::Rotate { agent, name }) => (agent, name, true),
+                    None => {
+                        let (agent, name) = commands::require_wake_key_target(agent, name)?;
+                        (agent, name, false)
+                    }
+                };
+                emit(
+                    commands::hook_wake_key(commands::HookWakeKeyOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        name,
+                        rotate,
+                        dry_run,
+                    })
+                    .await?,
+                )
+            }
         },
         LocalAction::Memory {
             target,

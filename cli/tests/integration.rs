@@ -191,6 +191,7 @@ mod unique_stream;
 mod upgrade_drill;
 mod valkey_required_gate;
 mod verify_fix_pin;
+mod wake_operator;
 mod work_items;
 mod worker_claims;
 
