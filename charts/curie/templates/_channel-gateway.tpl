@@ -1,7 +1,8 @@
 {{- define "curie.env.channelGateway" -}}
 {{- $root := .root -}}
 {{- if or $root.Values.channelGateway.deploy $root.Values.channelGateway.url -}}
-{{- $scheme := ternary "http" "https" $root.Values.channelGateway.allowInsecure -}}
+{{- $http := and $root.Values.channelGateway.allowInsecure (not $root.Values.channelGateway.tlsSecret) -}}
+{{- $scheme := ternary "http" "https" $http -}}
 - name: CURIE_CHANNEL_GATEWAY_URL
   value: {{ $root.Values.channelGateway.url | default (printf "%s://%s-channel-gateway:%v" $scheme (include "curie.fullname" $root) $root.Values.channelGateway.port) | quote }}
 - name: CURIE_CHANNEL_GATEWAY_TOKEN

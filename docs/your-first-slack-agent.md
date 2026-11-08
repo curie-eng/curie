@@ -9,8 +9,8 @@ The setup below creates and connects your Slack app.
 
 From nothing to a bot that answers in Slack and redeploys itself when you push.
 
-Four commands do the work. Everything else on this page is the accounts you
-need first and the seven mistakes that actually cost people time.
+Prepare the cluster, provider gateway and accounts first, then use the commands
+below to deploy the agent and connect Slack.
 
 ---
 
@@ -21,6 +21,7 @@ need first and the seven mistakes that actually cost people time.
 | **Model credential** | [console.anthropic.com](https://console.anthropic.com/) | The agent's brain |
 | **Docker** | [get-docker.sh](https://docs.docker.com/get-docker/) | Runs the agent locally |
 | **A cluster** | k3s on one small VM is enough | Only needed for the Slack step |
+| **Provider gateway** | [Gateway setup](../apps/dispatcher/README.md#provider-gateway) | Authenticated provider access over TLS |
 | **A Slack app** | [api.slack.com/apps](https://api.slack.com/apps) → *From a manifest* | Two tokens, below |
 
 A single-node k3s box with **no inbound ports** serves a Slack bot fine —
@@ -86,6 +87,12 @@ Invite the bot to your channel, and copy the **channel ID** — right-click the
 channel → *View channel details*, it's at the bottom and looks like `C0…`.
 
 ## 3. Put it on the cluster (10 min)
+
+Configure the [provider gateway](../apps/dispatcher/README.md#provider-gateway)
+and pass its Helm values with `--values-file` when running the install below.
+The gateway requires a trusted TLS certificate and separate API and worker
+caller credentials; its setup guide also covers an external gateway. The
+dispatcher and gateway hold Slack tokens.
 
 ```bash
 CURIE_CONTEXT="$(kubectl config current-context)"
