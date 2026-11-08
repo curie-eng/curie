@@ -1,0 +1,27 @@
+deploy: null
+replayStorageSize: 1Gi
+replayStorageClass: ''
+port: 8081
+url: ''
+allowInsecure: false
+tlsSecret: ''
+apiToken: null
+workerToken: null
+groupCacheTtlSeconds: 60
+readinessProbe:
+  initialDelaySeconds: 1
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 3
+livenessProbe:
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi

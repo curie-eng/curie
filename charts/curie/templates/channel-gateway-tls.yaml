@@ -1,0 +1,25 @@
+{{- $gateway := include "curie.channelGateway.values" . | fromYaml }}
+{{- if and (eq (include "curie.channelGateway.deploy" .) "true") (not $gateway.tlsSecret) (not $gateway.allowInsecure) }}
+{{- $name := include "curie.channelGateway.tlsSecret" . }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $name | default dict }}
+{{- $data := $existing.data | default dict }}
+{{- if not $data }}
+{{- $host := printf "%s-channel-gateway" (include "curie.fullname" .) }}
+{{- $ca := genCA (printf "%s-ca" $host) 3650 }}
+{{- $cert := genSignedCert $host nil (list $host (printf "%s.%s" $host .Release.Namespace) (printf "%s.%s.svc" $host .Release.Namespace) (printf "%s.%s.svc.cluster.local" $host .Release.Namespace)) 365 $ca }}
+{{- $data = dict "ca.crt" ($ca.Cert | b64enc) "tls.crt" ($cert.Cert | b64enc) "tls.key" ($cert.Key | b64enc) }}
+{{- else }}
+{{- range $key := list "ca.crt" "tls.crt" "tls.key" }}
+{{- if not (index $data $key) }}{{- fail "channel gateway TLS Secret is incomplete: restore ca.crt, tls.crt and tls.key, or rotate it as documented in the chart upgrade guide" }}{{- end }}
+{{- end }}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+type: kubernetes.io/tls
+data:
+  {{- toYaml $data | nindent 2 }}
+{{- end }}

@@ -2349,14 +2349,54 @@ built-in cluster-message reply adapter), a missing token reference, `default`
 configured twice or not at all, and an `extraEnv` entry naming any of these
 variables. `charts/curie/ci/slack-identities-assertions.sh` pins all of it.
 
-Enable `channelGateway.deploy` with a trusted `channelGateway.tlsSecret`, or
-explicitly set `channelGateway.allowInsecure` for a trusted development network.
-An external gateway uses `channelGateway.url`. Configure separate
-`channelGateway.apiToken` and `channelGateway.workerToken`; the gateway owns
-Slack reads, file fetches, sender lookup and replies. Its single replica and
-Recreate strategy keep the persistent SQLite replay ledger under one owner.
-Existing installs must remove every Slack token from API and worker before
-upgrading; both applications refuse to boot with one present.
+### Channel gateway upgrade
+
+An existing Slack install upgrades with the same values file and Secret objects.
+`channelGateway.deploy: null` automatically deploys the gateway when Slack is
+configured and `channelGateway.url` is empty. Setting `deploy: false` explicitly
+requires an external URL; the render refuses otherwise and names both fixes.
+Installs without Slack do not deploy a gateway automatically.
+
+The chart moves Slack bot-token references from the API and worker into the
+gateway, preserving their Secret names and keys. The dispatcher retains its
+intake credentials. The API and worker receive distinct caller credentials,
+generated and persisted in the chart Secret, and use verified internal TLS.
+No operator token changes are needed for a chart-managed install. Custom launchers
+must remove raw Slack tokens from API and worker environments because both
+applications now reject them. This is a runtime credential-custody change.
+
+With no `channelGateway.tlsSecret`, Helm creates
+`<fullname>-channel-gateway-tls` containing `ca.crt`, `tls.crt` and `tls.key`.
+The server certificate covers this release's service DNS names, lasts one year,
+and is signed by a CA valid for ten years. Helm `lookup` preserves the complete
+Secret across upgrades. Use a Helm client with Kubernetes API access; offline
+renderers cannot persist generated certificates and must instead provide a
+managed `channelGateway.tlsSecret` containing all three keys. API and worker
+mount only `ca.crt`; the gateway alone mounts the server key. The added CA is
+trusted only by gateway transports, including file downloads.
+
+Rotate before the server certificate expires. For operator-managed certificates,
+replace the named Secret's three keys with a matching CA, certificate and key.
+For chart-managed certificates, schedule a brief Slack delivery maintenance
+window, delete only this release's gateway TLS Secret, and run `helm upgrade`
+with the unchanged values file so Helm generates a new CA and certificate.
+Restart the gateway, API and worker Deployments together so all use the new
+certificate and trust bundle, then verify delivery. Rotation is explicit;
+ordinary upgrades never silently rotate the certificate. Do not delete the
+replay PVC during rotation.
+
+An external gateway uses `channelGateway.url`; configure separate
+`channelGateway.apiToken` and `channelGateway.workerToken`. For a private CA,
+`channelGateway.tlsSecret` supplies `ca.crt` to callers. For a chart-deployed
+gateway it also supplies `tls.crt` and `tls.key`. Explicit
+`channelGateway.allowInsecure: true` permits HTTP on a development network.
+A supplied TLS Secret always selects HTTPS. Its single replica and Recreate
+strategy keep the persistent SQLite replay ledger under one owner.
+
+Protected-worker provisioners must migrate `process.json` v1 once before
+starting the upgraded image; see the
+[one-shot process migration](../../packages/channel-gateway/README.md#protected-worker-process-files).
+The runtime continues rejecting v1; there is no dual-version startup path.
 
 A plain `curie cluster up` re-supplies a recorded list along with the
 `dispatcher.slack` token fields, so an operator does not need to pass it again
