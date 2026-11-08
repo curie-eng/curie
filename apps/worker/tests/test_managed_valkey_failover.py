@@ -227,8 +227,12 @@ async def _failover(servers: tuple[redis.Redis, redis.Redis, str, str]) -> None:
     task = None
     try:
         # The proxy consumes the same Settings DSN as API-issued connector grants.
-        assert await asyncio.to_thread(_set_nx_ex, settings.valkey_dsn(), "test:grant", 60)
-        assert not await asyncio.to_thread(_set_nx_ex, settings.valkey_dsn(), "test:grant", 60)
+        assert (
+            await asyncio.to_thread(_set_nx_ex, settings.valkey_dsn(), "test:grant", 60) == b"+OK"
+        )
+        assert (
+            await asyncio.to_thread(_set_nx_ex, settings.valkey_dsn(), "test:grant", 60) == b"$-1"
+        )
         await worker.xgroup_create(stream, "group", id="0", mkstream=True)
         await ClusterMessageReplyStore(api, ttl_s=60, max_events=10, max_bytes=10000).append(
             ref,
