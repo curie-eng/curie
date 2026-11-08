@@ -465,9 +465,9 @@ where
     D: serde::Deserializer<'de>,
 {
     let value = Option::<u64>::deserialize(deserializer)?;
-    if value == Some(0) {
+    if value.is_some_and(|duration| !(1..=315_360_000).contains(&duration)) {
         return Err(serde::de::Error::custom(
-            "expires_in_seconds must be positive or null",
+            "expires_in_seconds must be between 1 and 315360000, or null",
         ));
     }
     Ok(Some(value))

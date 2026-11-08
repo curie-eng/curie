@@ -166,7 +166,7 @@ def _parse_approval_targets(
         return None
 
     duration = binding.get("expires_in_seconds")
-    if duration is not None and (type(duration) is not int or duration <= 0):
+    if duration is not None and (type(duration) is not int or not 0 < duration <= 315_360_000):
         return None
 
     resolution = binding.get("resolution")

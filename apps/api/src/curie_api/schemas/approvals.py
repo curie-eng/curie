@@ -253,7 +253,7 @@ class ApprovalRouteBinding(_StoredWithoutNulls):
     resolution: ApprovalResolutionTarget | ApprovalRequestingSurfaceTarget
     notification: ApprovalNotificationTarget | None = None
     approvers: ApprovalApprovers | None = None
-    expires_in_seconds: int | None = Field(default=None, strict=True, gt=0)
+    expires_in_seconds: int | None = Field(default=None, strict=True, gt=0, le=315_360_000)
 
     @model_validator(mode="after")
     def _emails_need_the_requesting_surface(self) -> "ApprovalRouteBinding":

@@ -246,9 +246,10 @@ curie local approvals my-agent --routes-from approval-routes.json
 curie local approvals my-agent --list-routes
 ```
 
-A route's optional `expires_in_seconds` selects its decision deadline. A positive
-integer chooses that duration; explicit JSON null chooses no deadline. Omit the
-field to keep the producer's duration, including its existing null meaning.
+A route's optional `expires_in_seconds` selects its decision deadline. An integer
+from 1 to 315,360,000 seconds (ten years) chooses that duration; explicit JSON null
+chooses no deadline. Omit the field to keep the producer's duration, including its
+existing null meaning.
 Session requests default to 24 hours when the route has no override. Booleans,
 zero, negative values and fractional numbers are refused. The API freezes the
 chosen deadline at creation, so retries and later route edits do not move it.
