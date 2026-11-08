@@ -441,6 +441,40 @@ def connector_tool_turn(last: str) -> list[Any]:
     return [_assistant(TextBlock(text="Calling the connector tool")), call]
 
 
+# ``[fake:gated-connector-tool <connector> <tool> <json-object>]`` (ADR 0271)
+# emits one ToolUseBlock named ``mcp__<connector>__<tool>`` carrying exactly the
+# parsed object, so the permission gate runs over it like any scripted call.
+# It dials nothing; the approved call is made later with ``[fake:connector-tool]``.
+# A directive that does not parse falls back to the default turn.
+GATED_CONNECTOR_TOOL_MARKER = "[fake:gated-connector-tool"
+_GATED_CONNECTOR_TOOL_RE = re.compile(r"\[fake:gated-connector-tool (\S+) (\S+) (\{.*\})\]")
+
+
+def _parse_gated_connector_tool(last: str) -> tuple[str, dict[str, Any]] | None:
+    match = _GATED_CONNECTOR_TOOL_RE.search(last)
+    if not match:
+        return None
+    try:
+        args = json.loads(match.group(3))
+    except ValueError:
+        return None
+    if not isinstance(args, dict):
+        return None
+    return f"mcp__{match.group(1)}__{match.group(2)}", args
+
+
+def gated_connector_tool_turn(name: str, args: dict[str, Any]) -> list[Any]:
+    """A turn that attempts one connector tool call and never dials it."""
+
+    return [
+        _assistant(TextBlock(text="Attempting the connector tool")),
+        _assistant(ToolUseBlock(id="t1", name=name, input=args)),
+        _tool_result("t1", "ok"),
+        _assistant(TextBlock(text="all done"), usage={"input_tokens": 20, "output_tokens": 8}),
+        _result(text="all done", usage={"input_tokens": 20, "output_tokens": 8}),
+    ]
+
+
 async def _dial_connector_tool(
     config: Mapping[str, Any], tool: str, args: Mapping[str, Any], timeout: float
 ) -> tuple[bool, str]:
@@ -622,6 +656,11 @@ class FakeModelSession:
             return reversible_turn()
         if PROGRESS_DEMO_MARKER in last:
             return progress_demo_turn()
+        if GATED_CONNECTOR_TOOL_MARKER in last:
+            gated = _parse_gated_connector_tool(last)
+            if gated:
+                return gated_connector_tool_turn(*gated)
+            return default_turn()
         if CONNECTOR_TOOL_MARKER in last:
             return connector_tool_turn(last)
         if CONNECTOR_CALL_MARKER in last:
