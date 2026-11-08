@@ -195,7 +195,7 @@ else
   COMPOSE_FILES=("$REPO_ROOT/compose.dev.yaml")
 fi
 # Default matches message::DEFAULT_LOCAL_STUB_PORT. Isolation sets
-# CURIE_LOCAL_STUB_PORT to the worker's rebound SLACK_API_BASE_URL port.
+# CURIE_LOCAL_STUB_PORT to the gateway's rebound SLACK_API_BASE_URL port.
 STUB_PORT="${CURIE_LOCAL_STUB_PORT:-8155}"
 # Host-network worker OTLP and Collector self-metrics. Isolation remaps the
 # published collector ports; the default matches compose.dev.yaml.

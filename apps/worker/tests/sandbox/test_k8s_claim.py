@@ -1042,6 +1042,7 @@ def test_host_credentials_are_never_written_to_the_claim(
         "CURIE_API_KEY",
         "LANGFUSE_SECRET_KEY",
         "CURIE_ADAPTER_CREDENTIALS",
+        "CURIE_CHANNEL_GATEWAY_TOKEN",
         "CURIE_SEALING_PRIVATE_KEY",
         "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
         "CURIE_CONNECTOR_CALLER_SIGNING_KEY",

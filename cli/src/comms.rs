@@ -154,7 +154,14 @@ pub fn local_connect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
             comms_compose_args(
                 o,
                 &["core", "slack"],
-                &["up", "-d", "--wait", "curie-worker", "curie-dispatcher"],
+                &[
+                    "up",
+                    "-d",
+                    "--wait",
+                    "curie-worker",
+                    "curie-channel-gateway",
+                    "curie-dispatcher",
+                ],
             ),
         )
         .with_env(env),
@@ -184,7 +191,17 @@ pub fn local_disconnect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
         crate::local::with_stack_secret_env(
             OpsCommand::new(
                 "docker",
-                comms_compose_args(o, &["core"], &["up", "-d", "--wait", "curie-worker"]),
+                comms_compose_args(
+                    o,
+                    &["core"],
+                    &[
+                        "up",
+                        "-d",
+                        "--wait",
+                        "curie-worker",
+                        "curie-channel-gateway",
+                    ],
+                ),
             )
             .with_env(worker_env),
             o.model_credentials.clone(),
@@ -239,13 +256,9 @@ struct SlackTokenConsumer {
     removed_on_disconnect: bool,
 }
 
-const SLACK_TOKEN_CONSUMERS: [SlackTokenConsumer; 3] = [
+const SLACK_TOKEN_CONSUMERS: [SlackTokenConsumer; 2] = [
     SlackTokenConsumer {
-        workload: "worker",
-        removed_on_disconnect: false,
-    },
-    SlackTokenConsumer {
-        workload: "api",
+        workload: "channel-gateway",
         removed_on_disconnect: false,
     },
     SlackTokenConsumer {
@@ -256,7 +269,7 @@ const SLACK_TOKEN_CONSUMERS: [SlackTokenConsumer; 3] = [
 
 /// The kubectl rollout commands that follow the helm upgrade so the running pods
 /// pick up the token change. Connect rolls every Slack token consumer.
-/// Disconnect rolls the worker and API; Helm removes the dispatcher when its
+/// Disconnect rolls the gateway; Helm removes the dispatcher when its
 /// `curie.dispatcher.enabled` gate goes false, so there is none to wait on.
 ///
 /// Takes a RESOLVED `ReleaseFullname` (#1533): the chart names these Deployments
@@ -624,12 +637,9 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
-                "kubectl -n acme-system rollout restart deployment/platform-curie-worker",
-                "kubectl -n acme-system rollout restart deployment/platform-curie-api",
+                "kubectl -n acme-system rollout restart deployment/platform-curie-channel-gateway",
                 "kubectl -n acme-system rollout restart deployment/platform-curie-dispatcher",
-                "kubectl -n acme-system rollout status deployment/platform-curie-worker \
-                 --timeout=120s",
-                "kubectl -n acme-system rollout status deployment/platform-curie-api \
+                "kubectl -n acme-system rollout status deployment/platform-curie-channel-gateway \
                  --timeout=120s",
                 "kubectl -n acme-system rollout status deployment/platform-curie-dispatcher \
                  --timeout=120s",
@@ -647,11 +657,8 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
-                "kubectl -n acme-system rollout restart deployment/platform-curie-worker",
-                "kubectl -n acme-system rollout restart deployment/platform-curie-api",
-                "kubectl -n acme-system rollout status deployment/platform-curie-worker \
-                 --timeout=120s",
-                "kubectl -n acme-system rollout status deployment/platform-curie-api \
+                "kubectl -n acme-system rollout restart deployment/platform-curie-channel-gateway",
+                "kubectl -n acme-system rollout status deployment/platform-curie-channel-gateway \
                  --timeout=120s",
             ]
         );
@@ -698,8 +705,8 @@ mod tests {
             assert!(
                 plan.lines
                     .iter()
-                    .any(|line| line.contains("deployment/platform-curie-api")),
-                "dry run must roll the API token consumer: {:?}",
+                    .any(|line| line.contains("deployment/platform-curie-channel-gateway")),
+                "dry run must roll the gateway token consumer: {:?}",
                 plan.lines
             );
         }
@@ -804,12 +811,10 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "kubectl -n curie rollout restart deployment/curie-worker".to_string(),
-                "kubectl -n curie rollout restart deployment/curie-api".to_string(),
+                "kubectl -n curie rollout restart deployment/curie-channel-gateway".to_string(),
                 "kubectl -n curie rollout restart deployment/curie-dispatcher".to_string(),
-                "kubectl -n curie rollout status deployment/curie-worker --timeout=120s"
+                "kubectl -n curie rollout status deployment/curie-channel-gateway --timeout=120s"
                     .to_string(),
-                "kubectl -n curie rollout status deployment/curie-api --timeout=120s".to_string(),
                 "kubectl -n curie rollout status deployment/curie-dispatcher --timeout=120s"
                     .to_string(),
             ]
@@ -823,11 +828,9 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "kubectl -n curie rollout restart deployment/curie-worker".to_string(),
-                "kubectl -n curie rollout restart deployment/curie-api".to_string(),
-                "kubectl -n curie rollout status deployment/curie-worker --timeout=120s"
+                "kubectl -n curie rollout restart deployment/curie-channel-gateway".to_string(),
+                "kubectl -n curie rollout status deployment/curie-channel-gateway --timeout=120s"
                     .to_string(),
-                "kubectl -n curie rollout status deployment/curie-api --timeout=120s".to_string(),
             ]
         );
         assert!(
@@ -963,7 +966,7 @@ mod tests {
             "COMPOSE_PROJECT_NAME=curie SLACK_API_BASE_URL= 'SLACK_APP_TOKEN=xapp-1-s***' \
              'SLACK_BOT_TOKEN=xoxb-1-s***' \
              docker compose --profile core --profile slack -p curie -f compose.dev.yaml up -d --wait \
-             curie-worker curie-dispatcher"
+             curie-worker curie-channel-gateway curie-dispatcher"
         );
         assert!(!line.contains("secretsecret"), "secret leaked: {line}");
     }
@@ -1016,7 +1019,7 @@ mod tests {
             second,
             "COMPOSE_PROJECT_NAME=curie SLACK_API_BASE_URL=http://localhost:8155/api/ \
              SLACK_BOT_TOKEN=xoxb-dev \
-             docker compose --profile core -p curie -f compose.dev.yaml up -d --wait curie-worker"
+             docker compose --profile core -p curie -f compose.dev.yaml up -d --wait curie-worker curie-channel-gateway"
         );
         assert!(
             !second.contains("curie-dispatcher"),

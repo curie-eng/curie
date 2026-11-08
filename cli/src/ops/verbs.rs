@@ -4010,7 +4010,7 @@ fn parse_slack_api_base(ok: bool, out: &str) -> SlackApiBase {
     SlackApiBase::Configured(value.to_string())
 }
 
-/// The Slack API base the release's own worker is configured with.
+/// The Slack API base the release's own channel gateway is configured with.
 ///
 /// Read from the SAME release the bot token is read from (#1030). The base used to
 /// come from `SLACK_API_BASE_URL` in the CLI's own process environment while the
@@ -4026,15 +4026,23 @@ pub async fn discover_slack_api_base_url(namespace: &str, release: &str) -> Slac
             plain("get"),
             plain("deployment"),
             plain("-l"),
-            plain(worker_deployment_selector(release)),
+            plain(component_selector(release, "channel-gateway")),
             plain("-o"),
             plain(
-                "jsonpath={range .items[*].spec.template.spec.containers[*]}                 {.env[?(@.name=='SLACK_API_BASE_URL')].value}{\"\\n\"}{end}",
+                "jsonpath={range .items[*]}gateway{\"\\n\"}{range .spec.template.spec.containers[*]}                 {.env[?(@.name=='SLACK_API_BASE_URL')].value}{\"\\n\"}{end}{end}",
             ),
         ],
     );
     match run_capture(&cmd).await {
-        Ok((ok, out, _)) => parse_slack_api_base(ok, &out),
+        Ok((ok, out, _)) => {
+            if !ok || out.lines().filter(|line| *line == "gateway").count() != 1 {
+                return SlackApiBase::Unknown;
+            }
+            match out.strip_prefix("gateway\n") {
+                Some(value) => parse_slack_api_base(true, value),
+                None => SlackApiBase::Unknown,
+            }
+        }
         Err(_) => SlackApiBase::Unknown,
     }
 }

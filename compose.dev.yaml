@@ -485,8 +485,9 @@ services:
       GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-dev-webhook-secret}
       # Provider reads authenticate to the gateway with an API-only credential.
-      CURIE_CHANNEL_GATEWAY_URL: http://host.docker.internal:8081
+      CURIE_CHANNEL_GATEWAY_URL: http://host.docker.internal:${CURIE_LOCAL_GATEWAY_PORT:-8081}
       CURIE_CHANNEL_GATEWAY_TOKEN: ${CURIE_CHANNEL_GATEWAY_API_TOKEN:-curie-dev-gateway-api}
+      CURIE_CHANNEL_GATEWAY_PORT: ${CURIE_LOCAL_GATEWAY_PORT:-8081}
       CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE: "true"
       # Single-dash defaults preserve an explicitly empty endpoint/protocol.
       # `curie local up --minimal` uses that empty value to keep the core-only
@@ -639,7 +640,7 @@ services:
       # worker's self-dial URL (#678). curie-api joins curie_runner (via its
       # network membership), so this name resolves from a spawned runner.
       - CURIE_RUNNER_API_URL=http://curie-api:8000
-      - CURIE_CHANNEL_GATEWAY_URL=http://localhost:8081
+      - CURIE_CHANNEL_GATEWAY_URL=http://localhost:${CURIE_LOCAL_GATEWAY_PORT:-8081}
       - CURIE_CHANNEL_GATEWAY_TOKEN=${CURIE_CHANNEL_GATEWAY_WORKER_TOKEN:-curie-dev-gateway-worker}
       - CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE=true
       - CURIE_ATTACHMENT_MAX_FILE_BYTES=${CURIE_ATTACHMENT_MAX_FILE_BYTES:-33554432}
@@ -752,7 +753,7 @@ services:
   # profile and disabled by default.
   curie-gateway-replay-perms:
     profiles: *core_profiles
-    image: ghcr.io/curie-eng/curie-dispatcher:latest
+    image: ${CURIE_DISPATCHER_IMAGE:-ghcr.io/curie-eng/curie-dispatcher:latest}
     user: "0:0"
     command: ["python", "-c", "import os; os.chown('/state', 1000, 1000)"]
     volumes:
@@ -760,7 +761,7 @@ services:
 
   curie-channel-gateway:
     profiles: *core_profiles
-    image: ghcr.io/curie-eng/curie-dispatcher:latest
+    image: ${CURIE_DISPATCHER_IMAGE:-ghcr.io/curie-eng/curie-dispatcher:latest}
     command: ["python", "-m", "curie_channel_gateway.slack.read_server"]
     network_mode: host
     depends_on:
@@ -771,12 +772,19 @@ services:
     environment:
       CURIE_CHANNEL_GATEWAY_API_TOKEN: ${CURIE_CHANNEL_GATEWAY_API_TOKEN:-curie-dev-gateway-api}
       CURIE_CHANNEL_GATEWAY_WORKER_TOKEN: ${CURIE_CHANNEL_GATEWAY_WORKER_TOKEN:-curie-dev-gateway-worker}
+      CURIE_CHANNEL_GATEWAY_PORT: ${CURIE_LOCAL_GATEWAY_PORT:-8081}
       CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE: "true"
       CURIE_CHANNEL_GATEWAY_MAX_FILE_BYTES: ${CURIE_ATTACHMENT_MAX_FILE_BYTES:-33554432}
       SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-xoxb-dev}
       SLACK_API_BASE_URL: ${SLACK_API_BASE_URL-http://localhost:8155/api/}
       CURIE_SLACK_TRUSTED_ORIGINS: ${CURIE_SLACK_TRUSTED_ORIGINS-http://localhost,http://127.0.0.1,http://host.docker.internal}
       SLACK_USERGROUP_CACHE_TTL_S: ${SLACK_USERGROUP_CACHE_TTL_S:-60}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,socket; socket.create_connection(('127.0.0.1', int(os.environ['CURIE_CHANNEL_GATEWAY_PORT'])), timeout=3).close()"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
     restart: unless-stopped
 
   curie-dispatcher:
