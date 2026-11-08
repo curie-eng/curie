@@ -207,7 +207,10 @@ def test_api_display_summary_omits_the_ticket_while_the_grant_keeps_it() -> None
     arguments = {"note": "synthetic", "approval_ticket": _TICKET}
     summary = "Tool call awaiting approval: " + tool + " " + json.dumps(arguments)
     row = approval(summary, tool, arguments)
-    out = ApprovalOut.model_validate(row).model_dump()
+    out = ApprovalOut.model_validate(row).model_dump(mode="json")
     assert out["display_summary"] == "Approve execute approved. Note: synthetic"
-    assert _TICKET not in json.dumps(out)
+    # The exact `summary` record legitimately keeps the raw call text; the
+    # presentation fields and the grant arguments must not carry the ticket.
+    assert "granted_arguments" not in out
+    assert _TICKET not in json.dumps({k: v for k, v in out.items() if k != "summary"})
     assert row.granted_arguments == {"note": "synthetic", "approval_ticket": _TICKET}

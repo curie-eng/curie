@@ -14,6 +14,7 @@ import json
 import logging
 import subprocess
 import sys
+import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -888,7 +889,7 @@ def test_a_gated_tools_call_without_a_grant_is_refused_and_never_reaches_the_ser
 
 
 def test_a_matching_grant_is_forwarded_once_and_a_replay_is_refused() -> None:
-    grant = _mint_grant("merge_pull_request", {"n": 1}, jti="jti-1")
+    grant = _mint_grant("merge_pull_request", {"n": 1}, jti=str(uuid.uuid4()))
     headers = _caller_headers(grant)
 
     async def go() -> None:
@@ -908,7 +909,7 @@ def test_a_matching_grant_is_forwarded_once_and_a_replay_is_refused() -> None:
 
 
 def test_a_second_proxy_sharing_the_grant_store_rejects_the_same_jti() -> None:
-    grant = _mint_grant("merge_pull_request", {"n": 1}, jti="jti-1")
+    grant = _mint_grant("merge_pull_request", {"n": 1}, jti=str(uuid.uuid4()))
     headers = _caller_headers(grant)
     store = MemoryGrantStore()
 
@@ -929,13 +930,13 @@ def test_a_second_proxy_sharing_the_grant_store_rejects_the_same_jti() -> None:
 
 
 @pytest.mark.parametrize(
-    ("tool", "arguments", "jti"),
-    [("other_tool", {"n": 1}, "jti-tool"), ("merge_pull_request", {"n": 2}, "jti-args")],
+    ("tool", "arguments"),
+    [("other_tool", {"n": 1}), ("merge_pull_request", {"n": 2})],
 )
 def test_a_grant_for_another_tool_or_other_arguments_never_reaches_the_server(
-    tool: str, arguments: dict[str, int], jti: str
+    tool: str, arguments: dict[str, int]
 ) -> None:
-    grant = _mint_grant(tool, arguments, jti=jti)
+    grant = _mint_grant(tool, arguments, jti=str(uuid.uuid4()))
 
     async def go() -> None:
         async with _gated(grant_store=MemoryGrantStore()) as (upstream, proxy):
@@ -1006,24 +1007,33 @@ def test_a_batched_gated_tools_call_without_a_grant_never_reaches_the_server() -
     _run(go)
 
 
-def test_a_batched_gated_tools_call_forwards_once_when_the_grant_matches() -> None:
+def test_a_batched_gated_tools_call_is_refused_before_its_matching_grant_is_spent() -> None:
+    # ADR 0271 decision 7: an attested request carries exactly one tools/call,
+    # so a batch holding a gated call is refused, grant or not, before a spend.
     # The gated call is the second array element.
     body = (
         b'[{"jsonrpc":"2.0","id":1,"method":"tools/list"},'
         b'{"jsonrpc":"2.0","id":1,"method":"tools/call",'
         b'"params":{"name":"merge_pull_request","arguments":{"n":1}}}]'
     )
-    grant = _mint_grant("merge_pull_request", {"n": 1}, jti="jti-batch")
+    grant = _mint_grant("merge_pull_request", {"n": 1}, jti=str(uuid.uuid4()))
     headers = _caller_headers(grant)
 
     async def go() -> None:
         async with _gated(grant_store=MemoryGrantStore()) as (upstream, proxy):
-            status, _content_type, _payload = await _post(proxy, body, headers)
+            status, content_type, payload = await _post(proxy, body, headers)
+            assert status == _REFUSAL["status"]
+            assert content_type == _REFUSAL["content_type"]
+            assert payload == _grant_required_body()
+            assert upstream.seen == []
+            # Liveness: the batch spent nothing, so the same grant on the one
+            # call it names, alone, forwards once and is then spent.
+            status, _content_type, _payload = await _post(proxy, _MERGE_CALL, headers)
             assert status == 201
-            assert [seen["body"] for seen in upstream.seen] == [body]
+            assert [seen["body"] for seen in upstream.seen] == [_MERGE_CALL]
             assert caller.HEADER not in upstream.seen[0]["headers"]
             assert server.GRANT_HEADER not in upstream.seen[0]["headers"]
-            status, content_type, payload = await _post(proxy, body, headers)
+            status, content_type, payload = await _post(proxy, _MERGE_CALL, headers)
             assert status == _REFUSAL["status"]
             assert content_type == _REFUSAL["content_type"]
             assert payload == _grant_required_body()
@@ -1039,7 +1049,7 @@ def test_two_gated_calls_in_one_batch_are_refused_without_spending_the_grant() -
         b'{"jsonrpc":"2.0","id":2,"method":"tools/call",'
         b'"params":{"name":"merge_pull_request","arguments":{"n":1}}}]'
     )
-    grant = _mint_grant("merge_pull_request", {"n": 1}, jti="jti-two")
+    grant = _mint_grant("merge_pull_request", {"n": 1}, jti=str(uuid.uuid4()))
     headers = _caller_headers(grant)
 
     async def go() -> None:
@@ -1066,7 +1076,7 @@ def _other_agent_grant() -> str:
         tool="merge_pull_request",
         args=_canonical({"n": 1}),
         exp=int(_VECTOR["exp"]),
-        jti="jti-agent",
+        jti=str(uuid.uuid4()),
     )
 
 
@@ -1077,19 +1087,19 @@ def _other_agent_grant() -> str:
         pytest.param(lambda: "ccg.not.signed", MemoryGrantStore, server.GRANT_INVALID, id="bad"),
         pytest.param(_other_agent_grant, MemoryGrantStore, server.GRANT_AGENT_MISMATCH, id="agent"),
         pytest.param(
-            lambda: _mint_grant("other_tool", {"n": 1}, jti="jti-t"),
+            lambda: _mint_grant("other_tool", {"n": 1}, jti=str(uuid.uuid4())),
             MemoryGrantStore,
             server.GRANT_TOOL_MISMATCH,
             id="tool",
         ),
         pytest.param(
-            lambda: _mint_grant("merge_pull_request", {"n": 2}, jti="jti-a"),
+            lambda: _mint_grant("merge_pull_request", {"n": 2}, jti=str(uuid.uuid4())),
             MemoryGrantStore,
             server.GRANT_ARGUMENTS_MISMATCH,
             id="arguments",
         ),
         pytest.param(
-            lambda: _mint_grant("merge_pull_request", {"n": 1}, jti="jti-s"),
+            lambda: _mint_grant("merge_pull_request", {"n": 1}, jti=str(uuid.uuid4())),
             lambda: None,
             server.GRANT_NO_STORE,
             id="no-store",
@@ -1123,7 +1133,7 @@ def test_a_grant_refusal_logs_which_check_refused_and_never_the_grant(
 
 
 def test_a_replayed_grant_logs_not_spent(caplog: pytest.LogCaptureFixture) -> None:
-    headers = _caller_headers(_mint_grant("merge_pull_request", {"n": 1}, jti="jti-r"))
+    headers = _caller_headers(_mint_grant("merge_pull_request", {"n": 1}, jti=str(uuid.uuid4())))
 
     async def go() -> None:
         async with _gated(grant_store=MemoryGrantStore()) as (_upstream, proxy):
@@ -1133,7 +1143,10 @@ def test_a_replayed_grant_logs_not_spent(caplog: pytest.LogCaptureFixture) -> No
     with caplog.at_level(logging.INFO, logger="curie_connector_proxy"):
         _run(go)
     lines = [r.getMessage() for r in caplog.records if "outcome=" in r.getMessage()]
-    assert lines[0].endswith("outcome=admitted method=POST path='/mcp' principal=absent")
+    # ADR 0271 decision 7: the spent admit also says it was attested, as a
+    # suffix in any order, so the line no longer ends at ``principal=``.
+    assert "outcome=admitted method=POST path='/mcp' principal=absent" in lines[0]
+    assert "attested=present" in lines[0].split()
     assert lines[1].endswith(f"grant={server.GRANT_NOT_SPENT}")
 
 
@@ -1349,7 +1362,10 @@ def test_a_requesters_gated_call_without_its_grant_never_reaches_the_connector(
     ]
     if grant == "other_arguments":
         pairs.append(
-            (server.GRANT_HEADER, _mint_grant("merge_pull_request", {"n": 2}, jti="jti-p-args"))
+            (
+                server.GRANT_HEADER,
+                _mint_grant("merge_pull_request", {"n": 2}, jti=str(uuid.uuid4())),
+            )
         )
     elif grant == "another_agent":
         pairs.append((server.GRANT_HEADER, _other_agent_grant()))
@@ -1366,7 +1382,7 @@ def test_a_requesters_gated_call_without_its_grant_never_reaches_the_connector(
 
 # @spec CONNECTOR-REQUESTER-4
 def test_a_requesters_gated_call_with_its_grant_forwards_one_principal_and_no_bearer() -> None:
-    grant = _mint_grant("merge_pull_request", {"n": 1}, jti="jti-principal")
+    grant = _mint_grant("merge_pull_request", {"n": 1}, jti=str(uuid.uuid4()))
     pairs = [
         (caller.HEADER, _HUMAN_TOKEN),
         (server.GRANT_HEADER, grant),
