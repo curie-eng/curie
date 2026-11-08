@@ -58,7 +58,7 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   started the turn: a person's message or a job), `attachments`
   (`QueuedTurn.attachments`, a list of `Attachment` file REFERENCES — an
   adapter-scoped opaque `id` plus a `name`, never bytes and deliberately never a
-  url, so only the worker's `apps/worker/src/curie_worker/attachments.py::AttachmentFilePort` can resolve one), and `reply_handle` — a `ReplyHandle`
+  url, so only the worker's `packages/channel-gateway/src/curie_channel_gateway/ports/reads.py::FileSource` can resolve one), and `reply_handle` — a `ReplyHandle`
   (`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`) carrying the required
   `kind` and `channel` routing pair, required nullable `placeholder`, an optional
   per-turn `endpoint`, and optional `adapter` (`ReplyHandle.adapter`, the egress
@@ -538,7 +538,7 @@ implemented through `packages/channel-gateway/src/curie_channel_gateway/mail/egr
    (`apps/worker/src/curie_worker/kernel/core.py::Kernel._resolve_attachments`), and the
    lane picks the file port from its kind
    (`apps/worker/src/curie_worker/attachments.py::AttachmentCoordinator`). Slack keeps
-   `apps/worker/src/curie_worker/attachments.py::SlackFileClient` (`files.info` /
+   `packages/channel-gateway/src/curie_channel_gateway/slack/files.py::SlackFileClient` (`files.info` /
    `url_private_download` with the bot token; a missing `files:read` scope degrades
    attachments only, 4a71d99f). Every other kind goes to
    `apps/worker/src/curie_worker/attachments.py::ChannelPortFileClient`, which fetches

@@ -14,9 +14,10 @@ from typing import Any
 
 import boto3
 import pytest
+from curie_channel_gateway.read_transport import GatewayClient
 from curie_worker import run
 from curie_worker.config import WorkerConfig
-from curie_worker.sibling_turns import SiblingTurnLimit, SlackSenderIdentities
+from curie_worker.sibling_turns import SiblingTurnLimit
 
 _DECLARED = json.dumps(
     [
@@ -61,7 +62,14 @@ def built(monkeypatch: pytest.MonkeyPatch) -> Any:
         _KernelSpy.instances.clear()
 
         async def _drive() -> dict[str, Any]:
-            runtime = run.build(WorkerConfig(**config_overrides), env)
+            runtime = run.build(
+                WorkerConfig(
+                    channel_gateway_url="https://gateway.example.com",
+                    channel_gateway_token="worker-credential",
+                    **config_overrides,
+                ),
+                env,
+            )
             try:
                 assert len(_KernelSpy.instances) == 1
                 return _KernelSpy.instances[0].kwargs
@@ -89,13 +97,12 @@ def test_one_mail_adapter_builds_no_sibling_limit(built: Any) -> None:
 
 def test_two_slack_identities_wire_a_limit_over_both_tokens(built: Any) -> None:
     kwargs = built(
-        {"CURIE_SLACK_BOT_TOKEN__1": "xoxb-ops-placeholder"},
-        slack_bot_token="xoxb-default-placeholder",
+        {},
         slack_identities=_DECLARED,
     )
     limit = kwargs["sibling_limit"]
     assert isinstance(limit, SiblingTurnLimit)
-    assert isinstance(limit.slack, SlackSenderIdentities)
+    assert isinstance(limit.slack, GatewayClient)
     assert limit.slack.identities == ("default", "ops-bot")
     assert limit.channel is None
 

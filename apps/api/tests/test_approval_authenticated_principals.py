@@ -25,7 +25,7 @@ from curie_api.main import create_app
 from curie_api.models import ConsoleSession
 from curie_api.routers.console import SESSION_COOKIE
 from curie_api.slack_approvers import SlackApproverSetSelector
-from curie_api.usergroups import UserGroupMembership
+from curie_channel_gateway.group_models import UserGroupMembership
 from fastapi.testclient import TestClient
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine

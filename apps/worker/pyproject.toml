@@ -25,7 +25,6 @@ dependencies = [
     "curie-e2e-connector",
     "curie-dispatcher",
     "aiohttp>=3.11",
-    "slack-sdk>=3.43",
     "httpx>=0.28",
     # Sealed connector credentials (ADR-0094). libsodium sealed boxes, the same
     # named primitive the CLI seals with -- not a compatible-looking

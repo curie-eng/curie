@@ -34,6 +34,7 @@ from curie_api.main import create_app
 from curie_api.models import Agent, AgentChannel, AgentVersion, Deployment, Environment
 from curie_api.storage import BundleStore
 from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.files import FileResponse, SlackFileClient
 from curie_channel_gateway.slack.handlers import process_event
 from curie_dispatcher import admission as dispatcher_admission
 from curie_dispatcher.admission import build_admission
@@ -45,7 +46,6 @@ from curie_runner.server import create_app as runner_app
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker.attachment_access_client import AttachmentAccessClient
 from curie_worker.attachment_broker import AttachmentBroker
-from curie_worker.attachments import SlackFileClient, SlackFileResponse
 from curie_worker.binding import BindingResolver
 from curie_worker.config import WorkerConfig
 from curie_worker.consumer import Consumer
@@ -190,7 +190,7 @@ class SlackProvider:
 
     def transport(
         self, *, method: str, url: str, headers: dict[str, str], chunk_bytes: int
-    ) -> SlackFileResponse:
+    ) -> FileResponse:
         assert method == "GET" and headers["Authorization"] == f"Bearer {SLACK_TOKEN}"
         if "/files.info?" in url:
             file_id = parse_qs(urlsplit(url).query)["file"][0]
@@ -207,7 +207,7 @@ class SlackProvider:
                     },
                 }
             ).encode()
-            return SlackFileResponse(200, {"Content-Type": "application/json"}, iter([body]))
+            return FileResponse(200, {"Content-Type": "application/json"}, iter([body]))
         file_id = urlsplit(url).path.lstrip("/")
         assert file_id == "F0EXAMPLE1", "an unrequested provider body was opened"
 
@@ -218,7 +218,7 @@ class SlackProvider:
             if remainder := SELECTED_BYTES % chunk_bytes:
                 yield b"x" * remainder
 
-        return SlackFileResponse(200, {"Content-Type": "application/octet-stream"}, chunks())
+        return FileResponse(200, {"Content-Type": "application/octet-stream"}, chunks())
 
 
 class SlackWeb:

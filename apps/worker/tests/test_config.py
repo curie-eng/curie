@@ -117,9 +117,19 @@ _ENV_TABLE: list[_Row] = [
     _Row("valkey_port", "VALKEY_PORT", "6380", 6380, 6379),
     _Row("valkey_password", "VALKEY_PASSWORD", "vk-pass", "vk-pass", ""),
     _Row("valkey_db", "VALKEY_DB", "7", 7, 0),
-    _Row("slack_bot_token", "SLACK_BOT_TOKEN", "xoxb-sentinel", "xoxb-sentinel", ""),
     _Row(
-        "slack_api_base_url", "SLACK_API_BASE_URL", "http://slack.stub:9", "http://slack.stub:9", ""
+        "channel_gateway_url",
+        "CURIE_CHANNEL_GATEWAY_URL",
+        "https://gateway.example.com",
+        "https://gateway.example.com",
+        "",
+    ),
+    _Row(
+        "channel_gateway_token",
+        "CURIE_CHANNEL_GATEWAY_TOKEN",
+        "caller-sentinel",
+        "caller-sentinel",
+        "",
     ),
     _Row(
         "database_url",
@@ -604,8 +614,9 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.valkey_password == ""
     assert config.valkey_db == 0
     # Slack
-    assert config.slack_bot_token == ""
-    assert config.slack_api_base_url == ""
+    assert "slack_bot_token" not in WorkerConfig.model_fields
+    assert config.channel_gateway_url == ""
+    assert config.channel_gateway_token == ""
     assert config.slack_identities == ()
     # Postgres
     assert config.database_url == "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"

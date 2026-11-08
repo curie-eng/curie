@@ -6,6 +6,7 @@ from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
+from curie_channel_gateway.read_errors import ChannelReadRefused
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -23,7 +24,6 @@ from curie_api.schemas.channel_read import (
 from ..auth import require_internal_worker_token
 from ..channel_read.canvas import authorize_and_canvas, canvas_readers
 from ..channel_read.canvas_sections import CanvasSections
-from ..channel_read.errors import ChannelReadRefused
 from ..channel_read.ledger import ChannelReadLedger, LedgerUnavailable
 from ..channel_read.provider_guard import ProviderGuard
 from ..channel_read.service import authorize_and_read, channel_readers, mint_context

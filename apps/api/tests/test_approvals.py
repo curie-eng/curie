@@ -39,12 +39,12 @@ from curie_api.resumequeue import ResumeQueue
 from curie_api.resumereconciler import ResumeReconciler
 from curie_api.routers import approvals as approvals_module
 from curie_api.slack_approvers import SlackApproverSetSelector
-from curie_api.slack_usergroups import SlackUserGroupClient
 from curie_api.sweeper import (
     observe_pending_approvals,
     run_expiry_sweeper,
     sweep_expired_approvals,
 )
+from curie_channel_gateway.slack.groups import SlackUserGroupClient
 from curie_internal.sandbox_token import mint
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,

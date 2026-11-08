@@ -30,6 +30,7 @@ from uuid import UUID
 
 import aiohttp
 from channel_protocol.reply import ReplyAck, ReplyEvent
+from curie_channel_gateway.gateway_reply import GatewayReplySink, UnconfiguredGatewayReplySink
 from curie_channel_gateway.ports.reply import ReplyEventTransport
 from curie_channel_gateway.reply_errors import (
     InvalidReplyTargetError,
@@ -47,11 +48,9 @@ from curie_channel_gateway.reply_transport import (
     read_capped_ack,
     reply_ref_from,
 )
-from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 from pydantic import BaseModel, ConfigDict
 
 from .config import WorkerConfig
-from .slack_tokens import slack_bot_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -371,28 +370,21 @@ class ReplySinkRouter:
                 await closer()
 
 
-def build_reply_sink(
-    config: WorkerConfig, *, slack_tokens: Mapping[str, str] | None = None
-) -> ReplySinkRouter:
-    """The worker's sink: Slack below its own origin, everything else over HTTP.
-
-    ``slack_tokens`` is ``slack_tokens.slack_bot_tokens``'s map; ``run.build``
-    resolves it once and hands the same map to the attachment lane.
-    """
-    tokens = slack_bot_tokens(config) if slack_tokens is None else slack_tokens
+def build_reply_sink(config: WorkerConfig) -> ReplySinkRouter:
+    """Compose token-free worker delivery through the authenticated gateway."""
+    adapters: dict[str, ReplySink] = {kind: TrackerReplySink() for kind in TRACKER_KINDS}
+    adapters[SLACK_KIND] = UnconfiguredGatewayReplySink()
+    if config.channel_gateway_url:
+        adapters[SLACK_KIND] = GatewayReplySink(
+            config.channel_gateway_url,
+            config.channel_gateway_token,
+            allow_insecure_http=config.channel_gateway_allow_insecure,
+            identities=tuple(identity.name for identity in config.slack_identities) or ("default",),
+        )
     return ReplySinkRouter(
-        adapters={
-            SLACK_KIND: SlackReplyAdapter(
-                config.slack_bot_token,
-                identity_tokens=tokens,
-                base_url=config.slack_api_base_url or None,
-                trusted_origins=config.slack_trusted_origins,
-            ),
-            **{kind: TrackerReplySink() for kind in TRACKER_KINDS},
-        },
+        adapters=adapters,
         default=HttpReplyAdapter(config.adapter_credentials),
         cluster_message=_ClusterMessageReplyAdapter(
-            config.api_base_url,
-            config.internal_worker_token,
+            config.api_base_url, config.internal_worker_token
         ),
     )

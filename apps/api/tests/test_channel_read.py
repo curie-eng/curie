@@ -45,6 +45,7 @@ import redis.asyncio as aioredis
 from channel_protocol import ChannelCapability
 from curie_api.config import get_settings
 from curie_api.main import create_app
+from curie_test_support.channel_gateway import API_TOKEN, slack_gateway
 from fastapi.testclient import TestClient
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
@@ -358,14 +359,14 @@ class Stack:
     def start(self) -> None:
         self.client = TestClient(create_app())
         self.client.__enter__()
-        self._http = httpx.AsyncClient(transport=httpx.MockTransport(self.slack.handler))
+        self._http = httpx.AsyncClient()
         self.client.app.state.http_client = self._http
 
     def stop(self) -> None:
         """Models the API process going away; `start` brings it back."""
         assert self.client is not None and self._http is not None
+        self.client.portal.call(self._http.aclose)
         self.client.__exit__(None, None, None)
-        asyncio.run(self._http.aclose())
         self.client = None
 
     @property
@@ -465,23 +466,30 @@ def stack(
 ) -> Iterator[Stack]:
     env = {
         "INTERNAL_WORKER_TOKEN": WORKER_TOKEN,
-        "SLACK_BOT_TOKEN": BOT_TOKEN,
+        "CURIE_CHANNEL_GATEWAY_TOKEN": API_TOKEN,
+        "CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE": "true",
         "RUNS_STREAM": f"test:curie:channel-read-runs:{uuid.uuid4().hex}",
         "APPROVAL_SWEEP_INTERVAL_S": "0",
         "RESUME_RECONCILER_ENABLED": "false",
         "DEAD_LETTER_WATCH_INTERVAL_S": "0",
         **getattr(request, "param", {}),
     }
+    provider_token = env.pop("SLACK_BOT_TOKEN", BOT_TOKEN)
+    built = Stack(auth_headers)
+    gateway = slack_gateway(
+        built.slack.handler, {"default": provider_token} if provider_token else {}
+    )
+    env["CURIE_CHANNEL_GATEWAY_URL"] = gateway.__enter__()
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     get_settings.cache_clear()
-    built = Stack(auth_headers)
     built.start()
     try:
         yield built
     finally:
         if built.client is not None:
             built.stop()
+        gateway.__exit__(None, None, None)
         for agent_id in built.agents:
             if keys := _ledger_keys_of(agent_id):
                 _valkey_run(lambda client, keys=keys: client.delete(*keys))

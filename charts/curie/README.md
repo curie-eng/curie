@@ -2335,12 +2335,12 @@ dispatcher:
         botTokenExistingSecret: slack-sales      # key defaults to slackBotToken
 ```
 
-With no entries the chart renders exactly the objects it rendered before the
-key existed. With entries, the dispatcher, worker and API each receive
-`CURIE_SLACK_IDENTITIES`, which names every identity and the env vars holding
-its tokens, from one helper (`templates/_slack-identities.tpl`). Entry `n`'s bot
-token is `CURIE_SLACK_BOT_TOKEN__<n>` in all three, and the dispatcher also
-gets `CURIE_SLACK_APP_TOKEN__<n>` and, when set, `CURIE_SLACK_SIGNING_SECRET__<n>`.
+With entries, the dispatcher, gateway, worker and API each receive
+`CURIE_SLACK_IDENTITIES` from `templates/_slack-identities.tpl`. This declares
+identity names and token environment names; the API and worker receive no token
+values. Entry `n`'s bot token is `CURIE_SLACK_BOT_TOKEN__<n>` in the dispatcher
+and gateway. Only the dispatcher gets `CURIE_SLACK_APP_TOKEN__<n>` and, when set,
+`CURIE_SLACK_SIGNING_SECRET__<n>`.
 `default` always keeps the `SLACK_*` names. The render refuses a duplicate
 name, a name that is not lowercase letters and digits in runs joined by single
 hyphens (at most 40 characters, so every name is one a binding's `adapter` can
@@ -2348,6 +2348,15 @@ carry), a name of `curie-cluster-message` (reserved for the platform's
 built-in cluster-message reply adapter), a missing token reference, `default`
 configured twice or not at all, and an `extraEnv` entry naming any of these
 variables. `charts/curie/ci/slack-identities-assertions.sh` pins all of it.
+
+Enable `channelGateway.deploy` with a trusted `channelGateway.tlsSecret`, or
+explicitly set `channelGateway.allowInsecure` for a trusted development network.
+An external gateway uses `channelGateway.url`. Configure separate
+`channelGateway.apiToken` and `channelGateway.workerToken`; the gateway owns
+Slack reads, file fetches, sender lookup and replies. Its single replica and
+Recreate strategy keep the persistent SQLite replay ledger under one owner.
+Existing installs must remove every Slack token from API and worker before
+upgrading; both applications refuse to boot with one present.
 
 A plain `curie cluster up` re-supplies a recorded list along with the
 `dispatcher.slack` token fields, so an operator does not need to pass it again

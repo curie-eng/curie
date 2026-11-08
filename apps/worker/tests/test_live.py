@@ -51,9 +51,9 @@ from curie_channel_gateway.slack.blocks import (
     PROGRESS_CARD_BLOCK_ID_PREFIX,
     PROGRESS_MILESTONE_BLOCK_ID_PREFIX,
 )
+from curie_channel_gateway.slack.files import SlackFileClient, SlackFileError
 from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 from curie_dispatcher.queue import to_stream_fields
-from curie_worker.attachments import SlackFileClient, SlackFileError
 from curie_worker.reply_sink import TargetRoute
 from redis import Redis
 from redis.exceptions import RedisError

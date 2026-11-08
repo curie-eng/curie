@@ -213,24 +213,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         and settings.github_review_reconciler_interval_s > 0
         else None
     )
-    # The composition root for approvals (#420, ADR-0034): the only place that
-    # names Slack to build the approver-set selector, so the authorizer and the
-    # resolve endpoint depend on ports rather than on a provider. Each Slack
-    # identity's usergroup client shares the app's httpx client (ADR-0168
-    # decision 5); with no bot token there is none, the normal Slack-free
-    # deployment, and a route that declares an approvers group then fails
-    # closed at resolve time rather than silently widening.
+    # Authorization and freshness policy use authenticated gateway membership ports.
     app.state.approver_sets = build_approver_set_selector(http_client, settings)
-    # Every configured Slack identity as one unattached channel identity
-    # (#2909, ADR 0168 decision 1, as scoped by ADR 0193 decision 4): the
-    # legacy default plus every CURIE_SLACK_IDENTITIES entry with a non-blank
-    # bot token, each behind its own token gate, so a Slack-free install gets
-    # no row. Attaching it to a provider_installations row is #3039's job, not
-    # boot's -- only the identity's own credential can later report which
-    # installation it belongs to. Never fails boot; if this image started
-    # below this migration it keeps retrying in the background. identities.py
-    # still reads CURIE_SLACK_IDENTITIES directly to validate a binding's
-    # declared name, not from this table, pending #2911.
+    # Declarations reserve identities; only the gateway or dispatcher can later
+    # attest provider availability. Bootstrap never reads a provider token.
     app.state.static_slack_bootstrap_task = await start_static_slack_bootstrap(
         app.state.sessionmaker, settings
     )

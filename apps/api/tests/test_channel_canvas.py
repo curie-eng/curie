@@ -49,6 +49,7 @@ import pytest
 import redis.asyncio as aioredis
 from curie_api.channel_read.provider_guard import ProviderGuard
 from curie_api.config import get_settings
+from curie_test_support.channel_gateway import API_TOKEN, slack_gateway
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
 from sqlalchemy import text
@@ -508,23 +509,32 @@ def stack(
 ) -> Iterator[CanvasStack]:
     env = {
         "INTERNAL_WORKER_TOKEN": WORKER_TOKEN,
-        "SLACK_BOT_TOKEN": CANVAS_BOT_TOKEN,
+        "CURIE_CHANNEL_GATEWAY_TOKEN": API_TOKEN,
+        "CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE": "true",
         "RUNS_STREAM": f"test:curie:channel-canvas-runs:{uuid.uuid4().hex}",
         "APPROVAL_SWEEP_INTERVAL_S": "0",
         "RESUME_RECONCILER_ENABLED": "false",
         "DEAD_LETTER_WATCH_INTERVAL_S": "0",
         **getattr(request, "param", {}),
     }
+    provider_token = env.pop("SLACK_BOT_TOKEN", CANVAS_BOT_TOKEN)
+    named_token = env.pop("CURIE_SLACK_BOT_TOKEN__0", None)
+    built = CanvasStack(auth_headers, provider_token)
+    tokens = {"default": provider_token} if provider_token else {}
+    if named_token:
+        tokens["second"] = named_token
+    gateway = slack_gateway(built.slack.handler, tokens)
+    env["CURIE_CHANNEL_GATEWAY_URL"] = gateway.__enter__()
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     get_settings.cache_clear()
-    built = CanvasStack(auth_headers, env["SLACK_BOT_TOKEN"])
     built.start()
     try:
         yield built
     finally:
         if built.client is not None:
             built.stop()
+        gateway.__exit__(None, None, None)
         for agent_id in built.agents:
             if keys := _ledger_keys_of(agent_id):
                 _valkey_run(lambda client, keys=keys: client.delete(*keys))
@@ -1706,7 +1716,7 @@ def _root(body: str) -> str:
 
 
 def test_parse_the_recorded_canvas() -> None:
-    from curie_api.channel_read.slack_canvas import parse_canvas_html
+    from curie_channel_gateway.slack.canvas import parse_canvas_html
 
     document = parse_canvas_html(FIXTURE_HTML)
     expected = _expected_tables()
@@ -1723,7 +1733,7 @@ def test_parse_the_recorded_canvas() -> None:
 
 
 def test_parse_header_is_the_first_row_by_position() -> None:
-    from curie_api.channel_read.slack_canvas import parse_canvas_html
+    from curie_channel_gateway.slack.canvas import parse_canvas_html
 
     a, b, c = _sid("EXA", 0xA1), _sid("EXA", 0xB2), _sid("EXA", 0xC3)
     document = parse_canvas_html(
@@ -1742,7 +1752,7 @@ def test_parse_header_is_the_first_row_by_position() -> None:
 
 
 def test_parse_cell_rules() -> None:
-    from curie_api.channel_read.slack_canvas import parse_canvas_html
+    from curie_channel_gateway.slack.canvas import parse_canvas_html
 
     one, two, empty, inline, ent, long, edge, plain = (_sid("EXA", n) for n in range(0xD0, 0xD8))
     document = parse_canvas_html(
@@ -1776,7 +1786,7 @@ def test_parse_cell_rules() -> None:
 
 
 def test_parse_nested_tables_flatten_into_one_uneditable_cell() -> None:
-    from curie_api.channel_read.slack_canvas import parse_canvas_html
+    from curie_channel_gateway.slack.canvas import parse_canvas_html
 
     outer, inner = _sid("EXA", 0xE1), _sid("EXA", 0xE2)
     document = parse_canvas_html(
@@ -1794,7 +1804,7 @@ def test_parse_nested_tables_flatten_into_one_uneditable_cell() -> None:
 
 
 def test_parse_text_outside_tables_becomes_paragraphs_in_order() -> None:
-    from curie_api.channel_read.slack_canvas import parse_canvas_html
+    from curie_channel_gateway.slack.canvas import parse_canvas_html
 
     h2, li = _sid("EXA", 0xF1), _sid("EXA", 0xF2)
     document = parse_canvas_html(
@@ -1822,8 +1832,8 @@ def test_parse_text_outside_tables_becomes_paragraphs_in_order() -> None:
     ids=["login-page", "empty", "no-root", "bare-table"],
 )
 def test_parse_without_the_canvas_root_is_unreadable(page: str) -> None:
-    from curie_api.channel_read.errors import ChannelReadRefused
-    from curie_api.channel_read.slack_canvas import parse_canvas_html
+    from curie_channel_gateway.read_errors import ChannelReadRefused
+    from curie_channel_gateway.slack.canvas import parse_canvas_html
 
     with pytest.raises(ChannelReadRefused) as refused:
         parse_canvas_html(page)
@@ -1834,7 +1844,7 @@ def test_parse_without_the_canvas_root_is_unreadable(page: str) -> None:
     "value", REJECTED_TEXTS, ids=[f"rejected-{i}" for i in range(len(REJECTED_TEXTS))]
 )
 def test_cell_text_rule_rejects(value: str) -> None:
-    from curie_api.channel_read.slack_canvas import cell_text_problem
+    from curie_channel_gateway.slack.canvas import cell_text_problem
 
     problem = cell_text_problem(value)
     assert isinstance(problem, str) and problem
@@ -1846,13 +1856,13 @@ def test_cell_text_rule_rejects(value: str) -> None:
     [*ACCEPTED_TEXTS, "x" * 1000, "a", "C# and F# builds", "3.5 GB free", "sign-off pending"],
 )
 def test_cell_text_rule_accepts(value: str) -> None:
-    from curie_api.channel_read.slack_canvas import cell_text_problem
+    from curie_channel_gateway.slack.canvas import cell_text_problem
 
     assert cell_text_problem(value) is None
 
 
 def test_identifier_rules() -> None:
-    from curie_api.channel_read.slack_canvas import valid_canvas_id, valid_section_id
+    from curie_channel_gateway.slack.canvas import valid_canvas_id, valid_section_id
 
     for good in (CANVAS, "F" + "A" * 8, "F" + "9" * 24):
         assert valid_canvas_id(good), good

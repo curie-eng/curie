@@ -17,15 +17,23 @@ import hashlib
 import re
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, slack_speaking_identity
 from channel_protocol import ChannelCapability
 
-from .errors import ChannelReadRefused
-from .readers import BindingRoute, ChannelMessage, ProviderPage
-from .window import Operation, ResolvedWindow, epoch_micros, from_epoch_micros
+from ..read_errors import ChannelReadRefused
+from ..read_models import (
+    BindingRoute,
+    ChannelMessage,
+    ProviderPage,
+    ResolvedWindow,
+    epoch_micros,
+    from_epoch_micros,
+)
+
+Operation = Literal["history", "thread", "message"]
 
 SLACK_API = "https://slack.com/api/"
 TEXT_LIMIT = 4000

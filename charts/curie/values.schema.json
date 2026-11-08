@@ -202,6 +202,60 @@
     }
   ],
   "properties": {
+    "channelGateway": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "deploy": {
+          "type": "boolean"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "url": {
+          "type": "string"
+        },
+        "allowInsecure": {
+          "type": "boolean"
+        },
+        "tlsSecret": {
+          "type": "string"
+        },
+        "apiToken": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workerToken": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "groupCacheTtlSeconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "resources": {
+          "type": "object"
+        },
+        "replayStorageSize": {
+          "type": "string"
+        },
+        "replayStorageClass": {
+          "type": "string"
+        },
+        "readinessProbe": {
+          "type": "object"
+        },
+        "livenessProbe": {
+          "type": "object"
+        }
+      }
+    },
     "config": {
       "type": "object",
       "description": "Installed configuration schema stamp written by the CLI on every install and upgrade (issue #2299).",

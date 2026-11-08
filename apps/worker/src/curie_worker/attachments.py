@@ -4,13 +4,10 @@ The dispatcher records file *references* on the wire and nothing else:
 ``aci_protocol.Attachment`` carries ``id``/``name`` and deliberately no url and
 no bytes, because a carried channel URL would invite a sandbox-side fetch that
 ADR-0032's default-deny egress forbids.  This module is the other half.  The
-worker holds the channel credential and can reach the channel (the bot token
-for Slack, the adapter's egress secret for a channel-port binding, ADR-0153),
-so it downloads each referenced file, parks the bytes in the private object
-store under its OWN prefix, and mints a short-lived one-object read capability
-that the sandbox's attachment init container redeems.  The credential (the bot
-token, or an adapter's secret) never leaves the worker, which
-is what keeps ADR-0075's boundary intact while the Agent Proxy is unbuilt.
+worker retains attachment authority and asks a gateway file port for the
+provider bytes. It parks them under its own private object-store prefix and
+mints a short-lived one-object read capability for the sandbox. Slack tokens
+stay in the gateway; the worker holds only a caller credential.
 
 Three properties are load-bearing and each has a reason it is not merely style:
 
@@ -59,11 +56,13 @@ import uuid
 from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol
+from typing import Any
 
 from aci_protocol import Attachment, BootEnv, ReplyHandle
 from aci_protocol.turn import DEFAULT_IDENTITY, slack_speaking_identity
+from curie_channel_gateway.ports.reads import FileSource
 from curie_channel_gateway.reply_transport import ADAPTER_SECRET_HEADER
+from curie_channel_gateway.slack.files import FileResponse, SlackFileError
 from curie_internal.workspace_objects import WorkspaceObjectPort
 
 from .ledger_client import ThreadAttachmentRef
@@ -113,7 +112,6 @@ _REUSE_MARGIN_SECONDS = 60
 
 # Where Slack's file metadata is looked up. The id in ``Attachment`` is the
 # channel's own file id, so resolving it is the port's job, not this module's.
-_SLACK_API_URL = "https://slack.com/api"
 
 # A files.info envelope is metadata; nothing legitimate is large. Bounded so a
 # hostile or broken response cannot be read into memory without limit.
@@ -148,18 +146,6 @@ class AttachmentFetchError(AttachmentResolutionError):
         super().__init__("fetch", f"{name!r} could not be downloaded: {detail}")
 
 
-class SlackFileError(RuntimeError):
-    """Slack refused a file lookup or download at the application level.
-
-    Slack answers ``200`` with ``{"ok": false, "error": "..."}`` for an
-    application-level failure, so translating that envelope belongs to the port
-    rather than to the resolver above it. ``status`` is the HTTP status when the
-    refusal was one, so an earlier file's unavailability can be named.
-    """
-
-    def __init__(self, message: str, *, status: int | None = None) -> None:
-        self.status = status
-        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -702,26 +688,6 @@ class AttachmentReapCandidate:
     deleted_object_keys: tuple[str, ...]
 
 
-class AttachmentFilePort(Protocol):
-    """The channel's file download, chunk by chunk.
-
-    A generator rather than a bytes-returning call: the size cap is enforced
-    against what has actually been pulled, which is only possible if the caller
-    controls the pull.
-    """
-
-    def fetch(self, file_id: str) -> Iterator[bytes]: ...
-
-
-@dataclass(frozen=True)
-class SlackFileResponse:
-    """One transport answer: status, headers, and an unread chunk stream."""
-
-    status: int
-    headers: Mapping[str, str]
-    chunks: Iterator[bytes]
-
-
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(  # type: ignore[override]
         self,
@@ -867,13 +833,13 @@ class _ScopedHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(_ScopedHTTPSConnection, request, context=self._context)
 
 
-def _slack_transport(
+def _file_transport(
     *,
     method: str,
     url: str,
     headers: Mapping[str, str],
     chunk_bytes: int,
-) -> SlackFileResponse:
+) -> FileResponse:
     """One bearer-authenticated request whose body is left unread.
 
     Redirects are refused for the same reason the workspace credential client
@@ -900,7 +866,7 @@ def _slack_transport(
         # Error envelopes are control data, never attachment content.
         with exc:
             body = exc.read1(_MAX_INFO_BYTES + 1)
-        return SlackFileResponse(
+        return FileResponse(
             status=int(exc.code),
             headers=dict(exc.headers.items()) if exc.headers is not None else {},
             chunks=iter([body]),
@@ -932,7 +898,7 @@ def _slack_transport(
             if scope is not None and owned is not None:
                 scope.untrack(owned, response)
 
-    return SlackFileResponse(
+    return FileResponse(
         status=int(response.status),
         headers=dict(response.headers.items()),
         chunks=_chunks(),
@@ -968,7 +934,7 @@ class ChannelPortFileClient:
         self,
         *,
         credentials: Mapping[str, str],
-        transport: Callable[..., SlackFileResponse] = _slack_transport,
+        transport: Callable[..., FileResponse] = _file_transport,
         read_chunk_bytes: int = 1024 * 1024,
     ) -> None:
         if read_chunk_bytes <= 0:
@@ -977,7 +943,7 @@ class ChannelPortFileClient:
         self._transport = transport
         self._read_chunk_bytes = read_chunk_bytes
 
-    def bind(self, handle: ReplyHandle) -> AttachmentFilePort:
+    def bind(self, handle: ReplyHandle) -> FileSource:
         """The file port for one binding, refused before any request when the
         worker has nowhere to ask or nothing to authenticate with."""
 
@@ -988,7 +954,7 @@ class ChannelPortFileClient:
             )
         return self.bind_route(handle.adapter, handle.endpoint)
 
-    def bind_route(self, adapter: str | None, endpoint: str | None) -> AttachmentFilePort:
+    def bind_route(self, adapter: str | None, endpoint: str | None) -> FileSource:
         """The file port for one of the agent's CURRENT bindings (ADR 0205).
 
         ``bind`` for a route read from the bindings rather than from a reply
@@ -1019,11 +985,11 @@ class ChannelPortFileClient:
 
 @dataclass(frozen=True)
 class _BoundChannelPortFiles:
-    """One binding's ``AttachmentFilePort``."""
+    """One binding's ``FileSource``."""
 
     endpoint: str
     secret: str = field(repr=False)
-    transport: Callable[..., SlackFileResponse]
+    transport: Callable[..., FileResponse]
     read_chunk_bytes: int
 
     def fetch(self, file_id: str) -> Iterator[bytes]:
@@ -1041,117 +1007,6 @@ class _BoundChannelPortFiles:
         return response.chunks
 
 
-class SlackFileClient:
-    """Download one Slack file's bytes with the bot token, and only here.
-
-    The download reads ``url_private_download`` rather than ``url_private``:
-    Slack answers a PDF's ``url_private`` with a 302 to ``slack-files.com``,
-    and the transport below deliberately refuses to follow it (see
-    ``_NoRedirect``), so the bearer token never reaches a host Slack chose.
-    ``url_private_download`` is Slack's documented direct-download endpoint on
-    the same file object and does not redirect
-    (https://docs.slack.dev/reference/objects/file-object). It is NOT public,
-    though: the download must carry ``Authorization: Bearer <token>``, or
-    Slack answers with an HTML sign-in page rather than the bytes.
-
-    The token authenticates exactly these two requests and reaches nothing
-    downstream -- what the sandbox receives is a presigned one-object URL from
-    the private object store.
-    """
-
-    def __init__(
-        self,
-        *,
-        token: str,
-        transport: Callable[..., SlackFileResponse] = _slack_transport,
-        api_url: str = _SLACK_API_URL,
-        read_chunk_bytes: int = 1024 * 1024,
-    ) -> None:
-        if not token:
-            raise ValueError("attachment resolution requires a Slack bot token")
-        if read_chunk_bytes <= 0:
-            raise ValueError("read_chunk_bytes must be positive")
-        self._token = token
-        self._transport = transport
-        self._api_url = api_url.rstrip("/")
-        self._read_chunk_bytes = read_chunk_bytes
-
-    def fetch(self, file_id: str) -> Iterator[bytes]:
-        download_url = self._download_url(file_id)
-        response = self._transport(
-            method="GET",
-            url=download_url,
-            headers=self._headers(),
-            chunk_bytes=self._read_chunk_bytes,
-        )
-        if response.status != 200:
-            raise SlackFileError(
-                f"slack file download failed: HTTP {response.status}", status=response.status
-            )
-        content_type = self._content_type(response.headers)
-        if content_type.startswith("text/html"):
-            # Slack serves its sign-in page, with a 200, when the bearer token
-            # is missing or lacks files:read. Storing that page as the
-            # "attachment" would hand the agent a login screen to read.
-            raise SlackFileError(
-                "slack file download returned an HTML page rather than file bytes; "
-                "the bot token is likely missing the files:read scope"
-            )
-        return response.chunks
-
-    def _download_url(self, file_id: str) -> str:
-        response = self._transport(
-            method="GET",
-            url=f"{self._api_url}/files.info?file={file_id}",
-            headers=self._headers(),
-            chunk_bytes=self._read_chunk_bytes,
-        )
-        if response.status != 200:
-            raise SlackFileError(
-                f"slack files.info failed: HTTP {response.status}", status=response.status
-            )
-        body = self._bounded_body(response.chunks)
-        try:
-            payload = json.loads(body)
-            if not payload.get("ok"):
-                raise SlackFileError(f"slack files.info failed: {payload.get('error')}")
-            file_obj = payload["file"]
-            if not isinstance(file_obj, Mapping):
-                raise TypeError("file object is not a mapping")
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise SlackFileError("slack files.info returned an unusable envelope") from exc
-        # The envelope parsed fine and was ok, but the field this module reads
-        # instead of url_private (see the class docstring) may still be
-        # absent. Named explicitly rather than folded into the except above,
-        # since a missing field is not the same failure as a malformed
-        # envelope and an operator needs to be able to tell them apart.
-        if "url_private_download" not in file_obj:
-            raise SlackFileError(
-                "slack files.info's file object has no url_private_download field"
-            )
-        download_url = str(file_obj["url_private_download"])
-        if not download_url.startswith("https://"):
-            raise SlackFileError("slack files.info returned a non-HTTPS url_private_download")
-        return download_url
-
-    def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._token}"}
-
-    @staticmethod
-    def _content_type(headers: Mapping[str, str]) -> str:
-        for key, value in headers.items():
-            if str(key).lower() == "content-type":
-                return str(value).lower()
-        return ""
-
-    @staticmethod
-    def _bounded_body(chunks: Iterator[bytes]) -> bytes:
-        body = bytearray()
-        for chunk in chunks:
-            body.extend(chunk)
-            if len(body) > _MAX_INFO_BYTES:
-                raise SlackFileError("slack files.info response is oversized")
-        return bytes(body)
 
 
 class AttachmentCoordinator:
@@ -1171,11 +1026,11 @@ class AttachmentCoordinator:
     def __init__(
         self,
         *,
-        files: AttachmentFilePort | None,
+        files: FileSource | None,
         objects: WorkspaceObjectPort,
         limits: AttachmentLimits | None = None,
         clock: Callable[[], float] = time.time,
-        identity_files: Mapping[str, AttachmentFilePort] | None = None,
+        identity_files: Mapping[str, FileSource] | None = None,
         channel_files: ChannelPortFileClient | None = None,
     ) -> None:
         # None when this worker holds no bot token for `default` (ADR-0168
@@ -1187,7 +1042,7 @@ class AttachmentCoordinator:
         self.limits = limits or AttachmentLimits()
         self._clock = clock
         self._lock = threading.Lock()
-        self._identity_files: dict[str, AttachmentFilePort] = dict(identity_files or {})
+        self._identity_files: dict[str, FileSource] = dict(identity_files or {})
         self.channel_files = channel_files
 
     # -- resolve ------------------------------------------------------------
@@ -1614,7 +1469,7 @@ class AttachmentCoordinator:
 
     def _route_files(
         self, ref: ThreadAttachmentRef, routes: Sequence[Any]
-    ) -> AttachmentFilePort:
+    ) -> FileSource:
         """The download for an earlier file, from the agent's CURRENT bindings.
 
         Never from anything recorded with the file: Slack needs a Slack binding
@@ -1707,7 +1562,7 @@ class AttachmentCoordinator:
             return {}
         return cache
 
-    def _files_for(self, identity: str, handle: ReplyHandle | None = None) -> AttachmentFilePort:
+    def _files_for(self, identity: str, handle: ReplyHandle | None = None) -> FileSource:
         """The download for this turn's binding, refused before any fetch when absent."""
 
         if handle is not None and handle.kind != SLACK_KIND:
@@ -1733,7 +1588,7 @@ class AttachmentCoordinator:
         file_id: str,
         name: str,
         key: str,
-        files: AttachmentFilePort,
+        files: FileSource,
         deadline_epoch: float | None = None,
     ) -> tuple[str, int]:
         """Stream one file into the store under its cap, returning digest+size."""

@@ -10,6 +10,7 @@ from aci_protocol import (
     TurnSource,
 )
 from aci_protocol.turn import DEFAULT_IDENTITY
+from curie_channel_gateway.slack.tokens import token_identity
 from curie_telemetry.redact import redact_text
 
 from ..approvals import (
@@ -28,7 +29,6 @@ from ..sandbox.types import (
     RouteChangedError,
     SandboxHandle,
 )
-from ..slack_tokens import token_identity
 from ..workspace import (
     WORKSPACES_DISABLED_REFUSAL,
     WorkspaceSelectionRefused,

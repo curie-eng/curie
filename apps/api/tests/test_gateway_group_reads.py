@@ -4,7 +4,7 @@ import asyncio
 
 import httpx
 import pytest
-from curie_api.slack_usergroups import SlackUserGroupClient
+from curie_channel_gateway.slack.groups import SlackUserGroupClient
 
 
 @pytest.mark.parametrize("warm_cache", [False, True])

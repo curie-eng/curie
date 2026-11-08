@@ -1,0 +1,123 @@
+{{- if .Values.channelGateway.deploy }}
+{{- if and (not .Values.channelGateway.allowInsecure) (not .Values.channelGateway.tlsSecret) }}
+{{- fail "channelGateway.tlsSecret is required unless channelGateway.allowInsecure is explicitly true" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "curie.fullname" . }}-channel-gateway
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" . "component" "channel-gateway") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/gateway: {{ include "curie.secretChecksum" (dict "root" . "keys" (list "channelGatewayApiToken" "channelGatewayWorkerToken") "refs" (list) "env" (include "curie.env.slack" (dict "root" . "workload" "gateway"))) | quote }}
+      labels:
+        {{- include "curie.selectorLabels" (dict "root" . "component" "channel-gateway") | nindent 8 }}
+    spec:
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      automountServiceAccountToken: false
+      {{- with .Values.dispatcher.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: channel-gateway
+          image: {{ include "curie.image" (dict "repository" .Values.dispatcher.image.repository "tag" .Values.dispatcher.image.tag "digest" .Values.dispatcher.image.digest "defaultTag" .Chart.AppVersion) }}
+          command: ["python", "-m", "curie_channel_gateway.slack.read_server"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          ports:
+            - name: gateway
+              containerPort: {{ .Values.channelGateway.port }}
+          env:
+            {{- include "curie.env.slack" (dict "root" . "workload" "gateway") | nindent 12 }}
+            - name: CURIE_CHANNEL_GATEWAY_PORT
+              value: {{ .Values.channelGateway.port | quote }}
+            - name: CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE
+              value: {{ .Values.channelGateway.allowInsecure | quote }}
+            - name: SLACK_API_BASE_URL
+              value: {{ .Values.worker.slackApiBaseUrl | quote }}
+            - name: CURIE_SLACK_TRUSTED_ORIGINS
+              value: {{ .Values.worker.slackTrustedOrigins | quote }}
+            - name: CURIE_CHANNEL_GATEWAY_MAX_FILE_BYTES
+              value: {{ .Values.worker.attachments.maxFileBytes | quote }}
+            - name: SLACK_USERGROUP_CACHE_TTL_S
+              value: {{ .Values.channelGateway.groupCacheTtlSeconds | quote }}
+            {{- range $caller := list "api" "worker" }}
+            - name: CURIE_CHANNEL_GATEWAY_{{ upper $caller }}_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" $ }}
+                  key: {{ printf "channelGateway%sToken" (title $caller) }}
+            {{- end }}
+            {{- if .Values.channelGateway.tlsSecret }}
+            - name: CURIE_CHANNEL_GATEWAY_TLS_CERT
+              value: /var/run/gateway-tls/tls.crt
+            - name: CURIE_CHANNEL_GATEWAY_TLS_KEY
+              value: /var/run/gateway-tls/tls.key
+            {{- end }}
+          readinessProbe:
+            tcpSocket: {port: gateway}
+            {{- toYaml .Values.channelGateway.readinessProbe | nindent 12 }}
+          livenessProbe:
+            tcpSocket: {port: gateway}
+            {{- toYaml .Values.channelGateway.livenessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.channelGateway.resources | nindent 12 }}
+          volumeMounts:
+            - name: replay
+              mountPath: /var/lib/curie-gateway
+            {{- if .Values.channelGateway.tlsSecret }}
+            - name: tls
+              mountPath: /var/run/gateway-tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: replay
+          persistentVolumeClaim:
+            claimName: {{ include "curie.fullname" . }}-channel-gateway-replay
+        {{- if .Values.channelGateway.tlsSecret }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.channelGateway.tlsSecret }}
+        {{- end }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "curie.fullname" . }}-channel-gateway-replay
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- if .Values.channelGateway.replayStorageClass }}
+  storageClassName: {{ .Values.channelGateway.replayStorageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.channelGateway.replayStorageSize }}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "curie.fullname" . }}-channel-gateway
+spec:
+  selector:
+    {{- include "curie.selectorLabels" (dict "root" . "component" "channel-gateway") | nindent 4 }}
+  ports:
+    - port: {{ .Values.channelGateway.port }}
+      targetPort: gateway
+{{- end }}

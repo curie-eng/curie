@@ -28,8 +28,8 @@ from curie_api.slack_approvers import (
     SlackChannelMembers,
     SlackUserGroupMembers,
 )
-from curie_api.slack_usergroups import SlackUserGroupClient
-from curie_api.usergroups import GroupMembershipSource
+from curie_channel_gateway.ports.groups import GroupMembershipSource
+from curie_channel_gateway.slack.groups import SlackUserGroupClient
 
 
 def _approval(*, author: str = "U_AE", channel: str = "C_MGRS") -> Approval:

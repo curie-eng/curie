@@ -1,7 +1,7 @@
 """Channel read against a real Slack workspace (ADR 0100, #2877, AC7).
 
 Opt in with CURIE_LIVE_CHANNEL_READ=1. CI never sets it. Once opted in, the
-setup is required, never skipped: SLACK_BOT_TOKEN, SLACK_TEST_CHANNEL (a
+setup is required, never skipped: CURIE_LIVE_CREDENTIAL_FILE, SLACK_TEST_CHANNEL (a
 channel the bot is in) and SLACK_TEST_FOREIGN_CHANNEL (a channel the bot is
 NOT in). Postgres, Valkey and the object store are the compose services, as
 in the rest of this suite. Nothing is faked: the API's own HTTP client talks
@@ -23,12 +23,14 @@ import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from curie_api.config import get_settings
 from curie_api.main import create_app
+from curie_test_support.channel_gateway import API_TOKEN, slack_gateway
 from fastapi.testclient import TestClient
 
 from apps.api.tests.test_channel_read import (
@@ -46,7 +48,7 @@ pytestmark = pytest.mark.skipif(
     reason="live Slack channel read runs only with CURIE_LIVE_CHANNEL_READ=1",
 )
 
-REQUIRED = ("SLACK_BOT_TOKEN", "SLACK_TEST_CHANNEL", "SLACK_TEST_FOREIGN_CHANNEL")
+REQUIRED = ("CURIE_LIVE_CREDENTIAL_FILE", "SLACK_TEST_CHANNEL", "SLACK_TEST_FOREIGN_CHANNEL")
 UNBOUND = "C0NEVERBOUND9"
 
 
@@ -80,14 +82,14 @@ def live_slack() -> LiveSlack:
         pytest.fail(
             "CURIE_LIVE_CHANNEL_READ=1 needs " + ", ".join(missing) + "; this is a setup failure"
         )
-    token = os.environ["SLACK_BOT_TOKEN"]
+    token = Path(os.environ["CURIE_LIVE_CREDENTIAL_FILE"]).read_text().strip()
     channel = os.environ["SLACK_TEST_CHANNEL"]
     foreign = os.environ["SLACK_TEST_FOREIGN_CHANNEL"]
     if channel == foreign:
         pytest.fail("SLACK_TEST_CHANNEL and SLACK_TEST_FOREIGN_CHANNEL must differ")
     identity = _slack("auth.test", token)
     if not identity.get("ok"):
-        pytest.fail(f"SLACK_BOT_TOKEN is not usable: {identity.get('error', 'unknown')}")
+        pytest.fail(f"CURIE_LIVE_CREDENTIAL_FILE is not usable: {identity.get('error', 'unknown')}")
     info = _slack("conversations.info", token, channel=foreign)
     if info.get("ok") and info.get("channel", {}).get("is_member"):
         pytest.fail("the bot is a member of SLACK_TEST_FOREIGN_CHANNEL; it must not be")
@@ -142,64 +144,70 @@ def live_agent(
     live_slack: LiveSlack,
 ) -> Iterator[LiveAgent]:
     monkeypatch.setenv("INTERNAL_WORKER_TOKEN", WORKER_TOKEN)
-    monkeypatch.setenv("SLACK_BOT_TOKEN", live_slack.token)
+    gateway = slack_gateway(None, {"default": live_slack.token})
+    monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_URL", gateway.__enter__())
+    monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_TOKEN", API_TOKEN)
+    monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE", "true")
     monkeypatch.setenv("RUNS_STREAM", f"test:curie:channel-read-live:{uuid.uuid4().hex}")
     monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
     monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
     monkeypatch.setenv("DEAD_LETTER_WATCH_INTERVAL_S", "0")
     get_settings.cache_clear()
-    with TestClient(create_app()) as client:
-        agent = client.post(
-            "/agents",
-            json={
-                "name": f"live-reader-{uuid.uuid4().hex[:8]}",
-                "channel": {"kind": "slack", "address": live_slack.channel},
-            },
-            headers=auth_headers,
-        )
-        assert agent.status_code == 201, "agent create failed"
-        agent_id = agent.json()["id"]
-        bound = client.post(
-            f"/agents/{agent_id}/channels",
-            json={"kind": "slack", "address": live_slack.foreign},
-            headers=auth_headers,
-        )
-        assert bound.status_code == 201, "binding the foreign channel failed"
-        version = client.post(
-            f"/agents/{agent_id}/versions",
-            json={"version_label": "live", "created_by": "operator"},
-            headers=auth_headers,
-        )
-        assert version.status_code == 201, "version create failed"
-        version_id = version.json()["id"]
-        upload = client.put(
-            f"/agents/{agent_id}/versions/{version_id}/bundle",
-            files={"file": ("reader-bot.tar.gz", _bundle_archive(True))},
-            headers=auth_headers,
-        )
-        assert upload.status_code == 201, "bundle upload failed"
-        deployment = client.post(
-            "/deployments",
-            json={"agent_id": agent_id, "version_id": version_id, "environment": "dev"},
-            headers=auth_headers,
-        )
-        assert deployment.status_code == 201, "deployment create failed"
-        deployment_id = deployment.json()["id"]
-        minted = client.post(
-            MINT_URL,
-            json={
-                "agent_id": agent_id,
-                "deployment_id": deployment_id,
-                "event_id": f"live-{uuid.uuid4().hex}",
-                "mode": "open",
-                "owner": f"owner-{uuid.uuid4().hex}",
-                "default_channel": {"kind": "slack", "address": live_slack.channel},
-                "ttl_s": 3600,
-            },
-            headers=WORKER_HEADERS,
-        )
-        assert minted.status_code == 200, f"mint answered {minted.status_code}"
-        yield LiveAgent(client, agent_id, deployment_id, minted.json()["token"])
+    try:
+        with TestClient(create_app()) as client:
+            agent = client.post(
+                "/agents",
+                json={
+                    "name": f"live-reader-{uuid.uuid4().hex[:8]}",
+                    "channel": {"kind": "slack", "address": live_slack.channel},
+                },
+                headers=auth_headers,
+            )
+            assert agent.status_code == 201, "agent create failed"
+            agent_id = agent.json()["id"]
+            bound = client.post(
+                f"/agents/{agent_id}/channels",
+                json={"kind": "slack", "address": live_slack.foreign},
+                headers=auth_headers,
+            )
+            assert bound.status_code == 201, "binding the foreign channel failed"
+            version = client.post(
+                f"/agents/{agent_id}/versions",
+                json={"version_label": "live", "created_by": "operator"},
+                headers=auth_headers,
+            )
+            assert version.status_code == 201, "version create failed"
+            version_id = version.json()["id"]
+            upload = client.put(
+                f"/agents/{agent_id}/versions/{version_id}/bundle",
+                files={"file": ("reader-bot.tar.gz", _bundle_archive(True))},
+                headers=auth_headers,
+            )
+            assert upload.status_code == 201, "bundle upload failed"
+            deployment = client.post(
+                "/deployments",
+                json={"agent_id": agent_id, "version_id": version_id, "environment": "dev"},
+                headers=auth_headers,
+            )
+            assert deployment.status_code == 201, "deployment create failed"
+            deployment_id = deployment.json()["id"]
+            minted = client.post(
+                MINT_URL,
+                json={
+                    "agent_id": agent_id,
+                    "deployment_id": deployment_id,
+                    "event_id": f"live-{uuid.uuid4().hex}",
+                    "mode": "open",
+                    "owner": f"owner-{uuid.uuid4().hex}",
+                    "default_channel": {"kind": "slack", "address": live_slack.channel},
+                    "ttl_s": 3600,
+                },
+                headers=WORKER_HEADERS,
+            )
+            assert minted.status_code == 200, f"mint answered {minted.status_code}"
+            yield LiveAgent(client, agent_id, deployment_id, minted.json()["token"])
+    finally:
+        gateway.__exit__(None, None, None)
     get_settings.cache_clear()
 
 

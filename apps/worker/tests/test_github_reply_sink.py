@@ -60,7 +60,7 @@ def _update(kind: str, address: str, text: str = "the answer") -> ReplyUpdate:
 
 
 def _config() -> WorkerConfig:
-    return WorkerConfig(slack_bot_token=SLACK_TOKEN)  # type: ignore[arg-type]
+    return WorkerConfig()
 
 
 class _NoNetworkSession:

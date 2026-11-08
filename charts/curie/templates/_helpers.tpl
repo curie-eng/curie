@@ -1223,6 +1223,11 @@ credentials and the derived collector header cannot disagree. */}}
 {{- $langfuseInitProjectSecretKey := include "curie.managedSecret" (dict "root" . "key" "langfuseInitProjectSecretKey" "value" .Values.langfuse.init.projectSecretKey "default" "sk-lf-curie-dev" "hex" false "existingData" $existingSecretData) -}}
 {{- $langfuseInitUserPassword := include "curie.managedSecret" (dict "root" . "key" "langfuseInitUserPassword" "value" .Values.langfuse.init.userPassword "default" "curie-dev-password" "hex" false "existingData" $existingSecretData) -}}
 {{- $content := dict -}}
+{{- range $caller := list "api" "worker" -}}
+{{- $key := printf "channelGateway%sToken" (title $caller) -}}
+{{- $_ := set $content $key (include "curie.managedSecret" (dict "root" $ "key" $key "value" (index $.Values.channelGateway (printf "%sToken" $caller)) "default" (printf "curie-dev-gateway-%s" $caller) "hex" false "existingData" $existingSecretData)) -}}
+{{- end -}}
+
 {{- $_ := set $content "installationId" ((include "curie.installationId" .) | toString) -}}
 {{- $_ := set $content "postgresPassword" ((include "curie.managedSecret" (dict "root" . "key" "postgresPassword" "value" .Values.postgres.auth.password "default" "postgres" "hex" false "existingData" $existingSecretData)) | toString) -}}
 {{- $_ := set $content "valkeyPassword" ((include "curie.managedSecret" (dict "root" . "key" "valkeyPassword" "value" .Values.valkey.password "default" "valkeypass" "hex" false "existingData" $existingSecretData)) | toString) -}}

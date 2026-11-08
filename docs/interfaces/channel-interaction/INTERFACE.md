@@ -270,10 +270,10 @@ owes, and no deliverer calls an adapter with it.
   mail and Discord, choose their affordances statically. The "Advertise
   capabilities" requirement states ADR-0020's intent; another renderer has no
   live negotiation wire to join. The enum itself does have API consumers:
-  `apps/api/src/curie_api/channel_read/slack_reads.py::SlackChannelReader`
+  `packages/channel-gateway/src/curie_channel_gateway/slack/reads.py::SlackChannelReader`
   advertises `ChannelCapability.HISTORY_READ`, checked by
   `apps/api/src/curie_api/channel_read/readers.py::reader_for`.
-  `apps/api/src/curie_api/channel_read/slack_canvas.py::SlackCanvasReader`
+  `packages/channel-gateway/src/curie_channel_gateway/slack/canvas.py::SlackCanvasReader`
   advertises `CANVAS_READ` and `CANVAS_EDIT`, checked through
   `apps/api/src/curie_api/channel_read/readers.py::canvas_reader_for` from
   `apps/api/src/curie_api/channel_read/canvas.py`. These local reader checks

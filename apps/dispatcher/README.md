@@ -501,3 +501,48 @@ uv run pytest apps/dispatcher/tests -q
 event-filtering cases; `tests/test_queue.py` covers the seam and dedupe against
 real Valkey; `tests/test_supervisor.py` covers backoff, reconnect, and graceful
 shutdown with a fake connection.
+
+
+## Provider gateway
+
+Run `python -m curie_channel_gateway.slack.read_server` alongside the dispatcher
+for provider reads, group membership, attachment fetches, sender identities and
+worker replies. Only these processes receive Slack credentials. The dispatcher
+retains the chat attester key; the read gateway does not mint approval evidence.
+
+Set distinct `CURIE_CHANNEL_GATEWAY_API_TOKEN` and
+`CURIE_CHANNEL_GATEWAY_WORKER_TOKEN` on the gateway. Each application receives
+its own value as `CURIE_CHANNEL_GATEWAY_TOKEN`, plus `CURIE_CHANNEL_GATEWAY_URL`.
+API credentials authorize channel, canvas and membership operations; worker
+credentials authorize files, sender lookup and replies. Provider identities are
+configured at the gateway; reply origins pass its origin policy. File responses
+are capped at 32 MiB by default on both sides. Helm derives
+the gateway cap from `worker.attachments.maxFileBytes`; standalone gateways use
+`CURIE_CHANNEL_GATEWAY_MAX_FILE_BYTES`.
+
+The listener requires `CURIE_CHANNEL_GATEWAY_TLS_CERT` and
+`CURIE_CHANNEL_GATEWAY_TLS_KEY`. Clients verify the certificate using their
+system trust store, including an operator-supplied `SSL_CERT_FILE`.
+`CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE=true` explicitly permits HTTP on both ends;
+Compose uses that opt-out only for its local development listener.
+
+Existing installations must remove bot, user and app token environment variables
+from API and worker before upgrading, including named identity token variables.
+Both applications refuse those credentials at boot. In Helm, enable
+`channelGateway.deploy` with a trusted `channelGateway.tlsSecret`, or explicitly
+opt out of TLS with `channelGateway.allowInsecure`. Set `channelGateway.url` to
+use an external gateway. The gateway is opt-in because the chart cannot choose
+or trust an operator's server certificate. Until configured, provider-dependent
+operations fail closed; authorization never borrows a different identity or
+widens group membership when a gateway answer is missing.
+
+Gateway requests carry a signed timestamp and nonce as well as the caller
+credential. The replay ledger consumes each nonce once, survives restart and
+rejects stale or altered requests. Set `CURIE_CHANNEL_GATEWAY_REPLAY_DB` to a
+persistent SQLite file; Helm and Compose mount a dedicated volume. The chart
+uses one gateway replica with Recreate so the SQLite volume has one owner.
+
+Reply delivery uses the shared durable delivery claims as well as request replay
+protection. A retry of identical bytes at the same identity and provider route
+returns its confirmed result. An unconfirmed claim refuses after restart.
+Distinct posts with identical content require distinct delivery IDs.

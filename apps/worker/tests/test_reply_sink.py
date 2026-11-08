@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 
 import aiohttp
+import httpx
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
@@ -48,10 +49,9 @@ from curie_channel_gateway.reply_errors import (
     UnconfiguredSlackIdentityError,
     UntrustedSlackEndpointError,
 )
-from curie_channel_gateway.reply_transport import (
-    MAX_ACK_BODY_BYTES,
-    HttpReplyAdapter,
-)
+from curie_channel_gateway.reply_transport import MAX_ACK_BODY_BYTES, HttpReplyAdapter
+from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
+from curie_test_support.channel_gateway import WORKER_TOKEN, slack_gateway
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import (
     CLUSTER_MESSAGE_ADAPTER,
@@ -115,13 +115,48 @@ def _cluster_message_update(
 
 def _config(capture_port: int | None = None, **overrides: object) -> WorkerConfig:
     base: dict[str, object] = {
-        "slack_bot_token": SLACK_TOKEN,
         "adapter_credentials": {ADAPTER_A: SECRET_A, ADAPTER_B: SECRET_B},
     }
-    if capture_port is not None:
-        base["slack_api_base_url"] = f"http://127.0.0.1:{capture_port}/slack/api/"
+    provider_url = f"http://127.0.0.1:{capture_port}/slack/api/" if capture_port else None
+    trusted = overrides.pop("slack_trusted_origins", ())
+    if isinstance(trusted, str):
+        trusted = tuple(x.strip() for x in trusted.split(",") if x.strip())
+    gateway = slack_gateway(
+        lambda request: httpx.Response(500),
+        {},
+        reply=SlackReplyAdapter(SLACK_TOKEN, base_url=provider_url, trusted_origins=trusted),
+    )
+    base.update(
+        channel_gateway_url=gateway.__enter__(),
+        channel_gateway_token=WORKER_TOKEN,
+        channel_gateway_allow_insecure=True,
+    )
+    _test_gateways.append(gateway)
     base.update(overrides)
     return WorkerConfig(**base)  # type: ignore[arg-type]
+
+
+_test_gateways = []
+_test_sinks = []
+_production_reply_sink = build_reply_sink
+
+
+def build_reply_sink(config):
+    sink = _production_reply_sink(config)
+    _test_sinks.append(sink)
+    return sink
+
+
+async def _cleanup_gateway_test(coroutine):
+    try:
+        return await coroutine
+    finally:
+        for sink in _test_sinks:
+            await sink.aclose()
+        _test_sinks.clear()
+        for gateway in _test_gateways:
+            gateway.__exit__(None, None, None)
+        _test_gateways.clear()
 
 
 # --- T-B4: a non-Slack kind routes to the HTTP adapter ------------------------
@@ -149,7 +184,7 @@ def test_a_non_slack_kind_is_delivered_over_http_and_never_touches_slack() -> No
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_the_http_adapter_posts_the_serialized_event_as_json() -> None:
@@ -189,7 +224,7 @@ def test_the_http_adapter_posts_the_serialized_event_as_json() -> None:
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_a_reply_post_returns_the_adapters_minted_ref() -> None:
@@ -219,7 +254,7 @@ def test_a_reply_post_returns_the_adapters_minted_ref() -> None:
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 # --- T-B5: platform egress fails closed ---------------------------------------
@@ -256,7 +291,7 @@ def test_egress_without_a_credential_raises_and_sends_nothing(
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_egress_without_an_endpoint_raises_and_sends_nothing() -> None:
@@ -278,7 +313,7 @@ def test_egress_without_an_endpoint_raises_and_sends_nothing() -> None:
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 # --- T-B13: per-adapter credentials, and cross-adapter containment ------------
@@ -324,7 +359,7 @@ def test_each_adapters_secret_reaches_only_its_own_endpoint() -> None:
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_the_slack_bot_token_is_never_sent_to_a_non_slack_adapter() -> None:
@@ -348,7 +383,7 @@ def test_the_slack_bot_token_is_never_sent_to_a_non_slack_adapter() -> None:
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 # --- T-B10: the Slack bot token cannot leave its configured origin ------------
@@ -391,7 +426,7 @@ def test_a_slack_endpoint_at_another_origin_is_refused_and_nothing_is_sent() -> 
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_a_slack_endpoint_at_the_configured_origin_is_accepted() -> None:
@@ -417,7 +452,7 @@ def test_a_slack_endpoint_at_the_configured_origin_is_accepted() -> None:
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_a_configured_trusted_dev_origin_is_accepted() -> None:
@@ -462,7 +497,7 @@ def test_a_configured_trusted_dev_origin_is_accepted() -> None:
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_a_portless_trusted_entry_accepts_any_port_on_that_host() -> None:
@@ -498,7 +533,7 @@ def test_a_portless_trusted_entry_accepts_any_port_on_that_host() -> None:
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_a_portless_trusted_entry_still_refuses_another_host() -> None:
@@ -524,7 +559,7 @@ def test_a_portless_trusted_entry_still_refuses_another_host() -> None:
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_an_exact_trusted_entry_still_refuses_a_port_mismatch() -> None:
@@ -561,7 +596,7 @@ def test_an_exact_trusted_entry_still_refuses_a_port_mismatch() -> None:
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_a_slack_turn_with_no_per_turn_endpoint_uses_the_configured_origin() -> None:
@@ -578,7 +613,7 @@ def test_a_slack_turn_with_no_per_turn_endpoint_uses_the_configured_origin() -> 
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 # --- #2096: the rollout-free disconnected cluster-message relay --------------
@@ -618,8 +653,6 @@ def test_cluster_message_adapter_wins_before_slack_kind_and_uses_worker_token(
                 json.dumps({CLUSTER_MESSAGE_ADAPTER: SHADOW_CLUSTER_MESSAGE_TOKEN}),
             )
             config = WorkerConfig(
-                slack_bot_token=SLACK_TOKEN,
-                slack_api_base_url=f"http://127.0.0.1:{port}/slack/api/",
                 api_base_url=f"http://127.0.0.1:{port}",
                 internal_worker_token=INTERNAL_WORKER_TOKEN,
             )
@@ -653,7 +686,7 @@ def test_cluster_message_adapter_wins_before_slack_kind_and_uses_worker_token(
             await hostile_server.close()
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 @pytest.mark.parametrize(
@@ -706,7 +739,7 @@ def test_cluster_message_rejects_noncanonical_uuid4_before_any_request(
             if sink is not None:
                 await sink.aclose()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_cluster_message_absent_reply_ref_names_absence_not_malformed_uuid(
@@ -749,7 +782,7 @@ def test_cluster_message_absent_reply_ref_names_absence_not_malformed_uuid(
             if sink is not None:
                 await sink.aclose()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_cluster_message_redirect_is_refused_without_moving_worker_token() -> None:
@@ -784,7 +817,7 @@ def test_cluster_message_redirect_is_refused_without_moving_worker_token() -> No
                 await sink.aclose()
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 @pytest.mark.parametrize("kind", ["mail", "discord"])
@@ -812,7 +845,7 @@ def test_non_reserved_kinds_keep_the_generic_http_fallback(kind: str) -> None:
                 await sink.aclose()
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_non_reserved_adapter_on_slack_keeps_the_slack_adapter() -> None:
@@ -833,7 +866,7 @@ def test_non_reserved_adapter_on_slack_keeps_the_slack_adapter() -> None:
             port = server.port
             assert port is not None
             sink = build_reply_sink(_config(port))
-            with pytest.raises(UnconfiguredSlackIdentityError, match=f"'{ADAPTER_A}'"):
+            with pytest.raises(UnconfiguredSlackIdentityError):
                 await sink.emit(
                     _update("slack"),
                     route=TargetRoute(
@@ -847,7 +880,7 @@ def test_non_reserved_adapter_on_slack_keeps_the_slack_adapter() -> None:
                 await sink.aclose()
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 # --- T-B6: #530's transport fallback is Slack-only ---------------------------
@@ -879,7 +912,7 @@ def test_an_unreachable_slack_endpoint_falls_back_to_the_configured_default() ->
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_a_redirecting_adapter_endpoint_is_refused_and_the_secret_never_moves() -> None:
@@ -912,7 +945,7 @@ def test_a_redirecting_adapter_endpoint_is_refused_and_the_secret_never_moves() 
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_a_redirect_is_not_swallowed_by_best_effort_delivery() -> None:
@@ -941,7 +974,7 @@ def test_a_redirect_is_not_swallowed_by_best_effort_delivery() -> None:
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_an_unreachable_email_endpoint_raises_and_never_falls_back_to_slack() -> None:
@@ -970,7 +1003,7 @@ def test_an_unreachable_email_endpoint_raises_and_never_falls_back_to_slack() ->
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 # --- T-B7: #708's best-effort swallow survives on the HTTP path ---------------
@@ -994,7 +1027,7 @@ def test_a_best_effort_email_reply_to_a_dead_endpoint_completes() -> None:
         # delivered.
         assert ack.ref is None
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_the_same_dead_email_endpoint_still_raises_without_the_flag() -> None:
@@ -1010,7 +1043,7 @@ def test_the_same_dead_email_endpoint_still_raises_without_the_flag() -> None:
                 route=TargetRoute(endpoint=f"http://127.0.0.1:{dead}/a", adapter=ADAPTER_A),
             )
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_a_missing_credential_is_not_swallowed_by_best_effort() -> None:
@@ -1026,7 +1059,7 @@ def test_a_missing_credential_is_not_swallowed_by_best_effort() -> None:
                 best_effort_unreachable=True,
             )
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 # --- The acknowledgement body is bounded, and errors carry no full URL --------
@@ -1094,7 +1127,7 @@ def test_a_chunked_oversize_ack_is_refused_even_with_a_small_first_chunk() -> No
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_an_ack_at_the_cap_is_still_read_and_its_ref_survives() -> None:
@@ -1123,7 +1156,7 @@ def test_an_ack_at_the_cap_is_still_read_and_its_ref_survives() -> None:
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 @pytest.mark.parametrize("status", [401, 500])
@@ -1159,7 +1192,7 @@ def test_a_rejected_delivery_never_puts_the_endpoint_url_in_the_error(
         finally:
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 def test_a_missing_adapter_identity_names_only_the_endpoint_origin() -> None:
@@ -1179,7 +1212,7 @@ def test_a_missing_adapter_identity_names_only_the_endpoint_origin() -> None:
         assert "super-secret-token" not in message
         assert _urls_in(message) == ["http://adapter.example"]
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 @pytest.mark.parametrize("status", [400, 401, 403, 404, 410, 429, 500, 502, 503])
@@ -1237,7 +1270,7 @@ def test_only_gone_completion_is_a_terminal_delivery_failure(
             await adapter.aclose()
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
 
 
 @pytest.mark.parametrize(
@@ -1302,4 +1335,4 @@ def test_only_exact_refused_completion_classifies_provider_egress(
             await adapter.aclose()
             await server.close()
 
-    asyncio.run(go())
+    asyncio.run(_cleanup_gateway_test(go()))
