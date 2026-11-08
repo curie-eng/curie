@@ -688,6 +688,19 @@ def dm_receiver(
     return found[-1] if len(places) == 1 else None
 
 
+def dm_serves_origin(
+    registration: ReceiverRegistrationV1, provider: str, binding_id: str,
+) -> bool:
+    """Whether a DM card delivered by ``registration`` can be answered for its origin.
+
+    The same rule the answer applies (``http_approval_answer._serves_origin``):
+    a Slack origin's binding must be one the receiver explicitly serves. No
+    Slack registration lists an email binding, so an email origin is bound to
+    its stored card instead and needs no listing here. @spec APPROVER-DM-1.
+    """
+    return provider == "email" or binding_id in registration.binding_ids
+
+
 def dm_account(
     registration: ReceiverRegistrationV1, accounts: Any,
 ) -> dict[str, Any] | None:
@@ -734,6 +747,7 @@ class _DmCapture:
     credential: ResolvedProviderCredential = field(repr=False)
     approver: tuple[str, str]
     account: dict[str, Any]
+    origin: tuple[str, str]
 
     @property
     def delivery(self) -> wire.ApprovalDmDeliveryV1:
@@ -790,9 +804,10 @@ async def _provider_configuration(
 
 async def _capture_dm(
     session: AsyncSession, runtime: HttpInvocationRuntime, agent: Agent, identity: str,
-    ticket: ApprovalTicket,
+    ticket: ApprovalTicket, origin: tuple[str, str],
 ) -> _DmCapture:
-    """Phase one: one selected person, a current receiver, one account on it.
+    """Phase one: one selected person, a current receiver serving the origin
+    (``origin`` is the turn's provider and binding id), one account on it.
 
     @spec APPROVER-DM-1.
     """
@@ -800,7 +815,7 @@ async def _capture_dm(
         _refuse(422, APPROVER_DM_RECIPIENT_COUNT)
     tenant = agent.tenant_id
     registration = dm_receiver(runtime, str(tenant), identity)
-    if registration is None:
+    if registration is None or not dm_serves_origin(registration, *origin):
         _refuse(409, APPROVER_DM_RECEIVER_MISSING)
     try:
         await _current_slack_scope(session, registration, tenant)
@@ -821,7 +836,7 @@ async def _capture_dm(
         _refuse(503, "authority_unavailable")
     return _DmCapture(
         identity, tenant, registration, version, reference, issuer, credential,
-        (approver.issuer, approver.subject), account,
+        (approver.issuer, approver.subject), account, origin,
     )
 
 
@@ -910,6 +925,8 @@ async def _recheck_dm(
     ):
         _refuse(503, "authority_unavailable")
     if dm_receiver(runtime, str(capture.tenant_id), capture.identity) is not capture.registration:
+        _refuse(503, "authority_unavailable")
+    if not dm_serves_origin(capture.registration, *capture.origin):
         _refuse(503, "authority_unavailable")
     try:
         await _current_slack_scope(writer, capture.registration, capture.tenant_id)
@@ -1143,7 +1160,10 @@ async def create_http_approval(
                 # and one recipient account on its installation and namespace.
                 if registration is None or ticket is None:
                     _refuse(409, APPROVER_DM_REQUIRES_DYNAMIC)
-                dm = await _capture_dm(session, runtime, agent, identity, ticket)
+                dm = await _capture_dm(
+                    session, runtime, agent, identity, ticket,
+                    (original.scope.provider, original.scope.binding_id),
+                )
         if registration is not None:
             await _serving_gate(request, registration, serving)
         recipient = None if dm is None else await _lookup_recipient(request, dm)
@@ -1297,9 +1317,10 @@ def _registration_association(
 
 async def _first_registration(
     writer: AsyncSession, runtime: HttpInvocationRuntime, row: Approval,
-    body: wire.ApprovalCardRegistrationRequestV1,
+    body: wire.ApprovalCardRegistrationRequestV1, saved: wire.ApprovalContextV1,
 ) -> ReceiverRegistrationV1:
-    """The current route still delivers this row to the named bot and recipient.
+    """The current route still delivers this row to the named bot and recipient,
+    through a receiver that serves the row's origin (``saved`` is its seal).
 
     Consulted only before any registration commits (plan R4).
     @spec APPROVER-DM-2.
@@ -1320,7 +1341,9 @@ async def _first_registration(
     ):
         _refuse(409, APPROVAL_CARD_MISMATCH)
     registration = dm_receiver(runtime, str(agent.tenant_id), identity)
-    if registration is None:
+    if registration is None or not dm_serves_origin(
+        registration, saved.scope.provider, saved.scope.binding_id,
+    ):
         _refuse(409, APPROVAL_CARD_MISMATCH)
     try:
         await _current_slack_scope(writer, registration, agent.tenant_id)
@@ -1380,7 +1403,7 @@ async def register_approval_card(
                     _refuse(409, "approval_provenance_conflict")
                 if row.card_channel is not None:
                     _refuse(409, APPROVAL_CARD_MISMATCH)
-                registration = await _first_registration(writer, runtime, row, body)
+                registration = await _first_registration(writer, runtime, row, body, saved)
                 row.card_channel = body.channel
                 await writer.flush()
                 await writer.refresh(row)

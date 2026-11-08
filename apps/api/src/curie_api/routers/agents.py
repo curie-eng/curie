@@ -394,6 +394,16 @@ async def update_agent(
     # single fetch.
     if data.approval_routes is not None:
         proposed = {name: b.model_dump() for name, b in data.approval_routes.items()}
+        # ADR 0272 decision 1: refuse an undeliverable approver_dm resolution
+        # early too, in the order the locked write judges it, which repeats the
+        # check authoritatively under the agent row lock.
+        try:
+            await crud_agents.check_approver_dm_routes(
+                session, agent, proposed,
+                runtime=getattr(request.app.state, "http_identity_runtime", None),
+            )
+        except crud_agents.ApprovalRoutesRefused as exc:
+            raise HTTPException(exc.status, {"code": exc.code, "message": str(exc)}) from exc
         # ADR 0271 decision 1: refuse a selector write early, before any field
         # commits; `update_agent_approval_routes` repeats the version checks
         # under the agent row lock, where they are authoritative.
