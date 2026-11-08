@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import uuid
 
@@ -13,7 +14,7 @@ from curie_worker.binding import BindingResolver, ResolvedDeployment
 from curie_worker.config import WorkerConfig
 from curie_worker.eval.stream import EvalStreamConsumer
 
-_SEED = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+_SEED = base64.b64encode(bytes(range(32))).decode()
 _MAP = {
     "version": 1,
     "agents": {

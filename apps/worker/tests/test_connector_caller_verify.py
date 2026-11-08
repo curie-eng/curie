@@ -136,7 +136,7 @@ def _tampered() -> list[tuple[str, str]]:
     vector = _BY_NAME["a_plain_agent_name"]
     minted = str(vector["minted"])
     prefix, payload, signature = minted.split(".")
-    seed = base64.b64decode(str(vector["seed"]))
+    seed = bytes(range(*vector["seed_range"]))
 
     def signed(claims: bytes, *, head: str = "cct") -> str:
         segment = _b64url(claims)

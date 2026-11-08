@@ -12,6 +12,7 @@ recycling of a shell exactly as it would against the platform.
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import gzip
 import io
@@ -505,7 +506,7 @@ def test_connector_endpoint_settings_reach_the_runner_on_a_shell(
         binding._config = WorkerConfig(
             api_key="",
             bundle_plugin_dir=str(tmp_path),
-            connector_caller_signing_key=__import__("base64").b64encode(bytes(range(32))).decode(),
+            connector_caller_signing_key=base64.b64encode(bytes(range(32))).decode(),
             connector_endpoints=StaticConnectorEndpoints.model_validate(endpoints),
         )
         resolved = ResolvedDeployment(

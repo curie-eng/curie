@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -325,7 +326,7 @@ def test_live_worker_boot_reaches_static_proxy_and_exposes_upload_capability(
     from curie_worker.config import WorkerConfig
     from nacl.signing import SigningKey
 
-    seed = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+    seed = base64.b64encode(bytes(range(32))).decode()
     public = SigningKey(bytes(range(32))).verify_key
     seen: list[dict] = []
     callers: list[bool] = []

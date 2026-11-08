@@ -1101,10 +1101,13 @@ mod connector_caller_preservation_tests {
         CONNECTOR_CALLER_PREVIOUS_VERIFY_KEY, CONNECTOR_CALLER_SIGNING_KEY,
         CONNECTOR_CALLER_VERIFY_KEY,
     };
+    use base64::Engine;
 
     // The first frozen seed and its public key
     // (tests/vectors/connector-caller-token.json).
-    const SEED: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    fn seed() -> String {
+        base64::engine::general_purpose::STANDARD.encode((0_u8..32).collect::<Vec<_>>())
+    }
     const PUBLIC: &str = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=";
 
     fn get<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -1115,7 +1118,7 @@ mod connector_caller_preservation_tests {
     }
 
     fn recorded() -> serde_json::Value {
-        serde_json::json!({"connectorCaller": {"signingKey": SEED, "verifyKey": PUBLIC}})
+        serde_json::json!({"connectorCaller": {"signingKey": seed(), "verifyKey": PUBLIC}})
     }
 
     /// A plain `cluster up` drops anything it does not re-pass, and a new pair
@@ -1123,7 +1126,10 @@ mod connector_caller_preservation_tests {
     #[test]
     fn an_upgrade_re_supplies_the_recorded_pair_unchanged() {
         let all = resolve_preserved_values(Some(&recorded()), &[]);
-        assert_eq!(get(&all, CONNECTOR_CALLER_SIGNING_KEY), Some(SEED));
+        assert_eq!(
+            get(&all, CONNECTOR_CALLER_SIGNING_KEY),
+            Some(seed().as_str())
+        );
         assert_eq!(get(&all, CONNECTOR_CALLER_VERIFY_KEY), Some(PUBLIC));
         assert!(
             generate_connector_caller_values(Some(&recorded()), &[], false)
@@ -1169,7 +1175,7 @@ mod connector_caller_preservation_tests {
 
     #[test]
     fn an_operator_set_wins() {
-        let sets = vec![format!("{CONNECTOR_CALLER_SIGNING_KEY}={SEED}")];
+        let sets = vec![format!("{CONNECTOR_CALLER_SIGNING_KEY}={}", seed())];
         assert!(generate_connector_caller_values(None, &sets, false)
             .unwrap()
             .is_empty());
@@ -1194,7 +1200,7 @@ mod connector_caller_preservation_tests {
     #[test]
     fn a_previous_key_is_preserved_and_never_generated() {
         let existing = serde_json::json!({"connectorCaller": {
-            "signingKey": SEED, "verifyKey": PUBLIC, "previousVerifyKey": "OLD"
+            "signingKey": seed(), "verifyKey": PUBLIC, "previousVerifyKey": "OLD"
         }});
         let all = resolve_preserved_values(Some(&existing), &[]);
         assert_eq!(get(&all, CONNECTOR_CALLER_PREVIOUS_VERIFY_KEY), Some("OLD"));
