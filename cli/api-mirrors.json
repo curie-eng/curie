@@ -180,6 +180,11 @@
       "omissions": []
     },
     {
+      "struct": "ExemptGroupResponse",
+      "schema": "ApprovalExemptGroupOut",
+      "omissions": []
+    },
+    {
       "struct": "ApproverTicketWrite",
       "schema": "ApproverTicketRegistration",
       "omissions": []
@@ -197,6 +202,11 @@
     {
       "struct": "ApprovalSeparationWrite",
       "schema": "ApprovalSeparation",
+      "omissions": []
+    },
+    {
+      "struct": "ExemptGroupWrite",
+      "schema": "ApprovalExemptGroup",
       "omissions": []
     },
     {
