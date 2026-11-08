@@ -52,7 +52,7 @@ from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.kernel import failures, identity
 from curie_worker.kernel import routing as kernel_routing
 from curie_worker.runner_client import RunnerError
-from curie_worker.sandbox.types import SandboxError
+from curie_worker.sandbox.types import RouteChangedError, SandboxError
 
 from ..queue_fixtures import qevent, wait_until
 from .test_http_approval_pause import Creator, awaiting, raw_payload
@@ -1887,6 +1887,148 @@ def test_an_approval_resume_never_adopts_the_live_route_a_failed_suspend_left(
             assert recorded(replaced) == (requester_digest(alice), claims["exp"])
             assert paused_runner.opened == [first.text], "the resume ran on the paused runner"
             assert runner_at(h, replaced).opened == [resumed.text]
+            assert all_steers(h) == []
+            assert await is_done(h, resumed)
+
+    asyncio.run(run())
+
+
+def test_an_approval_resume_meeting_a_live_turn_waits_then_replaces_once(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec CONNECTOR-REQUESTER-3 (refusal, then recovery): no steer into a live turn.
+
+    Alice's turn pauses for approval and the suspend fails, so her runner
+    stays live; then it reports a live turn. Another person approves. The
+    opted-in resume never steers into that turn and never replaces a runner
+    mid-turn: it refuses with ``ThreadBusyError``, with no new claim and
+    nothing sent to the live runner. Liveness: once the runner is back at its
+    ``awaiting-approval`` boundary, the same resume replaces the sandbox and
+    runs once, on a fresh claim-time cct naming Alice, never the approver.
+    """
+    require_execution_interface()
+    require_requester_interface()
+    clock = install_clock(monkeypatch)
+
+    async def run() -> None:
+        binding, alice, bob, core = event_parties()
+        creator = RecordingCreator()
+        async with make_harness(
+            binding=binding, identity_authority=core, approvals=creator, per_sandbox_runners=2
+        ) as h:
+            monkeypatch.setattr(h.substrate, "suspend", failed_suspend)
+            first, approval_id = await pause_for_approval(h, creator, "resume-busy")
+            key = thread_key(first)
+            paused = route(h, key)
+            paused_runner = runner_at(h, paused)
+            before = cct_of(h.fake_k8s.claim_envs[0])
+            paused_runner.session_status = "running"
+            paused_runner.turn_active = True
+
+            clock.advance(120)
+            resumed = resume_of(approval_id, "resume-busy")
+            core.by_event[resumed.event_id] = alice
+            with pytest.raises(failures.ThreadBusyError):
+                await process(h, resumed)
+
+            assert len(h.fake_k8s.claim_envs) == 1, "the resume claimed beside a live turn"
+            assert route(h, key) == paused
+            assert paused_runner.opened == [first.text]
+            assert all_steers(h) == [], "the resume steered into the live turn"
+            assert not await is_done(h, resumed)
+
+            paused_runner.turn_active = False
+            paused_runner.session_status = SessionStatus.AWAITING_APPROVAL.value
+            await process(h, resumed)
+
+            assert len(h.fake_k8s.claim_envs) == 2
+            token = cct_of(h.fake_k8s.claim_envs[1])
+            claims = assert_fresh_requester_token(
+                binding, token, before=before, requester=alice, approver=bob
+            )
+            replaced = route(h, key)
+            assert replaced.claim_name != paused.claim_name
+            assert recorded(replaced) == (requester_digest(alice), claims["exp"])
+            assert paused_runner.opened == [first.text]
+            assert runner_at(h, replaced).opened == [resumed.text]
+            assert all_opened(h).count(resumed.text) == 1
+            assert all_steers(h) == []
+            assert await is_done(h, resumed)
+
+    asyncio.run(run())
+
+
+def test_an_approval_resume_never_adopts_a_route_that_appeared_after_its_snapshot(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec CONNECTOR-REQUESTER-3 (refusal, then recovery): no adoption past the snapshot.
+
+    Alice's paused runner stays live (the suspend failed), but the resume's
+    route snapshot misses it, as when the route is bound between the snapshot
+    and the claim. With no route to replace, the opted-in resume claims fresh
+    only: the substrate refuses the live route with ``RouteChangedError``
+    instead of adopting it, and nothing reaches the paused runner. Liveness:
+    the kernel's retry snapshots again, sees the paused route and replaces
+    it, so the resume runs once, on a fresh claim-time cct naming Alice.
+    """
+    require_execution_interface()
+    require_requester_interface()
+    clock = install_clock(monkeypatch)
+
+    async def run() -> None:
+        binding, alice, bob, core = event_parties()
+        creator = RecordingCreator()
+        async with make_harness(
+            binding=binding, identity_authority=core, approvals=creator, per_sandbox_runners=2
+        ) as h:
+            monkeypatch.setattr(h.substrate, "suspend", failed_suspend)
+            first, approval_id = await pause_for_approval(h, creator, "resume-raced")
+            key = thread_key(first)
+            paused = route(h, key)
+            paused_runner = runner_at(h, paused)
+            paused_runner.session_status = SessionStatus.AWAITING_APPROVAL.value
+            before = cct_of(h.fake_k8s.claim_envs[0])
+
+            real_lookup = h.substrate.lookup
+            missed: list[str] = []
+
+            def snapshot_misses_once(thread: str) -> Any:
+                if thread == key and not missed:
+                    missed.append(thread)
+                    return None
+                return real_lookup(thread)
+
+            real_claim = h.substrate.claim
+            refused: list[str] = []
+
+            def claim_spy(thread: str, **kwargs: Any) -> Any:
+                try:
+                    return real_claim(thread, **kwargs)
+                except RouteChangedError:
+                    refused.append(str(kwargs.get("fresh_only")))
+                    raise
+
+            monkeypatch.setattr(h.substrate, "lookup", snapshot_misses_once)
+            monkeypatch.setattr(h.substrate, "claim", claim_spy)
+
+            clock.advance(120)
+            resumed = resume_of(approval_id, "resume-raced")
+            core.by_event[resumed.event_id] = alice
+            await process(h, resumed)
+
+            assert missed == [key], "the snapshot never missed the route"
+            assert refused == ["True"], "the fresh-only claim did not refuse the live route"
+            assert paused_runner.opened == [first.text], "the resume adopted the paused runner"
+            assert len(h.fake_k8s.claim_envs) == 2
+            token = cct_of(h.fake_k8s.claim_envs[1])
+            claims = assert_fresh_requester_token(
+                binding, token, before=before, requester=alice, approver=bob
+            )
+            replaced = route(h, key)
+            assert replaced.claim_name != paused.claim_name
+            assert recorded(replaced) == (requester_digest(alice), claims["exp"])
+            assert runner_at(h, replaced).opened == [resumed.text]
+            assert all_opened(h).count(resumed.text) == 1
             assert all_steers(h) == []
             assert await is_done(h, resumed)
 
