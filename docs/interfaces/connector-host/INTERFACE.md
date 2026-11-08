@@ -385,9 +385,13 @@ it, and the proxy passes it to the agent's admitted hosted connectors as
 connector receives the header. The worker
 replaces a sandbox before serving a different requester and never runs one
 person's message under another person's token. A different person's message
-that arrives during a live turn waits for that turn to end, and if the turn
-outlasts the existing redelivery budget the message is settled visibly without
-running.
+that arrives during a live turn waits for that turn to end. A message that can
+park waits in a durable capacity wait record for up to the capacity wait budget
+(24 hours by default) and ends without running if the turn outlasts it; an
+HTTP identity delivery gets no notice when that happens. A delivery that cannot
+park, such as an approval resume, keeps the redelivery budget and is settled
+visibly without running. The local tier runs no caller proxy, so its hosted
+connectors never receive the header.
 
 As a precondition, the api, the worker and the agent's connector proxies must
 all run this release, and the agent must be redeployed first if its connector
