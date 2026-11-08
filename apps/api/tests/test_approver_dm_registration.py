@@ -204,6 +204,36 @@ def test_a_registration_for_another_bot_or_recipient_is_refused(
     card_registered(post_card(case.client, row["id"], body), body)
 
 
+def test_a_registration_for_a_receiver_that_does_not_serve_the_origin_is_refused(
+    dm_case: SimpleNamespace,
+) -> None:
+    """@spec APPROVER-DM-2 (review r1 F3): the card's bot must answer for the origin binding.
+
+    Creation refuses a DM identity whose receiver does not list the turn's
+    binding, so such a row only exists when the route is repointed after
+    creation: a pending DM row is created on the binding's own receiver, then
+    the operator repoints the owning route to ``detached`` (same installation
+    and namespace, registered receiver, ``binding_ids`` without the origin).
+    A first registration naming ``detached`` would store a card no click can
+    answer, so it answers 409 ``approval_card_mismatch`` and writes nothing.
+    Repointed back, the binding's receiver registers.
+    """
+    case = dm_case
+    scope = case.scope
+    row, request, identity = _pending(case)
+    detached = scope["detached"]
+    assert scope["binding"] not in detached["binding_ids"]
+    configured_dm(case, identity=detached["adapter"])
+
+    body = card_body(request, row["id"], card_identity=detached["adapter"])
+    refused_exactly(post_card(case.client, row["id"], body), 409, "approval_card_mismatch")
+    _unregistered(case, request)
+
+    configured_dm(case)
+    body = card_body(request, row["id"], card_identity=identity)
+    card_registered(post_card(case.client, row["id"], body), body)
+
+
 def test_a_registration_with_another_creation_context_is_refused(
     dm_case: SimpleNamespace,
 ) -> None:

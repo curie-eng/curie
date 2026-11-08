@@ -13,7 +13,9 @@ tickets, operator route writes). Three additions:
    bot identity on the same installation and namespace, and ``scope["foreign"]``,
    a bot identity on another installation and workspace namespace. A third
    identity row, ``scope["unregistered"]``, exists in the tenant with no
-   receiver registration at all.
+   receiver registration at all. A fourth, ``scope["detached"]``, is a bot
+   identity on the binding's installation and namespace whose registered
+   receiver lists only another binding, so it never serves the turn's origin.
 2. Route writes put ``{"mode": "approver_dm", "identity": <name>}`` on the
    owning route through the real ``PATCH /agents/{id}``.
 3. Helpers for the pinned internal operations: DM creation (``card_channel``
@@ -176,26 +178,33 @@ def add_receivers(scope: dict[str, Any]) -> None:
         scope, "synthetic-dm-foreign-" + uuid.uuid4().hex[:12], account=FOREIGN_ACCOUNT,
     )
     foreign.update(receiver_id=str(uuid.uuid4()), receiver_key=b"f" * 32)
-    scope["other"], scope["foreign"] = other, foreign
+    detached = add_identity(scope, "synthetic-dm-detached-" + uuid.uuid4().hex[:12])
+    detached.update(
+        receiver_id=str(uuid.uuid4()), receiver_key=b"d" * 32,
+        binding_ids=(str(uuid.uuid4()),),
+    )
+    scope["other"], scope["foreign"], scope["detached"] = other, foreign, detached
     scope["unregistered"] = add_identity(
         scope, "synthetic-dm-unregistered-" + uuid.uuid4().hex[:12],
     )
 
 
 def _registration_v1(module: Any, scope: dict[str, Any], receiver: dict[str, Any]) -> Any:
-    """@spec APPROVER-DM-3: every registration lists the binding and every roster human."""
+    """Every registration lists the binding and every roster human, except one that names
+    its own ``binding_ids`` (``detached``). @spec APPROVER-DM-3."""
     return module.ReceiverRegistrationV1(
         schema_version=1, receiver_id=receiver["receiver_id"], generation=1,
         tenant_id=scope["tenant"], channel_identity_id=receiver["identity"],
         channel_identity_name=receiver["adapter"],
         provider_installation_id=receiver["installation"], namespace=receiver["namespace"],
         installation_account=receiver["account"], bot_user_id="U0EXAMPLEBOT",
-        binding_ids=(scope["binding"],), human_native_ids=HUMANS,
+        binding_ids=receiver.get("binding_ids", (scope["binding"],)),
+        human_native_ids=HUMANS,
     )
 
 
 def dm_runtime(scope: dict[str, Any]) -> Any:
-    """The operator registrations: the binding's receiver, ``other`` and ``foreign``.
+    """The operator registrations: the binding's receiver, ``other``, ``foreign``, ``detached``.
 
     @spec APPROVER-DM-1 APPROVER-DM-3.
     """
@@ -205,7 +214,7 @@ def dm_runtime(scope: dict[str, Any]) -> Any:
     )
     receivers = tuple(
         (_registration_v1(module, scope, scope[name]), scope[name]["receiver_key"])
-        for name in ("main", "other", "foreign")
+        for name in ("main", "other", "foreign", "detached")
     )
     return module.build_http_invocation_runtime(
         providers, receivers, (("synthetic-context", 1, scope["context_key"]),),

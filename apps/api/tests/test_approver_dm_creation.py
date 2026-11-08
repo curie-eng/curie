@@ -291,6 +291,33 @@ def test_a_dm_request_naming_a_card_channel_refuses(dm_case: SimpleNamespace) ->
     _created(case)
 
 
+def test_a_route_identity_whose_receiver_does_not_serve_the_origin_refuses(
+    dm_case: SimpleNamespace,
+) -> None:
+    """@spec APPROVER-DM-1 (review r1 F3): the DM bot must be able to answer for the origin.
+
+    The route names ``detached``: an active bot identity on the binding's
+    installation and namespace with a registered receiver, so the route write
+    is accepted, but that receiver's ``binding_ids`` do not list the turn's
+    binding. Every click on a card it delivered would fail the answer's origin
+    check, so creation refuses before the ticket is spent: 409
+    ``approver_dm_receiver_missing`` (the existing "no usable receiver for the
+    identity" code), no row, nonce unspent. Repointed to the binding's own
+    receiver, the same agent creates.
+    """
+    case = dm_case
+    scope = case.scope
+    detached = scope["detached"]
+    assert scope["binding"] not in detached["binding_ids"]
+    configured_dm(case, identity=detached["adapter"])
+    request, payload = dm_request(case, [
+        selected(case, APPROVER_A, account(detached, NATIVE_A)),
+    ])
+    refused_creation(case, request, payload, 409, "approver_dm_receiver_missing")
+    configured_dm(case)
+    _created(case)
+
+
 # --- an unregistered DM is never answered on its origin -----------------------------------
 
 

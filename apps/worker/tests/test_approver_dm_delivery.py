@@ -900,6 +900,210 @@ def test_slack_sink_top_level_post_to_a_user_id_acks_the_dm_conversation_id() ->
     assert ack == ReplyAck.model_validate({"ref": CARD_TS, "channel": DM_CHANNEL})
 
 
+# --- Item 7b (review r1 F2): no text-only DM card through the real Slack adapter --
+#
+# Provider contract: https://docs.slack.dev/reference/methods/chat.postMessage/
+# A rejected call answers HTTP 200 with ``{"ok": false, "error": <code>}``, which
+# the SDK raises as ``SlackApiError``. ``invalid_blocks`` is a definite rejection
+# of the Block Kit payload; ``internal_error`` is documented as possibly having
+# partly succeeded, so it is ambiguous. In both cases a text-only DM card has no
+# buttons and cannot be answered, so the adapter must not post one and the worker
+# must not register its channel.
+
+POSTED_DM = {
+    "ok": True,
+    "channel": DM_CHANNEL,
+    "ts": CARD_TS,
+    "message": {
+        "type": "message",
+        "subtype": "bot_message",
+        "text": "Requesting sign-off",
+        "bot_id": "B0EXAMPLE1",
+        "user": "U0EXAMPLEBOT",
+        "app_id": "A0EXAMPLE1",
+        "team": "T0EXAMPLE1",
+        "ts": CARD_TS,
+    },
+}
+
+
+class RecordedSlack:
+    """A fake ``AsyncWebClient.chat_postMessage``: the blocks post answers ``error``
+    (a recorded ``ok: false`` body raised as ``SlackApiError``) or, with ``error``
+    None, the recorded DM post; a text-only post answers the same DM body, so a
+    fallback would succeed and be visible."""
+
+    def __init__(self, client: Any, error: str | None) -> None:
+        self.client, self.error = client, error
+        self.calls: list[dict[str, Any]] = []
+
+    def response(self, kwargs: dict[str, Any], data: dict[str, Any]) -> Any:
+        from slack_sdk.web.async_slack_response import AsyncSlackResponse
+
+        return AsyncSlackResponse(
+            client=self.client,
+            http_verb="POST",
+            api_url="https://slack.com/api/chat.postMessage",
+            req_args={"json": kwargs},
+            data=data,
+            headers={},
+            status_code=200,
+        )
+
+    async def chat_postMessage(self, **kwargs: Any) -> Any:  # noqa: N802 (SDK name)
+        from slack_sdk.errors import SlackApiError
+
+        self.calls.append(kwargs)
+        if kwargs.get("blocks") is not None and self.error is not None:
+            raise SlackApiError(
+                f"The request to the Slack API failed. (url: chat.postMessage) "
+                f"The server responded with: {{'ok': False, 'error': '{self.error}'}}",
+                self.response(kwargs, {"ok": False, "error": self.error}),
+            )
+        return self.response(kwargs, POSTED_DM)
+
+
+class RealSlackDmSink(FakeSink):
+    """The kernel's reply sink with the DM card delivered by the REAL
+    ``SlackReplyAdapter`` (Block Kit rendering, block fallback policy, ack
+    channel); every other event is recorded by ``FakeSink`` as usual."""
+
+    def __init__(self, error: str | None) -> None:
+        from curie_worker.slack_sink import SlackReplyAdapter
+
+        super().__init__()
+        self.adapter = SlackReplyAdapter("xoxb-test")
+        client = self.adapter._client_for(None)
+        self.slack = RecordedSlack(client, error)
+        client.chat_postMessage = self.slack.chat_postMessage  # type: ignore[method-assign]
+        self.dm_attempts: list[tuple[ReplyPost, TargetRoute]] = []
+
+    async def emit(
+        self, event: Any, *, route: TargetRoute, best_effort_unreachable: bool = False
+    ) -> ReplyAck:
+        if isinstance(event, ReplyPost) and event.target.address == RECIPIENT:
+            self.dm_attempts.append((event, route))
+            return await self.adapter.emit(
+                event, route=route, best_effort_unreachable=best_effort_unreachable
+            )
+        return await super().emit(
+            event, route=route, best_effort_unreachable=best_effort_unreachable
+        )
+
+
+def _dm_card_through_the_adapter(
+    make_harness: Any, error: str | None
+) -> tuple[DmCreator, RealSlackDmSink, Any]:
+    """Run one selected DM pause; returns the creator, the sink and the stored ref."""
+    creator, sink = DmCreator(), RealSlackDmSink(error)
+    stored: list[Any] = []
+
+    async def run() -> None:
+        async with make_harness(
+            binding=dm_binding(),
+            identity_authority=Core(),
+            approvals=creator,
+            sink=sink,
+            approval_pending_retention_enabled=True,
+        ) as h:
+            h.runner.default_script = awaiting_on_route()
+            event = qevent("DM card through the Slack adapter")
+            await process(h, event, raw=raw_payload(event))
+            stored.append(await h.card_store.read(APPROVAL_ID))
+
+    asyncio.run(run())
+    return creator, sink, stored[0]
+
+
+def test_a_dm_card_posted_by_the_slack_adapter_registers_its_dm_channel(
+    make_harness: Any,
+) -> None:
+    """@spec APPROVER-DM-2: liveness for the refusals below; one blocks post, one
+    registration of the DM id Slack answered with."""
+    creator, sink, stored = _dm_card_through_the_adapter(make_harness, None)
+    assert len(sink.dm_attempts) == 1
+    assert len(sink.slack.calls) == 1, sink.slack.calls
+    assert sink.slack.calls[0]["channel"] == RECIPIENT
+    assert sink.slack.calls[0].get("blocks"), "the DM card was posted without its buttons"
+    assert [item["channel"] for item in creator.registrations] == [DM_CHANNEL]
+    assert stored is not None and stored[0].channel == DM_CHANNEL
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param("invalid_blocks", id="blocks-rejected"),
+        pytest.param("internal_error", id="ambiguous-provider-error"),
+    ],
+)
+def test_a_rejected_dm_card_never_falls_back_to_a_text_only_dm(
+    make_harness: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: str,
+) -> None:
+    """@spec APPROVER-DM-2 (review r1 F2): a text-only DM card cannot be answered.
+
+    Slack refuses the Block Kit post. The adapter must not retry the DM as plain
+    text (no ``chat.postMessage`` without blocks), and the worker must record a
+    DM delivery failure and never register a channel or remember a card ref.
+    """
+    caplog.set_level(logging.INFO)
+    metrics = metric_recorder(monkeypatch)
+    creator, sink, stored = _dm_card_through_the_adapter(make_harness, error)
+
+    assert len(sink.dm_attempts) == 1, "the DM card was retried by the worker"
+    text_only = [call for call in sink.slack.calls if call.get("blocks") is None]
+    assert text_only == [], f"a text-only DM card was posted: {text_only}"
+    assert all(call["channel"] == RECIPIENT for call in sink.slack.calls)
+    assert creator.registrations == [], "a text-only or failed DM card was registered"
+    assert stored is None, "a failed DM card ref was remembered"
+    assert any("approver DM delivery failed" in record.getMessage() for record in caplog.records)
+    assert (
+        "curie.approval.lifecycle",
+        {"service.name": "curie-worker", "operation": "dm_delivery", "outcome": "failure"},
+    ) in [
+        (name, {key: attrs.get(key) for key in ("service.name", "operation", "outcome")})
+        for name, attrs in metrics
+    ]
+
+
+def test_an_ordinary_card_keeps_its_text_only_fallback() -> None:
+    """Existing behavior: a channel approval card rejected for its blocks still
+    falls back to a text-only post in the thread (the API resolve path works
+    regardless). Only the DM card loses the fallback."""
+    from curie_worker.slack_sink import SlackReplyAdapter
+
+    from apps.worker.tests.test_slack_sink import _approval_message
+
+    sink = SlackReplyAdapter("xoxb-test")
+    client = sink._client_for(None)
+    slack = RecordedSlack(client, "invalid_blocks")
+    client.chat_postMessage = slack.chat_postMessage  # type: ignore[method-assign]
+    ack = asyncio.run(
+        sink.emit(
+            ReplyPost(
+                version=REPLY_WIRE_VERSION,
+                event="reply.post",
+                target=ReplyTarget(
+                    kind="slack",
+                    address="C0EXAMPLE1",
+                    conversation_id="1700000000.000100",
+                    reply_ref=None,
+                ),
+                message=_approval_message(APPROVAL_ID, "Approve the synthetic operation"),
+                requested_by="U0EXAMPLE1",
+            ),
+            route=TargetRoute(),
+        )
+    )
+    assert len(slack.calls) == 2, slack.calls
+    assert slack.calls[0].get("blocks") and slack.calls[1].get("blocks") is None
+    assert {call["channel"] for call in slack.calls} == {"C0EXAMPLE1"}
+    assert slack.calls[1]["thread_ts"] == "1700000000.000100"
+    assert ack.ref == CARD_TS
+
+
 # --- Item 8 (AC4): ADR 0273 decision 4 retention applied to the DM ref ------------
 
 
