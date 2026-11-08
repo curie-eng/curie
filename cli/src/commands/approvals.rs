@@ -399,6 +399,7 @@ fn carry_over_selector_routes(
                         resolution: current.resolution.clone().into(),
                         notification: None,
                         approvers: current.approvers.clone(),
+                        expires_in_seconds: current.expires_in_seconds,
                         approver_ticket: Some(ticket),
                         separation,
                     },

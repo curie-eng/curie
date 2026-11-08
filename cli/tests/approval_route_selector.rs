@@ -493,6 +493,38 @@ fn a_single_route_edit_preserves_another_routes_registration() {
 }
 
 #[test]
+fn a_single_route_edit_preserves_a_carried_routes_deadline_and_its_explicit_null() {
+    // The deadline (ADR 0273) is presence-sensitive: a number, an explicit
+    // null, or absent are three stored states, and a carried route must
+    // write back the one it read.
+    for deadline in [serde_json::json!(900), serde_json::Value::Null] {
+        let other = serde_json::json!({
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "expires_in_seconds": deadline,
+            "approver_ticket": registration_readback(),
+            "separation": {"exclude_requester": true},
+        });
+        let api = api(
+            serde_json::json!({"ledger_post": other.clone(), "deal_desk": plain_route("C0EXAMPLE2")}),
+            6,
+            false,
+        );
+        let run = run(&args(
+            &api.server.base_url,
+            &["--route-resolution", "deal_desk=C0EXAMPLE3"],
+        ));
+        assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+        let sent = patches(&api.server);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(
+            sent[0]["approval_routes"]["ledger_post"], other,
+            "deadline {deadline}: {}",
+            sent[0]
+        );
+    }
+}
+
+#[test]
 fn a_single_route_edit_on_an_agent_without_selectors_sends_only_that_route() {
     let api = api(
         serde_json::json!({"deal_desk": plain_route("C0EXAMPLE2")}),
