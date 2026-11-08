@@ -60,6 +60,7 @@ from _hook_wake_support import (
     gate_lock_key,
     get_bundle_object,
     holding_hook_lock,
+    holding_run_row_lock,
     hook_lock_key,
     hook_runs,
     insert_open_run,
@@ -84,8 +85,10 @@ from _hook_wake_support import (
     turns,
     unix_now,
     unreachable_database,
+    unreachable_resume_queue,
     unreachable_valkey_dsn,
     wait_for_lock_waiters,
+    wait_for_lock_waiters_behind,
     wake,
     wake_app,
     wake_bundle,
@@ -850,6 +853,43 @@ def test_enqueue_refusal_closes_the_run_and_keeps_the_reservation(wake_db: str) 
     drive(scenario)
 
 
+# --- case 15b: uncertain enqueue failure ---
+
+
+def test_uncertain_enqueue_keeps_the_claim_and_the_reservation(wake_db: str) -> None:
+    async def scenario() -> None:
+        async with wake_app() as ctx:
+            headers = signed_headers(ctx.key(), ctx.agent_id, WAKE)
+            reservation = dedupe_key_for(ctx, headers).encode()
+            # Only the append meets a connection failure, which may have landed; the
+            # kill switch and the reservation stay on the app's live Valkey.
+            async with unreachable_resume_queue(ctx.app):
+                refused = await wake(ctx, headers=headers)
+            assert_refused(refused, 503, ENQUEUE_UNAVAILABLE)
+            runs, entries = await snapshot(ctx)
+            assert entries == []
+            [run] = runs
+            assert run["source"] == "webhook"
+            # Uncertain, so not closed failed: the open claim is left for lease recovery.
+            assert (run["outcome"], run["reason"], run["ended_at"]) == (None, None, None)
+            assert run["lease_expires_at"] is not None
+            lease = (run["lease_expires_at"] - run["started_at"]).total_seconds()
+            assert abs(lease - DEFAULT_LEASE_S) <= 2, lease
+            assert await dedupe_keys(ctx) == [reservation]
+            claimed = await snapshot(ctx)
+            # With the real queue back, the replay meets its reservation and a fresh
+            # delivery meets the live open claim: neither admits nor appends.
+            assert_coalesced(await wake(ctx, headers=headers))
+            fresh = signed_headers(ctx.key(), ctx.agent_id, WAKE)
+            assert_coalesced(await wake(ctx, headers=fresh))
+            assert await snapshot(ctx) == claimed
+            assert await dedupe_keys(ctx) == sorted(
+                [reservation, dedupe_key_for(ctx, fresh).encode()]
+            )
+
+    drive(scenario)
+
+
 # --- case 16: claim lease reclaim ---
 
 
@@ -1106,6 +1146,68 @@ def test_source_policy_race_with_parallel_wakes_admits_nothing_after_commit(
             assert all(run["started_at"] < committed for run in runs)
             assert_refused(await wake(ctx), 409, SOURCE_NOT_ORDINARY)
             assert await snapshot(ctx) == (runs, entries)
+
+    drive(scenario)
+
+
+PARTITION = {WAKE: {"pointer": "/item/id"}}
+
+
+async def _partition_the_wake(ctx: WakeApp) -> httpx.Response:
+    """The real agent PATCH: it takes neither the source gate nor the per hook lock."""
+    return await ctx.client.patch(
+        f"/agents/{ctx.agent_id}", headers=ctx.headers, json={"hook_partitions": PARTITION}
+    )
+
+
+def test_partition_patch_racing_admission_waits_for_the_admission_commit(wake_db: str) -> None:
+    async def scenario() -> None:
+        async with wake_app() as ctx, observer() as probe:
+            # An open claim whose lease already expired, so admission's reclaim must update it.
+            expired = await insert_open_run(
+                ctx.app,
+                ctx.agent_id,
+                ctx.version_id,
+                WAKE,
+                source="webhook",
+                age_s=60,
+                lease_expires_in_s=-1,
+            )
+            tasks: list[asyncio.Task[Any]] = []
+            try:
+                async with holding_run_row_lock(probe, expired) as holder:
+                    waking = asyncio.create_task(wake(ctx))
+                    tasks.append(waking)
+                    # Admission passed its locked recheck and now waits in the reclaim,
+                    # before its insert, on the row this probe holds.
+                    parked = await wait_for_lock_waiters_behind(probe, holder, unless=waking)
+                    assert len(parked) == 1, "the wake answered without reaching its reclaim"
+                    patching = asyncio.create_task(_partition_the_wake(ctx))
+                    tasks.append(patching)
+                    behind = await wait_for_lock_waiters_behind(probe, parked[0], unless=patching)
+                    assert behind and not patching.done(), (
+                        "the partition PATCH committed while admission sat between its locked "
+                        "recheck and its insert: admission holds no lock on the agent row"
+                    )
+                # Released: admission reclaims, admits and commits, and only then can the
+                # PATCH waiting on admission's transaction apply.
+                admitted = await asyncio.wait_for(waking, 10)
+                run_id = assert_queued(admitted)
+                patched = await asyncio.wait_for(patching, 10)
+            finally:
+                await finish(tasks)
+            assert patched.status_code == 200, patched.text
+            assert patched.json()["hook_partitions"] == PARTITION
+            runs = {str(run["id"]): run for run in await hook_runs(ctx.app, ctx.agent_id)}
+            assert set(runs) == {str(expired), run_id}
+            reclaimed = runs[str(expired)]
+            assert (reclaimed["outcome"], reclaimed["reason"]) == ("reclaimed", "claim_expired")
+            assert runs[run_id]["outcome"] is None
+            assert len(await stream_entries(ctx.app)) == 1
+            # The partition is committed: a fresh wake refuses before any run mutation.
+            before, keys = await snapshot(ctx), await dedupe_keys(ctx)
+            assert_refused(await wake(ctx), 409, SOURCE_NOT_ORDINARY)
+            await unchanged(ctx, before, keys=keys)
 
     drive(scenario)
 

@@ -41,8 +41,11 @@ from _migration_support import IsolatedMigrationDb
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn
 from curie_api.config import get_settings
 from curie_api.db import create_sessionmaker
+from curie_api.identity.http_approval_answer import approved_resume_authority
+from curie_api.identity.http_resume_publication import http_resume_owner
 from curie_api.killswitch import kill_key
 from curie_api.main import create_app
+from curie_api.resumequeue import ResumeQueue
 from curie_protected_hooks.source_policy_records import target_intent_sha256
 from curie_protected_hooks.source_policy_sql import SourceGate
 from redis.exceptions import RedisError
@@ -498,6 +501,35 @@ async def side_client(valkey_url: str) -> AsyncIterator[httpx.AsyncClient]:
         else:
             os.environ["VALKEY_URL"] = saved
         get_settings.cache_clear()
+
+
+@asynccontextmanager
+async def unreachable_resume_queue(app: Any) -> AsyncIterator[None]:
+    """Point only the runs stream append at a Valkey nothing serves.
+
+    The replacement is built as ``create_app`` builds ``app.state.resume_queue``
+    (same stream, graveyard and approval owner) on a client from
+    ``unreachable_valkey_dsn()``, so XADD raises a connection error rather than
+    a server reply: an append whose outcome the API cannot know.
+    ``app.state.valkey``, which the kill switch and the reservation use, stays
+    live. The original queue always comes back and the dead client is closed.
+    """
+    settings = get_settings()
+    dead = aioredis.from_url(unreachable_valkey_dsn())
+    saved = app.state.resume_queue
+    try:
+        app.state.resume_queue = ResumeQueue(
+            dead,
+            stream=settings.runs_stream,
+            dead_letter_stream=(
+                settings.resume_dead_letter_stream or settings.dead_letter_stream_name()
+            ),
+            approvals=http_resume_owner(app.state, approved=approved_resume_authority(app.state)),
+        )
+        yield
+    finally:
+        app.state.resume_queue = saved
+        await dead.aclose()
 
 
 @asynccontextmanager
@@ -978,6 +1010,57 @@ async def holding_hook_lock(
             {"key": hook_lock_key(agent_id, hook)},
         )
         yield
+
+
+@asynccontextmanager
+async def holding_run_row_lock(engine: AsyncEngine, run_id: Any) -> AsyncIterator[int]:
+    """Row-lock one ``hook_runs`` row from outside the app; yields the holder's backend pid.
+
+    An UPDATE that matches the row, such as admission's reclaim of an expired
+    claim, waits on this lock until the block exits.
+    """
+    async with engine.begin() as conn:
+        locked = await conn.scalar(
+            text("SELECT id FROM curie.hook_runs WHERE id=:id FOR UPDATE"),
+            {"id": uuid.UUID(str(run_id))},
+        )
+        assert locked is not None, run_id
+        yield int(await conn.scalar(text("SELECT pg_backend_pid()")))
+
+
+async def lock_waiters_behind(engine: AsyncEngine, holder_pid: int) -> list[int]:
+    """The backends holding an ungranted ``pg_locks`` entry that backend ``holder_pid`` blocks.
+
+    A row lock wait is an ungranted lock on the holder's transaction id, or on
+    the tuple for a later waiter; ``pg_blocking_pids`` names the holder either
+    way, so this sees the row waits that ``lock_waiters`` (advisory only) cannot.
+    """
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text(
+                "SELECT DISTINCT pid FROM pg_locks WHERE NOT granted "
+                "AND CAST(:holder AS integer) = ANY(pg_blocking_pids(pid)) ORDER BY pid"
+            ),
+            {"holder": holder_pid},
+        )
+        return [int(pid) for pid in result.scalars()]
+
+
+async def wait_for_lock_waiters_behind(
+    engine: AsyncEngine, holder_pid: int, *, unless: asyncio.Task[Any]
+) -> list[int]:
+    """The backends waiting behind ``holder_pid`` once there is one.
+
+    Returns an empty list instead when the ``unless`` task finishes first: a
+    request that completed never waited, which the caller asserts on rather
+    than meeting a timeout.
+    """
+    async with asyncio.timeout(5):
+        while True:
+            waiters = await lock_waiters_behind(engine, holder_pid)
+            if waiters or unless.done():
+                return waiters
+            await asyncio.sleep(0)
 
 
 async def finish(tasks: list[asyncio.Task[Any]]) -> None:
