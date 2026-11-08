@@ -10,6 +10,15 @@ from curie_api.identity.http_approval import approval_record_digest
 from sqlalchemy.exc import IntegrityError
 
 
+def _record(row: dict[str, object]) -> SimpleNamespace:
+    """The row as the current API reads it.
+
+    Below 0153 the row has no selection columns; 0153 reads every existing
+    approval as ``ordinary``, whose digest covers only the record fields.
+    """
+    return SimpleNamespace(**{"selection_mode": "ordinary", **row})
+
+
 def test_schedule_expansion_preserves_existing_approval_authority(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
@@ -23,14 +32,14 @@ def test_schedule_expansion_preserves_existing_approval_authority(
         {"id": approval_id, "dedupe": str(approval_id)},
     )
     before = sql_dicts("SELECT * FROM curie.approvals WHERE id=:id", {"id": approval_id})[0]
-    digest = approval_record_digest(SimpleNamespace(**before))
+    digest = approval_record_digest(_record(before))
     command.upgrade(alembic_config(), "0152")
     after = sql_dicts("SELECT * FROM curie.approvals WHERE id=:id", {"id": approval_id})[0]
     assert after == {**before, "remind_every_s": None}
-    assert approval_record_digest(SimpleNamespace(**after)) == digest
+    assert approval_record_digest(_record(after)) == digest
     sql_rows("UPDATE curie.approvals SET remind_every_s=60 WHERE id=:id", {"id": approval_id})
     scheduled = sql_dicts("SELECT * FROM curie.approvals WHERE id=:id", {"id": approval_id})[0]
-    assert approval_record_digest(SimpleNamespace(**scheduled)) == digest
+    assert approval_record_digest(_record(scheduled)) == digest
     with pytest.raises(IntegrityError):
         sql_rows("UPDATE curie.approvals SET remind_every_s=0 WHERE id=:id", {"id": approval_id})
     command.downgrade(alembic_config(), "0151")

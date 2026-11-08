@@ -62,7 +62,7 @@ def test_every_coupled_candidate_consumer_requires_0153(relative: str, extract: 
 def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None:
     """@spec HTTP-INVOCATION-EXECUTION-21: exact graph parent and file digest."""
     revisions = load("cli/src/application_schema_windows.json")["revisions"]
-    assert revisions[-13:] == [
+    assert revisions[-14:] == [
         "0138",
         "0139",
         "0140",
