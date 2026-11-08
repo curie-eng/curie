@@ -493,9 +493,15 @@ def _path_needs_images(path: str) -> bool:
     name = path.rsplit("/", 1)[-1]
     if path in {"uv.lock", "pyproject.toml"} or name in {"uv.lock", "pyproject.toml"}:
         return True
-    if path.startswith("packages/shell-supervisor/") or path in {
-        "runner/src/curie_runner/session.py",
-        "runner/src/curie_runner/server.py",
+    if path.startswith((
+        "packages/shell-supervisor/",
+        "runner/src/curie_runner/",
+        "apps/worker/src/curie_worker/kernel/",
+    )) or path in {
+        "apps/worker/src/curie_worker/markers.py",
+        "apps/worker/src/curie_worker/delivery_lease.py",
+        "apps/worker/src/curie_worker/stream_consumer.py",
+        "apps/worker/src/curie_worker/runner_client.py",
     }:
         return True
     return "Dockerfile" in name or name.endswith(".dockerfile")
@@ -6391,7 +6397,17 @@ def test_platform_runner_upgrade_stages_candidate_artifacts_before_own_lifecycle
     [
         "runner/src/curie_runner/session.py",
         "runner/src/curie_runner/server.py",
+        "runner/src/curie_runner/history.py",
+        "runner/src/curie_runner/preflight/check.py",
         "packages/shell-supervisor/src/curie_shell_supervisor/server.py",
+        "apps/worker/src/curie_worker/kernel/claim.py",
+        "apps/worker/src/curie_worker/kernel/completion.py",
+        "apps/worker/src/curie_worker/kernel/work_items.py",
+        "apps/worker/src/curie_worker/kernel/recovery/check.py",
+        "apps/worker/src/curie_worker/markers.py",
+        "apps/worker/src/curie_worker/delivery_lease.py",
+        "apps/worker/src/curie_worker/stream_consumer.py",
+        "apps/worker/src/curie_worker/runner_client.py",
     ],
 )
 def test_runner_recovery_changes_select_image_proofs(tmp_path: Path, path: str) -> None:

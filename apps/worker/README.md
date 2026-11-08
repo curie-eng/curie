@@ -654,17 +654,23 @@ still emits an operator-visible delivery failure.
 Before starting a turn, the worker records the claim and its delivery owner in
 Valkey. Maintenance observes missing ownership and allows
 `CURIE_ABANDONED_TURN_GRACE_S` (90 seconds by default) before checking the exact
-claim under the thread lock. A runner that remains active, unreadable or unable
-to confirm durable history is retired through its backend. Static shells stop
+claim under the thread lock. For an unfinished delivery, a runner that remains
+active, unreadable or unable to confirm durable history is retired through its
+backend. A terminal delivery's runner is retired only when status reports an
+active turn. An idle terminal runner keeps its route even if its history is
+non-durable; its watch is removed. An unreadable terminal runner keeps its watch
+for a later status read. Static shells stop
 the child and verify cleanup. If the runner settled before the supervisor's
 check, the cleaned shell can be reused; otherwise it is quarantined and its 503
 health response asks the platform to replace it. Settlement retains the recovery
-watch for maintenance, which removes it after observing the runner idle with
-durable history, confirming the claim is gone, or retiring it.
+watch for maintenance, which removes it after an eligible idle status,
+confirming the claim is gone, or retiring it.
 Failed retirements retain their watch and do not block other maintenance. Before
 retirement or replacing an unfinished predecessor's watch for a follow-up,
 recovery persists the runner's retained side-effect marker so reclaim escalates
-instead of replaying.
+instead of replaying. Reclaim waits without interrupting a different delivery's
+live watched turn. The runner flag is not tied to an event, so a change in
+delivery ownership can conservatively escalate a delivery that performed no action.
 Turns started through the attachment handoff currently register no recovery
 watch and are a known gap in this bound. The bound and runner cleanup settings
 are described in [the static substrate reference](../../docs/static-pool-substrate.md).

@@ -14,6 +14,7 @@ from aci_protocol import (
 from ..binding import FactoryWake
 from ..delivery_lease import DeliveryLease
 from ..killswitch import KillSwitch
+from ..sandbox.types import SandboxHandle
 from ..threadlock import LockLeaseLost
 from ..workitem_dispatch import (
     TerminationObservation,
@@ -425,20 +426,28 @@ async def reap_orphans(self: Kernel) -> list[str]:
             async with self._lock.hold(self._config.lock_key(thread_key)) as fence:
                 if not await self._markers.abandoned_turn(claim_name, expected):
                     continue
+                terminal = await self._markers.is_terminal(record["event_id"])
                 handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
                 if handle is not None and handle.claim_name == claim_name:
                     try:
                         status = await self._runner.status(
                             handle.base_url, token=handle.token or None, remaining_s=5.0
                         )
-                    except Exception:  # noqa: BLE001 - unreadable children must be retired
+                    except Exception:  # noqa: BLE001 - maintenance retries unavailable status
                         status = {}
                     if status.get("side_effect_emitted") is True:
                         await self._markers.mark_side_effect(record["event_id"])
-                    if not (
+                    if (
+                        terminal
+                        and status.get("turn_active") is not True
+                        and status.get("turn_active") is not False
+                    ):
+                        continue
+                    retire = status.get("turn_active") is True if terminal else not (
                         status.get("turn_active") is False
                         and status.get("history_durable") is True
-                    ):
+                    )
+                    if retire:
                         await fence.ensure_owned()
                         retired = await asyncio.to_thread(
                             self._substrate.release_if_claim, thread_key, claim_name
@@ -512,8 +521,8 @@ async def _preflight_reclaimed_delivery(
     second mechanism, and never a bare task cancel, which would skip the
     runner-side stop.
 
-    Rule 3: an unreadable runner FAILS CLOSED. ``_turn_active`` already
-    reports busy when liveness cannot be read, so an unreadable runner
+    Rule 3: an unreadable runner FAILS CLOSED. A status probe reports busy
+    when liveness cannot be read, so an unreadable runner
     exhausts the bounded poll and this raises, leaving the stream entry
     pending. A replacement never runs beside a possibly-active turn -- the
     "just retry it" simplification is precisely the failure mode this
@@ -540,7 +549,7 @@ async def _preflight_reclaimed_delivery(
     # one transferred delivery can never eat the whole deadline.
     #
     # Exhausting the window is not a silent pass: a probe cut short by it
-    # fails closed (``_turn_active`` reports busy on any unreadable answer)
+    # fails closed (a status probe reports busy on any unreadable answer)
     # and the loop falls through to the raise below, which is exactly rule
     # 3's refusal.
     deadline = clock.time.monotonic() + min(
@@ -556,14 +565,19 @@ async def _preflight_reclaimed_delivery(
         # the "or disappear" half of rule 2.
         return
     watched = await self._markers.watched_turn(handle.claim_name)
+    watched_event = json.loads(watched)["event_id"] if watched is not None else None
     if watched is not None:
+        assert watched_event is not None
         try:
             status = await self._runner.status(
                 handle.base_url, token=handle.token or None, remaining_s=_left()
             )
         except Exception as exc:  # noqa: BLE001 - an unreadable predecessor is a handoff wait
             raise memory.ReclaimPreflightUnsafe("watched predecessor status is unreadable") from exc
-        watched_event = json.loads(watched)["event_id"]
+        if json.loads(watched)["lease_key"] != self._config.delivery_lease_key(
+            lease.stream, lease.group, lease.entry_id
+        ) and await self._markers.watched_turn_live(handle.claim_name, watched):
+            raise memory.ReclaimPreflightUnsafe("a different delivery still owns the watched turn")
         if status.get("side_effect_emitted") is True:
             await self._markers.mark_side_effect(watched_event)
         if await self._markers.saw_side_effect(watched_event):
@@ -573,7 +587,19 @@ async def _preflight_reclaimed_delivery(
             raise memory.ReclaimPreflightUnsafe(
                 "side-effecting predecessor has not reached a durable handoff boundary"
             )
-    if not await self._turn_active(handle, remaining_s=_left()):
+
+    async def turn_active(candidate: SandboxHandle) -> bool:
+        try:
+            status = await self._runner.status(
+                candidate.base_url, token=candidate.token or None, remaining_s=_left()
+            )
+        except Exception:  # noqa: BLE001 - unreadable runners cannot permit replay
+            return True
+        if watched_event is not None and status.get("side_effect_emitted") is True:
+            await self._markers.mark_side_effect(watched_event)
+        return status.get("turn_active") is not False
+
+    if not await turn_active(handle):
         return
     logger.warning(
         "reclaimed delivery for thread %s (generation %d) found a live turn "
@@ -588,7 +614,7 @@ async def _preflight_reclaimed_delivery(
     while clock.time.monotonic() < deadline:
         await asyncio.sleep(min(constants._RECLAIM_PREFLIGHT_POLL_S, _left()))
         handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
-        if handle is None or not await self._turn_active(handle, remaining_s=_left()):
+        if handle is None or not await turn_active(handle):
             return
     raise memory.ReclaimPreflightUnsafe(
         f"thread {thread_key} still reports (or cannot deny) a live turn after "
