@@ -389,7 +389,12 @@ async def _declaration(
 
 
 async def _require_ordinary(
-    session: AsyncSession, held: SourceGateContext, agent_id: uuid.UUID, hook: str
+    session: AsyncSession,
+    held: SourceGateContext,
+    agent_id: uuid.UUID,
+    hook: str,
+    *,
+    lock_agent: bool,
 ) -> Any:
     """Ordinary source authority and no hook-scoped configuration (contract step 4).
 
@@ -409,16 +414,17 @@ async def _require_ordinary(
         raise _Refusal(status.HTTP_503_SERVICE_UNAVAILABLE, _AUTHORITY) from None
     if not snapshot.never_configured:
         raise _Refusal(status.HTTP_409_CONFLICT, _NOT_ORDINARY)
-    controls = (
-        await session.execute(
-            select(
-                Agent.hook_partitions,
-                Agent.source_bindings,
-                Agent.max_usd_per_day,
-                Agent.max_output_tokens_per_run,
-            ).where(Agent.id == agent_id)
-        )
-    ).one_or_none()
+    controls_query = select(
+        Agent.hook_partitions,
+        Agent.source_bindings,
+        Agent.max_usd_per_day,
+        Agent.max_output_tokens_per_run,
+    ).where(Agent.id == agent_id)
+    if lock_agent:
+        # The PATCH of partitions and bindings takes neither the gate nor the hook lock,
+        # so this row lock is what orders it behind admission and rotation.
+        controls_query = controls_query.with_for_update()
+    controls = (await session.execute(controls_query)).one_or_none()
     if controls is None:
         raise _Refusal(status.HTTP_404_NOT_FOUND, _NOT_DECLARED)
     # Any remediation row counts, removed or not: its generation survives removal.
@@ -551,7 +557,7 @@ async def _wake(
 
         # Steps 3 to 5: declaration, ordinary source, pause, kill, limits.
         version_id, prompt = await _declaration(session, store, agent_uuid, hook)
-        controls = await _require_ordinary(session, held, agent_uuid, hook)
+        controls = await _require_ordinary(session, held, agent_uuid, hook, lock_agent=False)
         await _require_admissible(request, session, agent_uuid, hook, controls)
 
         # Step 6: reserve the signed delivery id before any run mutation.
@@ -582,7 +588,7 @@ async def _wake(
             # A rotated key or a deleted agent (None) no longer matches the authenticated one.
             if await _generation(session, agent_uuid, hook) != generation:
                 raise _Refusal(status.HTTP_401_UNAUTHORIZED, _INVALID)
-            controls = await _require_ordinary(session, held, agent_uuid, hook)
+            controls = await _require_ordinary(session, held, agent_uuid, hook, lock_agent=True)
             await _require_admissible(request, session, agent_uuid, hook, controls)
             hook_key = {"agent_id": agent_uuid, "name": hook}
             leased = {**hook_key, "lease_s": settings.effective_hook_claim_lease_s}
@@ -679,7 +685,7 @@ async def get_wake_secret(
         canonical, agent_uuid = await _admin_target(request, agent_id, hook)
         async with _gated_agent(request, session, agent_uuid) as (_agent, held):
             await _declaration(session, store, agent_uuid, hook)
-            await _require_ordinary(session, held, agent_uuid, hook)
+            await _require_ordinary(session, held, agent_uuid, hook, lock_agent=False)
             generation = await _generation(session, agent_uuid, hook)
             if generation is None:
                 # The agent vanished after the gated read: answer as a missing agent.
@@ -716,11 +722,11 @@ async def rotate_wake_secret(
         canonical, agent_uuid = await _admin_target(request, agent_id, hook)
         async with _gated_agent(request, session, agent_uuid) as (_agent, held):
             await _declaration(session, store, agent_uuid, hook)
-            await _require_ordinary(session, held, agent_uuid, hook)
+            await _require_ordinary(session, held, agent_uuid, hook, lock_agent=False)
             await session.commit()
             async with session.begin():
                 await session.execute(_sql(_LOCK_SQL), {"agent_id": canonical, "name": hook})
-                await _require_ordinary(session, held, agent_uuid, hook)
+                await _require_ordinary(session, held, agent_uuid, hook, lock_agent=True)
                 await ensure_source_gate_live(held)
                 generation = await session.scalar(
                     _sql(_ROTATE_SQL),
