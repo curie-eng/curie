@@ -18,6 +18,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, NoReturn, TypedDict
 
@@ -39,6 +40,7 @@ from . import __version__
 from .action_executor_loop import ActionExecutorLoop
 from .actions import ActionClient, ActionRecorder
 from .approval_cards import ApprovalCardStore
+from .approval_reminders import deliver_reminder
 from .approvals import ApprovalClient
 from .attachment_access_client import AttachmentAccessClient
 from .attachments import (
@@ -831,6 +833,16 @@ def build(
         config=config,
         leases=DeliveryLeaseStore(async_redis, config),
         drain=drain_gate,
+        reminders=(
+            partial(
+                deliver_reminder,
+                reader=approval_client,
+                cards=card_store,
+                sink=ObservedReplySink(sink),
+            )
+            if approval_client is not None
+            else None
+        ),
     )
 
     # The eval lane (F3): a second consumer group on curie:evals, on its own

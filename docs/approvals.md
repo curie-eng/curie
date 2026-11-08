@@ -255,6 +255,44 @@ zero, negative values and fractional numbers are refused. The API freezes the
 chosen deadline at creation, so retries and later route edits do not move it.
 Publication and remediation keep their independent deadline policies.
 
+Set route `remind_every_s` to a positive integer to receive periodic reminders
+under the existing approval card. Omission or null disables reminders. The API
+freezes the interval and first due time at creation; route edits affect future
+approvals. Reminders and decision deadlines are independent. After an outage,
+the next interval starts from the sweeper's current database time rather than
+replaying missed intervals. A claimed reminder can be lost if publication fails;
+a later due interval remains scheduled. Redelivery after an uncertain send can
+produce another non-interactive reply.
+
+Roll out reminders in this order:
+
+1. Deploy compatible API readers, workers and mail adapters everywhere while
+   `CURIE_APPROVAL_REMINDERS_ENABLED` remains false. Every consumer in the runs
+   group must understand reminder entries before publication is enabled.
+2. Configure `remind_every_s` only after all API and worker route readers are
+   compatible. Older readers refuse this key. Complete pending reference
+   retention as described below.
+3. Enable `CURIE_APPROVAL_REMINDERS_ENABLED=true` on the API replicas. A disabled
+   API neither claims nor publishes reminders. The existing approval sweeper
+   interval controls how often due reminders are checked.
+
+For rollback, disable publication on every API replica, wait for those replicas
+to finish their current sweep, and drain all reminder entries through compatible
+workers in the runs group, including pending deliveries. Remove the route key
+before restoring incompatible API or worker readers. Keep compatible reference
+owners until pending approvals settle. Do not restore old workers while reminder
+entries remain available to that consumer group.
+
+Reminders reuse the card's stored transport, endpoint, identity and thread. They
+perform no eligibility lookup and contain no approval action or new email answer
+reference. Email reminders reply to the original thread participants and can be
+sent after the original turn has completed;
+answers still use the original live reference and ordinary signed sender proof.
+Missing card destinations are logged and skipped, and never create a new card.
+The CLI cluster-message relay skips reminders because its bounded reply bucket
+must retain capacity for the resumed answer. Use a fixed-channel or email card
+for reminder delivery.
+
 Deploy compatible API readers and workers before writing deadline keys. Complete
 the [reference-retention rollout](../apps/worker/README.md#approval-deadline-and-reference-retention-rollout)
 so pending cards, notices and reply-placement references survive the whole pending

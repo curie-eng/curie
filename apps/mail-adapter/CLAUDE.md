@@ -48,7 +48,7 @@ the enforceable-rule summary.
   permanent 503. A confirmed provider thread 404 for an admitted reply is the
   exception: persist a deleted receipt and return 410, including on duplicates
   and restart, so the worker dead-letters it without claiming delivery.
-- **Reply all only for the approval request and its outcome** (ADR-0177 amendment A5). Every other send stays sender-only, so the resumed answer reaches the requester. Never mail an address that is not already on the thread: the requester copies approvers in. The card's `Approver` fields word the email and decide nothing.
+- **Reply all only for the approval request, its reminders and its outcome** (ADR-0177 amendment A5 and ADR-0273 decision 3). Every other send stays sender-only, so the resumed answer reaches the requester. Never mail an address that is not already on the thread: the requester copies approvers in. The card's `Approver` fields word the email and decide nothing.
 - **`list_messages` always sends all three `include_*=false`.** They are
   constants in `agentmail.py`, not parameters and not config, so no caller and no
   operator can turn them on. Sending them when they are already the provider's

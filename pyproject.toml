@@ -532,6 +532,7 @@ norecursedirs = [
 ]
 testpaths = [
     "packages/aci-protocol/tests",
+    "packages/curie-internal/tests",
     "packages/channel-protocol/tests",
     "packages/plugin-format/tests",
     "packages/test-support/tests",

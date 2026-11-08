@@ -16,7 +16,9 @@ cannot masquerade as successful authentication refusal.
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import os
 import re
 import shutil
 import ssl
@@ -85,7 +87,7 @@ def _cleanup_containers(owner: str) -> None:
 @pytest.fixture(scope="module")
 def packaged_image(request: pytest.FixtureRequest) -> str:
     if sys.platform != "linux":
-        raise RuntimeError("the packaged mail proof requires Linux host networking")
+        raise RuntimeError("the packaged mail proof requires a Linux test host")
     for tool in ("docker", "openssl"):
         if shutil.which(tool) is None:
             raise RuntimeError(f"the packaged mail proof requires {tool}")
@@ -162,6 +164,7 @@ class ExternalApis:
 
 @pytest.fixture
 def external_apis(request: pytest.FixtureRequest, tmp_path: Path) -> ExternalApis:
+    callback_host = str(ipaddress.IPv4Address(os.environ.get("CURIE_LOCAL_STUB_HOST", "127.0.0.1")))
     certificate = tmp_path / "provider-ca.pem"
     private_key = tmp_path / "provider-key.pem"
     _require(
@@ -178,7 +181,7 @@ def external_apis(request: pytest.FixtureRequest, tmp_path: Path) -> ExternalApi
                 "-subj",
                 "/CN=localhost",
                 "-addext",
-                "subjectAltName=IP:127.0.0.1",
+                f"subjectAltName=IP:{callback_host}",
                 "-addext",
                 "basicConstraints=critical,CA:TRUE",
                 "-keyout",
@@ -214,7 +217,7 @@ def external_apis(request: pytest.FixtureRequest, tmp_path: Path) -> ExternalApi
     request.addfinalizer(cleanup)
 
     def start(handler: type[BaseHTTPRequestHandler], state: Any, *, tls: bool) -> int:
-        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server = ThreadingHTTPServer((callback_host, 0), handler)
         server.daemon_threads = True
         server.state = state  # type: ignore[attr-defined]
         thread = threading.Thread(
@@ -228,8 +231,8 @@ def external_apis(request: pytest.FixtureRequest, tmp_path: Path) -> ExternalApi
 
     mail = RecordedMailState()
     platform = RecordedIngressState()
-    mail.base_url = f"https://127.0.0.1:{start(RecordingMailHandler, mail, tls=True)}/v0"
-    platform.url = f"http://127.0.0.1:{start(RecordingIngressHandler, platform, tls=False)}"
+    mail.base_url = f"https://{callback_host}:{start(RecordingMailHandler, mail, tls=True)}/v0"
+    platform.url = f"http://{callback_host}:{start(RecordingIngressHandler, platform, tls=False)}"
     return ExternalApis(mail, platform, certificate)
 
 
@@ -259,6 +262,7 @@ def start_packaged(
     request.addfinalizer(lambda: _cleanup_containers(owner))
 
     def start(*, senders: str, opt_in: bool = False) -> PackagedProcess:
+        remote_callbacks = bool(os.environ.get("CURIE_LOCAL_STUB_HOST"))
         env = {
             "AGENTMAIL_API_KEY": AGENTMAIL_API_KEY,
             "AGENTMAIL_INBOX": INBOX,
@@ -270,28 +274,28 @@ def start_packaged(
             "ADAPTER_INGRESS_ENABLED": "true",
             "CURIE_MAIL_ALLOWED_SENDERS": senders,
             "CURIE_MAIL_POLL_INTERVAL_SECONDS": "0.05",
-            "CURIE_MAIL_PORT": "0",
+            "CURIE_MAIL_PORT": "8080" if remote_callbacks else "0",
             "CURIE_MAIL_STATE_PATH": "/tmp/packaged-mail-state.sqlite3",
             "SSL_CERT_FILE": "/tmp/provider-ca.pem",
             "OTEL_SDK_DISABLED": "true",
         }
         if opt_in:
             env["CURIE_MAIL_ALLOW_ALL_SENDERS"] = "true"
-        args = [
-            "run",
-            "--detach",
-            "--network",
-            "host",
-            "--label",
-            f"{CONTAINER_LABEL}={owner}",
-            "--mount",
-            f"type=bind,src={external_apis.certificate},dst=/tmp/provider-ca.pem,readonly",
-        ]
+        network_args = (
+            ["--publish", "127.0.0.1::8080"] if remote_callbacks else ["--network", "host"]
+        )
+        args = ["create", *network_args, "--label", f"{CONTAINER_LABEL}={owner}"]
         for name, value in env.items():
             args.extend(("--env", f"{name}={value}"))
         # No command or entrypoint override: the built image's CMD is the proof.
         container_id = _docker(*args, packaged_image).strip()
-        return PackagedProcess(container_id, external_apis)
+        _docker("cp", str(external_apis.certificate), f"{container_id}:/tmp/provider-ca.pem")
+        _docker("start", container_id)
+        process = PackagedProcess(container_id, external_apis)
+        if remote_callbacks:
+            port = _docker("port", container_id, "8080/tcp").strip().rsplit(":", 1)[1]
+            process.base_url = f"http://127.0.0.1:{port}"
+        return process
 
     return start
 
@@ -322,7 +326,8 @@ def polling_packaged(
         logs = process.logs()
         port = re.search(r"mail adapter starting: kind=email port=(\d+)\b", logs)
         if port:
-            process.base_url = f"http://127.0.0.1:{port.group(1)}"
+            if not process.base_url:
+                process.base_url = f"http://127.0.0.1:{port.group(1)}"
             if (
                 _health(process.base_url, "/healthz")
                 and _health(process.base_url, "/readyz")

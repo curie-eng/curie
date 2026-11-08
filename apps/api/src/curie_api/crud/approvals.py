@@ -2,11 +2,12 @@
 
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from aci_protocol import ApprovalRequest
 from aci_protocol.turn import route_identity
+from curie_internal.approval_reminder import ApprovalReminderV1
 from sqlalchemy import (
     case,
     func,
@@ -95,6 +96,8 @@ async def insert_approval(
         granted_arguments=data.granted_arguments,
         created_at=schedule.created_at,
         expires_at=schedule.expires_at,
+        remind_every_s=schedule.remind_every_s,
+        next_remind_at=schedule.next_remind_at,
     )
     if selection is not None:
         approval.selection_mode = "dynamic"
@@ -127,6 +130,46 @@ async def create_approval(
 
 async def get_approval(session: AsyncSession, approval_id: uuid.UUID) -> Approval | None:
     return await session.get(Approval, approval_id)
+
+
+async def claim_due_reminders(
+    session: AsyncSession, *, limit: int = 100
+) -> list[ApprovalReminderV1]:
+    """Claim each observed cursor once, restarting intervals from database time."""
+    now = await session.scalar(select(func.clock_timestamp()))
+    assert isinstance(now, datetime)
+    now = now.astimezone(UTC).replace(tzinfo=None)
+    eligible = (
+        Approval.status == ApprovalStatus.pending,
+        Approval.next_remind_at <= now,
+        Approval.remind_every_s > 0,
+        or_(Approval.expires_at.is_(None), Approval.expires_at > now),
+    )
+    candidates = (
+        await session.execute(
+            select(Approval.id, Approval.next_remind_at, Approval.remind_every_s)
+            .where(*eligible)
+            .order_by(Approval.next_remind_at, Approval.id)
+            .limit(limit)
+        )
+    ).all()
+    claimed = []
+    for approval_id, due_at, interval in candidates:
+        winner = await session.scalar(
+            update(Approval)
+            .where(Approval.id == approval_id, Approval.next_remind_at == due_at, *eligible)
+            .values(next_remind_at=now + timedelta(seconds=interval))
+            .returning(Approval.id)
+            .execution_options(synchronize_session=False)
+        )
+        if winner is not None:
+            claimed.append(
+                ApprovalReminderV1(
+                    version=1, approval_id=str(winner), claimed_due_at=due_at.replace(tzinfo=UTC)
+                )
+            )
+    await session.commit()
+    return claimed
 
 
 async def get_approval_route_binding(session: AsyncSession, approval: Approval) -> Any:
@@ -485,6 +528,7 @@ async def claim_approval_resolution(
 
     values: dict[str, Any] = {
         "status": decision,
+        "next_remind_at": None,
         "resolved_by": resolved_by,
         "resolution_note": note,
         "resolved_at": func.now(),
@@ -591,6 +635,7 @@ async def expire_approval(session: AsyncSession, approval_id: uuid.UUID) -> Appr
     publication = await get_publication_by_approval(session, approval_id)
     approval_values: dict[str, Any] = {
         "status": ApprovalStatus.expired,
+        "next_remind_at": None,
         "resolved_at": func.now(),
     }
     approval_values["resumed_at"] = (
@@ -945,6 +990,7 @@ async def recover_approval_atomic(
         publication = await get_publication_by_approval(session, approval_id)
         values: dict[str, Any] = {
             "status": ApprovalStatus.rejected,
+            "next_remind_at": None,
             "resolved_by": actor,
             "resolution_note": reason,
             "resolved_at": func.now(),

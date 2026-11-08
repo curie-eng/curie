@@ -380,6 +380,7 @@ class ApprovalRouteBinding(_StoredWithoutNulls):
     notification: ApprovalNotificationTarget | None = None
     approvers: ApprovalApprovers | None = None
     expires_in_seconds: int | None = Field(default=None, strict=True, gt=0, le=315_360_000)
+    remind_every_s: int | None = Field(default=None, strict=True, gt=0, le=2**31 - 1)
     approver_ticket: ApproverTicketRegistration | None = None
     separation: ApprovalSeparation | None = None
 
@@ -537,12 +538,15 @@ class ApprovalRouteBindingOut(BaseModel):
     notification: ApprovalTargetOut | None = None
     approvers: ApprovalApproversOut | None = None
     expires_in_seconds: int | None = None
+    remind_every_s: int | None = None
 
     @model_serializer(mode="wrap")
     def _preserve_deadline_presence(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         result: dict[str, Any] = handler(self)
         if "expires_in_seconds" not in self.model_fields_set:
             result.pop("expires_in_seconds", None)
+        if self.remind_every_s is None:
+            result.pop("remind_every_s", None)
         return result
 
     @classmethod

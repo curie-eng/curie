@@ -1435,3 +1435,50 @@ async fn invalid_deadline_values_never_write_routes() {
         assert_no_write(&server);
     }
 }
+
+#[tokio::test]
+async fn reminder_intervals_round_trip_and_invalid_values_never_write() {
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/vectors/approval-route-reminders.json"
+    ))
+    .unwrap();
+    for value in vectors["valid"].as_array().unwrap() {
+        let server = router_stub("{}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routes.json");
+        std::fs::write(&path, format!(r#"{{"review":{{"resolution":{{"kind":"slack","address":"C0EXAMPLE1"}},"remind_every_s":{value}}}}}"#)).unwrap();
+        let output = run(
+            &server,
+            ApprovalCmd {
+                routes_from: Some(path),
+                ..ApprovalCmd::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            patch_body(&server)["approval_routes"]["review"]["remind_every_s"],
+            *value
+        );
+        assert_eq!(
+            output.to_json()["routes"]["review"]["remind_every_s"],
+            *value
+        );
+    }
+    for value in vectors["invalid"].as_array().unwrap() {
+        let server = stub("null", "null");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routes.json");
+        std::fs::write(&path, format!(r#"{{"review":{{"resolution":{{"kind":"slack","address":"C0EXAMPLE1"}},"remind_every_s":{value}}}}}"#)).unwrap();
+        assert!(run(
+            &server,
+            ApprovalCmd {
+                routes_from: Some(path),
+                ..ApprovalCmd::default()
+            }
+        )
+        .await
+        .is_err());
+        assert_no_write(&server);
+    }
+}
