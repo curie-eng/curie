@@ -652,6 +652,38 @@ class Qualification(WakeStack):
             )
         )
 
+    def reset_hook_session(self, agent):
+        pods = [pod for pod, claim in self.agent_callers() if claim["agent"] == agent]
+        if not pods:
+            return
+        threads = self.sql(
+            "SELECT COALESCE(json_agg(thread_key),'[]'::json) FROM curie.thread_transcripts "
+            f"WHERE agent_id='{self.agents[agent]}'"
+        )
+        assert len(threads) == 1
+        self.worker(True)
+        reset = json.loads(
+            self.run(
+                self.cli,
+                "cluster",
+                "reset-thread",
+                agent,
+                "--thread-key",
+                threads[0],
+                "--context",
+                self.context,
+                "--namespace",
+                NAME,
+                "--release",
+                NAME,
+                "--yes",
+                "--json",
+            )
+        )
+        assert reset["released"] and reset["route_existed"]
+        for pod in pods:
+            self.kube("wait", "--for=delete", f"pod/{pod}", "--timeout=90s")
+
     def add_agent(self, agent):
         bundle = self.root / agent
         (bundle / ".claude-plugin").mkdir(parents=True)
@@ -1365,6 +1397,10 @@ def test_hosted_connector_session(qualification, agent, provider_tier):
     if credential_name not in {"CURIE_CREDENTIALS", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}:
         raise RuntimeError("approved test model credential uses an unsupported environment key")
     agent_id = stack.agents[agent]
+    stack.worker(True)
+    warm_run = stack.queued(agent)
+    stack.settled(warm_run, "ran")
+    assert any(claim["agent"] == agent for _, claim in stack.agent_callers())
     key = stack.key(agent)
     image = f"curie-wake-connector:{stack.tag}"
     stack.run(
@@ -1518,6 +1554,7 @@ def test_hosted_connector_session(qualification, agent, provider_tier):
         if wake_secret in json.dumps(container)
     ]
     assert references == ["server"]
+    stack.reset_hook_session(agent)
 
     def control(path, value=None):
         return json.loads(
