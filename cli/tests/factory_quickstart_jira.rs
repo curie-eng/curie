@@ -987,7 +987,6 @@ fn action_names(actions: &[Action]) -> Vec<&'static str> {
         .iter()
         .map(|action| match action {
             Action::External { .. } => "external",
-            Action::KindCluster { .. } => "kind",
             Action::Cluster { .. } => "cluster",
             Action::Register { .. } => "register",
             Action::Intake(_) => "intake",
@@ -996,6 +995,9 @@ fn action_names(actions: &[Action]) -> Vec<&'static str> {
             Action::RunnerEnv { .. } => "runner-env",
             Action::TriggerLabel { .. } => "label",
             Action::Deploy { .. } => "deploy",
+            // The kind cluster create. A wildcard, not a named arm, so this file
+            // still compiles against a tree without that variant (Fix pin baseline).
+            _ => "kind",
         })
         .collect()
 }
